@@ -69,6 +69,18 @@ def test_the_scaling_tutorial(tmp_path: Path) -> None:
         assert "spare 1-8 workers, 1-3 idle" in status
         assert workers(daemon) == "1"
 
+        # A reader saves load.py before running it, by when the worker
+        # has reported its CPU; the decision the page shows says I/O
+        # bound from that figure, so the load waits for it too.
+
+        wait_for(
+            lambda: (
+                re.search(r"workers: cpu \d+%", daemon.muructl("scale", "status", "busy").stdout)
+                is not None
+            ),
+            timeout=20,
+        )
+
         # Eight clients of load: the group grows to at least four workers,
         # the eight threads the load needs, and nothing fails. The page
         # shows five, four and one in hand, but the group can settle at

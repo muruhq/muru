@@ -2332,6 +2332,11 @@ impl Daemon {
             let measured = |value: Option<f64>, unit: &str| {
                 value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
             };
+            let p95 = |value: Option<f64>| {
+                value.map_or("-".to_owned(), |ms| {
+                    crate::scaling::describe_p95(ms, crate::scaling::SIGNAL_LARGEST_MS)
+                })
+            };
 
             let optional: Vec<String> = self
                 .running
@@ -2360,14 +2365,17 @@ impl Daemon {
                         format!("{} -> {}", status.ready, status.desired)
                     },
                     policy: status.spec.describe(),
-                    cpu: measured(status.workers.worker_cpu.map(|cpu| cpu * 100.0), "%"),
+                    cpu: status
+                        .workers
+                        .worker_cpu
+                        .map_or("-".to_owned(), crate::scaling::describe_cpu),
                     gc: measured(status.workers.gc_share.map(|share| share * 100.0), "%"),
-                    gil_wait: measured(status.workers.gil_wait_p95_ms, " ms"),
-                    loop_lag: measured(status.workers.loop_lag_p95_ms, " ms"),
+                    gil_wait: p95(status.workers.gil_wait_p95_ms),
+                    loop_lag: p95(status.workers.loop_lag_p95_ms),
                     handoff_wait: status
                         .workers
                         .handoff_queue_wait_p95_ms
-                        .map(|wait| format!("{wait:.0} ms")),
+                        .map(|wait| p95(Some(wait))),
                     diagnosis: status.diagnosis.summary.to_owned(),
                     advice: status.diagnosis.advice.to_owned(),
                     last_decision: status

@@ -120,6 +120,19 @@ min_lifetime = '1s'
     row = status_row(daemon)
     assert row[-1:] == ["idle"] and "spare" in " ".join(row), row
 
+    # The signals need two reports of the same worker, a few seconds
+    # apart. Until then busy slots alone say nothing of I/O against CPU,
+    # so the load waits for them (issue #466).
+
+    deadline = time.monotonic() + 20
+    shown = daemon.muructl("scale", "status", "shop").stdout
+
+    while not re.search(r"workers: cpu \d+%", shown) and time.monotonic() < deadline:
+        time.sleep(0.5)
+        shown = daemon.muructl("scale", "status", "shop").stdout
+
+    assert re.search(r"workers: cpu \d+%", shown), shown
+
     # Three requests in flight against one single-threaded worker: the
     # group is short and grows, never past its ceiling.
 
@@ -144,18 +157,7 @@ min_lifetime = '1s'
 
     scaled_out = [line for line in events if "scale out from 1" in line]
     assert "diagnosis: I/O bound with exhausted slots" in scaled_out[0], scaled_out
-
-    # The signals need two reports of the same worker, a few seconds
-    # apart, so a group that has just changed waits for them.
-
-    deadline = time.monotonic() + 20
     shown = daemon.muructl("scale", "status", "shop").stdout
-
-    while not re.search(r"workers: cpu \d+%", shown) and time.monotonic() < deadline:
-        time.sleep(0.5)
-        shown = daemon.muructl("scale", "status", "shop").stdout
-
-    assert re.search(r"workers: cpu \d+%", shown), shown
     assert "diagnosis: " in shown, shown
 
     # The metrics carry the autoscaler's gauges and counters.

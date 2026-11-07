@@ -82,8 +82,8 @@ def test_collections_are_counted_with_the_requests_they_paused(daemon: Daemon) -
     line = next(line for line in shown.splitlines() if f"gc generation {generation()}:" in line)
 
     match = re.search(
-        r"(\d+) collections, ([\d.]+) ms in all, p95 under ([\d.]+ ms|-), (\d+) objects freed, "
-        r"(\d+) while (\d+) requests were in flight",
+        r"(\d+) collections, ([\d.]+) ms in all, p95 (under [\d.]+ m?s|over [\d.]+ s|-), "
+        r"(\d+) objects freed, (\d+) while (\d+) requests were in flight",
         line,
     )
     assert match, line
