@@ -170,6 +170,7 @@ What the apply guarantees:
 
 - Routes and traffic change all at once or not at all, so a change that adds a host, a route and a release cannot leave a route pointing at a host that does not exist or at a release the apply added that has not started.
 - Applies happen one after another. An apply given while another is under way, a --no-wait one the daemon is still finishing included, waits for it to end and is then planned against the desired state it left, and its report says it waited.
+- An apply, once planned, is carried out by the daemon. A client that goes away while its releases start, interrupted or disconnected, stops only the report: the daemon finishes the apply, or undoes the prepare phase when a release does not start, as it does after a --no-wait apply.
 - A daemon restart cannot leave half of the configuration written. Before the commit's transaction only the prepare phase's records are written, and after it all of the rest is. The daemon builds its first snapshot from desired state when it starts again.
 
 What it does not guarantee:

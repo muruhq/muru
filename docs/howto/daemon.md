@@ -307,6 +307,12 @@ muru: nothing applied:
   create-route    route shop /             not applied
 ```
 
+Once planned, an apply is carried out by the daemon. Interrupting
+`muructl apply`, with Ctrl-C or by closing its terminal, stops the
+report, not the apply: the daemon finishes it, or removes what it added
+when a release does not start, and the `config.applied` or
+`config.apply_failed` event says how it ended.
+
 Applies happen one at a time. An apply given while another is under way,
 including one given `--no-wait` that the daemon is still finishing,
 waits for it to end and is then planned against what it left, and its
