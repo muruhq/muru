@@ -26,7 +26,11 @@ case "$os-$arch" in
         url="https://github.com/summerwind/h2spec/releases/download/$version/$archive"
         echo "downloading $url"
         scratch="$(mktemp -d)"
-        curl -sSL -o "$scratch/$archive" "$url"
+        if ! curl --fail -sSL -o "$scratch/$archive" "$url"; then
+            echo "could not download h2spec from $url (see curl's error above)" >&2
+            rm -rf "$scratch"
+            exit 1
+        fi
         tar -xzf "$scratch/$archive" -C "$scratch"
         mv "$scratch/h2spec" "$binary"
         rm -rf "$scratch"
