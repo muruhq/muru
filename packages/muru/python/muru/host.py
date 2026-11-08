@@ -95,6 +95,11 @@ TICK_SECONDS = 0.5
 
 REPORT_INTERVAL_SECONDS = 1.0
 
+# Section 7.6: a request past its deadline the worker has stopped
+# reporting for this many report intervals is forgotten.
+
+PAST_DEADLINE_FORGET_REPORTS = 3
+
 # How long a worker is given to answer a control request before the
 # host answers for it.
 
@@ -831,6 +836,23 @@ class WorkerState:
     # it out of routing and from being replaced.
 
     debug_sessions: int = 0
+
+    # Section 7.6: the requests the worker reports past their deadline,
+    # by request id: what its last report said of each, when it said it,
+    # and whether the event has been raised.
+
+    past_deadline: dict[str, PastDeadline] = field(default_factory=dict)
+
+
+@dataclass
+class PastDeadline:
+    """A request a worker reports past its deadline (section 7.6)."""
+
+    method: str
+    path: str
+    age_ms: int
+    seen_at: float
+    raised: bool = False
 
 
 @dataclass
@@ -2504,6 +2526,13 @@ class Host:
 
                 continue
 
+            # Section 7.6: a request past its deadline, a line of its own
+            # with every report while it lasts; tick() raises the event.
+
+            if "past_deadline" in report:
+                self.saw_past_deadline(state, report["past_deadline"])
+                continue
+
             # Section 6.7: what the worker settled its entrypoints as,
             # sent once before it serves; the supervisor is told when it
             # is news.
@@ -2724,6 +2753,50 @@ class Host:
                 "max_requests",
             )
 
+    def saw_past_deadline(self, state: WorkerState, request: dict[str, Any]) -> None:
+        """Note a request the worker reports past its deadline."""
+
+        request_id = str(request.get("request_id", ""))
+        seen = state.past_deadline.get(request_id)
+
+        if seen is None:
+            state.past_deadline[request_id] = PastDeadline(
+                str(request.get("method", "")),
+                str(request.get("path", "")),
+                int(request.get("age_ms", 0)),
+                time.monotonic(),
+            )
+        else:
+            seen.age_ms = int(request.get("age_ms", seen.age_ms))
+            seen.seen_at = time.monotonic()
+
+    def raise_past_deadline(self, state: WorkerState, now: float) -> None:
+        """Raise request.past_deadline once for each request the worker reports past it.
+
+        A request no longer reported for a few report intervals has
+        finished, or its worker has gone, and is forgotten.
+        """
+
+        for request_id, request in list(state.past_deadline.items()):
+            if now - request.seen_at > PAST_DEADLINE_FORGET_REPORTS * REPORT_INTERVAL_SECONDS:
+                del state.past_deadline[request_id]
+                continue
+
+            if request.raised:
+                continue
+
+            request.raised = True
+            self.emit(
+                "request.past_deadline",
+                "warning",
+                f"worker {state.index} (pid {state.pid}): request {request_id} "
+                f"{request.method} {request.path} is past its deadline, "
+                f"{request.age_ms / 1000:.1f} s after the worker took it; the client was "
+                "answered 504 and the request goes on in the worker",
+                group=self.group_of(state.index).name,
+                reason="deadline",
+            )
+
     def tick(self) -> None:
         """Apply the lifetime and hard timeout policies and advance replacements."""
 
@@ -2731,6 +2804,8 @@ class Host:
         self.advance_orphans(now)
 
         for state in list(self.states.values()):
+            self.raise_past_deadline(state, now)
+
             if state.replaced or state.index in self.replacing or not state.ready:
                 continue
 

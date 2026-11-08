@@ -810,6 +810,29 @@ fn report_thread(fd: i32, shared: &Shared, memory_interval: Duration, stop: &Ato
             libc::write(fd, line.as_ptr().cast(), line.len());
         }
 
+        // Section 7.6: each request past its deadline, a line of its own
+        // in every report while it lasts, so the host, which raises the
+        // event once, misses none for a write skipped. The path is cut so
+        // a line stays shorter than a pipe writes whole.
+
+        for request in shared.past_deadline(PAST_DEADLINE_LIMIT) {
+            let path: String = request.path.chars().take(200).collect();
+            let line = format!(
+                "{{\"past_deadline\":{{\"request_id\":{},\"method\":{},\"path\":{},\"age_ms\":{}}}}}\n",
+                serde_json_string(&request.request_id),
+                serde_json_string(&request.method),
+                serde_json_string(&path),
+                request.age_ms
+            );
+
+            // SAFETY: as above; a line skipped is sent again with the
+            // next report.
+
+            unsafe {
+                libc::write(fd, line.as_ptr().cast(), line.len());
+            }
+        }
+
         std::thread::sleep(REPORT_INTERVAL);
 
         if stop.load(Ordering::Relaxed) {
@@ -817,6 +840,9 @@ fn report_thread(fd: i32, shared: &Shared, memory_interval: Duration, stop: &Ato
         }
     }
 }
+
+/// The most requests past their deadline one report names (section 7.6).
+const PAST_DEADLINE_LIMIT: usize = 16;
 
 /// The signals a worker acts on: SIGTERM and SIGINT stop it, SIGUSR1 asks
 /// it to reopen its logs, SIGUSR2 to give memory back.

@@ -433,6 +433,9 @@ lost the evidence:
 
 - `request.soft_timeout`: a request past the [soft timeout](timeouts.md),
   with where its thread was, taken before the timeout interrupted it.
+- `request.past_deadline`: a request still running after the edge
+  answered it 504 at its [deadline](timeouts.md#past-the-deadline);
+  `debug stacks` shows where it is.
 - `worker.timeout_killed`: a worker replaced for the hard timeout, after
   `worker.loop_stalled` or `worker.gil_stalled`, or because its reports
   stopped, with where its oldest request was. Its threads' stacks go to

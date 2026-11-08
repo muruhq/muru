@@ -76,7 +76,7 @@ def start(runtime: Path, port: int | None = None, **kwargs: object) -> support.S
 
 
 def test_the_commands_reach_a_development_run(runtime: Path) -> None:
-    server = start(runtime)
+    server = start(runtime, args=["--timeout", "deadline=2s"])
 
     try:
         assert server.get("/").status == 200
@@ -131,6 +131,13 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
         wrong = muructl(runtime, "logs", "other", cwd=support.FIXTURES, check=False)
         assert "no application other here" in wrong.stderr, wrong.stderr
         assert "no WebSockets open" in muructl(runtime, "websockets", cwd=support.FIXTURES).stdout
+
+        # A request past its deadline is answered 504 and goes on in its
+        # worker; the host raises an event for it, once (issue 463).
+
+        assert server.get("/sleep?seconds=4").status == 504
+        assert server.wait_for_log("request.past_deadline: worker "), server.log()
+        assert "GET /sleep?seconds=4 is past its deadline" in server.log()
 
         # Logging levels and a restart go through the host as they do
         # under the daemon; the restart's event reaches the terminal.
