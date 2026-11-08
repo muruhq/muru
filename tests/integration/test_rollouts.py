@@ -289,8 +289,8 @@ def test_rollouts_pause_resume_approve_promote_and_abort(daemon: Daemon, tmp_pat
     assert "promoted: promoted by hand at 50%" in promoted, promoted
     wait_for_states(daemon, {"shop@r1": ("retained", ""), "shop@r2": ("ready", "yes")})
 
-    # Aborting takes the candidate out and keeps it warm, which stops the
-    # older retained release: one retained release per application.
+    # Aborting takes the candidate out and keeps it for inspection, beside
+    # the retained release a rollback goes to, which stays warm.
 
     daemon.muructl("deploy", "shop", str(SHOP), "--python", sys.executable, "--hold")
     daemon.muructl(
@@ -311,9 +311,12 @@ def test_rollouts_pause_resume_approve_promote_and_abort(daemon: Daemon, tmp_pat
     assert "rolled_back: aborted by hand at 50%" in aborted, aborted
     wait_for_states(
         daemon,
-        {"shop@r1": ("stopped", ""), "shop@r2": ("ready", "yes"), "shop@r3": ("retained", "")},
+        {"shop@r1": ("retained", ""), "shop@r2": ("ready", "yes"), "shop@r3": ("retained", "")},
     )
     assert releases_seen(daemon, 20, "after") == {"r2"}
+    listed = " ".join(daemon.muructl("release", "list", "shop").stdout.split())
+    assert "shop@r1 retained" in listed and "a rollback to it is instant" in listed, listed
+    assert "kept for inspection until" in listed and "not a rollback target" in listed, listed
 
     listing = daemon.muructl("rollout", "status", "shop").stdout
     assert listing.count("shop ") == 2 and "promoted" in listing and "rolled_back" in listing
@@ -325,6 +328,11 @@ def test_rollouts_pause_resume_approve_promote_and_abort(daemon: Daemon, tmp_pat
     ]:
         refused = daemon.muructl("rollout", "canary", *arguments, check=False)
         assert refused.returncode != 0 and complaint in refused.stderr, refused.stderr
+
+    # A rollback goes to the release that served before, still warm.
+
+    assert daemon.muructl("rollback", "shop").returncode == 0
+    assert served_by(daemon) == "r1"
 
 
 def test_a_held_release_previews_without_a_route(daemon: Daemon) -> None:

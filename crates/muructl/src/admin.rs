@@ -2709,7 +2709,8 @@ pub struct DeployArgs {
     retain: Option<Duration>,
 
     /// The workers each group of the release this one replaces keeps
-    /// while it stays warm (default 1; 0 keeps the host alone).
+    /// while it stays warm (default 1, or 0 for a group whose
+    /// min_workers is 0; 0 keeps the host alone).
     #[arg(long, value_name = "N")]
     retain_workers: Option<u32>,
 
@@ -3254,15 +3255,11 @@ fn print_deploy_plan(plan: &pb::DeployPlan) {
             plan.app, plan.serving
         ),
         (false, false) => println!(
-            "  the release would take over from {}@{}, which would stay warm for {} with {} to a group",
+            "  the release would take over from {}@{}, which would stay warm for {} with {}",
             plan.app,
             plan.serving,
             muru_config::format_duration(Duration::from_millis(plan.retain_ms)),
-            match plan.retain_workers {
-                0 => "its host alone".to_owned(),
-                1 => "1 worker".to_owned(),
-                count => format!("{count} workers"),
-            }
+            plan.retained
         ),
     }
 }
@@ -5540,7 +5537,8 @@ pub struct ApplyArgs {
     retain: Option<Duration>,
 
     /// The workers each group of a release the apply replaces keeps
-    /// while it stays warm (default 1; 0 keeps the host alone).
+    /// while it stays warm (default 1, or 0 for a group whose
+    /// min_workers is 0; 0 keeps the host alone).
     #[arg(long, value_name = "N")]
     retain_workers: Option<u32>,
 

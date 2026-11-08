@@ -11,7 +11,7 @@ muructl run app:application --timeout deadline=30s --timeout queue=2s
 | Name | Default | Measured | When it fires |
 | --- | --- | --- | --- |
 | `header_read` | 30s | from the connection's first byte to a complete request head | the connection is closed |
-| `queue` | 5s | from arrival to a worker thread picking the request up | 503 `queue_full` with `Retry-After: 1` |
+| `queue` | 5s | from arrival to a worker thread picking the request up | 503 `queue_full` with `Retry-After: 1`, or `cold_start_timeout` when the group had no worker and none started |
 | `deadline` | 300s | from arrival to the response head | 504 `deadline`; the worker is told to abandon the request |
 | `body_idle` | 60s | between two chunks of a streamed request body | 408 `client_timeout` if no response has started |
 | `response_idle` | 60s | between two chunks of a streamed response | the response is cut off and the connection closed |

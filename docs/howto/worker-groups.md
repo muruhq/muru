@@ -142,8 +142,8 @@ processes = 1
 The release is ready once the default group and every required group
 listen, and the optional group's workers join as each one does. Until the
 group has a worker, a request for its paths waits at the edge, as it
-does for a group scaled to zero, and is answered 503 at the queue
-timeout; it is not sent to the default group, since the paths were given
+does for a group scaled to zero, and is answered 503
+`cold_start_timeout` at the queue timeout; it is not sent to the default group, since the paths were given
 to the group for its own sizing or isolation, and serving them from
 elsewhere would hide that the group is down.
 

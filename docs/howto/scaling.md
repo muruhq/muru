@@ -97,14 +97,21 @@ idle_reap_after = '15m'
 ```
 
 The wake is a `scaling.decision` event, `scale out from 0 to 1 workers: a
-request is waiting for a group scaled to zero`, and the node's budget
-admits it as any scale-out. A request waits for its worker up to the
-queue timeout of the `[limits]` table, and is answered 503 if none
-arrives by then.
+request is waiting for a group scaled to zero`. The [node's
+budget](#the-nodes-budget) does not hold a wake back for its workers
+limit: a wake that takes the node over it says so (`over the node's
+budget of 6 workers`), and the retained releases that hold workers are
+stopped, oldest first, until the node is back under the limit. Its
+memory limit applies to a wake as to any scale-out, the retained releases
+making way first. A request waits for its worker up to the
+queue timeout of the `[limits]` table, and is answered 503 with the
+reason `cold_start_timeout` if none has started by then.
 
 With `host_idle_timeout`, the host stops too once every group of the
 release has been at zero for that long, and the next request starts it
-again, waiting through the application's import:
+again, waiting through the application's import. The budget treats this
+wake as the one above: the host starts whatever the workers limit, once
+its memory fits.
 
 ```toml
 [app.docs.release.r3.scaling]
@@ -115,7 +122,15 @@ host_idle_timeout = '1h'
 ```
 
 `host_idle_timeout` goes in the release's own scaling table, and every
-worker group of the release must have `min_workers = 0`. The events are
+worker group of the release must have `min_workers = 0`.
+
+When a deploy replaces such a release, it is retained without workers in
+a group whose `min_workers` is 0, so it holds none of the node's budget
+for them, and `muructl release list` notes that a rollback to it forks a
+worker. A release whose host had already stopped is retained as it is,
+noted as idle: a rollback to it waits for its import, as the next request
+would. `--retain-workers` on the deploy keeps that many workers in every
+group instead. The events are
 `release.idle` when the host stops and `release.woken` when a request
 starts it, and `muructl release list` shows the release as ready, idle.
 gRPC calls are matched by the services a worker registered, so a gRPC
@@ -268,8 +283,20 @@ its `memory.soft_limit`. When it fits only with the retained releases
 gone, they are stopped, oldest first; when it does not fit even then, the
 deploy is refused with a `scaling.denied_by_budget` event and no release
 is recorded. A rollback, and the releases the daemon starts again after a
-restart, are not held back. While the node is over its memory budget,
-retained releases are stopped, oldest first.
+restart, are not held back. Nor is a [wake from zero](#scale-to-zero) by
+the workers limit: a node may hold more releases at zero than it has
+workers for, and none of its workers is set aside for them. A wake that
+takes the node over the workers limit stops retained releases, oldest
+first, until it is back under, and until then other releases' scale-out
+is refused. While the node is over its memory budget, retained releases
+are stopped, oldest first.
+
+A retained release counts against the budget with the workers it keeps.
+After a [rollout](rollouts.md) is rolled back or aborted, its candidate
+is kept for 10 minutes beside the release a rollback goes to, so the
+application holds one more retained release meanwhile. Wherever retained
+releases make way, the candidate goes first, ahead of every rollback
+target.
 
 `muructl apply` warns of a release, a schedule or an overlay whose floor
 would not fit the budget as it stands, and each window that raises a

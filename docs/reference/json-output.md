@@ -61,7 +61,7 @@ $ muructl release show shop@r9 --json
 | `muructl host list` | `{"hosts": [...]}` |
 | `muructl route list` | `{"routes": [...]}` |
 | `muructl upstream list` | `{"upstreams": [...]}` |
-| `muructl deploy` | The new release, as `release show` prints it; with `--no-wait`, as recorded; with `--dry-run`, the plan: `app`, `release`, `new_app`, `description`, `settings` (each with `key`, `value` and `layer`), `builds`, `serving`, `settings_from`, `hold`, `retain_ms`, `retain_workers` and `refusals` |
+| `muructl deploy` | The new release, as `release show` prints it; with `--no-wait`, as recorded; with `--dry-run`, the plan: `app`, `release`, `new_app`, `description`, `settings` (each with `key`, `value` and `layer`), `builds`, `serving`, `settings_from`, `hold`, `retain_ms`, `retain_workers` (null unless `--retain-workers` gave it), `retained` (what the serving release would keep, such as `1 worker to a group`) and `refusals` |
 | `muructl render` | The document `muructl apply` takes: `{"app": {NAME: {"release": {ID: {...}}}}}`, the release's table with the keys of the daemon's format |
 | `muructl rollback` | The release traffic went back to |
 | `muructl drain` | The release drained |
