@@ -2801,7 +2801,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         python: python.python.clone(),
         pythonpath: library.pythonpath.clone(),
         pycache_prefix: None,
-        no_bytecode: false,
+        bytecode: None,
         app: resolved.entrypoint.clone(),
         name: Some(label.clone()),
         release: None,

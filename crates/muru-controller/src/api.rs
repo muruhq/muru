@@ -1655,13 +1655,6 @@ impl Admin for Service {
         // one snapshot of it.
 
         let tls = document.host.values().any(|host| host.tls.is_some());
-        let mut prepared = Prepared::default();
-
-        if let Err(error) = self.record(&plan, &mut report, &mut prepared) {
-            self.undo(&mut report, prepared, error).await;
-            return Ok(Response::new(report));
-        }
-
         let starts = plan.changes.iter().any(|change| {
             matches!(
                 change.action,
@@ -1671,42 +1664,44 @@ impl Admin for Service {
                 } | Action::Promote { .. }
             )
         });
+        let service = Service {
+            handle: self.handle.clone(),
+            applying: self.applying.clone(),
+        };
 
-        if !deploying.wait && starts {
-            let mut early = report.clone();
-            early.applied = true;
+        // The rest of the apply runs in a task of its own, which holds
+        // the lock until it has finished. A client that goes away drops
+        // this handler's future, but not the task, so an apply whose
+        // releases do not start is still undone. A --no-wait apply is
+        // answered once its releases are recorded; any other is answered
+        // when the task ends.
 
-            for message in &mut early.changes {
-                if message.outcome.is_empty() {
-                    message.outcome = "pending".to_owned();
-                }
+        let (early_tx, early_rx) = oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            let _applying = applying;
+            let mut prepared = Prepared::default();
+
+            if let Err(error) = service.record(&plan, &mut report, &mut prepared) {
+                service.undo(&mut report, prepared, error).await;
+                return report;
             }
 
-            early.notes.push(
-                "the rest of the apply waits for its releases to start; a config.applied or \
-                 config.apply_failed event says how it ended"
-                    .to_owned(),
-            );
+            if !deploying.wait && starts {
+                let _ = early_tx.send(early_report(&report));
+            }
 
-            let service = Service {
-                handle: self.handle.clone(),
-                applying: self.applying.clone(),
-            };
+            service
+                .complete(&plan, &mut report, prepared, &deploying, tls)
+                .await;
+            report
+        });
 
-            // The apply holds the lock until the daemon has finished it.
-
-            tokio::spawn(async move {
-                let _applying = applying;
-                service
-                    .complete(&plan, &mut report, prepared, &deploying, tls)
-                    .await;
-            });
-
+        if let Ok(early) = early_rx.await {
             return Ok(Response::new(early));
         }
 
-        self.complete(&plan, &mut report, prepared, &deploying, tls)
-            .await;
+        let report = task.await.map_err(internal)?;
         Ok(Response::new(report))
     }
 
@@ -2399,6 +2394,26 @@ fn parse_failure(error: String) -> pb::ConfigReport {
         errors: vec![error],
         ..Default::default()
     }
+}
+
+/// The answer to a --no-wait apply, once its releases are recorded: what
+/// is still to happen reads as pending.
+fn early_report(report: &pb::ConfigReport) -> pb::ConfigReport {
+    let mut early = report.clone();
+    early.applied = true;
+
+    for message in &mut early.changes {
+        if message.outcome.is_empty() {
+            message.outcome = "pending".to_owned();
+        }
+    }
+
+    early.notes.push(
+        "the rest of the apply waits for its releases to start; a config.applied or \
+         config.apply_failed event says how it ended"
+            .to_owned(),
+    );
+    early
 }
 
 fn report_message(plan: &Plan) -> pb::ConfigReport {

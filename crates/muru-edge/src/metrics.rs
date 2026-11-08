@@ -314,6 +314,10 @@ const BUCKETS: [(f64, &str); 13] = [
     (10.0, "10"),
 ];
 
+/// The largest bound of the request duration histograms, in seconds:
+/// a percentile past it reads as over it.
+pub const LARGEST_BUCKET_SECONDS: f64 = BUCKETS[BUCKETS.len() - 1].0;
+
 /// The buckets of a WebSocket's lifetime, in seconds: from a second to a
 /// day.
 const LIFETIME_BUCKETS: [(f64, &str); 9] = [

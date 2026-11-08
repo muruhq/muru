@@ -278,11 +278,16 @@ A collection pauses the whole worker, so pauses that landed on requests
 in flight are tail latency no single endpoint explains. The same figures
 are in the [metrics](metrics.md) as `muru_gc_pause_seconds`, and the
 [scaling](scaling.md) diagnosis names collection when it takes a tenth of
-the workers' time or more. The host already calls `gc.freeze()` before
-every fork, so a worker's collections scan only what the worker itself
-created; an application whose collections still cost it can create fewer
-long-lived cyclic objects after the fork, or call `gc.freeze()` itself once
-its caches are warm.
+the workers' time or more. Young collections that each free many objects
+are clearing short-lived reference cycles, such as two objects that
+refer to each other made for every request; the diagnosis says so, and
+breaking the cycle, or making the reference back a `weakref`, takes that
+collection away. Collections that free few objects are going over
+long-lived ones. The host already calls `gc.freeze()` before every fork,
+so a worker's collections scan only what the worker itself created; an
+application whose collections still cost it can create fewer long-lived
+cyclic objects after the fork, or call `gc.freeze()` itself once its
+caches are warm.
 
 ## Running code
 

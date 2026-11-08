@@ -2332,6 +2332,11 @@ impl Daemon {
             let measured = |value: Option<f64>, unit: &str| {
                 value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
             };
+            let p95 = |value: Option<f64>| {
+                value.map_or("-".to_owned(), |ms| {
+                    crate::scaling::describe_p95(ms, crate::scaling::SIGNAL_LARGEST_MS)
+                })
+            };
 
             let optional: Vec<String> = self
                 .running
@@ -2360,14 +2365,17 @@ impl Daemon {
                         format!("{} -> {}", status.ready, status.desired)
                     },
                     policy: status.spec.describe(),
-                    cpu: measured(status.workers.worker_cpu.map(|cpu| cpu * 100.0), "%"),
+                    cpu: status
+                        .workers
+                        .worker_cpu
+                        .map_or("-".to_owned(), crate::scaling::describe_cpu),
                     gc: measured(status.workers.gc_share.map(|share| share * 100.0), "%"),
-                    gil_wait: measured(status.workers.gil_wait_p95_ms, " ms"),
-                    loop_lag: measured(status.workers.loop_lag_p95_ms, " ms"),
+                    gil_wait: p95(status.workers.gil_wait_p95_ms),
+                    loop_lag: p95(status.workers.loop_lag_p95_ms),
                     handoff_wait: status
                         .workers
                         .handoff_queue_wait_p95_ms
-                        .map(|wait| format!("{wait:.0} ms")),
+                        .map(|wait| p95(Some(wait))),
                     diagnosis: status.diagnosis.summary.to_owned(),
                     advice: status.diagnosis.advice.to_owned(),
                     last_decision: status
@@ -4538,13 +4546,14 @@ impl Daemon {
 
         let library = self.runtime_library(&python).await?;
         let pycache = self.pycache_prefix(app, id, spec, identity);
+        let bytecode = Some(spec.bytecode.effective());
         let env = crate::commands::environment(
             env,
             &crate::commands::Interpreter {
                 python: &python,
                 runtime: library.pythonpath.as_deref(),
                 pycache: pycache.as_deref(),
-                no_bytecode: spec.bytecode.effective() == muru_config::Bytecode::Off,
+                bytecode,
             },
             app,
             id,
@@ -4557,6 +4566,7 @@ impl Daemon {
             label: "exec".to_owned(),
             argv: Vec::new(),
             env,
+            unset: crate::commands::not_inherited(bytecode),
             cwd: spec.source.clone(),
             identity,
             log: Some(self.host_log(app, id)),
@@ -4736,7 +4746,7 @@ impl Daemon {
             python,
             pythonpath: library.pythonpath.clone(),
             pycache_prefix,
-            no_bytecode: spec.bytecode.effective() == muru_config::Bytecode::Off,
+            bytecode: Some(spec.bytecode.effective()),
             app: spec.entrypoint.clone(),
             name: Some(app.to_owned()),
             release: Some(id.to_owned()),

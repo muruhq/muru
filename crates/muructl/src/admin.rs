@@ -1413,9 +1413,14 @@ fn print_memory(response: &pb::DebugResponse) {
                     idle.iter().zip(&busy).map(|(a, b)| a + b).collect()
                 })
                 .unwrap_or_default();
-            let p95 = signal_p95_ms(&pauses).map_or("-".to_owned(), |ms| format!("{ms} ms"));
+            let p95 = signal_p95_ms(&pauses).map_or("-".to_owned(), |ms| {
+                muru_controller::scaling::describe_p95(
+                    ms,
+                    muru_controller::scaling::SIGNAL_LARGEST_MS,
+                )
+            });
             println!(
-                "  gc generation {}: {} collections, {:.1} ms in all, p95 under {}, {} objects freed, {} while {} requests were in flight",
+                "  gc generation {}: {} collections, {:.1} ms in all, p95 {}, {} objects freed, {} while {} requests were in flight",
                 generation["generation"].as_str().unwrap_or("?"),
                 count("collections"),
                 count("ns") as f64 / 1e6,
@@ -1742,7 +1747,7 @@ async fn ask(
 /// A worker's answer as JSON, when it answered.
 /// The 95th percentile of a worker's cumulative histogram over the
 /// signal bounds, in milliseconds: the bound holding 95 percent of the
-/// observations, or none without any.
+/// observations, infinity past the last, or none without any.
 fn signal_p95_ms(counts: &[u64]) -> Option<f64> {
     let bounds = muru_proto::worker::v1::SIGNAL_BOUNDS_US;
     let total = *counts.last()?;
@@ -1753,7 +1758,11 @@ fn signal_p95_ms(counts: &[u64]) -> Option<f64> {
 
     let target = total as f64 * 0.95;
     let index = counts.iter().position(|count| *count as f64 >= target)?;
-    Some(*bounds.get(index).or(bounds.last())? as f64 / 1000.0)
+    Some(
+        bounds
+            .get(index)
+            .map_or(f64::INFINITY, |bound| *bound as f64 / 1000.0),
+    )
 }
 
 fn parse_result(answer: &pb::WorkerDebug) -> Option<serde_json::Value> {
@@ -3820,7 +3829,7 @@ fn split_target(text: &str) -> anyhow::Result<(&str, &str)> {
 fn print_scale_status(status: &pb::ScaleStatus) {
     println!("{}@{}", status.app, status.release);
     println!(
-        "{:<12} {:<12} {:<10} {:<7} {:<10} {:<10} POLICY",
+        "{:<12} {:<12} {:<10} {:<7} {:<13} {:<10} POLICY",
         "GROUP", "WORKERS", "SLOTS", "IDLE", "QUEUE-P95", "REAPS"
     );
 
@@ -3842,16 +3851,19 @@ fn print_scale_status(status: &pb::ScaleStatus) {
         };
 
         let p95 = match group.queue_wait_p95_ms {
-            Some(ms) => format!("{ms:.0} ms"),
+            Some(ms) => muru_controller::scaling::describe_p95(
+                ms,
+                muru_controller::scaling::QUEUE_LARGEST_MS,
+            ),
             None => "-".to_owned(),
         };
 
         println!(
-            "{:<12} {:<12} {:<10} {:<7} {:<10} {:<10} {}",
+            "{:<12} {:<12} {:<10} {:<7} {:<13} {:<10} {}",
             group.group,
             workers,
             format!("{:.0}/{:.0}", group.slots_busy, group.slots_total),
-            format!("{:.1}", group.idle_workers),
+            format!("{:.2}", group.idle_workers),
             p95,
             reaps,
             group.policy
@@ -3873,8 +3885,13 @@ fn print_scale_status(status: &pb::ScaleStatus) {
 
         // Section 7.3: the workers' own signals, and what they say.
 
-        let measured = |value: Option<f64>, unit: &str| {
-            value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
+        let p95 = |value: Option<f64>| {
+            value.map_or("-".to_owned(), |ms| {
+                muru_controller::scaling::describe_p95(
+                    ms,
+                    muru_controller::scaling::SIGNAL_LARGEST_MS,
+                )
+            })
         };
 
         // Section 6.14: the wait for a thread of requests handed from
@@ -3882,14 +3899,18 @@ fn print_scale_status(status: &pb::ScaleStatus) {
 
         let handoff = group
             .handoff_queue_wait_p95_ms
-            .map(|wait| format!(", handoff wait p95 {wait:.0} ms"))
+            .map(|wait| format!(", handoff wait p95 {}", p95(Some(wait))))
             .unwrap_or_default();
         println!(
             "  workers: cpu {}, gc {}, gil wait p95 {}, loop lag p95 {}{handoff}",
-            measured(group.worker_cpu.map(|cpu| cpu * 100.0), "%"),
-            measured(group.gc_share.map(|share| share * 100.0), "%"),
-            measured(group.gil_wait_p95_ms, " ms"),
-            measured(group.loop_lag_p95_ms, " ms")
+            group
+                .worker_cpu
+                .map_or("-".to_owned(), muru_controller::scaling::describe_cpu),
+            group
+                .gc_share
+                .map_or("-".to_owned(), |share| format!("{:.0}%", share * 100.0)),
+            p95(group.gil_wait_p95_ms),
+            p95(group.loop_lag_p95_ms)
         );
 
         if !group.diagnosis.is_empty() {
@@ -7009,6 +7030,7 @@ mod tests {
                 label: "exec".to_owned(),
                 argv: vec!["sh".to_owned(), "-c".to_owned(), script],
                 env: Vec::new(),
+                unset: Vec::new(),
                 cwd: dir.path().to_owned(),
                 identity: None,
                 log: None,

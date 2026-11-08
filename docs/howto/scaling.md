@@ -37,6 +37,11 @@ what is missing, up to `max_step_up` (4) at a time and never past
 the signals cannot say how much more is wanted, so each step soon after
 the last doubles the previous one, still bounded by `max_step_up`.
 
+An ASGI worker's event loop offers 1000 slots, so one request in flight
+already leaves it short of a whole idle worker, and `min_spare = 1` adds
+a second worker at the first request. For event loop workers,
+`min_spare = 0` or [target mode](#target-mode) suits better.
+
 Scale-in is slow on purpose. One worker is drained when, over the whole
 `scale_in_window` (10 minutes), more than `max_spare` workers were idle at
 every moment, or no request arrived for `idle_reap_after` (10 minutes).
@@ -277,13 +282,13 @@ event when it would not fit.
 ```console
 $ muructl scale status shop
 shop@r42
-GROUP        WORKERS      SLOTS      IDLE    QUEUE-P95  REAPS      POLICY
-default      3 -> 5       12/12      -1.0    230 ms     0/6        spare 2-12 workers, 1-4 idle
-  workers: cpu 12%, gc 0%, gil wait p95 1 ms, loop lag p95 -, handoff wait p95 40 ms
+GROUP        WORKERS      SLOTS      IDLE    QUEUE-P95     REAPS      POLICY
+default      3 -> 5       12/12      -1.00   under 250 ms  0/6        spare 2-12 workers, 1-4 idle
+  workers: cpu 12%, gc 0%, gil wait p95 under 1 ms, loop lag p95 -, handoff wait p95 under 50 ms
   diagnosis: I/O bound with exhausted slots; for the next release, more threads per worker, or more concurrency for an ASGI application
-  last: scale out from 3 to 5 workers: short by 1.0 workers for 5s (2s ago)
-reports      1            0/1        1.0     -          0/6        target 1-6 workers, 80% of slots busy
-  workers: cpu 2%, gc 0%, gil wait p95 1 ms, loop lag p95 -
+  last: scale out from 3 to 5 workers: short by 1.00 workers for 5s (2s ago)
+reports      1            0/1        1.00    -             0/6        target 1-6 workers, 80% of slots busy
+  workers: cpu 2%, gc 0%, gil wait p95 under 1 ms, loop lag p95 -
   diagnosis: idle
 ```
 
@@ -296,7 +301,16 @@ worker can use (one core with the GIL, a core per thread on a
 free-threaded interpreter without it), the share of their time spent in
 garbage collection, the 95th percentile wait of a thread for the GIL when
 it has work to run, and the 95th percentile lateness of an ASGI worker's
-event loop, which beats twice a second.
+event loop, which beats twice a second. The CPU time counts every thread
+of the process, including C code that releases the GIL and Muru's own
+threads, so it can pass what a worker can use; it is shown as at most
+100%. Until a worker has reported twice, its figures read `-`.
+
+The 95th percentiles here and in `QUEUE-P95` come from histograms, so
+each is the upper bound of the bucket the percentile fell in: `under
+250 ms` means between the bucket below and 250 ms, and `over 5 s` (for
+the queue, `over 10 s`) means past the largest bucket. `IDLE` is in
+worker equivalents, to two decimal places.
 
 The `diagnosis` line names what holds the group back and what to change
 in the next release:
@@ -304,11 +318,13 @@ in the next release:
 | Diagnosis | When | Suggested |
 | --- | --- | --- |
 | memory bound | a worker within 10% of its soft memory limit | fewer threads per worker, or a higher memory limit |
-| paused by garbage collection | 10% or more of the workers' time spent collecting | fewer long-lived objects created after the fork, or `gc.freeze()` once the worker has warmed up (see [debugging](debugging.md)) |
+| paused by garbage collection of short-lived reference cycles | 10% or more of the workers' time spent collecting, with each young collection freeing 100 objects or more on average | break the cycles, or use `weakref` for the references back |
+| paused by garbage collection | 10% or more of the workers' time spent collecting, freeing fewer | fewer long-lived objects created after the fork, or `gc.freeze()` once the worker has warmed up (see [debugging](debugging.md)) |
 | event loop held by blocking code | loop lag p95 of 100 ms or more | await blocking calls, or run them in a thread |
 | GIL bound | GIL wait p95 of 10 ms or more | more processes with fewer threads each |
 | CPU bound | CPU at 80% or more of what a worker can use | more processes, up to the node's cores |
 | requests handed to WSGI wait for a thread | handoff wait p95 of 100 ms or more | more threads for the requests [handed over](handoff.md#from-asgi-to-wsgi), or a mount for the paths that are |
+| waiting for the workers' first report | 80% or more of the slots busy, before the workers have a CPU figure | |
 | I/O bound with exhausted slots | 80% or more of the slots busy, CPU lower | more threads per worker, or more concurrency |
 | a few heavy requests | queue wait p95 of 100 ms or more with under half the slots busy | a worker group of their own for the slow paths |
 | idle | under 10% of the slots busy and no queue | |

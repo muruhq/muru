@@ -307,6 +307,12 @@ muru: nothing applied:
   create-route    route shop /             not applied
 ```
 
+Once planned, an apply is carried out by the daemon. Interrupting
+`muructl apply`, with Ctrl-C or by closing its terminal, stops the
+report, not the apply: the daemon finishes it, or removes what it added
+when a release does not start, and the `config.applied` or
+`config.apply_failed` event says how it ended.
+
 Applies happen one at a time. An apply given while another is under way,
 including one given `--no-wait` that the daemon is still finishing,
 waits for it to end and is then planned against what it left, and its
@@ -499,6 +505,10 @@ holds bytecode for the release's interpreter, compiled by `muructl build
 the project's `[tool.muru]` table, in a declared release or as
 `--bytecode` on `muructl deploy` takes `redirect` (the default), `source`
 or `off`, and `muructl release show` says which is in force.
+The setting holds whatever environment the daemon was started with: a
+`PYTHONDONTWRITEBYTECODE` inherited from the daemon's shell does not turn
+off `redirect` or `source`, while a release whose own environment sets it
+writes no bytecode.
 
 ## Where things live
 

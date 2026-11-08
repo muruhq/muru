@@ -264,6 +264,15 @@ class Daemon:
                 )
 
 
+def inherited() -> dict[str, str]:
+    """The environment a test daemon starts with: the test run's, less what
+    would change how its releases run. PYTHONDONTWRITEBYTECODE in a
+    developer's shell would reach what the daemon runs outside a release's
+    bytecode setting (issue #472); a test that wants it passes it itself."""
+
+    return {name: value for name, value in os.environ.items() if name != "PYTHONDONTWRITEBYTECODE"}
+
+
 def start_daemon(
     base: Path,
     run_dir: Path | None = None,
@@ -331,7 +340,7 @@ def start_daemon(
             ],
             stdout=handle,
             stderr=subprocess.STDOUT,
-            env={**os.environ, **(env or {})},
+            env={**inherited(), **(env or {})},
         )
 
     daemon = Daemon(process, port, base, run_dir, log_path, listeners)
