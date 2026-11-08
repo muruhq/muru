@@ -337,6 +337,121 @@ pub struct Plan {
     pub unchanged: u32,
 }
 
+/// The refusal for making `app` serve while other applications do and no
+/// host is declared to choose between them (section 4.3), or none.
+pub fn second_app_refusal(store: &Store, app: &str) -> Option<String> {
+    if !store.hosts().unwrap_or_default().is_empty() {
+        return None;
+    }
+
+    let serving = serving_apps(store);
+
+    if serving.is_empty() || serving.contains(app) {
+        return None;
+    }
+
+    let mut all = serving;
+    all.insert(app.to_owned());
+    Some(no_host_refusal(&all, Some(app)))
+}
+
+/// The applications with a serving release.
+fn serving_apps(store: &Store) -> BTreeSet<String> {
+    store
+        .apps()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|app| app.current.is_some())
+        .map(|app| app.name)
+        .collect()
+}
+
+/// Section 4.3: the refusal for an apply that would leave several
+/// applications serving with no host declared and is what brings that
+/// about, whether by serving another application or removing the last
+/// host; one that leaves such a state as it found it is not refused.
+fn apply_no_host_refusal(store: &Store, changes: &[Change]) -> Option<String> {
+    let before = serving_apps(store);
+    let hosts_before: BTreeSet<String> = store
+        .hosts()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let mut hosts = hosts_before.clone();
+    let mut serving = before.clone();
+
+    for change in changes {
+        match &change.action {
+            Action::PutHost { name, .. } => {
+                hosts.insert(name.clone());
+            }
+            Action::RemoveHost { name } => {
+                hosts.remove(name);
+            }
+            Action::RemoveApp { app } => {
+                serving.remove(app);
+            }
+            _ => {}
+        }
+
+        if let Some((app, _)) = change.action.serves() {
+            serving.insert(app.to_owned());
+        }
+    }
+
+    let worse = !hosts_before.is_empty() || !serving.is_subset(&before);
+
+    (hosts.is_empty() && serving.len() > 1 && worse).then(|| {
+        let added = serving.difference(&before).next().cloned();
+        no_host_refusal(&serving, added.as_deref())
+    })
+}
+
+/// The refusal's words: why, what to do, and a host and a route for each
+/// application, ready to paste.
+fn no_host_refusal(apps: &BTreeSet<String>, added: Option<&str>) -> String {
+    let names: Vec<&str> = apps.iter().map(String::as_str).collect();
+
+    let listed = match names.split_last() {
+        Some((last, first)) if !first.is_empty() => format!("{} and {last}", first.join(", ")),
+        _ => names.join(""),
+    };
+
+    let others: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| Some(*name) != added)
+        .collect();
+
+    let why = match added {
+        Some(added) if others.len() == 1 => format!(
+            "refused: with no hosts declared, every request goes to {}; declare hosts and routes \
+             for {listed} before {added} serves, or deploy {added} with --hold",
+            others[0]
+        ),
+        Some(added) => format!(
+            "refused: with no hosts declared, only one application can serve; declare hosts and \
+             routes for {listed} before {added} serves, or deploy {added} with --hold"
+        ),
+        None => format!(
+            "refused: {listed} would serve with no hosts declared to choose between them; declare \
+             hosts and routes for them"
+        ),
+    };
+
+    let example: Vec<String> = names
+        .iter()
+        .map(|name| {
+            format!(
+                "[host.{name}]\nnames = [\"{name}.example.com\"]\n\n[[route]]\nhost = \"{name}\"\napp = \"{name}\"\n"
+            )
+        })
+        .collect();
+
+    format!("{why}\n\n{}", example.join("\n"))
+}
+
 /// Compare a document with desired state. Creates and deploys come
 /// first, application by application with releases in id order; hosts
 /// and routes follow, then the promotions `serving` asks for, so a split
@@ -476,6 +591,10 @@ pub fn plan(
 
     if prune {
         plan_removals(store, document, &mut plan);
+    }
+
+    if let Some(refusal) = apply_no_host_refusal(store, &plan.changes) {
+        plan.errors.push(refusal);
     }
 
     plan
@@ -3679,9 +3798,14 @@ pub fn resolve_spec(
         }
     }
 
-    let env = resolve_env_specs(
+    let (env, env_layers) = resolve_env_specs(
         previous.map_or(&[][..], |previous| &previous.env),
         &table.env,
+        if tables.declared {
+            "the release table"
+        } else {
+            "[tool.muru.env]"
+        },
         &request.env,
     )?;
 
@@ -3712,7 +3836,8 @@ pub fn resolve_spec(
         &source,
     )?;
 
-    let layers = resolve_layers(request, &table, previous, tables.declared, &source);
+    let mut layers = resolve_layers(request, &table, previous, tables.declared, &source);
+    layers.0.extend(env_layers);
 
     // Section 9.12: commands from the declaration, else the source's own
     // table.
@@ -4768,18 +4893,27 @@ fn static_spec(entry: &muru_config::StaticDir, source: &Path) -> Result<StaticSp
 
 /// Section 10.8: the environment, the table's entries with the
 /// request's over them, references kept as references.
+/// The release's variables, by name: the previous release's, then its
+/// table's, then the request's, each with the layer it came from under
+/// `env.NAME` (section 3.3).
 fn resolve_env_specs(
     previous: &[EnvSpec],
     table: &BTreeMap<String, muru_config::EnvValue>,
+    table_layer: &str,
     request: &[pb::EnvEntry],
-) -> Result<Vec<EnvSpec>, String> {
+) -> Result<(Vec<EnvSpec>, BTreeMap<String, String>), String> {
     let mut env_table: BTreeMap<String, EnvSpec> = previous
         .iter()
         .map(|spec| (spec.name.clone(), spec.clone()))
         .collect();
+    let mut layers: BTreeMap<String, String> = previous
+        .iter()
+        .map(|spec| (env_layer(&spec.name), "the previous release".to_owned()))
+        .collect();
 
     for (name, value) in table {
         env_table.insert(name.clone(), env_spec_from_table(name, value)?);
+        layers.insert(env_layer(name), table_layer.to_owned());
     }
 
     for entry in request {
@@ -4802,9 +4936,15 @@ fn resolve_env_specs(
                 as_file: entry.as_file && !entry.secret_store.is_empty(),
             },
         );
+        layers.insert(env_layer(&entry.name), "--env".to_owned());
     }
 
-    Ok(env_table.into_values().collect())
+    Ok((env_table.into_values().collect(), layers))
+}
+
+/// The key a variable's layer is recorded under (section 3.3).
+pub fn env_layer(name: &str) -> String {
+    format!("env.{name}")
 }
 
 /// Section 4.12: the release's error pages, override and maintenance
@@ -4993,7 +5133,7 @@ fn resolve_http_spec(
         return Err("shutdown_timeout must be longer than nothing".to_owned());
     }
 
-    let env = resolve_env_specs(&[], &BTreeMap::new(), &request.env)?;
+    let (env, env_layers) = resolve_env_specs(&[], &BTreeMap::new(), "", &request.env)?;
     let (error_pages, error_override, maintenance) =
         resolve_error_tables(tables, &BTreeMap::new(), None, None, &source)?;
     muru_config::check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())?;
@@ -5047,7 +5187,7 @@ fn resolve_http_spec(
             readiness_timeout_ms,
             stop_signal: table.stop_signal.clone(),
         }),
-        layers: crate::model::Layers::default(),
+        layers: crate::model::Layers(env_layers),
         interpreter: None,
         build: crate::model::BuildSpec::default(),
         bytecode: crate::model::BytecodeSpec::default(),
@@ -6554,7 +6694,8 @@ mod tests {
         let text = format!(
             "[app.shop.release.r1]\nsource = '{0}'\nentrypoint = 'shop.wsgi:application'\npython = '/usr/bin/python3'\nthreads = 2\n\
              [app.shop.release.r2]\nsource = '{0}'\nentrypoint = 'shop.wsgi:application'\npython = '/usr/bin/python3'\n\
-             [app.blog.release.r1]\nsource = '{0}'\nentrypoint = 'blog:app'\npython = '/usr/bin/python3'\n",
+             [app.blog.release.r1]\nsource = '{0}'\nentrypoint = 'blog:app'\npython = '/usr/bin/python3'\n\
+             [host.blog]\nnames = ['blog.test']\n",
             source.display()
         );
 
@@ -6584,6 +6725,7 @@ mod tests {
                 ("create-app", "blog".to_owned()),
                 ("deploy", "blog@r1".to_owned()),
                 ("deploy", "shop@r2".to_owned()),
+                ("create-host", "host blog".to_owned()),
             ]
         );
     }

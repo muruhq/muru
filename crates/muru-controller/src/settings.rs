@@ -72,6 +72,9 @@ pub struct NodeSettings {
     /// Whether `muructl debug exec` may run code in workers (section
     /// 11.7).
     pub debug_exec: bool,
+    /// Section 8.7: the variables of the daemon's own environment passed
+    /// to a release's processes beside the base, by name or `PREFIX*`.
+    pub pass_env: Vec<String>,
     /// The node's budget (section 7.4).
     pub budget: crate::budget::Budget,
     /// The `[tools]` table (section 8.4): uv and interpreter installs.
@@ -183,6 +186,7 @@ impl NodeSettings {
                 .clone()
                 .or_else(|| daemon.and_then(|table| table.user.clone())),
             debug_exec: daemon.and_then(|table| table.debug_exec).unwrap_or(false),
+            pass_env: pass_env_from(daemon)?,
             budget,
             tools: document.tools.clone().unwrap_or_default(),
             proxy,
@@ -470,6 +474,25 @@ fn access_log_from(document: &muru_config::Document) -> Result<muru_edge::access
 
     filter.exclude = logs.access_log_exclude.clone();
     Ok(filter)
+}
+
+/// The `[daemon] pass_env` entries: variable names, each optionally
+/// with a `*` suffix, and none of Muru's own.
+fn pass_env_from(daemon: Option<&muru_config::Daemon>) -> Result<Vec<String>, String> {
+    let entries = daemon
+        .map(|table| table.pass_env.clone())
+        .unwrap_or_default();
+
+    for entry in &entries {
+        if !crate::commands::valid_pass_env(entry) {
+            return Err(format!(
+                "[daemon] pass_env: {entry:?} is not a variable name, optionally with a * suffix, \
+                 or one Muru sets itself"
+            ));
+        }
+    }
+
+    Ok(entries)
 }
 
 /// The edge limits from the [limits] table, with the defaults for the

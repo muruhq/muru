@@ -45,11 +45,16 @@ def test_the_deploy_and_roll_back_tutorial(tmp_path: Path) -> None:
 
         failed = daemon.muructl("deploy", "hello", str(RELEASES / "v2"), check=False)
         assert failed.returncode == 1
-        assert "before its workers were ready" in failed.stderr
+        assert "before its workers were ready: cannot load" in failed.stderr
+        assert "KeyError: 'GREETING'" in failed.stderr
         assert greeting(daemon) == "Hello from hello@r1\n"
         assert "KeyError: 'GREETING'" in daemon.muructl("logs", "hello@r2").stdout
         states = {row["release"]: row["state"] for row in daemon.releases("hello")}
         assert states == {"hello@r1": "ready", "hello@r2": "failed"}
+        assert "KeyError: 'GREETING'" in daemon.muructl("release", "list", "hello").stdout
+        events = daemon.muructl("events").stdout.splitlines()
+        failure = [line for line in events if "release.failed" in line]
+        assert failure and "KeyError: 'GREETING'" in failure[0], failure
 
         # Deploy a fix, with requests running: none of them fails.
 

@@ -127,6 +127,11 @@ sticky_grace = "2s"
     assert all(served_by(daemon, Cookie=f"muru_id=fresh-{n}")[0] == "r2" for n in range(50))
     assert served_by(daemon, Cookie="muru_release=r1")[0] == "r1"
     assert served_by(daemon, **{"Muru-Preview": "r1"})[0] == "r1"
+    named = daemon.request("/", host="shop.test", headers={"Muru-Preview": "r1"})
+    assert named.header_values("Muru-Preview") == []
+    unknown = daemon.request("/", host="shop.test", headers={"Muru-Preview": "r9"})
+    assert json.loads(unknown.body)["release"] in ("r1", "r2")
+    assert unknown.header_values("Muru-Preview") == ["ignored"]
 
     # With no share left, r1 drains once its sticky clients' grace passes;
     # until then their cookie still reaches it, afterwards it is ignored.

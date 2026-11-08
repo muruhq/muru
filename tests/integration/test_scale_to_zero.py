@@ -118,7 +118,8 @@ def test_an_idle_host_stops_and_the_next_request_starts_it(tmp_path: Path) -> No
             "events"
         ).stdout
         assert "its host stopped" in events(daemon, "release.idle")[0]
-        assert "idle: its host has stopped" in daemon.muructl("release", "list", "shop").stdout
+        idle = daemon.muructl("release", "list", "shop").stdout
+        assert "idle: its host has stopped" in idle and "- (" in idle, idle
 
         # Retained while idle, the release says a rollback to it waits for
         # its import, and the first request after the rollback does.

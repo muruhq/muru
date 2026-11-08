@@ -110,6 +110,7 @@ def test_workers_message_lists_the_routed_sockets_by_group(tmp_path: Path) -> No
         "sockets": ["/a"],
         "groups": [{"name": "api", "sockets": ["/api-0"]}],
         "interfaces": {},
+        "workers": [],
     }
 
     # The interfaces the host settled go with it, the default mount's

@@ -48,6 +48,7 @@ lint-text:
 lint-rust:
     cargo fmt --all --check
     cargo clippy {{default_crates}} --all-targets -- -D warnings
+    PYO3_PYTHON="{{justfile_directory()}}/.venv/bin/python" cargo clippy -p muru-py --all-targets -- -D warnings
 
 lint-python:
     uv run ruff format --check .

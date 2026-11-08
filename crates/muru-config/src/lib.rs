@@ -1283,6 +1283,13 @@ pub struct Daemon {
     /// The node's budget across every application (section 7.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<Budget>,
+    /// Variables of the daemon's own environment passed to a release's
+    /// host, workers, commands and managed servers, beside `PATH`, `HOME`,
+    /// `USER`, `LOGNAME`, `LANG`, `LC_*`, `TZ` and `TMPDIR`. Each is a name,
+    /// or a name with a `*` suffix such as `AWS_*`. A release's own
+    /// variables override them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pass_env: Vec<String>,
 }
 
 /// The `[tools]` table of the daemon's file (section 8.4): uv, and how

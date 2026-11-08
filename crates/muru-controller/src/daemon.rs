@@ -722,9 +722,31 @@ pub struct Info {
     /// The instances of each managed server release (section 9.9), by
     /// application and release, as the daemon last checked them.
     pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceRecord>>>,
+    /// What runs for each release now, by application and release, as the
+    /// daemon last published it.
+    pub live: std::sync::Mutex<HashMap<(String, String), LiveRelease>>,
+    /// The applications serving with no host declared to choose between
+    /// them, comma separated, or empty (section 4.3).
+    pub no_host: std::sync::Mutex<String>,
+    /// Section 8.7: `[daemon] pass_env`, as a reload may change it.
+    pub pass_env: std::sync::RwLock<Vec<String>>,
     /// Section 8.4: uv as found and how it is run, from the `[tools]`
     /// table read at start.
     pub provisioning: crate::provision::Provisioning,
+}
+
+/// What runs for one release now, for the API.
+#[derive(Debug, Clone, Default)]
+pub struct LiveRelease {
+    /// Whether a host runs for it: false for a dormant release.
+    pub host: bool,
+    /// Whether its host has said which workers it runs.
+    pub announced: bool,
+    /// Its workers, as its host last announced them.
+    pub workers: Vec<crate::host::HostWorker>,
+    /// For a retained release, when it is stopped, in Unix milliseconds;
+    /// otherwise 0.
+    pub retained_until_unix_ms: u64,
 }
 
 /// What each release's entrypoints run as (section 6.7): the interface
@@ -911,6 +933,12 @@ struct Running {
     /// The named groups' sockets and paths.
     groups: Vec<GroupRecord>,
     retained_until: Option<Instant>,
+    /// `retained_until` as Unix milliseconds, for the API; 0 when not
+    /// retained.
+    retained_until_unix_ms: u64,
+    /// The workers the host announced last, and whether it has yet.
+    workers: Vec<crate::host::HostWorker>,
+    announced: bool,
     /// Retained for inspection after a rejected rollout, outside the
     /// application's retained slot: it makes way before the rollback
     /// target does.
@@ -1150,9 +1178,9 @@ struct Daemon {
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
     serving: HashMap<String, String>,
-    /// The application whose workers take requests when no host is
-    /// declared: the last one traffic was switched to.
-    default_app: Option<String>,
+    /// The applications serving with no host to choose between them, as
+    /// last announced by a `routing.no_host` event.
+    no_host: BTreeSet<String>,
     /// Whether this process writes to the daemon log file, as a daemon
     /// started in the background does, so a reopen applies to it too.
     owns_log: bool,
@@ -1325,6 +1353,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }),
         interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
+        live: std::sync::Mutex::new(HashMap::new()),
+        no_host: std::sync::Mutex::new(String::new()),
+        pass_env: std::sync::RwLock::new(settings.pass_env.clone()),
         servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
     });
@@ -1492,7 +1523,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         probed: HashMap::new(),
         probe_client: crate::rollouts::probe_client(),
         serving: HashMap::new(),
-        default_app: None,
+        no_host: BTreeSet::new(),
         owns_log,
         commands: handle_commands,
         asked: HashMap::new(),
@@ -1614,6 +1645,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 daemon.watch_rate_limits(samples.as_deref());
             }
         }
+
+        daemon.publish_live();
     };
 
     // Section 13.3: by default the daemon detaches, leaving hosts and the
@@ -2776,6 +2809,17 @@ impl Daemon {
         let mut defined = self.client_rules.defined();
         defined.budget = self.budget_view(self.budget_usage());
         *self.info.defined.write().expect("defined names poisoned") = defined;
+        let pass_env_was = std::mem::replace(
+            &mut *self.info.pass_env.write().expect("pass_env poisoned"),
+            settings.pass_env.clone(),
+        );
+
+        if pass_env_was != settings.pass_env {
+            report.changed("[daemon] pass_env", "for releases started from now on");
+        } else {
+            report.unchanged("[daemon] pass_env");
+        }
+
         let actions = settings.dashboard_actions;
         let actions_were = self
             .info
@@ -3926,6 +3970,9 @@ impl Daemon {
                         sockets,
                         groups: record.groups.clone(),
                         retained_until,
+                        retained_until_unix_ms: unix_ms_of(retained_until),
+                        workers: Vec::new(),
+                        announced: false,
                         inspected: false,
                         sticky_until: None,
                         held: false,
@@ -3990,6 +4037,7 @@ impl Daemon {
                     return false;
                 }
             };
+        let env = self.server_environment(env, app, id, &release.spec);
         let adopted = Servers::adopt(
             &http,
             &run_dir.join("r1"),
@@ -4016,6 +4064,9 @@ impl Daemon {
                         sockets: Vec::new(),
                         groups: Vec::new(),
                         retained_until,
+                        retained_until_unix_ms: unix_ms_of(retained_until),
+                        workers: Vec::new(),
+                        announced: false,
                         inspected: false,
                         sticky_until: None,
                         held: false,
@@ -4317,6 +4368,13 @@ impl Daemon {
         hold: bool,
         created: oneshot::Sender<Result<Release, String>>,
     ) -> Result<Release, String> {
+        // Section 4.3: refused before anything is started.
+
+        if !hold && let Some(refusal) = crate::config::second_app_refusal(&self.store, app) {
+            let _ = created.send(Err(refusal.clone()));
+            return Err(refusal);
+        }
+
         if let Err(error) = self.make_room(app, &spec).await {
             let _ = created.send(Err(error.clone()));
             return Err(error);
@@ -4689,6 +4747,7 @@ impl Daemon {
         let library = self.runtime_library(&python).await?;
         let pycache = self.pycache_prefix(app, id, spec, identity);
         let bytecode = Some(spec.bytecode.effective());
+        let base = self.daemon_base(bytecode);
         let env = crate::commands::environment(
             env,
             &crate::commands::Interpreter {
@@ -4696,6 +4755,7 @@ impl Daemon {
                 runtime: library.pythonpath.as_deref(),
                 pycache: pycache.as_deref(),
                 bytecode,
+                base: Some(&base),
             },
             app,
             id,
@@ -4708,7 +4768,8 @@ impl Daemon {
             label: "exec".to_owned(),
             argv: Vec::new(),
             env,
-            unset: crate::commands::not_inherited(bytecode),
+            unset: Vec::new(),
+            clean: true,
             cwd: spec.source.clone(),
             identity,
             log: Some(self.host_log(app, id)),
@@ -4780,6 +4841,7 @@ impl Daemon {
             // caller has given it to the edge.
 
             running.retained_until = None;
+            running.retained_until_unix_ms = 0;
             running.inspected = false;
             return Ok(());
         }
@@ -4838,6 +4900,8 @@ impl Daemon {
         // instances instead of a host.
 
         if let Some(http) = spec.http.clone() {
+            let env = self.server_environment(env, app, id, spec);
+
             return self
                 .start_servers(app, id, &release, &http, env, identity, &run_dir, started)
                 .await;
@@ -4885,11 +4949,31 @@ impl Daemon {
 
         let pycache_prefix = self.pycache_prefix(app, id, spec, identity);
 
+        // Section 8.7: the host starts from a clean environment, built
+        // once for its host and workers.
+
+        let bytecode = Some(spec.bytecode.effective());
+        let base = self.daemon_base(bytecode);
+        let env = crate::commands::environment(
+            env,
+            &crate::commands::Interpreter {
+                python: &python,
+                runtime: library.pythonpath.as_deref(),
+                pycache: pycache_prefix.as_deref(),
+                bytecode,
+                base: Some(&base),
+            },
+            app,
+            id,
+            &spec.source,
+        );
+
         let host_spec = HostSpec {
             python,
-            pythonpath: library.pythonpath.clone(),
-            pycache_prefix,
-            bytecode: Some(spec.bytecode.effective()),
+            pythonpath: None,
+            pycache_prefix: None,
+            bytecode: None,
+            clean_env: true,
             app: spec.entrypoint.clone(),
             name: Some(app.to_owned()),
             release: Some(id.to_owned()),
@@ -4925,6 +5009,7 @@ impl Daemon {
                 .env
                 .iter()
                 .filter_map(crate::model::EnvSpec::shown_name)
+                .chain(base.into_iter().map(|(name, _)| name))
                 .collect(),
             identity,
             groups: spec
@@ -4963,6 +5048,11 @@ impl Daemon {
                 .collect(),
         };
 
+        // What the host writes from here on is what says why, if it fails.
+
+        let log = self.host_log(app, id);
+        let log_start = std::fs::metadata(&log).map_or(0, |metadata| metadata.len());
+
         let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs) {
             Ok(host) => host,
             Err(error) => {
@@ -4977,8 +5067,15 @@ impl Daemon {
         self.set_state(&release, ReleaseState::Warming, "waiting for the workers");
 
         if let Err(error) = host.wait_ready(START_TIMEOUT).await {
-            let message = format!("{error:#}");
+            let mut message = format!("{error:#}");
             host.stop(release.spec.timeouts.stop_budget()).await;
+
+            // Section 9.1: the failure names its cause, wherever it is read.
+
+            if let Some(reason) = crate::logs::start_failure(&log, log_start).await {
+                message = format!("{message}: {reason}");
+            }
+
             self.set_state(&release, ReleaseState::Failed, &message);
             self.events
                 .emit("release.failed", &subject, "error", &message);
@@ -5046,6 +5143,9 @@ impl Daemon {
                 sockets,
                 groups,
                 retained_until: None,
+                retained_until_unix_ms: 0,
+                workers: Vec::new(),
+                announced: false,
                 inspected: false,
                 sticky_until: None,
                 held: false,
@@ -5248,6 +5348,9 @@ impl Daemon {
                 sockets: Vec::new(),
                 groups: Vec::new(),
                 retained_until: None,
+                retained_until_unix_ms: 0,
+                workers: Vec::new(),
+                announced: false,
                 inspected: false,
                 sticky_until: None,
                 held: false,
@@ -5292,7 +5395,6 @@ impl Daemon {
         }
 
         self.serving.insert(app.to_owned(), id.to_owned());
-        self.default_app = Some(app.to_owned());
 
         if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
             running.held = false;
@@ -5319,6 +5421,32 @@ impl Daemon {
                 );
             }
         }
+    }
+
+    /// Section 4.3: say once when several applications serve with no
+    /// host to choose between them, and when that ends, and keep what
+    /// `muructl status` shows.
+    fn note_no_host(&mut self, serving: BTreeSet<String>) {
+        if serving == self.no_host {
+            return;
+        }
+
+        let names = serving.iter().cloned().collect::<Vec<_>>().join(", ");
+        *self.info.no_host.lock().expect("no_host poisoned") = names.clone();
+
+        if !serving.is_empty() {
+            self.events.emit(
+                "routing.no_host",
+                "edge",
+                "warning",
+                &format!(
+                    "{names} serve and no hosts are declared, so every request is answered 421; \
+                     declare hosts and routes for them"
+                ),
+            );
+        }
+
+        self.no_host = serving;
     }
 
     /// Section 4.4: desired state compiled for the edge. Each application
@@ -5526,18 +5654,21 @@ impl Daemon {
             }
         }
 
-        if self
-            .default_app
-            .as_ref()
-            .is_some_and(|name| !apps.iter().any(|app| &app.app == name))
-        {
-            self.default_app = None;
-        }
-        let default = self
-            .default_app
-            .as_ref()
-            .and_then(|name| apps.iter().find(|app| &app.app == name))
-            .or_else(|| apps.first());
+        // Section 4.3: with no host declared, the one application that
+        // serves takes every request. Nothing is chosen between several,
+        // and nothing is kept, so a restart cannot move the traffic.
+
+        let no_hosts = self.store.hosts().unwrap_or_default().is_empty();
+        let serving: BTreeSet<String> = apps
+            .iter()
+            .filter(|app| app.serving)
+            .map(|app| app.app.clone())
+            .collect();
+        let no_host = no_hosts && serving.len() > 1;
+        let default = (no_hosts && serving.len() == 1)
+            .then(|| apps.iter().find(|app| app.serving))
+            .flatten();
+        self.note_no_host(if no_host { serving } else { BTreeSet::new() });
         let worker_sockets = default.map(|app| app.sockets.clone()).unwrap_or_default();
         let default_app = default.map(|app| app.app.clone()).unwrap_or_default();
         let default_release = default.map(|app| app.release.clone()).unwrap_or_default();
@@ -5725,6 +5856,7 @@ impl Daemon {
             client_classes: self.clients.classes_message.clone(),
             rate_limits: self.clients.limits_message.clone(),
             default_traffic,
+            no_host,
             h2c: self.h2c.clone(),
             listener_limits: self.listener_limits.clone(),
             listener_proxies: self.listener_proxies.clone(),
@@ -5885,9 +6017,11 @@ impl Daemon {
 
             let mut floors = Vec::new();
             let mut kept = Kept::Workers(Vec::new());
+            let until = crate::model::now_unix_ms() + retain.lasts.as_millis() as u64;
 
             if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
                 running.retained_until = Some(Instant::now() + retain.lasts);
+                running.retained_until_unix_ms = until;
                 running.inspected = !retain.slot;
                 let host = running.backend.host().is_some();
                 let mut counts = Vec::new();
@@ -5926,7 +6060,6 @@ impl Daemon {
             // would cost, from what is kept. A retained release is not
             // scaled or idled, so the note holds until it is stopped.
 
-            let until = crate::model::now_unix_ms() + retain.lasts.as_millis() as u64;
             let lasts = muru_config::format_duration(retain.lasts);
 
             let (note, event) = if retain.slot {
@@ -6356,6 +6489,10 @@ impl Daemon {
             return Err(format!("{app}@{id} already serves"));
         }
 
+        if let Some(refusal) = crate::config::second_app_refusal(&self.store, app) {
+            return Err(refusal);
+        }
+
         self.make_room_for(app, id).await?;
         self.start(app, id).await?;
         self.switch_to(app, id).await;
@@ -6433,7 +6570,6 @@ impl Daemon {
 
         for (app, id, _) in &committed.promoted {
             self.serving.insert(app.clone(), id.clone());
-            self.default_app = Some(app.clone());
 
             if let Some(running) = self.running.get_mut(&(app.clone(), id.clone())) {
                 running.held = false;
@@ -8156,6 +8292,10 @@ impl Daemon {
         };
         let current = record.current.clone();
 
+        if let Some(refusal) = crate::config::second_app_refusal(&self.store, app) {
+            return Err(refusal);
+        }
+
         self.start(app, &previous).await?;
         self.switch_to(app, &previous).await;
         self.store
@@ -8292,6 +8432,68 @@ impl Daemon {
         self.publish_servers();
     }
 
+    /// Section 8.7: what a release's processes start from, from the
+    /// daemon's own environment.
+    fn daemon_base(&self, bytecode: Option<muru_config::Bytecode>) -> Vec<(String, String)> {
+        let pass_env = self
+            .info
+            .pass_env
+            .read()
+            .expect("pass_env poisoned")
+            .clone();
+
+        crate::commands::passed_from_daemon(std::env::vars(), &pass_env, bytecode)
+    }
+
+    /// A managed server's whole environment: its release's variables over
+    /// the clean base, with the release's interpreter first on PATH.
+    fn server_environment(
+        &self,
+        env: Vec<(String, String)>,
+        app: &str,
+        id: &str,
+        spec: &crate::model::ReleaseSpec,
+    ) -> Vec<(String, String)> {
+        let base = self.daemon_base(None);
+
+        crate::commands::environment(
+            env,
+            &crate::commands::Interpreter {
+                python: &spec.python,
+                runtime: None,
+                pycache: None,
+                bytecode: None,
+                base: Some(&base),
+            },
+            app,
+            id,
+            &spec.source,
+        )
+    }
+
+    /// Publish what runs for each release, for the release objects the
+    /// API answers with: after everything the daemon does, so a release
+    /// that stops leaves the map at once.
+    fn publish_live(&self) {
+        let live: HashMap<(String, String), LiveRelease> = self
+            .running
+            .iter()
+            .map(|(key, running)| {
+                (
+                    key.clone(),
+                    LiveRelease {
+                        host: running.backend.host().is_some(),
+                        announced: running.announced,
+                        workers: running.workers.clone(),
+                        retained_until_unix_ms: running.retained_until_unix_ms,
+                    },
+                )
+            })
+            .collect();
+
+        *self.info.live.lock().expect("live poisoned") = live;
+    }
+
     /// Publish each managed server release's instances, for `release
     /// show`: on every check, so a release that stops leaves the list
     /// within one.
@@ -8407,12 +8609,16 @@ impl Daemon {
                 sockets,
                 groups,
                 interfaces,
+                workers,
             } => {
                 self.info.interfaces.announce(app, id, interfaces);
 
                 let Some(running) = self.running.get_mut(&key) else {
                     return;
                 };
+
+                running.workers = workers;
+                running.announced = true;
 
                 // Section 7.4: the scalers were sized from the
                 // configuration when the release started, which may have
@@ -8953,6 +9159,16 @@ impl Daemon {
             tracing::error!(%error, "recording a release state failed");
         }
     }
+}
+
+/// An instant ahead as Unix milliseconds, or 0 for none.
+fn unix_ms_of(instant: Option<Instant>) -> u64 {
+    instant.map_or(0, |instant| {
+        crate::model::now_unix_ms()
+            + instant
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64
+    })
 }
 
 /// A Unix time as HH:MM:SS, UTC.

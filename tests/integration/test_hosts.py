@@ -398,13 +398,23 @@ def test_export_round_trips_hosts_and_routes_and_prune_removes_them(
     assert list(only_shop["host"]) == ["shop"]
     assert [route["app"] for route in only_shop["route"]] == ["shop"]
 
-    # Pruning with the hosts gone removes routes, then hosts, and the
-    # edge goes back to serving everything.
+    # Pruning the hosts is refused while several applications serve.
 
     config.write_text(APPLICATIONS)
+    refused = apply(daemon, config, "--prune")
+    assert refused.returncode == 1 and "no hosts declared" in refused.stdout, refused.stdout
+
+    # With one application left to serve, pruning removes routes, then
+    # hosts, and the edge goes back to serving everything.
+
+    config.write_text(release("shop", SHOP))
     pruned = apply(daemon, config, "--prune")
     assert pruned.returncode == 0, pruned.stdout + pruned.stderr
-    actions = [line.split()[0] for line in pruned.stdout.splitlines() if "remove-" in line]
+    actions = [
+        line.split()[0]
+        for line in pruned.stdout.splitlines()
+        if "remove-route" in line or "remove-host" in line
+    ]
     assert actions == ["remove-route"] * 4 + ["remove-host"] * 3
     assert daemon.muructl("host", "list").stdout.strip() == "no virtual hosts"
     assert daemon.request("/", host="anything.test").status == 200

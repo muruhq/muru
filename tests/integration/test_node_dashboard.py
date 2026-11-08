@@ -212,8 +212,14 @@ def test_worker_pages_show_status_stacks_tasks_and_memory(served: tuple[Daemon, 
     # An ASGI worker's tasks.
 
     assert daemon.deploy(
-        "asgi", support.FIXTURES, "--entrypoint", "plain_asgi:application", "--processes", "1"
-    ) == ("muru: release asgi@r1 is ready and serving")
+        "asgi",
+        support.FIXTURES,
+        "--entrypoint",
+        "plain_asgi:application",
+        "--processes",
+        "1",
+        "--hold",
+    ) == ("muru: release asgi@r1 is ready and held: not serving")
     tasks = fetch(port, "/fragment/workers/tasks?release=asgi@r1")[2].decode()
     assert "loop lag" in tasks
 

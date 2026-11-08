@@ -188,6 +188,7 @@ def test_groups_under_the_daemon_from_the_table_and_the_file(
     # A declared release's groups replace the table's, and resolve their
     # sizes from the release where silent; the export writes them whole.
 
+    daemon.muructl("drain", "grouped@r1")
     config = tmp_path / "shop.toml"
     config.write_text(
         f"""[app.shop.release.r1]

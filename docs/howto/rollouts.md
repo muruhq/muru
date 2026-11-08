@@ -6,8 +6,8 @@ share of the application's requests step by step, is judged at each step
 against the release that still serves, and is promoted when every step
 passes or rolled back when one fails. The shares are applied on the
 application's routes (see [virtual hosts](virtual-hosts.md)), or, on a
-daemon with no host declared, to every request the application takes
-as the default one.
+daemon with no host declared, to every request, which go to the one
+application serving (see [virtual hosts](virtual-hosts.md)).
 
 ## Holding a release
 

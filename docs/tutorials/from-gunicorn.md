@@ -81,8 +81,9 @@ curl http://127.0.0.1:8080/
 Hello from gunicorn/26.2.0
 ```
 
-`muructl release list legacy` shows the release with `1 gunicorn` where a
-release of Muru's workers shows its processes and threads, and
+`muructl release list legacy` shows the release with `1 (1 gunicorn)`, the
+instances running and the server, where a release of Muru's workers shows
+its workers and their processes and threads, and
 `muructl logs legacy@r1` shows gunicorn's own log. From here on gunicorn
 is supervised: an instance that exits is started again, and the release
 can be drained, kept warm and rolled back to like any other.

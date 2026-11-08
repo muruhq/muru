@@ -216,6 +216,8 @@ def test_handoff_under_the_daemon(daemon: Daemon, tmp_path: Path) -> None:
 
     # The setting is part of the declared release, compared on apply.
 
+    daemon.muructl("drain", "handoff@r1")
+
     config = tmp_path / "echo.toml"
     config.write_text(
         f"""[app.echo.release.r1]

@@ -89,7 +89,7 @@ def test_a_generic_server_is_started_probed_and_served(daemon: Daemon) -> None:
     # release's log, and the health of its instance is a gauge.
 
     rows = daemon.muructl("release", "list").stdout.splitlines()
-    assert any(row.split()[3:5] == ["1", "generic"] for row in rows[1:]), rows
+    assert any(row.split()[3:6] == ["1", "(1", "generic)"] for row in rows[1:]), rows
     wait_for(lambda: "legacy listening on unix:" in daemon.muructl("logs", "legacy").stdout)
     metrics = daemon.muructl("metrics").stdout
     assert 'muru_upstream_health{upstream="legacy@r1",address="unix:' in metrics
@@ -247,6 +247,12 @@ def test_gunicorn_and_uvicorn_profiles_add_their_own_flags(daemon: Daemon, tmp_p
         "legacy:application",
     ).stdout.strip()
     assert line == "muru: release gun@r1 is ready and serving"
+
+    # A host for the first application lets the second one serve.
+
+    first = daemon.base / "gun.toml"
+    first.write_text('[host.gun]\nnames = ["gun.test"]\n\n[[route]]\nhost = "gun"\napp = "gun"\n')
+    daemon.muructl("apply", "-f", str(first))
     line = daemon.muructl(
         "deploy",
         "uvi",
@@ -286,10 +292,10 @@ app = "uvi"
     uvi = report(daemon, "/api", host="uvi.test")
     assert (uvi["server"], uvi["path"]) == ("uvicorn", "/api")
     rows = {
-        row.split()[0]: row.split()[3:5]
+        row.split()[0]: row.split()[3:6]
         for row in daemon.muructl("release", "list").stdout.splitlines()[1:]
     }
-    assert rows == {"gun@r1": ["1", "gunicorn"], "uvi@r1": ["1", "uvicorn"]}
+    assert rows == {"gun@r1": ["1", "(1", "gunicorn)"], "uvi@r1": ["1", "(1", "uvicorn)"]}
 
 
 def test_a_cutover_canaries_from_the_server_to_native_workers(

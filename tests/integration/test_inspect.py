@@ -149,11 +149,10 @@ def test_inspect_describes_the_interpreter_modules_and_environment(daemon: Daemo
     assert "plain_wsgi" in result["modules"]
     assert result["settings"]["app"] == "plain"
 
-    # A variable the daemon passed on is named without its value, unless
-    # --env asks for every one (issue 462).
+    # A variable the daemon passes on is shown like the release's own
+    # (issues 462 and 475), and --env asks for every one.
 
-    assert result["environment"]["HOME"] is None
-    assert "\n    HOME\n" in text and "--env shows them" in text
+    assert result["environment"]["HOME"] is not None
 
     every = json.loads(daemon.muructl("debug", "inspect", "plain", "--json", "--env").stdout)
     environment = every["workers"][0]["result"]["environment"]

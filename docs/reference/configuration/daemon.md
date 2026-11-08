@@ -404,6 +404,7 @@ The `[daemon]` table of the daemon's file: how the daemon itself runs.
 | --- | --- | --- | --- |
 | `budget` | table, {ref}`[daemon.budget] <config-daemon-daemon-budget>` |  | The node's budget across every application. |
 | `debug_exec` | boolean | `false` | Allow `muructl debug exec`, which runs code in a worker; off unless set. |
+| `pass_env` | array of strings |  | Variables of the daemon's own environment passed to a release's host, workers, commands and managed servers, beside `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TZ` and `TMPDIR`. Each is a name, or a name with a `*` suffix such as `AWS_*`. A release's own variables override them. |
 | `user` | string | `"muru"` | The service user: whom a daemon that runs as root starts the edge, and the applications that name no user of their own, as. Never root. |
 
 (config-daemon-daemon-budget)=

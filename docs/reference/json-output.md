@@ -51,17 +51,17 @@ $ muructl release show shop@r9 --json
 
 | Command | Prints |
 | --- | --- |
-| `muructl status` | The daemon's or run's status: `version`, `pid`, `listeners`, `app_count`, `release_count`, `edge_pid` and the rest |
+| `muructl status` | The daemon's or run's status: `version`, `pid`, `listeners`, `app_count`, `release_count`, `edge_pid`, `no_host` (the applications serving with no hosts declared to choose between them, empty otherwise) and the rest |
 | `muructl daemon status` | The same as `muructl status` |
 | `muructl daemon reload` | What was reloaded: `message` |
 | `muructl app list` | `{"apps": [...]}`, each with `name`, `current_release`, `previous_release`, `user`, `maintenance` and the rest |
 | `muructl release list` | `{"releases": [...]}`, each a release as `release show` prints it |
-| `muructl release show` | The release: `app`, `id`, `state`, `message`, `source`, `entrypoint`, `serving`, its settings, mounts and groups; for a managed server, `server_instances`, each with `index`, `pid`, `address` and `started_unix_ms` |
+| `muructl release show` | The release: `app`, `id`, `state`, `message`, `source`, `entrypoint`, `serving`, its settings, mounts and groups; `host_running` (whether a host runs for it now), `workers` (each with `index`, `pid`, `group`, `socket` and `state`, one of `starting`, `ready`, `debugging`, `replacing` or `retiring`, empty when no host runs), `detected_interface` (`wsgi`, `asgi` or `grpc`, empty until known), `retained_until_unix_ms` (for a retained release, when it is stopped, otherwise `0`); for a managed server, `server_instances`, each with `index`, `pid`, `address` and `started_unix_ms` |
 | `muructl release wait` | The release once it reached a state waited for |
 | `muructl host list` | `{"hosts": [...]}` |
 | `muructl route list` | `{"routes": [...]}` |
 | `muructl upstream list` | `{"upstreams": [...]}` |
-| `muructl deploy` | The new release, as `release show` prints it; with `--no-wait`, as recorded; with `--dry-run`, the plan: `app`, `release`, `new_app`, `description`, `settings` (each with `key`, `value` and `layer`), `builds`, `serving`, `settings_from`, `hold`, `retain_ms`, `retain_workers` (null unless `--retain-workers` gave it), `retained` (what the serving release would keep, such as `1 worker to a group`) and `refusals` |
+| `muructl deploy` | The new release, as `release show` prints it; with `--no-wait`, as recorded; with `--dry-run`, the plan: `app`, `release`, `new_app`, `description`, `settings` (each with `key`, `value` and `layer`), `env` (each variable and secret the release would get, with `name`, `secret` as `store/key` or empty, `as_file` and `layer`, never its value), `builds`, `serving`, `settings_from`, `hold`, `retain_ms`, `retain_workers` (null unless `--retain-workers` gave it), `retained` (what the serving release would keep, such as `1 worker to a group`) and `refusals` |
 | `muructl render` | The document `muructl apply` takes: `{"app": {NAME: {"release": {ID: {...}}}}}`, the release's table with the keys of the daemon's format |
 | `muructl rollback` | The release traffic went back to |
 | `muructl drain` | The release drained |
