@@ -115,13 +115,13 @@ muructl deploy hello v2
 ```
 
 ```
-Error: the host exited with exit status: 1 before its workers were ready
+Error: the host exited with exit status: 1 before its workers were ready: cannot load app:application: KeyError: 'GREETING'
 ```
 
 The new release never took traffic. `curl` still gets
 `Hello from hello@r1`, and `muructl release list hello` shows `r2` as
-failed beside `r1`, which still serves. The release's own log says what
-went wrong:
+failed beside `r1`, which still serves, with the same reason. The
+release's own log has everything it wrote:
 
 ```
 muructl logs hello@r2
@@ -170,7 +170,7 @@ the old one finished the requests it had and stopped taking more.
 RELEASE                  STATE      SERVING  WORKERS          SOURCE
 hello@r3                 ready      yes      1 (1x4)          /Users/you/site/v3
 hello@r2                 failed              - (1x4)          /Users/you/site/v2
-                         the host exited with exit status: 1 before its workers were ready
+                         the host exited with exit status: 1 before its workers were ready: cannot load app:application: KeyError: 'GREETING'
 hello@r1                 retained            1 (1x4)          /Users/you/site/v1
                          warm until 10:24 UTC; a rollback to it is instant
 ```

@@ -172,6 +172,51 @@ pub async fn last_lines(path: &Path, lines: usize) -> Vec<String> {
     recent.into_iter().skip(skip).map(str::to_owned).collect()
 }
 
+/// How long a reason taken from a log may be.
+const REASON_CHARS: usize = 400;
+
+/// Why a host that did not get its workers ready failed, from what it
+/// wrote to its log after `position`: the host's own line saying it could
+/// not load the application, a worker's saying it failed to start, or the
+/// last line of a traceback. None when the log says nothing of the kind.
+pub async fn start_failure(path: &Path, position: u64) -> Option<String> {
+    let (text, _) = read_from(path, position).await.ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+
+    failure_line(&lines).map(|line| line.chars().take(REASON_CHARS).collect())
+}
+
+/// The line of `lines` that says why a start failed, as in `start_failure`.
+fn failure_line<'a>(lines: &[&'a str]) -> Option<&'a str> {
+    let after = |marker: &str, keep: bool| {
+        lines.iter().rev().find_map(|line| {
+            line.find(marker).map(|at| {
+                if keep {
+                    &line[at..]
+                } else {
+                    &line[at + marker.len()..]
+                }
+            })
+        })
+    };
+
+    after("cannot load ", true)
+        .or_else(|| after("failed to start: ", false))
+        .or_else(|| lines.iter().rev().find_map(|line| exception(line)))
+}
+
+/// The exception a traceback's last line names, from its class onwards,
+/// past anything written in front of it; none for any other line.
+fn exception(line: &str) -> Option<&str> {
+    let class_end = line.find(": ").unwrap_or(line.len());
+    let class_start = line[..class_end]
+        .rfind(char::is_whitespace)
+        .map_or(0, |at| at + 1);
+    let class = &line[class_start..class_end];
+
+    (class.ends_with("Error") || class.ends_with("Exception")).then(|| &line[class_start..])
+}
+
 /// The file from `position` to its end as text, and how many bytes that was.
 async fn read_from(path: &Path, position: u64) -> std::io::Result<(String, u64)> {
     let mut file = tokio::fs::File::open(path).await?;
@@ -182,4 +227,33 @@ async fn read_from(path: &Path, position: u64) -> std::io::Result<(String, u64)>
         String::from_utf8_lossy(&bytes).into_owned(),
         bytes.len() as u64,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::failure_line;
+
+    #[test]
+    fn a_failed_start_is_explained_by_the_line_that_says_why() {
+        assert_eq!(
+            failure_line(&[
+                "2026-01-01T10:00:00Z muru.host[1]: cannot load app:application: KeyError: 'GREETING'",
+                "muru.host[1]: stopped",
+            ]),
+            Some("cannot load app:application: KeyError: 'GREETING'"),
+        );
+        assert_eq!(
+            failure_line(&["worker 0 failed to start: ImportError: no such module"]),
+            Some("ImportError: no such module"),
+        );
+        assert_eq!(
+            failure_line(&[
+                "Traceback (most recent call last):",
+                "  File \"app.py\", line 1, in <module>",
+                "10:00:00 ModuleNotFoundError: No module named 'markdown'",
+            ]),
+            Some("ModuleNotFoundError: No module named 'markdown'"),
+        );
+        assert_eq!(failure_line(&["muru.host[1]: starting"]), None);
+    }
 }

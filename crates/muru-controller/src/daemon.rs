@@ -4996,6 +4996,11 @@ impl Daemon {
                 .collect(),
         };
 
+        // What the host writes from here on is what says why, if it fails.
+
+        let log = self.host_log(app, id);
+        let log_start = std::fs::metadata(&log).map_or(0, |metadata| metadata.len());
+
         let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs) {
             Ok(host) => host,
             Err(error) => {
@@ -5010,8 +5015,15 @@ impl Daemon {
         self.set_state(&release, ReleaseState::Warming, "waiting for the workers");
 
         if let Err(error) = host.wait_ready(START_TIMEOUT).await {
-            let message = format!("{error:#}");
+            let mut message = format!("{error:#}");
             host.stop(release.spec.timeouts.stop_budget()).await;
+
+            // Section 9.1: the failure names its cause, wherever it is read.
+
+            if let Some(reason) = crate::logs::start_failure(&log, log_start).await {
+                message = format!("{message}: {reason}");
+            }
+
             self.set_state(&release, ReleaseState::Failed, &message);
             self.events
                 .emit("release.failed", &subject, "error", &message);

@@ -316,8 +316,8 @@ applied, naming the release and why:
 ```console
 $ muructl apply -f config/
 muru: nothing applied:
-  shop@r3 did not start: the host exited with exit status: 1 before its workers were ready
-  deploy          shop@r3                  failed: the host exited with exit status: 1 before its workers were ready
+  shop@r3 did not start: the host exited with exit status: 1 before its workers were ready: cannot load app:application: KeyError: 'DATABASE_URL'
+  deploy          shop@r3                  failed: the host exited with exit status: 1 before its workers were ready: cannot load app:application: KeyError: 'DATABASE_URL'
   create-host     host shop                not applied
   create-route    route shop /             not applied
 ```
