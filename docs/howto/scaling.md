@@ -99,8 +99,8 @@ idle_reap_after = '15m'
 The wake is a `scaling.decision` event, `scale out from 0 to 1 workers: a
 request is waiting for a group scaled to zero`, and the node's budget
 admits it as any scale-out. A request waits for its worker up to the
-queue timeout of the `[limits]` table, and is answered 503 if none
-arrives by then.
+queue timeout of the `[limits]` table, and is answered 503 with the
+reason `cold_start_timeout` if none has started by then.
 
 With `host_idle_timeout`, the host stops too once every group of the
 release has been at zero for that long, and the next request starts it
