@@ -3288,6 +3288,19 @@ fn print_deploy_plan(plan: &pb::DeployPlan) {
         }
     }
 
+    for entry in &plan.env {
+        match (entry.secret.as_str(), entry.as_file) {
+            ("", _) => println!("  env {} ({})", entry.name, entry.layer),
+            (secret, false) => {
+                println!("  secret {} = {secret} ({})", entry.name, entry.layer);
+            }
+            (secret, true) => println!(
+                "  secret {} = {secret} as a file ({})",
+                entry.name, entry.layer
+            ),
+        }
+    }
+
     if !plan.settings_from.is_empty() {
         println!(
             "  settings nothing else gives come from {}@{}; --fresh takes none",

@@ -3679,9 +3679,14 @@ pub fn resolve_spec(
         }
     }
 
-    let env = resolve_env_specs(
+    let (env, env_layers) = resolve_env_specs(
         previous.map_or(&[][..], |previous| &previous.env),
         &table.env,
+        if tables.declared {
+            "the release table"
+        } else {
+            "[tool.muru.env]"
+        },
         &request.env,
     )?;
 
@@ -3712,7 +3717,8 @@ pub fn resolve_spec(
         &source,
     )?;
 
-    let layers = resolve_layers(request, &table, previous, tables.declared, &source);
+    let mut layers = resolve_layers(request, &table, previous, tables.declared, &source);
+    layers.0.extend(env_layers);
 
     // Section 9.12: commands from the declaration, else the source's own
     // table.
@@ -4768,18 +4774,27 @@ fn static_spec(entry: &muru_config::StaticDir, source: &Path) -> Result<StaticSp
 
 /// Section 10.8: the environment, the table's entries with the
 /// request's over them, references kept as references.
+/// The release's variables, by name: the previous release's, then its
+/// table's, then the request's, each with the layer it came from under
+/// `env.NAME` (section 3.3).
 fn resolve_env_specs(
     previous: &[EnvSpec],
     table: &BTreeMap<String, muru_config::EnvValue>,
+    table_layer: &str,
     request: &[pb::EnvEntry],
-) -> Result<Vec<EnvSpec>, String> {
+) -> Result<(Vec<EnvSpec>, BTreeMap<String, String>), String> {
     let mut env_table: BTreeMap<String, EnvSpec> = previous
         .iter()
         .map(|spec| (spec.name.clone(), spec.clone()))
         .collect();
+    let mut layers: BTreeMap<String, String> = previous
+        .iter()
+        .map(|spec| (env_layer(&spec.name), "the previous release".to_owned()))
+        .collect();
 
     for (name, value) in table {
         env_table.insert(name.clone(), env_spec_from_table(name, value)?);
+        layers.insert(env_layer(name), table_layer.to_owned());
     }
 
     for entry in request {
@@ -4802,9 +4817,15 @@ fn resolve_env_specs(
                 as_file: entry.as_file && !entry.secret_store.is_empty(),
             },
         );
+        layers.insert(env_layer(&entry.name), "--env".to_owned());
     }
 
-    Ok(env_table.into_values().collect())
+    Ok((env_table.into_values().collect(), layers))
+}
+
+/// The key a variable's layer is recorded under (section 3.3).
+pub fn env_layer(name: &str) -> String {
+    format!("env.{name}")
 }
 
 /// Section 4.12: the release's error pages, override and maintenance
@@ -4993,7 +5014,7 @@ fn resolve_http_spec(
         return Err("shutdown_timeout must be longer than nothing".to_owned());
     }
 
-    let env = resolve_env_specs(&[], &BTreeMap::new(), &request.env)?;
+    let (env, env_layers) = resolve_env_specs(&[], &BTreeMap::new(), "", &request.env)?;
     let (error_pages, error_override, maintenance) =
         resolve_error_tables(tables, &BTreeMap::new(), None, None, &source)?;
     muru_config::check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())?;
@@ -5047,7 +5068,7 @@ fn resolve_http_spec(
             readiness_timeout_ms,
             stop_signal: table.stop_signal.clone(),
         }),
-        layers: crate::model::Layers::default(),
+        layers: crate::model::Layers(env_layers),
         interpreter: None,
         build: crate::model::BuildSpec::default(),
         bytecode: crate::model::BytecodeSpec::default(),

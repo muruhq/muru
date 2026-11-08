@@ -55,8 +55,9 @@ release.
 
 `deploy --dry-run` asks the daemon what the deploy would do and changes
 nothing. It prints the id the release would take, each setting with the
-layer it would come from, whether an environment would be built, and
-what becomes of the release that serves:
+layer it would come from, each environment variable and secret by name
+with where it comes from (their values are not shown), whether an
+environment would be built, and what becomes of the release that serves:
 
 ```console
 $ muructl deploy shop /srv/shop --processes 4 --dry-run
@@ -68,6 +69,12 @@ muru: plan (nothing changed): release shop@r4, shop.wsgi:application 4x8 from /s
   sync_threads = 8                      (default)
   max_requests = 5000                   (the previous release)
   ...
+  env DEBUG (--env)
+  env SHOP_DATABASE (the previous release)
+  env SENTRY_ENVIRONMENT ([tool.muru.env])
+  secret STRIPE_KEY = vault/stripe (the previous release)
+  env HTTP_PROXY (passed from the daemon)
+  env PATH (passed from the daemon)
   settings nothing else gives come from shop@r3; --fresh takes none
   the release would take over from shop@r3, which would stay warm for 1800s with 1 worker to a group
 ```

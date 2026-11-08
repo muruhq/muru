@@ -493,6 +493,10 @@ impl Admin for Service {
                         .collect()
                 })
                 .unwrap_or_default(),
+            env: spec
+                .as_ref()
+                .map(|spec| planned_env(spec, &self.handle))
+                .unwrap_or_default(),
             builds: spec.as_ref().is_some_and(|spec| spec.build.builds),
             serving: app.and_then(|app| app.current).unwrap_or_default(),
             settings_from: previous
@@ -2637,6 +2641,52 @@ fn rollout_message(rollout: &Rollout) -> pb::Rollout {
         min_requests: rollout.gates.min_requests,
         approve_each_step: rollout.approve_each_step,
     }
+}
+
+/// Section 8.7: the variables a planned release would get, by name and
+/// never by value, with where each comes from: what it declares, then
+/// what the daemon would pass on, through the code a start uses.
+fn planned_env(spec: &crate::model::ReleaseSpec, handle: &Handle) -> Vec<pb::DeployEnv> {
+    let mut planned: Vec<pb::DeployEnv> = spec
+        .env
+        .iter()
+        .map(|entry| pb::DeployEnv {
+            name: entry.name.clone(),
+            secret: match (&entry.secret_store, &entry.secret_key) {
+                (Some(store), Some(key)) => format!("{store}/{key}"),
+                _ => String::new(),
+            },
+            as_file: entry.as_file,
+            layer: spec
+                .layers
+                .0
+                .get(&config::env_layer(&entry.name))
+                .cloned()
+                .unwrap_or_default(),
+        })
+        .collect();
+
+    let pass_env = handle
+        .info
+        .pass_env
+        .read()
+        .expect("pass_env poisoned")
+        .clone();
+    let bytecode = spec.http.is_none().then(|| spec.bytecode.effective());
+    let mut passed: Vec<String> =
+        crate::commands::passed_from_daemon(std::env::vars(), &pass_env, bytecode)
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| !planned.iter().any(|entry| &entry.name == name))
+            .collect();
+    passed.sort();
+
+    planned.extend(passed.into_iter().map(|name| pb::DeployEnv {
+        name,
+        layer: "passed from the daemon".to_owned(),
+        ..Default::default()
+    }));
+    planned
 }
 
 /// How long a deploy's answer waits for what the host has to say.

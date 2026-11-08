@@ -337,6 +337,15 @@ message DeployPlan {
   optional uint32 retain_workers = 11; // and the workers each of its groups would keep, as --retain-workers gave
   repeated string refusals = 12;    // what would refuse the deploy
   string retained = 13;             // what the release it replaces would keep, such as "1 worker to a group"
+  repeated DeployEnv env = 14;      // the variables and secrets it would get, by name, never by value (section 8.7)
+}
+
+// A variable a planned release would get, and where it would come from.
+message DeployEnv {
+  string name = 1;
+  string secret = 2;                // store/key for a secret, otherwise empty
+  bool as_file = 3;                 // a secret delivered as the file NAME_FILE names
+  string layer = 4;                 // --env, [tool.muru.env], the release table, the previous release or passed from the daemon
 }
 
 // One of a planned release's settings and the layer it would come from

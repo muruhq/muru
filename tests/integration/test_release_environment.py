@@ -44,6 +44,18 @@ def test_a_release_starts_from_a_clean_environment(tmp_path: Path) -> None:
         ran = daemon.muructl("exec", "shop", "--", "python", "-c", PRINT)
         assert ran.stdout.split() == ["None", "by", "name", "True"], ran.stdout
 
+        # The plan of the next deploy lists them by name and where each
+        # comes from, and never a value.
+
+        plan = daemon.muructl(
+            "deploy", "shop", str(SHOP), "--python", sys.executable, "--dry-run", "--env", "ADDED=x"
+        ).stdout
+        assert "env DECLARED (the previous release)" in plan, plan
+        assert "env ADDED (--env)" in plan, plan
+        assert "env PASSED_ON (passed from the daemon)" in plan, plan
+        assert "env HOME (passed from the daemon)" in plan, plan
+        assert "by name" not in plan and "INHERITED_ONLY" not in plan, plan
+
         # A managed server, the same.
 
         daemon.muructl("drain", "shop@r1")
