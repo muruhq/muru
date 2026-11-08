@@ -4921,6 +4921,11 @@ impl Daemon {
             memory_budget: None,
             cgroup: None,
             env,
+            shown_env: spec
+                .env
+                .iter()
+                .filter_map(crate::model::EnvSpec::shown_name)
+                .collect(),
             identity,
             groups: spec
                 .groups

@@ -884,6 +884,18 @@ impl EnvSpec {
             _ => format!("{}={}", self.name, self.value.clone().unwrap_or_default()),
         }
     }
+
+    /// The variable whose value `muructl debug inspect` shows without
+    /// `--env` (section 11.7): a plain value's own name, a secret
+    /// delivered as a file's NAME_FILE, which holds only its path, and
+    /// none for a secret's value.
+    pub fn shown_name(&self) -> Option<String> {
+        match (self.secret_store.is_some(), self.as_file) {
+            (false, _) => Some(self.name.clone()),
+            (true, true) => Some(format!("{}_FILE", self.name)),
+            (true, false) => None,
+        }
+    }
 }
 
 /// How a worker group is scaled (sections 7.2 and 7.4), resolved with

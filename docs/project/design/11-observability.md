@@ -64,6 +64,7 @@ The dashboard reads the same values from in-memory history. OTLP metric export i
 - Pull: WatchEvents over gRPC, or Server-Sent Events on the JSON gateway, resumable from a sequence number. muructl events --follow uses the same stream.
 - Push sinks with their own filters: webhooks (HMAC-signed, persistent outbox, at-least-once, deduplicate by id), OTLP log records (and spans for rollouts and deploys), journald or syslog, and JSON lines files.
 - Retention: 7 days by default, capped by size. The audit log is the long-retained subset initiated through the API.
+- A development run, and `muructl serve`, which have no state store, keep the events their hosts raise in memory for the life of the process, the last 256, across reloads, numbered from 1 as the daemon numbers its own and subject `app@rN` by the release that raised them; their admin socket answers ListEvents and WatchEvents from that ring, with `--after` and `--follow` as against the daemon (section 13.1).
 
 ## 11.6 Tracing
 
@@ -104,7 +105,7 @@ Every worker has a control connection to its host, and the host to the daemon, s
 
 **State and configuration.**
 
-- `muructl debug inspect`: the worker's sys.path, loaded modules with versions and file paths, environment with secrets redacted (the value of a key with SECRET, TOKEN, PASSWORD, PASSWD, KEY, CREDENTIAL or AUTH in its name or ending in _DSN, and the password of a URL under any other key), resolved settings, open descriptors and sockets, and thread names.
+- `muructl debug inspect`: the worker's sys.path, loaded modules with versions and file paths, environment, resolved settings, open descriptors and sockets, and thread names. The environment names every variable and gives values only for those Muru sets (`MURU_*`), the interpreter's (`PATH`, `VIRTUAL_ENV`, `LANG`, `TZ`, `PYTHON*`, `LC_*`) and the release's own, from `[tool.muru.env]` and `deploy --env`, a secret store's value excepted (a secret as a file shows its `NAME_FILE`); the host names the release's in `MURU_DECLARED_ENV`, and the runtime library holds the list of the others in one place. `--env` gives every value, for a person at a terminal; the MCP `debug` tool never passes it (section 10.11). Every value shown has secrets redacted (the value of a key with SECRET, TOKEN, PASSWORD, PASSWD, KEY, CREDENTIAL or AUTH in its name or ending in _DSN, and the password of a URL under any other key).
 - `muructl logging level` (section 11.4) changes a logger's level for a period and reverts on its own.
 - faulthandler is enabled in every worker with its output routed to the log collector, so a crash in a C extension leaves a Python traceback rather than nothing.
 

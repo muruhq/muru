@@ -129,7 +129,23 @@ are.
 
 A request past its deadline keeps running in the worker after the client
 has been answered, unless a soft timeout interrupts it or a hard timeout
-replaces its worker. Both are off by default. The application can see
+replaces its worker. Both are off by default.
+
+The host raises the event `request.past_deadline` (warning) once for
+each such request, within a second or two of its deadline, naming the
+worker and the request:
+
+```
+request.past_deadline: worker 0 (pid 41213): request 01J9Z3 GET /report is past its deadline, 300.0 s after the worker took it; the client was answered 504 and the request goes on in the worker
+```
+
+`muructl requests --list` no longer lists a request the client has been
+answered for, but its thread is still held: `muructl debug status`
+counts it under THREADS and THREAD-OLDEST, and `muructl debug stacks`
+shows where it is. A streaming response or a WebSocket, which the
+deadline stops bounding once the response starts, raises no event.
+
+The application can see
 the deadline coming: `environ["muru.deadline"]`, or `deadline` in an
 ASGI scope's `extensions["muru"]`, is when the edge gives up, in seconds
 since the epoch, so a handler can skip work it has no time left for:

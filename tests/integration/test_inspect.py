@@ -149,6 +149,17 @@ def test_inspect_describes_the_interpreter_modules_and_environment(daemon: Daemo
     assert "plain_wsgi" in result["modules"]
     assert result["settings"]["app"] == "plain"
 
+    # A variable the daemon passed on is named without its value, unless
+    # --env asks for every one (issue 462).
+
+    assert result["environment"]["HOME"] is None
+    assert "\n    HOME\n" in text and "--env shows them" in text
+
+    every = json.loads(daemon.muructl("debug", "inspect", "plain", "--json", "--env").stdout)
+    environment = every["workers"][0]["result"]["environment"]
+    assert environment["HOME"] is not None
+    assert environment["SENTRY_DSN"] == "***"
+
     # A build with the GIL off is named free-threaded once, in the process
     # model (issue 371). The worker says whether its GIL is off: the test's
     # own interpreter may differ, since an extension it loads can turn the

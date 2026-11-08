@@ -1,4 +1,4 @@
-"""What debug inspect hides of the environment (design specification section 11.7)."""
+"""What debug inspect shows of the environment (design specification section 11.7)."""
 
 from __future__ import annotations
 
@@ -36,3 +36,35 @@ from muru import _inspect
 )
 def test_a_password_in_a_url_is_hidden_and_the_rest_kept(key: str, value: str, shown: str) -> None:
     assert _inspect.redact(key, value) == shown
+
+
+def test_values_are_shown_for_muru_the_interpreter_and_the_release_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for key in list(_inspect.os.environ):
+        monkeypatch.delenv(key)
+
+    monkeypatch.setenv("MURU_APP", "shop")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("PYTHONPATH", "/opt/muru")
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    monkeypatch.setenv("DATABASE_URL", "postgres://shop:hunter2@db/shop")
+    monkeypatch.setenv("API_TOKEN", "abc")
+    monkeypatch.setenv("STRIPE_ACCOUNT", "acct_1")
+    monkeypatch.setenv(_inspect.DECLARED, "DATABASE_URL,API_TOKEN")
+
+    assert _inspect.environment(every=False) == {
+        "API_TOKEN": "***",
+        "DATABASE_URL": "postgres://shop:***@db/shop",
+        "LC_ALL": "C.UTF-8",
+        "MURU_APP": "shop",
+        "MURU_DECLARED_ENV": "DATABASE_URL,API_TOKEN",
+        "PATH": "/usr/bin",
+        "PYTHONPATH": "/opt/muru",
+        "STRIPE_ACCOUNT": None,
+    }
+
+    # With --env, every value, masked as before.
+
+    assert _inspect.environment(every=True)["STRIPE_ACCOUNT"] == "acct_1"
+    assert _inspect.environment(every=True)["API_TOKEN"] == "***"

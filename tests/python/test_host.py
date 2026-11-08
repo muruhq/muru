@@ -188,6 +188,33 @@ def test_a_restart_is_refused_for_a_worker_the_host_cannot_replace(tmp_path: Pat
     assert answers[-1]["error"] == "no worker 3"
 
 
+def test_a_request_past_its_deadline_is_one_event_until_it_ends(tmp_path: Path) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1)
+    sent: list[dict[str, object]] = []
+    instance.send_to_supervisor = sent.append  # type: ignore[method-assign]
+    state = host.WorkerState(0, 4242, 0, "w0.sock", time.monotonic(), -1)
+    request = {"request_id": "r-1", "method": "GET", "path": "/hang", "age_ms": 300100}
+
+    # Reported with every report while it lasts, it is raised once.
+
+    for _ in range(3):
+        instance.saw_past_deadline(state, request)
+        instance.raise_past_deadline(state, time.monotonic())
+
+    events = [message for message in sent if message.get("kind") == "request.past_deadline"]
+    assert len(events) == 1
+    assert "request r-1 GET /hang is past its deadline, 300.1 s" in str(events[0]["message"])
+
+    # Once the worker stops reporting it, it is forgotten.
+
+    later = (
+        time.monotonic() + (host.PAST_DEADLINE_FORGET_REPORTS + 1) * host.REPORT_INTERVAL_SECONDS
+    )
+    instance.raise_past_deadline(state, later)
+    assert state.past_deadline == {}
+
+
 def test_arguments_are_checked_against_the_interface(monkeypatch: pytest.MonkeyPatch) -> None:
     def wsgi(environ: object, start_response: object) -> None: ...
     def factory() -> None: ...

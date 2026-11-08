@@ -1439,6 +1439,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "clap",
+ "futures",
  "globset",
  "http",
  "http-body-util",
