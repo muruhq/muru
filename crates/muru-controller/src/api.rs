@@ -353,9 +353,7 @@ impl Admin for Service {
                     lasts: request
                         .retain_ms
                         .map_or(crate::daemon::RETENTION, Duration::from_millis),
-                    workers: request
-                        .retain_workers
-                        .unwrap_or(crate::daemon::RETAIN_WORKERS),
+                    workers: request.retain_workers,
                     slot: true,
                 },
                 hold: request.hold,
@@ -464,6 +462,17 @@ impl Admin for Service {
             .filter(|_| !request.fresh)
             .and_then(|app| app.current.clone().or_else(|| app.previous.clone()));
 
+        // What the serving release would keep once it is replaced.
+
+        let retained = app
+            .as_ref()
+            .and_then(|app| app.current.as_deref())
+            .and_then(|serving| self.handle.store.release(&request.app, serving).ok())
+            .map(|serving| {
+                crate::daemon::retained_workers_phrase(&serving.spec, request.retain_workers)
+            })
+            .unwrap_or_default();
+
         Ok(Response::new(pb::DeployPlan {
             app: request.app.clone(),
             release: id,
@@ -492,10 +501,9 @@ impl Admin for Service {
             retain_ms: request
                 .retain_ms
                 .unwrap_or(crate::daemon::RETENTION.as_millis() as u64),
-            retain_workers: request
-                .retain_workers
-                .unwrap_or(crate::daemon::RETAIN_WORKERS),
+            retain_workers: request.retain_workers,
             refusals,
+            retained,
         }))
     }
 
@@ -1625,9 +1633,7 @@ impl Admin for Service {
                 lasts: request
                     .retain_ms
                     .map_or(crate::daemon::RETENTION, Duration::from_millis),
-                workers: request
-                    .retain_workers
-                    .unwrap_or(crate::daemon::RETAIN_WORKERS),
+                workers: request.retain_workers,
                 slot: true,
             },
         };
@@ -1898,6 +1904,7 @@ impl Service {
         last.into_iter()
             .filter_map(|(app, id)| {
                 let serving = self.handle.store.app(app).ok()?.current?;
+                let spec = self.handle.store.release(app, &serving).ok()?.spec;
 
                 Some(if deploying.retain.lasts.is_zero() {
                     format!(
@@ -1905,13 +1912,9 @@ impl Service {
                     )
                 } else {
                     format!(
-                        "{app}@{serving} stays warm for {} with {} to a group, when {app}@{id} takes its place",
+                        "{app}@{serving} stays warm for {} with {}, when {app}@{id} takes its place",
                         muru_config::format_duration(deploying.retain.lasts),
-                        match deploying.retain.workers {
-                            0 => "its host alone".to_owned(),
-                            1 => "1 worker".to_owned(),
-                            count => format!("{count} workers"),
-                        }
+                        crate::daemon::retained_workers_phrase(&spec, deploying.retain.workers)
                     )
                 })
             })

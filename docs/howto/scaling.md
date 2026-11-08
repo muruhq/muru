@@ -122,7 +122,15 @@ host_idle_timeout = '1h'
 ```
 
 `host_idle_timeout` goes in the release's own scaling table, and every
-worker group of the release must have `min_workers = 0`. The events are
+worker group of the release must have `min_workers = 0`.
+
+When a deploy replaces such a release, it is retained without workers in
+a group whose `min_workers` is 0, so it holds none of the node's budget
+for them, and `muructl release list` notes that a rollback to it forks a
+worker. A release whose host had already stopped is retained as it is,
+noted as idle: a rollback to it waits for its import, as the next request
+would. `--retain-workers` on the deploy keeps that many workers in every
+group instead. The events are
 `release.idle` when the host stops and `release.woken` when a request
 starts it, and `muructl release list` shows the release as ready, idle.
 gRPC calls are matched by the services a worker registered, so a gRPC

@@ -69,8 +69,9 @@ const DASHBOARD_SOCKETS: u32 = 200;
 pub struct Retention {
     /// How long; zero stops it once it has drained.
     pub lasts: Duration,
-    /// The workers each group keeps.
-    pub workers: u32,
+    /// The workers each group keeps; none keeps the warm floor, or no
+    /// worker for a group whose min_workers is 0.
+    pub workers: Option<u32>,
     /// Whether the release takes its application's one retained slot,
     /// as the rollback target, making an older retained release stop.
     /// A rejected rollout's candidate is kept beside it instead, for
@@ -82,7 +83,7 @@ impl Default for Retention {
     fn default() -> Self {
         Self {
             lasts: RETENTION,
-            workers: RETAIN_WORKERS,
+            workers: None,
             slot: true,
         }
     }
@@ -97,6 +98,118 @@ impl Retention {
             lasts: INSPECTION,
             slot: false,
             ..Self::default()
+        }
+    }
+}
+
+/// Section 9.1: the workers a group of a retained release keeps when the
+/// deploy does not say: the warm floor, but none for a group that may
+/// scale to zero, which is configured to hold none.
+fn retained_by_default(spec: &crate::model::ScalingSpec) -> u32 {
+    if spec.is_static() {
+        RETAIN_WORKERS
+    } else {
+        RETAIN_WORKERS.min(spec.min_workers)
+    }
+}
+
+/// What each group of `release` would keep when retained as `workers`
+/// says, for a plan: "1 worker to a group", "its host alone", or each
+/// group's count when they differ.
+pub(crate) fn retained_workers_phrase(release: &ReleaseSpec, workers: Option<u32>) -> String {
+    let counts: Vec<(&str, u32)> =
+        std::iter::once((muru_edge::routing::DEFAULT_GROUP, &release.scaling))
+            .chain(
+                release
+                    .groups
+                    .iter()
+                    .map(|group| (group.name.as_str(), &group.scaling)),
+            )
+            .map(|(name, scaling)| {
+                (
+                    name,
+                    workers.unwrap_or_else(|| retained_by_default(scaling)),
+                )
+            })
+            .collect();
+    let first = counts.first().map_or(0, |(_, count)| *count);
+
+    if counts.iter().all(|(_, count)| *count == first) {
+        return match first {
+            0 => "its host alone".to_owned(),
+            1 => "1 worker to a group".to_owned(),
+            count => format!("{count} workers to a group"),
+        };
+    }
+
+    let parts: Vec<String> = counts
+        .iter()
+        .map(|(group, count)| format!("{count} in {group}"))
+        .collect();
+    format!("its host and {}", parts.join(", "))
+}
+
+/// Section 9.1: what a retained release keeps running, which decides
+/// what a rollback to it costs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Kept {
+    /// Its host stopped while idle: a rollback waits for the import.
+    Idle,
+    /// A managed server's instances, which keep running.
+    Instances,
+    /// Its host, with the workers each group keeps, by group name.
+    Workers(Vec<(String, u32)>),
+}
+
+impl Kept {
+    /// The release's note while it is retained, until `until`.
+    fn note(&self, until: &str) -> String {
+        match self {
+            Kept::Idle => format!("idle until {until}; a rollback to it waits for its import"),
+            Kept::Workers(counts) if counts.iter().all(|(_, count)| *count == 0) => {
+                format!("host kept until {until}; a rollback to it forks a worker")
+            }
+            Kept::Workers(counts) if counts.iter().any(|(_, count)| *count == 0) => format!(
+                "warm until {until}; a rollback to it forks a worker for a group that kept none"
+            ),
+            _ => format!("warm until {until}; a rollback to it is instant"),
+        }
+    }
+
+    /// The event's message: kept warm, kept idle or kept, for `lasts`,
+    /// with what it keeps.
+    fn event(&self, lasts: &str) -> String {
+        let how = match self {
+            Kept::Idle => "kept idle",
+            Kept::Workers(counts) if counts.iter().any(|(_, count)| *count == 0) => "kept",
+            _ => "kept warm",
+        };
+
+        format!("{how} for {lasts} {}", self.with())
+    }
+
+    /// What it is kept with, for the event.
+    fn with(&self) -> String {
+        match self {
+            Kept::Idle => "with its host stopped".to_owned(),
+            Kept::Instances => "with its instances".to_owned(),
+            Kept::Workers(counts) => {
+                let first = counts.first().map_or(0, |(_, count)| *count);
+
+                if counts.iter().all(|(_, count)| *count == first) {
+                    match first {
+                        0 => "with its host alone".to_owned(),
+                        1 => "with 1 worker per group".to_owned(),
+                        count => format!("with {count} workers per group"),
+                    }
+                } else {
+                    let parts: Vec<String> = counts
+                        .iter()
+                        .map(|(group, count)| format!("{count} in {group}"))
+                        .collect();
+                    format!("with its host and {}", parts.join(", "))
+                }
+            }
         }
     }
 }
@@ -5766,10 +5879,13 @@ impl Daemon {
             // workers fork from the preloaded host when it serves again.
 
             let mut floors = Vec::new();
+            let mut kept = Kept::Workers(Vec::new());
 
             if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
                 running.retained_until = Some(Instant::now() + retain.lasts);
                 running.inspected = !retain.slot;
+                let host = running.backend.host().is_some();
+                let mut counts = Vec::new();
 
                 for group in &mut running.scalers {
                     let held = running
@@ -5778,33 +5894,38 @@ impl Daemon {
                         .find(|record| record.name == group.name)
                         .map_or(running.sockets.len(), |record| record.sockets.len())
                         as u32;
+                    let keep = retain
+                        .workers
+                        .unwrap_or_else(|| retained_by_default(group.scaler.spec()));
 
-                    if held > retain.workers && running.backend.host().is_some() {
-                        group.requested = Some(retain.workers);
-                        floors.push(group.name.clone());
+                    if held > keep && host {
+                        group.requested = Some(keep);
+                        floors.push((group.name.clone(), keep));
                     }
+
+                    counts.push((group.name.clone(), if host { held.min(keep) } else { held }));
                 }
+
+                kept = match running.backend {
+                    Backend::Dormant => Kept::Idle,
+                    Backend::Servers(_) => Kept::Instances,
+                    Backend::Host(_) => Kept::Workers(counts),
+                };
             }
 
-            for group in floors {
-                self.ask_scale(app, id, &group, retain.workers);
+            for (group, keep) in floors {
+                self.ask_scale(app, id, &group, keep);
             }
+
+            // Section 9.1: the note says what a rollback to the release
+            // would cost, from what is kept. A retained release is not
+            // scaled or idled, so the note holds until it is stopped.
 
             let until = crate::model::now_unix_ms() + retain.lasts.as_millis() as u64;
-            let workers = format!(
-                "{} worker{} per group",
-                retain.workers,
-                if retain.workers == 1 { "" } else { "s" }
-            );
+            let lasts = muru_config::format_duration(retain.lasts);
 
             let (note, event) = if retain.slot {
-                (
-                    format!("warm until {}; a rollback to it is instant", clock(until)),
-                    format!(
-                        "kept warm for {} with {workers}",
-                        muru_config::format_duration(retain.lasts)
-                    ),
-                )
+                (kept.note(&clock(until)), kept.event(&lasts))
             } else {
                 (
                     format!(
@@ -5812,8 +5933,8 @@ impl Daemon {
                         clock(until)
                     ),
                     format!(
-                        "kept for inspection for {} with {workers}; not a rollback target",
-                        muru_config::format_duration(retain.lasts)
+                        "kept for inspection for {lasts} {}; not a rollback target",
+                        kept.with()
                     ),
                 )
             };
@@ -6970,6 +7091,10 @@ impl Daemon {
                 continue;
             }
 
+            let inspected = running.inspected;
+            let left = running.retained_until.map_or(Duration::ZERO, |until| {
+                until.saturating_duration_since(Instant::now())
+            });
             let groups: Vec<String> = running
                 .scalers
                 .iter_mut()
@@ -6981,6 +7106,16 @@ impl Daemon {
 
             for group in &groups {
                 self.ask_scale(app, id, group, 0);
+            }
+
+            // The note says what a rollback now costs; one kept for
+            // inspection keeps its own.
+
+            if !inspected && let Ok(release) = self.store.release(app, id) {
+                let until = crate::model::now_unix_ms() + left.as_millis() as u64;
+                let note = Kept::Workers(groups.iter().map(|group| (group.clone(), 0)).collect())
+                    .note(&clock(until));
+                self.set_state(&release, ReleaseState::Retained, &note);
             }
 
             self.events.emit(
@@ -9190,6 +9325,74 @@ fn step_message(steps: &[RolloutStep], step: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_group_that_may_scale_to_zero_retains_no_worker_by_default() {
+        let at_zero = crate::model::ScalingSpec {
+            mode: muru_config::ScalingMode::Spare,
+            min_workers: 0,
+            ..crate::model::ScalingSpec::default()
+        };
+        let floored = crate::model::ScalingSpec {
+            min_workers: 2,
+            ..at_zero.clone()
+        };
+
+        assert_eq!(retained_by_default(&at_zero), 0);
+        assert_eq!(retained_by_default(&floored), 1);
+        assert_eq!(
+            retained_by_default(&crate::model::ScalingSpec::default()),
+            1
+        );
+    }
+
+    #[test]
+    fn the_retained_note_says_what_a_rollback_costs() {
+        let kept = |counts: &[u32]| {
+            Kept::Workers(
+                counts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, count)| (format!("g{index}"), *count))
+                    .collect(),
+            )
+        };
+
+        assert_eq!(
+            kept(&[1, 1]).note("10:00 UTC"),
+            "warm until 10:00 UTC; a rollback to it is instant"
+        );
+        assert_eq!(
+            kept(&[0, 0]).note("10:00 UTC"),
+            "host kept until 10:00 UTC; a rollback to it forks a worker"
+        );
+        assert_eq!(
+            kept(&[1, 0]).note("10:00 UTC"),
+            "warm until 10:00 UTC; a rollback to it forks a worker for a group that kept none"
+        );
+        assert_eq!(
+            Kept::Idle.note("10:00 UTC"),
+            "idle until 10:00 UTC; a rollback to it waits for its import"
+        );
+        assert_eq!(
+            Kept::Instances.note("10:00 UTC"),
+            "warm until 10:00 UTC; a rollback to it is instant"
+        );
+
+        assert_eq!(
+            kept(&[1, 1]).event("30m"),
+            "kept warm for 30m with 1 worker per group"
+        );
+        assert_eq!(kept(&[0]).event("30m"), "kept for 30m with its host alone");
+        assert_eq!(
+            kept(&[1, 0]).event("30m"),
+            "kept for 30m with its host and 1 in g0, 0 in g1"
+        );
+        assert_eq!(
+            Kept::Idle.event("30m"),
+            "kept idle for 30m with its host stopped"
+        );
+    }
 
     #[test]
     fn the_clock_warning_is_raised_once_and_only_for_schedules() {

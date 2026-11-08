@@ -57,7 +57,8 @@ until the new one is ready.
 When a deploy replaces the serving release, the old one drains: the edge
 gives it no new requests, the requests it has finish, and it is then
 retained, kept warm with its host and one worker per group for a
-retention window of 30 minutes. A rollback within the window moves
+retention window of 30 minutes; a group that may scale to zero keeps no
+worker, and a release whose host had stopped while idle stays idle. A rollback within the window moves
 traffic back to it at once, and its groups grow back by forking from the
 host. One release per application is retained; a release superseded a
 second time, or one whose window ends, stops. A stopped release can

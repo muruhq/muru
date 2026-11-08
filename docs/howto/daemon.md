@@ -92,10 +92,15 @@ muructl events --follow
 A release that a deploy replaces is drained and then kept warm for a
 retention window of 30 minutes (`deploy --retain` changes it; `--retain
 0` stops it as soon as it has drained), with one worker in each of its
-groups (`deploy --retain-workers` changes it; `--retain-workers 0` keeps
-the host alone), so `rollback` within the window is instant: traffic
-moves back to the warm workers at once, and the groups grow back to
-their counts by forking from the host. After the window, or when another
+groups, or none in a group whose `min_workers` is 0 (`deploy
+--retain-workers` sets the count for every group; `--retain-workers 0`
+keeps the host alone), so `rollback` within the window is instant:
+traffic moves back to the warm workers at once, and the groups grow back
+to their counts by forking from the host. `muructl release list` notes
+what a rollback to a retained release costs: `a rollback to it is
+instant` while it keeps workers, `a rollback to it forks a worker` when
+it keeps its host alone, and `a rollback to it waits for its import` when
+its host had already stopped while idle. After the window, or when another
 deploy supersedes it again, the retained release is stopped. One release
 per application is retained at a time as the rollback target. A rollout's
 candidate that was rolled back or aborted is kept beside it for 10
