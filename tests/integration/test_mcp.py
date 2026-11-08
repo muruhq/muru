@@ -48,6 +48,21 @@ class Session:
                 result: dict[str, Any] = message["result"]
                 return result
 
+    def refused(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Send a request the server must refuse, and return the protocol error."""
+
+        self.next_id += 1
+        self.send({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params})
+
+        while True:
+            line = self.process.stdout.readline() if self.process.stdout else ""
+            assert line, "the server closed its output"
+            message = json.loads(line)
+
+            if message.get("id") == self.next_id:
+                error: dict[str, Any] = message["error"]
+                return error
+
     def send(self, message: dict[str, Any]) -> None:
         assert self.process.stdin is not None
         self.process.stdin.write(json.dumps(message) + "\n")
@@ -65,10 +80,11 @@ class Session:
 
 @contextmanager
 def session(
-    daemon: Daemon, *options: str, cwd: Path | None = None
+    daemon: Daemon, *options: str, cwd: Path | None = None, stderr: Path | None = None
 ) -> Iterator[tuple[Session, dict[str, Any]]]:
     """Start `muructl mcp serve` against the daemon, from `cwd` (the
-    project it serves), and initialize it."""
+    project it serves), and initialize it; its standard error goes to
+    the file `stderr`, when given."""
 
     muructl = support.muructl_path()
     assert muructl is not None
@@ -76,7 +92,7 @@ def session(
         [str(muructl), "mcp", "serve", "--socket", str(daemon.run_dir / "admin.sock"), *options],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL if stderr is None else stderr.open("w"),
         text=True,
         cwd=cwd,
     )
@@ -132,12 +148,26 @@ def test_a_failing_command_is_a_tool_error_with_its_sentence(daemon: Daemon) -> 
         assert failed and "release is required" in text
 
 
-def test_read_only_offers_no_tool_that_changes_anything(daemon: Daemon) -> None:
-    with session(daemon, "--read-only") as (client, initialized):
+def test_read_only_offers_no_tool_that_changes_anything(daemon: Daemon, tmp_path: Path) -> None:
+    stderr = tmp_path / "stderr"
+
+    with session(daemon, "--read-only", stderr=stderr) as (client, initialized):
         tools = client.tools()
         assert "status" in tools and "deploy" not in tools
         assert "read-only" in initialized["instructions"]
         assert all(tool["annotations"]["readOnlyHint"] for tool in tools.values())
+
+        error = client.refused("tools/call", {"name": "deploy", "arguments": {}})
+        assert error["message"] == "no tool named deploy"
+
+    # Standard error, which a client keeps as the server's log, has a
+    # start-up line and a plain line for the refusal, and none of the MCP
+    # library's own (issue 463).
+
+    lines = stderr.read_text().splitlines()
+    assert len(lines) == 2, lines
+    assert "tools, read-only" in lines[0] and "MCP server for " in lines[0]
+    assert lines[1].endswith("refused a call to deploy: the server is read-only")
 
 
 def test_allow_limits_the_tools_that_change_things(daemon: Daemon) -> None:

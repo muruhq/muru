@@ -34,6 +34,9 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use tokio::sync::mpsc;
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 use crate::watch::Watch;
 use muru_controller::host::{HostProcess, HostSpec};
@@ -858,18 +861,34 @@ enum Link {
     Tcp,
 }
 
+/// What muructl logs when MURU_LOG does not say: its own lines and
+/// every crate's warnings, the MCP library's chatter left out.
+const DEFAULT_LOG: &str = "info,rmcp=warn";
+
 fn main() -> anyhow::Result<()> {
     // Section 6.10: as a container's PID 1, muructl forks first and the
     // parent stays as the init; everything below is the child.
 
     init::become_init();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("MURU_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+
+    // The MCP library's own events stay at warnings unless MURU_LOG says
+    // otherwise, and the warning it gives for each refused tool call,
+    // with the error in Rust's debug form, is left to the server's own
+    // line (section 10.11).
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(|| log_format::Routed)
+                .event_format(log_format::Layout)
+                .with_filter(
+                    tracing_subscriber::EnvFilter::try_from_env("MURU_LOG")
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG)),
+                )
+                .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                    !mcp::is_refusal_echo(metadata)
+                })),
         )
-        .with_writer(|| log_format::Routed)
-        .event_format(log_format::Layout)
         .init();
     let cli = Cli::parse();
 

@@ -219,6 +219,29 @@ impl SocketArgs {
             .map(|run| run.socket)
     }
 
+    /// The socket a command would connect to as a phrase: the daemon's,
+    /// a development run's, or another named by its path.
+    pub fn describe(&self) -> String {
+        let socket = match self.socket() {
+            Ok(socket) => socket,
+            Err(error) => return format!("no admin socket yet ({error})"),
+        };
+
+        let locations = self.locations.resolve();
+
+        if socket == locations.admin_socket() {
+            return format!("the daemon at {}", socket.display());
+        }
+
+        match crate::run_admin::runs(&locations.run.path)
+            .iter()
+            .find(|run| run.socket == socket)
+        {
+            Some(run) => format!("the development run of {} at {}", run.app, socket.display()),
+            None => format!("the admin socket at {}", socket.display()),
+        }
+    }
+
     /// The socket to connect to (design specification section 13.8): as
     /// given, else a muructl serve's in its run directory, else a
     /// development run's from this project, else the daemon's when it

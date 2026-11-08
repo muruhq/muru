@@ -35,6 +35,18 @@ as `muructl up` does, so the first tool call works on a fresh checkout.
 `--socket`, `--system` and the location options choose another daemon, as
 for any command.
 
+The server writes to standard error, which the client keeps as the
+server's log, one line when it starts, naming what it serves and how
+many tools it offers, and a warning for each call it refuses:
+
+```
+muru: MCP server for the daemon at /run/user/501/muru/admin.sock: 30 tools (15 with --read-only)
+muru: warning: refused a call to deploy: the server is read-only
+```
+
+`MURU_LOG` sets what else is written there, as for any `muructl`
+command; `MURU_LOG=info,rmcp=debug` adds the MCP library's own messages.
+
 A [development run](run-settings.md) started from the same directory is
 found first, as it is for every command. Its admin socket answers
 `status`, `events`, `logs`, `metrics`, `websockets` and `debug`, and

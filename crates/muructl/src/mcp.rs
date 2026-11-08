@@ -124,12 +124,37 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         anyhow::ensure!(started.success(), "the daemon did not start");
     }
 
+    // One line on standard error, which the client keeps in its log for
+    // the server, says what this server serves.
+
+    let changing = server.tools.iter().filter(|spec| spec.changes).count();
+    tracing::info!(
+        "MCP server for {}: {} tools{}",
+        args.socket.describe(),
+        server.tools.len(),
+        if server.read_only {
+            ", read-only".to_owned()
+        } else {
+            format!(" ({} with --read-only)", server.tools.len() - changing)
+        }
+    );
+
     let service = server
         .serve(rmcp::transport::stdio())
         .await
         .context("starting the MCP session")?;
     service.waiting().await.context("serving the MCP session")?;
     Ok(())
+}
+
+/// Whether a log event is the MCP library's warning for an error the
+/// server answered a request with, which carries the error in Rust's
+/// debug form; the server logs each refusal itself, in a plain line.
+pub fn is_refusal_echo(metadata: &tracing::Metadata<'_>) -> bool {
+    metadata.target().starts_with("rmcp::service")
+        && *metadata.level() == tracing::Level::WARN
+        && metadata.fields().field("id").is_some()
+        && metadata.fields().field("error").is_some()
 }
 
 /// The server: the tools it offers and how its commands reach the daemon.
@@ -259,6 +284,20 @@ impl Server {
         )
     }
 
+    /// Why a tool by this name is not offered: left out by --read-only or
+    /// --allow, or not a tool at all.
+    fn refusal(&self, name: &str) -> String {
+        if !specs().iter().any(|spec| spec.name == name) {
+            return "no tool by that name".to_owned();
+        }
+
+        if self.read_only {
+            "the server is read-only".to_owned()
+        } else {
+            "--allow leaves it out".to_owned()
+        }
+    }
+
     /// The instructions the initialize response carries: what Muru's
     /// objects are, so the agent picks the right tool.
     fn instructions(&self) -> String {
@@ -339,6 +378,11 @@ impl ServerHandler for Server {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let Some(spec) = self.tools.iter().find(|spec| spec.name == request.name) else {
+            tracing::warn!(
+                "refused a call to {}: {}",
+                request.name,
+                self.refusal(&request.name)
+            );
             return Err(ErrorData::invalid_params(
                 format!("no tool named {}", request.name),
                 None,
