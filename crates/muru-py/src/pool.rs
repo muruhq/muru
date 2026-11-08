@@ -1100,7 +1100,7 @@ impl Shared {
             })
             .collect();
 
-        overdue.sort_by(|a, b| b.age_ms.cmp(&a.age_ms));
+        overdue.sort_by_key(|request| std::cmp::Reverse(request.age_ms));
         overdue.truncate(limit);
         overdue
     }
