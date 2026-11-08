@@ -372,6 +372,10 @@ pub const ID_COOKIE: &str = "muru_id";
 /// The cookie that keeps a client on the release it first got.
 pub const STICKY_COOKIE: &str = "muru_release";
 
+/// The value of the preview header on a response when the request named
+/// a release the route does not have.
+pub const PREVIEW_IGNORED: &str = "ignored";
+
 /// The cookie that pins a release for previews.
 pub const PREVIEW_COOKIE: &str = "muru_preview";
 
@@ -573,6 +577,29 @@ fn upstream_selection(upstream: &Arc<Upstream>) -> Selection {
     }
 }
 
+/// The release or `upstream:NAME` a request's preview header or cookie
+/// names, the header first.
+fn named_preview(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(PREVIEW_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| cookie(headers, PREVIEW_COOKIE))
+}
+
+/// Whether a request named a preview that what serves it is not: the
+/// route has no such release, a retained one included, and the request
+/// was routed as usual (section 9.4).
+pub fn preview_ignored(headers: &HeaderMap, selection: &Selection) -> bool {
+    named_preview(headers).is_some_and(|name| {
+        match (name.strip_prefix(UPSTREAM_PREFIX), &selection.upstream) {
+            (Some(upstream), Some(serving)) => upstream != serving.name(),
+            (Some(_), None) => true,
+            (None, _) => name != selection.release,
+        }
+    })
+}
+
 /// Section 4.5: which of an application's releases takes a request. The
 /// release a preview header or cookie names comes first, then the one the
 /// policy gives the client's class (section 4.14), then the one a sticky
@@ -586,12 +613,7 @@ fn choose<'a>(
     cookies: &mut Vec<String>,
     upstreams: &HashMap<String, Arc<Upstream>>,
 ) -> Chosen<'a> {
-    let preview = client
-        .headers
-        .get(PREVIEW_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| cookie(client.headers, PREVIEW_COOKIE));
+    let preview = named_preview(client.headers);
 
     if let Some(chosen) = preview
         .as_deref()
@@ -2953,6 +2975,19 @@ mod tests {
             None,
         ));
         assert_ne!(release, "r9", "an unknown release is ignored");
+
+        let decision = routing.select(
+            Some("shop.example.com"),
+            "/",
+            plain,
+            true,
+            &client(&headers, &ids),
+            None,
+        );
+        let Decision::Serve { selection, .. } = decision else {
+            panic!("not served");
+        };
+        assert!(preview_ignored(&headers, &selection), "and says so");
 
         let mut headers = HeaderMap::new();
         headers.insert(

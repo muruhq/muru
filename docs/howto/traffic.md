@@ -94,9 +94,16 @@ split = { r2 = 0 }
 
 A request carrying the `Muru-Preview: r2` header or a `muru_preview=r2`
 cookie goes to `r2` whatever the policy says, as long as `r2` is one of
-the route's releases. A preview naming an unknown release is ignored and
-the request is routed as usual. The serving release can be previewed the
-same way, which is useful while a split sends most clients elsewhere.
+the route's releases. The serving release can be previewed the same way,
+which is useful while a split sends most clients elsewhere.
+
+Only releases the edge routes can be previewed: the serving release, a
+release named in the route's policy and a release deployed with `--hold`,
+which is the way to try one before it takes traffic. A retained release
+keeps its workers for a rollback and takes no requests, so it cannot be
+previewed. A preview naming a release the route does not have is ignored,
+the request is routed as usual, and the response carries the header
+`muru-preview: ignored`.
 
 The preview header is not an `X-Muru-` header, so it is not among the
 headers the edge removes from requests.

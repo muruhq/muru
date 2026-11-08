@@ -1360,6 +1360,7 @@ async fn serve<I>(
             let mut merged = HeaderMap::new();
             let mut request_id = base_id.clone();
             let mut issued: Vec<String> = Vec::new();
+            let mut preview_ignored = false;
             let mut handling: Option<Handling> = None;
             let mut checks = 0usize;
             let mut admitted = false;
@@ -1633,6 +1634,8 @@ async fn serve<I>(
                             break handling.take().expect("checked").fallback;
                         }
 
+                        preview_ignored = origin.is_none()
+                            && routing::preview_ignored(&parts.headers, &selection);
                         context.server_name = server_name;
                         context.app = selection.app;
                         context.release = selection.release;
@@ -2078,6 +2081,16 @@ async fn serve<I>(
                         .headers_mut()
                         .append(http::header::SET_COOKIE, value);
                 }
+            }
+
+            // Section 9.4: a preview the route could not honour is not
+            // silently routed as usual.
+
+            if preview_ignored {
+                response.headers_mut().insert(
+                    routing::PREVIEW_HEADER,
+                    HeaderValue::from_static(routing::PREVIEW_IGNORED),
+                );
             }
 
             Ok::<_, Infallible>(response)

@@ -108,7 +108,7 @@ The controller compiles desired state into a complete, versioned, immutable snap
 ## 4.5 Route matching and selection
 
 - Within a virtual host: longest path prefix, then method and header predicates. Routes marked internal = true never match client requests.
-- Release choice: override header or preview cookie, then a valid sticky cookie, then deterministic bucketing (section 9.4).
+- Release choice: override header or preview cookie, then a valid sticky cookie, then deterministic bucketing (section 9.4). A preview naming a release the route does not have, a retained one included, is ignored, and the response carries `muru-preview: ignored`.
 - Worker group choice: the most specific path match among the release's groups, default group otherwise.
 - Worker choice: least outstanding requests (or power of two choices among them) within the group, per capacity pool (per-mount thread pools, ASGI concurrency, WebSocket connections).
 - Admission: a bounded queue per pool with queue_timeout. Overflow returns 503 with reason queue_full and Retry-After.
