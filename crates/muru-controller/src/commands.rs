@@ -163,6 +163,9 @@ pub struct Prepared {
     /// Variables of the daemon's own environment it does not inherit,
     /// unless `env` sets them.
     pub unset: Vec<String>,
+    /// Whether `env` is the whole environment (section 8.7), as it is
+    /// under the daemon, rather than laid over this process's own.
+    pub clean: bool,
     /// The directory it runs in: the release's source.
     pub cwd: PathBuf,
     /// Whom it runs as, when the daemon is root and the application
@@ -204,6 +207,56 @@ pub struct Interpreter<'a> {
     /// The release's bytecode setting (section 8.2); none where bytecode
     /// is left to Python and the environment, as in a development run.
     pub bytecode: Option<Bytecode>,
+    /// What the process starts from under the daemon (section 8.7), from
+    /// `passed_from_daemon`; none for `muructl run` and `muructl serve`,
+    /// which pass on the environment they were started with.
+    pub base: Option<&'a [(String, String)]>,
+}
+
+/// The variables a release's processes take from the daemon's own
+/// environment, whatever the daemon's configuration says (section 8.7).
+const BASE_VARIABLES: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_*", "TZ", "TMPDIR",
+];
+
+/// Whether a variable's name is matched by a name or `PREFIX*` pattern.
+fn name_matches(name: &str, pattern: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == pattern,
+    }
+}
+
+/// Whether a `[daemon] pass_env` entry is well formed: a variable's name,
+/// optionally with a `*` suffix, that is not Muru's own to set.
+pub fn valid_pass_env(entry: &str) -> bool {
+    let name = entry.strip_suffix('*').unwrap_or(entry);
+
+    !name.is_empty() && crate::model::valid_env_name(name) && !name.starts_with("MURU_")
+}
+
+/// Section 8.7: what a release's processes start from under the daemon,
+/// from the daemon's own `variables`: the base and whatever the daemon's
+/// `pass_env` names, less what Muru alone sets and what the bytecode
+/// setting says must not be inherited.
+pub fn passed_from_daemon(
+    variables: impl IntoIterator<Item = (String, String)>,
+    pass_env: &[String],
+    bytecode: Option<Bytecode>,
+) -> Vec<(String, String)> {
+    let not_inherited = not_inherited(bytecode);
+
+    variables
+        .into_iter()
+        .filter(|(name, _)| {
+            !name.starts_with("MURU_")
+                && !not_inherited.contains(name)
+                && (BASE_VARIABLES
+                    .iter()
+                    .any(|pattern| name_matches(name, pattern))
+                    || pass_env.iter().any(|pattern| name_matches(name, pattern)))
+        })
+        .collect()
 }
 
 /// The variables of the daemon's own environment that a release's host
@@ -221,11 +274,13 @@ pub fn not_inherited(bytecode: Option<Bytecode>) -> Vec<String> {
     }
 }
 
-/// A command's environment: the release's, with its interpreter's
-/// directory first on PATH (and VIRTUAL_ENV set when that is a virtual
-/// environment), the runtime library first on PYTHONPATH, bytecode where
-/// the host has it, and the MURU_ variables naming the application,
-/// release and source, which the release's settings cannot override.
+/// A release's environment: the release's own variables over what the
+/// process starts from, with its interpreter's directory first on PATH
+/// (and VIRTUAL_ENV set when that is a virtual environment), the runtime
+/// library first on PYTHONPATH, bytecode where the host has it, and the
+/// MURU_ variables naming the application, release and source, which the
+/// release's settings cannot override. Under the daemon this is the whole
+/// environment (section 8.7).
 pub fn environment(
     mut env: Vec<(String, String)>,
     interpreter: &Interpreter<'_>,
@@ -237,7 +292,13 @@ pub fn environment(
         env.iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.clone())
-            .or_else(|| std::env::var(name).ok())
+            .or_else(|| match interpreter.base {
+                Some(base) => base
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone()),
+                None => std::env::var(name).ok(),
+            })
             .filter(|value| !value.is_empty())
     };
     let first = |directory: &Path, rest: Option<String>| match rest {
@@ -286,7 +347,27 @@ pub fn environment(
 
     set.push(("MURU_RELEASE_DIR".to_owned(), source.display().to_string()));
 
-    env.retain(|(name, _)| !set.iter().any(|(key, _)| key == name) && !name.starts_with("MURU_"));
+    env.retain(|(name, _)| {
+        !set.iter().any(|(key, _)| key == name)
+            && !matches!(
+                name.as_str(),
+                "MURU_APP" | "MURU_RELEASE" | "MURU_RELEASE_DIR"
+            )
+    });
+
+    // What the process starts from, under the release's own and Muru's.
+
+    if let Some(base) = interpreter.base {
+        let carried: Vec<(String, String)> = base
+            .iter()
+            .filter(|(name, _)| {
+                !env.iter().any(|(key, _)| key == name) && !set.iter().any(|(key, _)| key == name)
+            })
+            .cloned()
+            .collect();
+        env.splice(0..0, carried);
+    }
+
     env.extend(set);
     env
 }
@@ -789,11 +870,15 @@ impl Underway {
     }
 }
 
-/// The process to start: the program in the release's source, with the
-/// daemon's environment less what the release does not inherit, and the
-/// release's own over it.
+/// The process to start: the program in the release's source, with its
+/// prepared environment, the whole of it under the daemon (section 8.7),
+/// otherwise over this process's own less what it does not inherit.
 fn process(prepared: &Prepared) -> Command {
     let mut command = Command::new(&prepared.argv[0]);
+
+    if prepared.clean {
+        command.env_clear();
+    }
 
     for name in &prepared.unset {
         command.env_remove(name);
@@ -1245,6 +1330,80 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn a_release_under_the_daemon_starts_from_the_base_and_what_is_passed() {
+        let daemon = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/you"),
+            ("LC_ALL", "C"),
+            ("SHELL", "/bin/zsh"),
+            ("HTTP_PROXY", "http://proxy"),
+            ("AWS_REGION", "ap-southeast-2"),
+            ("MURU_THING", "no"),
+            ("PYTHONDONTWRITEBYTECODE", "1"),
+        ]
+        .map(|(name, value)| (name.to_owned(), value.to_owned()));
+        let names = |pass: &[&str], bytecode| {
+            let pass: Vec<String> = pass.iter().map(|name| (*name).to_owned()).collect();
+            let mut names: Vec<String> = passed_from_daemon(daemon.clone(), &pass, bytecode)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(names(&[], None), ["HOME", "LC_ALL", "PATH"]);
+        assert_eq!(
+            names(&["HTTP_PROXY", "AWS_*"], None),
+            ["AWS_REGION", "HOME", "HTTP_PROXY", "LC_ALL", "PATH"],
+        );
+        assert_eq!(
+            names(&["PYTHON*"], Some(Bytecode::Redirect)),
+            ["HOME", "LC_ALL", "PATH"],
+            "what the release's bytecode setting does not inherit is not passed"
+        );
+    }
+
+    #[test]
+    fn the_release_declares_over_the_base_and_muru_over_the_release() {
+        let base = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            ("TZ".to_owned(), "UTC".to_owned()),
+        ];
+        let env = environment(
+            vec![("TZ".to_owned(), "Australia/Sydney".to_owned())],
+            &Interpreter {
+                python: Path::new("/srv/env/bin/python"),
+                runtime: None,
+                pycache: None,
+                bytecode: None,
+                base: Some(&base),
+            },
+            "shop",
+            "r2",
+            Path::new("/srv/shop"),
+        );
+        let get = |name: &str| {
+            env.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+
+        assert_eq!(get("PATH").as_deref(), Some("/srv/env/bin:/usr/bin"));
+        assert_eq!(get("TZ").as_deref(), Some("Australia/Sydney"));
+        assert_eq!(get("MURU_APP").as_deref(), Some("shop"));
+    }
+
+    #[test]
+    fn only_well_formed_names_can_be_passed() {
+        assert!(valid_pass_env("HTTP_PROXY"));
+        assert!(valid_pass_env("AWS_*"));
+        assert!(!valid_pass_env("*"));
+        assert!(!valid_pass_env("MURU_THING"));
+        assert!(!valid_pass_env("not a name"));
+    }
+
     fn prepared(argv: &[&str], log: PathBuf) -> Prepared {
         Prepared {
             app: "shop".to_owned(),
@@ -1253,6 +1412,7 @@ mod tests {
             argv: argv.iter().map(|part| (*part).to_owned()).collect(),
             env: vec![("GREETING".to_owned(), "hello".to_owned())],
             unset: Vec::new(),
+            clean: false,
             cwd: std::env::temp_dir(),
             identity: None,
             log: Some(log),
@@ -1307,6 +1467,7 @@ mod tests {
                 runtime: Some(&runtime),
                 pycache: None,
                 bytecode: Some(Bytecode::Off),
+                base: None,
             },
             "shop",
             "r2",
@@ -1355,6 +1516,7 @@ mod tests {
                     runtime: None,
                     pycache: None,
                     bytecode,
+                    base: None,
                 },
                 "shop",
                 "r2",

@@ -725,6 +725,8 @@ pub struct Info {
     /// What runs for each release now, by application and release, as the
     /// daemon last published it.
     pub live: std::sync::Mutex<HashMap<(String, String), LiveRelease>>,
+    /// Section 8.7: `[daemon] pass_env`, as a reload may change it.
+    pub pass_env: std::sync::RwLock<Vec<String>>,
     /// Section 8.4: uv as found and how it is run, from the `[tools]`
     /// table read at start.
     pub provisioning: crate::provision::Provisioning,
@@ -1349,6 +1351,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
         live: std::sync::Mutex::new(HashMap::new()),
+        pass_env: std::sync::RwLock::new(settings.pass_env.clone()),
         servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
     });
@@ -2802,6 +2805,17 @@ impl Daemon {
         let mut defined = self.client_rules.defined();
         defined.budget = self.budget_view(self.budget_usage());
         *self.info.defined.write().expect("defined names poisoned") = defined;
+        let pass_env_was = std::mem::replace(
+            &mut *self.info.pass_env.write().expect("pass_env poisoned"),
+            settings.pass_env.clone(),
+        );
+
+        if pass_env_was != settings.pass_env {
+            report.changed("[daemon] pass_env", "for releases started from now on");
+        } else {
+            report.unchanged("[daemon] pass_env");
+        }
+
         let actions = settings.dashboard_actions;
         let actions_were = self
             .info
@@ -4019,6 +4033,7 @@ impl Daemon {
                     return false;
                 }
             };
+        let env = self.server_environment(env, app, id, &release.spec);
         let adopted = Servers::adopt(
             &http,
             &run_dir.join("r1"),
@@ -4721,6 +4736,7 @@ impl Daemon {
         let library = self.runtime_library(&python).await?;
         let pycache = self.pycache_prefix(app, id, spec, identity);
         let bytecode = Some(spec.bytecode.effective());
+        let base = self.daemon_base(bytecode);
         let env = crate::commands::environment(
             env,
             &crate::commands::Interpreter {
@@ -4728,6 +4744,7 @@ impl Daemon {
                 runtime: library.pythonpath.as_deref(),
                 pycache: pycache.as_deref(),
                 bytecode,
+                base: Some(&base),
             },
             app,
             id,
@@ -4740,7 +4757,8 @@ impl Daemon {
             label: "exec".to_owned(),
             argv: Vec::new(),
             env,
-            unset: crate::commands::not_inherited(bytecode),
+            unset: Vec::new(),
+            clean: true,
             cwd: spec.source.clone(),
             identity,
             log: Some(self.host_log(app, id)),
@@ -4871,6 +4889,8 @@ impl Daemon {
         // instances instead of a host.
 
         if let Some(http) = spec.http.clone() {
+            let env = self.server_environment(env, app, id, spec);
+
             return self
                 .start_servers(app, id, &release, &http, env, identity, &run_dir, started)
                 .await;
@@ -4918,11 +4938,31 @@ impl Daemon {
 
         let pycache_prefix = self.pycache_prefix(app, id, spec, identity);
 
+        // Section 8.7: the host starts from a clean environment, built
+        // once for its host and workers.
+
+        let bytecode = Some(spec.bytecode.effective());
+        let base = self.daemon_base(bytecode);
+        let env = crate::commands::environment(
+            env,
+            &crate::commands::Interpreter {
+                python: &python,
+                runtime: library.pythonpath.as_deref(),
+                pycache: pycache_prefix.as_deref(),
+                bytecode,
+                base: Some(&base),
+            },
+            app,
+            id,
+            &spec.source,
+        );
+
         let host_spec = HostSpec {
             python,
-            pythonpath: library.pythonpath.clone(),
-            pycache_prefix,
-            bytecode: Some(spec.bytecode.effective()),
+            pythonpath: None,
+            pycache_prefix: None,
+            bytecode: None,
+            clean_env: true,
             app: spec.entrypoint.clone(),
             name: Some(app.to_owned()),
             release: Some(id.to_owned()),
@@ -4958,6 +4998,7 @@ impl Daemon {
                 .env
                 .iter()
                 .filter_map(crate::model::EnvSpec::shown_name)
+                .chain(base.into_iter().map(|(name, _)| name))
                 .collect(),
             identity,
             groups: spec
@@ -8342,6 +8383,45 @@ impl Daemon {
         }
 
         self.publish_servers();
+    }
+
+    /// Section 8.7: what a release's processes start from, from the
+    /// daemon's own environment.
+    fn daemon_base(&self, bytecode: Option<muru_config::Bytecode>) -> Vec<(String, String)> {
+        let pass_env = self
+            .info
+            .pass_env
+            .read()
+            .expect("pass_env poisoned")
+            .clone();
+
+        crate::commands::passed_from_daemon(std::env::vars(), &pass_env, bytecode)
+    }
+
+    /// A managed server's whole environment: its release's variables over
+    /// the clean base, with the release's interpreter first on PATH.
+    fn server_environment(
+        &self,
+        env: Vec<(String, String)>,
+        app: &str,
+        id: &str,
+        spec: &crate::model::ReleaseSpec,
+    ) -> Vec<(String, String)> {
+        let base = self.daemon_base(None);
+
+        crate::commands::environment(
+            env,
+            &crate::commands::Interpreter {
+                python: &spec.python,
+                runtime: None,
+                pycache: None,
+                bytecode: None,
+                base: Some(&base),
+            },
+            app,
+            id,
+            &spec.source,
+        )
     }
 
     /// Publish what runs for each release, for the release objects the

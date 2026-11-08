@@ -176,9 +176,14 @@ these:
 
 - the release's own, from `[tool.muru.env]` and `muructl deploy --env`,
   except a value that comes from a secret store. A secret delivered as
-  a file shows its `NAME_FILE` path.
+  a file shows its `NAME_FILE` path;
 
-Every other variable is named without its value:
+- under the daemon, what it passes on: `HOME`, `USER`, `LOGNAME`,
+  `TMPDIR` and the variables `[daemon] pass_env` names.
+
+Every other variable is named without its value. Under `muructl run`
+and `muructl serve`, which keep the environment they were started with,
+that is most of them:
 
 ```
   environment (64 values left out; --env shows them):

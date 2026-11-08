@@ -539,6 +539,9 @@ pub struct HostSpec {
     /// Section 8.2: the release's bytecode setting; none where bytecode
     /// is left to Python and the environment, as in a development run.
     pub bytecode: Option<muru_config::Bytecode>,
+    /// Whether `env` is the whole environment rather than laid over this
+    /// process's own (section 8.7), as it is under the daemon.
+    pub clean_env: bool,
     /// The user and group the host runs as, and its umask, when the
     /// daemon is root and the application names them (section 10.9).
     pub identity: Option<Identity>,
@@ -994,6 +997,10 @@ impl HostProcess {
         // Section 8.2: where bytecode goes, when it is not left to Python.
         // The release's setting holds whatever the daemon inherited, but
         // its own environment may still turn bytecode off.
+
+        if spec.clean_env {
+            command.env_clear();
+        }
 
         for name in crate::commands::not_inherited(spec.bytecode) {
             command.env_remove(name);

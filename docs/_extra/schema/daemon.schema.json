@@ -617,6 +617,13 @@
           "description": "Allow `muructl debug exec`, which runs code in a worker; off unless set.",
           "type": "boolean"
         },
+        "pass_env": {
+          "description": "Variables of the daemon's own environment passed to a release's host, workers, commands and managed servers, beside `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TZ` and `TMPDIR`. Each is a name, or a name with a `*` suffix such as `AWS_*`. A release's own variables override them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "user": {
           "default": "muru",
           "description": "The service user: whom a daemon that runs as root starts the edge, and the applications that name no user of their own, as. Never root.",

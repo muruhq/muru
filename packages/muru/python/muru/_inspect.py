@@ -43,7 +43,8 @@ REDACTED_SUFFIXES = ("_DSN",)
 
 # Section 11.7: the variables whose values inspect shows without --env,
 # by name and by prefix: what Muru sets and what the interpreter reads.
-# The release's own, which the host names in DECLARED, are shown too.
+# The release's own and, under the daemon, what the daemon passes on
+# (section 8.7), are shown too: the host names them in DECLARED.
 
 SHOWN = ("PATH", "VIRTUAL_ENV", "LANG", "TZ")
 SHOWN_PREFIXES = ("MURU_", "PYTHON", "LC_")

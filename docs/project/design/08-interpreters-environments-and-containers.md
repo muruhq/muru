@@ -227,3 +227,14 @@ COPY --from=build /usr/local/bin/muructl /usr/local/bin/muructl
 RUN useradd --uid 10001 app && install -d -o 10001 -g 0 -m 0770 /run/muru
 USER app
 ```
+
+## 8.7 A release's environment
+
+Under the daemon a release's host and workers, its commands (section 9.12) and its managed server instances (section 9.9) start from a clean environment, so what a release sees does not depend on who started the daemon or from where. It is made of, in order, later entries overriding earlier ones:
+
+1. A small base taken from the daemon's own environment when set there: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TZ` and `TMPDIR`.
+2. The variables `[daemon] pass_env` names, each a variable name or a `PREFIX*` pattern and never a value. A reload changes the list for releases started from then on. A name Muru sets itself cannot be passed.
+3. What the release declares: `[tool.muru.env]`, `--env` and secrets.
+4. What Muru sets, which nothing overrides: the `MURU_` variables, the interpreter's directory first on `PATH`, `VIRTUAL_ENV` for a virtual environment, `PYTHONPATH` with the runtime library first, and the bytecode settings of section 8.2. A variable the release's bytecode setting says must not be inherited is left out of the base and of `pass_env`.
+
+One function builds this for the host, for commands and for managed servers (`commands::environment`, from `commands::passed_from_daemon`). `muructl debug inspect` shows the values of every variable named here (section 11.7). `muructl run` and `muructl serve` keep the environment of the process that started them, since a development run belongs to the person running it and a container is configured through its environment.
