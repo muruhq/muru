@@ -405,6 +405,11 @@ pub fn stop_wait(budget: Duration) -> Duration {
     budget + STOP_MARGIN * 2
 }
 
+/// The variable naming, comma separated, the release's variables whose
+/// values `debug inspect` shows (section 11.7); the runtime library reads
+/// it as `muru._inspect.DECLARED`.
+pub const SHOWN_ENV_VARIABLE: &str = "MURU_DECLARED_ENV";
+
 /// What every host of a run is started with.
 pub struct HostSpec {
     /// The interpreter with the muru runtime library installed.
@@ -490,6 +495,9 @@ pub struct HostSpec {
     /// Environment variables for the host and its workers (section
     /// 10.8), secret values already resolved.
     pub env: Vec<(String, String)>,
+    /// Section 11.7: the variables of `env` whose values `debug inspect`
+    /// shows without `--env`, which leaves out a secret's value.
+    pub shown_env: Vec<String>,
     /// Section 8.3: the runtime library directory to put first on
     /// PYTHONPATH, when the environment's own `muru` is not used.
     pub pythonpath: Option<PathBuf>,
@@ -960,6 +968,11 @@ impl HostProcess {
         }
 
         command.envs(spec.env.iter().map(|(name, value)| (name, value)));
+
+        // Section 11.7: the release's variables whose values debug
+        // inspect shows, beside Muru's own and the interpreter's.
+
+        command.env(SHOWN_ENV_VARIABLE, spec.shown_env.join(","));
 
         if let Some(prefix) = &spec.pycache_prefix {
             command.env("PYTHONPYCACHEPREFIX", prefix);

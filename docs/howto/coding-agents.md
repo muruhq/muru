@@ -114,6 +114,14 @@ only the commands an application declares.
 Both are enforced by the server: a tool left out is not listed and cannot
 be called.
 
+`debug` with `inspect` is a tool that reads, so it is offered under
+`--read-only` too. It returns the names of every environment variable
+of the release's workers, and values only for Muru's own, the
+interpreter's and the release's, masked where they look like secrets
+(see [inspect](debugging.md#inspect)). It never returns the other
+values: `muructl debug inspect --env`, which shows them, is for a
+person at a terminal and is not offered as a tool.
+
 Whoever launches the server has the access the admin socket gives, which
 for a developer's own user daemon is everything. Do not point an agent at a
 shared system daemon unless that is intended.

@@ -753,8 +753,11 @@ pub enum DebugCommand {
     Tasks(DebugArgs),
 
     /// Each worker's interpreter, sys.path, loaded modules, threads,
-    /// descriptors and environment (secrets redacted).
-    Inspect(DebugArgs),
+    /// descriptors and environment: every variable's name, with values
+    /// only for Muru's own, the interpreter's and the release's unless
+    /// --env asks for every one; values that look like secrets are
+    /// masked either way.
+    Inspect(InspectArgs),
 
     /// Sample every thread's stack for a period, merged across the
     /// workers, as collapsed stacks for a flame graph or as pstats; with
@@ -783,6 +786,19 @@ pub enum DebugCommand {
     /// is under muructl run; under the daemon, only when its [daemon]
     /// table sets debug_exec.
     Attach(AttachArgs),
+}
+
+/// `muructl debug inspect`.
+#[derive(Args)]
+pub struct InspectArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// Show the value of every environment variable, masked where it
+    /// looks like a secret, not only Muru's, the interpreter's and the
+    /// release's.
+    #[arg(long)]
+    env: bool,
 }
 
 /// `muructl debug attach`.
@@ -1001,7 +1017,11 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::Status(args) => ("status", args, serde_json::json!({})),
         DebugCommand::Stacks(args) => ("stacks", args, serde_json::json!({})),
         DebugCommand::Tasks(args) => ("tasks", args, serde_json::json!({})),
-        DebugCommand::Inspect(args) => ("inspect", args, serde_json::json!({})),
+        DebugCommand::Inspect(inspect) => (
+            "inspect",
+            &inspect.common,
+            serde_json::json!({"env": inspect.env}),
+        ),
         DebugCommand::Profile(profile) => (
             "profile",
             &profile.common,
@@ -2059,10 +2079,26 @@ fn print_inspect(response: &pb::DebugResponse) {
             println!("  {count} open descriptors");
         }
 
-        println!("  environment:");
+        // A variable whose value was not asked for is named alone, and
+        // the heading says how to see the rest.
 
-        for (key, value) in result["environment"].as_object().into_iter().flatten() {
-            println!("    {key}={}", value.as_str().unwrap_or(""));
+        let environment = result["environment"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let withheld = environment.values().filter(|value| value.is_null()).count();
+
+        if withheld == 0 {
+            println!("  environment:");
+        } else {
+            println!("  environment ({withheld} values left out; --env shows them):");
+        }
+
+        for (key, value) in &environment {
+            match value.as_str() {
+                Some(value) => println!("    {key}={value}"),
+                None => println!("    {key}"),
+            }
         }
 
         println!();

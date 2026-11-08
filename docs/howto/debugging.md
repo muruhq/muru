@@ -164,10 +164,38 @@ scheduled from another thread waited to run.
 
 Each worker's interpreter and executable, working directory, `sys.path`,
 the modules loaded with versions where they declare one, threads, open
-descriptors and environment. The value of a key that looks like a
-secret (`SECRET`, `TOKEN`, `PASSWORD`, `KEY`, `CREDENTIAL` or `AUTH` in
-its name, or a name ending in `_DSN`) is replaced by `***`, and a
-password in a URL under any other key is: `DATABASE_URL` holding
+descriptors and environment.
+
+The environment lists every variable's name, and gives values only for
+these:
+
+- the variables Muru sets, whose names start with `MURU_`;
+
+- the interpreter's: `PATH`, `VIRTUAL_ENV`, `LANG`, `TZ`, and names
+  starting with `PYTHON` or `LC_`;
+
+- the release's own, from `[tool.muru.env]` and `muructl deploy --env`,
+  except a value that comes from a secret store. A secret delivered as
+  a file shows its `NAME_FILE` path.
+
+Every other variable is named without its value:
+
+```
+  environment (64 values left out; --env shows them):
+    DATABASE_URL=postgres://shop:***@db/shop
+    HOME
+    MURU_APP=shop
+    PATH=/usr/bin:/bin
+    SENTRY_ENVIRONMENT
+```
+
+`muructl debug inspect --env` shows every variable's value. In `--json`,
+a value left out is `null`.
+
+Either way, the value of a key that looks like a secret (`SECRET`,
+`TOKEN`, `PASSWORD`, `KEY`, `CREDENTIAL` or `AUTH` in its name, or a
+name ending in `_DSN`) is replaced by `***`, and a password in a URL
+under any other key is: `DATABASE_URL` holding
 `postgres://shop:hunter2@db/shop` is shown as
 `postgres://shop:***@db/shop`.
 

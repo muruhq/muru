@@ -2898,6 +2898,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
                 )),
             })
             .collect::<anyhow::Result<Vec<_>>>()?,
+        shown_env: resolved.env.keys().cloned().collect(),
         identity: None,
     };
 

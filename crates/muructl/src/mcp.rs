@@ -696,7 +696,7 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "debug",
-            description: "Look into a release's workers: status (pid, uptime, requests, memory), stacks (each thread's Python stack and the request it serves), tasks (asyncio), memory, or inspect (interpreter, modules, environment).",
+            description: "Look into a release's workers: status (pid, uptime, requests, memory), stacks (each thread's Python stack and the request it serves), tasks (asyncio), memory, or inspect (interpreter, modules, and every environment variable's name, with values only for Muru's own, the interpreter's and the release's).",
             changes: false,
             properties: json!({
                 "what": {"type": "string", "enum": ["status", "stacks", "tasks", "memory", "inspect"]},
@@ -1244,6 +1244,17 @@ mod tests {
             ])
         );
         assert!(command("debug", json!({"what": "exec", "target": "shop"})).is_err());
+
+        // Every environment value is for a person at a terminal, never
+        // for the agent's context.
+
+        assert_eq!(
+            command(
+                "debug",
+                json!({"what": "inspect", "target": "shop", "env": true})
+            ),
+            Ok(vec!["debug".into(), "inspect".into(), "shop".into()])
+        );
         assert_eq!(
             command(
                 "run_command",

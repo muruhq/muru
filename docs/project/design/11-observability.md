@@ -104,7 +104,7 @@ Every worker has a control connection to its host, and the host to the daemon, s
 
 **State and configuration.**
 
-- `muructl debug inspect`: the worker's sys.path, loaded modules with versions and file paths, environment with secrets redacted (the value of a key with SECRET, TOKEN, PASSWORD, PASSWD, KEY, CREDENTIAL or AUTH in its name or ending in _DSN, and the password of a URL under any other key), resolved settings, open descriptors and sockets, and thread names.
+- `muructl debug inspect`: the worker's sys.path, loaded modules with versions and file paths, environment, resolved settings, open descriptors and sockets, and thread names. The environment names every variable and gives values only for those Muru sets (`MURU_*`), the interpreter's (`PATH`, `VIRTUAL_ENV`, `LANG`, `TZ`, `PYTHON*`, `LC_*`) and the release's own, from `[tool.muru.env]` and `deploy --env`, a secret store's value excepted (a secret as a file shows its `NAME_FILE`); the host names the release's in `MURU_DECLARED_ENV`, and the runtime library holds the list of the others in one place. `--env` gives every value, for a person at a terminal; the MCP `debug` tool never passes it (section 10.11). Every value shown has secrets redacted (the value of a key with SECRET, TOKEN, PASSWORD, PASSWD, KEY, CREDENTIAL or AUTH in its name or ending in _DSN, and the password of a URL under any other key).
 - `muructl logging level` (section 11.4) changes a logger's level for a period and reverts on its own.
 - faulthandler is enabled in every worker with its output routed to the log collector, so a crash in a C extension leaves a Python traceback rather than nothing.
 
