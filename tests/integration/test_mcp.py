@@ -210,11 +210,17 @@ def test_the_skill_installs_into_the_project_and_reports_its_state(tmp_path: Pat
     current = skill(tmp_path, "status")
     assert current.returncode == 0 and "matches" in current.stdout
 
-    # An older or edited copy is out of date, and install puts it right.
+    # An edited copy is told apart from an out-of-date one, and install
+    # replaces it only with --force (issue 463).
 
-    path.write_text(path.read_text().replace("Developing with Muru", "Old"))
-    assert json.loads(skill(tmp_path, "status", "--json").stdout)["state"] == "out_of_date"
-    skill(tmp_path, "install")
+    path.write_text(path.read_text() + "\nOur notes.\n")
+    assert json.loads(skill(tmp_path, "status", "--json").stdout)["state"] == "edited"
+    refused = skill(tmp_path, "install")
+    assert refused.returncode == 1 and "--force" in refused.stderr, refused.stderr
+    assert path.read_text().endswith("Our notes.\n")
+
+    forced = skill(tmp_path, "install", "--force")
+    assert forced.returncode == 0 and "local changes" in forced.stdout, forced.stdout
     assert skill(tmp_path, "status").returncode == 0
 
     other = skill(tmp_path, "install", "--dir", "agents")

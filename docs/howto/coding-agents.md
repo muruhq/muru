@@ -148,12 +148,27 @@ and lives in the project, so it travels with the code:
 ```
 muructl mcp skill install          # writes .claude/skills/muru/SKILL.md
 muructl mcp skill install --dir .agents/skills    # another client's skills directory
-muructl mcp skill status           # current, missing or out of date; exits 1 unless current
+muructl mcp skill status           # current, missing, out of date or edited; exits 1 unless current
 muructl mcp skill print            # the skill on standard output
 ```
 
 Commit the skill with the project. After upgrading `muructl`, run `install`
-again; `status` in a `just` recipe or CI says when that is due. The MCP
+again; `status` in a `just` recipe or CI says when that is due.
+
+The skill records a hash of its text, so `status` tells a copy with local
+changes from one an older `muructl` wrote:
+
+```
+muru: the skill at .claude/skills/muru/SKILL.md is from muructl 1.0.0; this is muructl 1.1.0, and `muructl mcp skill install` updates it
+muru: the skill at .claude/skills/muru/SKILL.md has local changes to the skill for muructl 1.1.0; `muructl mcp skill install --force` replaces them
+```
+
+`install` refuses to overwrite a copy with local changes unless given
+`--force`, and then says it replaced them. The Muru skill is replaced on
+every upgrade, so keep the project's own notes for the agent in a skill
+of their own (`.claude/skills/shop/SKILL.md`, say) or in `CLAUDE.md`.
+
+The MCP
 server checks too: when the project's copy is missing or differs from the
 `muructl` serving it, the instructions it gives the agent at the start of
 a session say so and name the command, and the `skill_status` tool answers

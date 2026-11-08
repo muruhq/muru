@@ -879,7 +879,7 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "skill_status",
-            description: "Whether the project's Muru skill (.claude/skills/muru/SKILL.md) matches this muructl's: current, missing or out_of_date; `muructl mcp skill install` writes or updates it.",
+            description: "Whether the project's Muru skill (.claude/skills/muru/SKILL.md) matches this muructl's: current, missing, out_of_date, edited (local changes) or edited_out_of_date; `muructl mcp skill install` writes or updates it, and replaces an edited copy only with --force.",
             changes: false,
             properties: json!({}),
             required: &[],
