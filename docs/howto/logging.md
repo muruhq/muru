@@ -111,6 +111,13 @@ page carry too. On a terminal the time is your local clock; when the
 output goes to a pipe or a file, or with `--timestamps`, it is the full
 UTC time, as in `2026-11-02T05:42:22.836Z 200 GET /hello ...`.
 
+A request that never reached a worker, as one answered with a 503
+`queue_full` is, shows the time it waited and no application time:
+
+```
+05:42:27.903 503 GET /report 158B 5.00s queue=5.00s reason=queue_full id=01M5P6X4HQ740HFT2N80MAV4YV
+```
+
 A WebSocket has two lines with the same request id. The first is written
 when the application accepts it, with the 101 and the handshake's time;
 the second when it closes, with how long it was open, the bytes sent to

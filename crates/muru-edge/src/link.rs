@@ -1883,6 +1883,11 @@ async fn handle_inner(
         )
         .await;
 
+        // The time waited is recorded whether a worker was found or not,
+        // so a 503 for a full queue logs the whole wait.
+
+        recording.record.queue = queued.elapsed();
+
         let lease = match acquired {
             Ok(Ok(lease)) => lease,
             Ok(Err(error)) => {
@@ -1927,7 +1932,6 @@ async fn handle_inner(
 
         let Conn { reader, mut writer } = conn;
         recording.record.worker = Some(worker);
-        recording.record.queue = queued.elapsed();
         recording.record.retried = retried;
         recording.in_flight.dispatched(worker, on_loop);
 

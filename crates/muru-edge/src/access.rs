@@ -1625,6 +1625,8 @@ fn text_line(record: &Record) -> String {
             format_duration(record.queue),
             format_duration(record.application)
         );
+    } else if !record.queue.is_zero() {
+        let _ = write!(line, " queue={}", format_duration(record.queue));
     }
 
     if !record.reason.is_empty() {
