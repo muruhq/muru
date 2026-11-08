@@ -31,6 +31,8 @@ pub enum HostMessage {
         /// The interfaces the host settled, by mount, the default mount's
         /// under the empty name; none when the workers settle them.
         interfaces: Vec<(String, String)>,
+        /// Every worker the host runs now.
+        workers: Vec<HostWorker>,
     },
     /// An event about a worker, for the event log.
     Event {
@@ -60,6 +62,21 @@ pub enum HostMessage {
         /// Why no worker was asked, when none was.
         error: String,
     },
+}
+
+/// One worker a host runs, as it last announced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostWorker {
+    /// The worker's index within the host.
+    pub index: u32,
+    /// Its pid.
+    pub pid: u32,
+    /// Its group.
+    pub group: String,
+    /// The socket it listens on.
+    pub socket: String,
+    /// What it is doing: starting, ready, debugging, replacing or retiring.
+    pub state: String,
 }
 
 /// One worker's answer to a request (section 11.7).
@@ -231,6 +248,21 @@ impl HostMessage {
                             .iter()
                             .filter_map(|(mount, interface)| {
                                 Some((mount.clone(), interface.as_str()?.to_owned()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                workers: value["workers"]
+                    .as_array()
+                    .map(|workers| {
+                        workers
+                            .iter()
+                            .map(|worker| HostWorker {
+                                index: worker["index"].as_u64().unwrap_or(0) as u32,
+                                pid: worker["pid"].as_u64().unwrap_or(0) as u32,
+                                group: worker["group"].as_str().unwrap_or("default").to_owned(),
+                                socket: worker["socket"].as_str().unwrap_or_default().to_owned(),
+                                state: worker["state"].as_str().unwrap_or_default().to_owned(),
                             })
                             .collect()
                     })

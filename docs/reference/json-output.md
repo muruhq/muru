@@ -56,7 +56,7 @@ $ muructl release show shop@r9 --json
 | `muructl daemon reload` | What was reloaded: `message` |
 | `muructl app list` | `{"apps": [...]}`, each with `name`, `current_release`, `previous_release`, `user`, `maintenance` and the rest |
 | `muructl release list` | `{"releases": [...]}`, each a release as `release show` prints it |
-| `muructl release show` | The release: `app`, `id`, `state`, `message`, `source`, `entrypoint`, `serving`, its settings, mounts and groups; for a managed server, `server_instances`, each with `index`, `pid`, `address` and `started_unix_ms` |
+| `muructl release show` | The release: `app`, `id`, `state`, `message`, `source`, `entrypoint`, `serving`, its settings, mounts and groups; `host_running` (whether a host runs for it now), `workers` (each with `index`, `pid`, `group`, `socket` and `state`, one of `starting`, `ready`, `debugging`, `replacing` or `retiring`, empty when no host runs), `detected_interface` (`wsgi`, `asgi` or `grpc`, empty until known), `retained_until_unix_ms` (for a retained release, when it is stopped, otherwise `0`); for a managed server, `server_instances`, each with `index`, `pid`, `address` and `started_unix_ms` |
 | `muructl release wait` | The release once it reached a state waited for |
 | `muructl host list` | `{"hosts": [...]}` |
 | `muructl route list` | `{"routes": [...]}` |

@@ -1907,7 +1907,36 @@ class Host:
                 if group.name != "default"
             ],
             "interfaces": self.interfaces(),
+            "workers": [
+                {
+                    "index": state.index,
+                    "pid": state.pid,
+                    "group": self.placement[state.index][0].name,
+                    "socket": state.path,
+                    "state": self.worker_state(state),
+                }
+                for state in sorted(self.states.values(), key=lambda state: state.index)
+                if not state.replaced
+            ],
         }
+
+    def worker_state(self, state: WorkerState) -> str:
+        """Return one word for what a worker is doing.
+
+        It is `starting`, `ready`, `debugging` (a debugger session is
+        open), `replacing` (a fresh worker takes its place) or `retiring`
+        (scaled in).
+        """
+
+        leaving = self.replacing.get(state.index)
+
+        if state.replaced:
+            return "retiring" if leaving is not None and leaving.retire else "replacing"
+
+        if state.debug_sessions:
+            return "debugging"
+
+        return "ready" if state.ready else "starting"
 
     def interfaces(self) -> dict[str, str]:
         """Return the interfaces settled so far, by mount, the default as ``""``.
@@ -2268,22 +2297,10 @@ class Host:
         worker is routed once the host's latest announcement names it and
         the supervisor has acknowledged that announcement, so the edge
         routes to it; a replacement still warming, or a worker out of
-        routing while it is debugged, is not. Its state is `starting`,
-        `ready`, `debugging` (a debugger session is open), `replacing` (a
-        fresh worker takes its place) or `retiring` (scaled in).
+        routing while it is debugged, is not.
         """
 
         sides = state.sides if live is None else live
-        leaving = self.replacing.get(state.index)
-
-        if state.replaced:
-            status = "retiring" if leaving is not None and leaving.retire else "replacing"
-        elif state.debug_sessions:
-            status = "debugging"
-        elif state.ready:
-            status = "ready"
-        else:
-            status = "starting"
 
         return {
             "index": state.index,
@@ -2293,7 +2310,7 @@ class Host:
                 "group": self.placement[state.index][0].name,
                 "generation": state.generation,
                 "socket": state.path,
-                "state": status,
+                "state": self.worker_state(state),
                 "ready": state.ready,
                 "routed": self.routed.get(state.index) == state.path and self.acked >= self.version,
                 "debugging": state.debug_sessions > 0,
@@ -2733,6 +2750,11 @@ class Host:
         elif state.index in self.starting:
             self.starting.discard(state.index)
             self.routed[state.index] = state.path
+            self.announce()
+        elif self.supervisor is not None:
+            # A worker of the first fork was routed from the start, but
+            # the supervisor reports its state.
+
             self.announce()
 
     def check_requests(self, state: WorkerState) -> None:

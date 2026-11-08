@@ -378,6 +378,7 @@ impl Admin for Service {
             .await
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
+        await_host_report(&self.handle, &release).await;
         Ok(Response::new(release_message(release, &self.handle)))
     }
 
@@ -2638,6 +2639,50 @@ fn rollout_message(rollout: &Rollout) -> pb::Rollout {
     }
 }
 
+/// How long a deploy's answer waits for what the host has to say.
+const HOST_REPORT_WAIT: Duration = Duration::from_secs(2);
+
+/// Wait, within reason, until a release's host has said which workers it
+/// runs and what the application turned out to be, which it tells the
+/// daemon once the daemon's loop is free again after the deploy.
+async fn await_host_report(handle: &Handle, release: &Release) {
+    let deadline = tokio::time::Instant::now() + HOST_REPORT_WAIT;
+    let key = (release.app.clone(), release.id.clone());
+
+    loop {
+        let live = handle
+            .info
+            .live
+            .lock()
+            .expect("live poisoned")
+            .get(&key)
+            .cloned();
+        let reported = live
+            .as_ref()
+            .is_some_and(|live| !live.host || live.announced);
+
+        // A release at zero workers has nothing to settle its interface.
+
+        let settled = release.spec.interface != muru_config::Interface::Auto
+            || live.is_some_and(|live| live.workers.is_empty())
+            || !handle
+                .info
+                .interfaces
+                .announced(&release.app, &release.id)
+                .is_empty();
+
+        if release.spec.http.is_some() || (reported && settled) {
+            return;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn release_message(release: Release, handle: &Handle) -> pb::Release {
     let serving = handle
         .store
@@ -2673,13 +2718,28 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                 .collect()
         })
         .unwrap_or_default();
-    let detected_for = |mount: &str| {
+    let live = handle
+        .info
+        .live
+        .lock()
+        .expect("live poisoned")
+        .get(&(release.app.clone(), release.id.clone()))
+        .cloned()
+        .unwrap_or_default();
+
+    // What the host announced, and a declared interface until it has.
+
+    let detected_for = |mount: &str, declared: muru_config::Interface| {
         detected
             .iter()
             .find(|(name, _)| name == mount)
             .map(|(_, interface)| interface.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(|| match declared {
+                muru_config::Interface::Auto => String::new(),
+                other => other.as_str().to_owned(),
+            })
     };
+    let detected_interface = detected_for("", release.spec.interface);
 
     let bytecode = match release.spec.bytecode.effective() {
         muru_config::Bytecode::Redirect => format!(
@@ -2750,8 +2810,19 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         serving,
         created_unix_ms: release.created_unix_ms,
         resource_version: release.resource_version,
-        workers: Vec::new(),
-        retained_until_unix_ms: 0,
+        workers: live
+            .workers
+            .into_iter()
+            .map(|worker| pb::Worker {
+                index: worker.index,
+                pid: worker.pid,
+                socket: worker.socket,
+                group: worker.group,
+                state: worker.state,
+            })
+            .collect(),
+        host_running: live.host,
+        retained_until_unix_ms: live.retained_until_unix_ms,
         kind: if release.spec.http.is_some() {
             "http".to_owned()
         } else {
@@ -2784,7 +2855,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                     .threads
                     .map_or(0, |threads| saturate(threads.reserved())),
                 max_threads: mount.threads.map_or(0, |threads| saturate(threads.max())),
-                detected_interface: detected_for(&mount.name),
+                detected_interface: detected_for(&mount.name, mount.interface),
             })
             .collect(),
         groups: release
@@ -2805,7 +2876,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                 mounts: group.mounts.clone(),
             })
             .collect(),
-        detected_interface: detected_for(""),
+        detected_interface,
         websockets,
     }
 }

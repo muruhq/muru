@@ -585,7 +585,7 @@ message Release {
   bool serving = 13;                // traffic goes to it
   uint64 created_unix_ms = 14;
   uint64 resource_version = 15;
-  repeated Worker workers = 16;
+  repeated Worker workers = 16;     // as its host last reported them; empty when no host runs
   uint64 retained_until_unix_ms = 17; // for a retained release, when it is stopped
   string kind = 18;                 // workers or http (section 9.9)
   string profile = 19;              // the server of an http release
@@ -602,6 +602,7 @@ message Release {
   string build_when = 30;           // the build mode in force: auto, always or never
   string bytecode = 31;             // where bytecode goes: redirect with its directory, source (precompiled when detected), or off
   repeated ServerInstance server_instances = 32; // an http release's instances while it runs (section 9.9)
+  bool host_running = 33;           // whether a host runs for it now; false for a stopped or dormant release
 }
 
 // An instance of an http release's command.
@@ -645,6 +646,8 @@ message Worker {
   uint32 index = 1;
   uint32 pid = 2;
   string socket = 3;
+  string group = 4;                 // its worker group, default when none is named
+  string state = 5;                 // starting, ready, debugging, replacing or retiring
 }
 
 message ListEventsRequest {

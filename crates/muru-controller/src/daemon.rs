@@ -722,9 +722,26 @@ pub struct Info {
     /// The instances of each managed server release (section 9.9), by
     /// application and release, as the daemon last checked them.
     pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceRecord>>>,
+    /// What runs for each release now, by application and release, as the
+    /// daemon last published it.
+    pub live: std::sync::Mutex<HashMap<(String, String), LiveRelease>>,
     /// Section 8.4: uv as found and how it is run, from the `[tools]`
     /// table read at start.
     pub provisioning: crate::provision::Provisioning,
+}
+
+/// What runs for one release now, for the API.
+#[derive(Debug, Clone, Default)]
+pub struct LiveRelease {
+    /// Whether a host runs for it: false for a dormant release.
+    pub host: bool,
+    /// Whether its host has said which workers it runs.
+    pub announced: bool,
+    /// Its workers, as its host last announced them.
+    pub workers: Vec<crate::host::HostWorker>,
+    /// For a retained release, when it is stopped, in Unix milliseconds;
+    /// otherwise 0.
+    pub retained_until_unix_ms: u64,
 }
 
 /// What each release's entrypoints run as (section 6.7): the interface
@@ -911,6 +928,12 @@ struct Running {
     /// The named groups' sockets and paths.
     groups: Vec<GroupRecord>,
     retained_until: Option<Instant>,
+    /// `retained_until` as Unix milliseconds, for the API; 0 when not
+    /// retained.
+    retained_until_unix_ms: u64,
+    /// The workers the host announced last, and whether it has yet.
+    workers: Vec<crate::host::HostWorker>,
+    announced: bool,
     /// Retained for inspection after a rejected rollout, outside the
     /// application's retained slot: it makes way before the rollback
     /// target does.
@@ -1325,6 +1348,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }),
         interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
+        live: std::sync::Mutex::new(HashMap::new()),
         servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
     });
@@ -1614,6 +1638,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 daemon.watch_rate_limits(samples.as_deref());
             }
         }
+
+        daemon.publish_live();
     };
 
     // Section 13.3: by default the daemon detaches, leaving hosts and the
@@ -3926,6 +3952,9 @@ impl Daemon {
                         sockets,
                         groups: record.groups.clone(),
                         retained_until,
+                        retained_until_unix_ms: unix_ms_of(retained_until),
+                        workers: Vec::new(),
+                        announced: false,
                         inspected: false,
                         sticky_until: None,
                         held: false,
@@ -4016,6 +4045,9 @@ impl Daemon {
                         sockets: Vec::new(),
                         groups: Vec::new(),
                         retained_until,
+                        retained_until_unix_ms: unix_ms_of(retained_until),
+                        workers: Vec::new(),
+                        announced: false,
                         inspected: false,
                         sticky_until: None,
                         held: false,
@@ -4780,6 +4812,7 @@ impl Daemon {
             // caller has given it to the edge.
 
             running.retained_until = None;
+            running.retained_until_unix_ms = 0;
             running.inspected = false;
             return Ok(());
         }
@@ -5046,6 +5079,9 @@ impl Daemon {
                 sockets,
                 groups,
                 retained_until: None,
+                retained_until_unix_ms: 0,
+                workers: Vec::new(),
+                announced: false,
                 inspected: false,
                 sticky_until: None,
                 held: false,
@@ -5248,6 +5284,9 @@ impl Daemon {
                 sockets: Vec::new(),
                 groups: Vec::new(),
                 retained_until: None,
+                retained_until_unix_ms: 0,
+                workers: Vec::new(),
+                announced: false,
                 inspected: false,
                 sticky_until: None,
                 held: false,
@@ -5885,9 +5924,11 @@ impl Daemon {
 
             let mut floors = Vec::new();
             let mut kept = Kept::Workers(Vec::new());
+            let until = crate::model::now_unix_ms() + retain.lasts.as_millis() as u64;
 
             if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
                 running.retained_until = Some(Instant::now() + retain.lasts);
+                running.retained_until_unix_ms = until;
                 running.inspected = !retain.slot;
                 let host = running.backend.host().is_some();
                 let mut counts = Vec::new();
@@ -5926,7 +5967,6 @@ impl Daemon {
             // would cost, from what is kept. A retained release is not
             // scaled or idled, so the note holds until it is stopped.
 
-            let until = crate::model::now_unix_ms() + retain.lasts.as_millis() as u64;
             let lasts = muru_config::format_duration(retain.lasts);
 
             let (note, event) = if retain.slot {
@@ -8292,6 +8332,29 @@ impl Daemon {
         self.publish_servers();
     }
 
+    /// Publish what runs for each release, for the release objects the
+    /// API answers with: after everything the daemon does, so a release
+    /// that stops leaves the map at once.
+    fn publish_live(&self) {
+        let live: HashMap<(String, String), LiveRelease> = self
+            .running
+            .iter()
+            .map(|(key, running)| {
+                (
+                    key.clone(),
+                    LiveRelease {
+                        host: running.backend.host().is_some(),
+                        announced: running.announced,
+                        workers: running.workers.clone(),
+                        retained_until_unix_ms: running.retained_until_unix_ms,
+                    },
+                )
+            })
+            .collect();
+
+        *self.info.live.lock().expect("live poisoned") = live;
+    }
+
     /// Publish each managed server release's instances, for `release
     /// show`: on every check, so a release that stops leaves the list
     /// within one.
@@ -8407,12 +8470,16 @@ impl Daemon {
                 sockets,
                 groups,
                 interfaces,
+                workers,
             } => {
                 self.info.interfaces.announce(app, id, interfaces);
 
                 let Some(running) = self.running.get_mut(&key) else {
                     return;
                 };
+
+                running.workers = workers;
+                running.announced = true;
 
                 // Section 7.4: the scalers were sized from the
                 // configuration when the release started, which may have
@@ -8953,6 +9020,16 @@ impl Daemon {
             tracing::error!(%error, "recording a release state failed");
         }
     }
+}
+
+/// An instant ahead as Unix milliseconds, or 0 for none.
+fn unix_ms_of(instant: Option<Instant>) -> u64 {
+    instant.map_or(0, |instant| {
+        crate::model::now_unix_ms()
+            + instant
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64
+    })
 }
 
 /// A Unix time as HH:MM:SS, UTC.
