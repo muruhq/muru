@@ -64,6 +64,7 @@ The dashboard reads the same values from in-memory history. OTLP metric export i
 - Pull: WatchEvents over gRPC, or Server-Sent Events on the JSON gateway, resumable from a sequence number. muructl events --follow uses the same stream.
 - Push sinks with their own filters: webhooks (HMAC-signed, persistent outbox, at-least-once, deduplicate by id), OTLP log records (and spans for rollouts and deploys), journald or syslog, and JSON lines files.
 - Retention: 7 days by default, capped by size. The audit log is the long-retained subset initiated through the API.
+- A development run, and `muructl serve`, which have no state store, keep the events their hosts raise in memory for the life of the process, the last 256, across reloads, numbered from 1 as the daemon numbers its own and subject `app@rN` by the release that raised them; their admin socket answers ListEvents and WatchEvents from that ring, with `--after` and `--follow` as against the daemon (section 13.1).
 
 ## 11.6 Tracing
 

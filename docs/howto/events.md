@@ -26,6 +26,15 @@ $ muructl events --follow --after 43
 sequence number, so a watcher that reconnects misses nothing. Events are
 kept in the state store, the last ten thousand of them.
 
+A [development run](run-settings.md) and `muructl serve` answer `muructl
+events` too, for the events their hosts raise: workers started,
+recycled, replaced or exited, requests past a timeout or the deadline,
+debugging sessions. They keep the last 256 in memory for as long as
+they run, across reloads, numbered from 1, each with the release that
+raised it as its subject (`shop@r2` after the first reload).
+`--after` and `--follow` work as they do against the daemon. Each event
+is printed to the run's terminal as well.
+
 ## Webhooks
 
 A `[[events.sink]]` entry in the daemon's configuration file names a URL

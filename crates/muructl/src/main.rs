@@ -3017,6 +3017,10 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     // admin socket, which asks the workers things through it.
 
     let host_link: SharedHostLink = Arc::new(std::sync::Mutex::new(HostLink::default()));
+
+    // Section 13.1: the events the hosts raise, kept for muructl events.
+
+    let run_events = Arc::new(run_admin::RunEvents::default());
     host_link
         .lock()
         .expect("host link poisoned")
@@ -3270,6 +3274,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
             host: Arc::clone(&host_link),
             served: Arc::clone(&served),
             commands: commands.clone(),
+            events: Arc::clone(&run_events),
         });
 
         match run_admin::serve(state, admin_stop_rx).await {
@@ -3437,11 +3442,14 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
                             }
                         }
                     }
-                    muru_controller::host::HostMessage::Event { kind, group, reason, .. } => {
+                    muru_controller::host::HostMessage::Event { kind, level, message, group, reason } => {
                         // The host has logged the event, and its line is
-                        // the one the terminal shows; the run counts it.
+                        // the one the terminal shows; the run counts it
+                        // and keeps it for muructl events.
 
-                        run_admin::count_worker_event(&label, &format!("r{}", current.release), &kind, &group, &reason);
+                        let release = format!("r{}", current.release);
+                        run_admin::count_worker_event(&label, &release, &kind, &group, &reason);
+                        run_events.record(&kind, &format!("{label}@{release}"), &level, &message);
                     }
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);

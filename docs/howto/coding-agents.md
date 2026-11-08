@@ -53,7 +53,9 @@ found first, as it is for every command. Its admin socket answers
 `commands` and `run_command` for [the project's own
 commands](commands.md#the-projects-own-commands) with the run's
 application as the target, but not the lists or a deploy; stop it, or
-give `--socket` the daemon's socket, when the agent is to deploy.
+give `--socket` the daemon's socket, when the agent is to deploy. The
+run's `events` are those its workers raised since it started, reloads
+included, [kept in memory](events.md#the-event-stream), the last 256.
 
 ## The development loop
 

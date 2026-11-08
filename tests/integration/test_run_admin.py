@@ -139,6 +139,39 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
         assert server.wait_for_log("request.past_deadline: worker "), server.log()
         assert "GET /sleep?seconds=4 is past its deadline" in server.log()
 
+        # The run keeps the events its hosts raised and answers events
+        # as the daemon does, with --after and --follow (issue 470).
+
+        listed = muructl(runtime, "events", "--json", cwd=support.FIXTURES).stdout
+        events = json.loads(listed)["events"]
+        assert [event["sequence"] for event in events] == list(range(1, len(events) + 1))
+        past = [event for event in events if event["type"] == "request.past_deadline"]
+        assert len(past) == 1, events
+        assert past[0]["subject"] == "plain-wsgi@r1" and past[0]["level"] == "warning"
+
+        last = events[-1]["sequence"]
+        after = muructl(runtime, "events", "--json", "--after", str(last - 1), cwd=support.FIXTURES)
+        assert [event["sequence"] for event in json.loads(after.stdout)["events"]] == [last]
+
+        path = support.muructl_path()
+        assert path is not None
+        follow = subprocess.Popen(
+            [str(path), "events", "--follow", "--json", "--after", str(last)],
+            stdout=subprocess.PIPE,
+            text=True,
+            cwd=support.FIXTURES,
+            env={**os.environ, "MURU_RUN_DIR": str(runtime)},
+        )
+
+        try:
+            muructl(runtime, "restart", "plain-wsgi", "--worker", "0", cwd=support.FIXTURES)
+            assert follow.stdout is not None
+            followed = json.loads(follow.stdout.readline())
+            assert followed["sequence"] == last + 1, followed
+        finally:
+            follow.kill()
+            follow.wait()
+
         # Logging levels and a restart go through the host as they do
         # under the daemon; the restart's event reaches the terminal.
 
@@ -184,8 +217,6 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
         assert "muructl deploy needs the daemon: this is the development run of plain-wsgi" in (
             refused.stderr
         )
-        refused = muructl(runtime, "events", cwd=support.FIXTURES, check=False)
-        assert "a development run keeps no event log" in refused.stderr
         refused = muructl(runtime, "logs", "reopen", cwd=support.FIXTURES, check=False)
         assert "writes no log files" in refused.stderr
 
