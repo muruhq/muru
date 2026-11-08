@@ -283,6 +283,13 @@ first, until it is back under, and until then other releases' scale-out
 is refused. While the node is over its memory budget, retained releases
 are stopped, oldest first.
 
+A retained release counts against the budget with the workers it keeps.
+After a [rollout](rollouts.md) is rolled back or aborted, its candidate
+is kept for 10 minutes beside the release a rollback goes to, so the
+application holds one more retained release meanwhile. Wherever retained
+releases make way, the candidate goes first, ahead of every rollback
+target.
+
 `muructl apply` warns of a release, a schedule or an overlay whose floor
 would not fit the budget as it stands, and each window that raises a
 floor is checked again ahead of time, from the start of its `warm_up` or

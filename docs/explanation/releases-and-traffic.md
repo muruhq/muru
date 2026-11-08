@@ -171,8 +171,9 @@ Two kinds of evidence decide at once, whatever the request count: a
 worker of the candidate that crashes or is killed by a timeout, and a
 probe URL that fails on the candidate more often than on the baseline.
 A gate that fails rolls back immediately, without waiting for the hold
-to end, and the candidate is kept warm with its logs and workers for
-looking at.
+to end, and the candidate is kept for 10 minutes with its logs and
+workers for looking at. It is kept beside the retained release a rollback
+goes to, so a failed canary does not cost the instant rollback.
 
 While a rollout runs, its share is live state the daemon changes. It is
 not part of the configuration `muructl config export` writes, and while

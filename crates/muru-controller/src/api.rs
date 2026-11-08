@@ -356,6 +356,7 @@ impl Admin for Service {
                     workers: request
                         .retain_workers
                         .unwrap_or(crate::daemon::RETAIN_WORKERS),
+                    slot: true,
                 },
                 hold: request.hold,
                 created: created_tx,
@@ -1627,6 +1628,7 @@ impl Admin for Service {
                 workers: request
                     .retain_workers
                     .unwrap_or(crate::daemon::RETAIN_WORKERS),
+                slot: true,
             },
         };
 

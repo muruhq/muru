@@ -50,6 +50,10 @@ pub const RETENTION: Duration = Duration::from_secs(30 * 60);
 /// (section 9.1).
 pub const RETAIN_WORKERS: u32 = 1;
 
+/// How long a rolled back or aborted rollout's candidate is kept, for its
+/// logs and workers to be looked at (section 9.3).
+pub const INSPECTION: Duration = Duration::from_secs(10 * 60);
+
 /// How long to wait for a release's processes to stop, given its stop
 /// budget: never less than the drain timeout.
 fn stop_wait(budget: Duration) -> Duration {
@@ -67,6 +71,11 @@ pub struct Retention {
     pub lasts: Duration,
     /// The workers each group keeps.
     pub workers: u32,
+    /// Whether the release takes its application's one retained slot,
+    /// as the rollback target, making an older retained release stop.
+    /// A rejected rollout's candidate is kept beside it instead, for
+    /// inspection only.
+    pub slot: bool,
 }
 
 impl Default for Retention {
@@ -74,6 +83,20 @@ impl Default for Retention {
         Self {
             lasts: RETENTION,
             workers: RETAIN_WORKERS,
+            slot: true,
+        }
+    }
+}
+
+impl Retention {
+    /// Section 9.3: how a rolled back or aborted rollout's candidate is
+    /// kept: for a shorter window, outside the retained slot, so the
+    /// release a rollback goes to stays warm.
+    pub fn inspection() -> Self {
+        Self {
+            lasts: INSPECTION,
+            slot: false,
+            ..Self::default()
         }
     }
 }
@@ -775,6 +798,10 @@ struct Running {
     /// The named groups' sockets and paths.
     groups: Vec<GroupRecord>,
     retained_until: Option<Instant>,
+    /// Retained for inspection after a rejected rollout, outside the
+    /// application's retained slot: it makes way before the rollback
+    /// target does.
+    inspected: bool,
     /// Section 9.4: while set, the release is leaving traffic but stays
     /// reachable by sticky cookie until the instant, when it drains with
     /// the retention given.
@@ -3786,6 +3813,7 @@ impl Daemon {
                         sockets,
                         groups: record.groups.clone(),
                         retained_until,
+                        inspected: false,
                         sticky_until: None,
                         held: false,
                         control: None,
@@ -3875,6 +3903,7 @@ impl Daemon {
                         sockets: Vec::new(),
                         groups: Vec::new(),
                         retained_until,
+                        inspected: false,
                         sticky_until: None,
                         held: false,
                         control: None,
@@ -4638,6 +4667,7 @@ impl Daemon {
             // caller has given it to the edge.
 
             running.retained_until = None;
+            running.inspected = false;
             return Ok(());
         }
 
@@ -4898,6 +4928,7 @@ impl Daemon {
                 sockets,
                 groups,
                 retained_until: None,
+                inspected: false,
                 sticky_until: None,
                 held: false,
                 control: None,
@@ -5099,6 +5130,7 @@ impl Daemon {
                 sockets: Vec::new(),
                 groups: Vec::new(),
                 retained_until: None,
+                inspected: false,
                 sticky_until: None,
                 held: false,
                 control: None,
@@ -5710,14 +5742,18 @@ impl Daemon {
             .emit("release.draining", &subject, "info", "draining");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // One retained release per application: an older one makes way.
+        // One retained release per application: an older one makes way,
+        // unless this one is kept for inspection only.
 
         if !retain.lasts.is_zero() {
             let older: Vec<String> = self
                 .running
                 .iter()
                 .filter(|((other_app, other_id), running)| {
-                    other_app == app && other_id != id && running.retained_until.is_some()
+                    retain.slot
+                        && other_app == app
+                        && other_id != id
+                        && running.retained_until.is_some()
                 })
                 .map(|((_, other_id), _)| other_id.clone())
                 .collect();
@@ -5733,6 +5769,7 @@ impl Daemon {
 
             if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
                 running.retained_until = Some(Instant::now() + retain.lasts);
+                running.inspected = !retain.slot;
 
                 for group in &mut running.scalers {
                     let held = running
@@ -5754,22 +5791,36 @@ impl Daemon {
             }
 
             let until = crate::model::now_unix_ms() + retain.lasts.as_millis() as u64;
-            self.set_state(
-                &release,
-                ReleaseState::Retained,
-                &format!("warm until {}; a rollback to it is instant", clock(until)),
+            let workers = format!(
+                "{} worker{} per group",
+                retain.workers,
+                if retain.workers == 1 { "" } else { "s" }
             );
-            self.events.emit(
-                "release.retained",
-                &subject,
-                "info",
-                &format!(
-                    "kept warm for {} with {} worker{} per group",
-                    muru_config::format_duration(retain.lasts),
-                    retain.workers,
-                    if retain.workers == 1 { "" } else { "s" }
-                ),
-            );
+
+            let (note, event) = if retain.slot {
+                (
+                    format!("warm until {}; a rollback to it is instant", clock(until)),
+                    format!(
+                        "kept warm for {} with {workers}",
+                        muru_config::format_duration(retain.lasts)
+                    ),
+                )
+            } else {
+                (
+                    format!(
+                        "kept for inspection until {}; not a rollback target",
+                        clock(until)
+                    ),
+                    format!(
+                        "kept for inspection for {} with {workers}; not a rollback target",
+                        muru_config::format_duration(retain.lasts)
+                    ),
+                )
+            };
+
+            self.set_state(&release, ReleaseState::Retained, &note);
+            self.events
+                .emit("release.retained", &subject, "info", &event);
             return;
         }
 
@@ -6144,7 +6195,7 @@ impl Daemon {
                     &subject,
                     "warning",
                     &format!(
-                        "rollout {}: {message}; the candidate is kept warm",
+                        "rollout {}: {message}; the candidate is kept for inspection",
                         rollout.id
                     ),
                 );
@@ -6153,7 +6204,7 @@ impl Daemon {
                 if !self.referenced_releases().contains(&candidate)
                     && self.serving.get(&rollout.app) != Some(&rollout.candidate)
                 {
-                    self.drain(&rollout.app, &rollout.candidate, Retention::default())
+                    self.drain(&rollout.app, &rollout.candidate, Retention::inspection())
                         .await;
                 }
             }
@@ -6892,23 +6943,24 @@ impl Daemon {
 
     /// Section 9.1: the node is over its memory budget. The retained
     /// release created first that still has workers drops to its host
-    /// alone; when none has, the one created first stops.
+    /// alone; when none has, the one created first stops. One kept for
+    /// inspection goes before any rollback target.
     async fn relieve_memory(&mut self) {
-        let mut retained: Vec<(u64, String, String)> = self
+        let mut retained: Vec<(bool, u64, String, String)> = self
             .running
             .iter()
             .filter(|(_, running)| running.retained_until.is_some())
-            .map(|((app, id), _)| {
+            .map(|((app, id), running)| {
                 let created = self
                     .store
                     .release(app, id)
                     .map_or(0, |release| release.created_unix_ms);
-                (created, app.clone(), id.clone())
+                (!running.inspected, created, app.clone(), id.clone())
             })
             .collect();
         retained.sort();
 
-        for (_, app, id) in &retained {
+        for (_, _, app, id) in &retained {
             let key = (app.clone(), id.clone());
             let Some(running) = self.running.get_mut(&key) else {
                 continue;
@@ -6940,7 +6992,7 @@ impl Daemon {
             return;
         }
 
-        if let Some((_, app, id)) = retained.first() {
+        if let Some((_, _, app, id)) = retained.first() {
             self.stop_release(app, id, "the node is over its memory budget")
                 .await;
         }
@@ -7376,7 +7428,8 @@ impl Daemon {
     }
 
     /// The retained release created first of those `wanted` accepts,
-    /// given each one's application and state.
+    /// given each one's application and state; one kept for inspection
+    /// goes before any rollback target.
     fn oldest_retained_where(
         &self,
         wanted: impl Fn(&str, &Running) -> bool,
@@ -7384,15 +7437,15 @@ impl Daemon {
         self.running
             .iter()
             .filter(|((app, _), running)| running.retained_until.is_some() && wanted(app, running))
-            .map(|((app, id), _)| {
+            .map(|((app, id), running)| {
                 let created = self
                     .store
                     .release(app, id)
                     .map_or(0, |release| release.created_unix_ms);
-                (created, app.clone(), id.clone())
+                (!running.inspected, created, app.clone(), id.clone())
             })
             .min()
-            .map(|(_, app, id)| (app, id))
+            .map(|(_, _, app, id)| (app, id))
     }
 
     /// Section 7.5: the capacity active overlays and schedules set, and
