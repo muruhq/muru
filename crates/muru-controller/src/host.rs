@@ -496,8 +496,9 @@ pub struct HostSpec {
     /// Section 8.2: the directory bytecode is written under
     /// (PYTHONPYCACHEPREFIX), when it is redirected.
     pub pycache_prefix: Option<PathBuf>,
-    /// Section 8.2: write no bytecode at all.
-    pub no_bytecode: bool,
+    /// Section 8.2: the release's bytecode setting; none where bytecode
+    /// is left to Python and the environment, as in a development run.
+    pub bytecode: Option<muru_config::Bytecode>,
     /// The user and group the host runs as, and its umask, when the
     /// daemon is root and the application names them (section 10.9).
     pub identity: Option<Identity>,
@@ -950,15 +951,21 @@ impl HostProcess {
             command.current_dir(dir);
         }
 
-        command.envs(spec.env.iter().map(|(name, value)| (name, value)));
-
         // Section 8.2: where bytecode goes, when it is not left to Python.
+        // The release's setting holds whatever the daemon inherited, but
+        // its own environment may still turn bytecode off.
+
+        for name in crate::commands::not_inherited(spec.bytecode) {
+            command.env_remove(name);
+        }
+
+        command.envs(spec.env.iter().map(|(name, value)| (name, value)));
 
         if let Some(prefix) = &spec.pycache_prefix {
             command.env("PYTHONPYCACHEPREFIX", prefix);
         }
 
-        if spec.no_bytecode {
+        if spec.bytecode == Some(muru_config::Bytecode::Off) {
             command.env("PYTHONDONTWRITEBYTECODE", "1");
         }
 

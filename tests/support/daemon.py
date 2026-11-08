@@ -267,8 +267,8 @@ class Daemon:
 def inherited() -> dict[str, str]:
     """The environment a test daemon starts with: the test run's, less what
     would change how its releases run. PYTHONDONTWRITEBYTECODE in a
-    developer's shell would turn off the bytecode the default redirect
-    writes (issue #472)."""
+    developer's shell would reach what the daemon runs outside a release's
+    bytecode setting (issue #472); a test that wants it passes it itself."""
 
     return {name: value for name, value in os.environ.items() if name != "PYTHONDONTWRITEBYTECODE"}
 

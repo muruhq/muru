@@ -7030,6 +7030,7 @@ mod tests {
                 label: "exec".to_owned(),
                 argv: vec!["sh".to_owned(), "-c".to_owned(), script],
                 env: Vec::new(),
+                unset: Vec::new(),
                 cwd: dir.path().to_owned(),
                 identity: None,
                 log: None,

@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from support.daemon import SHOP, Daemon
+from support.daemon import SHOP, Daemon, start_daemon
 from support.daemon import daemon as daemon_fixture
 
 daemon = daemon_fixture
@@ -35,6 +35,31 @@ def test_bytecode_is_redirected_to_the_release_directory(daemon: Daemon, tmp_pat
 
     shown = daemon.muructl("release", "show", "shop@r1").stdout
     assert f"bytecode     redirect, under {prefix}" in shown
+
+
+def test_the_release_setting_holds_over_the_daemon_environment(tmp_path: Path) -> None:
+    # A daemon started from a shell that turns bytecode off still writes it
+    # where a redirect release says; a release whose own environment turns
+    # it off writes none.
+
+    source = tmp_path / "shop"
+    shutil.copytree(SHOP, source, ignore=shutil.ignore_patterns("__pycache__"))
+    daemon = start_daemon(tmp_path, env={"PYTHONDONTWRITEBYTECODE": "1"})
+
+    try:
+        assert daemon.deploy("shop", source) == "muru: release shop@r1 is ready and serving"
+        assert daemon.get("/").status == 200
+        assert compiled_files(daemon.base / "state" / "pycache" / "shop" / "r1")
+
+        assert (
+            daemon.deploy("shop", source, "--release", "r2", "--env", "PYTHONDONTWRITEBYTECODE=1")
+            == "muru: release shop@r2 is ready and serving"
+        )
+        assert daemon.get("/").status == 200
+        assert not compiled_files(daemon.base / "state" / "pycache" / "shop" / "r2")
+        assert not compiled_files(source)
+    finally:
+        daemon.stop()
 
 
 def test_off_writes_none_and_source_uses_what_is_precompiled(

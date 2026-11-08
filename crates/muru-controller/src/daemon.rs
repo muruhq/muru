@@ -4546,13 +4546,14 @@ impl Daemon {
 
         let library = self.runtime_library(&python).await?;
         let pycache = self.pycache_prefix(app, id, spec, identity);
+        let bytecode = Some(spec.bytecode.effective());
         let env = crate::commands::environment(
             env,
             &crate::commands::Interpreter {
                 python: &python,
                 runtime: library.pythonpath.as_deref(),
                 pycache: pycache.as_deref(),
-                no_bytecode: spec.bytecode.effective() == muru_config::Bytecode::Off,
+                bytecode,
             },
             app,
             id,
@@ -4565,6 +4566,7 @@ impl Daemon {
             label: "exec".to_owned(),
             argv: Vec::new(),
             env,
+            unset: crate::commands::not_inherited(bytecode),
             cwd: spec.source.clone(),
             identity,
             log: Some(self.host_log(app, id)),
@@ -4744,7 +4746,7 @@ impl Daemon {
             python,
             pythonpath: library.pythonpath.clone(),
             pycache_prefix,
-            no_bytecode: spec.bytecode.effective() == muru_config::Bytecode::Off,
+            bytecode: Some(spec.bytecode.effective()),
             app: spec.entrypoint.clone(),
             name: Some(app.to_owned()),
             release: Some(id.to_owned()),

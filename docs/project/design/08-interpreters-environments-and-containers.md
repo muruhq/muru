@@ -114,6 +114,8 @@ compile_bytecode = true  # uv sync --compile-bytecode, feeds bytecode = 'source'
 
 The setting is bytecode = 'redirect' (default), 'source' or 'off' per release or variant. muructl check reports when a release would run without any usable bytecode cache.
 
+The setting holds whatever environment the daemon was started with. Python honours PYTHONDONTWRITEBYTECODE over PYTHONPYCACHEPREFIX, so under 'redirect' and 'source' the daemon removes an inherited PYTHONDONTWRITEBYTECODE from the environment of the release's host and of the commands it runs for the release, while a release whose own environment sets it keeps it. Under 'off' the daemon sets it. muructl run leaves the variable to the user's shell.
+
 ## 8.3 Runtime library installation
 
 The runtime library is Muru's, not the application's (ADR 0037). muructl puts the `muru` package that matches its own version on the host's PYTHONPATH for the interpreter in use, in every mode, so an application need not list it as a dependency and `import muru` works with nothing in `pyproject.toml`.

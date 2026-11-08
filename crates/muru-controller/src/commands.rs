@@ -12,6 +12,7 @@ use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use muru_config::Bytecode;
 use muru_proto::admin::v1 as pb;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, BufReader};
 use tokio::process::Command;
@@ -159,6 +160,9 @@ pub struct Prepared {
     pub argv: Vec<String>,
     /// The environment added to the daemon's own.
     pub env: Vec<(String, String)>,
+    /// Variables of the daemon's own environment it does not inherit,
+    /// unless `env` sets them.
+    pub unset: Vec<String>,
     /// The directory it runs in: the release's source.
     pub cwd: PathBuf,
     /// Whom it runs as, when the daemon is root and the application
@@ -197,8 +201,24 @@ pub struct Interpreter<'a> {
     pub runtime: Option<&'a Path>,
     /// Where bytecode is written, when it is redirected (section 8.2).
     pub pycache: Option<&'a Path>,
-    /// Write no bytecode at all.
-    pub no_bytecode: bool,
+    /// The release's bytecode setting (section 8.2); none where bytecode
+    /// is left to Python and the environment, as in a development run.
+    pub bytecode: Option<Bytecode>,
+}
+
+/// The variables of the daemon's own environment that a release's host
+/// and commands do not inherit, though the release's own environment may
+/// still set them (section 8.2). Under `redirect` and `source` that is
+/// PYTHONDONTWRITEBYTECODE, which Python honours over the cache prefix,
+/// so the shell the daemon was started from would otherwise turn the
+/// release's bytecode off.
+pub fn not_inherited(bytecode: Option<Bytecode>) -> Vec<String> {
+    match bytecode {
+        Some(Bytecode::Redirect | Bytecode::Source) => {
+            vec!["PYTHONDONTWRITEBYTECODE".to_owned()]
+        }
+        Some(Bytecode::Off) | None => Vec::new(),
+    }
 }
 
 /// A command's environment: the release's, with its interpreter's
@@ -252,7 +272,7 @@ pub fn environment(
         ));
     }
 
-    if interpreter.no_bytecode {
+    if interpreter.bytecode == Some(Bytecode::Off) {
         set.push(("PYTHONDONTWRITEBYTECODE".to_owned(), "1".to_owned()));
     }
 
@@ -769,6 +789,28 @@ impl Underway {
     }
 }
 
+/// The process to start: the program in the release's source, with the
+/// daemon's environment less what the release does not inherit, and the
+/// release's own over it.
+fn process(prepared: &Prepared) -> Command {
+    let mut command = Command::new(&prepared.argv[0]);
+
+    for name in &prepared.unset {
+        command.env_remove(name);
+    }
+
+    command
+        .args(&prepared.argv[1..])
+        .current_dir(&prepared.cwd)
+        .envs(prepared.env.iter().map(|(name, value)| (name, value)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    command
+}
+
 /// Run the command to its end, relaying its output and recording it.
 async fn supervise(
     prepared: Prepared,
@@ -788,15 +830,7 @@ async fn supervise(
             .ok()
     });
 
-    let mut command = Command::new(&prepared.argv[0]);
-    command
-        .args(&prepared.argv[1..])
-        .current_dir(&prepared.cwd)
-        .envs(prepared.env.iter().map(|(name, value)| (name, value)))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let mut command = process(&prepared);
 
     // A session of its own, so stopping it reaches whatever it started,
     // as the user the release runs as.
@@ -1218,6 +1252,7 @@ mod tests {
             label: "exec".to_owned(),
             argv: argv.iter().map(|part| (*part).to_owned()).collect(),
             env: vec![("GREETING".to_owned(), "hello".to_owned())],
+            unset: Vec::new(),
             cwd: std::env::temp_dir(),
             identity: None,
             log: Some(log),
@@ -1271,7 +1306,7 @@ mod tests {
                 python: &python,
                 runtime: Some(&runtime),
                 pycache: None,
-                no_bytecode: true,
+                bytecode: Some(Bytecode::Off),
             },
             "shop",
             "r2",
@@ -1298,6 +1333,59 @@ mod tests {
         assert_eq!(get("MURU_RELEASE"), ["r2"]);
         assert_eq!(get("MURU_RELEASE_DIR"), ["/srv/shop"]);
         assert_eq!(get("DATABASE_URL"), ["sqlite://"]);
+    }
+
+    #[test]
+    fn the_bytecode_setting_holds_over_an_inherited_dont_write_bytecode() {
+        let log = std::env::temp_dir().join("r2.log");
+
+        // What the process does with the daemon's PYTHONDONTWRITEBYTECODE:
+        // none when it inherits it, Some(None) when it is removed, and
+        // Some(value) when it is set.
+
+        let given = |release: &[(&str, &str)], bytecode: Option<Bytecode>| {
+            let release = release
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect();
+            let env = environment(
+                release,
+                &Interpreter {
+                    python: Path::new("/srv/env/bin/python"),
+                    runtime: None,
+                    pycache: None,
+                    bytecode,
+                },
+                "shop",
+                "r2",
+                Path::new("/srv/shop"),
+            );
+            let prepared = Prepared {
+                env,
+                unset: not_inherited(bytecode),
+                ..prepared(&["true"], log.clone())
+            };
+
+            process(&prepared)
+                .as_std()
+                .get_envs()
+                .find(|(name, _)| *name == "PYTHONDONTWRITEBYTECODE")
+                .map(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+        };
+
+        let set = Some(Some("1".to_owned()));
+
+        assert_eq!(given(&[], Some(Bytecode::Redirect)), Some(None));
+        assert_eq!(given(&[], Some(Bytecode::Source)), Some(None));
+        assert_eq!(given(&[], Some(Bytecode::Off)), set);
+        assert_eq!(given(&[], None), None);
+        assert_eq!(
+            given(
+                &[("PYTHONDONTWRITEBYTECODE", "1")],
+                Some(Bytecode::Redirect)
+            ),
+            set
+        );
     }
 
     #[test]

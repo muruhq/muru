@@ -505,6 +505,10 @@ holds bytecode for the release's interpreter, compiled by `muructl build
 the project's `[tool.muru]` table, in a declared release or as
 `--bytecode` on `muructl deploy` takes `redirect` (the default), `source`
 or `off`, and `muructl release show` says which is in force.
+The setting holds whatever environment the daemon was started with: a
+`PYTHONDONTWRITEBYTECODE` inherited from the daemon's shell does not turn
+off `redirect` or `source`, while a release whose own environment sets it
+writes no bytecode.
 
 ## Where things live
 
