@@ -280,7 +280,8 @@ with `--fix`; the formatters keep what it inserts.
   its sub-issues; add an issue that belongs to a step as a sub-issue of
   it. The maintainer moves issues to Next; take the Next issue with the
   lowest Order, never a `tracking` issue, move it to In Progress
-  when its branch is made, and let `Closes #N` move it to In Review and
+  and add it to the open release milestone when its branch is made,
+  and let `Closes #N` move it to In Review and
   Done. There are two exceptions to the maintainer choosing what goes
   to Next. The first is a problem in the tests or their harness rather
   than in Muru, a flaky test above all: label it `testing` (with `bug`
