@@ -89,6 +89,13 @@ muructl restart shop --worker 1
 muructl events --follow
 ```
 
+The `WORKERS` column of `muructl release list` gives the workers running
+now and, in brackets, the shape the release asks for: `2 (2x4)` is two
+workers of a release of two processes with four threads each, and
+`0 (1x4)` a release scaled to zero. `-` in place of the count means no
+host runs for the release, because it is stopped, failed or idle. A
+managed server shows its instances the same way, as `1 (1 gunicorn)`.
+
 A release that a deploy replaces is drained and then kept warm for a
 retention window of 30 minutes (`deploy --retain` changes it; `--retain
 0` stops it as soon as it has drained), with one worker in each of its

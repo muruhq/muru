@@ -5140,21 +5140,17 @@ pub async fn release_list(
     }
 
     println!(
-        "{:<24} {:<10} {:<8} {:<10} SOURCE",
+        "{:<24} {:<10} {:<8} {:<16} SOURCE",
         "RELEASE", "STATE", "SERVING", "WORKERS"
     );
 
     for release in releases {
         println!(
-            "{:<24} {:<10} {:<8} {:<10} {}",
+            "{:<24} {:<10} {:<8} {:<16} {}",
             format!("{}@{}", release.app, release.id),
             release.state,
             if release.serving { "yes" } else { "" },
-            if release.kind == "http" {
-                format!("{} {}", release.instances, release.profile)
-            } else {
-                format!("{}x{}", release.processes, release.threads)
-            },
+            workers_column(&release),
             release.source
         );
 
@@ -5164,6 +5160,32 @@ pub async fn release_list(
     }
 
     Ok(())
+}
+
+/// The WORKERS column of `release list`: what runs now, or `-` when
+/// nothing does, and the shape the release asks for in brackets.
+fn workers_column(release: &pb::Release) -> String {
+    if release.kind == "http" {
+        let running = release
+            .server_instances
+            .iter()
+            .filter(|instance| instance.pid != 0)
+            .count();
+        let shape = format!("{} {}", release.instances, release.profile);
+
+        return match running {
+            0 => format!("- ({shape})"),
+            count => format!("{count} ({shape})"),
+        };
+    }
+
+    let shape = format!("{}x{}", release.processes, release.threads);
+
+    if release.host_running {
+        format!("{} ({shape})", release.workers.len())
+    } else {
+        format!("- ({shape})")
+    }
 }
 
 /// Show one release.
@@ -7071,6 +7093,50 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 #[cfg(test)]
 mod tests {
     use super::metric_samples;
+    use super::pb;
+
+    #[test]
+    fn the_workers_column_says_what_runs_beside_the_shape() {
+        let release = pb::Release {
+            processes: 1,
+            threads: 4,
+            kind: "workers".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(super::workers_column(&release), "- (1x4)");
+
+        let at_zero = pb::Release {
+            host_running: true,
+            ..release.clone()
+        };
+        assert_eq!(super::workers_column(&at_zero), "0 (1x4)");
+
+        let serving = pb::Release {
+            workers: vec![pb::Worker::default(), pb::Worker::default()],
+            ..at_zero
+        };
+        assert_eq!(super::workers_column(&serving), "2 (1x4)");
+
+        let server = pb::Release {
+            kind: "http".to_owned(),
+            instances: 2,
+            profile: "gunicorn".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(super::workers_column(&server), "- (2 gunicorn)");
+
+        let running = pb::Release {
+            server_instances: vec![
+                pb::ServerInstance {
+                    pid: 7,
+                    ..Default::default()
+                },
+                pb::ServerInstance::default(),
+            ],
+            ..server
+        };
+        assert_eq!(super::workers_column(&running), "1 (2 gunicorn)");
+    }
 
     #[tokio::test]
     async fn output_that_cannot_be_written_stops_the_command_and_waits_for_it() {

@@ -167,11 +167,11 @@ the old one finished the requests it had and stopped taking more.
 `muructl release list hello` now shows `r3` serving and `r1` retained:
 
 ```
-RELEASE                  STATE      SERVING  WORKERS    SOURCE
-hello@r3                 ready      yes      1x4        /Users/you/site/v3
-hello@r2                 failed              1x4        /Users/you/site/v2
+RELEASE                  STATE      SERVING  WORKERS          SOURCE
+hello@r3                 ready      yes      1 (1x4)          /Users/you/site/v3
+hello@r2                 failed              - (1x4)          /Users/you/site/v2
                          the host exited with exit status: 1 before its workers were ready
-hello@r1                 retained            1x4        /Users/you/site/v1
+hello@r1                 retained            1 (1x4)          /Users/you/site/v1
                          warm until 10:24 UTC; a rollback to it is instant
 ```
 

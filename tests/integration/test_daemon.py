@@ -136,7 +136,7 @@ def test_settings_come_from_the_table_and_flags(daemon: Daemon) -> None:
     # factory project's muru.toml names a factory entrypoint.
 
     daemon.deploy("shop", SHOP)
-    assert "2x3" in daemon.muructl("release", "list", "shop").stdout
+    assert "2 (2x3)" in daemon.muructl("release", "list", "shop").stdout
 
     daemon.deploy("factory", FACTORY, "--threads", "2")
     listing = daemon.muructl("release", "list", "factory").stdout
