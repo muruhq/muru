@@ -51,7 +51,7 @@ $ muructl release show shop@r9 --json
 
 | Command | Prints |
 | --- | --- |
-| `muructl status` | The daemon's or run's status: `version`, `pid`, `listeners`, `app_count`, `release_count`, `edge_pid` and the rest |
+| `muructl status` | The daemon's or run's status: `version`, `pid`, `listeners`, `app_count`, `release_count`, `edge_pid`, `no_host` (the applications serving with no hosts declared to choose between them, empty otherwise) and the rest |
 | `muructl daemon status` | The same as `muructl status` |
 | `muructl daemon reload` | What was reloaded: `message` |
 | `muructl app list` | `{"apps": [...]}`, each with `name`, `current_release`, `previous_release`, `user`, `maintenance` and the rest |

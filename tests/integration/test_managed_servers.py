@@ -247,6 +247,12 @@ def test_gunicorn_and_uvicorn_profiles_add_their_own_flags(daemon: Daemon, tmp_p
         "legacy:application",
     ).stdout.strip()
     assert line == "muru: release gun@r1 is ready and serving"
+
+    # A host for the first application lets the second one serve.
+
+    first = daemon.base / "gun.toml"
+    first.write_text('[host.gun]\nnames = ["gun.test"]\n\n[[route]]\nhost = "gun"\napp = "gun"\n')
+    daemon.muructl("apply", "-f", str(first))
     line = daemon.muructl(
         "deploy",
         "uvi",

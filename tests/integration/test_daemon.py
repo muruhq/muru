@@ -138,7 +138,7 @@ def test_settings_come_from_the_table_and_flags(daemon: Daemon) -> None:
     daemon.deploy("shop", SHOP)
     assert "2 (2x3)" in daemon.muructl("release", "list", "shop").stdout
 
-    daemon.deploy("factory", FACTORY, "--threads", "2")
+    daemon.deploy("factory", FACTORY, "--threads", "2", "--hold")
     listing = daemon.muructl("release", "list", "factory").stdout
     assert "1x2" in listing
     assert daemon.releases("factory")[0]["state"] == "ready"

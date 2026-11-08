@@ -1207,6 +1207,8 @@ pub struct Routing {
     /// names it, so a preview can reach its other releases (a held one,
     /// section 9.2) without a host declared.
     default_app: Option<String>,
+    /// Several applications serve and no host chooses between them.
+    no_host: bool,
     /// Section 6.13: the listeners that limit cleartext HTTP/2 to some
     /// clients.
     h2c: HashMap<SocketAddr, crate::proxy::Networks>,
@@ -1274,6 +1276,9 @@ pub enum Decision {
     },
     /// No virtual host answers to that name on this listener (421).
     Misdirected,
+    /// Several applications serve and no host is declared to choose
+    /// between them (421, section 4.3).
+    NoHost,
     /// The host has no route for the path (404).
     NoRoute,
     /// The route or mount is internal (section 4.10) and the request
@@ -1357,6 +1362,7 @@ impl Routing {
             classifier: crate::classify::Classifier::default(),
             default_policy: None,
             default_app: None,
+            no_host: false,
             h2c: HashMap::new(),
             listener_trust: HashMap::new(),
             sites_vary: false,
@@ -1619,6 +1625,7 @@ impl Routing {
             classifier,
             default_policy,
             default_app: default_name,
+            no_host: snapshot.no_host,
             h2c,
             listener_trust,
             sites_vary: false,
@@ -2071,6 +2078,10 @@ impl Routing {
         client: &Client<'_>,
         origin: Option<&Origin>,
     ) -> Decision {
+        if self.no_host {
+            return Decision::NoHost;
+        }
+
         if self.hosts.is_empty() {
             // A rollout of the default application chooses among its
             // releases as a route's policy does, and without one a
@@ -2493,6 +2504,7 @@ mod tests {
             listener_limits: Vec::new(),
             listener_proxies: Vec::new(),
             worker_sockets: Vec::new(),
+            no_host: false,
             default_app: String::new(),
             default_release: String::new(),
             hosts: vec![
@@ -2595,7 +2607,7 @@ mod tests {
             Decision::Serve { server_name, .. } => server_name,
             Decision::Redirect { .. } => Some("redirect".to_owned()),
             Decision::Maintenance { .. } => Some("maintenance".to_owned()),
-            Decision::Misdirected => Some("421".to_owned()),
+            Decision::Misdirected | Decision::NoHost => Some("421".to_owned()),
             Decision::NoRoute => Some("404".to_owned()),
             Decision::InternalOnly => Some("internal".to_owned()),
             Decision::NotAccepted { .. } => Some("not accepted".to_owned()),
@@ -2930,6 +2942,30 @@ mod tests {
             cookies[0].starts_with(&format!("{ID_COOKIE}=")) && cookies[0].contains("HttpOnly"),
             "{cookies:?}"
         );
+    }
+
+    #[test]
+    fn several_applications_with_no_host_are_answered_421() {
+        let mut no_host = snapshot();
+        no_host.no_host = true;
+        let routing = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(Routing::from_snapshot(&no_host, None))
+            .unwrap();
+        let ids = crate::errors::RequestIds::new();
+        let headers = HeaderMap::new();
+
+        assert!(matches!(
+            routing.select(
+                Some("shop.test"),
+                "/",
+                "127.0.0.1:8080",
+                false,
+                &client(&headers, &ids),
+                None
+            ),
+            Decision::NoHost
+        ));
     }
 
     #[test]

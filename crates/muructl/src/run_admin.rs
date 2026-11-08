@@ -762,6 +762,7 @@ impl Admin for Service {
             app: state.app.clone(),
             release: state.release_id(),
             project: state.project.display().to_string(),
+            no_host: String::new(),
         }))
     }
 

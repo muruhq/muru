@@ -121,7 +121,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | --- | --- |
 | 400, 414, 431 | malformed, upload_malformed, uri_too_long, headers_too_large |
 | 404 | no_route, internal_only, sendfile_missing |
-| 408, 411, 413, 421, 426 | client_timeout, length_required, body_too_large, upload_too_large, too_many_files, misdirected, upgrade_not_allowed |
+| 408, 411, 413, 421, 426 | client_timeout, length_required, body_too_large, upload_too_large, too_many_files, misdirected, no_host, upgrade_not_allowed |
 | 429 | rate_limited |
 | 500 | app_error, redirect_loop, sendfile_refused |
 | 502 | worker_crashed, worker_stalled, worker_unavailable, upstream_failed |

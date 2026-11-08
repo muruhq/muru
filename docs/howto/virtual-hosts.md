@@ -84,9 +84,42 @@ The application sees the name the request matched with as `SERVER_NAME`
 (ASGI: the `server` tuple), or the host's `canonical` name when
 `use_canonical_name` is true; `HTTP_HOST` is always what the client sent.
 
-Without any host declared, every request on every listener goes to the
-application traffic was last switched to, which is how a daemon serving
-one application works.
+With no host declared and one application serving, every request on
+every listener goes to it. An action that would make a second application
+serve while no host is declared is refused: `muructl deploy`, a traffic
+switch or rollout to a held release, and `muructl apply`, whether its file
+adds a second serving application or removes the last host while several
+serve. The refusal shows a host and a route for each application, ready
+to paste:
+
+```console
+$ muructl deploy blog ./blog
+Error: refused: with no hosts declared, every request goes to shop; declare hosts and routes for blog and shop before blog serves, or deploy blog with --hold
+
+[host.blog]
+names = ["blog.example.com"]
+
+[[route]]
+host = "blog"
+app = "blog"
+
+[host.shop]
+names = ["shop.example.com"]
+
+[[route]]
+host = "shop"
+app = "shop"
+```
+
+`muructl deploy --hold` still works, so the second application can be
+deployed and checked before the hosts are applied, and a route can name
+an application with no release serving yet.
+
+If several applications do serve with no host declared, as when the
+daemon's store was changed by hand, every request is answered 421 with
+the reason `no_host` and a body that names no application, a
+`routing.no_host` event says so at warning level, and `muructl status`
+and `muructl daemon status` carry a line about it.
 
 ## TLS
 

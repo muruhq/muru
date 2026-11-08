@@ -21,6 +21,7 @@ precisely than the status, appears in the access log line as
 | 405 | `method_not_allowed` | The route refuses the method with `answer = 'method_not_allowed'`; `Allow` names the methods left (see the [client classes guide](../howto/client-classes.md#method-restrictions-and-site-modes)) |
 | 413 | `upload_too_large`, `too_many_files` | A file of an [upload](../howto/uploads.md) is over the route's `max_file_size`, or the form has more files than its `max_files` |
 | 421 | `misdirected` | No [virtual host](../howto/virtual-hosts.md) answers to the request's name on the listener it arrived on |
+| 421 | `no_host` | Several applications serve and no [host](../howto/virtual-hosts.md) is declared to choose between them. |
 | 429 | `rate_limited` | A [rate limit](../howto/client-classes.md) of the host or route refused the request, with `Retry-After`, and the RateLimit fields when the limit sends them |
 | 500 | `app_error` | The application raised, or called `start_response` with `exc_info` after output had started. Development mode includes the traceback |
 | 500 | `sendfile_refused` | The application named a file in a [file hint](../howto/file-hints.md#by-path) outside the mount's `sendfile_roots` |

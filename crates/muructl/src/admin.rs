@@ -2560,6 +2560,13 @@ pub async fn daemon_status(socket: SocketArgs, json: bool) -> anyhow::Result<()>
     );
     println!("websockets {} open", status.websockets);
 
+    if !status.no_host.is_empty() {
+        println!(
+            "routing  {} serve with no hosts declared, so every request is answered 421",
+            status.no_host
+        );
+    }
+
     if !status.budget.is_empty() {
         println!("budget   {}", status.budget);
     }

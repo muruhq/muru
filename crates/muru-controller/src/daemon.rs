@@ -725,6 +725,9 @@ pub struct Info {
     /// What runs for each release now, by application and release, as the
     /// daemon last published it.
     pub live: std::sync::Mutex<HashMap<(String, String), LiveRelease>>,
+    /// The applications serving with no host declared to choose between
+    /// them, comma separated, or empty (section 4.3).
+    pub no_host: std::sync::Mutex<String>,
     /// Section 8.7: `[daemon] pass_env`, as a reload may change it.
     pub pass_env: std::sync::RwLock<Vec<String>>,
     /// Section 8.4: uv as found and how it is run, from the `[tools]`
@@ -1175,9 +1178,9 @@ struct Daemon {
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
     serving: HashMap<String, String>,
-    /// The application whose workers take requests when no host is
-    /// declared: the last one traffic was switched to.
-    default_app: Option<String>,
+    /// The applications serving with no host to choose between them, as
+    /// last announced by a `routing.no_host` event.
+    no_host: BTreeSet<String>,
     /// Whether this process writes to the daemon log file, as a daemon
     /// started in the background does, so a reopen applies to it too.
     owns_log: bool,
@@ -1351,6 +1354,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
         live: std::sync::Mutex::new(HashMap::new()),
+        no_host: std::sync::Mutex::new(String::new()),
         pass_env: std::sync::RwLock::new(settings.pass_env.clone()),
         servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
@@ -1519,7 +1523,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         probed: HashMap::new(),
         probe_client: crate::rollouts::probe_client(),
         serving: HashMap::new(),
-        default_app: None,
+        no_host: BTreeSet::new(),
         owns_log,
         commands: handle_commands,
         asked: HashMap::new(),
@@ -4364,6 +4368,13 @@ impl Daemon {
         hold: bool,
         created: oneshot::Sender<Result<Release, String>>,
     ) -> Result<Release, String> {
+        // Section 4.3: refused before anything is started.
+
+        if !hold && let Some(refusal) = crate::config::second_app_refusal(&self.store, app) {
+            let _ = created.send(Err(refusal.clone()));
+            return Err(refusal);
+        }
+
         if let Err(error) = self.make_room(app, &spec).await {
             let _ = created.send(Err(error.clone()));
             return Err(error);
@@ -5384,7 +5395,6 @@ impl Daemon {
         }
 
         self.serving.insert(app.to_owned(), id.to_owned());
-        self.default_app = Some(app.to_owned());
 
         if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
             running.held = false;
@@ -5411,6 +5421,32 @@ impl Daemon {
                 );
             }
         }
+    }
+
+    /// Section 4.3: say once when several applications serve with no
+    /// host to choose between them, and when that ends, and keep what
+    /// `muructl status` shows.
+    fn note_no_host(&mut self, serving: BTreeSet<String>) {
+        if serving == self.no_host {
+            return;
+        }
+
+        let names = serving.iter().cloned().collect::<Vec<_>>().join(", ");
+        *self.info.no_host.lock().expect("no_host poisoned") = names.clone();
+
+        if !serving.is_empty() {
+            self.events.emit(
+                "routing.no_host",
+                "edge",
+                "warning",
+                &format!(
+                    "{names} serve and no hosts are declared, so every request is answered 421; \
+                     declare hosts and routes for them"
+                ),
+            );
+        }
+
+        self.no_host = serving;
     }
 
     /// Section 4.4: desired state compiled for the edge. Each application
@@ -5618,18 +5654,21 @@ impl Daemon {
             }
         }
 
-        if self
-            .default_app
-            .as_ref()
-            .is_some_and(|name| !apps.iter().any(|app| &app.app == name))
-        {
-            self.default_app = None;
-        }
-        let default = self
-            .default_app
-            .as_ref()
-            .and_then(|name| apps.iter().find(|app| &app.app == name))
-            .or_else(|| apps.first());
+        // Section 4.3: with no host declared, the one application that
+        // serves takes every request. Nothing is chosen between several,
+        // and nothing is kept, so a restart cannot move the traffic.
+
+        let no_hosts = self.store.hosts().unwrap_or_default().is_empty();
+        let serving: BTreeSet<String> = apps
+            .iter()
+            .filter(|app| app.serving)
+            .map(|app| app.app.clone())
+            .collect();
+        let no_host = no_hosts && serving.len() > 1;
+        let default = (no_hosts && serving.len() == 1)
+            .then(|| apps.iter().find(|app| app.serving))
+            .flatten();
+        self.note_no_host(if no_host { serving } else { BTreeSet::new() });
         let worker_sockets = default.map(|app| app.sockets.clone()).unwrap_or_default();
         let default_app = default.map(|app| app.app.clone()).unwrap_or_default();
         let default_release = default.map(|app| app.release.clone()).unwrap_or_default();
@@ -5817,6 +5856,7 @@ impl Daemon {
             client_classes: self.clients.classes_message.clone(),
             rate_limits: self.clients.limits_message.clone(),
             default_traffic,
+            no_host,
             h2c: self.h2c.clone(),
             listener_limits: self.listener_limits.clone(),
             listener_proxies: self.listener_proxies.clone(),
@@ -6449,6 +6489,10 @@ impl Daemon {
             return Err(format!("{app}@{id} already serves"));
         }
 
+        if let Some(refusal) = crate::config::second_app_refusal(&self.store, app) {
+            return Err(refusal);
+        }
+
         self.make_room_for(app, id).await?;
         self.start(app, id).await?;
         self.switch_to(app, id).await;
@@ -6526,7 +6570,6 @@ impl Daemon {
 
         for (app, id, _) in &committed.promoted {
             self.serving.insert(app.clone(), id.clone());
-            self.default_app = Some(app.clone());
 
             if let Some(running) = self.running.get_mut(&(app.clone(), id.clone())) {
                 running.held = false;
@@ -8248,6 +8291,10 @@ impl Daemon {
             return Err(format!("{app} has no previous release to roll back to"));
         };
         let current = record.current.clone();
+
+        if let Some(refusal) = crate::config::second_app_refusal(&self.store, app) {
+            return Err(refusal);
+        }
 
         self.start(app, &previous).await?;
         self.switch_to(app, &previous).await;

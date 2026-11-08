@@ -151,6 +151,7 @@ message Status {
   string app = 16;                  // a run's application, as its log names it; empty for a daemon
   string release = 17;              // a run's release, r1 and so on; empty for a daemon
   string project = 18;              // a run's project directory; empty for a daemon
+  string no_host = 19;              // several applications serve with no hosts declared, and which; empty otherwise
 }
 
 message ListWebSocketsRequest {

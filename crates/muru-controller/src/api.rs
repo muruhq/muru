@@ -127,6 +127,7 @@ impl Admin for Service {
             app: String::new(),
             release: String::new(),
             project: String::new(),
+            no_host: info.no_host.lock().expect("no_host poisoned").clone(),
         }))
     }
 
@@ -414,6 +415,12 @@ impl Admin for Service {
         } else {
             request.release.clone()
         };
+
+        if !request.hold
+            && let Some(refusal) = config::second_app_refusal(store, &request.app)
+        {
+            refusals.push(refusal);
+        }
 
         if !crate::model::valid_name(&id) {
             refusals.push(format!("{id:?} is not a valid release id"));

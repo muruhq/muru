@@ -1753,6 +1753,15 @@ async fn serve<I>(
                             ),
                         ))
                     }
+                    (None, routing::Decision::NoHost) => link::Handled::Response(link::reject(
+                        &parts,
+                        &context,
+                        errors::Problem::new(
+                            StatusCode::MISDIRECTED_REQUEST,
+                            "no_host",
+                            "This server has several applications and no hosts to choose between them.",
+                        ),
+                    )),
                     (None, routing::Decision::InternalOnly) => {
                         link::Handled::Response(link::reject(
                             &parts,
