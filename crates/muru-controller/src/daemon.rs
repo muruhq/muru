@@ -7046,8 +7046,10 @@ impl Daemon {
 
     /// Section 7.4: a request is waiting at the edge for a group with no
     /// workers. A release whose host stopped while idle is started
-    /// again; a group scaled to zero gets a worker, once the node's
-    /// budget admits it.
+    /// again; a group scaled to zero gets a worker. The node's workers
+    /// limit holds back neither, and a wake that takes the node over it
+    /// stops retained releases to make room; the memory limit applies to
+    /// both, as it does to a deploy.
     async fn wake(&mut self, wake: muru_proto::edge::v1::Wake) {
         let key = (wake.app.clone(), wake.release.clone());
         let subject = format!("{}@{}", wake.app, wake.release);
@@ -7059,28 +7061,7 @@ impl Daemon {
         };
 
         if matches!(running.backend, Backend::Dormant) {
-            self.running.remove(&key);
-            self.events.emit(
-                "release.woken",
-                &subject,
-                "info",
-                "a request is waiting: starting its host again",
-            );
-
-            match self.start(&wake.app, &wake.release).await {
-                Ok(()) => {
-                    if let Err(error) = self.push_snapshot().await {
-                        tracing::error!(%error, "pushing the snapshot for a woken release failed");
-                    }
-
-                    self.mark_ready(&wake.app, &wake.release, "woken by a request");
-                }
-                Err(error) => {
-                    self.events
-                        .emit("release.failed", &subject, "error", &error);
-                }
-            }
-
+            self.wake_host(&wake.app, &wake.release).await;
             return;
         }
 
@@ -7107,7 +7088,6 @@ impl Daemon {
             .store
             .app(&wake.app)
             .map_or(0, |record| record.priority);
-        let used = self.budget_usage();
         let ask = crate::budget::Ask {
             key: (),
             priority,
@@ -7115,7 +7095,36 @@ impl Daemon {
             to,
             cost,
         };
-        let admitted = crate::budget::admit(&self.budget, used, vec![ask]).remove(0);
+
+        // The wake is admitted with the workers limit lifted. Retained
+        // releases make way for its memory, the oldest first, as they do
+        // for a deploy, and it is refused only when it does not fit even
+        // without them.
+
+        let lifted = crate::budget::Budget {
+            workers: None,
+            ..self.budget
+        };
+        let mut used = self.budget_usage();
+        let mut admitted = crate::budget::admit(&lifted, used, vec![ask.clone()]).remove(0);
+
+        while admitted.limit == Some(crate::budget::Limit::Memory) {
+            let Some((other_app, other_id)) = self.oldest_retained(None) else {
+                break;
+            };
+
+            self.stop_release(
+                &other_app,
+                &other_id,
+                &format!(
+                    "making room in the node's memory budget for {subject}, woken by a request"
+                ),
+            )
+            .await;
+            used = self.budget_usage();
+            admitted = crate::budget::admit(&lifted, used, vec![ask.clone()]).remove(0);
+        }
+
         let Some(group) = self
             .running
             .get_mut(&key)
@@ -7143,13 +7152,101 @@ impl Daemon {
         }
 
         group.requested = Some(to);
-        self.events.emit(
-            "scaling.decision",
-            &subject,
-            "info",
-            &decision_message(&wake.group, 0, to, &reason, false),
-        );
+        let mut message = decision_message(&wake.group, 0, to, &reason, false);
+
+        if let Some(limit) = self
+            .budget
+            .workers
+            .filter(|limit| used.workers + to > *limit)
+        {
+            message.push_str(&format!(", over the node's budget of {limit} workers"));
+        }
+
+        self.events
+            .emit("scaling.decision", &subject, "info", &message);
         self.ask_scale(&wake.app, &wake.release, &wake.group, to);
+        self.make_worker_room(&subject).await;
+    }
+
+    /// Section 7.4: start again the host of a release that stopped while
+    /// idle, for a request waiting at the edge. Its memory must fit the
+    /// node's budget, retained releases making way as for a deploy; the
+    /// workers limit does not hold it back.
+    async fn wake_host(&mut self, app: &str, id: &str) {
+        let key = (app.to_owned(), id.to_owned());
+        let subject = format!("{app}@{id}");
+        let Ok(release) = self.store.release(app, id) else {
+            return;
+        };
+
+        if self.make_room(app, &release.spec).await.is_err() {
+            return;
+        }
+
+        let starting = release.spec.processes
+            + release
+                .spec
+                .groups
+                .iter()
+                .map(|group| group.processes)
+                .sum::<u32>();
+        let used = self.budget_usage();
+        let mut message = "a request is waiting: starting its host again".to_owned();
+
+        if let Some(limit) = self
+            .budget
+            .workers
+            .filter(|limit| used.workers + starting > *limit)
+        {
+            message.push_str(&format!(", over the node's budget of {limit} workers"));
+        }
+
+        self.running.remove(&key);
+        self.events
+            .emit("release.woken", &subject, "info", &message);
+
+        match self.start(app, id).await {
+            Ok(()) => {
+                if let Err(error) = self.push_snapshot().await {
+                    tracing::error!(%error, "pushing the snapshot for a woken release failed");
+                }
+
+                self.mark_ready(app, id, "woken by a request");
+                self.make_worker_room(&subject).await;
+            }
+            Err(error) => {
+                self.events
+                    .emit("release.failed", &subject, "error", &error);
+            }
+        }
+    }
+
+    /// Section 7.4: a wake from zero took the node over its workers
+    /// limit. Retained releases that hold workers stop, the oldest first,
+    /// until the node is back under it or none is left; until then other
+    /// releases' scale-out finds no room.
+    async fn make_worker_room(&mut self, subject: &str) {
+        let Some(limit) = self.budget.workers else {
+            return;
+        };
+
+        while self.budget_usage().workers > limit {
+            let fallback = self.node_mean_pss();
+            let Some((app, id)) =
+                self.oldest_retained_where(|_, running| running.usage(fallback).workers > 0)
+            else {
+                break;
+            };
+
+            self.stop_release(
+                &app,
+                &id,
+                &format!(
+                    "making room in the node's worker budget for {subject}, woken by a request"
+                ),
+            )
+            .await;
+        }
     }
 
     /// Section 7.4: the mean proportional set size of every worker that
@@ -7275,11 +7372,18 @@ impl Daemon {
     /// Section 9.1: the retained release created first, other than one
     /// of `except`'s application, which make way under memory pressure.
     fn oldest_retained(&self, except: Option<&str>) -> Option<(String, String)> {
+        self.oldest_retained_where(|app, _| except != Some(app))
+    }
+
+    /// The retained release created first of those `wanted` accepts,
+    /// given each one's application and state.
+    fn oldest_retained_where(
+        &self,
+        wanted: impl Fn(&str, &Running) -> bool,
+    ) -> Option<(String, String)> {
         self.running
             .iter()
-            .filter(|((app, _), running)| {
-                running.retained_until.is_some() && except != Some(app.as_str())
-            })
+            .filter(|((app, _), running)| running.retained_until.is_some() && wanted(app, running))
             .map(|((app, id), _)| {
                 let created = self
                     .store
