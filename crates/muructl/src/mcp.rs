@@ -1413,6 +1413,71 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "prune_cache",
+            description: "Remove what is stale from the cache areas: runtime libraries of other versions, or of the version or tag named, and downloaded Pythons no release uses. dry_run lists what would go; anything else is refused unless yes is true.",
+            changes: true,
+            properties: json!({
+                "area": {"type": "string", "enum": ["user", "daemon"]},
+                "version": {"type": "string"},
+                "tag": {"type": "string"},
+                "dry_run": {"type": "boolean"},
+                "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["cache", "prune"]);
+                command.extend(
+                    arguments
+                        .get("area")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+                command.extend(option(arguments, "version", "--version"));
+                command.extend(option(arguments, "tag", "--tag"));
+
+                for (key, name) in [("dry_run", "--dry-run"), ("yes", "--yes")] {
+                    if flag(arguments, key) {
+                        command.push(name.to_owned());
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "clear_cache",
+            description: "Remove everything in a cache area that is not in use, which is re-created on demand; a runtime library is fetched again, which needs the network or a wheel directory. The development certificates stay unless certs is true. dry_run lists what would go; anything else is refused unless yes is true.",
+            changes: true,
+            properties: json!({
+                "area": {"type": "string", "enum": ["user", "daemon"]},
+                "certs": {"type": "boolean", "description": "Also remove the development certificates"},
+                "dry_run": {"type": "boolean"},
+                "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
+            }),
+            required: &["area"],
+            command: |arguments| {
+                let mut command = words(&["cache", "clear"]);
+                command.extend(
+                    arguments
+                        .get("area")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+
+                for (key, name) in [
+                    ("certs", "--certs"),
+                    ("dry_run", "--dry-run"),
+                    ("yes", "--yes"),
+                ] {
+                    if flag(arguments, key) {
+                        command.push(name.to_owned());
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "reopen_logs",
             description: "Reopen every log file by name, after something outside Muru has renamed them; workers also runs each worker's on_reopen_logs hook.",
             changes: true,
@@ -1525,6 +1590,15 @@ mod tests {
                 "2".into()
             ]),
             "without yes the command runs with no --yes, and refuses"
+        );
+        assert_eq!(
+            command("clear_cache", json!({"area": "user", "dry_run": true})),
+            Ok(vec![
+                "cache".into(),
+                "clear".into(),
+                "user".into(),
+                "--dry-run".into()
+            ])
         );
         assert_eq!(
             command("remove_release", json!({"release": "shop@r1", "yes": true})),

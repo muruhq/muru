@@ -104,6 +104,10 @@ service Admin {
 
   // The daemon's re-creatable data (sections 8.2, 8.3 and 13.8).
   rpc ListCache(ListCacheRequest) returns (ListCacheResponse);
+  // Remove what is stale, or list what would go.
+  rpc PruneCache(PruneCacheRequest) returns (RemoveCacheResponse);
+  // Remove everything in the daemon's area that is not in use, or list it.
+  rpc ClearCache(ClearCacheRequest) returns (RemoveCacheResponse);
 
   // Metrics (section 11.1): the node's Prometheus text exposition.
   rpc GetMetrics(GetMetricsRequest) returns (MetricsText);
@@ -1145,6 +1149,26 @@ message CacheEntry {
   string tag = 5;                   // of a runtime library: the interpreter tag
   uint64 size = 6;                  // the bytes it takes
   string in_use = 7;                // what uses it, when something does
+  uint64 freed = 8;                 // what removing it gives back
+  string error = 9;                 // why it could not be removed
+}
+
+message PruneCacheRequest {
+  string version = 1;               // only runtime libraries of this version
+  string tag = 2;                   // only runtime libraries of this interpreter tag
+  bool dry_run = 3;                 // only list what would go
+}
+
+message ClearCacheRequest {
+  bool dry_run = 1;                 // only list what would go
+}
+
+message RemoveCacheResponse {
+  string directory = 1;             // the directory the area is in
+  repeated CacheEntry removed = 2;  // what went, or would go
+  repeated CacheEntry left = 3;     // what stayed because something uses it
+  uint64 freed = 4;                 // the bytes given back, or that would be
+  bool dry_run = 5;                 // nothing was changed
 }
 
 message ListCacheResponse {

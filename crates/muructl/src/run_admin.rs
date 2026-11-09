@@ -1193,6 +1193,8 @@ impl Admin for Service {
         rollback(pb::RollbackRequest) -> pb::Release, "muructl rollback";
         drain_release(pb::DrainReleaseRequest) -> pb::Release, "muructl drain";
         list_cache(pb::ListCacheRequest) -> pb::ListCacheResponse, "muructl cache";
+        prune_cache(pb::PruneCacheRequest) -> pb::RemoveCacheResponse, "muructl cache prune";
+        clear_cache(pb::ClearCacheRequest) -> pb::RemoveCacheResponse, "muructl cache clear";
         prune_releases(pb::PruneReleasesRequest) -> pb::RemoveReleasesResponse, "muructl release prune";
         remove_release(pb::RemoveReleaseRequest) -> pb::RemoveReleasesResponse, "muructl release remove";
         start_rollout(pb::StartRolloutRequest) -> pb::Rollout, "muructl rollout";

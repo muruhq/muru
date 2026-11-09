@@ -961,6 +961,8 @@ fn main() -> anyhow::Result<()> {
         Command::Cache { command } => runtime.block_on(async move {
             match command {
                 admin::CacheCommand::List(args) => admin::cache_list(*args).await,
+                admin::CacheCommand::Prune(args) => admin::cache_prune(*args).await,
+                admin::CacheCommand::Clear(args) => admin::cache_clear(*args).await,
             }
         }),
         Command::Runtime { command } => runtime.block_on(provision::run(command)),

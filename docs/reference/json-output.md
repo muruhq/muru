@@ -99,6 +99,7 @@ $ muructl release show shop@r9 --json
 | `muructl release remove` | As `muructl release prune` prints it, with `why` of `named` and an empty `kept` |
 | `muructl app remove` | As `muructl release prune` prints it, with `why` of `application` and an empty `kept` |
 | `muructl cache list` | `user` and `daemon`, the areas asked for, each with `directory`, `total` and `entries`, each with `kind` (`runtime`, `certs`, `uv`, `uv_cache` or `python`), `name`, `path`, `version` and `tag` of a runtime library, `size` (bytes) and `in_use`, what uses it |
+| `muructl cache prune`, `muructl cache clear` | `user` and `daemon`, the areas worked on, each with `directory`, `freed` (bytes), `dry_run`, `removed` and `left` (what stayed because it is in use), each as `muructl cache list` gives them, with `freed` and `error` when it could not be removed |
 | `muructl logs prune` | `freed` (bytes), `dry_run` and `removed`, each with `name`, `size`, `why` (`keep`, `older_than` or `orphaned`) and `error` when it could not be removed |
 | `muructl logs rotate` | `logs`, each with `name`, `size`, `archive` (relative to the log directory, before compression through a daemon) and `error` when that log could not be rotated |
 | `muructl logs truncate` | `freed`, `dry_run` and `logs`, each with `name`, `size`, `kept`, `freed`, `in_place` (the log was cut in place, so lines written while it was copied are lost), `late` (the bytes writers added during the swap, carried over) and `error` when that log could not be cut |

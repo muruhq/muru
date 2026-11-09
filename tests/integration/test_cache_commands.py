@@ -101,5 +101,57 @@ def test_cache_list_through_a_daemon_and_without_one(tmp_path: Path) -> None:
             check=False,
         )
         assert refused.returncode != 0 and "keeps its state in" in refused.stderr
+
+        # Prune through the daemon: its area is worked on by the daemon,
+        # which keeps the version it runs. The runtime library named by
+        # version and the unused Python go.
+
+        version = muructl("--version").stdout.split()[-1].replace("-alpha.", "a")
+        write(state / f"runtime/{version}/cp313/muru/__init__.py")
+        plan = json.loads(muructl("cache", "prune", "daemon", *where, "--dry-run", "--json").stdout)
+        assert plan["daemon"]["dry_run"] is True
+        assert {item["name"] for item in plan["daemon"]["removed"]} == {
+            "1.0.0/cp313",
+            "python/cpython-3.13",
+        }, "the daemon's own runtime library stays"
+        assert (state / "python/cpython-3.13").exists(), "a dry run changes nothing"
+
+        refused = muructl("cache", "prune", "daemon", *where, check=False)
+        assert refused.returncode != 0 and "--yes" in refused.stderr
+
+        answer = json.loads(muructl("cache", "prune", "daemon", *where, "--yes", "--json").stdout)
+        assert answer["daemon"]["freed"] > 0
+        assert not (state / "python/cpython-3.13").exists()
+        assert (state / f"runtime/{version}/cp313").exists()
+        assert (state / "uv-cache/alice").exists(), "prune leaves uv's cache"
     finally:
         daemon.stop()
+
+    # With no daemon the user cache and the daemon's files are worked on
+    # directly. A named version goes; a clear leaves the certificates
+    # unless named.
+
+    answer = json.loads(
+        muructl("cache", "prune", "user", *where, "--version", "1.0.0", "--yes", "--json").stdout
+    )
+    assert [item["name"] for item in answer["user"]["removed"]] == ["1.0.0/cp313"]
+    assert not (cache / "runtime/1.0.0").exists()
+    assert (cache / "runtime/1.1.0/cp314t").exists()
+
+    refused = muructl("cache", "clear", "user", *where, check=False)
+    assert refused.returncode != 0 and "--yes" in refused.stderr
+
+    answer = json.loads(muructl("cache", "clear", "user", *where, "--yes", "--json").stdout)
+    assert [item["name"] for item in answer["user"]["removed"]] == ["1.1.0/cp314t"]
+    assert (cache / "certs/dev.pem").exists(), "the certificates stay unless named"
+
+    answer = json.loads(
+        muructl("cache", "clear", "user", *where, "--certs", "--yes", "--json").stdout
+    )
+    assert [item["name"] for item in answer["user"]["removed"]] == ["certs"]
+    assert not (cache / "certs").exists()
+
+    answer = json.loads(muructl("cache", "clear", "daemon", *where, "--yes", "--json").stdout)
+    names = {item["name"] for item in answer["daemon"]["removed"]}
+    assert names == {"uv-cache/alice"}, answer
+    assert not (state / "uv-cache/alice").exists()

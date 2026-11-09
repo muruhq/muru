@@ -65,6 +65,8 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | TruncateLogs | POST /v1/logs:truncate | cut live logs to their newest bytes at a line boundary, or say what that would free; a running daemon holds the files against rotation while it does |
 | ListLogs | GET /v1/logs | each log with its size, archives and total, and whether its release or host still exists |
 | ListCache | GET /v1/cache | what the daemon's re-creatable data takes and what uses each entry |
+| PruneCache | POST /v1/cache:prune | remove runtime libraries of other versions, or of the version or tag named, and downloaded Pythons no release uses, leaving what is in use, or list what would go |
+| ClearCache | POST /v1/cache:clear | remove everything in the daemon's re-creatable data that is not in use, or list it |
 | GetMetrics | GET /metrics | the Prometheus text exposition (11.1) |
 | SetLogLevel | POST /v1/apps/{app}/releases/{release}:loglevel | time-limited logger levels |
 | OverrideAccessLog | POST /v1/access-log:override | time-limited changes to which requests the access log writes, listed or reset |

@@ -254,6 +254,181 @@ pub fn state_report(locations: &Locations, releases: &[Release]) -> pb::ListCach
     report(root, entries)
 }
 
+/// What `prune` removes.
+#[derive(Debug, Default, Clone)]
+pub struct PruneRules {
+    /// The version the area's owner runs now, whose runtime library stays.
+    pub own_version: String,
+    /// Only runtime libraries of this version, when set.
+    pub version: Option<String>,
+    /// Only runtime libraries of this interpreter tag, when set.
+    pub tag: Option<String>,
+}
+
+/// Split entries into what would be removed and what is left, because
+/// it is in use. `chosen` says whether an entry would otherwise go.
+fn choose(
+    directory: &str,
+    entries: Vec<pb::CacheEntry>,
+    chosen: impl Fn(&pb::CacheEntry) -> bool,
+    dry_run: bool,
+) -> pb::RemoveCacheResponse {
+    let mut answer = pb::RemoveCacheResponse {
+        directory: directory.to_owned(),
+        dry_run,
+        ..Default::default()
+    };
+    let mut together = Measure::default();
+
+    for mut item in entries {
+        if !chosen(&item) {
+            continue;
+        }
+
+        if !item.in_use.is_empty() {
+            answer.left.push(item);
+            continue;
+        }
+
+        let mut measure = Measure::default();
+        measure.add(Path::new(&item.path));
+        item.freed = measure.total().freed;
+        together.merge(&measure);
+        answer.removed.push(item);
+    }
+
+    answer.freed = together.total().freed;
+    answer
+}
+
+/// What a prune removes of a report: runtime libraries of other versions,
+/// or of the version or tag named, and, when neither is named, downloaded
+/// Pythons nothing uses. What is in use of those named is left and
+/// reported; a Python in use is simply not stale.
+pub fn plan_prune(
+    report: pb::ListCacheResponse,
+    rules: &PruneRules,
+    dry_run: bool,
+) -> pb::RemoveCacheResponse {
+    let named = rules.version.is_some() || rules.tag.is_some();
+    let entries: Vec<pb::CacheEntry> = report
+        .entries
+        .into_iter()
+        .filter(|item| named || item.kind != PYTHON || item.in_use.is_empty())
+        .collect();
+
+    choose(
+        &report.directory,
+        entries,
+        |item| match item.kind.as_str() {
+            RUNTIME if named => {
+                rules
+                    .version
+                    .as_ref()
+                    .is_none_or(|version| *version == item.version)
+                    && rules.tag.as_ref().is_none_or(|tag| *tag == item.tag)
+            }
+            RUNTIME => item.version != rules.own_version,
+            PYTHON => !named,
+            _ => false,
+        },
+        dry_run,
+    )
+}
+
+/// What a clear removes of a report: everything, except the development
+/// certificates unless `certs`, since a browser or system may trust them.
+pub fn plan_clear(
+    report: pb::ListCacheResponse,
+    certs: bool,
+    dry_run: bool,
+) -> pb::RemoveCacheResponse {
+    choose(
+        &report.directory,
+        report.entries,
+        |item| item.kind != CERTS || certs,
+        dry_run,
+    )
+}
+
+/// Remove what the plan says, filling in why anything could not be, and
+/// removing a runtime version's directory once it is empty.
+pub fn carry_out(answer: &mut pb::RemoveCacheResponse) {
+    for item in &mut answer.removed {
+        let path = Path::new(&item.path);
+        let Ok(metadata) = path.symlink_metadata() else {
+            continue;
+        };
+
+        let removed = if metadata.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+
+        match removed {
+            Ok(()) => {
+                if item.kind == RUNTIME
+                    && let Some(version) = path.parent()
+                {
+                    let _ = std::fs::remove_dir(version);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => item.error = error.to_string(),
+        }
+    }
+
+    // A release that was not removed gave nothing back, so with any left
+    // the total is what those that went gave back.
+
+    if answer.removed.iter().any(|item| !item.error.is_empty()) {
+        answer.freed = answer
+            .removed
+            .iter()
+            .filter(|item| item.error.is_empty())
+            .map(|item| item.freed)
+            .sum();
+    }
+}
+
+/// A prune of a daemon's state directory.
+pub fn prune_state(
+    locations: &Locations,
+    releases: &[Release],
+    version: Option<String>,
+    tag: Option<String>,
+    dry_run: bool,
+) -> pb::RemoveCacheResponse {
+    let rules = PruneRules {
+        own_version: muru_provision::runtime::pep440(env!("CARGO_PKG_VERSION")),
+        version,
+        tag,
+    };
+    let mut answer = plan_prune(state_report(locations, releases), &rules, dry_run);
+
+    if !dry_run {
+        carry_out(&mut answer);
+    }
+
+    answer
+}
+
+/// A clear of a daemon's state directory.
+pub fn clear_state(
+    locations: &Locations,
+    releases: &[Release],
+    dry_run: bool,
+) -> pb::RemoveCacheResponse {
+    let mut answer = plan_clear(state_report(locations, releases), false, dry_run);
+
+    if !dry_run {
+        carry_out(&mut answer);
+    }
+
+    answer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +436,129 @@ mod tests {
     fn write(path: PathBuf) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"content").unwrap();
+    }
+
+    fn runtime(version: &str, tag: &str, in_use: &str) -> pb::CacheEntry {
+        pb::CacheEntry {
+            kind: RUNTIME.to_owned(),
+            name: format!("{version}/{tag}"),
+            version: version.to_owned(),
+            tag: tag.to_owned(),
+            in_use: in_use.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn other(kind: &str, name: &str, in_use: &str) -> pb::CacheEntry {
+        pb::CacheEntry {
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+            in_use: in_use.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn named(items: &[pb::CacheEntry]) -> Vec<&str> {
+        items.iter().map(|item| item.name.as_str()).collect()
+    }
+
+    fn report_of(entries: Vec<pb::CacheEntry>) -> pb::ListCacheResponse {
+        pb::ListCacheResponse {
+            entries,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prune_takes_other_versions_and_unused_pythons_and_leaves_what_is_in_use() {
+        let rules = PruneRules {
+            own_version: "1.1.0".to_owned(),
+            ..Default::default()
+        };
+        let answer = plan_prune(
+            report_of(vec![
+                runtime("1.0.0", "cp313", ""),
+                runtime("1.0.0", "cp314", "the release shop@r1"),
+                runtime("1.1.0", "cp313", ""),
+                other(CERTS, "certs", ""),
+                other(UV_CACHE, "uv-cache/a", ""),
+                other(PYTHON, "python/a", ""),
+                other(PYTHON, "python/b", "the release shop@r1"),
+            ]),
+            &rules,
+            true,
+        );
+
+        assert_eq!(named(&answer.removed), ["1.0.0/cp313", "python/a"]);
+        assert_eq!(
+            named(&answer.left),
+            ["1.0.0/cp314"],
+            "a Python in use is not stale"
+        );
+
+        // Naming a version or tag takes only those runtime libraries,
+        // muructl's own included, and no Pythons.
+
+        let rules = PruneRules {
+            own_version: "1.1.0".to_owned(),
+            tag: Some("cp313".to_owned()),
+            ..Default::default()
+        };
+        let answer = plan_prune(
+            report_of(vec![
+                runtime("1.0.0", "cp313", ""),
+                runtime("1.1.0", "cp313", ""),
+                runtime("1.1.0", "cp314", ""),
+                other(PYTHON, "python/a", ""),
+            ]),
+            &rules,
+            true,
+        );
+
+        assert_eq!(named(&answer.removed), ["1.0.0/cp313", "1.1.0/cp313"]);
+    }
+
+    #[test]
+    fn clear_takes_everything_but_certificates_unless_named_and_leaves_what_is_in_use() {
+        let entries = vec![
+            runtime("1.0.0", "cp313", ""),
+            runtime("1.0.0", "cp314", "the development run of shop"),
+            other(CERTS, "certs", ""),
+            other(UV, "tools", ""),
+        ];
+
+        let answer = plan_clear(report_of(entries.clone()), false, true);
+        assert_eq!(named(&answer.removed), ["1.0.0/cp313", "tools"]);
+        assert_eq!(named(&answer.left), ["1.0.0/cp314"]);
+
+        let answer = plan_clear(report_of(entries), true, true);
+        assert_eq!(named(&answer.removed), ["1.0.0/cp313", "certs", "tools"]);
+    }
+
+    #[test]
+    fn carrying_out_removes_the_plan_and_says_what_it_freed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+
+        write(root.join("runtime/1.0.0/cp313/muru/__init__.py"));
+        write(root.join("runtime/1.1.0/cp313/muru/__init__.py"));
+
+        let entries = user_entries(root);
+        let rules = PruneRules {
+            own_version: "1.1.0".to_owned(),
+            ..Default::default()
+        };
+        let mut answer = plan_prune(report(root, entries), &rules, false);
+        carry_out(&mut answer);
+
+        assert_eq!(named(&answer.removed), ["1.0.0/cp313"]);
+        assert!(answer.removed[0].error.is_empty());
+        assert!(answer.freed > 0);
+        assert!(
+            !root.join("runtime/1.0.0").exists(),
+            "the empty version goes"
+        );
+        assert!(root.join("runtime/1.1.0/cp313").exists());
     }
 
     #[test]

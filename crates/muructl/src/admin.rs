@@ -8004,6 +8004,82 @@ pub enum CacheCommand {
     /// each runtime library by version and interpreter tag, the certificates,
     /// a managed uv, uv's build cache and downloaded Pythons.
     List(Box<CacheListArgs>),
+
+    /// Remove what is stale: runtime libraries of other versions, or of
+    /// the version or tag named, and downloaded Pythons no release uses.
+    /// Asks first; without a terminal it needs --yes.
+    Prune(Box<CachePruneArgs>),
+
+    /// Remove everything in an area that is not in use. It is re-created
+    /// on demand. The development certificates are left unless named.
+    /// Asks first; without a terminal it needs --yes.
+    Clear(Box<CacheClearArgs>),
+}
+
+/// What `muructl cache prune` takes.
+#[derive(Args, Clone)]
+pub struct CachePruneArgs {
+    /// The area to prune; both when none is named.
+    #[arg(value_enum)]
+    area: Option<CacheArea>,
+
+    /// Only runtime libraries of this version, muructl's own included.
+    #[arg(long, value_name = "VERSION")]
+    version: Option<String>,
+
+    /// Only runtime libraries of this interpreter tag, muructl's own
+    /// version included.
+    #[arg(long, value_name = "TAG")]
+    tag: Option<String>,
+
+    /// Only list what would be removed.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// The daemon's and the user cache's locations.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// What `muructl cache clear` takes.
+#[derive(Args, Clone)]
+pub struct CacheClearArgs {
+    /// The area to clear.
+    #[arg(value_enum)]
+    area: CacheArea,
+
+    /// Also remove the development certificates, which a browser or the
+    /// system may trust.
+    #[arg(long)]
+    certs: bool,
+
+    /// Only list what would be removed.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// The daemon's and the user cache's locations.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
 }
 
 /// The user cache directory: --cache-dir, else what `muructl run` uses.
@@ -8167,6 +8243,349 @@ pub async fn cache_list(args: CacheListArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// One area's plan or result, and where it goes next.
+struct CacheRemoval {
+    title: &'static str,
+    answer: pb::RemoveCacheResponse,
+}
+
+/// A prune's plan or outcome on the user cache.
+fn user_cache_prune(
+    args: &CachePruneArgs,
+    dry_run: bool,
+) -> anyhow::Result<pb::RemoveCacheResponse> {
+    use muru_controller::cache;
+
+    let rules = cache::PruneRules {
+        own_version: crate::provision::version(),
+        version: args.version.clone(),
+        tag: args.tag.clone(),
+    };
+    let mut answer = cache::plan_prune(
+        user_cache_report(&args.socket, &args.files)?,
+        &rules,
+        dry_run,
+    );
+
+    if !dry_run {
+        cache::carry_out(&mut answer);
+    }
+
+    Ok(answer)
+}
+
+/// A prune's plan or outcome on the daemon's area.
+async fn daemon_cache_prune(
+    args: &CachePruneArgs,
+    way: &CacheWay,
+    dry_run: bool,
+) -> anyhow::Result<pb::RemoveCacheResponse> {
+    match way {
+        CacheWay::Daemon(client) => Ok((**client)
+            .clone()
+            .prune_cache(pb::PruneCacheRequest {
+                version: args.version.clone().unwrap_or_default(),
+                tag: args.tag.clone().unwrap_or_default(),
+                dry_run,
+            })
+            .await
+            .map_err(explain)?
+            .into_inner()),
+        CacheWay::Files(locations, releases) => Ok(muru_controller::cache::prune_state(
+            locations,
+            releases,
+            args.version.clone(),
+            args.tag.clone(),
+            dry_run,
+        )),
+    }
+}
+
+/// A clear's plan or outcome on the user cache.
+fn user_cache_clear(
+    args: &CacheClearArgs,
+    dry_run: bool,
+) -> anyhow::Result<pb::RemoveCacheResponse> {
+    use muru_controller::cache;
+
+    let mut answer = cache::plan_clear(
+        user_cache_report(&args.socket, &args.files)?,
+        args.certs,
+        dry_run,
+    );
+
+    if !dry_run {
+        cache::carry_out(&mut answer);
+    }
+
+    Ok(answer)
+}
+
+/// A clear's plan or outcome on the daemon's area.
+async fn daemon_cache_clear(
+    way: &CacheWay,
+    dry_run: bool,
+) -> anyhow::Result<pb::RemoveCacheResponse> {
+    match way {
+        CacheWay::Daemon(client) => Ok((**client)
+            .clone()
+            .clear_cache(pb::ClearCacheRequest { dry_run })
+            .await
+            .map_err(explain)?
+            .into_inner()),
+        CacheWay::Files(locations, releases) => Ok(muru_controller::cache::clear_state(
+            locations, releases, dry_run,
+        )),
+    }
+}
+
+/// Print one area's plan and what is left, on standard error unless this
+/// is the dry run's answer.
+fn show_cache_plan(removal: &CacheRemoval, dry_run: bool) {
+    let print = |line: String| {
+        if dry_run {
+            println!("{line}");
+        } else {
+            eprintln!("{line}");
+        }
+    };
+
+    if removal.answer.removed.is_empty() && removal.answer.left.is_empty() {
+        return;
+    }
+
+    print(format!("{} in {}", removal.title, removal.answer.directory));
+
+    for item in &removal.answer.removed {
+        print(format!("  {} ({})", item.name, human_size(item.freed)));
+    }
+
+    for item in &removal.answer.left {
+        print(format!(
+            "  {} is left: in use by {}",
+            item.name, item.in_use
+        ));
+    }
+}
+
+/// `muructl cache prune` and `clear`, for scripts: each area asked for.
+#[derive(serde::Serialize)]
+struct CacheRemovalReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<pb::RemoveCacheResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon: Option<pb::RemoveCacheResponse>,
+}
+
+/// Show the plans, ask, and return whether to go on. `notice` is what is
+/// said before the question.
+fn cache_removal_decided(
+    removals: &[CacheRemoval],
+    dry_run: bool,
+    json: bool,
+    yes: bool,
+    notice: Option<&str>,
+) -> anyhow::Result<bool> {
+    let count: usize = removals
+        .iter()
+        .map(|removal| removal.answer.removed.len())
+        .sum();
+    let freed: u64 = removals.iter().map(|removal| removal.answer.freed).sum();
+
+    if dry_run || count == 0 {
+        if !json {
+            for removal in removals {
+                show_cache_plan(removal, true);
+            }
+
+            if count == 0 {
+                println!("muru: nothing to remove");
+            } else {
+                println!("would free {}", human_size(freed));
+            }
+        }
+
+        return Ok(false);
+    }
+
+    for removal in removals {
+        show_cache_plan(removal, false);
+    }
+
+    if let Some(notice) = notice {
+        eprintln!("{notice}");
+    }
+
+    let question = format!(
+        "Remove {count} item{}, freeing {}?",
+        if count == 1 { "" } else { "s" },
+        human_size(freed)
+    );
+
+    if confirm(&question, yes)? {
+        Ok(true)
+    } else {
+        eprintln!("muru: nothing was changed");
+        Ok(false)
+    }
+}
+
+/// Report the outcome of a removal, failing if any part of it did.
+fn finish_cache_removal(removals: Vec<CacheRemoval>, json: bool) -> anyhow::Result<()> {
+    let failures: Vec<String> = removals
+        .iter()
+        .flat_map(|removal| removal.answer.removed.iter())
+        .filter(|item| !item.error.is_empty())
+        .map(|item| format!("{}: {}", item.name, item.error))
+        .collect();
+    let freed: u64 = removals.iter().map(|removal| removal.answer.freed).sum();
+
+    if json {
+        let mut report = CacheRemovalReport {
+            user: None,
+            daemon: None,
+        };
+
+        for removal in removals {
+            if removal.title == USER_AREA_TITLE {
+                report.user = Some(removal.answer);
+            } else {
+                report.daemon = Some(removal.answer);
+            }
+        }
+
+        print_answer(&report)?;
+    } else {
+        println!("muru: removed, freeing {}", human_size(freed));
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+const USER_AREA_TITLE: &str = "USER CACHE";
+const DAEMON_AREA_TITLE: &str = "DAEMON DATA";
+
+/// Print the plans as `--json` gives them, for a run that stops there.
+fn print_cache_plans(removals: Vec<CacheRemoval>) -> anyhow::Result<()> {
+    let mut report = CacheRemovalReport {
+        user: None,
+        daemon: None,
+    };
+
+    for removal in removals {
+        if removal.title == USER_AREA_TITLE {
+            report.user = Some(removal.answer);
+        } else {
+            report.daemon = Some(removal.answer);
+        }
+    }
+
+    print_answer(&report)
+}
+
+/// Remove what is stale.
+pub async fn cache_prune(args: CachePruneArgs) -> anyhow::Result<()> {
+    let way = if args.area == Some(CacheArea::User) {
+        None
+    } else {
+        Some(cache_way(&args.socket, &args.files).await?)
+    };
+
+    let mut removals = Vec::new();
+
+    if args.area != Some(CacheArea::Daemon) {
+        removals.push(CacheRemoval {
+            title: USER_AREA_TITLE,
+            answer: user_cache_prune(&args, true)?,
+        });
+    }
+
+    if let Some(way) = &way {
+        removals.push(CacheRemoval {
+            title: DAEMON_AREA_TITLE,
+            answer: daemon_cache_prune(&args, way, true).await?,
+        });
+    }
+
+    let go_on = cache_removal_decided(&removals, args.dry_run, args.output.json, args.yes, None)?;
+
+    if !go_on {
+        return if args.output.json && (args.dry_run || nothing_planned(&removals)) {
+            print_cache_plans(removals)
+        } else {
+            Ok(())
+        };
+    }
+
+    for removal in &mut removals {
+        removal.answer = if removal.title == USER_AREA_TITLE {
+            user_cache_prune(&args, false)?
+        } else {
+            let way = way.as_ref().context("the daemon's area was planned")?;
+            daemon_cache_prune(&args, way, false).await?
+        };
+    }
+
+    finish_cache_removal(removals, args.output.json)
+}
+
+/// Whether no area has anything to remove.
+fn nothing_planned(removals: &[CacheRemoval]) -> bool {
+    removals
+        .iter()
+        .all(|removal| removal.answer.removed.is_empty())
+}
+
+/// Remove everything in an area that is not in use.
+pub async fn cache_clear(args: CacheClearArgs) -> anyhow::Result<()> {
+    let way = if args.area == CacheArea::User {
+        None
+    } else {
+        Some(cache_way(&args.socket, &args.files).await?)
+    };
+
+    let plan = match &way {
+        None => CacheRemoval {
+            title: USER_AREA_TITLE,
+            answer: user_cache_clear(&args, true)?,
+        },
+        Some(way) => CacheRemoval {
+            title: DAEMON_AREA_TITLE,
+            answer: daemon_cache_clear(way, true).await?,
+        },
+    };
+
+    let mut removals = vec![plan];
+    let notice = "These are re-created on demand. A runtime library is fetched again when next                   needed, which needs the network or a wheel directory (MURU_WHEEL_DIR).";
+
+    let go_on = cache_removal_decided(
+        &removals,
+        args.dry_run,
+        args.output.json,
+        args.yes,
+        Some(notice),
+    )?;
+
+    if !go_on {
+        return if args.output.json && (args.dry_run || nothing_planned(&removals)) {
+            print_cache_plans(removals)
+        } else {
+            Ok(())
+        };
+    }
+
+    removals[0].answer = match &way {
+        None => user_cache_clear(&args, false)?,
+        Some(way) => daemon_cache_clear(way, false).await?,
+    };
+
+    finish_cache_removal(removals, args.output.json)
 }
 
 /// A byte count for a reader, in the units sizes are given in.

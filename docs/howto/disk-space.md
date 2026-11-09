@@ -129,3 +129,35 @@ Name `user` or `daemon` to show one. The user cache is the one `muructl
 run` uses; `--cache-dir` names another. The daemon's data comes from the
 running daemon, and with none running from the state directory, which
 `--state-dir` names.
+
+### Pruning what is stale
+
+`muructl cache prune` removes runtime libraries for versions other than
+muructl's own, and downloaded Pythons no release uses:
+
+```console
+$ muructl cache prune
+USER CACHE in /home/me/.cache/muru
+  0.9.0/cp313 (4.7MB)
+DAEMON DATA in /home/me/.local/state/muru
+  python/cpython-3.12-linux-x86_64-gnu (118.0MB)
+Remove 2 items, freeing 122.7MB? [y/N]
+```
+
+Name `user` or `daemon` for one area. `--version` or `--tag` removes
+just the runtime libraries of that version or interpreter tag, muructl's
+own included. Muru never prunes on its own.
+
+### Clearing an area
+
+`muructl cache clear user` or `muructl cache clear daemon` removes
+everything in the area, and says that it is re-created on demand and that
+a runtime library is fetched again, which needs the network or a wheel
+directory (`MURU_WHEEL_DIR`, or `tools.wheel_dir`). The development
+certificates stay unless `--certs` names them, since a browser or the
+system may trust them.
+
+Both commands ask first, with `--yes` and `--dry-run` as for releases.
+What is in use is left and reported: a runtime library in use by a running
+`muructl run` or release, and, while a release is being built or started,
+uv's build cache, the Pythons and the current runtime library.

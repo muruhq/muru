@@ -57,6 +57,8 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Capacity | muructl schedule add, list, remove | Scheduled capacity | 7.5 |
 | Capacity | muructl edge pools, set | Edge pools and process counts | 4.2 |
 | Operations | muructl cache list [user or daemon] | What the user cache and the daemon's re-creatable data take, by runtime library version and tag, certificates, managed uv, uv's build cache and downloaded Pythons, with what uses each. Flags: --json, and with no daemon running --state-dir and --cache-dir | 13.8 |
+| Operations | muructl cache prune [user or daemon] | Remove runtime libraries of other versions, or of the version or tag named, and downloaded Pythons no release uses; what is in use is left. Asks first. Flags: --version, --tag, --dry-run, --yes, --json, --state-dir, --cache-dir | 13.8 |
+| Operations | muructl cache clear user or daemon | Remove everything in the area that is not in use. Asks first. Flags: --certs (the development certificates too), --dry-run, --yes, --json, --state-dir, --cache-dir | 13.8 |
 | Observability | muructl watch | Live view of applications, releases and workers | 10.7 |
 | Observability | muructl events | Show or follow events with filters. Flags: --follow, --after | 11.5 |
 | Observability | muructl logs RELEASE | Show or follow logs | 11.2 |

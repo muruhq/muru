@@ -1391,6 +1391,42 @@ impl Admin for Service {
         Ok(Response::new(answer))
     }
 
+    async fn prune_cache(
+        &self,
+        request: Request<pb::PruneCacheRequest>,
+    ) -> Result<Response<pb::RemoveCacheResponse>, Status> {
+        let request = request.into_inner();
+        let releases = self.handle.store.releases(None).map_err(internal)?;
+        let locations = self.handle.info.locations.clone();
+        let named = |text: String| (!text.is_empty()).then_some(text);
+        let (version, tag) = (named(request.version), named(request.tag));
+
+        let answer = tokio::task::spawn_blocking(move || {
+            crate::cache::prune_state(&locations, &releases, version, tag, request.dry_run)
+        })
+        .await
+        .map_err(internal)?;
+
+        Ok(Response::new(answer))
+    }
+
+    async fn clear_cache(
+        &self,
+        request: Request<pb::ClearCacheRequest>,
+    ) -> Result<Response<pb::RemoveCacheResponse>, Status> {
+        let dry_run = request.into_inner().dry_run;
+        let releases = self.handle.store.releases(None).map_err(internal)?;
+        let locations = self.handle.info.locations.clone();
+
+        let answer = tokio::task::spawn_blocking(move || {
+            crate::cache::clear_state(&locations, &releases, dry_run)
+        })
+        .await
+        .map_err(internal)?;
+
+        Ok(Response::new(answer))
+    }
+
     async fn get_metrics(
         &self,
         _: Request<pb::GetMetricsRequest>,
