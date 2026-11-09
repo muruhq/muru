@@ -163,21 +163,6 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
         )
         return [body]
 
-    if path == "/deep":
-        # A thread many frames deep, for a stacks reply that is large.
-
-        def descend(remaining: int) -> None:
-            if remaining:
-                descend(remaining - 1)
-            else:
-                time.sleep(float(query.get("seconds", "5")))
-
-        depth = int(query.get("depth", "1000"))
-        sys.setrecursionlimit(depth + 200)
-        descend(depth)
-        start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", "4")])
-        return [b"deep"]
-
     if path == "/sleep":
         time.sleep(float(query.get("seconds", "0.1")))
         start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", "5")])

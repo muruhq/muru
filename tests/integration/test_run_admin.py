@@ -10,7 +10,6 @@ import json
 import os
 import subprocess
 import threading
-import time
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
@@ -80,13 +79,19 @@ def test_a_debug_reply_larger_than_the_default_limit_arrives(runtime: Path) -> N
     server = start(runtime)
 
     try:
-        deep = threading.Thread(target=lambda: server.get("/deep?depth=70000&seconds=6"))
-        deep.start()
-        time.sleep(2)
-        large = muructl(runtime, "debug", "stacks", "plain-wsgi", cwd=support.FIXTURES).stdout
-        deep.join(timeout=30)
-        assert len(large) > 4 * 1024 * 1024, len(large)
-        assert "in descend" in large
+        size = 5 * 1024 * 1024
+        large = muructl(
+            runtime,
+            "debug",
+            "exec",
+            "plain-wsgi",
+            "--worker",
+            "0",
+            "--",
+            f"print('x' * {size})",
+            cwd=support.FIXTURES,
+        ).stdout
+        assert large.count("x") >= size, len(large)
     finally:
         server.stop()
 
