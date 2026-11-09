@@ -4361,6 +4361,33 @@ pub enum AppCommand {
         #[command(flatten)]
         output: JsonArgs,
     },
+
+    /// Remove an application: drain whatever runs and remove every
+    /// release with its environment, bytecode and logs. Refused while a
+    /// route sends it traffic. Asks first; without a terminal it needs
+    /// --yes.
+    Remove(Box<AppRemoveArgs>),
+}
+
+/// What `muructl app remove` takes.
+#[derive(Args, Clone)]
+pub struct AppRemoveArgs {
+    /// The application.
+    app: String,
+
+    /// Only say what would go.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
 }
 
 /// List applications.
@@ -4413,6 +4440,59 @@ pub async fn app_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Remove an application and all its releases.
+pub async fn app_remove(args: AppRemoveArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.socket()?).await?;
+    let request = pb::RemoveAppRequest {
+        app: args.app.clone(),
+        dry_run: true,
+    };
+
+    let plan = client
+        .remove_app(request.clone())
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if args.dry_run {
+        if !args.output.json && plan.removed.is_empty() {
+            println!("muru: {} has no releases to remove", args.app);
+            return Ok(());
+        }
+
+        show_removal_plan(&plan, true, args.output.json)?;
+        return Ok(());
+    }
+
+    for release in &plan.removed {
+        eprintln!("  {}", removal_line(release));
+    }
+
+    let question = format!(
+        "Remove application {} and its {} release{}, freeing {}?",
+        args.app,
+        plan.removed.len(),
+        if plan.removed.len() == 1 { "" } else { "s" },
+        human_size(plan.freed)
+    );
+
+    if !confirm(&question, args.yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    let answer = client
+        .remove_app(pb::RemoveAppRequest {
+            dry_run: false,
+            ..request
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    finish_removal(&answer, args.output.json)
 }
 
 /// The `muructl overlay` subcommands (section 9.10).

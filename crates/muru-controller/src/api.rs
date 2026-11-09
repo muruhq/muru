@@ -799,6 +799,89 @@ impl Admin for Service {
         Ok(Response::new(answer))
     }
 
+    async fn remove_app(
+        &self,
+        request: Request<pb::RemoveAppRequest>,
+    ) -> Result<Response<pb::RemoveReleasesResponse>, Status> {
+        let request = request.into_inner();
+        let store = &self.handle.store;
+        let app = store.app(&request.app).map_err(not_found)?;
+
+        let _applying = if request.dry_run {
+            None
+        } else {
+            Some(self.applying.clone().lock_owned().await)
+        };
+
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::AppRemovalRefused {
+                app: app.name.clone(),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+
+        if let Some(why) = done_rx.await.map_err(|_| Status::unavailable(STOPPING))? {
+            return Err(Status::failed_precondition(format!(
+                "{} cannot be removed: {why}",
+                app.name
+            )));
+        }
+
+        let planned: Vec<Planned> = store
+            .releases(Some(&app.name))
+            .map_err(internal)?
+            .into_iter()
+            .map(|release| Planned {
+                app: app.name.clone(),
+                id: release.id,
+                state: release.state,
+                created_unix_ms: release.created_unix_ms,
+                why: removal::Reason::Application,
+            })
+            .collect();
+        let mut answer = self.measured(&planned, false, request.dry_run).await?;
+
+        if request.dry_run {
+            return Ok(Response::new(answer));
+        }
+
+        // The daemon drains what runs and drops the records in one step;
+        // the files follow, since a release's environment can be large.
+
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::RemoveApp {
+                app: app.name.clone(),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+
+        for (item, message) in planned.iter().zip(answer.removed.iter_mut()) {
+            self.handle.events.emit(
+                "release.removed",
+                &format!("{}@{}", item.app, item.id),
+                "notice",
+                item.why.event_message(),
+            );
+            message.error = self
+                .remove_files(&item.app, &item.id, false)
+                .await
+                .join("; ");
+        }
+
+        settle_freed(&mut answer);
+        Ok(Response::new(answer))
+    }
+
     async fn remove_release(
         &self,
         request: Request<pb::RemoveReleaseRequest>,
@@ -2918,13 +3001,11 @@ impl Service {
             .collect())
     }
 
-    /// Measure what the planned releases take and, unless this is a dry
-    /// run, remove them one at a time. The daemon checks each again as it
-    /// drops the record, so one that became protected since it was chosen
-    /// is reported and left.
-    async fn carry_out(
+    /// What the planned releases take, as the answer a removal gives
+    /// before anything has gone.
+    async fn measured(
         &self,
-        planned: Vec<Planned>,
+        planned: &[Planned],
         keep_logs: bool,
         dry_run: bool,
     ) -> Result<pb::RemoveReleasesResponse, Status> {
@@ -2940,7 +3021,7 @@ impl Service {
         .await
         .map_err(internal)?;
 
-        let mut answer = pb::RemoveReleasesResponse {
+        Ok(pb::RemoveReleasesResponse {
             removed: planned
                 .iter()
                 .zip(&each)
@@ -2957,7 +3038,20 @@ impl Service {
             kept: Vec::new(),
             freed: together.freed,
             dry_run,
-        };
+        })
+    }
+
+    /// Measure what the planned releases take and, unless this is a dry
+    /// run, remove them one at a time. The daemon checks each again as it
+    /// drops the record, so one that became protected since it was chosen
+    /// is reported and left.
+    async fn carry_out(
+        &self,
+        planned: Vec<Planned>,
+        keep_logs: bool,
+        dry_run: bool,
+    ) -> Result<pb::RemoveReleasesResponse, Status> {
+        let mut answer = self.measured(&planned, keep_logs, dry_run).await?;
 
         if dry_run {
             return Ok(answer);
@@ -2991,17 +3085,7 @@ impl Service {
             message.error = failures.join("; ");
         }
 
-        // A release that was not removed gave nothing back.
-
-        if answer.removed.iter().any(|item| !item.error.is_empty()) {
-            answer.freed = answer
-                .removed
-                .iter()
-                .filter(|item| item.error.is_empty())
-                .map(|item| item.disk_bytes)
-                .sum();
-        }
-
+        settle_freed(&mut answer);
         Ok(answer)
     }
 
@@ -3020,6 +3104,19 @@ impl Service {
 
 /// The outcome when the daemon's command loop has gone.
 const STOPPING: &str = "the daemon is stopping";
+
+/// A release that was not removed gave nothing back, so with any left
+/// the total is what those that went gave back.
+fn settle_freed(answer: &mut pb::RemoveReleasesResponse) {
+    if answer.removed.iter().any(|item| !item.error.is_empty()) {
+        answer.freed = answer
+            .removed
+            .iter()
+            .filter(|item| item.error.is_empty())
+            .map(|item| item.disk_bytes)
+            .sum();
+    }
+}
 
 /// A release chosen for removal, before its disk use is known.
 struct Planned {

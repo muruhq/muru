@@ -34,6 +34,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Configuration | muructl config show RELEASE --effective | Merged settings with their sources | 3.3 |
 | Configuration | muructl config schema | Print the JSON Schema for configuration files | 10.3 |
 | Applications | muructl app create, list, show, delete | Manage applications | 3.1 |
+| Applications | muructl app remove APP | Drain whatever runs and remove the application and all its releases, with their environments, bytecode and logs; refused while a route sends it traffic. Asks first. Flags: --dry-run, --yes, --json | 9.1 |
 | Applications | muructl release list, show, wait | Manage releases and wait for states; list shows the disk each takes | 9.1 |
 | Applications | muructl release prune [APP] --keep N | Remove old releases, of one application or all: the N newest that have not failed stay, with the serving, rollback and running releases and those a route or rollout uses. Failed releases stay until older than both the serving and the rollback release. Asks first. Flags: --force (take releases applied files declare), --keep-logs, --dry-run, --yes, --json | 9.1 |
 | Applications | muructl release remove APP@ID | Remove one release, the protected ones of 9.1 refused; a failed release named goes at once. Asks first. Flags: --keep-logs, --dry-run, --yes, --json | 9.1 |

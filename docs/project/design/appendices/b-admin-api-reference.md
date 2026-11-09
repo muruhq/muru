@@ -51,6 +51,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | PauseRollout, ResumeRollout, PromoteRollout, AbortRollout | POST /v1/apps/{app}/rollouts/{rollout}:pause, :resume, :promote, :abort | rollout control |
 | DrainRelease | POST /v1/apps/{app}/releases/{release}:drain | drain with timeouts |
 | RemoveRelease | DELETE /v1/apps/{app}/releases/{release} | remove one release, the protected ones of 9.1 refused, or say what it would free |
+| RemoveApp | DELETE /v1/apps/{app} | drain what runs and remove the application and its releases, refused while a route sends it traffic, or say what would go |
 | PruneReleases | POST /v1/apps/{app}/releases:prune | remove old releases by the rules of 9.1, of an application or of all, or list what would go |
 | SetScale | POST /v1/apps/{app}/releases/{release}:scale | sizes, bounds, temporary floors |
 | GetScaleStatus | GET /v1/apps/{app}/releases/{release}/scale | signals, decisions, churn |

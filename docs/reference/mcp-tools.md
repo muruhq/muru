@@ -42,6 +42,7 @@ ones it names.
 | `reopen_logs` | changes | `muructl logs reopen` | `workers` |
 | `prune_releases` | changes | `muructl release prune`, refused unless `yes` is true or `dry_run` asked for | `app`, `keep`, `force`, `keep_logs`, `dry_run`, `yes` |
 | `remove_release` | changes | `muructl release remove`, refused unless `yes` is true or `dry_run` asked for | `release` (app@release), `keep_logs`, `dry_run`, `yes` |
+| `remove_app` | changes | `muructl app remove`, refused unless `yes` is true or `dry_run` asked for | `app`, `dry_run`, `yes` |
 | `prune_logs` | changes | `muructl logs prune`, refused unless `yes` is true or `dry_run` asked for | `keep`, `older_than`, `orphaned`, `dry_run`, `yes` |
 | `rotate_logs` | changes | `muructl logs rotate` | `target` (app@release), `access`, `host`, `all` |
 | `truncate_logs` | changes | `muructl logs truncate`, refused unless `yes` is true | `target` (app@release), `access`, `host`, `all`, `keep`, `yes` |

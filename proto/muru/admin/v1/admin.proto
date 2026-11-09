@@ -17,6 +17,8 @@ service Admin {
   // Applications.
   rpc ListApps(ListAppsRequest) returns (ListAppsResponse);
   rpc GetApp(GetAppRequest) returns (App);
+  // Remove an application and every release it has, or say what would go.
+  rpc RemoveApp(RemoveAppRequest) returns (RemoveReleasesResponse);
 
   // Create a release from a source directory and apply the application's
   // default strategy (blue/green): start it, move traffic when it is
@@ -421,6 +423,11 @@ message PruneReleasesRequest {
   bool force = 3;                   // also take releases applied files declare
   bool keep_logs = 4;               // leave the logs of what is removed
   bool dry_run = 5;                 // only list what would go
+}
+
+message RemoveAppRequest {
+  string app = 1;
+  bool dry_run = 2;                 // only say what would go
 }
 
 message RemoveReleaseRequest {

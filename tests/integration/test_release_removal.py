@@ -5,7 +5,9 @@ never takes."""
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -166,5 +168,75 @@ def test_release_prune_takes_only_what_it_may(tmp_path: Path) -> None:
         answer = as_json(daemon, "release", "remove", "shop@r3", "--keep-logs", "--yes")
         assert removed_ids(answer) == ["r3"]
         assert (logs / "r3.log").exists()
+    finally:
+        daemon.stop()
+
+
+def alive(pid: int) -> bool:
+    """Whether a process exists."""
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+
+    return True
+
+
+def test_app_remove_drains_and_goes_only_once_no_route_sends_traffic(tmp_path: Path) -> None:
+    daemon = start_daemon(tmp_path, listeners=[(support.free_port(), False)])
+
+    def site(routed: bool) -> Path:
+        document = "".join(
+            f"[app.shop.release.{release}]\nsource = '{SHOP}'\npython = '{sys.executable}'\n\n"
+            for release in ("r1", "r2")
+        )
+
+        if routed:
+            document += (
+                "[host.shop]\nnames = ['shop.test']\ndefault = true\n\n"
+                "[[route]]\nhost = 'shop'\napp = 'shop'\npath = '/'\n"
+            )
+
+        path = tmp_path / "site.toml"
+        path.write_text(document)
+        return path
+
+    try:
+        daemon.muructl("apply", "-f", str(site(routed=True)))
+        seed_files(tmp_path, "shop", "r1")
+        record = tomllib.loads((daemon.run_dir / "apps/shop/r2/host.toml").read_text())
+        pid = record["pid"]
+
+        # A route sends it traffic: refused, and nothing changes.
+
+        refused = daemon.muructl("app", "remove", "shop", "--yes", check=False)
+        assert refused.returncode != 0 and "route" in refused.stderr
+        assert alive(pid)
+        assert (daemon.run_dir / "apps/shop/r2").exists()
+
+        # With the route gone, the question comes first.
+
+        daemon.muructl("apply", "-f", str(site(routed=False)), "--prune")
+        refused = daemon.muructl("app", "remove", "shop", check=False)
+        assert refused.returncode != 0 and "--yes" in refused.stderr
+
+        plan = as_json(daemon, "app", "remove", "shop", "--dry-run")
+        assert sorted(removed_ids(plan)) == ["r1", "r2"]
+        assert plan["dry_run"] is True and alive(pid)
+
+        answer = as_json(daemon, "app", "remove", "shop", "--yes")
+        assert sorted(removed_ids(answer)) == ["r1", "r2"]
+        assert {item["why"] for item in answer["removed"]} == {"application"}
+        assert not alive(pid), "what ran was drained"
+
+        assert as_json(daemon, "app", "list")["apps"] == []
+        assert as_json(daemon, "release", "list")["releases"] == []
+        assert not (tmp_path / "state/envs/shop").exists()
+        assert not (tmp_path / "logs/apps/shop").exists()
+        events = daemon.muructl("events").stdout
+        assert "shop@r1" in events and "shop@r2" in events and "release.removed" in events
+
+        assert daemon.muructl("app", "remove", "shop", "--yes", check=False).returncode != 0
     finally:
         daemon.stop()

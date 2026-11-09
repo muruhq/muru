@@ -97,6 +97,7 @@ $ muructl release show shop@r9 --json
 | `muructl logs reopen` | What reopened its files: `edge`, `hosts` |
 | `muructl release prune` | `freed` (bytes), `dry_run`, `removed` and `kept`. `removed` holds what goes, each with `app`, `id`, `state`, `created_unix_ms`, `disk_bytes`, `why` (`keep` or `failed`) and `error` when it could not be removed or part of it was left behind. `kept` holds what stays, each with `app`, `id`, `state` and `why` (`serving`, `rollback`, `in_use`, `referenced`, `declared`, `keep` or `failed`) |
 | `muructl release remove` | As `muructl release prune` prints it, with `why` of `named` and an empty `kept` |
+| `muructl app remove` | As `muructl release prune` prints it, with `why` of `application` and an empty `kept` |
 | `muructl logs prune` | `freed` (bytes), `dry_run` and `removed`, each with `name`, `size`, `why` (`keep`, `older_than` or `orphaned`) and `error` when it could not be removed |
 | `muructl logs rotate` | `logs`, each with `name`, `size`, `archive` (relative to the log directory, before compression through a daemon) and `error` when that log could not be rotated |
 | `muructl logs truncate` | `freed`, `dry_run` and `logs`, each with `name`, `size`, `kept`, `freed`, `in_place` (the log was cut in place, so lines written while it was copied are lost), `late` (the bytes writers added during the swap, carried over) and `error` when that log could not be cut |

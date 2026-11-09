@@ -51,6 +51,8 @@ Superseded releases stay warm for a retention window (default 30 minutes, or the
 
 `muructl release remove APP@ID` removes one release, by name, and refuses the protected ones with why. Naming a failed release removes it without waiting for the cutoff, and a release applied files declare goes, since the operator named it.
 
+`muructl app remove APP` removes a whole application: whatever runs is drained, and every release goes with its environment, bytecode and logs. It is refused while a route, including one an active overlay lays over the routes, still sends traffic to the application, while a rollout of it is under way, and while a release of it is pending or being built. The checks, the drains and dropping the records are one step of the command loop.
+
 What goes with a release: its record, its environment, its bytecode, its run directory and, unless --keep-logs, its log and log archives. A release's source directory is never touched, since Muru points at it and does not own it. The directories under STATE/envs and STATE/pycache and the log and run directories named for the application go when they are empty. The same removal serves `muructl apply --prune`, so it takes logs too, and an apply undone after a release did not start, which leaves the release's log so that it can say why. `muructl release list` shows what each release takes, counted from the same files: the bytes allocated with each hard-linked file counted once, and, separately, what removing it gives back, which is less when uv's cache holds further links to the environment's files. Measuring walks the environment, so the release list asks for it and other callers of ListReleases do not pay for it.
 
 ## 9.2 Strategies

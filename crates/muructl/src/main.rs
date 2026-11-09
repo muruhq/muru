@@ -963,6 +963,7 @@ fn main() -> anyhow::Result<()> {
                 admin::AppCommand::List { socket, output } => {
                     admin::app_list(socket, output.json).await
                 }
+                admin::AppCommand::Remove(args) => admin::app_remove(*args).await,
             }
         }),
         Command::Release { command } => runtime.block_on(async move {

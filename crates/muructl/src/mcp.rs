@@ -1377,6 +1377,34 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "remove_app",
+            description: "Remove an application: drain whatever runs and remove every release with its environment, bytecode and logs. Refused while a route sends it traffic. dry_run says what would go; anything else is refused unless yes is true.",
+            changes: true,
+            properties: json!({
+                "app": {"type": "string"},
+                "dry_run": {"type": "boolean"},
+                "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
+            }),
+            required: &["app"],
+            command: |arguments| {
+                let mut command = words(&["app", "remove"]);
+                command.extend(
+                    arguments
+                        .get("app")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+
+                for (key, name) in [("dry_run", "--dry-run"), ("yes", "--yes")] {
+                    if flag(arguments, key) {
+                        command.push(name.to_owned());
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "reopen_logs",
             description: "Reopen every log file by name, after something outside Muru has renamed them; workers also runs each worker's on_reopen_logs hook.",
             changes: true,

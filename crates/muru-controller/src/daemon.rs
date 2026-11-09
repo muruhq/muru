@@ -473,6 +473,21 @@ pub enum Command {
         /// Where the outcome goes.
         done: oneshot::Sender<Result<(), String>>,
     },
+    /// Section 9.1: why an application cannot be removed now, if so.
+    AppRemovalRefused {
+        /// The application.
+        app: String,
+        /// Where the answer goes.
+        done: oneshot::Sender<Option<String>>,
+    },
+    /// Section 9.1: drain whatever an application runs and drop it and
+    /// its release records, unless it cannot be removed now.
+    RemoveApp {
+        /// The application.
+        app: String,
+        /// Where the outcome goes.
+        done: oneshot::Sender<Result<(), String>>,
+    },
     /// Section 10.10: start a recorded release held, for an apply's
     /// prepare phase, unless it runs.
     StartHeld {
@@ -4258,6 +4273,12 @@ impl Daemon {
             }
             Command::ForgetRelease { app, id, done } => {
                 let _ = done.send(self.forget_release(&app, &id));
+            }
+            Command::AppRemovalRefused { app, done } => {
+                let _ = done.send(self.app_removal_refused(&app));
+            }
+            Command::RemoveApp { app, done } => {
+                let _ = done.send(self.remove_app(&app).await);
             }
             Command::StartHeld { app, id, done } => {
                 let _ = done.send(self.start_held(&app, &id).await);
@@ -8475,6 +8496,92 @@ impl Daemon {
         self.store
             .delete_release(app, id)
             .map_err(|error| error.to_string())
+    }
+
+    /// Section 9.1: why an application cannot be removed now, if so: a
+    /// route still sends it traffic, a rollout is under way, or a release
+    /// of it is being built or waits to be started.
+    fn app_removal_refused(&self, app: &str) -> Option<String> {
+        let (routes, _) = self.effective();
+
+        for route in self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .iter()
+            .chain(&routes)
+        {
+            if route_apps(route).contains(&app) {
+                return Some(format!(
+                    "route {} {} sends traffic to {app}; remove the route first",
+                    route.host,
+                    route.key()
+                ));
+            }
+        }
+
+        if let Ok(Some(rollout)) = self.store.active_rollout(app) {
+            return Some(format!(
+                "a rollout of {app} to {} is under way; promote or abort it first",
+                rollout.candidate
+            ));
+        }
+
+        self.store
+            .releases(Some(app))
+            .unwrap_or_default()
+            .iter()
+            .find(|release| {
+                matches!(
+                    release.state,
+                    ReleaseState::Pending | ReleaseState::Building
+                )
+            })
+            .map(|release| {
+                format!(
+                    "{app}@{} is {}; wait for it to finish",
+                    release.id, release.state
+                )
+            })
+    }
+
+    /// Section 9.1: drain whatever an application runs, then drop its
+    /// release records and the application.
+    async fn remove_app(&mut self, app: &str) -> Result<(), String> {
+        if let Some(why) = self.app_removal_refused(app) {
+            return Err(format!("{app} cannot be removed: {why}"));
+        }
+
+        let releases = self
+            .store
+            .releases(Some(app))
+            .map_err(|error| error.to_string())?;
+
+        for release in &releases {
+            let key = (app.to_owned(), release.id.clone());
+
+            if self.running.contains_key(&key) || !release.state.is_final() {
+                self.drain_release(app, &release.id).await?;
+            }
+        }
+
+        if let Some(((_, id), _)) = self.running.iter().find(|((name, _), _)| name == app) {
+            return Err(format!("{app}@{id} did not stop"));
+        }
+
+        self.store
+            .delete_app(app)
+            .map_err(|error| error.to_string())?;
+        self.serving.remove(app);
+        self.maintenance.remove(app);
+
+        // The edge forgets the application with its next snapshot.
+
+        if let Err(error) = self.push_snapshot().await {
+            tracing::warn!(%error, "pushing the snapshot after removing {app} failed");
+        }
+
+        Ok(())
     }
 
     /// A host that exited on its own fails its release; the release that

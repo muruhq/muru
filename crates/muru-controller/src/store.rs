@@ -487,6 +487,8 @@ impl Store {
     pub fn delete_app(&self, name: &str) -> Result<(), StoreError> {
         self.with(|connection| {
             connection.execute("DELETE FROM releases WHERE app = ?1", [name])?;
+            connection.execute("DELETE FROM rollouts WHERE app = ?1", [name])?;
+            connection.execute("DELETE FROM scale_pins WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM maintenance WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM command_runs WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM apps WHERE name = ?1", [name])?;

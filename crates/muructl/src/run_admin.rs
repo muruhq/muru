@@ -1153,6 +1153,7 @@ impl Admin for Service {
     needs_the_daemon! {
         list_apps(pb::ListAppsRequest) -> pb::ListAppsResponse, "muructl app";
         get_app(pb::GetAppRequest) -> pb::App, "muructl app";
+        remove_app(pb::RemoveAppRequest) -> pb::RemoveReleasesResponse, "muructl app remove";
         deploy(pb::DeployRequest) -> pb::Release, "muructl deploy";
         plan_deploy(pb::DeployRequest) -> pb::DeployPlan, "muructl deploy";
         list_releases(pb::ListReleasesRequest) -> pb::ListReleasesResponse, "muructl release";
