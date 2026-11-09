@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import http.client
+import json
 import os
 import re
 import shutil
@@ -75,6 +76,7 @@ def unavailable(reason: str) -> None:
 # directory, so tests/conftest.py removes them when the session ends.
 
 _short_dirs: list[Path] = []
+_temporary_files: list[Path] = []
 
 
 def short_dir(prefix: str) -> Path:
@@ -87,11 +89,72 @@ def short_dir(prefix: str) -> Path:
     return directory
 
 
+def temporary_log(prefix: str) -> Path:
+    """Return a new file for a server's output, kept after the server
+    stops for the test to read and removed when the session ends."""
+
+    log = Path(tempfile.mkstemp(prefix=prefix, suffix=".log")[1])
+    _temporary_files.append(log)
+    return log
+
+
+def short_dirs_made() -> int:
+    """How many directories short_dir has made so far, for
+    end_processes_since."""
+
+    return len(_short_dirs)
+
+
+def end_processes_using(directory: Path) -> None:
+    """End whatever still runs from a directory of the tests.
+
+    A test that fails before it stops what it started leaves it running: a
+    daemon told to detach leaves its edge and hosts, and a development run
+    that was not reached leaves its own process. An edge or a host names
+    the directory on its command line, and a development run has a record
+    under it, so either can be found. Neither gets a grace period, since
+    a test is over and nothing depends on what it was doing.
+    """
+
+    found = subprocess.run(
+        ["pgrep", "-f", str(directory)], capture_output=True, text=True, check=False
+    )
+    pids = {int(line) for line in found.stdout.split()}
+
+    for record in directory.glob("runs/*/run.json"):
+        try:
+            pids.add(json.loads(record.read_text())["pid"])
+        except (OSError, ValueError, KeyError):
+            continue
+
+    pids.discard(os.getpid())
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def end_processes_since(made: int) -> None:
+    """End whatever still runs from the directories made since `made`
+    of them existed, so that one test's failure does not outlive it."""
+
+    for directory in _short_dirs[made:]:
+        end_processes_using(directory)
+
+
 def remove_short_dirs() -> None:
-    """Remove every directory short_dir made."""
+    """End whatever still runs from every directory short_dir made, then
+    remove them and the temporary logs."""
 
     while _short_dirs:
-        shutil.rmtree(_short_dirs.pop(), ignore_errors=True)
+        directory = _short_dirs.pop()
+        end_processes_using(directory)
+        shutil.rmtree(directory, ignore_errors=True)
+
+    while _temporary_files:
+        _temporary_files.pop().unlink(missing_ok=True)
 
 
 # Ports free_port has handed out. A port is free again once its probe
@@ -420,7 +483,7 @@ def start(
         options += ["--chdir", str(chdir)]
     if reload is not None and not {"--reload", "--no-reload"} & set(args):
         options += ["--reload" if reload else "--no-reload"]
-    log = Path(tempfile.mkstemp(prefix="muru-test-", suffix=".log")[1])
+    log = temporary_log("muru-test-")
 
     with log.open("wb") as handle:
         process = subprocess.Popen(
