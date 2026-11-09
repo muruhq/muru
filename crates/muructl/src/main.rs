@@ -528,8 +528,8 @@ struct RunArgs {
     /// header_read (30s), body_idle (60s), response_idle (60s),
     /// keep_alive (20s) or keep_alive_proxy (75s) at the edge; soft
     /// (off), hard (off), hard_drain_grace (10s), shutdown (5s),
-    /// websocket_drain_grace (0s), loop_stall (10s) or gil_stall (30s)
-    /// in the host, which interrupts a request that runs past the soft
+    /// websocket_drain_grace (0s), exit_grace (2s), loop_stall (10s) or
+    /// gil_stall (30s) in the host, which interrupts a request that runs past the soft
     /// timeout and replaces a worker whose request runs past the hard
     /// timeout, whose event loop stalls past loop_stall, or in which no
     /// thread has run Python for gil_stall. Repeatable.
@@ -1124,6 +1124,7 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         "hard_drain_grace",
         "shutdown",
         "websocket_drain_grace",
+        "exit_grace",
         "loop_stall",
         "gil_stall",
     ]
@@ -1132,7 +1133,7 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         return Err(format!(
             "{name:?} is not a timeout name: queue, deadline, header_read, body_idle, \
              response_idle, keep_alive, keep_alive_proxy, soft, hard, hard_drain_grace, \
-             shutdown, websocket_drain_grace, loop_stall or gil_stall"
+             shutdown, websocket_drain_grace, exit_grace, loop_stall or gil_stall"
         ));
     }
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
@@ -1288,6 +1289,8 @@ pub(crate) struct HostTimeouts {
     pub shutdown: Duration,
     /// How long a stopping worker keeps its open WebSockets.
     pub websocket_drain_grace: Duration,
+    /// How long a stopping worker has for its shutdown work.
+    pub exit_grace: Duration,
     /// How long an ASGI worker's event loop may stall.
     pub loop_stall: Duration,
     /// How long a worker may run no Python, or send no report.
@@ -1336,6 +1339,9 @@ pub(crate) fn worker_timeouts(
             parse(&table.websocket_drain_grace, "websocket_drain_grace")
         })?
         .unwrap_or_default();
+    let mut exit_grace = table
+        .map_or(Ok(None), |table| parse(&table.exit_grace, "exit_grace"))?
+        .unwrap_or(Duration::from_secs(2));
     let mut loop_stall = table
         .map_or(Ok(None), |table| {
             parse(&table.loop_stall_timeout, "loop_stall_timeout")
@@ -1354,6 +1360,7 @@ pub(crate) fn worker_timeouts(
             "hard_drain_grace" => grace = *duration,
             "shutdown" => shutdown = *duration,
             "websocket_drain_grace" => websocket_drain_grace = *duration,
+            "exit_grace" => exit_grace = *duration,
             "loop_stall" => loop_stall = *duration,
             "gil_stall" => gil_stall = *duration,
             _ => {}
@@ -1389,6 +1396,7 @@ pub(crate) fn worker_timeouts(
         hard_drain_grace: grace,
         shutdown,
         websocket_drain_grace,
+        exit_grace,
         loop_stall,
         gil_stall,
     })
@@ -1429,6 +1437,7 @@ fn group_timeouts(
         hard_drain_grace_ms: ms(release.hard_drain_grace),
         shutdown_timeout_ms: ms(release.shutdown),
         websocket_drain_grace_ms: ms(release.websocket_drain_grace),
+        exit_grace_ms: ms(release.exit_grace),
         loop_stall_timeout_ms: ms(release.loop_stall),
         gil_stall_timeout_ms: ms(release.gil_stall),
     });
@@ -2885,7 +2894,8 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     )?;
     let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
     let memory = memory_policy(&args.memory, resolved.memory.as_ref())?;
-    let stop_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
+    let requests_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
+    let stop_budget = requests_budget + timeouts.exit_grace;
 
     // The application's name, as the edge labels it and muru.context()
     // reports it, so a command the log names works as it is.
@@ -2985,6 +2995,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         hard_drain_grace: timeouts.hard_drain_grace,
         shutdown_timeout: timeouts.shutdown,
         websocket_drain_grace: timeouts.websocket_drain_grace,
+        exit_grace: timeouts.exit_grace,
         loop_stall_timeout: timeouts.loop_stall,
         gil_stall_timeout: timeouts.gil_stall,
         memory: memory.clone(),
@@ -3755,7 +3766,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
             );
         }
 
-        drainer.drain(stop_budget.min(for_drain)).await;
+        drainer.drain(requests_budget.min(for_drain)).await;
         current
             .stop_until(
                 deadline.min(Instant::now() + stop_budget + muru_controller::host::STOP_MARGIN),
@@ -3766,14 +3777,14 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         let for_drain = deadline
             .saturating_duration_since(Instant::now())
             .saturating_sub(muru_controller::shutdown::WORKERS_RESERVE);
-        drainer.drain(stop_budget.min(for_drain)).await;
+        drainer.drain(requests_budget.min(for_drain)).await;
         current
             .stop_until(
                 deadline.min(Instant::now() + stop_budget + muru_controller::host::STOP_MARGIN),
             )
             .await;
     } else {
-        drainer.drain(stop_budget).await;
+        drainer.drain(requests_budget).await;
         current.stop(stop_budget).await;
     }
 

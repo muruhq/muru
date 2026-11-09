@@ -543,14 +543,26 @@ impl Shared {
             })
     }
 
-    /// Stop the shared pool and the mounts' own, letting their queued
-    /// requests finish. Called with the interpreter detached.
-    pub fn shutdown_pools(&self) {
-        self.pool.shutdown();
+    /// Close the shared pool and the mounts' own: they take no new job and
+    /// finish those queued.
+    pub fn close_pools(&self) {
+        self.pool.close();
 
         for mount in self.mounts.values() {
             if let Some(pool) = &mount.pool {
-                pool.shutdown();
+                pool.close();
+            }
+        }
+    }
+
+    /// Wait for the pools' threads to end, until `deadline`. A thread still
+    /// running a request then is left to end with the process.
+    pub fn join_pools(&self, deadline: Instant) {
+        self.pool.join(deadline);
+
+        for mount in self.mounts.values() {
+            if let Some(pool) = &mount.pool {
+                pool.join(deadline);
             }
         }
     }
@@ -1344,15 +1356,26 @@ impl Pool {
         }
     }
 
-    /// Stop accepting jobs, let the queued ones finish, and join the threads.
-    /// Must be called with the interpreter detached, since the threads need
-    /// it to finish their work.
-    pub fn shutdown(&self) {
+    /// Stop accepting jobs; the queued ones finish and the threads end.
+    pub fn close(&self) {
         self.sender.lock().expect("pool sender poisoned").take();
+    }
+
+    /// Wait for the closed pool's threads to end, until `deadline`. Must be
+    /// called with the interpreter detached, since the threads need it to
+    /// finish their work.
+    pub fn join(&self, deadline: Instant) {
         let handles = std::mem::take(&mut *self.handles.lock().expect("pool handles poisoned"));
 
+        while !handles.iter().all(std::thread::JoinHandle::is_finished) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         for handle in handles {
-            let _ = handle.join();
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
     }
 }

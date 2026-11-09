@@ -185,7 +185,7 @@ A worker group, the `[app.NAME.release.ID.groups.NAME]` or `[tool.muru.groups.NA
 | `scaling` | table, {ref}`[app.NAME.release.ID.scaling] <config-daemon-app-name-release-id-scaling>` |  | How the group is scaled; static when absent. |
 | `sync_threads` | integer | the release's | Threads for synchronous code called from an ASGI application. |
 | `threads` | integer | the release's | Application threads per worker. |
-| `timeouts` | table, {ref}`[app.NAME.release.ID.timeouts] <config-daemon-app-name-release-id-timeouts>` |  | The group's own timeouts, each the release's when absent; `shutdown_timeout` and `websocket_drain_grace` belong to the release. |
+| `timeouts` | table, {ref}`[app.NAME.release.ID.timeouts] <config-daemon-app-name-release-id-timeouts>` |  | The group's own timeouts, each the release's when absent; `shutdown_timeout`, `websocket_drain_grace` and `exit_grace` belong to the release. |
 
 (config-daemon-app-name-release-id-groups-name-match)=
 ## `[app.NAME.release.ID.groups.NAME.match]`
@@ -329,6 +329,7 @@ The same keys apply at `[app.NAME.release.ID.groups.NAME.timeouts]`.
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `body_idle_timeout` | string | the host's, else `body_idle_timeout` in `[limits]` | Time a client may pause while sending a body to what is served here. |
+| `exit_grace` | string | `"2s"` | How long a worker has for its shutdown work (lifespan shutdown, the `on_exit` hook and `atexit` callbacks) after its requests have had `websocket_drain_grace` and `shutdown_timeout`, before it is killed. |
 | `gil_stall_timeout` | string | `"30s"` | How long a worker may go with no thread running Python, or with no report to its host, before it is replaced as for the hard timeout. |
 | `hard_drain_grace` | string | `"10s"` | How long a worker being replaced is given to finish its other requests before it is told to stop. |
 | `hard_timeout` | string |  | How long a request may run in a worker before the worker is replaced, for example 60s; off when absent. Must exceed the soft timeout by at least 5s. |

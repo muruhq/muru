@@ -825,8 +825,8 @@ pub struct Group {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaling: Option<Scaling>,
     /// The group's own timeouts (section 7.6), each the release's when
-    /// absent; `shutdown_timeout` and `websocket_drain_grace` belong to
-    /// the release.
+    /// absent; `shutdown_timeout`, `websocket_drain_grace` and `exit_grace`
+    /// belong to the release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<Timeouts>,
     /// The largest body of a request the group serves, for example 200MB
@@ -881,6 +881,10 @@ pub fn check_group_timeouts(timeouts: Option<&Timeouts>) -> Result<(), String> {
 
     if timeouts.websocket_drain_grace.is_some() {
         return Err("timeouts.websocket_drain_grace applies to the whole release".to_owned());
+    }
+
+    if timeouts.exit_grace.is_some() {
+        return Err("timeouts.exit_grace applies to the whole release".to_owned());
     }
 
     Ok(())
@@ -1538,6 +1542,12 @@ pub struct Timeouts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "0s"))]
     pub websocket_drain_grace: Option<String>,
+    /// How long a worker has for its shutdown work (lifespan shutdown, the
+    /// `on_exit` hook and `atexit` callbacks) after its requests have had
+    /// `websocket_drain_grace` and `shutdown_timeout`, before it is killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "2s"))]
+    pub exit_grace: Option<String>,
     /// How long an ASGI worker's event loop may go without running before the
     /// worker is replaced as for the hard timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4393,6 +4403,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
                     || timeouts.hard_timeout.is_some()
                     || timeouts.hard_drain_grace.is_some()
                     || timeouts.websocket_drain_grace.is_some()
+                    || timeouts.exit_grace.is_some()
                     || timeouts.loop_stall_timeout.is_some()
                     || timeouts.gil_stall_timeout.is_some()
             }),
@@ -5820,6 +5831,19 @@ pub fn parse_pyproject(text: &str) -> Result<Option<ToolMuru>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_group_may_not_set_the_exit_grace() {
+        let timeouts = Timeouts {
+            exit_grace: Some("3s".to_owned()),
+            ..Timeouts::default()
+        };
+
+        assert_eq!(
+            check_group_timeouts(Some(&timeouts)).unwrap_err(),
+            "timeouts.exit_grace applies to the whole release"
+        );
+    }
 
     #[test]
     fn names_follow_the_rules() {

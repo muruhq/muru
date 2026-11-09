@@ -949,6 +949,7 @@ class Host:
         hard_drain_grace: float = 10.0,
         shutdown_timeout: float = 5.0,
         websocket_drain_grace: float = 0.0,
+        exit_grace: float = 2.0,
         loop_stall_timeout: float = 10.0,
         gil_stall_timeout: float = 30.0,
         memory: MemoryPolicy | None = None,
@@ -974,6 +975,7 @@ class Host:
         self.hard_drain_grace = hard_drain_grace
         self.shutdown_timeout = shutdown_timeout
         self.websocket_drain_grace = websocket_drain_grace
+        self.exit_grace = exit_grace
         self.loop_stall_timeout = loop_stall_timeout
         self.gil_stall_timeout = gil_stall_timeout
         self.memory = memory or MemoryPolicy()
@@ -3752,10 +3754,11 @@ class Host:
     def stop_budget(self) -> float:
         """Return how long a worker told to stop may take before it is killed.
 
-        That is the WebSockets' grace, then the shutdown timeout.
+        That is the WebSockets' grace, the shutdown timeout, then the
+        exit grace for the worker's shutdown work.
         """
 
-        return self.websocket_drain_grace + self.shutdown_timeout
+        return self.websocket_drain_grace + self.shutdown_timeout + self.exit_grace
 
     def terminate_all(self) -> None:
         """Stop every worker: SIGTERM, its stop budget, then SIGKILL."""
@@ -4224,6 +4227,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="how long a worker told to stop keeps its open WebSockets before closing them",
     )
     parser.add_argument(
+        "--exit-grace",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="how long a worker has for its shutdown work once its requests have had theirs",
+    )
+    parser.add_argument(
         "--memory-measure",
         choices=("uss", "pss", "rss"),
         default="uss",
@@ -4481,6 +4491,7 @@ def main(argv: list[str] | None = None) -> int:
         hard_drain_grace=args.hard_drain_grace,
         shutdown_timeout=args.shutdown_timeout,
         websocket_drain_grace=args.websocket_drain_grace,
+        exit_grace=args.exit_grace,
         loop_stall_timeout=args.loop_stall_timeout,
         gil_stall_timeout=args.gil_stall_timeout,
         memory=MemoryPolicy(

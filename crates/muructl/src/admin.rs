@@ -2690,7 +2690,8 @@ pub struct ReleaseArgs {
     /// runs this long; off), hard (replace a worker whose request runs
     /// this long; off), hard_drain_grace (10s), shutdown (5s),
     /// websocket_drain_grace (how long a stopping worker keeps its open
-    /// WebSockets; 0s), loop_stall (replace an ASGI worker whose event
+    /// WebSockets; 0s), exit_grace (how long a stopping worker has for its
+    /// shutdown work; 2s), loop_stall (replace an ASGI worker whose event
     /// loop stalls this long; 10s) or gil_stall (replace a worker in
     /// which no thread has run Python for this long; 30s). Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
@@ -3043,6 +3044,7 @@ fn parse_host_timeout(text: &str) -> Result<(String, Duration), String> {
         "hard_drain_grace",
         "shutdown",
         "websocket_drain_grace",
+        "exit_grace",
         "loop_stall",
         "gil_stall",
     ]
@@ -3050,7 +3052,7 @@ fn parse_host_timeout(text: &str) -> Result<(String, Duration), String> {
     {
         return Err(format!(
             "{name:?} is not a host timeout name: soft, hard, hard_drain_grace, shutdown, \
-             websocket_drain_grace, loop_stall or gil_stall"
+             websocket_drain_grace, exit_grace, loop_stall or gil_stall"
         ));
     }
 
@@ -3162,6 +3164,7 @@ impl ReleaseArgs {
             hard_drain_grace_ms: timeout_ms(&self.timeouts, "hard_drain_grace"),
             shutdown_timeout_ms: timeout_ms(&self.timeouts, "shutdown"),
             websocket_drain_grace_ms: timeout_ms(&self.timeouts, "websocket_drain_grace"),
+            exit_grace_ms: timeout_ms(&self.timeouts, "exit_grace"),
             loop_stall_timeout_ms: timeout_ms(&self.timeouts, "loop_stall"),
             gil_stall_timeout_ms: timeout_ms(&self.timeouts, "gil_stall"),
             memory_measure: memory_setting(&self.memory, "measure").unwrap_or_default(),

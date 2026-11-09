@@ -318,6 +318,12 @@ fn workers(
             given.websocket_drain_grace,
             Some(format_ms(defaults.websocket_drain_grace_ms)),
         ),
+        exit_grace: writer.one(
+            "timeouts.exit_grace",
+            request.exit_grace_ms.map(format_ms),
+            given.exit_grace,
+            Some(format_ms(defaults.exit_grace_ms)),
+        ),
         loop_stall_timeout: writer.one(
             "timeouts.loop_stall_timeout",
             request.loop_stall_timeout_ms.map(format_ms),

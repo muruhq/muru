@@ -510,6 +510,9 @@ pub struct HostSpec {
     /// How long a worker told to stop keeps its open WebSockets before it
     /// closes them with 1001.
     pub websocket_drain_grace: Duration,
+    /// How long a worker has for its shutdown work once its requests have
+    /// had their time (section 7.6).
+    pub exit_grace: Duration,
     /// How long an ASGI worker's event loop may stall before the worker
     /// is replaced (section 7.6).
     pub loop_stall_timeout: Duration,
@@ -994,6 +997,8 @@ impl HostProcess {
             .arg(spec.shutdown_timeout.as_secs_f64().to_string())
             .arg("--websocket-drain-grace")
             .arg(spec.websocket_drain_grace.as_secs_f64().to_string())
+            .arg("--exit-grace")
+            .arg(spec.exit_grace.as_secs_f64().to_string())
             .arg("--loop-stall-timeout")
             .arg(spec.loop_stall_timeout.as_secs_f64().to_string())
             .arg("--gil-stall-timeout")
@@ -1329,7 +1334,7 @@ impl HostProcess {
     /// Stop the host: SIGTERM and its stdin closed, then SIGKILL after a
     /// grace period. Its workers finish the requests they are serving.
     /// Stop the host and its workers. The host gives its workers `budget`,
-    /// the WebSockets' grace and the shutdown timeout, before it kills
+    /// the WebSockets' grace, the shutdown timeout and the exit grace, before it kills
     /// them, and is itself killed if it has not exited `STOP_MARGIN`
     /// after that.
     pub async fn stop(self, budget: Duration) {

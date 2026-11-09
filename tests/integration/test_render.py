@@ -154,6 +154,7 @@ def test_full_writes_every_setting_with_where_it_came_from() -> None:
         "hard_drain_grace": "10s",
         "shutdown_timeout": "5s",
         "websocket_drain_grace": "0ms",
+        "exit_grace": "2s",
         "loop_stall_timeout": "10s",
         "gil_stall_timeout": "30s",
     }

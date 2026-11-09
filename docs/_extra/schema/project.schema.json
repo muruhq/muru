@@ -367,7 +367,7 @@
         },
         "timeouts": {
           "$ref": "#/$defs/Timeouts",
-          "description": "The group's own timeouts, each the release's when absent; `shutdown_timeout` and `websocket_drain_grace` belong to the release."
+          "description": "The group's own timeouts, each the release's when absent; `shutdown_timeout`, `websocket_drain_grace` and `exit_grace` belong to the release."
         }
       },
       "type": "object"
@@ -1258,6 +1258,11 @@
           "description": "Time a client may pause while sending a body to what is served here.",
           "type": "string",
           "x-default": "the host's, else `body_idle_timeout` in `[limits]`"
+        },
+        "exit_grace": {
+          "default": "2s",
+          "description": "How long a worker has for its shutdown work (lifespan shutdown, the `on_exit` hook and `atexit` callbacks) after its requests have had `websocket_drain_grace` and `shutdown_timeout`, before it is killed.",
+          "type": "string"
         },
         "gil_stall_timeout": {
           "default": "30s",

@@ -81,8 +81,8 @@ pub struct Lifecycle {
     /// How long open WebSockets keep running once the worker is told to
     /// stop, before they are closed with 1001.
     pub websocket_drain: Duration,
-    /// How long the event loop's requests then get to finish, the host's
-    /// shutdown timeout, before the worker stops waiting for them.
+    /// How long the requests then get to finish, the host's shutdown
+    /// timeout, before the worker stops waiting for them.
     pub drain: Duration,
 }
 
@@ -232,29 +232,40 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
         Ok(())
     });
 
-    // Requests already running finish on their threads, or on the event
-    // loop, while the runtime still carries their responses; then
-    // everything stops.
+    // Section 7.6: the host kills the worker its stop budget after telling
+    // it to stop, so everything here is measured from that moment. The
+    // requests get no longer than the WebSockets' grace and the shutdown
+    // timeout, whatever on_drain took, which leaves the exit grace for the
+    // shutdown work below.
 
+    let told = Instant::now();
+    let requests_end = told + lifecycle.websocket_drain + lifecycle.drain;
     Lifecycle::call(lifecycle.on_drain.as_ref());
-    shared.shutdown_pools();
 
-    // The pool joins its threads; the loop's requests are waited for here.
+    // Requests already running finish on their threads, or on the event
+    // loop, while the runtime still carries their responses. No new one
+    // starts on a thread from here.
+
+    shared.close_pools();
+
+    let wait = |deadline: Instant| {
+        while shared.in_flight() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
     // Open WebSockets keep running for their grace, then are closed with
-    // 1001 (section 5.6), and what is left gets the shutdown timeout.
+    // 1001 (section 5.6), and what is left gets the shutdown timeout. A
+    // thread still running a request at the end is left behind: it ends
+    // with the process.
 
     if shared.asgi.is_some() {
-        let wait = |deadline: Instant| {
-            while shared.in_flight() > 0 && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        };
-
-        wait(Instant::now() + lifecycle.websocket_drain);
+        wait(told + lifecycle.websocket_drain);
         shared.close_websockets();
-        wait(Instant::now() + lifecycle.drain);
     }
 
+    wait(requests_end);
+    shared.join_pools(requests_end);
     stop_watchdog.store(true, Ordering::Relaxed);
     Lifecycle::call(lifecycle.on_exit.as_ref());
     drop(runtime);
