@@ -34,6 +34,9 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use tokio::sync::mpsc;
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 use crate::watch::Watch;
 use muru_controller::host::{HostProcess, HostSpec};
@@ -441,6 +444,12 @@ struct RunArgs {
     #[arg(value_name = "ENTRYPOINT or PATH")]
     app: Option<String>,
 
+    /// The application's name, in metrics, logs and the commands
+    /// (default: `[project] name` from pyproject.toml, else the
+    /// entrypoint's top-level module).
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
     /// The interface the entrypoint speaks: auto (detected from the
     /// callable), wsgi, asgi, or grpc for a function that registers gRPC
     /// services.
@@ -519,8 +528,8 @@ struct RunArgs {
     /// header_read (30s), body_idle (60s), response_idle (60s),
     /// keep_alive (20s) or keep_alive_proxy (75s) at the edge; soft
     /// (off), hard (off), hard_drain_grace (10s), shutdown (5s),
-    /// websocket_drain_grace (0s), loop_stall (10s) or gil_stall (30s)
-    /// in the host, which interrupts a request that runs past the soft
+    /// websocket_drain_grace (0s), exit_grace (2s), loop_stall (10s) or
+    /// gil_stall (30s) in the host, which interrupts a request that runs past the soft
     /// timeout and replaces a worker whose request runs past the hard
     /// timeout, whose event loop stalls past loop_stall, or in which no
     /// thread has run Python for gil_stall. Repeatable.
@@ -623,6 +632,12 @@ struct RunArgs {
     /// 127.0.0.1 and ::1. Repeatable.
     #[arg(long = "host", value_name = "NAME")]
     hosts: Vec<String>,
+
+    /// A .env file of variables the run starts with, over the project's
+    /// [tool.muru.env]; a relative path is the project's. None is read
+    /// unless this or env_file in the run table names one.
+    #[arg(long, value_name = "FILE")]
+    env_file: Option<PathBuf>,
 
     /// Print the settings the run would use, each with where it came
     /// from, in the shape of the project's file, and exit.
@@ -858,18 +873,34 @@ enum Link {
     Tcp,
 }
 
+/// What muructl logs when MURU_LOG does not say: its own lines and
+/// every crate's warnings, the MCP library's chatter left out.
+const DEFAULT_LOG: &str = "info,rmcp=warn";
+
 fn main() -> anyhow::Result<()> {
     // Section 6.10: as a container's PID 1, muructl forks first and the
     // parent stays as the init; everything below is the child.
 
     init::become_init();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("MURU_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+
+    // The MCP library's own events stay at warnings unless MURU_LOG says
+    // otherwise, and the warning it gives for each refused tool call,
+    // with the error in Rust's debug form, is left to the server's own
+    // line (section 10.11).
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(|| log_format::Routed)
+                .event_format(log_format::Layout)
+                .with_filter(
+                    tracing_subscriber::EnvFilter::try_from_env("MURU_LOG")
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG)),
+                )
+                .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                    !mcp::is_refusal_echo(metadata)
+                })),
         )
-        .with_writer(|| log_format::Routed)
-        .event_format(log_format::Layout)
         .init();
     let cli = Cli::parse();
 
@@ -1093,6 +1124,7 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         "hard_drain_grace",
         "shutdown",
         "websocket_drain_grace",
+        "exit_grace",
         "loop_stall",
         "gil_stall",
     ]
@@ -1101,7 +1133,7 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         return Err(format!(
             "{name:?} is not a timeout name: queue, deadline, header_read, body_idle, \
              response_idle, keep_alive, keep_alive_proxy, soft, hard, hard_drain_grace, \
-             shutdown, websocket_drain_grace, loop_stall or gil_stall"
+             shutdown, websocket_drain_grace, exit_grace, loop_stall or gil_stall"
         ));
     }
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
@@ -1257,6 +1289,8 @@ pub(crate) struct HostTimeouts {
     pub shutdown: Duration,
     /// How long a stopping worker keeps its open WebSockets.
     pub websocket_drain_grace: Duration,
+    /// How long a stopping worker has for its shutdown work.
+    pub exit_grace: Duration,
     /// How long an ASGI worker's event loop may stall.
     pub loop_stall: Duration,
     /// How long a worker may run no Python, or send no report.
@@ -1305,6 +1339,9 @@ pub(crate) fn worker_timeouts(
             parse(&table.websocket_drain_grace, "websocket_drain_grace")
         })?
         .unwrap_or_default();
+    let mut exit_grace = table
+        .map_or(Ok(None), |table| parse(&table.exit_grace, "exit_grace"))?
+        .unwrap_or(Duration::from_secs(2));
     let mut loop_stall = table
         .map_or(Ok(None), |table| {
             parse(&table.loop_stall_timeout, "loop_stall_timeout")
@@ -1323,6 +1360,7 @@ pub(crate) fn worker_timeouts(
             "hard_drain_grace" => grace = *duration,
             "shutdown" => shutdown = *duration,
             "websocket_drain_grace" => websocket_drain_grace = *duration,
+            "exit_grace" => exit_grace = *duration,
             "loop_stall" => loop_stall = *duration,
             "gil_stall" => gil_stall = *duration,
             _ => {}
@@ -1358,6 +1396,7 @@ pub(crate) fn worker_timeouts(
         hard_drain_grace: grace,
         shutdown,
         websocket_drain_grace,
+        exit_grace,
         loop_stall,
         gil_stall,
     })
@@ -1398,6 +1437,7 @@ fn group_timeouts(
         hard_drain_grace_ms: ms(release.hard_drain_grace),
         shutdown_timeout_ms: ms(release.shutdown),
         websocket_drain_grace_ms: ms(release.websocket_drain_grace),
+        exit_grace_ms: ms(release.exit_grace),
         loop_stall_timeout_ms: ms(release.loop_stall),
         gil_stall_timeout_ms: ms(release.gil_stall),
     });
@@ -1501,6 +1541,8 @@ struct Serving {
     tls_key: Option<PathBuf>,
     /// Names the development certificate covers besides localhost.
     hosts: Vec<String>,
+    /// A .env file, relative to the project, the run starts with.
+    env_file: Option<PathBuf>,
     /// Whether the run reloads on changes.
     reload: bool,
     reload_dirs: Vec<PathBuf>,
@@ -1575,6 +1617,10 @@ impl Serving {
                 .clone()
                 .or_else(|| settings.tls_key.as_deref().map(PathBuf::from)),
             hosts: strings(&settings.hosts, &args.hosts),
+            env_file: args
+                .env_file
+                .clone()
+                .or_else(|| settings.env_file.as_deref().map(PathBuf::from)),
             reload,
             reload_dirs: settings
                 .reload_dirs
@@ -1671,8 +1717,11 @@ struct Resolved {
     error_override: Option<muru_config::ErrorOverride>,
     /// The memory table (section 7.7).
     memory: Option<muru_config::Memory>,
-    /// Environment variables from the table (section 10.8).
+    /// Environment variables from the table (section 10.8), with those of
+    /// the run's `.env` file over them (section 13.1).
     env: std::collections::BTreeMap<String, muru_config::EnvValue>,
+    /// The names the run's `.env` file sets, for --print-config.
+    env_file_names: Vec<String>,
     /// How the run serves (section 13.1).
     serving: Serving,
     /// The tables as they were read, for --print-config.
@@ -1774,6 +1823,22 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
 
     let layers = print_config::Layers::new(&table, &run_table, &local_run);
     let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
+
+    // Section 13.1: the run's .env file, named explicitly, over what the
+    // project's table declares. The file is read once, as the run starts.
+
+    let mut env = table.env.clone();
+    let mut env_file_names = Vec::new();
+
+    if let Some(file) = &serving.env_file {
+        for (name, value) in read_env_file(&project.join(file))? {
+            if !env_file_names.contains(&name) {
+                env_file_names.push(name.clone());
+            }
+
+            env.insert(name, muru_config::EnvValue::Plain(value));
+        }
+    }
 
     // Whether the entrypoint is a factory belongs to the entrypoint: the
     // table's factory settings apply to the table's entrypoint only.
@@ -1937,7 +2002,8 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         },
         timeouts: table.timeouts,
         memory: table.memory,
-        env: table.env,
+        env,
+        env_file_names,
         serving,
         layers,
     })
@@ -2215,17 +2281,55 @@ fn mount_paths(resolved: &Resolved) -> Vec<muru_edge::routing::MountPath> {
         .collect()
 }
 
-/// The application's name: the top-level module of its entrypoint, as
-/// the host names it for muru.context().
-fn app_name(entrypoint: &str) -> String {
+/// The application's name, as the edge labels it and the host names it
+/// for muru.context(): the project's `[project] name` when there is one,
+/// else the top-level module of its entrypoint, underscores as hyphens.
+fn app_name(project: &Path, entrypoint: &str) -> String {
+    if let Some(name) = project_name(project) {
+        return name;
+    }
+
     let module = entrypoint.split(':').next().unwrap_or(entrypoint);
     let top = module.split('.').next().unwrap_or(module);
 
     if top.is_empty() {
         "default".to_owned()
     } else {
-        top.to_owned()
+        top.replace('_', "-")
     }
+}
+
+/// `[project] name` from the project's pyproject.toml, normalised as
+/// Python package names are, when it makes a valid application name.
+fn project_name(project: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(project.join("pyproject.toml")).ok()?;
+    let file: toml::Table = text.parse().ok()?;
+    let name = file.get("project")?.get("name")?.as_str()?;
+    let normalised = name.to_ascii_lowercase().replace(['_', '.'], "-");
+
+    muru_config::valid_name(&normalised).then_some(normalised)
+}
+
+/// The line that marks SIGTERM under `muructl serve`: what readiness does
+/// and how long the delay and the drain may take.
+fn stopping_line(policy: &muru_controller::shutdown::Policy) {
+    let budget = muru_config::format_duration(policy.budget);
+
+    let plan = if policy.delay.is_zero() {
+        format!("draining for up to {budget}")
+    } else {
+        format!(
+            "serving for the shutdown delay of {}, then draining for up to {budget}",
+            muru_config::format_duration(policy.delay)
+        )
+    };
+
+    muru_common::log::line_of_kind(
+        muru_common::log::Stream::Stdout,
+        "serve.stopping",
+        "muru",
+        format_args!("stopping: readiness now fails; {plan}"),
+    );
 }
 
 /// How TLS was set up: the listener configuration and, for a development
@@ -2334,9 +2438,18 @@ struct CheckArgs {
     #[arg(long)]
     strict: bool,
 
-    /// A file of NAME=VALUE lines, for settings the import reads.
+    /// A .env file of NAME=VALUE lines, for settings the import reads.
     #[arg(long, value_name = "FILE")]
     env_file: Option<PathBuf>,
+}
+
+/// The variables of a `.env` file, or why it cannot be used.
+fn read_env_file(path: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+
+    muru_config::parse_env_file(&text)
+        .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))
 }
 
 /// What the interpreter's check reports (muru.check).
@@ -2508,22 +2621,7 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
     }
 
     if let Some(file) = &args.env_file {
-        let text =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-
-        for line in text.lines() {
-            let line = line.trim();
-
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            let Some((name, value)) = line.split_once('=') else {
-                anyhow::bail!("{}: {line:?} is not NAME=VALUE", file.display());
-            };
-
-            command.env(name.trim(), value.trim().trim_matches('"'));
-        }
+        command.envs(read_env_file(file)?);
     }
 
     let output = command
@@ -2775,6 +2873,11 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     };
 
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+
+    if serve.is_some() {
+        serve::group_writable(&run_dir, 0o770);
+    }
+
     let access_log_file = resolved
         .serving
         .access_log_file
@@ -2791,17 +2894,27 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     )?;
     let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
     let memory = memory_policy(&args.memory, resolved.memory.as_ref())?;
-    let stop_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
+    let requests_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
+    let stop_budget = requests_budget + timeouts.exit_grace;
 
     // The application's name, as the edge labels it and muru.context()
     // reports it, so a command the log names works as it is.
 
-    let label = app_name(&resolved.entrypoint).replace('_', "-");
+    let label = match &args.name {
+        Some(name) if muru_config::valid_name(name) => name.clone(),
+        Some(name) => anyhow::bail!(
+            "{name:?} is not a valid application name: lowercase letters, digits and hyphens, up \
+             to 63 characters"
+        ),
+        None => app_name(&resolved.project, &resolved.entrypoint),
+    };
+
     let mut spec = HostSpec {
         python: python.python.clone(),
         pythonpath: library.pythonpath.clone(),
         pycache_prefix: None,
-        no_bytecode: false,
+        bytecode: None,
+        clean_env: false,
         app: resolved.entrypoint.clone(),
         name: Some(label.clone()),
         release: None,
@@ -2882,6 +2995,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         hard_drain_grace: timeouts.hard_drain_grace,
         shutdown_timeout: timeouts.shutdown,
         websocket_drain_grace: timeouts.websocket_drain_grace,
+        exit_grace: timeouts.exit_grace,
         loop_stall_timeout: timeouts.loop_stall,
         gil_stall_timeout: timeouts.gil_stall,
         memory: memory.clone(),
@@ -2898,6 +3012,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
                 )),
             })
             .collect::<anyhow::Result<Vec<_>>>()?,
+        shown_env: resolved.env.keys().cloned().collect(),
         identity: None,
     };
 
@@ -2997,6 +3112,10 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     // admin socket, which asks the workers things through it.
 
     let host_link: SharedHostLink = Arc::new(std::sync::Mutex::new(HostLink::default()));
+
+    // Section 13.1: the events the hosts raise, kept for muructl events.
+
+    let run_events = Arc::new(run_admin::RunEvents::default());
     host_link
         .lock()
         .expect("host link poisoned")
@@ -3250,6 +3369,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
             host: Arc::clone(&host_link),
             served: Arc::clone(&served),
             commands: commands.clone(),
+            events: Arc::clone(&run_events),
         });
 
         match run_admin::serve(state, admin_stop_rx).await {
@@ -3417,11 +3537,14 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
                             }
                         }
                     }
-                    muru_controller::host::HostMessage::Event { kind, group, reason, .. } => {
+                    muru_controller::host::HostMessage::Event { kind, level, message, group, reason } => {
                         // The host has logged the event, and its line is
-                        // the one the terminal shows; the run counts it.
+                        // the one the terminal shows; the run counts it
+                        // and keeps it for muructl events.
 
-                        run_admin::count_worker_event(&label, &format!("r{}", current.release), &kind, &group, &reason);
+                        let release = format!("r{}", current.release);
+                        run_admin::count_worker_event(&label, &release, &kind, &group, &reason);
+                        run_events.record(&kind, &format!("{label}@{release}"), &level, &message);
                     }
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);
@@ -3564,6 +3687,12 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         health.stopping();
     }
 
+    if let Some(mode) = &serve
+        && signalled
+    {
+        stopping_line(&mode.shutdown);
+    }
+
     // Section 9.12: the commands running through the admin socket are
     // stopped as at their timeout while the rest stops, inside the same
     // budget, and waited for, so each caller hears how its command ended
@@ -3623,26 +3752,45 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
 
         let for_drain = deadline
             .saturating_duration_since(Instant::now())
-            .saturating_sub(muru_controller::shutdown::WORKERS_RESERVE);
-        drainer.drain(stop_budget.min(for_drain)).await;
+            .saturating_sub(muru_controller::shutdown::drain_reserve(
+                timeouts.exit_grace,
+            ));
+
+        if signalled {
+            muru_common::log::line_of_kind(
+                muru_common::log::Stream::Stdout,
+                "serve.draining",
+                "muru",
+                format_args!(
+                    "stopped accepting connections; {} still open, draining",
+                    drainer.open_connections()
+                ),
+            );
+        }
+
+        drainer.drain(requests_budget.min(for_drain)).await;
         current
             .stop_until(
                 deadline.min(Instant::now() + stop_budget + muru_controller::host::STOP_MARGIN),
+                Some(muru_controller::shutdown::workers_deadline(deadline)),
             )
             .await;
     } else if muru_controller::shutdown::is_main_process() {
         let deadline = Instant::now() + muru_controller::shutdown::DEFAULT_BUDGET;
         let for_drain = deadline
             .saturating_duration_since(Instant::now())
-            .saturating_sub(muru_controller::shutdown::WORKERS_RESERVE);
-        drainer.drain(stop_budget.min(for_drain)).await;
+            .saturating_sub(muru_controller::shutdown::drain_reserve(
+                timeouts.exit_grace,
+            ));
+        drainer.drain(requests_budget.min(for_drain)).await;
         current
             .stop_until(
                 deadline.min(Instant::now() + stop_budget + muru_controller::host::STOP_MARGIN),
+                Some(muru_controller::shutdown::workers_deadline(deadline)),
             )
             .await;
     } else {
-        drainer.drain(stop_budget).await;
+        drainer.drain(requests_budget).await;
         current.stop(stop_budget).await;
     }
 
@@ -3712,6 +3860,39 @@ mod tests {
     use clap::CommandFactory as _;
 
     use super::Cli;
+
+    #[test]
+    fn an_application_is_named_after_its_project_else_its_module() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let project = directory.path();
+
+        // With no pyproject.toml, the entrypoint's top-level module.
+
+        assert_eq!(
+            super::app_name(project, "shop_site.wsgi:application"),
+            "shop-site"
+        );
+
+        // The project's name wins, normalised as a package name is.
+
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = 'Shop_Front.v2'\n",
+        )
+        .expect("write");
+        assert_eq!(
+            super::app_name(project, "shop_site.wsgi:application"),
+            "shop-front-v2"
+        );
+
+        // A pyproject.toml with no usable name leaves the module.
+
+        std::fs::write(project.join("pyproject.toml"), "[tool.muru]\nthreads = 2\n")
+            .expect("write");
+        assert_eq!(super::app_name(project, "app:application"), "app");
+        std::fs::write(project.join("pyproject.toml"), "[project]\nname = '-x-'\n").expect("write");
+        assert_eq!(super::app_name(project, "app:application"), "app");
+    }
 
     /// Whether a line names a part of the design documents: a section, a
     /// phase or an ADR, followed by its number.

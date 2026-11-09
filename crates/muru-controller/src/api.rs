@@ -127,6 +127,7 @@ impl Admin for Service {
             app: String::new(),
             release: String::new(),
             project: String::new(),
+            no_host: info.no_host.lock().expect("no_host poisoned").clone(),
         }))
     }
 
@@ -353,9 +354,8 @@ impl Admin for Service {
                     lasts: request
                         .retain_ms
                         .map_or(crate::daemon::RETENTION, Duration::from_millis),
-                    workers: request
-                        .retain_workers
-                        .unwrap_or(crate::daemon::RETAIN_WORKERS),
+                    workers: request.retain_workers,
+                    slot: true,
                 },
                 hold: request.hold,
                 created: created_tx,
@@ -379,6 +379,7 @@ impl Admin for Service {
             .await
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
+        await_host_report(&self.handle, &release).await;
         Ok(Response::new(release_message(release, &self.handle)))
     }
 
@@ -414,6 +415,12 @@ impl Admin for Service {
         } else {
             request.release.clone()
         };
+
+        if !request.hold
+            && let Some(refusal) = config::second_app_refusal(store, &request.app)
+        {
+            refusals.push(refusal);
+        }
 
         if !crate::model::valid_name(&id) {
             refusals.push(format!("{id:?} is not a valid release id"));
@@ -463,6 +470,17 @@ impl Admin for Service {
             .filter(|_| !request.fresh)
             .and_then(|app| app.current.clone().or_else(|| app.previous.clone()));
 
+        // What the serving release would keep once it is replaced.
+
+        let retained = app
+            .as_ref()
+            .and_then(|app| app.current.as_deref())
+            .and_then(|serving| self.handle.store.release(&request.app, serving).ok())
+            .map(|serving| {
+                crate::daemon::retained_workers_phrase(&serving.spec, request.retain_workers)
+            })
+            .unwrap_or_default();
+
         Ok(Response::new(pb::DeployPlan {
             app: request.app.clone(),
             release: id,
@@ -482,6 +500,10 @@ impl Admin for Service {
                         .collect()
                 })
                 .unwrap_or_default(),
+            env: spec
+                .as_ref()
+                .map(|spec| planned_env(&request.app, spec, &self.handle))
+                .unwrap_or_default(),
             builds: spec.as_ref().is_some_and(|spec| spec.build.builds),
             serving: app.and_then(|app| app.current).unwrap_or_default(),
             settings_from: previous
@@ -491,10 +513,9 @@ impl Admin for Service {
             retain_ms: request
                 .retain_ms
                 .unwrap_or(crate::daemon::RETENTION.as_millis() as u64),
-            retain_workers: request
-                .retain_workers
-                .unwrap_or(crate::daemon::RETAIN_WORKERS),
+            retain_workers: request.retain_workers,
             refusals,
+            retained,
         }))
     }
 
@@ -1624,9 +1645,8 @@ impl Admin for Service {
                 lasts: request
                     .retain_ms
                     .map_or(crate::daemon::RETENTION, Duration::from_millis),
-                workers: request
-                    .retain_workers
-                    .unwrap_or(crate::daemon::RETAIN_WORKERS),
+                workers: request.retain_workers,
+                slot: true,
             },
         };
 
@@ -1655,13 +1675,6 @@ impl Admin for Service {
         // one snapshot of it.
 
         let tls = document.host.values().any(|host| host.tls.is_some());
-        let mut prepared = Prepared::default();
-
-        if let Err(error) = self.record(&plan, &mut report, &mut prepared) {
-            self.undo(&mut report, prepared, error).await;
-            return Ok(Response::new(report));
-        }
-
         let starts = plan.changes.iter().any(|change| {
             matches!(
                 change.action,
@@ -1671,42 +1684,44 @@ impl Admin for Service {
                 } | Action::Promote { .. }
             )
         });
+        let service = Service {
+            handle: self.handle.clone(),
+            applying: self.applying.clone(),
+        };
 
-        if !deploying.wait && starts {
-            let mut early = report.clone();
-            early.applied = true;
+        // The rest of the apply runs in a task of its own, which holds
+        // the lock until it has finished. A client that goes away drops
+        // this handler's future, but not the task, so an apply whose
+        // releases do not start is still undone. A --no-wait apply is
+        // answered once its releases are recorded; any other is answered
+        // when the task ends.
 
-            for message in &mut early.changes {
-                if message.outcome.is_empty() {
-                    message.outcome = "pending".to_owned();
-                }
+        let (early_tx, early_rx) = oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            let _applying = applying;
+            let mut prepared = Prepared::default();
+
+            if let Err(error) = service.record(&plan, &mut report, &mut prepared) {
+                service.undo(&mut report, prepared, error).await;
+                return report;
             }
 
-            early.notes.push(
-                "the rest of the apply waits for its releases to start; a config.applied or \
-                 config.apply_failed event says how it ended"
-                    .to_owned(),
-            );
+            if !deploying.wait && starts {
+                let _ = early_tx.send(early_report(&report));
+            }
 
-            let service = Service {
-                handle: self.handle.clone(),
-                applying: self.applying.clone(),
-            };
+            service
+                .complete(&plan, &mut report, prepared, &deploying, tls)
+                .await;
+            report
+        });
 
-            // The apply holds the lock until the daemon has finished it.
-
-            tokio::spawn(async move {
-                let _applying = applying;
-                service
-                    .complete(&plan, &mut report, prepared, &deploying, tls)
-                    .await;
-            });
-
+        if let Ok(early) = early_rx.await {
             return Ok(Response::new(early));
         }
 
-        self.complete(&plan, &mut report, prepared, &deploying, tls)
-            .await;
+        let report = task.await.map_err(internal)?;
         Ok(Response::new(report))
     }
 
@@ -1901,6 +1916,7 @@ impl Service {
         last.into_iter()
             .filter_map(|(app, id)| {
                 let serving = self.handle.store.app(app).ok()?.current?;
+                let spec = self.handle.store.release(app, &serving).ok()?.spec;
 
                 Some(if deploying.retain.lasts.is_zero() {
                     format!(
@@ -1908,13 +1924,9 @@ impl Service {
                     )
                 } else {
                     format!(
-                        "{app}@{serving} stays warm for {} with {} to a group, when {app}@{id} takes its place",
+                        "{app}@{serving} stays warm for {} with {}, when {app}@{id} takes its place",
                         muru_config::format_duration(deploying.retain.lasts),
-                        match deploying.retain.workers {
-                            0 => "its host alone".to_owned(),
-                            1 => "1 worker".to_owned(),
-                            count => format!("{count} workers"),
-                        }
+                        crate::daemon::retained_workers_phrase(&spec, deploying.retain.workers)
                     )
                 })
             })
@@ -2401,6 +2413,26 @@ fn parse_failure(error: String) -> pb::ConfigReport {
     }
 }
 
+/// The answer to a --no-wait apply, once its releases are recorded: what
+/// is still to happen reads as pending.
+fn early_report(report: &pb::ConfigReport) -> pb::ConfigReport {
+    let mut early = report.clone();
+    early.applied = true;
+
+    for message in &mut early.changes {
+        if message.outcome.is_empty() {
+            message.outcome = "pending".to_owned();
+        }
+    }
+
+    early.notes.push(
+        "the rest of the apply waits for its releases to start; a config.applied or \
+         config.apply_failed event says how it ended"
+            .to_owned(),
+    );
+    early
+}
+
 fn report_message(plan: &Plan) -> pb::ConfigReport {
     pb::ConfigReport {
         errors: plan.errors.clone(),
@@ -2618,6 +2650,128 @@ fn rollout_message(rollout: &Rollout) -> pb::Rollout {
     }
 }
 
+/// Section 8.7: the variables a planned release would get, by name and
+/// never by value, with where each comes from: what it declares, then
+/// what the daemon would pass on, through the code a start uses. Under
+/// another user, `HOME`, `USER` and `LOGNAME` are that user's and so are
+/// Muru's rather than the daemon's.
+fn planned_env(app: &str, spec: &crate::model::ReleaseSpec, handle: &Handle) -> Vec<pb::DeployEnv> {
+    let mut planned: Vec<pb::DeployEnv> = spec
+        .env
+        .iter()
+        .map(|entry| pb::DeployEnv {
+            name: entry.name.clone(),
+            secret: match (&entry.secret_store, &entry.secret_key) {
+                (Some(store), Some(key)) => format!("{store}/{key}"),
+                _ => String::new(),
+            },
+            as_file: entry.as_file,
+            layer: spec
+                .layers
+                .0
+                .get(&config::env_layer(&entry.name))
+                .cloned()
+                .unwrap_or_default(),
+        })
+        .collect();
+
+    let pass_env = handle
+        .info
+        .pass_env
+        .read()
+        .expect("pass_env poisoned")
+        .clone();
+    let bytecode = spec.http.is_none().then(|| spec.bytecode.effective());
+    let identity = planned_identity(app, handle);
+    let mut passed: Vec<String> =
+        crate::commands::passed_from_daemon(std::env::vars(), &pass_env, bytecode, identity)
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| !planned.iter().any(|entry| &entry.name == name))
+            .collect();
+    passed.sort();
+
+    planned.extend(passed.into_iter().map(|name| {
+        let account =
+            identity.is_some() && crate::commands::ACCOUNT_VARIABLES.contains(&name.as_str());
+
+        pb::DeployEnv {
+            name,
+            layer: if account {
+                "set by Muru"
+            } else {
+                "passed from the daemon"
+            }
+            .to_owned(),
+            ..Default::default()
+        }
+    }));
+    planned
+}
+
+/// Section 10.9: whom a release of the application would run as, as a
+/// start decides it, without the events a start raises. A user the
+/// system does not have is left to the start to report.
+fn planned_identity(app: &str, handle: &Handle) -> Option<crate::host::Identity> {
+    let named = handle
+        .store
+        .app(app)
+        .ok()
+        .and_then(|record| record.user.map(|user| (user, record.group)));
+
+    match named {
+        Some((user, group)) if crate::host::Identity::can_switch() => {
+            crate::host::Identity::lookup(&user, group.as_deref(), None).ok()
+        }
+        Some(_) => None,
+        None => handle.info.service,
+    }
+}
+
+/// How long a deploy's answer waits for what the host has to say.
+const HOST_REPORT_WAIT: Duration = Duration::from_secs(2);
+
+/// Wait, within reason, until a release's host has said which workers it
+/// runs and what the application turned out to be, which it tells the
+/// daemon once the daemon's loop is free again after the deploy.
+async fn await_host_report(handle: &Handle, release: &Release) {
+    let deadline = tokio::time::Instant::now() + HOST_REPORT_WAIT;
+    let key = (release.app.clone(), release.id.clone());
+
+    loop {
+        let live = handle
+            .info
+            .live
+            .lock()
+            .expect("live poisoned")
+            .get(&key)
+            .cloned();
+        let reported = live
+            .as_ref()
+            .is_some_and(|live| !live.host || live.announced);
+
+        // A release at zero workers has nothing to settle its interface.
+
+        let settled = release.spec.interface != muru_config::Interface::Auto
+            || live.is_some_and(|live| live.workers.is_empty())
+            || !handle
+                .info
+                .interfaces
+                .announced(&release.app, &release.id)
+                .is_empty();
+
+        if release.spec.http.is_some() || (reported && settled) {
+            return;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn release_message(release: Release, handle: &Handle) -> pb::Release {
     let serving = handle
         .store
@@ -2653,13 +2807,28 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                 .collect()
         })
         .unwrap_or_default();
-    let detected_for = |mount: &str| {
+    let live = handle
+        .info
+        .live
+        .lock()
+        .expect("live poisoned")
+        .get(&(release.app.clone(), release.id.clone()))
+        .cloned()
+        .unwrap_or_default();
+
+    // What the host announced, and a declared interface until it has.
+
+    let detected_for = |mount: &str, declared: muru_config::Interface| {
         detected
             .iter()
             .find(|(name, _)| name == mount)
             .map(|(_, interface)| interface.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(|| match declared {
+                muru_config::Interface::Auto => String::new(),
+                other => other.as_str().to_owned(),
+            })
     };
+    let detected_interface = detected_for("", release.spec.interface);
 
     let bytecode = match release.spec.bytecode.effective() {
         muru_config::Bytecode::Redirect => format!(
@@ -2730,8 +2899,19 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         serving,
         created_unix_ms: release.created_unix_ms,
         resource_version: release.resource_version,
-        workers: Vec::new(),
-        retained_until_unix_ms: 0,
+        workers: live
+            .workers
+            .into_iter()
+            .map(|worker| pb::Worker {
+                index: worker.index,
+                pid: worker.pid,
+                socket: worker.socket,
+                group: worker.group,
+                state: worker.state,
+            })
+            .collect(),
+        host_running: live.host,
+        retained_until_unix_ms: live.retained_until_unix_ms,
         kind: if release.spec.http.is_some() {
             "http".to_owned()
         } else {
@@ -2764,7 +2944,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                     .threads
                     .map_or(0, |threads| saturate(threads.reserved())),
                 max_threads: mount.threads.map_or(0, |threads| saturate(threads.max())),
-                detected_interface: detected_for(&mount.name),
+                detected_interface: detected_for(&mount.name, mount.interface),
             })
             .collect(),
         groups: release
@@ -2785,7 +2965,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                 mounts: group.mounts.clone(),
             })
             .collect(),
-        detected_interface: detected_for(""),
+        detected_interface,
         websockets,
     }
 }

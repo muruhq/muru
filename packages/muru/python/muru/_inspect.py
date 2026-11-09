@@ -11,6 +11,10 @@ Each request is one JSON object with an ``op`` and ``args``; each answer
 is one JSON object with ``ok`` and a ``result`` or an ``error``. The
 runtime's control thread calls :func:`handle` with the request line and
 the requests in flight, attached to the interpreter only for the call.
+An operation over a period (``profile``, ``trace``, ``memory`` with a
+trace, ``exec``) is called on a thread of its own, so the control thread goes on
+answering meanwhile; the runtime runs one of them at a time and refuses
+a second.
 """
 
 from __future__ import annotations
@@ -40,6 +44,15 @@ from muru import _debug
 
 REDACTED = ("SECRET", "TOKEN", "PASSWORD", "PASSWD", "KEY", "CREDENTIAL", "AUTH")
 REDACTED_SUFFIXES = ("_DSN",)
+
+# Section 11.7: the variables whose values inspect shows without --env,
+# by name and by prefix: what Muru sets and what the interpreter reads.
+# The release's own and, under the daemon, what the daemon passes on
+# (section 8.7), are shown too: the host names them in DECLARED.
+
+SHOWN = ("PATH", "VIRTUAL_ENV", "LANG", "TZ")
+SHOWN_PREFIXES = ("MURU_", "PYTHON", "LC_")
+DECLARED = "MURU_DECLARED_ENV"
 
 # Logger levels changed for a period, with what they were, so a reset or
 # the period's end puts them back.
@@ -78,7 +91,7 @@ def handle(
         elif op == "tasks":
             result = tasks(loop)
         elif op == "inspect":
-            result = inspect()
+            result = inspect(bool(args.get("env", False)))
         elif op == "logging":
             result = set_level(
                 str(args.get("logger", "")),
@@ -575,8 +588,38 @@ def _redact_url(text: str) -> str:
     return urlunsplit(parts._replace(netloc=f"{username}:***@{hostinfo}"))
 
 
-def inspect() -> dict[str, Any]:
-    """Describe the worker's interpreter, modules, environment, threads and descriptors."""
+def shown(key: str, declared: set[str]) -> bool:
+    """Say whether inspect shows a variable's value without being asked for every one.
+
+    It does for the variables Muru sets, the interpreter's and those the
+    release declares, `declared`; every other variable is named only.
+    """
+
+    return key in SHOWN or key.startswith(SHOWN_PREFIXES) or key in declared
+
+
+def environment(every: bool) -> dict[str, str | None]:
+    """Return the worker's environment as inspect shows it: every name, masked values.
+
+    Without `every`, a variable that `shown` leaves out has no value
+    (None), so configuration under a name the masking does not catch
+    stays out of the answer.
+    """
+
+    declared = set(filter(None, os.environ.get(DECLARED, "").split(",")))
+
+    return {
+        key: redact(key, value) if every or shown(key, declared) else None
+        for key, value in sorted(os.environ.items())
+    }
+
+
+def inspect(every: bool = False) -> dict[str, Any]:
+    """Describe the worker's interpreter, modules, environment, threads and descriptors.
+
+    The environment names every variable, with values for those `shown`
+    allows, or for every one with `every` (`muructl debug inspect --env`).
+    """
 
     from muru import context
 
@@ -591,7 +634,6 @@ def inspect() -> dict[str, Any]:
             "file": getattr(module, "__file__", None),
         }
 
-    environment = {key: redact(key, value) for key, value in sorted(os.environ.items())}
     threads = [
         {"name": thread.name, "ident": thread.ident, "daemon": thread.daemon}
         for thread in threading.enumerate()
@@ -605,7 +647,7 @@ def inspect() -> dict[str, Any]:
         "cwd": os.getcwd(),
         "sys_path": list(sys.path),
         "modules": modules,
-        "environment": environment,
+        "environment": environment(every),
         "threads": threads,
         "descriptors": descriptors(),
         "settings": {

@@ -52,7 +52,7 @@ message Snapshot {
   repeated ErrorPage error_pages = 8;   // section 4.12: the node-wide pages
   ErrorOverride error_override = 9;     // the node-wide override; off when absent
   repeated Upstream upstreams = 10;     // section 4.13: the HTTP upstreams routes may name
-  string default_app = 11;              // the application the default workers belong to; found by sockets when empty
+  string default_app = 11;              // the one application serving with no host declared; found by sockets when empty
   string default_release = 12;          // and its release
   repeated ClientClass client_classes = 13; // section 4.14: classification rules, in order
   repeated RateLimit rate_limits = 14;  // section 4.15: the rate limits hosts and routes name
@@ -63,6 +63,7 @@ message Snapshot {
   repeated AccessLogOverride access_log_overrides = 19; // section 11.2: changes in force for a period, the newest last; only with access_log
   repeated ListenerLimits listener_limits = 20; // section 4.18: listeners' own limits, over the snapshot's; read only with limits
   repeated ListenerProxy listener_proxies = 21; // section 4.7: listeners' own trusted proxies, in place of proxy for their connections
+  bool no_host = 22;                    // sections 4.3 and 4.5: several applications serve and no host chooses; every request is 421
 }
 
 // Section 11.2: which access records are written, where the edge was

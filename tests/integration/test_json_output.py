@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,15 @@ def test_read_commands_print_the_api_answers(daemon: Daemon) -> None:
     deployed = answer(daemon, "deploy", "shop", str(SHOP))
     assert (deployed["app"], deployed["id"], deployed["state"]) == ("shop", "r1", "ready")
     assert deployed["serving"] is True
+
+    # The deploy answers with what the host runs and what it found.
+
+    assert deployed["detected_interface"] == "wsgi"
+    assert deployed["host_running"] is True
+    assert deployed["workers"], deployed
+    assert all(worker["pid"] > 0 and worker["group"] == "default" for worker in deployed["workers"])
+    assert {worker["state"] for worker in deployed["workers"]} <= {"starting", "ready"}
+    assert deployed["retained_until_unix_ms"] == 0
 
     status = answer(daemon, "status")
     assert status["app_count"] == 1
@@ -79,6 +89,13 @@ def test_a_release_s_output_prints_as_json_lines(daemon: Daemon) -> None:
 def test_mutating_commands_print_what_they_changed(daemon: Daemon) -> None:
     daemon.deploy("shop", SHOP)
     daemon.deploy("shop", SHOP)
+
+    # Superseded and warm, the release says when it is stopped.
+
+    retained = answer(daemon, "release", "show", "shop@r1")
+    assert retained["state"] == "retained"
+    assert retained["retained_until_unix_ms"] > time.time() * 1000
+    assert retained["host_running"] is True
 
     rolled_back = answer(daemon, "rollback", "shop")
     assert (rolled_back["id"], rolled_back["serving"]) == ("r1", True)

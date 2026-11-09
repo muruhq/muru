@@ -52,6 +52,14 @@ and group up, gives the release's run directory, its secret files and
 its log to that user, and starts the host with that identity, which the
 workers inherit. A user or group that does not exist fails the release.
 
+The release has that user's own `HOME`, `USER` and `LOGNAME`, taken from
+the system's password database, and so do its commands, its managed
+servers and the build of its environment. A value for one of them in
+`[tool.muru.env]` or from `muructl deploy --env` is used instead. An
+account with no home directory, such as `/nonexistent`, gives a release
+that path, so an application that writes under `~` needs a real one or
+its own `HOME` declared.
+
 The release's socket directory belongs to the application's user with
 the service user's group, and opens to those two alone, so the edge
 reaches the workers' sockets and nothing else does. The admin socket and

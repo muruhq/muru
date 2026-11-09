@@ -166,6 +166,7 @@ def test_mounts_under_the_daemon_from_the_table_and_the_file(
     # A declared release's mounts replace the table's; the export writes
     # them whole and applies back unchanged.
 
+    daemon.muructl("drain", "mounted@r1")
     config = tmp_path / "echo.toml"
     config.write_text(
         f"""[app.echo.release.r1]

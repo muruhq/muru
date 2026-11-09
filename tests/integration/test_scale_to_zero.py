@@ -2,11 +2,13 @@
 and 9.1): a group with no floor drains its last worker once idle and the
 next request wakes it, a release with a host_idle_timeout stops its host
 too and the next request starts it again, and a superseded release keeps
-one worker per group while it stays warm.
+one worker per group while it stays warm, or none for a group that may
+scale to zero, with a note that says what a rollback to it costs.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -92,6 +94,16 @@ def test_an_idle_group_scales_to_zero_and_a_request_wakes_it(tmp_path: Path) -> 
 
         woken = [line for line in events(daemon, "scaling.decision") if "from 0 to 1" in line]
         assert woken and "a request is waiting for a group scaled to zero" in woken[0], woken
+
+        # A group that may scale to zero keeps no worker once retained,
+        # and the note says a rollback forks one.
+
+        deployed = daemon.muructl("deploy", "shop", str(SHOP), "--python", sys.executable)
+        assert deployed.returncode == 0, deployed.stderr
+        retained = events(daemon, "release.retained")
+        assert retained and "kept for 1800s with its host alone" in retained[0], retained
+        listed = " ".join(daemon.muructl("release", "list", "shop").stdout.split())
+        assert "host kept until" in listed and "a rollback to it forks a worker" in listed, listed
     finally:
         daemon.stop()
 
@@ -106,12 +118,23 @@ def test_an_idle_host_stops_and_the_next_request_starts_it(tmp_path: Path) -> No
             "events"
         ).stdout
         assert "its host stopped" in events(daemon, "release.idle")[0]
-        assert "idle: its host has stopped" in daemon.muructl("release", "list", "shop").stdout
+        idle = daemon.muructl("release", "list", "shop").stdout
+        assert "idle: its host has stopped" in idle and "- (" in idle, idle
+
+        # Retained while idle, the release says a rollback to it waits for
+        # its import, and the first request after the rollback does.
+
+        deployed = daemon.muructl("deploy", "shop", str(SHOP), "--python", sys.executable)
+        assert deployed.returncode == 0, deployed.stderr
+        listed = " ".join(daemon.muructl("release", "list", "shop").stdout.split())
+        assert "idle until" in listed and "a rollback to it waits for its import" in listed, listed
+        assert daemon.muructl("rollback", "shop").returncode == 0
 
         response = daemon.get("/")
         assert response.status == 200, response
+        assert json.loads(response.body)["release"] == "r1", response.body
         assert events(daemon, "release.woken")
-        assert workers(daemon) >= 1
+        assert workers(daemon, "shop@r1") >= 1
     finally:
         daemon.stop()
 

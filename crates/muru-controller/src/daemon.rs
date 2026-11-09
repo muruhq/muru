@@ -50,6 +50,10 @@ pub const RETENTION: Duration = Duration::from_secs(30 * 60);
 /// (section 9.1).
 pub const RETAIN_WORKERS: u32 = 1;
 
+/// How long a rolled back or aborted rollout's candidate is kept, for its
+/// logs and workers to be looked at (section 9.3).
+pub const INSPECTION: Duration = Duration::from_secs(10 * 60);
+
 /// How long to wait for a release's processes to stop, given its stop
 /// budget: never less than the drain timeout.
 fn stop_wait(budget: Duration) -> Duration {
@@ -65,15 +69,147 @@ const DASHBOARD_SOCKETS: u32 = 200;
 pub struct Retention {
     /// How long; zero stops it once it has drained.
     pub lasts: Duration,
-    /// The workers each group keeps.
-    pub workers: u32,
+    /// The workers each group keeps; none keeps the warm floor, or no
+    /// worker for a group whose min_workers is 0.
+    pub workers: Option<u32>,
+    /// Whether the release takes its application's one retained slot,
+    /// as the rollback target, making an older retained release stop.
+    /// A rejected rollout's candidate is kept beside it instead, for
+    /// inspection only.
+    pub slot: bool,
 }
 
 impl Default for Retention {
     fn default() -> Self {
         Self {
             lasts: RETENTION,
-            workers: RETAIN_WORKERS,
+            workers: None,
+            slot: true,
+        }
+    }
+}
+
+impl Retention {
+    /// Section 9.3: how a rolled back or aborted rollout's candidate is
+    /// kept: for a shorter window, outside the retained slot, so the
+    /// release a rollback goes to stays warm.
+    pub fn inspection() -> Self {
+        Self {
+            lasts: INSPECTION,
+            slot: false,
+            ..Self::default()
+        }
+    }
+}
+
+/// Section 9.1: the workers a group of a retained release keeps when the
+/// deploy does not say: the warm floor, but none for a group that may
+/// scale to zero, which is configured to hold none.
+fn retained_by_default(spec: &crate::model::ScalingSpec) -> u32 {
+    if spec.is_static() {
+        RETAIN_WORKERS
+    } else {
+        RETAIN_WORKERS.min(spec.min_workers)
+    }
+}
+
+/// What each group of `release` would keep when retained as `workers`
+/// says, for a plan: "1 worker to a group", "its host alone", or each
+/// group's count when they differ.
+pub(crate) fn retained_workers_phrase(release: &ReleaseSpec, workers: Option<u32>) -> String {
+    let counts: Vec<(&str, u32)> =
+        std::iter::once((muru_edge::routing::DEFAULT_GROUP, &release.scaling))
+            .chain(
+                release
+                    .groups
+                    .iter()
+                    .map(|group| (group.name.as_str(), &group.scaling)),
+            )
+            .map(|(name, scaling)| {
+                (
+                    name,
+                    workers.unwrap_or_else(|| retained_by_default(scaling)),
+                )
+            })
+            .collect();
+    let first = counts.first().map_or(0, |(_, count)| *count);
+
+    if counts.iter().all(|(_, count)| *count == first) {
+        return match first {
+            0 => "its host alone".to_owned(),
+            1 => "1 worker to a group".to_owned(),
+            count => format!("{count} workers to a group"),
+        };
+    }
+
+    let parts: Vec<String> = counts
+        .iter()
+        .map(|(group, count)| format!("{count} in {group}"))
+        .collect();
+    format!("its host and {}", parts.join(", "))
+}
+
+/// Section 9.1: what a retained release keeps running, which decides
+/// what a rollback to it costs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Kept {
+    /// Its host stopped while idle: a rollback waits for the import.
+    Idle,
+    /// A managed server's instances, which keep running.
+    Instances,
+    /// Its host, with the workers each group keeps, by group name.
+    Workers(Vec<(String, u32)>),
+}
+
+impl Kept {
+    /// The release's note while it is retained, until `until`.
+    fn note(&self, until: &str) -> String {
+        match self {
+            Kept::Idle => format!("idle until {until}; a rollback to it waits for its import"),
+            Kept::Workers(counts) if counts.iter().all(|(_, count)| *count == 0) => {
+                format!("host kept until {until}; a rollback to it forks a worker")
+            }
+            Kept::Workers(counts) if counts.iter().any(|(_, count)| *count == 0) => format!(
+                "warm until {until}; a rollback to it forks a worker for a group that kept none"
+            ),
+            _ => format!("warm until {until}; a rollback to it is instant"),
+        }
+    }
+
+    /// The event's message: kept warm, kept idle or kept, for `lasts`,
+    /// with what it keeps.
+    fn event(&self, lasts: &str) -> String {
+        let how = match self {
+            Kept::Idle => "kept idle",
+            Kept::Workers(counts) if counts.iter().any(|(_, count)| *count == 0) => "kept",
+            _ => "kept warm",
+        };
+
+        format!("{how} for {lasts} {}", self.with())
+    }
+
+    /// What it is kept with, for the event.
+    fn with(&self) -> String {
+        match self {
+            Kept::Idle => "with its host stopped".to_owned(),
+            Kept::Instances => "with its instances".to_owned(),
+            Kept::Workers(counts) => {
+                let first = counts.first().map_or(0, |(_, count)| *count);
+
+                if counts.iter().all(|(_, count)| *count == first) {
+                    match first {
+                        0 => "with its host alone".to_owned(),
+                        1 => "with 1 worker per group".to_owned(),
+                        count => format!("with {count} workers per group"),
+                    }
+                } else {
+                    let parts: Vec<String> = counts
+                        .iter()
+                        .map(|(group, count)| format!("{count} in {group}"))
+                        .collect();
+                    format!("with its host and {}", parts.join(", "))
+                }
+            }
         }
     }
 }
@@ -586,9 +722,34 @@ pub struct Info {
     /// The instances of each managed server release (section 9.9), by
     /// application and release, as the daemon last checked them.
     pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceRecord>>>,
+    /// What runs for each release now, by application and release, as the
+    /// daemon last published it.
+    pub live: std::sync::Mutex<HashMap<(String, String), LiveRelease>>,
+    /// The applications serving with no host declared to choose between
+    /// them, comma separated, or empty (section 4.3).
+    pub no_host: std::sync::Mutex<String>,
+    /// Section 8.7: `[daemon] pass_env`, as a reload may change it.
+    pub pass_env: std::sync::RwLock<Vec<String>>,
+    /// The service user (ADR 0026), when this daemon is root, for what a
+    /// deploy's plan says a release would run as.
+    pub service: Option<crate::host::Identity>,
     /// Section 8.4: uv as found and how it is run, from the `[tools]`
     /// table read at start.
     pub provisioning: crate::provision::Provisioning,
+}
+
+/// What runs for one release now, for the API.
+#[derive(Debug, Clone, Default)]
+pub struct LiveRelease {
+    /// Whether a host runs for it: false for a dormant release.
+    pub host: bool,
+    /// Whether its host has said which workers it runs.
+    pub announced: bool,
+    /// Its workers, as its host last announced them.
+    pub workers: Vec<crate::host::HostWorker>,
+    /// For a retained release, when it is stopped, in Unix milliseconds;
+    /// otherwise 0.
+    pub retained_until_unix_ms: u64,
 }
 
 /// What each release's entrypoints run as (section 6.7): the interface
@@ -724,9 +885,9 @@ impl Backend {
 
     /// Stop the processes as `stop` does, killing what is still there at
     /// `kill_at` (section 13.3).
-    async fn stop_until(self, kill_at: Instant) {
+    async fn stop_until(self, kill_at: Instant, workers_by: Instant) {
         match self {
-            Self::Host(host) => host.stop_until(kill_at).await,
+            Self::Host(host) => host.stop_until(kill_at, Some(workers_by)).await,
             Self::Servers(servers) => servers.stop_until(kill_at).await,
             Self::Dormant => {}
         }
@@ -775,6 +936,16 @@ struct Running {
     /// The named groups' sockets and paths.
     groups: Vec<GroupRecord>,
     retained_until: Option<Instant>,
+    /// `retained_until` as Unix milliseconds, for the API; 0 when not
+    /// retained.
+    retained_until_unix_ms: u64,
+    /// The workers the host announced last, and whether it has yet.
+    workers: Vec<crate::host::HostWorker>,
+    announced: bool,
+    /// Retained for inspection after a rejected rollout, outside the
+    /// application's retained slot: it makes way before the rollback
+    /// target does.
+    inspected: bool,
     /// Section 9.4: while set, the release is leaving traffic but stays
     /// reachable by sticky cookie until the instant, when it drains with
     /// the retention given.
@@ -1010,9 +1181,9 @@ struct Daemon {
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
     serving: HashMap<String, String>,
-    /// The application whose workers take requests when no host is
-    /// declared: the last one traffic was switched to.
-    default_app: Option<String>,
+    /// The applications serving with no host to choose between them, as
+    /// last announced by a `routing.no_host` event.
+    no_host: BTreeSet<String>,
     /// Whether this process writes to the daemon log file, as a daemon
     /// started in the background does, so a reopen applies to it too.
     owns_log: bool,
@@ -1185,6 +1356,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }),
         interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
+        live: std::sync::Mutex::new(HashMap::new()),
+        no_host: std::sync::Mutex::new(String::new()),
+        pass_env: std::sync::RwLock::new(settings.pass_env.clone()),
+        service,
         servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
     });
@@ -1352,7 +1527,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         probed: HashMap::new(),
         probe_client: crate::rollouts::probe_client(),
         serving: HashMap::new(),
-        default_app: None,
+        no_host: BTreeSet::new(),
         owns_log,
         commands: handle_commands,
         asked: HashMap::new(),
@@ -1474,6 +1649,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 daemon.watch_rate_limits(samples.as_deref());
             }
         }
+
+        daemon.publish_live();
     };
 
     // Section 13.3: by default the daemon detaches, leaving hosts and the
@@ -2332,6 +2509,11 @@ impl Daemon {
             let measured = |value: Option<f64>, unit: &str| {
                 value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
             };
+            let p95 = |value: Option<f64>| {
+                value.map_or("-".to_owned(), |ms| {
+                    crate::scaling::describe_p95(ms, crate::scaling::SIGNAL_LARGEST_MS)
+                })
+            };
 
             let optional: Vec<String> = self
                 .running
@@ -2360,14 +2542,17 @@ impl Daemon {
                         format!("{} -> {}", status.ready, status.desired)
                     },
                     policy: status.spec.describe(),
-                    cpu: measured(status.workers.worker_cpu.map(|cpu| cpu * 100.0), "%"),
+                    cpu: status
+                        .workers
+                        .worker_cpu
+                        .map_or("-".to_owned(), crate::scaling::describe_cpu),
                     gc: measured(status.workers.gc_share.map(|share| share * 100.0), "%"),
-                    gil_wait: measured(status.workers.gil_wait_p95_ms, " ms"),
-                    loop_lag: measured(status.workers.loop_lag_p95_ms, " ms"),
+                    gil_wait: p95(status.workers.gil_wait_p95_ms),
+                    loop_lag: p95(status.workers.loop_lag_p95_ms),
                     handoff_wait: status
                         .workers
                         .handoff_queue_wait_p95_ms
-                        .map(|wait| format!("{wait:.0} ms")),
+                        .map(|wait| p95(Some(wait))),
                     diagnosis: status.diagnosis.summary.to_owned(),
                     advice: status.diagnosis.advice.to_owned(),
                     last_decision: status
@@ -2628,6 +2813,17 @@ impl Daemon {
         let mut defined = self.client_rules.defined();
         defined.budget = self.budget_view(self.budget_usage());
         *self.info.defined.write().expect("defined names poisoned") = defined;
+        let pass_env_was = std::mem::replace(
+            &mut *self.info.pass_env.write().expect("pass_env poisoned"),
+            settings.pass_env.clone(),
+        );
+
+        if pass_env_was != settings.pass_env {
+            report.changed("[daemon] pass_env", "for releases started from now on");
+        } else {
+            report.unchanged("[daemon] pass_env");
+        }
+
         let actions = settings.dashboard_actions;
         let actions_were = self
             .info
@@ -3778,6 +3974,10 @@ impl Daemon {
                         sockets,
                         groups: record.groups.clone(),
                         retained_until,
+                        retained_until_unix_ms: unix_ms_of(retained_until),
+                        workers: Vec::new(),
+                        announced: false,
+                        inspected: false,
                         sticky_until: None,
                         held: false,
                         control: None,
@@ -3841,6 +4041,7 @@ impl Daemon {
                     return false;
                 }
             };
+        let env = self.server_environment(env, app, id, &release.spec, identity);
         let adopted = Servers::adopt(
             &http,
             &run_dir.join("r1"),
@@ -3867,6 +4068,10 @@ impl Daemon {
                         sockets: Vec::new(),
                         groups: Vec::new(),
                         retained_until,
+                        retained_until_unix_ms: unix_ms_of(retained_until),
+                        workers: Vec::new(),
+                        announced: false,
+                        inspected: false,
                         sticky_until: None,
                         held: false,
                         control: None,
@@ -4167,6 +4372,13 @@ impl Daemon {
         hold: bool,
         created: oneshot::Sender<Result<Release, String>>,
     ) -> Result<Release, String> {
+        // Section 4.3: refused before anything is started.
+
+        if !hold && let Some(refusal) = crate::config::second_app_refusal(&self.store, app) {
+            let _ = created.send(Err(refusal.clone()));
+            return Err(refusal);
+        }
+
         if let Err(error) = self.make_room(app, &spec).await {
             let _ = created.send(Err(error.clone()));
             return Err(error);
@@ -4355,6 +4567,14 @@ impl Daemon {
                 .open(&log_path)
                 .map_err(|error| format!("opening {}: {error}", log_path.display()))?;
             let mut command = build.command(&uv, &isolation);
+
+            // The build runs as the release's user, so it has that user's
+            // home too and not the daemon's (section 8.7).
+
+            if let Some(identity) = identity {
+                command.envs(identity.account());
+            }
+
             crate::host::own_session_std(&mut command, identity);
             let _ = writeln!(log, "[build] {}", build.describe());
 
@@ -4538,13 +4758,16 @@ impl Daemon {
 
         let library = self.runtime_library(&python).await?;
         let pycache = self.pycache_prefix(app, id, spec, identity);
+        let bytecode = Some(spec.bytecode.effective());
+        let base = self.daemon_base(bytecode, identity);
         let env = crate::commands::environment(
             env,
             &crate::commands::Interpreter {
                 python: &python,
                 runtime: library.pythonpath.as_deref(),
                 pycache: pycache.as_deref(),
-                no_bytecode: spec.bytecode.effective() == muru_config::Bytecode::Off,
+                bytecode,
+                base: Some(&base),
             },
             app,
             id,
@@ -4557,6 +4780,8 @@ impl Daemon {
             label: "exec".to_owned(),
             argv: Vec::new(),
             env,
+            unset: Vec::new(),
+            clean: true,
             cwd: spec.source.clone(),
             identity,
             log: Some(self.host_log(app, id)),
@@ -4628,6 +4853,8 @@ impl Daemon {
             // caller has given it to the edge.
 
             running.retained_until = None;
+            running.retained_until_unix_ms = 0;
+            running.inspected = false;
             return Ok(());
         }
 
@@ -4685,6 +4912,8 @@ impl Daemon {
         // instances instead of a host.
 
         if let Some(http) = spec.http.clone() {
+            let env = self.server_environment(env, app, id, spec, identity);
+
             return self
                 .start_servers(app, id, &release, &http, env, identity, &run_dir, started)
                 .await;
@@ -4732,11 +4961,31 @@ impl Daemon {
 
         let pycache_prefix = self.pycache_prefix(app, id, spec, identity);
 
+        // Section 8.7: the host starts from a clean environment, built
+        // once for its host and workers.
+
+        let bytecode = Some(spec.bytecode.effective());
+        let base = self.daemon_base(bytecode, identity);
+        let env = crate::commands::environment(
+            env,
+            &crate::commands::Interpreter {
+                python: &python,
+                runtime: library.pythonpath.as_deref(),
+                pycache: pycache_prefix.as_deref(),
+                bytecode,
+                base: Some(&base),
+            },
+            app,
+            id,
+            &spec.source,
+        );
+
         let host_spec = HostSpec {
             python,
-            pythonpath: library.pythonpath.clone(),
-            pycache_prefix,
-            no_bytecode: spec.bytecode.effective() == muru_config::Bytecode::Off,
+            pythonpath: None,
+            pycache_prefix: None,
+            bytecode: None,
+            clean_env: true,
             app: spec.entrypoint.clone(),
             name: Some(app.to_owned()),
             release: Some(id.to_owned()),
@@ -4762,12 +5011,19 @@ impl Daemon {
             hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
             shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),
             websocket_drain_grace: Duration::from_millis(spec.timeouts.websocket_drain_grace_ms),
+            exit_grace: Duration::from_millis(spec.timeouts.exit_grace_ms),
             loop_stall_timeout: Duration::from_millis(spec.timeouts.loop_stall_timeout_ms),
             gil_stall_timeout: Duration::from_millis(spec.timeouts.gil_stall_timeout_ms),
             memory: spec.memory.clone(),
             memory_budget: None,
             cgroup: None,
             env,
+            shown_env: spec
+                .env
+                .iter()
+                .filter_map(crate::model::EnvSpec::shown_name)
+                .chain(base.into_iter().map(|(name, _)| name))
+                .collect(),
             identity,
             groups: spec
                 .groups
@@ -4805,6 +5061,11 @@ impl Daemon {
                 .collect(),
         };
 
+        // What the host writes from here on is what says why, if it fails.
+
+        let log = self.host_log(app, id);
+        let log_start = std::fs::metadata(&log).map_or(0, |metadata| metadata.len());
+
         let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs) {
             Ok(host) => host,
             Err(error) => {
@@ -4819,8 +5080,15 @@ impl Daemon {
         self.set_state(&release, ReleaseState::Warming, "waiting for the workers");
 
         if let Err(error) = host.wait_ready(START_TIMEOUT).await {
-            let message = format!("{error:#}");
+            let mut message = format!("{error:#}");
             host.stop(release.spec.timeouts.stop_budget()).await;
+
+            // Section 9.1: the failure names its cause, wherever it is read.
+
+            if let Some(reason) = crate::logs::start_failure(&log, log_start).await {
+                message = format!("{message}: {reason}");
+            }
+
             self.set_state(&release, ReleaseState::Failed, &message);
             self.events
                 .emit("release.failed", &subject, "error", &message);
@@ -4888,6 +5156,10 @@ impl Daemon {
                 sockets,
                 groups,
                 retained_until: None,
+                retained_until_unix_ms: 0,
+                workers: Vec::new(),
+                announced: false,
+                inspected: false,
                 sticky_until: None,
                 held: false,
                 control: None,
@@ -5089,6 +5361,10 @@ impl Daemon {
                 sockets: Vec::new(),
                 groups: Vec::new(),
                 retained_until: None,
+                retained_until_unix_ms: 0,
+                workers: Vec::new(),
+                announced: false,
+                inspected: false,
                 sticky_until: None,
                 held: false,
                 control: None,
@@ -5132,7 +5408,6 @@ impl Daemon {
         }
 
         self.serving.insert(app.to_owned(), id.to_owned());
-        self.default_app = Some(app.to_owned());
 
         if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
             running.held = false;
@@ -5159,6 +5434,32 @@ impl Daemon {
                 );
             }
         }
+    }
+
+    /// Section 4.3: say once when several applications serve with no
+    /// host to choose between them, and when that ends, and keep what
+    /// `muructl status` shows.
+    fn note_no_host(&mut self, serving: BTreeSet<String>) {
+        if serving == self.no_host {
+            return;
+        }
+
+        let names = serving.iter().cloned().collect::<Vec<_>>().join(", ");
+        *self.info.no_host.lock().expect("no_host poisoned") = names.clone();
+
+        if !serving.is_empty() {
+            self.events.emit(
+                "routing.no_host",
+                "edge",
+                "warning",
+                &format!(
+                    "{names} serve and no hosts are declared, so every request is answered 421; \
+                     declare hosts and routes for them"
+                ),
+            );
+        }
+
+        self.no_host = serving;
     }
 
     /// Section 4.4: desired state compiled for the edge. Each application
@@ -5366,18 +5667,21 @@ impl Daemon {
             }
         }
 
-        if self
-            .default_app
-            .as_ref()
-            .is_some_and(|name| !apps.iter().any(|app| &app.app == name))
-        {
-            self.default_app = None;
-        }
-        let default = self
-            .default_app
-            .as_ref()
-            .and_then(|name| apps.iter().find(|app| &app.app == name))
-            .or_else(|| apps.first());
+        // Section 4.3: with no host declared, the one application that
+        // serves takes every request. Nothing is chosen between several,
+        // and nothing is kept, so a restart cannot move the traffic.
+
+        let no_hosts = self.store.hosts().unwrap_or_default().is_empty();
+        let serving: BTreeSet<String> = apps
+            .iter()
+            .filter(|app| app.serving)
+            .map(|app| app.app.clone())
+            .collect();
+        let no_host = no_hosts && serving.len() > 1;
+        let default = (no_hosts && serving.len() == 1)
+            .then(|| apps.iter().find(|app| app.serving))
+            .flatten();
+        self.note_no_host(if no_host { serving } else { BTreeSet::new() });
         let worker_sockets = default.map(|app| app.sockets.clone()).unwrap_or_default();
         let default_app = default.map(|app| app.app.clone()).unwrap_or_default();
         let default_release = default.map(|app| app.release.clone()).unwrap_or_default();
@@ -5565,6 +5869,7 @@ impl Daemon {
             client_classes: self.clients.classes_message.clone(),
             rate_limits: self.clients.limits_message.clone(),
             default_traffic,
+            no_host,
             h2c: self.h2c.clone(),
             listener_limits: self.listener_limits.clone(),
             listener_proxies: self.listener_proxies.clone(),
@@ -5700,14 +6005,18 @@ impl Daemon {
             .emit("release.draining", &subject, "info", "draining");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // One retained release per application: an older one makes way.
+        // One retained release per application: an older one makes way,
+        // unless this one is kept for inspection only.
 
         if !retain.lasts.is_zero() {
             let older: Vec<String> = self
                 .running
                 .iter()
                 .filter(|((other_app, other_id), running)| {
-                    other_app == app && other_id != id && running.retained_until.is_some()
+                    retain.slot
+                        && other_app == app
+                        && other_id != id
+                        && running.retained_until.is_some()
                 })
                 .map(|((_, other_id), _)| other_id.clone())
                 .collect();
@@ -5720,9 +6029,15 @@ impl Daemon {
             // workers fork from the preloaded host when it serves again.
 
             let mut floors = Vec::new();
+            let mut kept = Kept::Workers(Vec::new());
+            let until = crate::model::now_unix_ms() + retain.lasts.as_millis() as u64;
 
             if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
                 running.retained_until = Some(Instant::now() + retain.lasts);
+                running.retained_until_unix_ms = until;
+                running.inspected = !retain.slot;
+                let host = running.backend.host().is_some();
+                let mut counts = Vec::new();
 
                 for group in &mut running.scalers {
                     let held = running
@@ -5731,35 +6046,53 @@ impl Daemon {
                         .find(|record| record.name == group.name)
                         .map_or(running.sockets.len(), |record| record.sockets.len())
                         as u32;
+                    let keep = retain
+                        .workers
+                        .unwrap_or_else(|| retained_by_default(group.scaler.spec()));
 
-                    if held > retain.workers && running.backend.host().is_some() {
-                        group.requested = Some(retain.workers);
-                        floors.push(group.name.clone());
+                    if held > keep && host {
+                        group.requested = Some(keep);
+                        floors.push((group.name.clone(), keep));
                     }
+
+                    counts.push((group.name.clone(), if host { held.min(keep) } else { held }));
                 }
+
+                kept = match running.backend {
+                    Backend::Dormant => Kept::Idle,
+                    Backend::Servers(_) => Kept::Instances,
+                    Backend::Host(_) => Kept::Workers(counts),
+                };
             }
 
-            for group in floors {
-                self.ask_scale(app, id, &group, retain.workers);
+            for (group, keep) in floors {
+                self.ask_scale(app, id, &group, keep);
             }
 
-            let until = crate::model::now_unix_ms() + retain.lasts.as_millis() as u64;
-            self.set_state(
-                &release,
-                ReleaseState::Retained,
-                &format!("warm until {}; a rollback to it is instant", clock(until)),
-            );
-            self.events.emit(
-                "release.retained",
-                &subject,
-                "info",
-                &format!(
-                    "kept warm for {} with {} worker{} per group",
-                    muru_config::format_duration(retain.lasts),
-                    retain.workers,
-                    if retain.workers == 1 { "" } else { "s" }
-                ),
-            );
+            // Section 9.1: the note says what a rollback to the release
+            // would cost, from what is kept. A retained release is not
+            // scaled or idled, so the note holds until it is stopped.
+
+            let lasts = muru_config::format_duration(retain.lasts);
+
+            let (note, event) = if retain.slot {
+                (kept.note(&clock(until)), kept.event(&lasts))
+            } else {
+                (
+                    format!(
+                        "kept for inspection until {}; not a rollback target",
+                        clock(until)
+                    ),
+                    format!(
+                        "kept for inspection for {lasts} {}; not a rollback target",
+                        kept.with()
+                    ),
+                )
+            };
+
+            self.set_state(&release, ReleaseState::Retained, &note);
+            self.events
+                .emit("release.retained", &subject, "info", &event);
             return;
         }
 
@@ -6134,7 +6467,7 @@ impl Daemon {
                     &subject,
                     "warning",
                     &format!(
-                        "rollout {}: {message}; the candidate is kept warm",
+                        "rollout {}: {message}; the candidate is kept for inspection",
                         rollout.id
                     ),
                 );
@@ -6143,7 +6476,7 @@ impl Daemon {
                 if !self.referenced_releases().contains(&candidate)
                     && self.serving.get(&rollout.app) != Some(&rollout.candidate)
                 {
-                    self.drain(&rollout.app, &rollout.candidate, Retention::default())
+                    self.drain(&rollout.app, &rollout.candidate, Retention::inspection())
                         .await;
                 }
             }
@@ -6167,6 +6500,10 @@ impl Daemon {
 
         if current.as_deref() == Some(id) {
             return Err(format!("{app}@{id} already serves"));
+        }
+
+        if let Some(refusal) = crate::config::second_app_refusal(&self.store, app) {
+            return Err(refusal);
         }
 
         self.make_room_for(app, id).await?;
@@ -6246,7 +6583,6 @@ impl Daemon {
 
         for (app, id, _) in &committed.promoted {
             self.serving.insert(app.clone(), id.clone());
-            self.default_app = Some(app.clone());
 
             if let Some(running) = self.running.get_mut(&(app.clone(), id.clone())) {
                 running.held = false;
@@ -6882,23 +7218,24 @@ impl Daemon {
 
     /// Section 9.1: the node is over its memory budget. The retained
     /// release created first that still has workers drops to its host
-    /// alone; when none has, the one created first stops.
+    /// alone; when none has, the one created first stops. One kept for
+    /// inspection goes before any rollback target.
     async fn relieve_memory(&mut self) {
-        let mut retained: Vec<(u64, String, String)> = self
+        let mut retained: Vec<(bool, u64, String, String)> = self
             .running
             .iter()
             .filter(|(_, running)| running.retained_until.is_some())
-            .map(|((app, id), _)| {
+            .map(|((app, id), running)| {
                 let created = self
                     .store
                     .release(app, id)
                     .map_or(0, |release| release.created_unix_ms);
-                (created, app.clone(), id.clone())
+                (!running.inspected, created, app.clone(), id.clone())
             })
             .collect();
         retained.sort();
 
-        for (_, app, id) in &retained {
+        for (_, _, app, id) in &retained {
             let key = (app.clone(), id.clone());
             let Some(running) = self.running.get_mut(&key) else {
                 continue;
@@ -6908,6 +7245,10 @@ impl Daemon {
                 continue;
             }
 
+            let inspected = running.inspected;
+            let left = running.retained_until.map_or(Duration::ZERO, |until| {
+                until.saturating_duration_since(Instant::now())
+            });
             let groups: Vec<String> = running
                 .scalers
                 .iter_mut()
@@ -6921,6 +7262,16 @@ impl Daemon {
                 self.ask_scale(app, id, group, 0);
             }
 
+            // The note says what a rollback now costs; one kept for
+            // inspection keeps its own.
+
+            if !inspected && let Ok(release) = self.store.release(app, id) {
+                let until = crate::model::now_unix_ms() + left.as_millis() as u64;
+                let note = Kept::Workers(groups.iter().map(|group| (group.clone(), 0)).collect())
+                    .note(&clock(until));
+                self.set_state(&release, ReleaseState::Retained, &note);
+            }
+
             self.events.emit(
                 "release.retained",
                 &format!("{app}@{id}"),
@@ -6930,7 +7281,7 @@ impl Daemon {
             return;
         }
 
-        if let Some((_, app, id)) = retained.first() {
+        if let Some((_, _, app, id)) = retained.first() {
             self.stop_release(app, id, "the node is over its memory budget")
                 .await;
         }
@@ -7036,8 +7387,10 @@ impl Daemon {
 
     /// Section 7.4: a request is waiting at the edge for a group with no
     /// workers. A release whose host stopped while idle is started
-    /// again; a group scaled to zero gets a worker, once the node's
-    /// budget admits it.
+    /// again; a group scaled to zero gets a worker. The node's workers
+    /// limit holds back neither, and a wake that takes the node over it
+    /// stops retained releases to make room; the memory limit applies to
+    /// both, as it does to a deploy.
     async fn wake(&mut self, wake: muru_proto::edge::v1::Wake) {
         let key = (wake.app.clone(), wake.release.clone());
         let subject = format!("{}@{}", wake.app, wake.release);
@@ -7049,28 +7402,7 @@ impl Daemon {
         };
 
         if matches!(running.backend, Backend::Dormant) {
-            self.running.remove(&key);
-            self.events.emit(
-                "release.woken",
-                &subject,
-                "info",
-                "a request is waiting: starting its host again",
-            );
-
-            match self.start(&wake.app, &wake.release).await {
-                Ok(()) => {
-                    if let Err(error) = self.push_snapshot().await {
-                        tracing::error!(%error, "pushing the snapshot for a woken release failed");
-                    }
-
-                    self.mark_ready(&wake.app, &wake.release, "woken by a request");
-                }
-                Err(error) => {
-                    self.events
-                        .emit("release.failed", &subject, "error", &error);
-                }
-            }
-
+            self.wake_host(&wake.app, &wake.release).await;
             return;
         }
 
@@ -7097,7 +7429,6 @@ impl Daemon {
             .store
             .app(&wake.app)
             .map_or(0, |record| record.priority);
-        let used = self.budget_usage();
         let ask = crate::budget::Ask {
             key: (),
             priority,
@@ -7105,7 +7436,36 @@ impl Daemon {
             to,
             cost,
         };
-        let admitted = crate::budget::admit(&self.budget, used, vec![ask]).remove(0);
+
+        // The wake is admitted with the workers limit lifted. Retained
+        // releases make way for its memory, the oldest first, as they do
+        // for a deploy, and it is refused only when it does not fit even
+        // without them.
+
+        let lifted = crate::budget::Budget {
+            workers: None,
+            ..self.budget
+        };
+        let mut used = self.budget_usage();
+        let mut admitted = crate::budget::admit(&lifted, used, vec![ask.clone()]).remove(0);
+
+        while admitted.limit == Some(crate::budget::Limit::Memory) {
+            let Some((other_app, other_id)) = self.oldest_retained(None) else {
+                break;
+            };
+
+            self.stop_release(
+                &other_app,
+                &other_id,
+                &format!(
+                    "making room in the node's memory budget for {subject}, woken by a request"
+                ),
+            )
+            .await;
+            used = self.budget_usage();
+            admitted = crate::budget::admit(&lifted, used, vec![ask.clone()]).remove(0);
+        }
+
         let Some(group) = self
             .running
             .get_mut(&key)
@@ -7133,13 +7493,101 @@ impl Daemon {
         }
 
         group.requested = Some(to);
-        self.events.emit(
-            "scaling.decision",
-            &subject,
-            "info",
-            &decision_message(&wake.group, 0, to, &reason, false),
-        );
+        let mut message = decision_message(&wake.group, 0, to, &reason, false);
+
+        if let Some(limit) = self
+            .budget
+            .workers
+            .filter(|limit| used.workers + to > *limit)
+        {
+            message.push_str(&format!(", over the node's budget of {limit} workers"));
+        }
+
+        self.events
+            .emit("scaling.decision", &subject, "info", &message);
         self.ask_scale(&wake.app, &wake.release, &wake.group, to);
+        self.make_worker_room(&subject).await;
+    }
+
+    /// Section 7.4: start again the host of a release that stopped while
+    /// idle, for a request waiting at the edge. Its memory must fit the
+    /// node's budget, retained releases making way as for a deploy; the
+    /// workers limit does not hold it back.
+    async fn wake_host(&mut self, app: &str, id: &str) {
+        let key = (app.to_owned(), id.to_owned());
+        let subject = format!("{app}@{id}");
+        let Ok(release) = self.store.release(app, id) else {
+            return;
+        };
+
+        if self.make_room(app, &release.spec).await.is_err() {
+            return;
+        }
+
+        let starting = release.spec.processes
+            + release
+                .spec
+                .groups
+                .iter()
+                .map(|group| group.processes)
+                .sum::<u32>();
+        let used = self.budget_usage();
+        let mut message = "a request is waiting: starting its host again".to_owned();
+
+        if let Some(limit) = self
+            .budget
+            .workers
+            .filter(|limit| used.workers + starting > *limit)
+        {
+            message.push_str(&format!(", over the node's budget of {limit} workers"));
+        }
+
+        self.running.remove(&key);
+        self.events
+            .emit("release.woken", &subject, "info", &message);
+
+        match self.start(app, id).await {
+            Ok(()) => {
+                if let Err(error) = self.push_snapshot().await {
+                    tracing::error!(%error, "pushing the snapshot for a woken release failed");
+                }
+
+                self.mark_ready(app, id, "woken by a request");
+                self.make_worker_room(&subject).await;
+            }
+            Err(error) => {
+                self.events
+                    .emit("release.failed", &subject, "error", &error);
+            }
+        }
+    }
+
+    /// Section 7.4: a wake from zero took the node over its workers
+    /// limit. Retained releases that hold workers stop, the oldest first,
+    /// until the node is back under it or none is left; until then other
+    /// releases' scale-out finds no room.
+    async fn make_worker_room(&mut self, subject: &str) {
+        let Some(limit) = self.budget.workers else {
+            return;
+        };
+
+        while self.budget_usage().workers > limit {
+            let fallback = self.node_mean_pss();
+            let Some((app, id)) =
+                self.oldest_retained_where(|_, running| running.usage(fallback).workers > 0)
+            else {
+                break;
+            };
+
+            self.stop_release(
+                &app,
+                &id,
+                &format!(
+                    "making room in the node's worker budget for {subject}, woken by a request"
+                ),
+            )
+            .await;
+        }
     }
 
     /// Section 7.4: the mean proportional set size of every worker that
@@ -7265,20 +7713,28 @@ impl Daemon {
     /// Section 9.1: the retained release created first, other than one
     /// of `except`'s application, which make way under memory pressure.
     fn oldest_retained(&self, except: Option<&str>) -> Option<(String, String)> {
+        self.oldest_retained_where(|app, _| except != Some(app))
+    }
+
+    /// The retained release created first of those `wanted` accepts,
+    /// given each one's application and state; one kept for inspection
+    /// goes before any rollback target.
+    fn oldest_retained_where(
+        &self,
+        wanted: impl Fn(&str, &Running) -> bool,
+    ) -> Option<(String, String)> {
         self.running
             .iter()
-            .filter(|((app, _), running)| {
-                running.retained_until.is_some() && except != Some(app.as_str())
-            })
-            .map(|((app, id), _)| {
+            .filter(|((app, _), running)| running.retained_until.is_some() && wanted(app, running))
+            .map(|((app, id), running)| {
                 let created = self
                     .store
                     .release(app, id)
                     .map_or(0, |release| release.created_unix_ms);
-                (created, app.clone(), id.clone())
+                (!running.inspected, created, app.clone(), id.clone())
             })
             .min()
-            .map(|(_, app, id)| (app, id))
+            .map(|(_, _, app, id)| (app, id))
     }
 
     /// Section 7.5: the capacity active overlays and schedules set, and
@@ -7849,6 +8305,10 @@ impl Daemon {
         };
         let current = record.current.clone();
 
+        if let Some(refusal) = crate::config::second_app_refusal(&self.store, app) {
+            return Err(refusal);
+        }
+
         self.start(app, &previous).await?;
         self.switch_to(app, &previous).await;
         self.store
@@ -7985,6 +8445,73 @@ impl Daemon {
         self.publish_servers();
     }
 
+    /// Section 8.7: what a release's processes start from, from the
+    /// daemon's own environment and whom they run as.
+    fn daemon_base(
+        &self,
+        bytecode: Option<muru_config::Bytecode>,
+        identity: Option<crate::host::Identity>,
+    ) -> Vec<(String, String)> {
+        let pass_env = self
+            .info
+            .pass_env
+            .read()
+            .expect("pass_env poisoned")
+            .clone();
+
+        crate::commands::passed_from_daemon(std::env::vars(), &pass_env, bytecode, identity)
+    }
+
+    /// A managed server's whole environment: its release's variables over
+    /// the clean base, with the release's interpreter first on PATH.
+    fn server_environment(
+        &self,
+        env: Vec<(String, String)>,
+        app: &str,
+        id: &str,
+        spec: &crate::model::ReleaseSpec,
+        identity: Option<crate::host::Identity>,
+    ) -> Vec<(String, String)> {
+        let base = self.daemon_base(None, identity);
+
+        crate::commands::environment(
+            env,
+            &crate::commands::Interpreter {
+                python: &spec.python,
+                runtime: None,
+                pycache: None,
+                bytecode: None,
+                base: Some(&base),
+            },
+            app,
+            id,
+            &spec.source,
+        )
+    }
+
+    /// Publish what runs for each release, for the release objects the
+    /// API answers with: after everything the daemon does, so a release
+    /// that stops leaves the map at once.
+    fn publish_live(&self) {
+        let live: HashMap<(String, String), LiveRelease> = self
+            .running
+            .iter()
+            .map(|(key, running)| {
+                (
+                    key.clone(),
+                    LiveRelease {
+                        host: running.backend.host().is_some(),
+                        announced: running.announced,
+                        workers: running.workers.clone(),
+                        retained_until_unix_ms: running.retained_until_unix_ms,
+                    },
+                )
+            })
+            .collect();
+
+        *self.info.live.lock().expect("live poisoned") = live;
+    }
+
     /// Publish each managed server release's instances, for `release
     /// show`: on every check, so a release that stops leaves the list
     /// within one.
@@ -8100,12 +8627,16 @@ impl Daemon {
                 sockets,
                 groups,
                 interfaces,
+                workers,
             } => {
                 self.info.interfaces.announce(app, id, interfaces);
 
                 let Some(running) = self.running.get_mut(&key) else {
                     return;
                 };
+
+                running.workers = workers;
+                running.announced = true;
 
                 // Section 7.4: the scalers were sized from the
                 // configuration when the release started, which may have
@@ -8358,17 +8889,32 @@ impl Daemon {
         self.shutdown.shuts_down()
     }
 
+    /// The longest exit grace among the releases with workers, for what a
+    /// shutdown's drain leaves of its budget (section 13.3).
+    fn largest_exit_grace(&self) -> Duration {
+        let largest = self
+            .running
+            .iter()
+            .filter(|(_, running)| running.backend.host().is_some())
+            .filter_map(|((app, id), _)| self.store.release(app, id).ok())
+            .map(|release| release.spec.timeouts.exit_grace_ms)
+            .max()
+            .unwrap_or(0);
+
+        Duration::from_millis(largest)
+    }
+
     /// Section 13.3: the edge's part of a shutdown. For the policy's
     /// delay it keeps accepting, with every connection closing after its
     /// response, then it stops accepting and the requests in flight
-    /// finish, within what the budget leaves after a moment for the
-    /// workers. The edge itself stays up for the WebSockets until it is
+    /// finish, within what the budget leaves for the workers' shutdown
+    /// work and a moment for the edge. The edge itself stays up for the WebSockets until it is
     /// stopped last.
     async fn drain_edge(&mut self, policy: &crate::shutdown::Policy, deadline: Instant) {
         let grace = deadline
             .saturating_duration_since(Instant::now())
             .saturating_sub(policy.delay)
-            .saturating_sub(crate::shutdown::WORKERS_RESERVE);
+            .saturating_sub(crate::shutdown::drain_reserve(self.largest_exit_grace()));
 
         match self.edge.drain(policy.delay, grace).await {
             Ok(true) => {}
@@ -8412,7 +8958,10 @@ impl Daemon {
             let run_dir = self.locations.run.path.join("apps").join(&app).join(&id);
             let record = running.backend.record_path(&run_dir);
             stopping.push(async move {
-                running.backend.stop_until(kill_at).await;
+                running
+                    .backend
+                    .stop_until(kill_at, crate::shutdown::workers_deadline(deadline))
+                    .await;
                 forget_release_dir(&run_dir, &record);
                 release
             });
@@ -8646,6 +9195,16 @@ impl Daemon {
             tracing::error!(%error, "recording a release state failed");
         }
     }
+}
+
+/// An instant ahead as Unix milliseconds, or 0 for none.
+fn unix_ms_of(instant: Option<Instant>) -> u64 {
+    instant.map_or(0, |instant| {
+        crate::model::now_unix_ms()
+            + instant
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64
+    })
 }
 
 /// A Unix time as HH:MM:SS, UTC.
@@ -9023,6 +9582,74 @@ fn step_message(steps: &[RolloutStep], step: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_group_that_may_scale_to_zero_retains_no_worker_by_default() {
+        let at_zero = crate::model::ScalingSpec {
+            mode: muru_config::ScalingMode::Spare,
+            min_workers: 0,
+            ..crate::model::ScalingSpec::default()
+        };
+        let floored = crate::model::ScalingSpec {
+            min_workers: 2,
+            ..at_zero.clone()
+        };
+
+        assert_eq!(retained_by_default(&at_zero), 0);
+        assert_eq!(retained_by_default(&floored), 1);
+        assert_eq!(
+            retained_by_default(&crate::model::ScalingSpec::default()),
+            1
+        );
+    }
+
+    #[test]
+    fn the_retained_note_says_what_a_rollback_costs() {
+        let kept = |counts: &[u32]| {
+            Kept::Workers(
+                counts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, count)| (format!("g{index}"), *count))
+                    .collect(),
+            )
+        };
+
+        assert_eq!(
+            kept(&[1, 1]).note("10:00 UTC"),
+            "warm until 10:00 UTC; a rollback to it is instant"
+        );
+        assert_eq!(
+            kept(&[0, 0]).note("10:00 UTC"),
+            "host kept until 10:00 UTC; a rollback to it forks a worker"
+        );
+        assert_eq!(
+            kept(&[1, 0]).note("10:00 UTC"),
+            "warm until 10:00 UTC; a rollback to it forks a worker for a group that kept none"
+        );
+        assert_eq!(
+            Kept::Idle.note("10:00 UTC"),
+            "idle until 10:00 UTC; a rollback to it waits for its import"
+        );
+        assert_eq!(
+            Kept::Instances.note("10:00 UTC"),
+            "warm until 10:00 UTC; a rollback to it is instant"
+        );
+
+        assert_eq!(
+            kept(&[1, 1]).event("30m"),
+            "kept warm for 30m with 1 worker per group"
+        );
+        assert_eq!(kept(&[0]).event("30m"), "kept for 30m with its host alone");
+        assert_eq!(
+            kept(&[1, 0]).event("30m"),
+            "kept for 30m with its host and 1 in g0, 0 in g1"
+        );
+        assert_eq!(
+            Kept::Idle.event("30m"),
+            "kept idle for 30m with its host stopped"
+        );
+    }
 
     #[test]
     fn the_clock_warning_is_raised_once_and_only_for_schedules() {

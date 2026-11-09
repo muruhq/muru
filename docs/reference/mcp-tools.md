@@ -16,7 +16,7 @@ ones it names.
 | `commands` | reads | `muructl command list` | `target` |
 | `events` | reads | `muructl events` | `after` (a sequence number) |
 | `logs` | reads | `muructl logs`, the lines returned as an array | `target`, `lines` (default 100, at most 1000), `access` |
-| `debug` | reads | `muructl debug status`, `stacks`, `tasks`, `memory` or `inspect` | `what`, `target`, `worker` |
+| `debug` | reads | `muructl debug status`, `stacks`, `tasks`, `memory` or `inspect`, never with `--env` | `what`, `target`, `worker` |
 | `scale_status` | reads | `muructl scale status` | `target` |
 | `config` | reads | `muructl config show` or `config diff` | `action` (show, diff), `app`, `effective`, `file` |
 | `metrics` | reads | `muructl metrics`, the samples kept to those whose name starts with `prefix` | `prefix` |

@@ -49,6 +49,7 @@ spec:
           readinessProbe:
             httpGet: {path: /readyz, port: admin}
             periodSeconds: 2
+            failureThreshold: 1
           resources:
             requests: {cpu: "1", memory: 512Mi}
             limits: {cpu: "2", memory: 1Gi}
@@ -96,9 +97,19 @@ The pieces, in turn:
   endpoints and the ingress stop sending to it, closing each connection
   after its response. Then the requests in flight finish and the
   container exits, all within `MURU_SERVE_SHUTDOWN_BUDGET`, which is set
-  under `terminationGracePeriodSeconds`. A rolling update loses no
+  under `terminationGracePeriodSeconds` and has to cover the delay, the
+  requests, the workers' `exit_grace` (2 seconds by default) and a second
+  for the edge. A rolling update loses no
   requests and needs no `preStop` hook; [stopping](containers.md#stopping)
   covers the sequence.
+- **Restarts in place.** A container restarted in place, by a resize, a
+  failed liveness probe or anything else, keeps its pod, so its endpoint
+  is not marked terminating and leaves the Service only once the
+  readiness probe has failed `failureThreshold` times. Keep
+  `MURU_SERVE_SHUTDOWN_DELAY` longer than `periodSeconds` times
+  `failureThreshold` of the readiness probe, here 5 seconds against 2.
+  Muru answers `/readyz` itself rather than through a worker, so a
+  `failureThreshold` of 1 does not take a busy pod out of the Service.
 - **The proxy in front.** The ingress controller's connections come from
   pod addresses, so `MURU_SERVE_TRUSTED_PROXY=private` applies its
   `Forwarded` and `X-Forwarded-*` headers. Name its range instead to
@@ -144,7 +155,9 @@ limits:
 `restartPolicy: RestartContainer` in the `resizePolicy` has the kubelet
 restart the container when the limit changes. The restart is an ordinary
 stop: readiness fails, the requests in flight finish, and the new
-container sizes itself from the new limits. The pod stays where it is,
+container sizes itself from the new limits. With the readiness probe
+above no request is lost, as described under
+[restarts in place](#the-deployment). The pod stays where it is,
 on the same node with the same address.
 
 A VerticalPodAutoscaler in its `Recreate` mode evicts the pod and

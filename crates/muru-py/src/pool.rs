@@ -35,6 +35,19 @@ pub struct Interrupted {
     pub place: Option<String>,
 }
 
+/// A request in flight past the edge's deadline for it (section 7.6),
+/// which the host makes an event.
+pub struct PastDeadline {
+    /// The request identifier.
+    pub request_id: String,
+    /// The method.
+    pub method: String,
+    /// The path and query.
+    pub path: String,
+    /// How long the worker has had it, in milliseconds.
+    pub age_ms: u64,
+}
+
 /// The innermost frames of a thread as `file line N in function`,
 /// innermost first, read without opening source files.
 fn thread_place(py: Python<'_>, thread: u64) -> Option<String> {
@@ -82,6 +95,9 @@ pub struct RequestInfo {
     pub method: String,
     /// The path, as received.
     pub path: String,
+    /// When the edge gives up on it, in milliseconds since the epoch;
+    /// 0 for none.
+    pub deadline_unix_ms: u64,
     /// The Python thread serving it, once one has picked it up.
     pub thread: Option<u64>,
     /// That thread's native identifier, for a reader from outside.
@@ -527,14 +543,26 @@ impl Shared {
             })
     }
 
-    /// Stop the shared pool and the mounts' own, letting their queued
-    /// requests finish. Called with the interpreter detached.
-    pub fn shutdown_pools(&self) {
-        self.pool.shutdown();
+    /// Close the shared pool and the mounts' own: they take no new job and
+    /// finish those queued.
+    pub fn close_pools(&self) {
+        self.pool.close();
 
         for mount in self.mounts.values() {
             if let Some(pool) = &mount.pool {
-                pool.shutdown();
+                pool.close();
+            }
+        }
+    }
+
+    /// Wait for the pools' threads to end, until `deadline`. A thread still
+    /// running a request then is left to end with the process.
+    pub fn join_pools(&self, deadline: Instant) {
+        self.pool.join(deadline);
+
+        for mount in self.mounts.values() {
+            if let Some(pool) = &mount.pool {
+                pool.join(deadline);
             }
         }
     }
@@ -559,6 +587,7 @@ impl Shared {
                     started: Instant::now(),
                     request_id: head.request_id.clone(),
                     method: head.method.clone(),
+                    deadline_unix_ms: head.deadline_unix_ms,
                     path: if head.query.is_empty() {
                         String::from_utf8_lossy(&head.raw_path).into_owned()
                     } else {
@@ -1053,6 +1082,41 @@ impl Shared {
             .unwrap_or(0)
     }
 
+    /// The requests in flight past their deadline, at most `limit`, the
+    /// oldest first (section 7.6). The edge has answered each with a 504
+    /// and the code serving it goes on, so the host raises an event for
+    /// each. Streaming responses and WebSockets, which the deadline no
+    /// longer bounds once their response has started, are left out.
+    pub fn past_deadline(&self, limit: usize) -> Vec<PastDeadline> {
+        let now = Instant::now();
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+
+        let mut overdue: Vec<PastDeadline> = self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .values()
+            .filter(|info| {
+                !info.exempt
+                    && !info.websocket
+                    && info.deadline_unix_ms != 0
+                    && now_unix_ms >= info.deadline_unix_ms
+            })
+            .map(|info| PastDeadline {
+                request_id: info.request_id.clone(),
+                method: info.method.clone(),
+                path: info.path.clone(),
+                age_ms: now.saturating_duration_since(info.started).as_millis() as u64,
+            })
+            .collect();
+
+        overdue.sort_by_key(|request| std::cmp::Reverse(request.age_ms));
+        overdue.truncate(limit);
+        overdue
+    }
+
     /// What each side of the worker holds now (section 11.7): the
     /// application threads, when requests run on them, and the event
     /// loop, when there is one. A request holds a thread from the moment
@@ -1292,15 +1356,26 @@ impl Pool {
         }
     }
 
-    /// Stop accepting jobs, let the queued ones finish, and join the threads.
-    /// Must be called with the interpreter detached, since the threads need
-    /// it to finish their work.
-    pub fn shutdown(&self) {
+    /// Stop accepting jobs; the queued ones finish and the threads end.
+    pub fn close(&self) {
         self.sender.lock().expect("pool sender poisoned").take();
+    }
+
+    /// Wait for the closed pool's threads to end, until `deadline`. Must be
+    /// called with the interpreter detached, since the threads need it to
+    /// finish their work.
+    pub fn join(&self, deadline: Instant) {
         let handles = std::mem::take(&mut *self.handles.lock().expect("pool handles poisoned"));
 
+        while !handles.iter().all(std::thread::JoinHandle::is_finished) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         for handle in handles {
-            let _ = handle.join();
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
     }
 }

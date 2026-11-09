@@ -188,6 +188,7 @@ def test_groups_under_the_daemon_from_the_table_and_the_file(
     # A declared release's groups replace the table's, and resolve their
     # sizes from the release where silent; the export writes them whole.
 
+    daemon.muructl("drain", "grouped@r1")
     config = tmp_path / "shop.toml"
     config.write_text(
         f"""[app.shop.release.r1]
@@ -246,7 +247,8 @@ memory = {{ hard_limit = "1GB" }}
 def test_an_optional_group_that_cannot_start_leaves_the_release_ready(daemon: Daemon) -> None:
     # ADR 0033: the batch group's worker fails in post_fork, three times,
     # and is given up; the release is ready on the other groups' workers
-    # and the batch paths wait for a worker until the queue timeout.
+    # and the batch paths wait for a worker until the queue timeout, then
+    # are told no worker had started.
 
     deployed = daemon.deploy("grouped", GROUPED, "--env", "MURU_FAIL_GROUP=batch")
     assert deployed == "muru: release grouped@r1 is ready and serving"
@@ -255,7 +257,9 @@ def test_an_optional_group_that_cannot_start_leaves_the_release_ready(daemon: Da
 
     held = daemon.request("/batch/nightly", headers={"Accept": "application/json"})
     assert held.status == 503, held.body
-    assert json.loads(held.body)["reason"] == "queue_full"
+    problem = json.loads(held.body)
+    assert problem["reason"] == "cold_start_timeout", problem
+    assert problem["detail"].startswith("No worker had started"), problem
 
     events = daemon.muructl("events").stdout
     assert "7 workers ready in" in events and "without the optional group batch" in events, events

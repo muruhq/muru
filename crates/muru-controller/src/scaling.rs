@@ -168,6 +168,11 @@ pub struct WorkerSignals {
     /// The share of a worker's wall time spent in garbage collection,
     /// averaged over the workers (section 11.1).
     pub gc_share: Option<f64>,
+    /// The objects a young collection freed, on average over the
+    /// workers' young collections (generations 0 and 1, or every
+    /// collection of a collector that takes the whole heap); none
+    /// without any. Many means short-lived reference cycles.
+    pub gc_freed_per_young: Option<f64>,
 }
 
 impl WorkerSignals {
@@ -187,6 +192,7 @@ impl WorkerSignals {
         let mut loop_lag = Vec::new();
         let mut handoff_wait = Vec::new();
         let mut gc = Vec::new();
+        let mut young = (0u64, 0u64);
         let wall_ms = elapsed.as_millis() as f64;
 
         for worker in after.iter().filter(|worker| worker.group == group) {
@@ -226,6 +232,26 @@ impl WorkerSignals {
                 let spent = nanos(worker).saturating_sub(nanos(earlier)) as f64;
                 gc.push(spent / 1_000_000.0 / wall_ms);
             }
+
+            // The young collections since the earlier report, and the
+            // objects they freed.
+
+            for generation in worker
+                .gc
+                .iter()
+                .filter(|generation| matches!(generation.generation.as_str(), "0" | "1" | "full"))
+            {
+                let Some(then) = earlier
+                    .gc
+                    .iter()
+                    .find(|then| then.generation == generation.generation)
+                else {
+                    continue;
+                };
+
+                young.0 += generation.collections.saturating_sub(then.collections);
+                young.1 += generation.collected.saturating_sub(then.collected);
+            }
         }
 
         Self {
@@ -235,6 +261,7 @@ impl WorkerSignals {
             loop_lag_p95_ms: p95_ms(&loop_lag),
             handoff_queue_wait_p95_ms: p95_ms(&handoff_wait),
             gc_share: mean(&gc),
+            gc_freed_per_young: (young.0 > 0).then(|| young.1 as f64 / young.0 as f64),
         }
     }
 }
@@ -259,7 +286,7 @@ fn add_growth(sum: &mut Vec<u64>, now: &[u64], then: &[u64]) {
 
 /// The 95th percentile of a histogram over the signal bounds, in
 /// milliseconds: the bound of the first count holding 95 percent of all,
-/// the last bound for what lies beyond it, or none without observations.
+/// infinity for what lies beyond the last, or none without observations.
 fn p95_ms(counts: &[u64]) -> Option<f64> {
     let bounds = muru_proto::worker::v1::SIGNAL_BOUNDS_US;
     let total = *counts.last()?;
@@ -270,8 +297,47 @@ fn p95_ms(counts: &[u64]) -> Option<f64> {
 
     let target = total as f64 * 0.95;
     let index = counts.iter().position(|count| *count as f64 >= target)?;
-    let bound = bounds.get(index).or(bounds.last())?;
-    Some(*bound as f64 / 1000.0)
+    Some(
+        bounds
+            .get(index)
+            .map_or(f64::INFINITY, |bound| *bound as f64 / 1000.0),
+    )
+}
+
+/// The largest of the signal bounds, in milliseconds.
+pub const SIGNAL_LARGEST_MS: f64 = muru_proto::worker::v1::SIGNAL_BOUNDS_US
+    [muru_proto::worker::v1::SIGNAL_BOUNDS_US.len() - 1] as f64
+    / 1000.0;
+
+/// The largest bound of the edge's queue wait histogram, in milliseconds.
+pub const QUEUE_LARGEST_MS: f64 = muru_edge::metrics::LARGEST_BUCKET_SECONDS * 1000.0;
+
+/// A 95th percentile read from a histogram, in words. It is the upper
+/// bound of the bucket it fell in, not a measurement, so it reads as
+/// `under 250 ms`, or as `over 5 s` past the largest bound.
+pub fn describe_p95(ms: f64, largest_ms: f64) -> String {
+    if ms.is_infinite() || ms > largest_ms {
+        format!("over {}", describe_ms(largest_ms))
+    } else {
+        format!("under {}", describe_ms(ms))
+    }
+}
+
+/// Milliseconds in words: `0.5 ms`, `250 ms`, `2.5 s`.
+fn describe_ms(ms: f64) -> String {
+    if ms >= 1000.0 {
+        format!("{} s", ms / 1000.0)
+    } else {
+        format!("{ms} ms")
+    }
+}
+
+/// A worker's CPU share as a percentage. The figure counts every thread
+/// of the process, the ones running C code that released the GIL and
+/// Muru's own among them, so it can pass what a worker can use; it is
+/// shown as at most 100%.
+pub fn describe_cpu(share: f64) -> String {
+    format!("{:.0}%", share.min(1.0) * 100.0)
 }
 
 /// Section 7.3: what holds a group back, and what would help the next
@@ -279,13 +345,19 @@ fn p95_ms(counts: &[u64]) -> Option<f64> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnosis {
     /// The bottleneck: cpu, gil, io, heavy, loop, handoff, memory, gc,
-    /// idle or none.
+    /// idle, none, or waiting before the workers' first report.
     pub bottleneck: &'static str,
     /// The bottleneck in words.
     pub summary: &'static str,
     /// The tuning it suggests, when any.
     pub advice: &'static str,
 }
+
+/// The objects a young collection frees, on average, from which the
+/// garbage it collects is taken to be short-lived reference cycles.
+/// Measured on CPython 3.15: about 2000 for a page that makes cycles,
+/// none for one that keeps a cache of long-lived objects.
+const GC_CYCLES_FREED: f64 = 100.0;
 
 /// Classify a group's bottleneck. `utilization` is busy slots over all,
 /// and `memory_near_limit` whether its workers are within 10 percent of
@@ -317,7 +389,19 @@ pub fn diagnose(
     // as GIL wait and loop lag too; it is named first when it is a tenth
     // of the workers' time or more.
 
+    // Young collections that each free many objects are clearing
+    // short-lived reference cycles; time collecting that frees few is
+    // spent going over long-lived objects.
+
     if signals.gc_share.unwrap_or(0.0) >= 0.1 {
+        if signals.gc_freed_per_young.unwrap_or(0.0) >= GC_CYCLES_FREED {
+            return diagnosis(
+                "gc",
+                "paused by garbage collection of short-lived reference cycles",
+                "break the cycles, or use weakref for the references back",
+            );
+        }
+
         return diagnosis(
             "gc",
             "paused by garbage collection",
@@ -354,6 +438,13 @@ pub fn diagnose(
             "requests handed to WSGI wait for a thread",
             "more threads for the requests handed over, or a mount for the paths that are",
         );
+    }
+
+    // Busy slots alone do not say whether the workers wait on I/O or
+    // on the CPU, and the workers have not reported a CPU figure yet.
+
+    if utilization >= 0.8 && signals.worker_cpu.is_none() {
+        return diagnosis("waiting", "waiting for the workers' first report", "");
     }
 
     if utilization >= 0.8 {
@@ -948,10 +1039,10 @@ impl Scaler {
             ScalingMode::Spare => (
                 idle < self.spec.min_spare as f64,
                 if idle < 0.0 {
-                    format!("short by {:.1} workers", -idle)
+                    format!("short by {:.2} workers", -idle)
                 } else {
                     format!(
-                        "{idle:.1} idle workers, under min_spare {}",
+                        "{idle:.2} idle workers, under min_spare {}",
                         self.spec.min_spare
                     )
                 },
@@ -976,8 +1067,8 @@ impl Scaler {
                     (
                         true,
                         format!(
-                            "queue wait p95 {:.0} ms, over the target of {} ms",
-                            self.queue_wait_p95_ms.unwrap_or(0.0),
+                            "queue wait p95 {}, over the target of {} ms",
+                            describe_p95(self.queue_wait_p95_ms.unwrap_or(0.0), QUEUE_LARGEST_MS),
                             self.spec.queue_wait_p95_ms.unwrap_or(0)
                         ),
                     )
@@ -1120,7 +1211,7 @@ impl Scaler {
                 if let Some(least) = least_idle.filter(|least| *least > self.spec.max_spare as f64)
                 {
                     format!(
-                        "at least {least:.1} idle workers over the last {}, over max_spare {}",
+                        "at least {least:.2} idle workers over the last {}, over max_spare {}",
                         muru_config::format_duration(window),
                         self.spec.max_spare
                     )
@@ -1696,7 +1787,7 @@ mod tests {
 
         match decision {
             Some(Decision::ScaleOut { to: 3, reason }) => {
-                assert!(reason.contains("queue wait p95 250 ms"), "{reason}");
+                assert!(reason.contains("queue wait p95 under 250 ms"), "{reason}");
             }
             other => panic!("{other:?}"),
         }
@@ -1832,7 +1923,10 @@ mod tests {
 
     #[test]
     fn the_diagnosis_names_the_bottleneck() {
-        let quiet = WorkerSignals::default();
+        let quiet = WorkerSignals {
+            worker_cpu: Some(0.2),
+            ..WorkerSignals::default()
+        };
         let busy_cpu = WorkerSignals {
             worker_cpu: Some(0.95),
             ..WorkerSignals::default()
@@ -1893,5 +1987,108 @@ mod tests {
                 .advice
                 .contains("more threads")
         );
+    }
+
+    #[test]
+    fn busy_slots_without_a_cpu_figure_wait_for_the_first_report() {
+        // Issue #466: before the workers' first report there is no CPU
+        // figure, and busy slots alone could be I/O or CPU.
+
+        let unmeasured = WorkerSignals::default();
+        let diagnosis = diagnose(0.9, None, &unmeasured, false);
+        assert_eq!(diagnosis.bottleneck, "waiting");
+        assert_eq!(diagnosis.summary, "waiting for the workers' first report");
+        assert_eq!(diagnosis.advice, "");
+
+        // With few slots busy the figure is not needed.
+
+        assert_eq!(diagnose(0.05, None, &unmeasured, false).bottleneck, "idle");
+    }
+
+    #[test]
+    fn garbage_collection_of_reference_cycles_is_told_apart() {
+        // Issue #466: young collections that free many objects are
+        // clearing reference cycles; ones that free few are going over
+        // long-lived objects.
+
+        let cycles = WorkerSignals {
+            worker_cpu: Some(0.9),
+            gc_share: Some(0.7),
+            gc_freed_per_young: Some(2000.0),
+            ..WorkerSignals::default()
+        };
+        let long_lived = WorkerSignals {
+            gc_freed_per_young: Some(0.0),
+            ..cycles.clone()
+        };
+
+        let diagnosis = diagnose(0.9, None, &cycles, false);
+        assert_eq!(diagnosis.bottleneck, "gc");
+        assert!(
+            diagnosis.summary.contains("reference cycles"),
+            "{diagnosis:?}"
+        );
+        assert!(diagnosis.advice.contains("weakref"), "{diagnosis:?}");
+        let diagnosis = diagnose(0.9, None, &long_lived, false);
+        assert_eq!(diagnosis.summary, "paused by garbage collection");
+        assert!(diagnosis.advice.contains("gc.freeze()"), "{diagnosis:?}");
+    }
+
+    #[test]
+    fn the_objects_young_collections_free_are_averaged_over_them() {
+        let zeros = vec![0; 11];
+        let generation = |name: &str, collections: u64, collected: u64| crate::host::GcGeneration {
+            generation: name.to_owned(),
+            collections,
+            nanos: 0,
+            collected,
+            busy: 0,
+            waited: 0,
+            idle: Vec::new(),
+            idle_us: 0,
+            busy_pauses: Vec::new(),
+            busy_us: 0,
+        };
+        let mut before = worker(1, 0, zeros.clone(), true);
+        before.gc = vec![
+            generation("0", 10, 100),
+            generation("1", 1, 0),
+            generation("2", 0, 0),
+        ];
+        let mut after = worker(1, 0, zeros, true);
+        after.gc = vec![
+            generation("0", 100, 180_100),
+            generation("1", 11, 20_000),
+            generation("2", 2, 7),
+        ];
+
+        // 100 young collections freed 200,000 objects; the full
+        // collections are left out.
+
+        let signals =
+            WorkerSignals::between(&[before], &[after], "default", Duration::from_secs(10), 4);
+        assert_eq!(signals.gc_freed_per_young, Some(2000.0));
+    }
+
+    #[test]
+    fn a_percentile_reads_as_the_bound_of_its_bucket() {
+        assert_eq!(describe_p95(250.0, QUEUE_LARGEST_MS), "under 250 ms");
+        assert_eq!(describe_p95(2500.0, QUEUE_LARGEST_MS), "under 2.5 s");
+        assert_eq!(describe_p95(0.5, SIGNAL_LARGEST_MS), "under 0.5 ms");
+        assert_eq!(describe_p95(f64::INFINITY, SIGNAL_LARGEST_MS), "over 5 s");
+        assert_eq!(describe_p95(f64::INFINITY, QUEUE_LARGEST_MS), "over 10 s");
+
+        // Past the last of the signal bounds is infinity, which the
+        // diagnosis still counts as over every threshold.
+
+        let mut counts = vec![0; 11];
+        counts[10] = 20;
+        assert_eq!(p95_ms(&counts), Some(f64::INFINITY));
+    }
+
+    #[test]
+    fn a_cpu_share_is_shown_as_at_most_all_of_a_worker() {
+        assert_eq!(describe_cpu(0.42), "42%");
+        assert_eq!(describe_cpu(1.01), "100%");
     }
 }

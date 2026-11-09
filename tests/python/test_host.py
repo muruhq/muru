@@ -110,6 +110,7 @@ def test_workers_message_lists_the_routed_sockets_by_group(tmp_path: Path) -> No
         "sockets": ["/a"],
         "groups": [{"name": "api", "sockets": ["/api-0"]}],
         "interfaces": {},
+        "workers": [],
     }
 
     # The interfaces the host settled go with it, the default mount's
@@ -186,6 +187,240 @@ def test_a_restart_is_refused_for_a_worker_the_host_cannot_replace(tmp_path: Pat
 
     instance.take_request({"id": 2, "op": "restart", "worker": 3, "args": {"force": True}})
     assert answers[-1]["error"] == "no worker 3"
+
+
+def test_a_request_past_its_deadline_is_one_event_until_it_ends(tmp_path: Path) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1)
+    sent: list[dict[str, object]] = []
+    instance.send_to_supervisor = sent.append  # type: ignore[method-assign]
+    state = host.WorkerState(0, 4242, 0, "w0.sock", time.monotonic(), -1)
+    request = {"request_id": "r-1", "method": "GET", "path": "/hang", "age_ms": 300100}
+
+    # Reported with every report while it lasts, it is raised once.
+
+    for _ in range(3):
+        instance.saw_past_deadline(state, request)
+        instance.raise_past_deadline(state, time.monotonic())
+
+    events = [message for message in sent if message.get("kind") == "request.past_deadline"]
+    assert len(events) == 1
+    assert "request r-1 GET /hang is past its deadline, 300.1 s" in str(events[0]["message"])
+
+    # Once the worker stops reporting it, it is forgotten.
+
+    later = (
+        time.monotonic() + (host.PAST_DEADLINE_FORGET_REPORTS + 1) * host.REPORT_INTERVAL_SECONDS
+    )
+    instance.raise_past_deadline(state, later)
+    assert state.past_deadline == {}
+
+
+def replacing_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spawned: int = 5001
+) -> tuple[host.Host, host.WorkerState, list[dict[str, Any]], list[host.Pending]]:
+    """A host with one worker, nothing forked, and every ask held for the test to answer."""
+
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1)
+    sent: list[dict[str, Any]] = []
+    asked: list[host.Pending] = []
+
+    def ask(
+        state: host.WorkerState, op: str, args: dict[str, Any], timeout: float, then: Any
+    ) -> None:
+        asked.append(host.Pending(0, op, {state.pid: state.index}, then=then))
+
+    state = host.WorkerState(0, 4242, 0, "w0.sock", time.monotonic(), -1)
+    instance.states[state.pid] = state
+    instance.workers[state.pid] = state.index
+    monkeypatch.setattr(_outside, "WHOLE", False)
+    instance.control_listener = object()  # type: ignore[assignment]
+    instance.send_to_supervisor = sent.append  # type: ignore[method-assign]
+    instance.ask = ask  # type: ignore[method-assign]
+    instance.spawn = lambda index, replacing=False: spawned  # type: ignore[method-assign]
+    return instance, state, sent, asked
+
+
+def exits(monkeypatch: pytest.MonkeyPatch, *statuses: tuple[int, int]) -> None:
+    """Have os.waitpid report these (pid, status) pairs, then nothing."""
+
+    waiting = list(statuses)
+    monkeypatch.setattr(os, "waitpid", lambda _pid, _flags: waiting.pop(0) if waiting else (0, 0))
+
+
+def test_a_timeout_kill_is_reported_at_the_decision_and_not_again_at_the_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    instance, state, sent, asked = replacing_host(tmp_path, monkeypatch)
+    instance.replace(state, "a request ran too long", "worker.timeout_killed", "hard_timeout")
+
+    # Waiting only for the stacks, at most a second, not the drain grace.
+
+    assert not [message for message in sent if message.get("type") == "event"]
+    stacks = next(pending for pending in asked if pending.op == "stacks")
+    stacks.answers[4242] = {
+        "ok": True,
+        "result": {
+            "threads": [
+                {
+                    "name": "t",
+                    "request": {"elapsed_ms": 9},
+                    "frames": [{"file": "/srv/app.py", "line": 13, "function": "application"}],
+                }
+            ]
+        },
+    }
+    assert stacks.then is not None
+    stacks.then(stacks)
+    (event,) = [message for message in sent if message.get("type") == "event"]
+    assert event["kind"] == "worker.timeout_killed"
+    assert event["reason"] == "hard_timeout"
+    assert event["message"] == (
+        "worker 0 (pid 4242) replaced by pid 5001: a request ran too long; "
+        "at app.py line 13 in application"
+    )
+
+    # The old worker going is a line in the log and no second event.
+
+    exits(monkeypatch, (4242, 0))
+    instance.reap()
+    assert len([message for message in sent if message.get("type") == "event"]) == 1
+    assert "worker 0 (pid 4242) exited after its drain grace" in capsys.readouterr().err
+
+
+def kinds(sent: list[dict[str, Any]]) -> list[object]:
+    return [message["kind"] for message in sent if message.get("type") == "event"]
+
+
+def test_each_kill_for_memory_is_one_oom_killed_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = tmp_path / "memory.events"
+    events.write_text("oom 0\noom_kill 0\n")
+    instance, _state, sent, _asked = replacing_host(tmp_path, monkeypatch)
+    instance.cgroup = str(tmp_path)
+    instance.oom_kills = 0
+    instance.workers[4243] = 0
+
+    # Two workers killed together: the first reaped sees the count at 2.
+
+    events.write_text("oom 2\noom_kill 2\n")
+    exits(monkeypatch, (4242, signal.SIGKILL), (4243, signal.SIGKILL))
+    instance.reap()
+    assert kinds(sent) == ["worker.oom_killed", "worker.oom_killed"]
+    assert instance.oom_kills == 2
+
+    # With every kill put down to a worker, a SIGKILL is someone else's.
+
+    instance.workers[4244] = 0
+    exits(monkeypatch, (4244, signal.SIGKILL))
+    instance.reap()
+    assert kinds(sent)[-1] == "worker.exited"
+
+
+def test_a_kill_for_memory_during_a_replacement_is_counted_and_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = tmp_path / "memory.events"
+    events.write_text("oom_kill 0\n")
+    instance, state, sent, _asked = replacing_host(tmp_path, monkeypatch)
+    instance.cgroup = str(tmp_path)
+    instance.oom_kills = 0
+
+    # The kernel takes the condemned worker: not a recycle, and the kill
+    # is used up, so it cannot be put on a later exit.
+
+    instance.replace(state, "over the limit", "worker.recycled", "memory")
+    events.write_text("oom_kill 1\n")
+    exits(monkeypatch, (4242, signal.SIGKILL))
+    instance.reap()
+    assert kinds(sent) == ["worker.oom_killed"]
+    assert sent[-1]["reason"] == "oom_killed"
+    assert instance.oom_kills == 1
+
+    # A SIGKILL the host sent itself, past the stop budget, leaves a kill
+    # the cgroup counted for the exit it belongs to.
+
+    state = host.WorkerState(0, 4300, 0, "w0.sock", time.monotonic(), -1)
+    instance.states[4300] = state
+    instance.workers[4300] = 0
+    instance.replace(state, "served its share", "worker.recycled", "max_requests")
+    instance.replacing[0].killed = True
+    events.write_text("oom_kill 2\n")
+    exits(monkeypatch, (4300, signal.SIGKILL))
+    instance.reap()
+    assert kinds(sent)[-1] == "worker.recycled"
+    assert instance.oom_kills == 1
+
+
+def container_memory(cgroup: Path, used: int, inactive: int = 0, limit: int = 1000) -> None:
+    (cgroup / "memory.max").write_text(f"{limit}\n")
+    (cgroup / "memory.current").write_text(f"{used}\n")
+    (cgroup / "memory.stat").write_text(f"anon 1\ninactive_file {inactive}\n")
+
+
+def test_memory_left_counts_reclaimable_file_pages_and_needs_a_limit(tmp_path: Path) -> None:
+    assert host.memory_left(None) is None
+    container_memory(tmp_path, used=800, inactive=300)
+    assert host.memory_left(str(tmp_path)) == 500
+    (tmp_path / "memory.max").write_text("max\n")
+    assert host.memory_left(str(tmp_path)) is None
+
+
+def test_a_worker_short_of_room_stops_before_its_replacement_is_forked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "memory.events").write_text("oom_kill 0\n")
+    container_memory(tmp_path, used=800, limit=1000)
+    instance, state, sent, _asked = replacing_host(tmp_path, monkeypatch)
+    forked: list[int] = []
+
+    def spawn(index: int, replacing: bool = False) -> int:
+        assert replacing
+        forked.append(index)
+        return 5001
+
+    instance.cgroup = str(tmp_path)
+    instance.memory.hard_limit = 300
+    instance.spawn = spawn  # type: ignore[method-assign]
+    instance.routed[0] = state.path
+
+    # It leaves routing and nothing is forked while it holds its memory.
+
+    instance.replace(state, "uss is over the hard limit", "worker.recycled", "memory", hard=True)
+    replacement = instance.replacing[0]
+    assert forked == [] and replacement.stop_first and replacement.terminate_at is None
+    assert instance.routed[0] is None and replacement.announced is not None
+
+    # Told to stop once the edge has moved off it, then replaced on exit.
+
+    instance.acked = replacement.announced
+    instance.advance(replacement, time.monotonic())
+    assert replacement.terminate_at is not None and not replacement.terminated
+    exits(monkeypatch, (4242, 0))
+    instance.reap()
+    assert forked == [0] and 0 in instance.starting
+    (event,) = [message for message in sent if message.get("kind") == "worker.recycled"]
+    assert "replaced by pid 5001" in str(event["message"])
+
+
+def test_a_worker_with_room_or_condemned_for_something_else_is_replaced_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container_memory(tmp_path, used=200, limit=1000)
+    instance, state, _sent, _asked = replacing_host(tmp_path, monkeypatch)
+    instance.cgroup = str(tmp_path)
+    instance.memory.hard_limit = 300
+
+    instance.replace(state, "over the limit", "worker.recycled", "memory")
+    assert not instance.replacing[0].stop_first and instance.replacing[0].new_pid == 5001
+
+    container_memory(tmp_path, used=900, limit=1000)
+    instance.replacing.clear()
+    state.replaced = False
+    instance.replace(state, "served its share", "worker.recycled", "max_requests")
+    assert not instance.replacing[0].stop_first and instance.replacing[0].new_pid == 5001
 
 
 def test_arguments_are_checked_against_the_interface(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -361,3 +596,32 @@ def test_a_worker_that_does_not_answer_for_stacks_is_read_from_outside_on_3_14(
     else:
         assert answer["ok"] and answer["result"]["outside"]
         assert answer["result"]["threads"][0]["frames"][0]["function"] == "application"
+
+
+def test_a_shutdown_with_a_budget_of_its_own_leaves_the_workers_less_time(
+    tmp_path: Path,
+) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(
+        release, str(tmp_path), workers=1, threads=1, shutdown_timeout=5.0, exit_grace=2.0
+    )
+
+    # No file: the worker's own stop budget.
+
+    assert instance.time_to_stop() == 7.0
+
+    # What the shutdown leaves is less than the budget and comes off it,
+    # more than the budget is no reason to take longer.
+
+    stop_by = tmp_path / host.STOP_BY_FILE
+    stop_by.write_text(str(int((time.time() + 3.0) * 1000)))
+    assert 2.5 < instance.time_to_stop() <= 3.0
+    stop_by.write_text(str(int((time.time() + 60.0) * 1000)))
+    assert instance.time_to_stop() == 7.0
+
+    # Past already, or unreadable.
+
+    stop_by.write_text(str(int((time.time() - 1.0) * 1000)))
+    assert instance.time_to_stop() == 0.0
+    stop_by.write_text("not a time")
+    assert instance.time_to_stop() == 7.0

@@ -151,7 +151,7 @@ def test_the_delay_closes_connections_while_the_edge_still_accepts(tmp_path: Pat
 
 def test_what_outruns_the_budget_is_killed(tmp_path: Path) -> None:
     daemon = start_daemon(
-        tmp_path, config_extra="[shutdown]\non_sigterm = 'shutdown'\nbudget = '3s'\n"
+        tmp_path, config_extra="[shutdown]\non_sigterm = 'shutdown'\nbudget = '4s'\n"
     )
 
     try:
@@ -159,14 +159,16 @@ def test_what_outruns_the_budget_is_killed(tmp_path: Path) -> None:
         thread, outcome = request_in_the_background(daemon, "/slow?ms=30000")
         time.sleep(0.5)
 
-        # The request cannot finish in time; the daemon still exits
-        # cleanly at the budget, and nothing is left running.
+        # The request cannot finish in time. The edge waits for it until
+        # the workers' exit grace and the edge's second are what is left of
+        # the budget, the worker gives up on it at once to keep that exit
+        # grace, and the daemon exits cleanly with nothing left running.
 
         started = time.monotonic()
         daemon.process.send_signal(signal.SIGTERM)
         assert daemon.process.wait(timeout=30) == 0
         elapsed = time.monotonic() - started
-        assert 2.5 < elapsed < 6, elapsed
+        assert 0.8 < elapsed < 4, elapsed
         thread.join(timeout=10)
         assert outcome and outcome != ["status 200"], outcome
         assert "still in flight" in daemon.log()

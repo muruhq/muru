@@ -219,6 +219,29 @@ impl SocketArgs {
             .map(|run| run.socket)
     }
 
+    /// The socket a command would connect to as a phrase: the daemon's,
+    /// a development run's, or another named by its path.
+    pub fn describe(&self) -> String {
+        let socket = match self.socket() {
+            Ok(socket) => socket,
+            Err(error) => return format!("no admin socket yet ({error})"),
+        };
+
+        let locations = self.locations.resolve();
+
+        if socket == locations.admin_socket() {
+            return format!("the daemon at {}", socket.display());
+        }
+
+        match crate::run_admin::runs(&locations.run.path)
+            .iter()
+            .find(|run| run.socket == socket)
+        {
+            Some(run) => format!("the development run of {} at {}", run.app, socket.display()),
+            None => format!("the admin socket at {}", socket.display()),
+        }
+    }
+
     /// The socket to connect to (design specification section 13.8): as
     /// given, else a muructl serve's in its run directory, else a
     /// development run's from this project, else the daemon's when it
@@ -237,47 +260,80 @@ impl SocketArgs {
         );
         let serve_socket = serve_dir.join(crate::serve::ADMIN_SOCKET);
 
-        if serve_dir.join("serve.json").is_file() && serve_socket.exists() {
+        let serve_file = serve_dir.join("serve.json");
+
+        if serve_file.is_file() && serve_socket.exists() {
             return Ok(serve_socket);
         }
 
+        // A run directory this user may not enter is not the same as none:
+        // discovery carries on past it, and comes back to it only if it
+        // finds nothing else, so that `connect` can say what was denied.
+
+        let denied = may_not_enter(&serve_file).then_some(serve_socket);
+
         let locations = self.locations.resolve();
         let daemon = locations.admin_socket();
+        let daemon_listening = daemon.exists();
         let runs = crate::run_admin::runs(&locations.run.path);
         let here = std::env::current_dir()
             .and_then(|directory| directory.canonicalize())
             .ok();
 
-        if let Some(run) = runs
-            .iter()
-            .find(|run| here.as_ref().is_some_and(|here| run.project == *here))
-        {
-            return Ok(run.socket.clone());
-        }
+        discovered(&runs, here.as_deref(), daemon, daemon_listening, denied)
+    }
+}
 
-        if daemon.exists() {
-            return Ok(daemon);
-        }
+/// Whether looking at `path` is refused because a directory on the way
+/// to it may not be entered, as opposed to the path being absent.
+fn may_not_enter(path: &Path) -> bool {
+    matches!(
+        path.try_exists(),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+    )
+}
 
-        match runs.as_slice() {
-            [] => Ok(daemon),
-            [run] => Ok(run.socket.clone()),
-            several => anyhow::bail!(
-                "no daemon is running and several development runs are: {}; name one with \
-                 --socket, or run the command from its project directory",
-                several
-                    .iter()
-                    .map(|run| format!(
-                        "{} on http://{} from {} (--socket {})",
-                        run.app,
-                        run.listen,
-                        run.project.display(),
-                        run.socket.display()
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-        }
+/// The rest of discovery (design specification section 13.8), once there
+/// is no usable serve: a development run from the current project, the
+/// daemon's socket when it listens, then the one run listening. With
+/// nothing there, the socket of a run directory this user may not enter
+/// when there is one, so the permission error is reported, or the daemon's.
+fn discovered(
+    runs: &[crate::run_admin::RunInfo],
+    here: Option<&Path>,
+    daemon: PathBuf,
+    daemon_listening: bool,
+    denied: Option<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(run) = runs
+        .iter()
+        .find(|run| here.is_some_and(|here| run.project == here))
+    {
+        return Ok(run.socket.clone());
+    }
+
+    if daemon_listening {
+        return Ok(daemon);
+    }
+
+    match runs {
+        [] => Ok(denied.unwrap_or(daemon)),
+        [run] => Ok(run.socket.clone()),
+        several => anyhow::bail!(
+            "no daemon is running and several development runs are: {}; name one with \
+             --socket, or run the command from its project directory",
+            several
+                .iter()
+                .map(|run| format!(
+                    "{} on http://{} from {} (--socket {})",
+                    run.app,
+                    run.listen,
+                    run.project.display(),
+                    run.socket.display()
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
     }
 }
 
@@ -753,8 +809,11 @@ pub enum DebugCommand {
     Tasks(DebugArgs),
 
     /// Each worker's interpreter, sys.path, loaded modules, threads,
-    /// descriptors and environment (secrets redacted).
-    Inspect(DebugArgs),
+    /// descriptors and environment: every variable's name, with values
+    /// only for Muru's own, the interpreter's and the release's unless
+    /// --env asks for every one; values that look like secrets are
+    /// masked either way.
+    Inspect(InspectArgs),
 
     /// Sample every thread's stack for a period, merged across the
     /// workers, as collapsed stacks for a flame graph or as pstats; with
@@ -783,6 +842,19 @@ pub enum DebugCommand {
     /// is under muructl run; under the daemon, only when its [daemon]
     /// table sets debug_exec.
     Attach(AttachArgs),
+}
+
+/// `muructl debug inspect`.
+#[derive(Args)]
+pub struct InspectArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// Show the value of every environment variable, masked where it
+    /// looks like a secret, not only Muru's, the interpreter's and the
+    /// release's.
+    #[arg(long)]
+    env: bool,
 }
 
 /// `muructl debug attach`.
@@ -1001,7 +1073,11 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::Status(args) => ("status", args, serde_json::json!({})),
         DebugCommand::Stacks(args) => ("stacks", args, serde_json::json!({})),
         DebugCommand::Tasks(args) => ("tasks", args, serde_json::json!({})),
-        DebugCommand::Inspect(args) => ("inspect", args, serde_json::json!({})),
+        DebugCommand::Inspect(inspect) => (
+            "inspect",
+            &inspect.common,
+            serde_json::json!({"env": inspect.env}),
+        ),
         DebugCommand::Profile(profile) => (
             "profile",
             &profile.common,
@@ -1413,9 +1489,14 @@ fn print_memory(response: &pb::DebugResponse) {
                     idle.iter().zip(&busy).map(|(a, b)| a + b).collect()
                 })
                 .unwrap_or_default();
-            let p95 = signal_p95_ms(&pauses).map_or("-".to_owned(), |ms| format!("{ms} ms"));
+            let p95 = signal_p95_ms(&pauses).map_or("-".to_owned(), |ms| {
+                muru_controller::scaling::describe_p95(
+                    ms,
+                    muru_controller::scaling::SIGNAL_LARGEST_MS,
+                )
+            });
             println!(
-                "  gc generation {}: {} collections, {:.1} ms in all, p95 under {}, {} objects freed, {} while {} requests were in flight",
+                "  gc generation {}: {} collections, {:.1} ms in all, p95 {}, {} objects freed, {} while {} requests were in flight",
                 generation["generation"].as_str().unwrap_or("?"),
                 count("collections"),
                 count("ns") as f64 / 1e6,
@@ -1722,7 +1803,7 @@ async fn ask(
             args_json: args.to_string(),
         })
         .await
-        .map_err(explain)?
+        .map_err(|status| explain_debug(op, status))?
         .into_inner();
 
     if response.workers.is_empty() {
@@ -1742,7 +1823,7 @@ async fn ask(
 /// A worker's answer as JSON, when it answered.
 /// The 95th percentile of a worker's cumulative histogram over the
 /// signal bounds, in milliseconds: the bound holding 95 percent of the
-/// observations, or none without any.
+/// observations, infinity past the last, or none without any.
 fn signal_p95_ms(counts: &[u64]) -> Option<f64> {
     let bounds = muru_proto::worker::v1::SIGNAL_BOUNDS_US;
     let total = *counts.last()?;
@@ -1753,7 +1834,11 @@ fn signal_p95_ms(counts: &[u64]) -> Option<f64> {
 
     let target = total as f64 * 0.95;
     let index = counts.iter().position(|count| *count as f64 >= target)?;
-    Some(*bounds.get(index).or(bounds.last())? as f64 / 1000.0)
+    Some(
+        bounds
+            .get(index)
+            .map_or(f64::INFINITY, |bound| *bound as f64 / 1000.0),
+    )
 }
 
 fn parse_result(answer: &pb::WorkerDebug) -> Option<serde_json::Value> {
@@ -2050,10 +2135,26 @@ fn print_inspect(response: &pb::DebugResponse) {
             println!("  {count} open descriptors");
         }
 
-        println!("  environment:");
+        // A variable whose value was not asked for is named alone, and
+        // the heading says how to see the rest.
 
-        for (key, value) in result["environment"].as_object().into_iter().flatten() {
-            println!("    {key}={}", value.as_str().unwrap_or(""));
+        let environment = result["environment"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let withheld = environment.values().filter(|value| value.is_null()).count();
+
+        if withheld == 0 {
+            println!("  environment:");
+        } else {
+            println!("  environment ({withheld} values left out; --env shows them):");
+        }
+
+        for (key, value) in &environment {
+            match value.as_str() {
+                Some(value) => println!("    {key}={value}"),
+                None => println!("    {key}"),
+            }
         }
 
         println!();
@@ -2492,6 +2593,13 @@ pub async fn daemon_status(socket: SocketArgs, json: bool) -> anyhow::Result<()>
     );
     println!("websockets {} open", status.websockets);
 
+    if !status.no_host.is_empty() {
+        println!(
+            "routing  {} serve with no hosts declared, so every request is answered 421",
+            status.no_host
+        );
+    }
+
     if !status.budget.is_empty() {
         println!("budget   {}", status.budget);
     }
@@ -2582,7 +2690,8 @@ pub struct ReleaseArgs {
     /// runs this long; off), hard (replace a worker whose request runs
     /// this long; off), hard_drain_grace (10s), shutdown (5s),
     /// websocket_drain_grace (how long a stopping worker keeps its open
-    /// WebSockets; 0s), loop_stall (replace an ASGI worker whose event
+    /// WebSockets; 0s), exit_grace (how long a stopping worker has for its
+    /// shutdown work; 2s), loop_stall (replace an ASGI worker whose event
     /// loop stalls this long; 10s) or gil_stall (replace a worker in
     /// which no thread has run Python for this long; 30s). Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
@@ -2700,7 +2809,8 @@ pub struct DeployArgs {
     retain: Option<Duration>,
 
     /// The workers each group of the release this one replaces keeps
-    /// while it stays warm (default 1; 0 keeps the host alone).
+    /// while it stays warm (default 1, or 0 for a group whose
+    /// min_workers is 0; 0 keeps the host alone).
     #[arg(long, value_name = "N")]
     retain_workers: Option<u32>,
 
@@ -2934,6 +3044,7 @@ fn parse_host_timeout(text: &str) -> Result<(String, Duration), String> {
         "hard_drain_grace",
         "shutdown",
         "websocket_drain_grace",
+        "exit_grace",
         "loop_stall",
         "gil_stall",
     ]
@@ -2941,7 +3052,7 @@ fn parse_host_timeout(text: &str) -> Result<(String, Duration), String> {
     {
         return Err(format!(
             "{name:?} is not a host timeout name: soft, hard, hard_drain_grace, shutdown, \
-             websocket_drain_grace, loop_stall or gil_stall"
+             websocket_drain_grace, exit_grace, loop_stall or gil_stall"
         ));
     }
 
@@ -3053,6 +3164,7 @@ impl ReleaseArgs {
             hard_drain_grace_ms: timeout_ms(&self.timeouts, "hard_drain_grace"),
             shutdown_timeout_ms: timeout_ms(&self.timeouts, "shutdown"),
             websocket_drain_grace_ms: timeout_ms(&self.timeouts, "websocket_drain_grace"),
+            exit_grace_ms: timeout_ms(&self.timeouts, "exit_grace"),
             loop_stall_timeout_ms: timeout_ms(&self.timeouts, "loop_stall"),
             gil_stall_timeout_ms: timeout_ms(&self.timeouts, "gil_stall"),
             memory_measure: memory_setting(&self.memory, "measure").unwrap_or_default(),
@@ -3219,6 +3331,19 @@ fn print_deploy_plan(plan: &pb::DeployPlan) {
         }
     }
 
+    for entry in &plan.env {
+        match (entry.secret.as_str(), entry.as_file) {
+            ("", _) => println!("  env {} ({})", entry.name, entry.layer),
+            (secret, false) => {
+                println!("  secret {} = {secret} ({})", entry.name, entry.layer);
+            }
+            (secret, true) => println!(
+                "  secret {} = {secret} as a file ({})",
+                entry.name, entry.layer
+            ),
+        }
+    }
+
     if !plan.settings_from.is_empty() {
         println!(
             "  settings nothing else gives come from {}@{}; --fresh takes none",
@@ -3245,15 +3370,11 @@ fn print_deploy_plan(plan: &pb::DeployPlan) {
             plan.app, plan.serving
         ),
         (false, false) => println!(
-            "  the release would take over from {}@{}, which would stay warm for {} with {} to a group",
+            "  the release would take over from {}@{}, which would stay warm for {} with {}",
             plan.app,
             plan.serving,
             muru_config::format_duration(Duration::from_millis(plan.retain_ms)),
-            match plan.retain_workers {
-                0 => "its host alone".to_owned(),
-                1 => "1 worker".to_owned(),
-                count => format!("{count} workers"),
-            }
+            plan.retained
         ),
     }
 }
@@ -3820,7 +3941,7 @@ fn split_target(text: &str) -> anyhow::Result<(&str, &str)> {
 fn print_scale_status(status: &pb::ScaleStatus) {
     println!("{}@{}", status.app, status.release);
     println!(
-        "{:<12} {:<12} {:<10} {:<7} {:<10} {:<10} POLICY",
+        "{:<12} {:<12} {:<10} {:<7} {:<13} {:<10} POLICY",
         "GROUP", "WORKERS", "SLOTS", "IDLE", "QUEUE-P95", "REAPS"
     );
 
@@ -3842,16 +3963,19 @@ fn print_scale_status(status: &pb::ScaleStatus) {
         };
 
         let p95 = match group.queue_wait_p95_ms {
-            Some(ms) => format!("{ms:.0} ms"),
+            Some(ms) => muru_controller::scaling::describe_p95(
+                ms,
+                muru_controller::scaling::QUEUE_LARGEST_MS,
+            ),
             None => "-".to_owned(),
         };
 
         println!(
-            "{:<12} {:<12} {:<10} {:<7} {:<10} {:<10} {}",
+            "{:<12} {:<12} {:<10} {:<7} {:<13} {:<10} {}",
             group.group,
             workers,
             format!("{:.0}/{:.0}", group.slots_busy, group.slots_total),
-            format!("{:.1}", group.idle_workers),
+            format!("{:.2}", group.idle_workers),
             p95,
             reaps,
             group.policy
@@ -3873,8 +3997,13 @@ fn print_scale_status(status: &pb::ScaleStatus) {
 
         // Section 7.3: the workers' own signals, and what they say.
 
-        let measured = |value: Option<f64>, unit: &str| {
-            value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
+        let p95 = |value: Option<f64>| {
+            value.map_or("-".to_owned(), |ms| {
+                muru_controller::scaling::describe_p95(
+                    ms,
+                    muru_controller::scaling::SIGNAL_LARGEST_MS,
+                )
+            })
         };
 
         // Section 6.14: the wait for a thread of requests handed from
@@ -3882,14 +4011,18 @@ fn print_scale_status(status: &pb::ScaleStatus) {
 
         let handoff = group
             .handoff_queue_wait_p95_ms
-            .map(|wait| format!(", handoff wait p95 {wait:.0} ms"))
+            .map(|wait| format!(", handoff wait p95 {}", p95(Some(wait))))
             .unwrap_or_default();
         println!(
             "  workers: cpu {}, gc {}, gil wait p95 {}, loop lag p95 {}{handoff}",
-            measured(group.worker_cpu.map(|cpu| cpu * 100.0), "%"),
-            measured(group.gc_share.map(|share| share * 100.0), "%"),
-            measured(group.gil_wait_p95_ms, " ms"),
-            measured(group.loop_lag_p95_ms, " ms")
+            group
+                .worker_cpu
+                .map_or("-".to_owned(), muru_controller::scaling::describe_cpu),
+            group
+                .gc_share
+                .map_or("-".to_owned(), |share| format!("{:.0}%", share * 100.0)),
+            p95(group.gil_wait_p95_ms),
+            p95(group.loop_lag_p95_ms)
         );
 
         if !group.diagnosis.is_empty() {
@@ -5063,21 +5196,17 @@ pub async fn release_list(
     }
 
     println!(
-        "{:<24} {:<10} {:<8} {:<10} SOURCE",
+        "{:<24} {:<10} {:<8} {:<16} SOURCE",
         "RELEASE", "STATE", "SERVING", "WORKERS"
     );
 
     for release in releases {
         println!(
-            "{:<24} {:<10} {:<8} {:<10} {}",
+            "{:<24} {:<10} {:<8} {:<16} {}",
             format!("{}@{}", release.app, release.id),
             release.state,
             if release.serving { "yes" } else { "" },
-            if release.kind == "http" {
-                format!("{} {}", release.instances, release.profile)
-            } else {
-                format!("{}x{}", release.processes, release.threads)
-            },
+            workers_column(&release),
             release.source
         );
 
@@ -5087,6 +5216,32 @@ pub async fn release_list(
     }
 
     Ok(())
+}
+
+/// The WORKERS column of `release list`: what runs now, or `-` when
+/// nothing does, and the shape the release asks for in brackets.
+fn workers_column(release: &pb::Release) -> String {
+    if release.kind == "http" {
+        let running = release
+            .server_instances
+            .iter()
+            .filter(|instance| instance.pid != 0)
+            .count();
+        let shape = format!("{} {}", release.instances, release.profile);
+
+        return match running {
+            0 => format!("- ({shape})"),
+            count => format!("{count} ({shape})"),
+        };
+    }
+
+    let shape = format!("{}x{}", release.processes, release.threads);
+
+    if release.host_running {
+        format!("{} ({shape})", release.workers.len())
+    } else {
+        format!("- ({shape})")
+    }
 }
 
 /// Show one release.
@@ -5519,7 +5674,8 @@ pub struct ApplyArgs {
     retain: Option<Duration>,
 
     /// The workers each group of a release the apply replaces keeps
-    /// while it stays warm (default 1; 0 keeps the host alone).
+    /// while it stays warm (default 1, or 0 for a group whose
+    /// min_workers is 0; 0 keeps the host alone).
     #[arg(long, value_name = "N")]
     retain_workers: Option<u32>,
 
@@ -6973,6 +7129,26 @@ fn explain(status: tonic::Status) -> anyhow::Error {
     anyhow::anyhow!("{}", status.message())
 }
 
+/// A debug reply past the client's limit says what to narrow; any other
+/// error is passed on as `explain` would.
+fn explain_debug(op: &str, status: tonic::Status) -> anyhow::Error {
+    if status.code() != tonic::Code::OutOfRange {
+        return explain(status);
+    }
+
+    let hint = match op {
+        "profile" => ", or a shorter --for",
+        "trace" | "memory" => ", or a smaller --top",
+        _ => "",
+    };
+
+    anyhow::anyhow!(
+        "the reply to debug {op} is larger than the {} MiB muructl accepts; ask one worker with \
+         --worker{hint}",
+        muru_controller::client::MAX_REPLY_MIB
+    )
+}
+
 fn process_alive(pid: u32) -> bool {
     // SAFETY: kill with signal 0 checks for the process and sends nothing.
 
@@ -6993,6 +7169,133 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 #[cfg(test)]
 mod tests {
     use super::metric_samples;
+    use super::pb;
+
+    #[test]
+    fn discovery_reports_a_denied_run_directory_only_with_nothing_else_to_offer() {
+        use std::path::{Path, PathBuf};
+
+        use crate::run_admin::RunInfo;
+
+        let run = |socket: &str, project: &str| RunInfo {
+            pid: 1,
+            app: "app".to_owned(),
+            project: PathBuf::from(project),
+            listen: "127.0.0.1:8080".to_owned(),
+            socket: PathBuf::from(socket),
+        };
+        let daemon = PathBuf::from("/user/admin.sock");
+        let denied = PathBuf::from("/run/muru/admin.sock");
+        let found = |runs: &[RunInfo], here, listening, denied: Option<&Path>| {
+            super::discovered(
+                runs,
+                here,
+                daemon.clone(),
+                listening,
+                denied.map(Path::to_path_buf),
+            )
+            .expect("found")
+        };
+        let mine = [run("/user/runs/8080/admin.sock", "/mine")];
+
+        // A non-member's own run or daemon wins, nothing said about the
+        // directory.
+
+        let here = Some(Path::new("/mine"));
+        assert_eq!(found(&mine, here, true, Some(&denied)), mine[0].socket);
+        assert_eq!(found(&mine, None, false, Some(&denied)), mine[0].socket);
+        assert_eq!(found(&[], None, true, Some(&denied)), daemon);
+
+        // With nothing else the denied socket is the answer, and only then.
+
+        assert_eq!(found(&[], None, false, Some(&denied)), denied);
+        assert_eq!(found(&[], None, false, None), daemon);
+    }
+
+    #[test]
+    fn a_directory_that_may_not_be_entered_is_told_from_an_absent_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: geteuid has no preconditions.
+
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root enters anything, so there is nothing to refuse
+        }
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let locked = directory.path().join("locked");
+        std::fs::create_dir(&locked).expect("mkdir");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        assert!(super::may_not_enter(&locked.join("serve.json")));
+        assert!(!super::may_not_enter(&directory.path().join("absent/x")));
+        assert!(!super::may_not_enter(&directory.path().join("x")));
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+
+    #[test]
+    fn a_debug_reply_past_the_limit_says_what_to_narrow() {
+        let status = tonic::Status::out_of_range("Error, decoded message length too large");
+        let message = super::explain_debug("profile", status).to_string();
+        assert!(
+            message.starts_with("the reply to debug profile is larger than"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("--worker, or a shorter --for"),
+            "{message}"
+        );
+
+        let other = tonic::Status::not_found("no such release");
+        assert_eq!(
+            super::explain_debug("stacks", other).to_string(),
+            "no such release"
+        );
+    }
+
+    #[test]
+    fn the_workers_column_says_what_runs_beside_the_shape() {
+        let release = pb::Release {
+            processes: 1,
+            threads: 4,
+            kind: "workers".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(super::workers_column(&release), "- (1x4)");
+
+        let at_zero = pb::Release {
+            host_running: true,
+            ..release.clone()
+        };
+        assert_eq!(super::workers_column(&at_zero), "0 (1x4)");
+
+        let serving = pb::Release {
+            workers: vec![pb::Worker::default(), pb::Worker::default()],
+            ..at_zero
+        };
+        assert_eq!(super::workers_column(&serving), "2 (1x4)");
+
+        let server = pb::Release {
+            kind: "http".to_owned(),
+            instances: 2,
+            profile: "gunicorn".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(super::workers_column(&server), "- (2 gunicorn)");
+
+        let running = pb::Release {
+            server_instances: vec![
+                pb::ServerInstance {
+                    pid: 7,
+                    ..Default::default()
+                },
+                pb::ServerInstance::default(),
+            ],
+            ..server
+        };
+        assert_eq!(super::workers_column(&running), "1 (2 gunicorn)");
+    }
 
     #[tokio::test]
     async fn output_that_cannot_be_written_stops_the_command_and_waits_for_it() {
@@ -7009,6 +7312,8 @@ mod tests {
                 label: "exec".to_owned(),
                 argv: vec!["sh".to_owned(), "-c".to_owned(), script],
                 env: Vec::new(),
+                unset: Vec::new(),
+                clean: false,
                 cwd: dir.path().to_owned(),
                 identity: None,
                 log: None,

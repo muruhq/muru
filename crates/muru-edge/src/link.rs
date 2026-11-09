@@ -1883,6 +1883,11 @@ async fn handle_inner(
         )
         .await;
 
+        // The time waited is recorded whether a worker was found or not,
+        // so a 503 for a full queue logs the whole wait.
+
+        recording.record.queue = queued.elapsed();
+
         let lease = match acquired {
             Ok(Ok(lease)) => lease,
             Ok(Err(error)) => {
@@ -1898,12 +1903,23 @@ async fn handle_inner(
             }
             Err(_) => {
                 // Section 7.6: the queue wait is bounded by queue_timeout.
+                // A pool waiting for a wake had no worker to be busy: the
+                // group was at zero, its host was starting, or its
+                // workers were on their way (section 7.4).
 
-                let mut problem = Problem::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "queue_full",
-                    "Every worker stayed busy for the whole queue timeout.",
-                );
+                let mut problem = if pool.wakes().is_some() {
+                    Problem::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "cold_start_timeout",
+                        "No worker had started for the request within the queue timeout.",
+                    )
+                } else {
+                    Problem::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "queue_full",
+                        "Every worker stayed busy for the whole queue timeout.",
+                    )
+                };
                 problem.retry_after = Some(1);
                 *failing.recording.lock().expect("recording poisoned") = Some(recording);
                 return failing.respond(problem);
@@ -1927,7 +1943,6 @@ async fn handle_inner(
 
         let Conn { reader, mut writer } = conn;
         recording.record.worker = Some(worker);
-        recording.record.queue = queued.elapsed();
         recording.record.retried = retried;
         recording.in_flight.dispatched(worker, on_loop);
 

@@ -6,8 +6,8 @@ share of the application's requests step by step, is judged at each step
 against the release that still serves, and is promoted when every step
 passes or rolled back when one fails. The shares are applied on the
 application's routes (see [virtual hosts](virtual-hosts.md)), or, on a
-daemon with no host declared, to every request the application takes
-as the default one.
+daemon with no host declared, to every request, which go to the one
+application serving (see [virtual hosts](virtual-hosts.md)).
 
 ## Holding a release
 
@@ -82,8 +82,12 @@ compared, and the limits alone apply.
 The gates are checked every second once the candidate has served
 `--min-requests` requests in the step. A failing gate rolls back at once,
 without waiting for the hold to end: the candidate leaves traffic and is
-kept warm, so its logs and workers can be looked at, and the rollout
-records why:
+kept for 10 minutes, so its logs and workers can be looked at, and the
+rollout records why. `muructl rollout abort` keeps it the same way. The
+candidate is kept beside the application's retained release, not in its
+place, so the release that served before the deploy stays warm for an
+instant rollback; `muructl release list` notes the candidate as kept for
+inspection and not a rollback target:
 
 ```console
 $ muructl rollout status shop

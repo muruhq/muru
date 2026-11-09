@@ -50,15 +50,17 @@ pub fn declared(project: &Path, file: Option<&Path>) -> Result<Vec<CommandSpec>,
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
-/// What the project's application is called: its entrypoint's package,
-/// as a development run names it, else the directory.
+/// What the project's application is called, as a development run names
+/// it, else the directory.
 pub fn label(project: &Path, entrypoint: Option<&str>) -> String {
     match entrypoint {
-        Some(entrypoint) => crate::app_name(entrypoint).replace('_', "-"),
-        None => project.file_name().map_or_else(
-            || "default".to_owned(),
-            |name| name.to_string_lossy().into_owned(),
-        ),
+        Some(entrypoint) => crate::app_name(project, entrypoint),
+        None => crate::project_name(project).unwrap_or_else(|| {
+            project.file_name().map_or_else(
+                || "default".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        }),
     }
 }
 
@@ -135,7 +137,8 @@ pub fn prepare(context: &Context, request: CommandRequest) -> Result<Prepared, S
             python: &context.python,
             runtime: context.pythonpath.as_deref(),
             pycache: None,
-            no_bytecode: false,
+            bytecode: None,
+            base: None,
         },
         &context.app,
         &context.release,
@@ -148,6 +151,8 @@ pub fn prepare(context: &Context, request: CommandRequest) -> Result<Prepared, S
         label: "exec".to_owned(),
         argv: Vec::new(),
         env,
+        unset: Vec::new(),
+        clean: false,
         cwd: context.project.clone(),
         identity: None,
         log: None,

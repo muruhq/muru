@@ -321,7 +321,11 @@ pub(crate) async fn handle(
             .min(at.saturating_duration_since(queued))
     });
 
-    let lease = match tokio::time::timeout(queue_timeout, pool.acquire(&head.mount)).await {
+    let acquired = tokio::time::timeout(queue_timeout, pool.acquire(&head.mount)).await;
+    let mut recording = recording;
+    recording.record.queue = queued.elapsed();
+
+    let lease = match acquired {
         Ok(Ok(lease)) => lease,
         Ok(Err(error)) => {
             tracing::warn!(%error, "no worker connection for a gRPC call");
@@ -344,9 +348,7 @@ pub(crate) async fn handle(
         }
     };
 
-    let mut recording = recording;
     recording.record.worker = Some(lease.worker);
-    recording.record.queue = queued.elapsed();
     recording.in_flight.grpc(lease.worker, lease.on_loop);
     let dispatched = Instant::now();
     let mut reader = lease.conn.reader;

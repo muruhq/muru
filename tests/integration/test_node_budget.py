@@ -11,10 +11,11 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from support.daemon import SHOP, Daemon, start_daemon
+from support.daemon import FACTORY, SHOP, Daemon, start_daemon
 
 
 def shop(tmp_path: Path, extra: str = "", releases: tuple[str, ...] = ("r1",)) -> Path:
@@ -65,6 +66,18 @@ def wait_for_event(daemon: Daemon, kind: str, timeout: float = 30) -> list[str]:
             time.sleep(0.5)
 
     return found
+
+
+def wait_until(predicate: Callable[[], bool], timeout: float = 30) -> bool:
+    deadline = time.monotonic() + timeout
+
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+
+        time.sleep(0.5)
+
+    return True
 
 
 def budget_line(daemon: Daemon, expected: str | None = None, timeout: float = 20) -> str:
@@ -179,5 +192,106 @@ def test_a_release_whose_memory_does_not_fit_is_not_started(tmp_path: Path) -> N
         releases = daemon.muructl("release", "list", "shop").stdout
         assert "r2" not in releases, releases
         assert wait_for_event(daemon, "scaling.denied_by_budget")
+    finally:
+        daemon.stop()
+
+
+def scaled_to_zero(daemon: Daemon) -> bool:
+    lines = daemon.muructl("scale", "status", "shop").stdout.splitlines()
+    return any(line.split()[:2] == ["default", "0"] for line in lines[2:])
+
+
+def test_a_wake_from_zero_is_not_held_back_by_the_worker_budget(tmp_path: Path) -> None:
+    # The node allows two workers: the factory's serving release and its
+    # retained one hold them while the shop is at zero. Each wake of the
+    # shop, by a fork while its host stays and then by a cold start once
+    # its host has stopped, takes the node over the limit, and the
+    # factory's retained release stops to make room.
+
+    daemon = start_daemon(
+        tmp_path,
+        config_extra="[limits]\nqueue_timeout = '30s'\n\n[daemon.budget]\nworkers = 2\n",
+    )
+    config = tmp_path / "apps.toml"
+    config.write_text(
+        f"""[app.shop.release.r1]
+source = '{SHOP}'
+python = '{sys.executable}'
+processes = 1
+threads = 1
+
+[app.shop.release.r1.scaling]
+mode = 'spare'
+min_workers = 0
+max_workers = 2
+idle_reap_after = '2s'
+scale_in_window = '2s'
+hold_after_growth = '1s'
+reap_interval = '1s'
+min_lifetime = '1s'
+host_idle_timeout = '6s'
+
+[app.factory.release.r1]
+source = '{FACTORY}'
+python = '{sys.executable}'
+processes = 1
+threads = 1
+
+[host.shop]
+names = ["shop.test"]
+default = true
+
+[host.factory]
+names = ["factory.test"]
+
+[[route]]
+host = "shop"
+app = "shop"
+
+[[route]]
+host = "factory"
+app = "factory"
+"""
+    )
+
+    def retained_stops(release: str) -> bool:
+        # The release's row, then its note on the line below.
+
+        lines = daemon.muructl("release", "list", "factory").stdout.splitlines()
+        row = next((index for index, line in enumerate(lines) if line.startswith(release)), None)
+
+        if row is None:
+            return False
+
+        shown = " ".join(lines[row : row + 2])
+        return "stopped" in shown and "the node's worker budget for shop@r1" in shown
+
+    try:
+        assert daemon.muructl("apply", "-f", str(config)).returncode == 0
+        assert "is ready and serving" in daemon.deploy("factory", FACTORY)
+        assert wait_until(lambda: scaled_to_zero(daemon)), daemon.muructl(
+            "scale", "status", "shop"
+        ).stdout
+        assert budget_line(daemon, "2 of 2") == "budget   2 of 2 workers"
+
+        # The warm wake forks a worker over the limit.
+
+        assert daemon.request("/", host="shop.test").status == 200
+        woken = wait_for_event(daemon, "over the node's budget of 2 workers")
+        assert woken and "scaling.decision" in woken[0], woken
+        assert wait_until(lambda: retained_stops("factory@r1")), daemon.muructl(
+            "release", "list", "factory"
+        ).stdout
+
+        # The cold wake starts the stopped host over the limit.
+
+        assert "is ready and serving" in daemon.deploy("factory", FACTORY)
+        assert wait_until(lambda: bool(wait_for_event(daemon, "release.idle", 1)), timeout=40)
+        assert daemon.request("/", host="shop.test").status == 200
+        woken = wait_for_event(daemon, "release.woken")
+        assert woken and "over the node's budget of 2 workers" in woken[0], woken
+        assert wait_until(lambda: retained_stops("factory@r2")), daemon.muructl(
+            "release", "list", "factory"
+        ).stdout
     finally:
         daemon.stop()

@@ -114,6 +114,8 @@ compile_bytecode = true  # uv sync --compile-bytecode, feeds bytecode = 'source'
 
 The setting is bytecode = 'redirect' (default), 'source' or 'off' per release or variant. muructl check reports when a release would run without any usable bytecode cache.
 
+The setting holds whatever environment the daemon was started with. Python honours PYTHONDONTWRITEBYTECODE over PYTHONPYCACHEPREFIX, so under 'redirect' and 'source' the daemon removes an inherited PYTHONDONTWRITEBYTECODE from the environment of the release's host and of the commands it runs for the release, while a release whose own environment sets it keeps it. Under 'off' the daemon sets it. muructl run leaves the variable to the user's shell.
+
 ## 8.3 Runtime library installation
 
 The runtime library is Muru's, not the application's (ADR 0037). muructl puts the `muru` package that matches its own version on the host's PYTHONPATH for the interpreter in use, in every mode, so an application need not list it as a dependency and `import muru` works with nothing in `pyproject.toml`.
@@ -225,3 +227,14 @@ COPY --from=build /usr/local/bin/muructl /usr/local/bin/muructl
 RUN useradd --uid 10001 app && install -d -o 10001 -g 0 -m 0770 /run/muru
 USER app
 ```
+
+## 8.7 A release's environment
+
+Under the daemon a release's host and workers, its commands (section 9.12) and its managed server instances (section 9.9) start from a clean environment, so what a release sees does not depend on who started the daemon or from where. It is made of, in order, later entries overriding earlier ones:
+
+1. A small base taken from the daemon's own environment when set there: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TZ` and `TMPDIR`. A release run as another user (section 10.9) has that user's own `HOME`, `USER` and `LOGNAME` from the password database in their place, whatever the daemon's say and whatever `pass_env` names; a user with no entry has none of them. What the release declares still overrides them, as it does the rest of the base.
+2. The variables `[daemon] pass_env` names, each a variable name or a `PREFIX*` pattern and never a value. A reload changes the list for releases started from then on. A name Muru sets itself cannot be passed.
+3. What the release declares: `[tool.muru.env]`, `--env` and secrets.
+4. What Muru sets, which nothing overrides: the `MURU_` variables, the interpreter's directory first on `PATH`, `VIRTUAL_ENV` for a virtual environment, `PYTHONPATH` with the runtime library first, and the bytecode settings of section 8.2. A variable the release's bytecode setting says must not be inherited is left out of the base and of `pass_env`.
+
+One function builds this for the host, for commands and for managed servers (`commands::environment`, from `commands::passed_from_daemon`). `muructl deploy --dry-run` lists what the release declares and what the daemon would pass on, by name with its source and never its value, through the same code, and an account variable taken from the release's user as set by Muru. A build, which also runs as the release's user (section 8.2), has that user's `HOME`, `USER` and `LOGNAME` too. `muructl debug inspect` shows the values of every variable named here (section 11.7). `muructl run` and `muructl serve` keep the environment of the process that started them, since a development run belongs to the person running it and a container is configured through its environment.

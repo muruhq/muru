@@ -31,6 +31,8 @@ pub enum HostMessage {
         /// The interfaces the host settled, by mount, the default mount's
         /// under the empty name; none when the workers settle them.
         interfaces: Vec<(String, String)>,
+        /// Every worker the host runs now.
+        workers: Vec<HostWorker>,
     },
     /// An event about a worker, for the event log.
     Event {
@@ -60,6 +62,21 @@ pub enum HostMessage {
         /// Why no worker was asked, when none was.
         error: String,
     },
+}
+
+/// One worker a host runs, as it last announced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostWorker {
+    /// The worker's index within the host.
+    pub index: u32,
+    /// Its pid.
+    pub pid: u32,
+    /// Its group.
+    pub group: String,
+    /// The socket it listens on.
+    pub socket: String,
+    /// What it is doing: starting, ready, debugging, replacing or retiring.
+    pub state: String,
 }
 
 /// One worker's answer to a request (section 11.7).
@@ -235,6 +252,21 @@ impl HostMessage {
                             .collect()
                     })
                     .unwrap_or_default(),
+                workers: value["workers"]
+                    .as_array()
+                    .map(|workers| {
+                        workers
+                            .iter()
+                            .map(|worker| HostWorker {
+                                index: worker["index"].as_u64().unwrap_or(0) as u32,
+                                pid: worker["pid"].as_u64().unwrap_or(0) as u32,
+                                group: worker["group"].as_str().unwrap_or("default").to_owned(),
+                                socket: worker["socket"].as_str().unwrap_or_default().to_owned(),
+                                state: worker["state"].as_str().unwrap_or_default().to_owned(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             "event" => Some(Self::Event {
                 kind: value["kind"].as_str().unwrap_or("worker.event").to_owned(),
@@ -405,6 +437,17 @@ pub fn stop_wait(budget: Duration) -> Duration {
     budget + STOP_MARGIN * 2
 }
 
+/// The file in a host's run directory saying when a shutdown wants its
+/// workers gone, in milliseconds since the Unix epoch (section 13.3). It
+/// is written before the host is told to stop, so the host always finds
+/// it; `muru.host` reads it under this name.
+pub const STOP_BY_FILE: &str = "stop-by";
+
+/// The variable naming, comma separated, the release's variables whose
+/// values `debug inspect` shows (section 11.7); the runtime library reads
+/// it as `muru._inspect.DECLARED`.
+pub const SHOWN_ENV_VARIABLE: &str = "MURU_DECLARED_ENV";
+
 /// What every host of a run is started with.
 pub struct HostSpec {
     /// The interpreter with the muru runtime library installed.
@@ -473,6 +516,9 @@ pub struct HostSpec {
     /// How long a worker told to stop keeps its open WebSockets before it
     /// closes them with 1001.
     pub websocket_drain_grace: Duration,
+    /// How long a worker has for its shutdown work once its requests have
+    /// had their time (section 7.6).
+    pub exit_grace: Duration,
     /// How long an ASGI worker's event loop may stall before the worker
     /// is replaced (section 7.6).
     pub loop_stall_timeout: Duration,
@@ -490,14 +536,21 @@ pub struct HostSpec {
     /// Environment variables for the host and its workers (section
     /// 10.8), secret values already resolved.
     pub env: Vec<(String, String)>,
+    /// Section 11.7: the variables of `env` whose values `debug inspect`
+    /// shows without `--env`, which leaves out a secret's value.
+    pub shown_env: Vec<String>,
     /// Section 8.3: the runtime library directory to put first on
     /// PYTHONPATH, when the environment's own `muru` is not used.
     pub pythonpath: Option<PathBuf>,
     /// Section 8.2: the directory bytecode is written under
     /// (PYTHONPYCACHEPREFIX), when it is redirected.
     pub pycache_prefix: Option<PathBuf>,
-    /// Section 8.2: write no bytecode at all.
-    pub no_bytecode: bool,
+    /// Section 8.2: the release's bytecode setting; none where bytecode
+    /// is left to Python and the environment, as in a development run.
+    pub bytecode: Option<muru_config::Bytecode>,
+    /// Whether `env` is the whole environment rather than laid over this
+    /// process's own (section 8.7), as it is under the daemon.
+    pub clean_env: bool,
     /// The user and group the host runs as, and its umask, when the
     /// daemon is root and the application names them (section 10.9).
     pub identity: Option<Identity>,
@@ -545,6 +598,65 @@ impl Identity {
         };
 
         Ok(Self { uid, gid, umask })
+    }
+
+    /// Section 8.7: `HOME`, `USER` and `LOGNAME` for the user this is, from
+    /// the password database. None for a user id with no entry, and an
+    /// empty field is left out.
+    pub fn account(&self) -> Vec<(String, String)> {
+        let mut buffer = vec![0u8; 4096];
+
+        // SAFETY: an all-zero passwd is a valid value of a C struct of
+        // integers and pointers, and getpwuid_r overwrites it.
+
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+
+        // getpwuid_r, not getpwuid: the daemon has many threads, and the
+        // other's static storage is shared between them.
+
+        loop {
+            // SAFETY: every pointer is to a live local, and the length is
+            // that of the buffer; on return the strings in `entry` point
+            // into the buffer.
+
+            let status = unsafe {
+                libc::getpwuid_r(
+                    self.uid as libc::uid_t,
+                    &mut entry,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut found,
+                )
+            };
+
+            if status == libc::ERANGE && buffer.len() < 1 << 20 {
+                buffer.resize(buffer.len() * 2, 0);
+                continue;
+            }
+
+            break;
+        }
+
+        if found.is_null() {
+            return Vec::new();
+        }
+
+        let field = |pointer: *const libc::c_char| {
+            // SAFETY: getpwuid_r found an entry, so its string fields are
+            // NUL-terminated within the buffer, which is still alive.
+
+            unsafe { std::ffi::CStr::from_ptr(pointer) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        let (home, name) = (field(entry.pw_dir), field(entry.pw_name));
+
+        [("HOME", home), ("USER", name.clone()), ("LOGNAME", name)]
+            .into_iter()
+            .filter(|(_, value)| !value.is_empty())
+            .map(|(variable, value)| (variable.to_owned(), value))
+            .collect()
     }
 
     /// Whether this process may switch to another user.
@@ -891,6 +1003,8 @@ impl HostProcess {
             .arg(spec.shutdown_timeout.as_secs_f64().to_string())
             .arg("--websocket-drain-grace")
             .arg(spec.websocket_drain_grace.as_secs_f64().to_string())
+            .arg("--exit-grace")
+            .arg(spec.exit_grace.as_secs_f64().to_string())
             .arg("--loop-stall-timeout")
             .arg(spec.loop_stall_timeout.as_secs_f64().to_string())
             .arg("--gil-stall-timeout")
@@ -950,15 +1064,30 @@ impl HostProcess {
             command.current_dir(dir);
         }
 
+        // Section 8.2: where bytecode goes, when it is not left to Python.
+        // The release's setting holds whatever the daemon inherited, but
+        // its own environment may still turn bytecode off.
+
+        if spec.clean_env {
+            command.env_clear();
+        }
+
+        for name in crate::commands::not_inherited(spec.bytecode) {
+            command.env_remove(name);
+        }
+
         command.envs(spec.env.iter().map(|(name, value)| (name, value)));
 
-        // Section 8.2: where bytecode goes, when it is not left to Python.
+        // Section 11.7: the release's variables whose values debug
+        // inspect shows, beside Muru's own and the interpreter's.
+
+        command.env(SHOWN_ENV_VARIABLE, spec.shown_env.join(","));
 
         if let Some(prefix) = &spec.pycache_prefix {
             command.env("PYTHONPYCACHEPREFIX", prefix);
         }
 
-        if spec.no_bytecode {
+        if spec.bytecode == Some(muru_config::Bytecode::Off) {
             command.env("PYTHONDONTWRITEBYTECODE", "1");
         }
 
@@ -1211,17 +1340,25 @@ impl HostProcess {
     /// Stop the host: SIGTERM and its stdin closed, then SIGKILL after a
     /// grace period. Its workers finish the requests they are serving.
     /// Stop the host and its workers. The host gives its workers `budget`,
-    /// the WebSockets' grace and the shutdown timeout, before it kills
+    /// the WebSockets' grace, the shutdown timeout and the exit grace, before it kills
     /// them, and is itself killed if it has not exited `STOP_MARGIN`
     /// after that.
     pub async fn stop(self, budget: Duration) {
-        self.stop_until(Instant::now() + budget + STOP_MARGIN).await;
+        self.stop_until(Instant::now() + budget + STOP_MARGIN, None)
+            .await;
     }
 
     /// Stop the host as `stop` does, killing it at `kill_at` if it is
     /// still there: for a shutdown that has a budget of its own (section
-    /// 13.3), which may be shorter than the workers' stop budget.
-    pub async fn stop_until(mut self, kill_at: Instant) {
+    /// 13.3), which may be shorter than the workers' stop budget. With
+    /// `workers_by`, the host is told when the shutdown wants its workers
+    /// gone, which it tells each of them, so that a worker told to stop
+    /// late in a shutdown still leaves itself the exit grace.
+    pub async fn stop_until(mut self, kill_at: Instant, workers_by: Option<Instant>) {
+        if let Some(workers_by) = workers_by {
+            self.tell_stop_by(workers_by);
+        }
+
         if let Some(pid) = self.pid() {
             // SAFETY: kill(2) with a valid pid and signal has no memory-safety
             // preconditions; the pid is a host this daemon started or adopted.
@@ -1260,6 +1397,28 @@ impl HostProcess {
         }
 
         let _ = std::fs::remove_dir_all(&self.run_dir);
+    }
+
+    /// Write when the workers must be gone where the host looks for it, by
+    /// the clock both sides read. Before the signal, so the host finds it
+    /// whenever the signal lands. A host that cannot read it stops by its
+    /// own budget and is killed at the shutdown's deadline.
+    fn tell_stop_by(&self, workers_by: Instant) {
+        let at = SystemTime::now() + workers_by.saturating_duration_since(Instant::now());
+        let path = self.run_dir.join(STOP_BY_FILE);
+        let Ok(since_epoch) = at.duration_since(SystemTime::UNIX_EPOCH) else {
+            return;
+        };
+
+        if let Err(error) = std::fs::write(&path, since_epoch.as_millis().to_string()) {
+            tracing::warn!(%error, "could not tell the host when its workers must be gone");
+            return;
+        }
+
+        // The host may run as another user than this process.
+
+        let permissions = std::os::unix::fs::PermissionsExt::from_mode(0o644);
+        let _ = std::fs::set_permissions(&path, permissions);
     }
 
     /// Leave the host running and forget it, for a daemon that detaches.

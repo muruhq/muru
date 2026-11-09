@@ -11,7 +11,7 @@ runs:
 
 | Field | Value |
 | --- | --- |
-| `app` | The application name as `muructl deploy` gave it; under `muructl run` the name the terminal and the commands use, the entrypoint's top-level module with underscores as hyphens, so `shop_site.wsgi:application` is `shop-site` |
+| `app` | The application name as `muructl deploy` gave it; under `muructl run` and `muructl serve` the name the terminal and the commands use: `--name` (or `MURU_SERVE_NAME` for `muructl serve`) when given, else `[project] name` from the project's `pyproject.toml`, with underscores and dots as hyphens, else the entrypoint's top-level module with underscores as hyphens, so `shop_site.wsgi:application` is `shop-site` |
 | `release` | The release identifier; under `muructl run` the one the terminal names, `r1`, then `r2` after a reload |
 | `group` | The worker group; `default` until worker groups arrive |
 | `worker_id` | The worker's index from 0, or `None` in the host (and outside Muru) |
@@ -35,7 +35,7 @@ return value is ignored.
 | `post_fork(context)` | In each worker, right after the fork |
 | `on_ready(context)` | In each worker, after `post_fork`, before it accepts requests |
 | `on_drain(context)` | In each worker when it is told to stop, before requests in flight finish |
-| `on_exit(context)` | In each worker after its last request, before it exits |
+| `on_exit(context)` | In each worker after its last request and lifespan shutdown, before its `atexit` callbacks |
 | `on_reopen_logs(context)` | In each worker that receives SIGUSR1 |
 
 With per-worker imports (preload `false`, or the fallback when the import

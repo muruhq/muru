@@ -94,6 +94,80 @@ impl HostLink {
     }
 }
 
+/// The events a run keeps for `muructl events` (section 13.1): the last
+/// `KEPT` its hosts raised, numbered from 1 as the daemon numbers its
+/// own, in memory for the run's life, across reloads, and sent to each
+/// watcher as they happen.
+pub struct RunEvents {
+    kept: Mutex<(u64, std::collections::VecDeque<pb::Event>)>,
+    sender: broadcast::Sender<pb::Event>,
+}
+
+impl Default for RunEvents {
+    fn default() -> Self {
+        Self {
+            kept: Mutex::new((0, std::collections::VecDeque::with_capacity(Self::KEPT))),
+            sender: broadcast::channel(Self::KEPT).0,
+        }
+    }
+}
+
+impl RunEvents {
+    /// How many events are kept, the oldest going first.
+    pub const KEPT: usize = 256;
+
+    /// Record an event and tell the watchers.
+    pub fn record(&self, kind: &str, subject: &str, level: &str, message: &str) {
+        let level = match level {
+            "error" | "warning" | "notice" => level,
+            _ => "info",
+        };
+
+        let event = {
+            let mut kept = self.kept.lock().expect("run events poisoned");
+            kept.0 += 1;
+            let event = pb::Event {
+                sequence: kept.0,
+                time_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as u64),
+                r#type: kind.to_owned(),
+                subject: subject.to_owned(),
+                level: level.to_owned(),
+                message: message.to_owned(),
+            };
+
+            if kept.1.len() == Self::KEPT {
+                kept.1.pop_front();
+            }
+
+            kept.1.push_back(event.clone());
+            event
+        };
+
+        let _ = self.sender.send(event);
+    }
+
+    /// The events kept after a sequence number, oldest first, at most
+    /// `limit` of them.
+    pub fn after(&self, after: u64, limit: usize) -> Vec<pb::Event> {
+        self.kept
+            .lock()
+            .expect("run events poisoned")
+            .1
+            .iter()
+            .filter(|event| event.sequence > after)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// Watch for events from now on.
+    pub fn subscribe(&self) -> broadcast::Receiver<pb::Event> {
+        self.sender.subscribe()
+    }
+}
+
 /// What the service answers from: the run's facts, the edge's counters
 /// and logs, and the host's control connection.
 pub struct RunState {
@@ -128,6 +202,8 @@ pub struct RunState {
     /// The commands running through the admin socket, which the run's
     /// shutdown stops and waits for.
     pub commands: muru_controller::commands::Underway,
+    /// The events the run's hosts raised.
+    pub events: Arc<RunEvents>,
 }
 
 /// What the run serves the application with, which a command of the
@@ -484,10 +560,12 @@ impl Registration {
             listen: listen.to_string(),
             socket: socket.to_path_buf(),
         };
-        std::fs::write(
-            socket.with_file_name("serve.json"),
-            serde_json::to_vec(&info)?,
-        )?;
+        let registration = socket.with_file_name("serve.json");
+        std::fs::write(&registration, serde_json::to_vec(&info)?)?;
+
+        // Section 13.9: any user ID with the group may use the serve.
+
+        crate::serve::group_writable(&registration, 0o660);
         Ok(Self {
             directory: None,
             socket: socket.to_path_buf(),
@@ -550,6 +628,11 @@ pub async fn serve(
             socket.display()
         )
     })?;
+
+    // Whoever may enter its directory may connect: only the owner for a
+    // run, the group as well under muructl serve (section 13.9).
+
+    crate::serve::group_writable(&socket, 0o770);
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
     let service = AdminServer::new(Service { state });
 
@@ -686,6 +769,7 @@ impl Admin for Service {
             app: state.app.clone(),
             release: state.release_id(),
             project: state.project.display().to_string(),
+            no_host: String::new(),
         }))
     }
 
@@ -978,16 +1062,50 @@ impl Admin for Service {
 
     async fn list_events(
         &self,
-        _: Request<pb::ListEventsRequest>,
+        request: Request<pb::ListEventsRequest>,
     ) -> Result<Response<pb::ListEventsResponse>, Status> {
-        Err(self.events_are_printed())
+        let request = request.into_inner();
+
+        let limit = if request.limit == 0 {
+            100
+        } else {
+            request.limit as usize
+        };
+
+        Ok(Response::new(pb::ListEventsResponse {
+            events: self.state.events.after(request.after, limit),
+        }))
     }
 
     async fn watch_events(
         &self,
-        _: Request<pb::WatchEventsRequest>,
+        request: Request<pb::WatchEventsRequest>,
     ) -> Result<Response<EventStream>, Status> {
-        Err(self.events_are_printed())
+        // Subscribe first, then read what is kept, so nothing between the
+        // two is missed; an event in both is sent once, by its sequence.
+
+        let live = self.state.events.subscribe();
+        let kept = self
+            .state
+            .events
+            .after(request.into_inner().after, RunEvents::KEPT);
+        let last = kept.last().map_or(0, |event| event.sequence);
+
+        let first = tokio_stream::iter(kept.into_iter().map(Ok));
+        let rest = futures::stream::unfold((live, last), |(mut live, last)| async move {
+            loop {
+                match live.recv().await {
+                    Ok(event) if event.sequence > last => {
+                        let next = event.sequence;
+                        return Some((Ok(event), (live, next)));
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        });
+        let stream: EventStream = Box::pin(tokio_stream::StreamExt::chain(first, rest));
+        Ok(Response::new(stream))
     }
 
     needs_the_daemon! {
@@ -1027,12 +1145,34 @@ impl Admin for Service {
     }
 }
 
-impl Service {
-    /// Why `muructl events` is refused: a run prints its events.
-    fn events_are_printed(&self) -> Status {
-        Status::failed_precondition(format!(
-            "a development run keeps no event log: the events of {} are printed to its terminal",
-            self.state.app
-        ))
+#[cfg(test)]
+mod tests {
+    use super::RunEvents;
+
+    #[test]
+    fn the_ring_keeps_the_last_events_numbered_from_one() {
+        let events = RunEvents::default();
+
+        for index in 0..RunEvents::KEPT + 4 {
+            events.record(
+                "worker.started",
+                "shop@r1",
+                "debug",
+                &format!("event {index}"),
+            );
+        }
+
+        let kept = events.after(0, 1000);
+        assert_eq!(kept.len(), RunEvents::KEPT);
+        assert_eq!(kept[0].sequence, 5);
+        assert_eq!(kept[0].level, "info");
+        assert_eq!(kept.last().map(|event| event.sequence), Some(260));
+
+        let later = events.after(258, 1000);
+        assert_eq!(
+            later.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            [259, 260]
+        );
+        assert_eq!(events.after(0, 3).len(), 3);
     }
 }

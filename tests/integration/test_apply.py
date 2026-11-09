@@ -408,6 +408,52 @@ def test_an_apply_waits_for_the_one_under_way(daemon: Daemon, tmp_path: Path) ->
     assert json.loads(response.body)["release"] == "r1"
 
 
+def test_an_apply_whose_client_goes_away_is_still_undone(daemon: Daemon, tmp_path: Path) -> None:
+    # Issue #471: an apply finishes in the daemon when the muructl that
+    # gave it is killed while its releases start, so a release that does
+    # not start is still undone.
+
+    slow = tmp_path / "slow"
+    slow.mkdir()
+    (slow / "app.py").write_text(
+        "import time\n\ntime.sleep(2)\nraise RuntimeError('this release never starts')\n"
+    )
+    config = tmp_path / "shop.toml"
+    config.write_text(release("shop", "r1"))
+    assert apply(daemon, config).returncode == 0
+    config.write_text(
+        release("shop", "r1") + release("shop", "r2", source=slow, entrypoint="app:application")
+    )
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    socket = str(daemon.run_dir / "admin.sock")
+    client = subprocess.Popen(
+        [muructl, "apply", "-f", str(config), "--socket", socket],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    try:
+        deadline = time.monotonic() + 10
+
+        while "shop@r2" not in {row["release"] for row in daemon.releases()}:
+            assert client.poll() is None, "the apply ended before shop@r2 was recorded"
+            assert time.monotonic() < deadline, "shop@r2 was never recorded"
+            time.sleep(0.05)
+    finally:
+        client.kill()
+        client.wait()
+
+    deadline = time.monotonic() + 30
+
+    while "config.apply_failed" not in daemon.events():
+        assert time.monotonic() < deadline, daemon.muructl("events").stdout
+        time.sleep(0.2)
+
+    assert daemon.releases() == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
+
+
 def test_prune_removes_what_the_files_no_longer_contain(daemon: Daemon, tmp_path: Path) -> None:
     config = tmp_path / "shop.toml"
     config.write_text(release("shop", "r1") + release("shop", "r2"))
@@ -538,6 +584,10 @@ def test_a_directory_of_files_with_relative_sources(daemon: Daemon, tmp_path: Pa
     (config / "20-factory.toml").write_text(
         release("factory", "r1", source=FACTORY, interface="wsgi")
     )
+    (config / "30-hosts.toml").write_text(
+        "[host.shop]\nnames = ['shop.test']\n\n[[route]]\nhost = 'shop'\napp = 'shop'\n\n"
+        "[host.factory]\nnames = ['factory.test']\n\n[[route]]\nhost = 'factory'\napp = 'factory'\n"
+    )
     (config / "notes.txt").write_text("not configuration\n")
 
     applied = apply(daemon, config)
@@ -550,7 +600,7 @@ def test_a_directory_of_files_with_relative_sources(daemon: Daemon, tmp_path: Pa
 
     # Listeners and limits in an applied file are reported, not applied.
 
-    (config / "30-node.toml").write_text("[[listener]]\naddress = '127.0.0.1:9999'\n")
+    (config / "40-node.toml").write_text("[[listener]]\naddress = '127.0.0.1:9999'\n")
     warned = apply(daemon, config)
     assert warned.returncode == 0, warned.stdout + warned.stderr
     assert "warning: [[listener]] entries belong in the daemon configuration file" in warned.stdout
@@ -708,6 +758,17 @@ def test_a_frozen_worker_does_not_hold_up_other_applications(daemon: Daemon) -> 
     assert daemon.deploy("shop", SHOP, "--processes", "2") == (
         "muru: release shop@r1 is ready and serving"
     )
+
+    # The first host lets the second application serve; the route to it
+    # comes with the change the frozen worker must not hold up.
+
+    site = daemon.base / "frozen"
+    site.mkdir()
+    (site / "first.toml").write_text(
+        "[host.shop]\nnames = ['shop.test']\ndefault = true\n\n"
+        "[[route]]\nhost = 'shop'\napp = 'shop'\n"
+    )
+    daemon.muructl("apply", "-f", str(site / "first.toml"))
     assert daemon.deploy("other", SHOP, "--processes", "1") == (
         "muru: release other@r1 is ready and serving"
     )
@@ -720,8 +781,6 @@ def test_a_frozen_worker_does_not_hold_up_other_applications(daemon: Daemon) -> 
     os.kill(frozen, signal.SIGSTOP)
 
     try:
-        site = daemon.base / "frozen"
-        site.mkdir()
         (site / "site.toml").write_text(
             """[host.shop]
 names = ['shop.test']

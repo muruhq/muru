@@ -11,7 +11,7 @@ muructl run app:application --timeout deadline=30s --timeout queue=2s
 | Name | Default | Measured | When it fires |
 | --- | --- | --- | --- |
 | `header_read` | 30s | from the connection's first byte to a complete request head | the connection is closed |
-| `queue` | 5s | from arrival to a worker thread picking the request up | 503 `queue_full` with `Retry-After: 1` |
+| `queue` | 5s | from arrival to a worker thread picking the request up | 503 `queue_full` with `Retry-After: 1`, or `cold_start_timeout` when the group had no worker and none started |
 | `deadline` | 300s | from arrival to the response head | 504 `deadline`; the worker is told to abandon the request |
 | `body_idle` | 60s | between two chunks of a streamed request body | 408 `client_timeout` if no response has started |
 | `response_idle` | 60s | between two chunks of a streamed response | the response is cut off and the connection closed |
@@ -129,7 +129,23 @@ are.
 
 A request past its deadline keeps running in the worker after the client
 has been answered, unless a soft timeout interrupts it or a hard timeout
-replaces its worker. Both are off by default. The application can see
+replaces its worker. Both are off by default.
+
+The host raises the event `request.past_deadline` (warning) once for
+each such request, within a second or two of its deadline, naming the
+worker and the request:
+
+```
+request.past_deadline: worker 0 (pid 41213): request 01J9Z3 GET /report is past its deadline, 300.0 s after the worker took it; the client was answered 504 and the request goes on in the worker
+```
+
+`muructl requests --list` no longer lists a request the client has been
+answered for, but its thread is still held: `muructl debug status`
+counts it under THREADS and THREAD-OLDEST, and `muructl debug stacks`
+shows where it is. A streaming response or a WebSocket, which the
+deadline stops bounding once the response starts, raises no event.
+
+The application can see
 the deadline coming: `environ["muru.deadline"]`, or `deadline` in an
 ASGI scope's `extensions["muru"]`, is when the edge gives up, in seconds
 since the epoch, so a handler can skip work it has no time left for:
@@ -211,7 +227,8 @@ a `worker.timeout_killed` event records what happened.
 | `hard` | off | from the request reaching the worker | the worker is replaced |
 | `hard_drain_grace` | 10s | from the worker leaving routing | the worker is told to stop |
 | `websocket_drain_grace` | 0s | from the worker being told to stop | its open WebSockets are closed with 1001 |
-| `shutdown` | 5s | from the worker's WebSockets being closed | the worker is killed |
+| `shutdown` | 5s | from the worker's WebSockets being closed | the worker stops waiting for its requests |
+| `exit_grace` | 2s | from the worker no longer waiting for its requests | the worker is killed |
 
 ```
 muructl run app:application --timeout hard=60s
@@ -228,6 +245,7 @@ hard_timeout = "60s"
 hard_drain_grace = "10s"
 websocket_drain_grace = "0s"
 shutdown_timeout = "5s"
+exit_grace = "2s"
 loop_stall_timeout = "10s"
 gil_stall_timeout = "30s"
 ```
@@ -256,9 +274,29 @@ the `on_drain` hook. Its open WebSockets keep running for
 server is going away"): the application's handler gets
 `websocket.disconnect` with 1001, the client gets the same code and can
 reconnect to the release that serves, and the close is counted as
-`drained`. What is still running then gets `shutdown_timeout` before the
-host kills the worker, so a worker is gone at most
-`websocket_drain_grace` plus `shutdown_timeout` after it was told to stop.
+`drained`. What is still running then gets `shutdown_timeout`. When that
+is up, the worker stops waiting for its requests and does its shutdown
+work: lifespan shutdown, the `on_exit` hook and the callbacks registered
+with `atexit`. `exit_grace` is the time for that work. It is added to the other two and it always applies, so a
+worker is gone at most `websocket_drain_grace` plus `shutdown_timeout`
+plus `exit_grace` after it was told to stop, and the host kills it if it
+is still there then. A worker that finishes sooner exits sooner, and
+time its requests did not use is there for its shutdown work too.
+
+`shutdown_timeout` covers the worker's threads as it does its event
+loop. A thread still running a request when it is up is left behind and
+ends with the worker.
+
+Stopping as part of a whole shutdown, a worker can be told to stop with
+less than its budget left: the edge has already waited for the requests,
+inside the shutdown's own budget. The host tells it how long it has, and
+the worker stops waiting for its requests in time to leave `exit_grace`
+for its shutdown work, so that work still runs.
+
+An application whose lifespan shutdown does not finish before the worker
+would be killed gets a line in the log saying that it did not complete
+lifespan shutdown in time, and its task is cancelled. The `on_exit` hook
+then still runs.
 
 A grace longer than nothing lets a socket finish what it is doing, such
 as a message being sent; most clients reconnect on 1001 at once, so the

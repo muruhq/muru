@@ -164,10 +164,44 @@ scheduled from another thread waited to run.
 
 Each worker's interpreter and executable, working directory, `sys.path`,
 the modules loaded with versions where they declare one, threads, open
-descriptors and environment. The value of a key that looks like a
-secret (`SECRET`, `TOKEN`, `PASSWORD`, `KEY`, `CREDENTIAL` or `AUTH` in
-its name, or a name ending in `_DSN`) is replaced by `***`, and a
-password in a URL under any other key is: `DATABASE_URL` holding
+descriptors and environment.
+
+The environment lists every variable's name, and gives values only for
+these:
+
+- the variables Muru sets, whose names start with `MURU_`;
+
+- the interpreter's: `PATH`, `VIRTUAL_ENV`, `LANG`, `TZ`, and names
+  starting with `PYTHON` or `LC_`;
+
+- the release's own, from `[tool.muru.env]` and `muructl deploy --env`,
+  except a value that comes from a secret store. A secret delivered as
+  a file shows its `NAME_FILE` path;
+
+- under the daemon, what it passes on: `HOME`, `USER`, `LOGNAME` (the
+  release's own user's, when it runs as another user), `TMPDIR` and the
+  variables `[daemon] pass_env` names.
+
+Every other variable is named without its value. Under `muructl run`
+and `muructl serve`, which keep the environment they were started with,
+that is most of them:
+
+```
+  environment (64 values left out; --env shows them):
+    DATABASE_URL=postgres://shop:***@db/shop
+    HOME
+    MURU_APP=shop
+    PATH=/usr/bin:/bin
+    SENTRY_ENVIRONMENT
+```
+
+`muructl debug inspect --env` shows every variable's value. In `--json`,
+a value left out is `null`.
+
+Either way, the value of a key that looks like a secret (`SECRET`,
+`TOKEN`, `PASSWORD`, `KEY`, `CREDENTIAL` or `AUTH` in its name, or a
+name ending in `_DSN`) is replaced by `***`, and a password in a URL
+under any other key is: `DATABASE_URL` holding
 `postgres://shop:hunter2@db/shop` is shown as
 `postgres://shop:***@db/shop`.
 
@@ -278,11 +312,16 @@ A collection pauses the whole worker, so pauses that landed on requests
 in flight are tail latency no single endpoint explains. The same figures
 are in the [metrics](metrics.md) as `muru_gc_pause_seconds`, and the
 [scaling](scaling.md) diagnosis names collection when it takes a tenth of
-the workers' time or more. The host already calls `gc.freeze()` before
-every fork, so a worker's collections scan only what the worker itself
-created; an application whose collections still cost it can create fewer
-long-lived cyclic objects after the fork, or call `gc.freeze()` itself once
-its caches are warm.
+the workers' time or more. Young collections that each free many objects
+are clearing short-lived reference cycles, such as two objects that
+refer to each other made for every request; the diagnosis says so, and
+breaking the cycle, or making the reference back a `weakref`, takes that
+collection away. Collections that free few objects are going over
+long-lived ones. The host already calls `gc.freeze()` before every fork,
+so a worker's collections scan only what the worker itself created; an
+application whose collections still cost it can create fewer long-lived
+cyclic objects after the fork, or call `gc.freeze()` itself once its
+caches are warm.
 
 ## Running code
 
@@ -400,6 +439,9 @@ lost the evidence:
 
 - `request.soft_timeout`: a request past the [soft timeout](timeouts.md),
   with where its thread was, taken before the timeout interrupted it.
+- `request.past_deadline`: a request still running after the edge
+  answered it 504 at its [deadline](timeouts.md#past-the-deadline);
+  `debug stacks` shows where it is.
 - `worker.timeout_killed`: a worker replaced for the hard timeout, after
   `worker.loop_stalled` or `worker.gil_stalled`, or because its reports
   stopped, with where its oldest request was. Its threads' stacks go to
@@ -426,12 +468,22 @@ changed this way revert when the period ends, on `--reset`, and when the
 worker is replaced, since a new worker starts from the release's
 [logging defaults](logging.md).
 
+A reply is held to 256 MiB. Past that, the command says the reply was
+too large and to ask one worker with `--worker`, or a shorter `--for`
+for `profile`, or a smaller `--top` for `trace` and `memory`.
+
 ## How it reaches the worker
 
 Every worker has a control connection to its host, created at fork, and
 the host has one to the daemon. A request travels daemon to host to
 worker, where a thread of the runtime library takes it, attaches to the
-interpreter only to answer, and sends the answer back the same way. The
-daemon never reaches into a worker process directly, which is what lets
+interpreter only to answer, and sends the answer back the same way. A
+`profile`, a `trace` or a `memory --trace` runs its period, and an
+`exec` its code, on a thread of its own, so the worker goes on answering
+`status` and `stacks`, and giving up requests stuck past the hard
+timeout, while one runs. A worker runs one of them at a time, and
+refuses a second with a message saying that another is running. A
+profile read from outside the worker takes no thread of the worker and
+is not counted. The daemon never reaches into a worker process directly, which is what lets
 the same commands work on a release running as another user, and on
 an application in a container under `muructl serve`.

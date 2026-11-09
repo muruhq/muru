@@ -122,7 +122,7 @@ muructl events
 ```
     27 09:56:32 notice   rollout.started      hello@r4                 rollout 1 against r1: 10% for 30s, 50% for 30s
     28 09:56:38 warning  rollout.gate_failed  hello@r4                 step 1 at 10%: 5xx rate 24.53% over the limit of 1.00% (baseline 0.00%)
-    29 09:56:38 warning  rollout.rolled_back  hello@r4                 rollout 1: gate failed at 10%: 5xx rate 24.53% over the limit of 1.00% (baseline 0.00%); the candidate is kept warm
+    29 09:56:38 warning  rollout.rolled_back  hello@r4                 rollout 1: gate failed at 10%: 5xx rate 24.53% over the limit of 1.00% (baseline 0.00%); the candidate is kept for inspection
 ```
 
 A gate only fails when the candidate is worse than the baseline over the

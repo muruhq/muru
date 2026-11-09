@@ -8,7 +8,7 @@
 //! budget for the whole shutdown; the defaults suit `docker stop`'s ten
 //! seconds.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Set in the environment of the command the built-in init runs for a
 /// container's PID 1 (section 6.10), so the daemon knows what it is.
@@ -18,9 +18,22 @@ pub const UNDER_INIT: &str = "MURU_UNDER_INIT";
 /// under the ten seconds `docker stop` gives before SIGKILL.
 pub const DEFAULT_BUDGET: Duration = Duration::from_secs(8);
 
+/// What a shutdown keeps at the end of its budget for the edge to stop,
+/// after the workers have gone.
+pub const EDGE_RESERVE: Duration = Duration::from_secs(1);
+
 /// What the drain of the requests in flight leaves of the budget for the
-/// workers and the edge, however long the requests run.
-pub const WORKERS_RESERVE: Duration = Duration::from_secs(1);
+/// workers' shutdown work and the edge, however long the requests run.
+/// With releases of different settings `exit_grace` is the largest.
+pub fn drain_reserve(exit_grace: Duration) -> Duration {
+    exit_grace + EDGE_RESERVE
+}
+
+/// When a shutdown ending at `deadline` wants every worker gone, which
+/// leaves the edge its moment after them.
+pub fn workers_deadline(deadline: Instant) -> Instant {
+    deadline.checked_sub(EDGE_RESERVE).unwrap_or(deadline)
+}
 
 /// Whether this process is a container's main process: PID 1 itself, or
 /// the command the built-in init runs for PID 1.
@@ -133,9 +146,9 @@ fn seconds(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use super::{OnSigterm, Policy};
+    use super::{OnSigterm, Policy, drain_reserve, workers_deadline};
 
     fn table(
         on_sigterm: Option<&str>,
@@ -183,6 +196,20 @@ mod tests {
         let policy = Policy::from_table(Some(&detach), true).unwrap();
         assert_eq!(policy.on_sigterm, OnSigterm::Detach);
         assert_eq!(policy.describe(), "SIGTERM detaches, delay 0s, budget 8s");
+    }
+
+    #[test]
+    fn the_reserve_leaves_the_workers_exit_grace_and_the_edge_a_moment() {
+        assert_eq!(
+            drain_reserve(Duration::from_secs(2)),
+            Duration::from_secs(3)
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        assert_eq!(
+            deadline.duration_since(workers_deadline(deadline)),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]

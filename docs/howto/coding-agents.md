@@ -35,13 +35,27 @@ as `muructl up` does, so the first tool call works on a fresh checkout.
 `--socket`, `--system` and the location options choose another daemon, as
 for any command.
 
+The server writes to standard error, which the client keeps as the
+server's log, one line when it starts, naming what it serves and how
+many tools it offers, and a warning for each call it refuses:
+
+```
+muru: MCP server for the daemon at /run/user/501/muru/admin.sock: 30 tools (15 with --read-only)
+muru: warning: refused a call to deploy: the server is read-only
+```
+
+`MURU_LOG` sets what else is written there, as for any `muructl`
+command; `MURU_LOG=info,rmcp=debug` adds the MCP library's own messages.
+
 A [development run](run-settings.md) started from the same directory is
 found first, as it is for every command. Its admin socket answers
 `status`, `events`, `logs`, `metrics`, `websockets` and `debug`, and
 `commands` and `run_command` for [the project's own
 commands](commands.md#the-projects-own-commands) with the run's
 application as the target, but not the lists or a deploy; stop it, or
-give `--socket` the daemon's socket, when the agent is to deploy.
+give `--socket` the daemon's socket, when the agent is to deploy. The
+run's `events` are those its workers raised since it started, reloads
+included, [kept in memory](events.md#the-event-stream), the last 256.
 
 ## The development loop
 
@@ -114,6 +128,14 @@ only the commands an application declares.
 Both are enforced by the server: a tool left out is not listed and cannot
 be called.
 
+`debug` with `inspect` is a tool that reads, so it is offered under
+`--read-only` too. It returns the names of every environment variable
+of the release's workers, and values only for Muru's own, the
+interpreter's and the release's, masked where they look like secrets
+(see [inspect](debugging.md#inspect)). It never returns the other
+values: `muructl debug inspect --env`, which shows them, is for a
+person at a terminal and is not offered as a tool.
+
 Whoever launches the server has the access the admin socket gives, which
 for a developer's own user daemon is everything. Do not point an agent at a
 shared system daemon unless that is intended.
@@ -128,12 +150,27 @@ and lives in the project, so it travels with the code:
 ```
 muructl mcp skill install          # writes .claude/skills/muru/SKILL.md
 muructl mcp skill install --dir .agents/skills    # another client's skills directory
-muructl mcp skill status           # current, missing or out of date; exits 1 unless current
+muructl mcp skill status           # current, missing, out of date or edited; exits 1 unless current
 muructl mcp skill print            # the skill on standard output
 ```
 
 Commit the skill with the project. After upgrading `muructl`, run `install`
-again; `status` in a `just` recipe or CI says when that is due. The MCP
+again; `status` in a `just` recipe or CI says when that is due.
+
+The skill records a hash of its text, so `status` tells a copy with local
+changes from one an older `muructl` wrote:
+
+```
+muru: the skill at .claude/skills/muru/SKILL.md is from muructl 1.0.0; this is muructl 1.1.0, and `muructl mcp skill install` updates it
+muru: the skill at .claude/skills/muru/SKILL.md has local changes to the skill for muructl 1.1.0; `muructl mcp skill install --force` replaces them
+```
+
+`install` refuses to overwrite a copy with local changes unless given
+`--force`, and then says it replaced them. The Muru skill is replaced on
+every upgrade, so keep the project's own notes for the agent in a skill
+of their own (`.claude/skills/shop/SKILL.md`, say) or in `CLAUDE.md`.
+
+The MCP
 server checks too: when the project's copy is missing or differs from the
 `muructl` serving it, the instructions it gives the agent at the start of
 a session say so and name the command, and the `skill_status` tool answers

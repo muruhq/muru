@@ -9,6 +9,113 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a21 (2026-11-09)
+
+### Added
+
+- Added the event `request.past_deadline`, which the host raises once for each request still running in its worker after the edge has answered it 504 at its deadline. The coding agents skill now says that with the default timeouts a hung request is not ended, and sends the agent to `requests` and `debug stacks` when a test fails. ([#463](https://github.com/muruhq/muru/issues/463))
+- A preview naming a release the route does not have, a retained release among them, now answers with the response header `muru-preview: ignored`. ([#464](https://github.com/muruhq/muru/issues/464))
+- `muructl serve` logs a line at SIGTERM and when the listener closes,
+  with `serve.stopping` and `serve.draining` as their `kind` in JSON logs. ([#465](https://github.com/muruhq/muru/issues/465))
+- A development run (`muructl run`) and `muructl serve` now answer `muructl events`, with `--after` and `--follow`, from the last 256 events their hosts raised, kept in memory across reloads, so the MCP `events` tool works against a run too. ([#470](https://github.com/muruhq/muru/issues/470))
+- Added the `exit_grace` setting in `timeouts`, 2 seconds by default and set for a whole release. A worker told to stop now has this long for its shutdown work once its requests have had `websocket_drain_grace` and `shutdown_timeout`, so a request that outlasts the drain no longer cuts off lifespan shutdown and the `on_exit` hook. ([#497](https://github.com/muruhq/muru/issues/497))
+- Added `muructl run --env-file FILE` and `env_file` in the run settings, which give a development run the variables of a `.env` file over `[tool.muru.env]`. A file is only read when one of them names it. ([#506](https://github.com/muruhq/muru/issues/506))
+
+### Changed
+
+- `muructl mcp skill status` now tells a copy of the skill with local changes (`edited`) from one an older `muructl` wrote (`out_of_date`), and `muructl mcp skill install` refuses to overwrite local changes unless given `--force`, saying what it replaced. ([#463](https://github.com/muruhq/muru/issues/463))
+- The `WORKERS` column of `muructl release list` shows the workers running now beside the shape the release asks for, such as `2 (2x4)`, `0 (1x4)` at zero and `- (1x4)` when no host runs. ([#464](https://github.com/muruhq/muru/issues/464))
+- `muructl run` and `muructl serve` name the application after `[project]
+  name` in `pyproject.toml` when there is one, else the entrypoint's
+  top-level module as before, and `--name` (with `MURU_SERVE_NAME` under
+  serve) sets it. ([#465](https://github.com/muruhq/muru/issues/465))
+- A worker replaced for memory while less is left under the container's
+  limit than one worker's hard limit stops before its replacement is
+  forked, so two large workers are not alive at once. ([#465](https://github.com/muruhq/muru/issues/465))
+- Muru no longer guesses which application takes the requests when no hosts are declared. One application serving takes every request. An action that would make a second application serve with no hosts is refused, with a host and a route for each application to paste, and `--hold` still works. If several applications serve with no hosts anyway, every request is answered 421 with the reason `no_host`, with a `routing.no_host` event and a line in `muructl status`. The stored default application is gone. ([#469](https://github.com/muruhq/muru/issues/469))
+- Under the daemon, a release's host, workers, commands and managed servers now start from a clean environment: what Muru sets, a small base from the daemon's own environment, the variables `[daemon] pass_env` names, and what the release declares. A release relying on a variable it inherited from the daemon's environment must now declare it or have the daemon's file pass it through. `muructl run` and `muructl serve` keep the environment they were started with. ([#475](https://github.com/muruhq/muru/issues/475))
+- A worker told to stop now gives up on a request stuck on a WSGI thread at the end of `shutdown_timeout`, as it does on the event loop, so its shutdown work still runs. ([#497](https://github.com/muruhq/muru/issues/497))
+
+### Fixed
+
+- The node's workers limit no longer holds back a wake from zero. A
+  release whose host was kept used to be refused its one worker when the
+  node was full, while one whose host had stopped was started over the
+  limit. Both wakes now go ahead, a wake that takes the node over the limit
+  stops retained releases, oldest first, to make room, and the memory limit
+  applies to both, including the cold wake that skipped it before. ([#461](https://github.com/muruhq/muru/issues/461))
+- The access log now records the time a request waited for a worker on a
+  503 `queue_full` or `no_workers`, as `queue_ms` and `queue=`, where it
+  used to log a queue time of 0. ([#461](https://github.com/muruhq/muru/issues/461))
+- A request held for a group with no workers, scaled to zero, starting its
+  host or waiting for an optional group's workers, is now answered 503
+  `cold_start_timeout` when its queue timeout passes, with a body saying no
+  worker had started. It used to be `queue_full`, which says every worker
+  stayed busy, and read as overload in the access log. ([#461](https://github.com/muruhq/muru/issues/461))
+- `muructl mcp serve` no longer writes the MCP library's start-up and session messages to standard error. It writes one line of its own when it starts, naming what it serves and how many tools it offers, and a plain warning for each tool call it refuses. ([#463](https://github.com/muruhq/muru/issues/463))
+- `muructl deploy --dry-run` now lists the environment variables and secrets the release would get, by name and never by value, each with where it comes from, including `(passed from the daemon)`. ([#464](https://github.com/muruhq/muru/issues/464))
+- Release objects from the admin API, `muructl release list`, `release show`, `deploy --json` and the MCP tools now carry the release's live `workers`, `host_running`, `retained_until_unix_ms` and `detected_interface`, which were empty or zero before. ([#464](https://github.com/muruhq/muru/issues/464))
+- A deploy that fails because the host could not load the application now says why, in the deploy's error, its `--json`, the `release.failed` event and the release's note in `muructl release list`, instead of leaving the reason to `muructl logs`. ([#464](https://github.com/muruhq/muru/issues/464))
+- `muructl serve` creates its admin socket, `serve.json` and `release`
+  directory group-writable, as documented, so another user ID in the same
+  group can use `muructl` in the container. A permission error on the admin
+  socket names the socket and its owner instead of reading "transport error". ([#465](https://github.com/muruhq/muru/issues/465))
+- Workers the kernel kills for memory together are each reported as
+  `worker.oom_killed` and counted once in `muru_worker_exits_total`, as is
+  a worker killed while being replaced, scaled in or starting. ([#465](https://github.com/muruhq/muru/issues/465))
+- The scaling diagnosis and figures are more accurate. A decision made
+  before the workers first report their CPU says it is waiting for that
+  report, instead of calling a CPU-bound release I/O bound. Garbage
+  collection of short-lived reference cycles gets its own diagnosis and
+  advice. A 95th percentile reads as the bucket it fell in (`under 250 ms`,
+  `over 5 s`). Idle workers are shown to two decimal places, and a worker's
+  CPU share is shown as at most 100%. ([#466](https://github.com/muruhq/muru/issues/466))
+- A rollout's candidate that a failing gate or `muructl rollout abort`
+  takes out of traffic is now kept for 10 minutes beside the retained
+  release, noted as kept for inspection and not a rollback target. It used
+  to take the retained release's place for 30 minutes, labelled as a
+  rollback target, so the release a rollback goes to was stopped and had
+  to start from cold. ([#467](https://github.com/muruhq/muru/issues/467))
+- A retained release's note now says what a rollback to it costs, from
+  what it keeps: `a rollback to it is instant` while it keeps workers, `a
+  rollback to it forks a worker` with its host alone, and `a rollback to it
+  waits for its import` when its host had stopped while idle. It used to
+  say instant whatever was kept. By default a group whose `min_workers` is
+  0 now retains no worker, so it holds none of the node's budget; an
+  explicit `--retain-workers` still applies to every group. ([#467](https://github.com/muruhq/muru/issues/467))
+- A worker replaced by the hard timeout counts against a rollout's canary
+  when the host decides to replace it: `worker.timeout_killed` is raised
+  then, no longer when the old worker exits after its drain grace, whose
+  exit is a line in the log. ([#468](https://github.com/muruhq/muru/issues/468))
+- An apply whose `muructl` is interrupted while its releases start is now
+  still finished by the daemon. A release that then failed to start used to
+  stay recorded and held, with no `config.apply_failed` event, because the
+  undo stopped with the client. ([#471](https://github.com/muruhq/muru/issues/471))
+- A daemon started from a shell with `PYTHONDONTWRITEBYTECODE` set no longer
+  turns off the bytecode of releases set to `redirect` or `source`, which
+  used to write none while `muructl release show` reported the cache. A
+  release that sets the variable in its own environment still writes none. ([#473](https://github.com/muruhq/muru/issues/473))
+- A release run as another user under a root daemon now has that user's `HOME`, `USER` and `LOGNAME`, in its host and workers, commands, managed servers and environment builds, rather than root's. `muructl deploy --dry-run` lists them as set by Muru. ([#495](https://github.com/muruhq/muru/issues/495))
+- Fixed callbacks registered with `atexit` never running in a worker. They now run in each worker as it stops, after the `on_exit` hook, and in a worker that fails to start, so a library that flushes on exit no longer loses its last batch. ([#496](https://github.com/muruhq/muru/issues/496))
+- Fixed a whole shutdown leaving workers no time for their shutdown work: the edge now stops waiting for requests `exit_grace` plus one second before the end of the budget, and each worker is told how long it has, so lifespan shutdown and the `on_exit` hook still run in a container with a stuck request. An application whose lifespan shutdown is too slow is now reported in the log instead of ending with no message. ([#497](https://github.com/muruhq/muru/issues/497))
+- Fixed `muructl debug profile`, `trace` and `memory --trace` holding up the worker's control thread for their whole period: the worker now goes on answering `debug status` and `debug stacks`, and giving up requests past the hard timeout, while one runs. A worker runs one such operation at a time and refuses a second with a message saying another is running. ([#498](https://github.com/muruhq/muru/issues/498))
+- A `muructl debug` reply larger than 4 MiB arrives; past 256 MiB the
+  command says the reply was too large and what to narrow. ([#499](https://github.com/muruhq/muru/issues/499))
+- `muructl check --env-file` now reads `export`, single quotes, and comments after a value correctly, through the parser `muructl run` uses, and refuses a line it cannot read by its number. ([#506](https://github.com/muruhq/muru/issues/506))
+- A command that cannot enter a muructl serve's run directory now says permission was denied on its socket, rather than that nothing is listening at another path, when it finds no development run or daemon of the user's own. ([#520](https://github.com/muruhq/muru/issues/520))
+- Fixed `muructl debug exec` holding up the worker's control thread for as long as its code ran: the worker now goes on answering `debug status` and giving up requests past the hard timeout meanwhile. It runs one such operation at a time, alongside `profile`, `trace` and `memory --trace`. ([#523](https://github.com/muruhq/muru/issues/523))
+
+### Security
+
+- `muructl debug inspect`, and the MCP `debug` tool with `inspect`, now list every environment variable's name but give values only for the variables Muru sets, the interpreter's and the release's own (a secret store's value excepted). `muructl debug inspect --env` shows every value, masked where it looks like a secret as before; the MCP tool never passes it. ([#462](https://github.com/muruhq/muru/issues/462))
+
+### Documentation
+
+- The Kubernetes guide's Deployment sets `failureThreshold: 1` on the
+  readiness probe and states how `MURU_SERVE_SHUTDOWN_DELAY` relates to it,
+  which keeps a container restarted in place from losing connections. ([#465](https://github.com/muruhq/muru/issues/465))
+
+
 ## 0.1.0a20 (2026-11-07)
 
 ### Added

@@ -65,15 +65,18 @@ directory and `deploy`'s settings, without the daemon.
 4. When something fails, find out why before changing code:
 
    - `events` for what happened in order: the release's state changes,
-     traffic switches, worker crashes and timeout kills.
+     traffic switches, worker crashes and timeout kills, and each
+     request that ran past its deadline.
 
    - `logs` with the application as `target` for its output: prints,
      logging and tracebacks. `access` gives the access log, with each
      request's status, time and the reason Muru answered when it did.
 
-   - `debug` with `stacks` for what every worker thread is doing now and
-     which request it is serving: the way to see a hung or slow request.
-     `status` gives each worker's requests in flight and memory.
+   - `requests` with `list` for the requests in flight now, each with its
+     age, and `debug` with `stacks` for what every worker thread is doing
+     and which request it is serving: the way to see a hung or slow
+     request. `debug` with `status` gives each worker's threads held and
+     memory, a thread held by a request already answered included.
 
    - `release` for the release's settings as the daemon resolved them.
 
@@ -110,9 +113,14 @@ directory and `deploy`'s settings, without the daemon.
   `reason` such as `app_error`, `worker_crashed`, `deadline` or `hard_timeout`;
   the access log records it.
 
-- A request that runs past its timeout is ended and its worker replaced;
-  `events` names it. Raise the timeout in the release's settings rather
-  than retrying.
+- The soft and hard timeouts are off by default, so a hung request is
+  not ended: at the request deadline (300 s unless the settings say
+  otherwise) the client gets a 504 with the reason `deadline`, the
+  request goes on in its worker, and `events` records a
+  `request.past_deadline` naming it. Look at `debug` with `stacks` for
+  where it is stuck; `requests` lists only those not yet answered.
+  With a soft or hard timeout set, a request past it is ended (and its
+  worker replaced, for the hard one), and `events` names that too.
 
 - `docs` returns pages of the user guide by name; start with the list it
   gives without a page.

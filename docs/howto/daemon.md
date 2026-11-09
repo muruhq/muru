@@ -55,8 +55,9 @@ release.
 
 `deploy --dry-run` asks the daemon what the deploy would do and changes
 nothing. It prints the id the release would take, each setting with the
-layer it would come from, whether an environment would be built, and
-what becomes of the release that serves:
+layer it would come from, each environment variable and secret by name
+with where it comes from (their values are not shown), whether an
+environment would be built, and what becomes of the release that serves:
 
 ```console
 $ muructl deploy shop /srv/shop --processes 4 --dry-run
@@ -68,6 +69,12 @@ muru: plan (nothing changed): release shop@r4, shop.wsgi:application 4x8 from /s
   sync_threads = 8                      (default)
   max_requests = 5000                   (the previous release)
   ...
+  env DEBUG (--env)
+  env SHOP_DATABASE (the previous release)
+  env SENTRY_ENVIRONMENT ([tool.muru.env])
+  secret STRIPE_KEY = vault/stripe (the previous release)
+  env HTTP_PROXY (passed from the daemon)
+  env PATH (passed from the daemon)
   settings nothing else gives come from shop@r3; --fresh takes none
   the release would take over from shop@r3, which would stay warm for 1800s with 1 worker to a group
 ```
@@ -89,15 +96,30 @@ muructl restart shop --worker 1
 muructl events --follow
 ```
 
+The `WORKERS` column of `muructl release list` gives the workers running
+now and, in brackets, the shape the release asks for: `2 (2x4)` is two
+workers of a release of two processes with four threads each, and
+`0 (1x4)` a release scaled to zero. `-` in place of the count means no
+host runs for the release, because it is stopped, failed or idle. A
+managed server shows its instances the same way, as `1 (1 gunicorn)`.
+
 A release that a deploy replaces is drained and then kept warm for a
 retention window of 30 minutes (`deploy --retain` changes it; `--retain
 0` stops it as soon as it has drained), with one worker in each of its
-groups (`deploy --retain-workers` changes it; `--retain-workers 0` keeps
-the host alone), so `rollback` within the window is instant: traffic
-moves back to the warm workers at once, and the groups grow back to
-their counts by forking from the host. After the window, or when another
+groups, or none in a group whose `min_workers` is 0 (`deploy
+--retain-workers` sets the count for every group; `--retain-workers 0`
+keeps the host alone), so `rollback` within the window is instant:
+traffic moves back to the warm workers at once, and the groups grow back
+to their counts by forking from the host. `muructl release list` notes
+what a rollback to a retained release costs: `a rollback to it is
+instant` while it keeps workers, `a rollback to it forks a worker` when
+it keeps its host alone, and `a rollback to it waits for its import` when
+its host had already stopped while idle. After the window, or when another
 deploy supersedes it again, the retained release is stopped. One release
-per application is retained at a time. `rollback` to a release that was
+per application is retained at a time as the rollback target. A rollout's
+candidate that was rolled back or aborted is kept beside it for 10
+minutes, for its logs and workers to be looked at, and does not take its
+place. `rollback` to a release that was
 stopped starts it again first and moves traffic when it is ready; the
 release it replaces is retained in turn. `drain` takes a release out of
 traffic and stops it; draining the serving release leaves the application
@@ -134,6 +156,43 @@ interfaces use: threads for WSGI, the event loop for ASGI and gRPC.
 A release whose host exits on its own is marked failed; if it was serving,
 the daemon starts it again. A deploy whose release fails to start leaves
 the previous release serving and reports the failure.
+
+### What a release's environment holds
+
+A release's host, workers, commands and managed servers start from a
+clean environment, whoever started the daemon and from wherever:
+
+1. What Muru sets: the `MURU_` variables, the interpreter's directory first
+   on `PATH`, `VIRTUAL_ENV`, `PYTHONPATH` with the runtime library first,
+   and the bytecode settings.
+
+2. A small base taken from the daemon's own environment when set there:
+   `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TZ` and `TMPDIR`.
+   A release run as another user has that user's `HOME`, `USER` and
+   `LOGNAME` from the system's password database instead, and
+   `muructl deploy --dry-run` lists them as set by Muru (see
+   [per-application users](users.md)).
+
+3. Variables `pass_env` in the `[daemon]` table of the daemon's file
+   passes through by name, with a `*` suffix allowed:
+
+   ```toml
+   [daemon]
+   pass_env = ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE", "AWS_*"]
+   ```
+
+4. What the release declares, in `[tool.muru.env]`, with `--env` and as
+   secrets, which overrides the base and `pass_env` but not what Muru sets.
+
+Anything else the daemon's own environment holds does not reach a
+release. A release that needs another variable declares it, or the
+daemon's file passes it on. `muructl daemon reload` applies a changed
+`pass_env` to releases started from then on. `muructl debug inspect`
+shows the values of what Muru sets, the base, what is passed through and
+what the release declares.
+
+`muructl run` keeps the environment of the shell that started it, and
+`muructl serve` keeps the container's.
 
 ## Declaring applications in files
 
@@ -301,11 +360,17 @@ applied, naming the release and why:
 ```console
 $ muructl apply -f config/
 muru: nothing applied:
-  shop@r3 did not start: the host exited with exit status: 1 before its workers were ready
-  deploy          shop@r3                  failed: the host exited with exit status: 1 before its workers were ready
+  shop@r3 did not start: the host exited with exit status: 1 before its workers were ready: cannot load app:application: KeyError: 'DATABASE_URL'
+  deploy          shop@r3                  failed: the host exited with exit status: 1 before its workers were ready: cannot load app:application: KeyError: 'DATABASE_URL'
   create-host     host shop                not applied
   create-route    route shop /             not applied
 ```
+
+Once planned, an apply is carried out by the daemon. Interrupting
+`muructl apply`, with Ctrl-C or by closing its terminal, stops the
+report, not the apply: the daemon finishes it, or removes what it added
+when a release does not start, and the `config.applied` or
+`config.apply_failed` event says how it ended.
 
 Applies happen one at a time. An apply given while another is under way,
 including one given `--no-wait` that the daemon is still finishing,
@@ -499,6 +564,8 @@ holds bytecode for the release's interpreter, compiled by `muructl build
 the project's `[tool.muru]` table, in a declared release or as
 `--bytecode` on `muructl deploy` takes `redirect` (the default), `source`
 or `off`, and `muructl release show` says which is in force.
+A release whose own environment sets `PYTHONDONTWRITEBYTECODE` writes no
+bytecode.
 
 ## Where things live
 
@@ -624,7 +691,10 @@ daemon through its admin socket: `--socket` or `MURU_SOCKET`, else a
 development run started from the current directory, else the daemon's
 socket in the runtime directory, else the one development run listening;
 with several runs and no daemon the command names them, so one can be
-chosen with `--socket`. `muructl status` says which was found.
+chosen with `--socket`. `muructl status` says which was found. A run
+directory you may not enter is passed over like one that is not there;
+when nothing else is found, the command says permission was denied on
+its socket.
 
 ## In a container
 
@@ -718,7 +788,9 @@ file again, checks it whole, and applies what changed:
 
 - the [node's budget](scaling.md#the-nodes-budget), `[daemon.budget]`;
 
-- the dashboard's `actions` switch, `[dashboard] actions`.
+- the dashboard's `actions` switch, `[dashboard] actions`;
+
+- `[daemon] pass_env`, for releases started from then on.
 
 The rest of the file is read when the daemon starts: the `[metrics]`
 table, the `[dashboard]` table's `listen` address, the

@@ -677,6 +677,11 @@ impl Drainer {
         });
     }
 
+    /// How many connections are open, for what a stop reports.
+    pub fn open_connections(&self) -> usize {
+        Arc::strong_count(&self.shared.connections).saturating_sub(1)
+    }
+
     /// Stop accepting, let the requests in flight finish and close idle
     /// keep-alive connections (with GOAWAY on HTTP/2), waiting at most
     /// `grace` for them. Returns whether every connection finished in
@@ -1360,6 +1365,7 @@ async fn serve<I>(
             let mut merged = HeaderMap::new();
             let mut request_id = base_id.clone();
             let mut issued: Vec<String> = Vec::new();
+            let mut preview_ignored = false;
             let mut handling: Option<Handling> = None;
             let mut checks = 0usize;
             let mut admitted = false;
@@ -1633,6 +1639,8 @@ async fn serve<I>(
                             break handling.take().expect("checked").fallback;
                         }
 
+                        preview_ignored = origin.is_none()
+                            && routing::preview_ignored(&parts.headers, &selection);
                         context.server_name = server_name;
                         context.app = selection.app;
                         context.release = selection.release;
@@ -1750,6 +1758,15 @@ async fn serve<I>(
                             ),
                         ))
                     }
+                    (None, routing::Decision::NoHost) => link::Handled::Response(link::reject(
+                        &parts,
+                        &context,
+                        errors::Problem::new(
+                            StatusCode::MISDIRECTED_REQUEST,
+                            "no_host",
+                            "This server has several applications and no hosts to choose between them.",
+                        ),
+                    )),
                     (None, routing::Decision::InternalOnly) => {
                         link::Handled::Response(link::reject(
                             &parts,
@@ -2078,6 +2095,16 @@ async fn serve<I>(
                         .headers_mut()
                         .append(http::header::SET_COOKIE, value);
                 }
+            }
+
+            // Section 9.4: a preview the route could not honour is not
+            // silently routed as usual.
+
+            if preview_ignored {
+                response.headers_mut().insert(
+                    routing::PREVIEW_HEADER,
+                    HeaderValue::from_static(routing::PREVIEW_IGNORED),
+                );
             }
 
             Ok::<_, Infallible>(response)

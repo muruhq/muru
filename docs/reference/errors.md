@@ -21,6 +21,7 @@ precisely than the status, appears in the access log line as
 | 405 | `method_not_allowed` | The route refuses the method with `answer = 'method_not_allowed'`; `Allow` names the methods left (see the [client classes guide](../howto/client-classes.md#method-restrictions-and-site-modes)) |
 | 413 | `upload_too_large`, `too_many_files` | A file of an [upload](../howto/uploads.md) is over the route's `max_file_size`, or the form has more files than its `max_files` |
 | 421 | `misdirected` | No [virtual host](../howto/virtual-hosts.md) answers to the request's name on the listener it arrived on |
+| 421 | `no_host` | Several applications serve and no [host](../howto/virtual-hosts.md) is declared to choose between them. |
 | 429 | `rate_limited` | A [rate limit](../howto/client-classes.md) of the host or route refused the request, with `Retry-After`, and the RateLimit fields when the limit sends them |
 | 500 | `app_error` | The application raised, or called `start_response` with `exc_info` after output had started. Development mode includes the traceback |
 | 500 | `sendfile_refused` | The application named a file in a [file hint](../howto/file-hints.md#by-path) outside the mount's `sendfile_roots` |
@@ -33,6 +34,7 @@ precisely than the status, appears in the access log line as
 | 503 | `read_only` | The route refuses the method while its site is read-only (see the [client classes guide](../howto/client-classes.md#method-restrictions-and-site-modes)) |
 | 503 | `no_workers` | No worker is available at all, with `Retry-After: 1` |
 | 503 | `queue_full` | Every worker thread was busy for longer than the queue timeout, with `Retry-After: 1` |
+| 503 | `cold_start_timeout` | The request's group had no worker, because it was [scaled to zero](../howto/scaling.md#scale-to-zero), its host was starting or its workers were on their way, and none started within the queue timeout, with `Retry-After: 1` |
 | 503 | `mount_not_loaded` | The worker the request reached does not serve the request's mount, which a [worker group's `mounts` list](../howto/worker-groups.md#mounts-a-group-serves) left out |
 | 504 | `deadline` | The application or upstream did not produce a response head within the request deadline |
 | 504 | `soft_timeout` | The request ran past the soft timeout and was interrupted in the worker before it produced a response head; development mode includes the traceback of where it was (see the [timeouts guide](../howto/timeouts.md)) |

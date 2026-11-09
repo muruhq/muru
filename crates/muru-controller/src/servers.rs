@@ -351,6 +351,7 @@ impl Servers {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
+            .env_clear()
             .envs(self.env.iter().cloned())
             .env("MURU_HTTP_BIND", instance.bind.address())
             .env("MURU_INSTANCE", instance.index.to_string());

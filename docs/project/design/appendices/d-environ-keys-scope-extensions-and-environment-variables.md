@@ -66,7 +66,7 @@ MURU_* variables cannot be overridden by application or release settings.
 | MURU_DAEMON_CONFIG | the daemon's configuration file (section 13.8); its earlier name, MURU_CONFIG, is refused |
 | MURU_SOCKET, MURU_SERVER | admin endpoint for client commands |
 | MURU_UV | path to uv |
-| MURU_LOG | muructl's own log filter (tracing syntax) |
+| MURU_LOG | muructl's own log filter (tracing syntax); `info,rmcp=warn` when unset |
 | MURU_NO_INIT | set to 1, muructl as a container's PID 1 runs the command itself instead of forking the built-in init (section 6.10), for images that bring tini or use `docker run --init` |
 | NO_COLOR | disable coloured output |
 | MURU_STATE_DIR, MURU_RUN_DIR, MURU_LOG_DIR, MURU_CACHE_DIR | override file locations (section 13.8) |

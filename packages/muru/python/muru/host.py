@@ -38,6 +38,7 @@ to it before the old worker is told to stop.
 from __future__ import annotations
 
 import argparse
+import atexit
 import faulthandler
 import gc
 import importlib
@@ -68,6 +69,17 @@ WSGIApplication = Callable[..., Any]
 
 RESTART_DELAY_SECONDS = 0.5
 
+# Section 13.3: the file in the run directory saying when a shutdown wants
+# the workers gone, written by the supervisor before it signals the host
+# (the name is STOP_BY_FILE in the supervisor too).
+
+STOP_BY_FILE = "stop-by"
+
+# What the worker keeps back from lifespan shutdown of the time it has
+# left, so a slow application is reported rather than ending with SIGKILL.
+
+EXIT_REPORT_SECONDS = 0.25
+
 # How long a replacement waits for the supervisor to say the edge routes
 # to the new worker before the old one is told to stop regardless, and
 # how long after that word the old worker is left alone, so a request
@@ -94,6 +106,11 @@ TICK_SECONDS = 0.5
 # a worker is silent once a report is this much later than due.
 
 REPORT_INTERVAL_SECONDS = 1.0
+
+# Section 7.6: a request past its deadline the worker has stopped
+# reporting for this many report intervals is forgotten.
+
+PAST_DEADLINE_FORGET_REPORTS = 3
 
 # How long a worker is given to answer a control request before the
 # host answers for it.
@@ -205,6 +222,20 @@ def resolve_app(
 # start-up lines of every worker.
 
 UNNAMED_EVENTS = frozenset({"worker.started", "worker.ready"})
+
+
+def run_exit_callbacks() -> None:
+    """Run the callbacks registered with ``atexit`` in this worker, on this thread.
+
+    A worker ends with ``os._exit``, which runs none of them. This clears
+    the list, so a second call runs nothing and a process that goes on to
+    finalize runs them once (section 6.3).
+    """
+
+    try:
+        atexit._run_exitfuncs()
+    except BaseException:
+        traceback.print_exc()
 
 
 def detect_interface(app: Any) -> str:
@@ -832,6 +863,23 @@ class WorkerState:
 
     debug_sessions: int = 0
 
+    # Section 7.6: the requests the worker reports past their deadline,
+    # by request id: what its last report said of each, when it said it,
+    # and whether the event has been raised.
+
+    past_deadline: dict[str, PastDeadline] = field(default_factory=dict)
+
+
+@dataclass
+class PastDeadline:
+    """A request a worker reports past its deadline (section 7.6)."""
+
+    method: str
+    path: str
+    age_ms: int
+    seen_at: float
+    raised: bool = False
+
 
 @dataclass
 class Pending:
@@ -864,6 +912,12 @@ class Replacement:
     # stuck request's stack, or its commonest objects), for the event.
 
     capture: str | None = None
+
+    # Section 9.3: a timeout kill is reported at the decision, as soon as
+    # the replacement exists and the stacks asked for have been answered.
+
+    captured: bool = False
+    reported: bool = False
     announced: int | None = None
     announced_at: float | None = None
 
@@ -878,6 +932,11 @@ class Replacement:
     # Section 7.4: a retirement, which stops the worker without a successor.
 
     retire: bool = False
+
+    # Section 13.9: short of memory, so the successor is forked only once
+    # this worker has gone.
+
+    stop_first: bool = False
 
 
 @dataclass
@@ -916,6 +975,7 @@ class Host:
         hard_drain_grace: float = 10.0,
         shutdown_timeout: float = 5.0,
         websocket_drain_grace: float = 0.0,
+        exit_grace: float = 2.0,
         loop_stall_timeout: float = 10.0,
         gil_stall_timeout: float = 30.0,
         memory: MemoryPolicy | None = None,
@@ -941,6 +1001,7 @@ class Host:
         self.hard_drain_grace = hard_drain_grace
         self.shutdown_timeout = shutdown_timeout
         self.websocket_drain_grace = websocket_drain_grace
+        self.exit_grace = exit_grace
         self.loop_stall_timeout = loop_stall_timeout
         self.gil_stall_timeout = gil_stall_timeout
         self.memory = memory or MemoryPolicy()
@@ -1197,8 +1258,12 @@ class Host:
             except BaseException:
                 traceback.print_exc()
             finally:
+                # A failure outside the worker's own handling still runs
+                # the atexit callbacks; they have already run otherwise.
                 # os._exit skips the flush that a normal exit would do, so
                 # whatever is still buffered would be lost.
+
+                run_exit_callbacks()
 
                 for stream in (sys.stdout, sys.stderr):
                     try:
@@ -1546,22 +1611,32 @@ class Host:
         except Exception as error:
             log(f"worker {index} failed to start: {error.__class__.__name__}: {error}")
             traceback.print_exc()
+            run_exit_callbacks()
             if loop is not None:
                 loop.stop()
             return 1
 
         from muru import _native
 
-        def on_exit() -> None:
-            """Run lifespan shutdown for every ASGI application and the hook, then stop the loop."""
+        def on_exit(left: float) -> None:
+            """Run the worker's shutdown work in order, then stop the loop.
 
-            _asgi.stop_registered()
+            Lifespan shutdown of every ASGI application, the on_exit hook
+            and the ``atexit`` callbacks (section 6.3). `left` is how long
+            the worker has before the host kills it. Lifespan shutdown
+            stops waiting with a little to spare, so a slow application is
+            reported and the rest can still run.
+            """
+
+            deadline = time.monotonic() + left - EXIT_REPORT_SECONDS
+            _asgi.stop_registered(deadline)
 
             for mounted_lifespan in lifespans:
-                mounted_lifespan.shutdown()
+                mounted_lifespan.shutdown(deadline)
             if lifespan is not None:
-                lifespan.shutdown()
+                lifespan.shutdown(deadline)
             hooks.call_logged("on_exit", context)
+            run_exit_callbacks()
             if loop is not None:
                 loop.stop()
 
@@ -1593,6 +1668,7 @@ class Host:
         timeout_arguments: dict[str, Any] = {
             "websocket_drain_ms": int(self.websocket_drain_grace * 1000),
             "drain_ms": int(self.shutdown_timeout * 1000),
+            "exit_grace_ms": int(self.exit_grace * 1000),
         }
 
         if group.soft_timeout is not None:
@@ -1654,6 +1730,7 @@ class Host:
             )
         except Exception as error:
             log(f"worker {index} failed: {error}")
+            run_exit_callbacks()
             return 1
 
         return 0
@@ -1885,7 +1962,36 @@ class Host:
                 if group.name != "default"
             ],
             "interfaces": self.interfaces(),
+            "workers": [
+                {
+                    "index": state.index,
+                    "pid": state.pid,
+                    "group": self.placement[state.index][0].name,
+                    "socket": state.path,
+                    "state": self.worker_state(state),
+                }
+                for state in sorted(self.states.values(), key=lambda state: state.index)
+                if not state.replaced
+            ],
         }
+
+    def worker_state(self, state: WorkerState) -> str:
+        """Return one word for what a worker is doing.
+
+        It is `starting`, `ready`, `debugging` (a debugger session is
+        open), `replacing` (a fresh worker takes its place) or `retiring`
+        (scaled in).
+        """
+
+        leaving = self.replacing.get(state.index)
+
+        if state.replaced:
+            return "retiring" if leaving is not None and leaving.retire else "replacing"
+
+        if state.debug_sessions:
+            return "debugging"
+
+        return "ready" if state.ready else "starting"
 
     def interfaces(self) -> dict[str, str]:
         """Return the interfaces settled so far, by mount, the default as ``""``.
@@ -2246,22 +2352,10 @@ class Host:
         worker is routed once the host's latest announcement names it and
         the supervisor has acknowledged that announcement, so the edge
         routes to it; a replacement still warming, or a worker out of
-        routing while it is debugged, is not. Its state is `starting`,
-        `ready`, `debugging` (a debugger session is open), `replacing` (a
-        fresh worker takes its place) or `retiring` (scaled in).
+        routing while it is debugged, is not.
         """
 
         sides = state.sides if live is None else live
-        leaving = self.replacing.get(state.index)
-
-        if state.replaced:
-            status = "retiring" if leaving is not None and leaving.retire else "replacing"
-        elif state.debug_sessions:
-            status = "debugging"
-        elif state.ready:
-            status = "ready"
-        else:
-            status = "starting"
 
         return {
             "index": state.index,
@@ -2271,7 +2365,7 @@ class Host:
                 "group": self.placement[state.index][0].name,
                 "generation": state.generation,
                 "socket": state.path,
-                "state": status,
+                "state": self.worker_state(state),
                 "ready": state.ready,
                 "routed": self.routed.get(state.index) == state.path and self.acked >= self.version,
                 "debugging": state.debug_sessions > 0,
@@ -2504,6 +2598,13 @@ class Host:
 
                 continue
 
+            # Section 7.6: a request past its deadline, a line of its own
+            # with every report while it lasts; tick() raises the event.
+
+            if "past_deadline" in report:
+                self.saw_past_deadline(state, report["past_deadline"])
+                continue
+
             # Section 6.7: what the worker settled its entrypoints as,
             # sent once before it serves; the supervisor is told when it
             # is news.
@@ -2705,6 +2806,11 @@ class Host:
             self.starting.discard(state.index)
             self.routed[state.index] = state.path
             self.announce()
+        elif self.supervisor is not None:
+            # A worker of the first fork was routed from the start, but
+            # the supervisor reports its state.
+
+            self.announce()
 
     def check_requests(self, state: WorkerState) -> None:
         """Replace a worker that has served its share of requests."""
@@ -2724,6 +2830,50 @@ class Host:
                 "max_requests",
             )
 
+    def saw_past_deadline(self, state: WorkerState, request: dict[str, Any]) -> None:
+        """Note a request the worker reports past its deadline."""
+
+        request_id = str(request.get("request_id", ""))
+        seen = state.past_deadline.get(request_id)
+
+        if seen is None:
+            state.past_deadline[request_id] = PastDeadline(
+                str(request.get("method", "")),
+                str(request.get("path", "")),
+                int(request.get("age_ms", 0)),
+                time.monotonic(),
+            )
+        else:
+            seen.age_ms = int(request.get("age_ms", seen.age_ms))
+            seen.seen_at = time.monotonic()
+
+    def raise_past_deadline(self, state: WorkerState, now: float) -> None:
+        """Raise request.past_deadline once for each request the worker reports past it.
+
+        A request no longer reported for a few report intervals has
+        finished, or its worker has gone, and is forgotten.
+        """
+
+        for request_id, request in list(state.past_deadline.items()):
+            if now - request.seen_at > PAST_DEADLINE_FORGET_REPORTS * REPORT_INTERVAL_SECONDS:
+                del state.past_deadline[request_id]
+                continue
+
+            if request.raised:
+                continue
+
+            request.raised = True
+            self.emit(
+                "request.past_deadline",
+                "warning",
+                f"worker {state.index} (pid {state.pid}): request {request_id} "
+                f"{request.method} {request.path} is past its deadline, "
+                f"{request.age_ms / 1000:.1f} s after the worker took it; the client was "
+                "answered 504 and the request goes on in the worker",
+                group=self.group_of(state.index).name,
+                reason="deadline",
+            )
+
     def tick(self) -> None:
         """Apply the lifetime and hard timeout policies and advance replacements."""
 
@@ -2731,6 +2881,8 @@ class Host:
         self.advance_orphans(now)
 
         for state in list(self.states.values()):
+            self.raise_past_deadline(state, now)
+
             if state.replaced or state.index in self.replacing or not state.ready:
                 continue
 
@@ -2885,14 +3037,70 @@ class Host:
                 self.abandon_requests(state, abandon)
 
             if kind == "worker.timeout_killed":
-                self.capture_stacks(state, replacement)
+                self.capture_stacks(state, replacement, self.report_timeout_kill)
 
             grace = self.group_of(index).hard_drain_grace
             replacement.terminate_at = time.monotonic() + (
                 self.hard_drain_grace if grace is None else grace
             )
 
+        # Section 13.9: two large workers alive at once is what the kernel
+        # would kill for, so with no room for a second this one leaves
+        # routing and stops first, and reap() forks its successor.
+
+        short = self.short_of_memory(index) if cause == "memory" else None
+
+        if short is not None:
+            log(
+                f"worker {index} (pid {state.pid}) stops before its replacement starts: "
+                f"{format_size(short)} is left under the container's memory limit"
+            )
+            replacement.stop_first = True
+            replacement.terminate_at = None
+            self.routed[index] = None
+            replacement.announced = self.announce()
+            replacement.announced_at = time.monotonic()
+            return
+
         replacement.new_pid = self.spawn(index, replacing=True)
+
+        if kind == "worker.timeout_killed":
+            self.report_timeout_kill(replacement)
+
+    def short_of_memory(self, index: int) -> int | None:
+        """Return what is left under the container's limit, if less than one worker may use."""
+
+        policy = self.group_of(index).memory or self.memory
+        left = memory_left(self.cgroup)
+
+        if left is None or policy.hard_limit is None or left >= policy.hard_limit:
+            return None
+
+        return left
+
+    def report_timeout_kill(self, replacement: Replacement) -> None:
+        """Raise a timeout kill's event, once, when both halves of it are known.
+
+        Section 9.3: the host's decision to replace the worker is the
+        evidence a rollout counts, so this does not wait for the old
+        worker to go. The event names the new pid, known once the fork
+        returns, and where the stuck request was, which the worker answers
+        within the second capture_stacks allows it.
+        """
+
+        if replacement.reported or replacement.new_pid is None or not replacement.captured:
+            return
+
+        replacement.reported = True
+        capture = f"; {replacement.capture}" if replacement.capture else ""
+        self.emit(
+            replacement.kind,
+            "warning",
+            f"worker {replacement.index} (pid {replacement.old_pid}) replaced by pid "
+            f"{replacement.new_pid}: {replacement.reason}{capture}",
+            group=self.group_of(replacement.index).name,
+            reason=replacement.cause,
+        )
 
     def abandon_requests(self, state: WorkerState, args: dict[str, str]) -> None:
         """Have a condemned worker give up requests that cannot finish.
@@ -3077,7 +3285,12 @@ class Host:
         self.ask_workers(targets, "bookkeeping", {}, 1.0, named)
         return True
 
-    def capture_stacks(self, state: WorkerState, replacement: Replacement) -> None:
+    def capture_stacks(
+        self,
+        state: WorkerState,
+        replacement: Replacement,
+        then: Callable[[Replacement], None] | None = None,
+    ) -> None:
         """Take a worker's stacks before it is killed for the hard timeout.
 
         Section 11.7: the stacks go to the log and where the oldest request
@@ -3085,8 +3298,15 @@ class Host:
         every frame; otherwise the worker is asked, and one that cannot
         answer within a second gets SIGQUIT, so faulthandler writes its
         stacks to the log, and is read from outside as well where that is
-        possible.
+        possible. `then` is called once the capture is settled, answered
+        or not.
         """
+
+        def settled() -> None:
+            replacement.captured = True
+
+            if then is not None:
+                then(replacement)
 
         outside = self.read_outside(state.pid) if _outside.WHOLE else None
 
@@ -3097,6 +3317,7 @@ class Host:
                 bookkeeping = answer.get("result", {}) if answer.get("ok") else {}
                 result = _outside.stacks_result(outside, bookkeeping)
                 self.record_capture(state, replacement, result["threads"])
+                settled()
 
             self.ask(state, "bookkeeping", {}, 1.0, read)
             return
@@ -3104,11 +3325,12 @@ class Host:
         def answered(pending: Pending) -> None:
             answer = pending.answers.get(state.pid, {})
 
-            if not answer.get("ok"):
+            if answer.get("ok"):
+                self.record_capture(state, replacement, answer.get("result", {}).get("threads", []))
+            else:
                 replacement.capture = "its stacks were written to the log by faulthandler"
-                return
 
-            self.record_capture(state, replacement, answer.get("result", {}).get("threads", []))
+            settled()
 
         self.ask(state, "stacks", {}, 1.0, answered)
 
@@ -3286,14 +3508,27 @@ class Host:
             if self.stopping:
                 continue
 
-            # The old worker of a replacement is done with: its event
-            # says why it went, and nothing restarts it.
-
             replacement = self.replacing.get(index)
+            killed_here = (
+                replacement is not None and replacement.old_pid == pid and replacement.killed
+            )
+            oom_killed = not killed_here and self.took_oom_kill(status)
+
+            # The old worker of a replacement is done with: its event
+            # says why it went, and nothing restarts it. A timeout kill's
+            # event was raised at the decision, so nothing is counted here
+            # unless the kernel took it first.
 
             if replacement is not None and replacement.old_pid == pid and replacement.retire:
                 del self.replacing[index]
                 self.retired.add(index)
+
+                if oom_killed:
+                    self.report_oom_kill(
+                        index, f"worker {index} (pid {pid}) was killed by the kernel for memory"
+                    )
+                    continue
+
                 self.emit(
                     "worker.exited",
                     "info",
@@ -3305,11 +3540,30 @@ class Host:
 
             if replacement is not None and replacement.old_pid == pid:
                 del self.replacing[index]
-                level = "warning" if replacement.kind == "worker.timeout_killed" else "info"
+
+                # Section 13.9: the worker was stopped first, so its
+                # successor starts now and is routed to once it is ready.
+
+                if replacement.stop_first:
+                    self.starting.add(index)
+                    replacement.new_pid = self.spawn(index, replacing=True)
+
+                if oom_killed:
+                    self.report_oom_kill(
+                        index,
+                        f"worker {index} (pid {pid}) was killed by the kernel for memory while "
+                        f"being replaced by pid {replacement.new_pid}",
+                    )
+                    continue
+
+                if replacement.kind == "worker.timeout_killed":
+                    log(f"worker {index} (pid {pid}) exited after its drain grace")
+                    continue
+
                 capture = f"; {replacement.capture}" if replacement.capture else ""
                 self.emit(
                     replacement.kind,
-                    level,
+                    "info",
                     f"worker {index} (pid {pid}) replaced by pid {replacement.new_pid}: "
                     f"{replacement.reason}{capture}",
                     group=self.group_of(index).name,
@@ -3327,6 +3581,15 @@ class Host:
                 if replacement.announced is None and old is not None:
                     old.replaced = False
                     self.start_failures[index] = self.start_failures.get(index, 0) + 1
+
+                    if oom_killed:
+                        self.report_oom_kill(
+                            index,
+                            f"worker {index} replacement (pid {pid}) was killed by the kernel "
+                            f"for memory before it was ready; pid {old.pid} keeps serving",
+                        )
+                        continue
+
                     self.emit(
                         "worker.exited",
                         "error",
@@ -3357,16 +3620,21 @@ class Host:
                         self.routed[index] = None
                         self.retired.add(index)
                         self.emit(
-                            "worker.exited",
+                            "worker.oom_killed" if oom_killed else "worker.exited",
                             "error",
                             f"worker {index} (pid {pid}) of the optional group {group.name} "
                             f"failed {MAX_START_FAILURES} times at start, last with "
                             f"{describe(status)}; it is given up",
                             group=group.name,
-                            reason="start_failed",
+                            reason="oom_killed" if oom_killed else "start_failed",
                         )
                         self.announce()
                         continue
+
+                    if oom_killed:
+                        self.report_oom_kill(
+                            index, f"worker {index} (pid {pid}) was killed by the kernel for memory"
+                        )
 
                     log(
                         f"worker {index} failed {MAX_START_FAILURES} times at start, "
@@ -3378,26 +3646,10 @@ class Host:
             else:
                 self.start_failures[index] = 0
 
-            # Section 13.9: a SIGKILL nobody here sent, while the cgroup
-            # counts another kill for memory, is the kernel's.
-
-            kills = oom_kills(self.cgroup)
-            oom_killed = (
-                os.WIFSIGNALED(status)
-                and os.WTERMSIG(status) == signal.SIGKILL
-                and kills is not None
-                and self.oom_kills is not None
-                and kills > self.oom_kills
-            )
-            self.oom_kills = kills
-
             if oom_killed:
-                self.emit(
-                    "worker.oom_killed",
-                    "error",
+                self.report_oom_kill(
+                    index,
                     f"worker {index} (pid {pid}) was killed by the kernel for memory, restarting",
-                    group=self.group_of(index).name,
-                    reason="oom_killed",
                 )
             else:
                 self.emit(
@@ -3409,6 +3661,37 @@ class Host:
                 )
 
             self.restart_after[index] = time.monotonic() + RESTART_DELAY_SECONDS
+
+    def took_oom_kill(self, status: int) -> bool:
+        """Say whether a worker's exit is one of the kernel's kills for memory.
+
+        Section 13.9: a SIGKILL the host did not send, while the cgroup
+        counts more kills than have been put down to a worker, is the
+        kernel's. Each exit uses up one kill, so workers killed together
+        are each reported, whichever is reaped first.
+        """
+
+        if not os.WIFSIGNALED(status) or os.WTERMSIG(status) != signal.SIGKILL:
+            return False
+
+        kills = oom_kills(self.cgroup)
+
+        if kills is None or self.oom_kills is None or kills <= self.oom_kills:
+            return False
+
+        self.oom_kills += 1
+        return True
+
+    def report_oom_kill(self, index: int, message: str) -> None:
+        """Raise the event for a worker the kernel killed for memory."""
+
+        self.emit(
+            "worker.oom_killed",
+            "error",
+            message,
+            group=self.group_of(index).name,
+            reason="oom_killed",
+        )
 
     def restart_due(self) -> None:
         """Start replacements whose delay has passed."""
@@ -3513,13 +3796,54 @@ class Host:
     def stop_budget(self) -> float:
         """Return how long a worker told to stop may take before it is killed.
 
-        That is the WebSockets' grace, then the shutdown timeout.
+        That is the WebSockets' grace, the shutdown timeout, then the
+        exit grace for the worker's shutdown work.
         """
 
-        return self.websocket_drain_grace + self.shutdown_timeout
+        return self.websocket_drain_grace + self.shutdown_timeout + self.exit_grace
+
+    def time_to_stop(self) -> float:
+        """Return how long the workers have to stop, in seconds.
+
+        Their stop budget, or less when a shutdown with a budget of its
+        own has said when it wants them gone (section 13.3).
+        """
+
+        budget = self.stop_budget()
+
+        try:
+            with open(os.path.join(self.socket_dir, STOP_BY_FILE)) as stop_by:
+                left = int(stop_by.read()) / 1000 - time.time()
+        except (OSError, ValueError):
+            return budget
+
+        return max(0.0, min(left, budget))
+
+    def tell_workers_time_left(self, left: float) -> None:
+        """Tell every worker how long it has, without waiting for an answer.
+
+        Sent before the signal: the worker's control thread takes it
+        without the interpreter, and its wait for requests looks at it
+        every few milliseconds, so it stops waiting in time to leave the
+        exit grace for its shutdown work.
+        """
+
+        message = {"op": "stop_within", "args": {"ms": int(left * 1000)}}
+        line = json.dumps(message).encode() + b"\n"
+
+        for control in self.control_sockets.values():
+            try:
+                control.sendall(line)
+            except OSError:
+                pass
 
     def terminate_all(self) -> None:
-        """Stop every worker: SIGTERM, its stop budget, then SIGKILL."""
+        """Stop every worker: SIGTERM, the time it has, then SIGKILL."""
+
+        left = self.time_to_stop()
+
+        if left < self.stop_budget():
+            self.tell_workers_time_left(left)
 
         for pid in self.workers:
             try:
@@ -3529,7 +3853,7 @@ class Host:
 
         # Reap whatever exits within the grace period.
 
-        deadline = time.monotonic() + self.stop_budget()
+        deadline = time.monotonic() + left
 
         while self.workers and time.monotonic() < deadline:
             try:
@@ -3596,6 +3920,37 @@ def oom_kills(cgroup: str | None) -> int | None:
         pass
 
     return None
+
+
+def memory_left(cgroup: str | None) -> int | None:
+    """Read what is left under the cgroup's memory limit, or None with no limit.
+
+    Inactive file pages count as free, since the kernel reclaims those
+    before it kills anything.
+    """
+
+    if cgroup is None:
+        return None
+
+    try:
+        with open(os.path.join(cgroup, "memory.max")) as limit_file:
+            limit = int(limit_file.read())
+
+        with open(os.path.join(cgroup, "memory.current")) as current_file:
+            current = int(current_file.read())
+
+        inactive = 0
+
+        with open(os.path.join(cgroup, "memory.stat")) as stat:
+            for line in stat:
+                name, _, count = line.partition(" ")
+
+                if name == "inactive_file":
+                    inactive = int(count)
+    except (OSError, ValueError):
+        return None
+
+    return limit - max(current - inactive, 0)
 
 
 def format_size(size: int) -> str:
@@ -3954,6 +4309,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="how long a worker told to stop keeps its open WebSockets before closing them",
     )
     parser.add_argument(
+        "--exit-grace",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="how long a worker has for its shutdown work once its requests have had theirs",
+    )
+    parser.add_argument(
         "--memory-measure",
         choices=("uss", "pss", "rss"),
         default="uss",
@@ -4211,6 +4573,7 @@ def main(argv: list[str] | None = None) -> int:
         hard_drain_grace=args.hard_drain_grace,
         shutdown_timeout=args.shutdown_timeout,
         websocket_drain_grace=args.websocket_drain_grace,
+        exit_grace=args.exit_grace,
         loop_stall_timeout=args.loop_stall_timeout,
         gil_stall_timeout=args.gil_stall_timeout,
         memory=MemoryPolicy(

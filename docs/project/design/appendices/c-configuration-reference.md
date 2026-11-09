@@ -75,7 +75,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | serving (the release that serves the application's traffic; the others an apply adds are held) | application | the last release in id order an apply adds, else the one that serves | 10.4 |
 | max_requests, max_lifetime, max_surge | group | off, off, 1 | 7.7 |
 | memory.measure, soft_limit, soft_for, reclaim_first, hard_limit, check_interval, malloc_arena_max, allocator | group | uss, off, 2m, true, off, 5s, unset, system | 7.7 |
-| timeouts (soft_timeout, hard_timeout, hard_drain_grace, shutdown_timeout, loop_stall_timeout, gil_stall_timeout, idle_timeout) | release, group | off, off, 10s, 5s, 10s, 30s, 60s | 7.6 |
+| timeouts (soft_timeout, hard_timeout, hard_drain_grace, shutdown_timeout, websocket_drain_grace, exit_grace, loop_stall_timeout, gil_stall_timeout, idle_timeout) | release, group, except shutdown_timeout, websocket_drain_grace and exit_grace, which are the release's | off, off, 10s, 5s, 0s, 2s, 10s, 30s, 60s | 7.6 |
 | timeouts (queue_timeout, request_deadline, body_idle_timeout, response_idle_timeout) | host, release, group, route | 5s, 300s, 60s, 60s, from `[limits]` | 4.6 |
 | response.flush, coalesce_min_bytes, coalesce_max_delay, first_block | release, route | coalesce, 16KiB, 10ms, immediate | 5.4 |
 | max_body_size | `[limits]`, host, release, group, mount, route | 10MB | 4.6 |
@@ -121,7 +121,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | --- | --- |
 | 400, 414, 431 | malformed, upload_malformed, uri_too_long, headers_too_large |
 | 404 | no_route, internal_only, sendfile_missing |
-| 408, 411, 413, 421, 426 | client_timeout, length_required, body_too_large, upload_too_large, too_many_files, misdirected, upgrade_not_allowed |
+| 408, 411, 413, 421, 426 | client_timeout, length_required, body_too_large, upload_too_large, too_many_files, misdirected, no_host, upgrade_not_allowed |
 | 429 | rate_limited |
 | 500 | app_error, redirect_loop, sendfile_refused |
 | 502 | worker_crashed, worker_stalled, worker_unavailable, upstream_failed |
@@ -146,4 +146,4 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Clients | ratelimit.enforcing, client_class.list_reloaded |
 | Dashboard | dashboard.login_issued, dashboard.action |
 | Commands | command.started, command.finished, command.failed |
-| Debugging | request.soft_timeout, debug.profile, debug.trace, debug.memory, debug.exec, debug.breakpoint, debug.breakpoint_expired, debug.attached, debug.detached |
+| Debugging | request.soft_timeout, request.past_deadline, debug.profile, debug.trace, debug.memory, debug.exec, debug.breakpoint, debug.breakpoint_expired, debug.attached, debug.detached |

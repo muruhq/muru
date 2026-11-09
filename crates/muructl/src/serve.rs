@@ -75,6 +75,12 @@ pub struct ServeArgs {
     #[arg(long, value_name = "N")]
     min_ready: Option<String>,
 
+    /// The application's name, in metrics, logs and the commands
+    /// (default: `[project] name` from pyproject.toml, else the
+    /// entrypoint's top-level module).
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
     /// The interface the entrypoint speaks: auto, wsgi, asgi or grpc.
     #[arg(long, value_name = "NAME")]
     interface: Option<String>,
@@ -240,6 +246,7 @@ const KEYS: &[(&str, Kind)] = &[
     ("concurrency", Kind::Text),
     ("preload", Kind::Text),
     ("hooks", Kind::Text),
+    ("name", Kind::Text),
     ("timeout", Kind::List),
     ("max_body_size", Kind::Text),
     ("max_requests", Kind::Text),
@@ -335,6 +342,7 @@ fn from_flags(args: &ServeArgs) -> BTreeMap<&'static str, Value> {
     text("concurrency", &args.concurrency);
     text("preload", &args.preload);
     text("hooks", &args.hooks);
+    text("name", &args.name);
     text("max_body_size", &args.max_body_size);
     text("max_requests", &args.max_requests);
     text("max_lifetime", &args.max_lifetime);
@@ -850,6 +858,7 @@ fn prepare(
     argv.push(listen.to_string());
 
     for (key, flag) in [
+        ("name", "--name"),
         ("interface", "--interface"),
         ("threads", "--threads"),
         ("sync_threads", "--sync-threads"),
@@ -1042,7 +1051,7 @@ pub fn make_run_dir(dir: &Path) -> anyhow::Result<()> {
         let uid = unsafe { libc::getuid() };
         anyhow::anyhow!(run_dir_error(dir, &error, uid))
     })?;
-    group_writable(dir);
+    group_writable(dir, 0o770);
     Ok(())
 }
 
@@ -1073,10 +1082,10 @@ fn run_dir_error(dir: &Path, error: &std::io::Error, uid: u32) -> String {
 /// Make a directory serve creates writable by its group, which a
 /// platform that runs containers under an arbitrary user ID shares as
 /// group 0.
-pub fn group_writable(dir: &Path) {
+pub fn group_writable(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o770));
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
 }
 
 /// The runtime library the interpreter's own environment holds, when it

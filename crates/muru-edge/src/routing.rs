@@ -372,6 +372,10 @@ pub const ID_COOKIE: &str = "muru_id";
 /// The cookie that keeps a client on the release it first got.
 pub const STICKY_COOKIE: &str = "muru_release";
 
+/// The value of the preview header on a response when the request named
+/// a release the route does not have.
+pub const PREVIEW_IGNORED: &str = "ignored";
+
 /// The cookie that pins a release for previews.
 pub const PREVIEW_COOKIE: &str = "muru_preview";
 
@@ -573,6 +577,29 @@ fn upstream_selection(upstream: &Arc<Upstream>) -> Selection {
     }
 }
 
+/// The release or `upstream:NAME` a request's preview header or cookie
+/// names, the header first.
+fn named_preview(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(PREVIEW_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| cookie(headers, PREVIEW_COOKIE))
+}
+
+/// Whether a request named a preview that what serves it is not: the
+/// route has no such release, a retained one included, and the request
+/// was routed as usual (section 9.4).
+pub fn preview_ignored(headers: &HeaderMap, selection: &Selection) -> bool {
+    named_preview(headers).is_some_and(|name| {
+        match (name.strip_prefix(UPSTREAM_PREFIX), &selection.upstream) {
+            (Some(upstream), Some(serving)) => upstream != serving.name(),
+            (Some(_), None) => true,
+            (None, _) => name != selection.release,
+        }
+    })
+}
+
 /// Section 4.5: which of an application's releases takes a request. The
 /// release a preview header or cookie names comes first, then the one the
 /// policy gives the client's class (section 4.14), then the one a sticky
@@ -586,12 +613,7 @@ fn choose<'a>(
     cookies: &mut Vec<String>,
     upstreams: &HashMap<String, Arc<Upstream>>,
 ) -> Chosen<'a> {
-    let preview = client
-        .headers
-        .get(PREVIEW_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| cookie(client.headers, PREVIEW_COOKIE));
+    let preview = named_preview(client.headers);
 
     if let Some(chosen) = preview
         .as_deref()
@@ -1185,6 +1207,8 @@ pub struct Routing {
     /// names it, so a preview can reach its other releases (a held one,
     /// section 9.2) without a host declared.
     default_app: Option<String>,
+    /// Several applications serve and no host chooses between them.
+    no_host: bool,
     /// Section 6.13: the listeners that limit cleartext HTTP/2 to some
     /// clients.
     h2c: HashMap<SocketAddr, crate::proxy::Networks>,
@@ -1252,6 +1276,9 @@ pub enum Decision {
     },
     /// No virtual host answers to that name on this listener (421).
     Misdirected,
+    /// Several applications serve and no host is declared to choose
+    /// between them (421, section 4.3).
+    NoHost,
     /// The host has no route for the path (404).
     NoRoute,
     /// The route or mount is internal (section 4.10) and the request
@@ -1335,6 +1362,7 @@ impl Routing {
             classifier: crate::classify::Classifier::default(),
             default_policy: None,
             default_app: None,
+            no_host: false,
             h2c: HashMap::new(),
             listener_trust: HashMap::new(),
             sites_vary: false,
@@ -1597,6 +1625,7 @@ impl Routing {
             classifier,
             default_policy,
             default_app: default_name,
+            no_host: snapshot.no_host,
             h2c,
             listener_trust,
             sites_vary: false,
@@ -2049,6 +2078,10 @@ impl Routing {
         client: &Client<'_>,
         origin: Option<&Origin>,
     ) -> Decision {
+        if self.no_host {
+            return Decision::NoHost;
+        }
+
         if self.hosts.is_empty() {
             // A rollout of the default application chooses among its
             // releases as a route's policy does, and without one a
@@ -2471,6 +2504,7 @@ mod tests {
             listener_limits: Vec::new(),
             listener_proxies: Vec::new(),
             worker_sockets: Vec::new(),
+            no_host: false,
             default_app: String::new(),
             default_release: String::new(),
             hosts: vec![
@@ -2573,7 +2607,7 @@ mod tests {
             Decision::Serve { server_name, .. } => server_name,
             Decision::Redirect { .. } => Some("redirect".to_owned()),
             Decision::Maintenance { .. } => Some("maintenance".to_owned()),
-            Decision::Misdirected => Some("421".to_owned()),
+            Decision::Misdirected | Decision::NoHost => Some("421".to_owned()),
             Decision::NoRoute => Some("404".to_owned()),
             Decision::InternalOnly => Some("internal".to_owned()),
             Decision::NotAccepted { .. } => Some("not accepted".to_owned()),
@@ -2911,6 +2945,30 @@ mod tests {
     }
 
     #[test]
+    fn several_applications_with_no_host_are_answered_421() {
+        let mut no_host = snapshot();
+        no_host.no_host = true;
+        let routing = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(Routing::from_snapshot(&no_host, None))
+            .unwrap();
+        let ids = crate::errors::RequestIds::new();
+        let headers = HeaderMap::new();
+
+        assert!(matches!(
+            routing.select(
+                Some("shop.test"),
+                "/",
+                "127.0.0.1:8080",
+                false,
+                &client(&headers, &ids),
+                None
+            ),
+            Decision::NoHost
+        ));
+    }
+
+    #[test]
     fn preview_and_sticky_cookies_pin_the_release() {
         let routing = tokio::runtime::Runtime::new()
             .unwrap()
@@ -2953,6 +3011,19 @@ mod tests {
             None,
         ));
         assert_ne!(release, "r9", "an unknown release is ignored");
+
+        let decision = routing.select(
+            Some("shop.example.com"),
+            "/",
+            plain,
+            true,
+            &client(&headers, &ids),
+            None,
+        );
+        let Decision::Serve { selection, .. } = decision else {
+            panic!("not served");
+        };
+        assert!(preview_ignored(&headers, &selection), "and says so");
 
         let mut headers = HeaderMap::new();
         headers.insert(

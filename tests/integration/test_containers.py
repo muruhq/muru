@@ -7,10 +7,16 @@ serve` and for the daemon, and serve runs under an arbitrary user ID with a
 read-only root filesystem, answering its probes from inside.
 
 The image takes minutes to build the first time and is cached after; the
-suite carries the requires_docker marker and runs with `just test-docker`."""
+suite carries the requires_docker marker and runs with `just test-docker`.
+
+The image tag and the container names carry a short hash of the checkout's
+path, so two checkouts can run the suite at once and a rerun in the same
+checkout reuses its image layers. An image is left behind for that reason:
+images from checkouts that are gone are left to `docker image prune`."""
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import shutil
 import subprocess
@@ -24,7 +30,8 @@ import pytest
 pytestmark = pytest.mark.requires_docker
 
 ROOT = Path(__file__).resolve().parents[2]
-IMAGE = "muru-test:working-tree"
+CHECKOUT = hashlib.sha256(str(ROOT).encode()).hexdigest()[:8]
+IMAGE = f"muru-test:{CHECKOUT}"
 
 # A short worker stop budget, so the scenarios run in seconds.
 
@@ -75,11 +82,13 @@ class Container:
         self.name = name
         self.port = port
 
-    def exec(self, *command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-        """Run a command in the container."""
+    def exec(
+        self, *command: str, check: bool = True, user: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a command in the container, as its own user unless told otherwise."""
 
         return subprocess.run(
-            ["docker", "exec", self.name, *command],
+            ["docker", "exec", *(["--user", user] if user else []), self.name, *command],
             capture_output=True,
             text=True,
             check=check,
@@ -168,9 +177,9 @@ def container(image: str, request: pytest.FixtureRequest) -> Iterator[Callable[.
     def start(
         *command: str, env: dict[str, str] | None = None, options: tuple[str, ...] = ()
     ) -> Container:
-        name = f"muru-test-{request.node.name[:40]}-{len(started)}".replace("[", "-").replace(
-            "]", ""
-        )
+        name = f"muru-test-{CHECKOUT}-{request.node.name[:40]}-{len(started)}".replace(
+            "[", "-"
+        ).replace("]", "")
         subprocess.run(["docker", "rm", "-f", name], check=False, capture_output=True)
         environment = [f"--env={key}={value}" for key, value in (env or {}).items()]
         subprocess.run(
@@ -398,6 +407,10 @@ def test_serve_runs_as_an_arbitrary_user_on_a_read_only_root(
             "/run/muru:mode=0770,gid=0",
             "--tmpfs",
             "/tmp",
+            "--memory",
+            "512m",
+            "--memory-swap",
+            "512m",
         ),
     )
     wait_until_serving(instance)
@@ -412,6 +425,72 @@ def test_serve_runs_as_an_arbitrary_user_on_a_read_only_root(
     assert instance.exec("python3", "-c", "import os; print(os.getuid())").stdout.strip() == (
         "1000770000"
     )
+
+    # Section 13.9: another user ID with group 0 may use the serve too,
+    # the spool stays its owner's, and a user outside the group that names
+    # the socket is told which it may not use and whose it is.
+
+    other = instance.exec("muructl", "status", check=False, user="5555:0")
+    assert other.returncode == 0, other.stdout + other.stderr
+    modes = instance.exec(
+        "python3",
+        "-c",
+        "import os\n"
+        "for name in ('admin.sock', 'probe.sock', 'serve.json', 'release', 'spool'):\n"
+        "    print(name, oct(os.stat(f'/run/muru/{name}').st_mode & 0o777))\n",
+    ).stdout.split("\n")
+    assert modes[:5] == [
+        "admin.sock 0o770",
+        "probe.sock 0o770",
+        "serve.json 0o660",
+        "release 0o770",
+        "spool 0o700",
+    ], modes
+    outside = instance.exec(
+        "muructl", "status", "--socket", "/run/muru/admin.sock", check=False, user="5555:5555"
+    )
+    assert outside.returncode != 0
+    assert "permission denied on /run/muru/admin.sock" in outside.stderr, outside.stderr
+    assert "belongs to UID" in outside.stderr, outside.stderr
+
+    # Without --socket the same user is told the same, having nothing else
+    # to find, and with a run of their own finds that and is told nothing
+    # about a directory they may not enter.
+
+    nothing = instance.exec("muructl", "status", check=False, user="5555:5555")
+    assert nothing.returncode != 0
+    assert "permission denied on /run/muru/admin.sock" in nothing.stderr, nothing.stderr
+    subprocess.run(
+        [
+            "docker",
+            "exec",
+            "--detach",
+            "--user",
+            "5555:5555",
+            "--env",
+            "HOME=/tmp/five",
+            instance.name,
+            "muructl",
+            "run",
+            "plain_wsgi:application",
+            "--port",
+            "auto",
+            "--dashboard",
+            "off",
+            "--no-reload",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    def own_run_found() -> bool:
+        return instance.exec("muructl", "status", check=False, user="5555:5555").returncode == 0
+
+    wait_for(own_run_found)
+    own = instance.exec("muructl", "status", check=False, user="5555:5555")
+    assert "/run/muru" not in own.stdout + own.stderr, own.stdout + own.stderr
 
     # Section 9.12: a command of the project runs through the serve, and
     # in a container of its own, where nothing serves, by muructl itself.
@@ -432,6 +511,16 @@ def test_serve_runs_as_an_arbitrary_user_on_a_read_only_root(
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert completed.stdout.strip() == "release none"
+
+    # Section 13.9: over its hard limit with no room for a second worker
+    # of that size, the worker stops first and its successor starts after.
+
+    thread, _ = instance.request_in_the_background("/grow?mb=360")
+    wait_for(lambda: "stops before its replacement starts" in instance.logs(), timeout=30)
+    thread.join(timeout=30)
+    wait_for(lambda: ": worker.recycled: worker 0" in instance.logs(), timeout=30)
+    wait_until_serving(instance)
+    assert "worker.oom_killed" not in instance.logs(), instance.logs()
 
     elapsed, code = instance.stop()
     assert code == 0, instance.logs()

@@ -59,7 +59,14 @@ class Handler(BaseHTTPRequestHandler):
             "cwd": os.getcwd(),
             "env": {
                 name: os.environ.get(name)
-                for name in ("MURU_HTTP_BIND", "PORT", "MURU_INSTANCE", "LEGACY_SETTING")
+                for name in (
+                    "MURU_HTTP_BIND",
+                    "PORT",
+                    "MURU_INSTANCE",
+                    "LEGACY_SETTING",
+                    "INHERITED_ONLY",
+                    "PASSED_ON",
+                )
             },
         }
         self.reply(200, json.dumps(report).encode(), [("Content-Type", "application/json")])

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +24,7 @@ def test_queue_timeout_answers_503_queue_full() -> None:
             # on a busy machine.
 
             time.sleep(1.0)
+            server.mark_log()
             started = time.monotonic()
             queued = server.get("/", headers={"Accept": "application/json"})
             waited = time.monotonic() - started
@@ -32,6 +34,17 @@ def test_queue_timeout_answers_503_queue_full() -> None:
         assert json.loads(queued.body)["reason"] == "queue_full"
         assert queued.header("Retry-After") == "1"
         assert 0.8 < waited < 2.5
+
+        # The access log records the whole wait as the queue time.
+
+        request_id = queued.header("X-Request-ID")
+        assert server.wait_for_log(f"id={request_id}")
+        line = next(
+            line for line in server.log_since_mark().splitlines() if f"id={request_id}" in line
+        )
+        queue = re.search(r" queue=([0-9.]+)s reason=queue_full ", line)
+        assert queue, line
+        assert 0.8 < float(queue[1]) < 2.5
         assert server.get("/").status == 200
     finally:
         server.stop()

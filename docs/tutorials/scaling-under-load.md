@@ -56,8 +56,8 @@ muructl scale status busy
 
 ```
 busy@r1
-GROUP        WORKERS      SLOTS      IDLE    QUEUE-P95  REAPS      POLICY
-default      1            0/2        1.0     -          0/6        spare 1-8 workers, 1-3 idle
+GROUP        WORKERS      SLOTS      IDLE    QUEUE-P95     REAPS      POLICY
+default      1            0/2        1.00    -             0/6        spare 1-8 workers, 1-3 idle
   workers: cpu -, gil wait p95 -, loop lag p95 -
   diagnosis: idle
 ```
@@ -88,11 +88,11 @@ muructl scale status busy
 
 ```
 busy@r1
-GROUP        WORKERS      SLOTS      IDLE    QUEUE-P95  REAPS      POLICY
-default      5            7/10       1.0     1000 ms    0/6        spare 1-8 workers, 1-3 idle
-  workers: cpu 1%, gil wait p95 0 ms, loop lag p95 -
+GROUP        WORKERS      SLOTS      IDLE    QUEUE-P95     REAPS      POLICY
+default      5            7/10       1.00    under 1 s     0/6        spare 1-8 workers, 1-3 idle
+  workers: cpu 1%, gil wait p95 under 0.5 ms, loop lag p95 -
   diagnosis: within capacity
-  last: scaled out to 5: short by 3.0 workers for 5996ms (3s ago)
+  last: scaled out to 5: short by 3.00 workers for 5996ms (3s ago)
 ```
 
 When the load arrived, requests waited at the edge for a free thread,
@@ -107,7 +107,7 @@ and none fails.
 The diagnosis line describes the latest second. With five workers the
 group is just within capacity, so it may also read I/O bound when all
 eight clients are waiting at once. The `last:` line is the latest
-decision, which may be the spare rule's instead, `0.0 idle workers, under
+decision, which may be the spare rule's instead, `0.00 idle workers, under
 min_spare 1`, when the group ran out of idle workers on its way up. Why it
 grew is in the decisions, each an event with its reasons:
 
@@ -116,7 +116,7 @@ muructl events
 ```
 
 ```
-    5 10:14:07 info     scaling.decision     busy@r1                  default: scale out from 1 to 5 workers: short by 3.0 workers for 5996ms; diagnosis: I/O bound with exhausted slots; ...
+    5 10:14:07 info     scaling.decision     busy@r1                  default: scale out from 1 to 5 workers: short by 3.00 workers for 5996ms; diagnosis: I/O bound with exhausted slots; ...
 ```
 
 The diagnosis when it decided says what held the group back: its
