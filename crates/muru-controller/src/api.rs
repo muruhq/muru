@@ -1376,6 +1376,21 @@ impl Admin for Service {
         Ok(Response::new(answer))
     }
 
+    async fn list_cache(
+        &self,
+        _: Request<pb::ListCacheRequest>,
+    ) -> Result<Response<pb::ListCacheResponse>, Status> {
+        let releases = self.handle.store.releases(None).map_err(internal)?;
+        let locations = self.handle.info.locations.clone();
+
+        let answer =
+            tokio::task::spawn_blocking(move || crate::cache::state_report(&locations, &releases))
+                .await
+                .map_err(internal)?;
+
+        Ok(Response::new(answer))
+    }
+
     async fn get_metrics(
         &self,
         _: Request<pb::GetMetricsRequest>,

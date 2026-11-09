@@ -683,6 +683,10 @@ struct HostRecord {
     sockets: Vec<PathBuf>,
     #[serde(default)]
     groups: Vec<GroupRecord>,
+    /// The runtime library directory the host runs with, which `muructl
+    /// cache` leaves while the host is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime: Option<PathBuf>,
 }
 
 /// A named worker group's sockets and paths, for re-adoption and the
@@ -5237,6 +5241,7 @@ impl Daemon {
                 pid: host.pid().unwrap_or(0),
                 sockets: host.sockets.clone(),
                 groups: groups.clone(),
+                runtime: library.pythonpath.clone(),
             },
         );
         let now = Instant::now();
@@ -8915,6 +8920,8 @@ impl Daemon {
                         pid,
                         sockets: all,
                         groups: running.groups.clone(),
+                        runtime: read_record::<HostRecord>(&record)
+                            .and_then(|previous| previous.runtime),
                     },
                 );
 

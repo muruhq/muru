@@ -228,6 +228,11 @@ enum Command {
     },
 
     /// The runtime library on its own: unpack it for an image.
+    Cache {
+        #[command(subcommand)]
+        command: admin::CacheCommand,
+    },
+
     Runtime {
         #[command(subcommand)]
         command: provision::RuntimeCommand,
@@ -953,6 +958,11 @@ fn main() -> anyhow::Result<()> {
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
         Command::Debug { command } => runtime.block_on(admin::debug(command)),
+        Command::Cache { command } => runtime.block_on(async move {
+            match command {
+                admin::CacheCommand::List(args) => admin::cache_list(*args).await,
+            }
+        }),
         Command::Runtime { command } => runtime.block_on(provision::run(command)),
         Command::Secret { command } => runtime.block_on(admin::secret(command)),
         Command::Logging { command } => runtime.block_on(admin::logging(command)),
@@ -3344,7 +3354,13 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
             &label,
             &project,
         ),
-        None => run_admin::Registration::new(&runtime, edge.local_addr(), &label, &project),
+        None => run_admin::Registration::new(
+            &runtime,
+            edge.local_addr(),
+            &label,
+            &project,
+            library.pythonpath.as_deref(),
+        ),
     };
 
     let registration = match registered {
@@ -3612,6 +3628,12 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
                         spec.python = python.python.clone();
                         spec.pythonpath = library.pythonpath.clone();
                         served.replace(spec.python.clone(), spec.pythonpath.clone());
+
+                        if let (Some(registration), Some(directory)) =
+                            (&registration, &library.pythonpath)
+                        {
+                            registration.note_runtime(directory);
+                        }
                     }
                     Ok(false) => {}
                     Err(error) => {

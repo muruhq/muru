@@ -7521,35 +7521,42 @@ struct LogDirectory {
     existing: Option<muru_controller::log_files::Existing>,
 }
 
-/// Find how to reach the log files. A command that names no socket looks
-/// for the daemon alone, since only a daemon writes log files; with none
-/// listening it works on the files in the resolved log directory.
-async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result<LogsWay> {
-    let locations = Locations::resolve(&Options {
+/// The locations the daemon's location options resolve to.
+fn daemon_locations(socket: &SocketArgs, files: &DaemonFileArgs) -> Locations {
+    Locations::resolve(&Options {
         config: files.config.clone(),
         state_dir: files.state_dir.clone(),
         run_dir: socket.locations.run_dir.clone(),
         log_dir: files.log_dir.clone(),
         cache_dir: files.cache_dir.clone(),
         system: socket.locations.system,
-    });
+    })
+}
+
+/// Whether nothing listens where a command that names no socket would
+/// find the daemon. A socket file that is absent, or one left behind that
+/// refuses the connection, is no daemon. Anything else, such as a
+/// permission refused, is left for the connection to report.
+fn no_daemon(socket: &SocketArgs, path: &Path) -> bool {
+    socket.socket.is_none()
+        && match path.try_exists() {
+            Ok(false) => true,
+            Ok(true) => muru_controller::client::left_behind(path),
+            Err(_) => false,
+        }
+}
+
+/// Find how to reach the log files. A command that names no socket looks
+/// for the daemon alone, since only a daemon writes log files; with none
+/// listening it works on the files in the resolved log directory.
+async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result<LogsWay> {
+    let locations = daemon_locations(socket, files);
     let path = socket
         .socket
         .clone()
         .unwrap_or_else(|| locations.admin_socket());
 
-    // A socket file that is absent, or one left behind that refuses the
-    // connection, is no daemon. Anything else, such as a permission
-    // refused, is left for the connection below to report.
-
-    let nothing_listens = socket.socket.is_none()
-        && match path.try_exists() {
-            Ok(false) => true,
-            Ok(true) => muru_controller::client::left_behind(&path),
-            Err(_) => false,
-        };
-
-    if nothing_listens {
+    if no_daemon(socket, &path) {
         let store_path = locations.state_store();
 
         let existing = if store_path.is_file() {
@@ -7962,6 +7969,206 @@ pub async fn logs_prune(args: LogsPruneArgs) -> anyhow::Result<()> {
     }
 }
 
+/// The areas `muructl cache` works on.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CacheArea {
+    /// The user cache: runtime libraries, certificates, a managed uv.
+    User,
+    /// The daemon's state directory: its runtime libraries, uv's build
+    /// cache and downloaded Pythons.
+    Daemon,
+}
+
+/// What `muructl cache list` takes.
+#[derive(Args, Clone)]
+pub struct CacheListArgs {
+    /// The area to list; both when none is named.
+    #[arg(value_enum)]
+    area: Option<CacheArea>,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// The daemon's and the user cache's locations.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// The `muructl cache` subcommands.
+#[derive(Subcommand)]
+pub enum CacheCommand {
+    /// Show what the user cache and the daemon's re-creatable data take,
+    /// each runtime library by version and interpreter tag, the certificates,
+    /// a managed uv, uv's build cache and downloaded Pythons.
+    List(Box<CacheListArgs>),
+}
+
+/// The user cache directory: --cache-dir, else what `muructl run` uses.
+fn user_cache_dir(files: &DaemonFileArgs) -> anyhow::Result<PathBuf> {
+    match &files.cache_dir {
+        Some(path) => Ok(std::path::absolute(path).unwrap_or_else(|_| path.clone())),
+        None => crate::devcert::cache_dir(),
+    }
+}
+
+/// How a cache command reaches the daemon's area: its daemon when one
+/// runs, else its files, with what the state store says the releases use.
+enum CacheWay {
+    Daemon(Box<muru_proto::admin::v1::admin_client::AdminClient<tonic::transport::Channel>>),
+    Files(Box<Locations>, Vec<muru_controller::model::Release>),
+}
+
+/// Find how to reach the daemon's area. A --state-dir that is not the
+/// running daemon's is refused rather than worked on behind its back.
+async fn cache_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result<CacheWay> {
+    let locations = daemon_locations(socket, files);
+    let path = socket
+        .socket
+        .clone()
+        .unwrap_or_else(|| locations.admin_socket());
+
+    if no_daemon(socket, &path) {
+        let store_path = locations.state_store();
+
+        let releases = if store_path.is_file() {
+            muru_controller::store::Store::open_read_only(&store_path)
+                .with_context(|| format!("opening {}", store_path.display()))?
+                .releases(None)?
+        } else {
+            Vec::new()
+        };
+
+        return Ok(CacheWay::Files(Box::new(locations), releases));
+    }
+
+    let mut client = client::connect(&path).await?;
+
+    if let Some(asked) = &files.state_dir {
+        let answer = client
+            .list_cache(pb::ListCacheRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner();
+        let same = asked.canonicalize().ok() == Path::new(&answer.directory).canonicalize().ok();
+
+        if !same {
+            anyhow::bail!(
+                "the daemon running at {} keeps its state in {}, not {}",
+                path.display(),
+                answer.directory,
+                asked.display()
+            );
+        }
+    }
+
+    Ok(CacheWay::Daemon(Box::new(client)))
+}
+
+/// What the development runs have of the user cache in use.
+fn user_cache_in_use(socket: &SocketArgs) -> muru_controller::cache::InUse {
+    let mut in_use = muru_controller::cache::InUse::default();
+
+    for run in crate::run_admin::runs(&socket.locations.resolve().run.path) {
+        for directory in run.runtime {
+            let resolved = std::fs::canonicalize(&directory).unwrap_or(directory);
+            in_use
+                .runtime
+                .insert(resolved, format!("the development run of {}", run.app));
+        }
+    }
+
+    in_use
+}
+
+/// The report on the user cache, with what development runs use marked.
+fn user_cache_report(
+    socket: &SocketArgs,
+    files: &DaemonFileArgs,
+) -> anyhow::Result<pb::ListCacheResponse> {
+    use muru_controller::cache;
+
+    let root = user_cache_dir(files)?;
+    let mut entries = cache::user_entries(&root);
+    cache::mark_in_use(
+        &mut entries,
+        &user_cache_in_use(socket),
+        &crate::provision::version(),
+    );
+
+    Ok(cache::report(&root, entries))
+}
+
+/// The report on the daemon's area, through the daemon or from its files.
+async fn daemon_cache_report(way: CacheWay) -> anyhow::Result<pb::ListCacheResponse> {
+    match way {
+        CacheWay::Daemon(mut client) => Ok(client
+            .list_cache(pb::ListCacheRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner()),
+        CacheWay::Files(locations, releases) => {
+            Ok(muru_controller::cache::state_report(&locations, &releases))
+        }
+    }
+}
+
+/// `muructl cache list`, for scripts: the two areas that were asked for.
+#[derive(serde::Serialize)]
+struct CacheReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<pb::ListCacheResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon: Option<pb::ListCacheResponse>,
+}
+
+/// List the cache areas.
+pub async fn cache_list(args: CacheListArgs) -> anyhow::Result<()> {
+    let user = if args.area == Some(CacheArea::Daemon) {
+        None
+    } else {
+        Some(user_cache_report(&args.socket, &args.files)?)
+    };
+
+    let daemon = if args.area == Some(CacheArea::User) {
+        None
+    } else {
+        Some(daemon_cache_report(cache_way(&args.socket, &args.files).await?).await?)
+    };
+
+    if args.output.json {
+        return print_answer(&CacheReport { user, daemon });
+    }
+
+    for (title, report) in [("USER CACHE", &user), ("DAEMON DATA", &daemon)] {
+        let Some(report) = report else {
+            continue;
+        };
+
+        println!("{title} in {}", report.directory);
+
+        if report.entries.is_empty() {
+            println!("  nothing");
+        }
+
+        for entry in &report.entries {
+            let used = if entry.in_use.is_empty() {
+                String::new()
+            } else {
+                format!("  in use by {}", entry.in_use)
+            };
+
+            println!("  {:<40} {:>9}{used}", entry.name, human_size(entry.size));
+        }
+
+        println!("  total {}", human_size(report.total));
+    }
+
+    Ok(())
+}
+
 /// A byte count for a reader, in the units sizes are given in.
 fn human_size(bytes: u64) -> String {
     const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
@@ -8152,6 +8359,7 @@ mod tests {
             project: PathBuf::from(project),
             listen: "127.0.0.1:8080".to_owned(),
             socket: PathBuf::from(socket),
+            runtime: Vec::new(),
         };
         let daemon = PathBuf::from("/user/admin.sock");
         let denied = PathBuf::from("/run/muru/admin.sock");

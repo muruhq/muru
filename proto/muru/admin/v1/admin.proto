@@ -102,6 +102,9 @@ service Admin {
   // Remove log archives by count or age and, when asked, the logs of what no longer exists.
   rpc PruneLogs(PruneLogsRequest) returns (PruneLogsResponse);
 
+  // The daemon's re-creatable data (sections 8.2, 8.3 and 13.8).
+  rpc ListCache(ListCacheRequest) returns (ListCacheResponse);
+
   // Metrics (section 11.1): the node's Prometheus text exposition.
   rpc GetMetrics(GetMetricsRequest) returns (MetricsText);
 
@@ -1129,6 +1132,25 @@ message PruneLogsResponse {
   repeated PrunedFile removed = 1;
   uint64 freed = 2;                 // the bytes freed, or that would be
   bool dry_run = 3;                 // nothing was changed
+}
+
+message ListCacheRequest {}
+
+// One thing a cache area holds.
+message CacheEntry {
+  string kind = 1;                  // runtime, certs, uv, uv_cache or python
+  string name = 2;                  // its name within the area
+  string path = 3;
+  string version = 4;               // of a runtime library
+  string tag = 5;                   // of a runtime library: the interpreter tag
+  uint64 size = 6;                  // the bytes it takes
+  string in_use = 7;                // what uses it, when something does
+}
+
+message ListCacheResponse {
+  string directory = 1;             // the directory the area is in
+  repeated CacheEntry entries = 2;
+  uint64 total = 3;                 // the bytes the area takes
 }
 
 message GetMetricsRequest {}

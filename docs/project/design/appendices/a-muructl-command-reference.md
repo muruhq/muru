@@ -56,6 +56,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Capacity | muructl restart RELEASE or APP --worker N | Replace one worker with a fresh one, or every worker in turn with --all; --pid names it by process id, --force kills it at once, --no-wait returns before the replacement serves | 7.6 |
 | Capacity | muructl schedule add, list, remove | Scheduled capacity | 7.5 |
 | Capacity | muructl edge pools, set | Edge pools and process counts | 4.2 |
+| Operations | muructl cache list [user or daemon] | What the user cache and the daemon's re-creatable data take, by runtime library version and tag, certificates, managed uv, uv's build cache and downloaded Pythons, with what uses each. Flags: --json, and with no daemon running --state-dir and --cache-dir | 13.8 |
 | Observability | muructl watch | Live view of applications, releases and workers | 10.7 |
 | Observability | muructl events | Show or follow events with filters. Flags: --follow, --after | 11.5 |
 | Observability | muructl logs RELEASE | Show or follow logs | 11.2 |

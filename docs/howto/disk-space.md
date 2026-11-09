@@ -104,3 +104,28 @@ under way and while a release of it is being built.
 
 `muructl apply -f config/ --prune` removes the releases the files do not
 declare in the same way, logs included.
+
+## Caches
+
+Muru keeps data that can be re-created in two places: the user cache,
+which `muructl run` fills, and the daemon's state directory. `muructl
+cache list` shows what each takes, with what uses it:
+
+```console
+$ muructl cache list
+USER CACHE in /home/me/.cache/muru
+  1.0.0/cp313                                 4.7MB  in use by the development run of shop
+  1.0.0/cp314t                                4.7MB
+  certs                                       4.0KB
+  total 9.4MB
+DAEMON DATA in /home/me/.local/state/muru
+  1.0.0/cp313                                 4.7MB  in use by the release shop@r5
+  uv-cache/shop                             412.0MB
+  python/cpython-3.13-linux-x86_64-gnu      130.2MB  in use by the release shop@r5
+  total 546.9MB
+```
+
+Name `user` or `daemon` to show one. The user cache is the one `muructl
+run` uses; `--cache-dir` names another. The daemon's data comes from the
+running daemon, and with none running from the state directory, which
+`--state-dir` names.

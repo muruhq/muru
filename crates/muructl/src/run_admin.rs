@@ -489,6 +489,10 @@ pub struct RunInfo {
     pub listen: String,
     /// The admin socket.
     pub socket: PathBuf,
+    /// The runtime library directories the run uses, which `muructl
+    /// cache` leaves while it runs.
+    #[serde(default)]
+    pub runtime: Vec<PathBuf>,
 }
 
 /// The run's place in the user runtime directory, removed when dropped.
@@ -509,6 +513,7 @@ impl Registration {
         listen: SocketAddr,
         app: &str,
         project: &Path,
+        library: Option<&Path>,
     ) -> anyhow::Result<Self> {
         let runs = runtime.join("runs");
         std::fs::create_dir_all(&runs).with_context(|| format!("creating {}", runs.display()))?;
@@ -534,12 +539,37 @@ impl Registration {
             project: project.to_path_buf(),
             listen: listen.to_string(),
             socket: socket.clone(),
+            runtime: library.map(Path::to_path_buf).into_iter().collect(),
         };
         std::fs::write(directory.join("run.json"), serde_json::to_vec(&info)?)?;
         Ok(Self {
             directory: Some(directory),
             socket,
         })
+    }
+
+    /// Record another runtime library directory the run uses, when a
+    /// rebuild moved it to a different interpreter. Earlier ones stay
+    /// listed, since a release may still be draining on them.
+    pub fn note_runtime(&self, library: &Path) {
+        let Some(directory) = &self.directory else {
+            return;
+        };
+        let path = directory.join("run.json");
+        let Some(mut info) = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RunInfo>(&bytes).ok())
+        else {
+            return;
+        };
+
+        if !info.runtime.iter().any(|known| known == library) {
+            info.runtime.push(library.to_path_buf());
+
+            if let Ok(bytes) = serde_json::to_vec(&info) {
+                let _ = std::fs::write(path, bytes);
+            }
+        }
     }
 
     /// The admin socket of `muructl serve` at `socket`, in its run
@@ -559,6 +589,7 @@ impl Registration {
             project: project.to_path_buf(),
             listen: listen.to_string(),
             socket: socket.to_path_buf(),
+            runtime: Vec::new(),
         };
         let registration = socket.with_file_name("serve.json");
         std::fs::write(&registration, serde_json::to_vec(&info)?)?;
@@ -1161,6 +1192,7 @@ impl Admin for Service {
         wait_release(pb::WaitReleaseRequest) -> pb::Release, "muructl release wait";
         rollback(pb::RollbackRequest) -> pb::Release, "muructl rollback";
         drain_release(pb::DrainReleaseRequest) -> pb::Release, "muructl drain";
+        list_cache(pb::ListCacheRequest) -> pb::ListCacheResponse, "muructl cache";
         prune_releases(pb::PruneReleasesRequest) -> pb::RemoveReleasesResponse, "muructl release prune";
         remove_release(pb::RemoveReleaseRequest) -> pb::RemoveReleasesResponse, "muructl release remove";
         start_rollout(pb::StartRolloutRequest) -> pb::Rollout, "muructl rollout";

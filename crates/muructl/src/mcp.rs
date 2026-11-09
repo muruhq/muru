@@ -727,6 +727,14 @@ fn specs() -> Vec<Spec> {
             command: |_| Ok(words(&["logs", "list"])),
         },
         Spec {
+            name: "cache",
+            description: "What the user cache and the daemon's re-creatable data take: each runtime library by version and interpreter tag, the certificates, uv's build cache, downloaded Pythons, and what uses each.",
+            changes: false,
+            properties: json!({}),
+            required: &[],
+            command: |_| Ok(words(&["cache", "list"])),
+        },
+        Spec {
             name: "events",
             description: "The daemon's events in order (deploys, state changes, rollouts, worker faults), up to 200 after a sequence number.",
             changes: false,
