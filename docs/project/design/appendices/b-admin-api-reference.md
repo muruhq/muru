@@ -18,7 +18,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | Resource | Gateway path | Notes |
 | --- | --- | --- |
 | Application | /v1/apps/{app} | defaults, reload, memory and timeout settings |
-| Release | /v1/apps/{app}/releases/{release} | create starts it, immutable except scale and limits |
+| Release | /v1/apps/{app}/releases/{release} | create starts it, immutable except scale and limits; ListReleases measures disk use when asked |
 | WorkerGroup | /v1/apps/{app}/releases/{release}/groups/{group} | Get, List, Watch, Update of sizes and scaling |
 | Worker | /v1/apps/{app}/releases/{release}/groups/{group}/workers/{worker} | read only |
 | Schedule | /v1/apps/{app}/schedules/{schedule} | scheduled capacity |
@@ -50,6 +50,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | CheckRelease | POST /v1/apps/{app}:check | validate in a throwaway host |
 | PauseRollout, ResumeRollout, PromoteRollout, AbortRollout | POST /v1/apps/{app}/rollouts/{rollout}:pause, :resume, :promote, :abort | rollout control |
 | DrainRelease | POST /v1/apps/{app}/releases/{release}:drain | drain with timeouts |
+| PruneReleases | POST /v1/apps/{app}/releases:prune | remove old releases by the rules of 9.1, of an application or of all, or list what would go |
 | SetScale | POST /v1/apps/{app}/releases/{release}:scale | sizes, bounds, temporary floors |
 | GetScaleStatus | GET /v1/apps/{app}/releases/{release}/scale | signals, decisions, churn |
 | SetMaintenance | POST /v1/apps/{app}:maintenance | maintenance mode |

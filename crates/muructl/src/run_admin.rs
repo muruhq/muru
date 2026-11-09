@@ -1160,6 +1160,7 @@ impl Admin for Service {
         wait_release(pb::WaitReleaseRequest) -> pb::Release, "muructl release wait";
         rollback(pb::RollbackRequest) -> pb::Release, "muructl rollback";
         drain_release(pb::DrainReleaseRequest) -> pb::Release, "muructl drain";
+        prune_releases(pb::PruneReleasesRequest) -> pb::RemoveReleasesResponse, "muructl release prune";
         start_rollout(pb::StartRolloutRequest) -> pb::Rollout, "muructl rollout";
         get_rollout(pb::GetRolloutRequest) -> pb::Rollout, "muructl rollout";
         list_rollouts(pb::ListRolloutsRequest) -> pb::ListRolloutsResponse, "muructl rollout";

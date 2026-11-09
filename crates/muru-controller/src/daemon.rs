@@ -455,6 +455,24 @@ pub enum Command {
         /// Where the outcome goes.
         done: oneshot::Sender<Result<Release, String>>,
     },
+    /// Section 9.1: the releases a route's traffic names and the
+    /// candidates of the rollouts under way, which removal leaves.
+    ReferencedReleases {
+        /// Where the answer goes.
+        done: oneshot::Sender<BTreeSet<(String, String)>>,
+    },
+    /// Section 9.1: drop a release's record unless it has become
+    /// protected since it was chosen. The check and the removal are one
+    /// step of the command loop, so a promotion or rollback cannot slip
+    /// between them.
+    ForgetRelease {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// Where the outcome goes.
+        done: oneshot::Sender<Result<(), String>>,
+    },
     /// Section 10.10: start a recorded release held, for an apply's
     /// prepare phase, unless it runs.
     StartHeld {
@@ -4234,6 +4252,12 @@ impl Daemon {
             }
             Command::Drain { app, id, done } => {
                 let _ = done.send(self.drain_release(&app, &id).await);
+            }
+            Command::ReferencedReleases { done } => {
+                let _ = done.send(self.referenced_releases());
+            }
+            Command::ForgetRelease { app, id, done } => {
+                let _ = done.send(self.forget_release(&app, &id));
             }
             Command::StartHeld { app, id, done } => {
                 let _ = done.send(self.start_held(&app, &id).await);
@@ -8416,6 +8440,40 @@ impl Daemon {
 
         self.store
             .release(app, id)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Section 9.1: drop a release's record, unless it is protected now.
+    fn forget_release(&self, app: &str, id: &str) -> Result<(), String> {
+        let record = self.store.app(app).map_err(|error| error.to_string())?;
+        let release = self
+            .store
+            .release(app, id)
+            .map_err(|error| error.to_string())?;
+        let candidate = crate::removal::Candidate {
+            id: id.to_owned(),
+            state: release.state,
+            created_unix_ms: release.created_unix_ms,
+            declared: false,
+            referenced: self
+                .referenced_releases()
+                .contains(&(app.to_owned(), id.to_owned())),
+        };
+
+        if let Some(why) = crate::removal::protection(
+            record.current.as_deref(),
+            record.previous.as_deref(),
+            &candidate,
+        ) {
+            return Err(format!("{app}@{id} cannot be removed: {}", why.describe()));
+        }
+
+        if self.running.contains_key(&(app.to_owned(), id.to_owned())) {
+            return Err(format!("{app}@{id} cannot be removed: it is still running"));
+        }
+
+        self.store
+            .delete_release(app, id)
             .map_err(|error| error.to_string())
     }
 

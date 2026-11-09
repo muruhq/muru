@@ -5149,6 +5149,12 @@ pub enum ReleaseCommand {
         output: JsonArgs,
     },
 
+    /// Remove old releases, of one application or of all: their records,
+    /// environments, bytecode and logs. Never takes the serving or rollback
+    /// release, a running one or one a route or rollout uses. Asks first;
+    /// without a terminal it needs --yes.
+    Prune(Box<ReleasePruneArgs>),
+
     /// Wait until a release reaches a state.
     Wait {
         /// The release, as app@release.
@@ -5170,6 +5176,41 @@ pub enum ReleaseCommand {
     },
 }
 
+/// What `muructl release prune` takes.
+#[derive(Args, Clone)]
+pub struct ReleasePruneArgs {
+    /// The application; every application when none is named.
+    app: Option<String>,
+
+    /// Keep this many of the newest releases that have not failed, beside
+    /// the serving and rollback releases.
+    #[arg(long, value_name = "N")]
+    keep: u32,
+
+    /// Also take releases that applied files declare, which the next
+    /// apply would create again.
+    #[arg(long)]
+    force: bool,
+
+    /// Leave the log and log archives of what is removed.
+    #[arg(long)]
+    keep_logs: bool,
+
+    /// Only list what would be removed.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
 /// List releases.
 pub async fn release_list(
     app: Option<String>,
@@ -5180,6 +5221,7 @@ pub async fn release_list(
     let answer = client
         .list_releases(pb::ListReleasesRequest {
             app: app.unwrap_or_default(),
+            disk: true,
         })
         .await?
         .into_inner();
@@ -5196,17 +5238,18 @@ pub async fn release_list(
     }
 
     println!(
-        "{:<24} {:<10} {:<8} {:<16} SOURCE",
-        "RELEASE", "STATE", "SERVING", "WORKERS"
+        "{:<24} {:<10} {:<8} {:<16} {:>9} SOURCE",
+        "RELEASE", "STATE", "SERVING", "WORKERS", "DISK"
     );
 
     for release in releases {
         println!(
-            "{:<24} {:<10} {:<8} {:<16} {}",
+            "{:<24} {:<10} {:<8} {:<16} {:>9} {}",
             format!("{}@{}", release.app, release.id),
             release.state,
             if release.serving { "yes" } else { "" },
             workers_column(&release),
+            human_size(release.disk_bytes),
             release.source
         );
 
@@ -5216,6 +5259,151 @@ pub async fn release_list(
     }
 
     Ok(())
+}
+
+/// Remove old releases.
+pub async fn release_prune(args: ReleasePruneArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.socket()?).await?;
+    let request = pb::PruneReleasesRequest {
+        app: args.app.clone().unwrap_or_default(),
+        keep: args.keep,
+        force: args.force,
+        keep_logs: args.keep_logs,
+        dry_run: true,
+    };
+
+    let plan = client
+        .prune_releases(request.clone())
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if !show_removal_plan(&plan, args.dry_run, args.output.json)? {
+        return Ok(());
+    }
+
+    if !confirm_removal(&plan, args.yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    let answer = client
+        .prune_releases(pb::PruneReleasesRequest {
+            dry_run: false,
+            ..request
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    finish_removal(&answer, args.output.json)
+}
+
+/// Print a removal's plan. Returns whether it goes on to the question: a
+/// dry run stops here, and so does a plan with nothing in it.
+fn show_removal_plan(
+    plan: &pb::RemoveReleasesResponse,
+    dry_run: bool,
+    json: bool,
+) -> anyhow::Result<bool> {
+    if dry_run || plan.removed.is_empty() {
+        if json {
+            print_answer(plan)?;
+            return Ok(false);
+        }
+
+        if plan.removed.is_empty() {
+            println!("muru: no releases to remove");
+        }
+
+        for release in &plan.removed {
+            println!("{}", removal_line(release));
+        }
+
+        if dry_run {
+            for release in &plan.kept {
+                println!(
+                    "{}@{} is kept ({}): {}",
+                    release.app,
+                    release.id,
+                    release.state,
+                    keep_phrase(&release.why)
+                );
+            }
+        }
+
+        if dry_run && !plan.removed.is_empty() {
+            println!("would free {}", human_size(plan.freed));
+        }
+
+        return Ok(false);
+    }
+
+    for release in &plan.removed {
+        eprintln!("  {}", removal_line(release));
+    }
+
+    Ok(true)
+}
+
+/// One release of a removal, for a person: what it is, its state, what
+/// removing it frees.
+fn removal_line(release: &pb::RemovedRelease) -> String {
+    format!(
+        "{}@{} ({}, {})",
+        release.app,
+        release.id,
+        release.state,
+        human_size(release.disk_bytes)
+    )
+}
+
+/// Why a release stays, for a person.
+fn keep_phrase(why: &str) -> &str {
+    match why {
+        "serving" => "it serves the application's traffic",
+        "rollback" => "it is the release a rollback restores",
+        "in_use" => "it is in use",
+        "referenced" => "a route's traffic or a rollout under way uses it",
+        "declared" => "applied files declare it; --force takes it",
+        "keep" => "among the newest kept",
+        "failed" => "failed, and not yet older than both the serving and rollback releases",
+        other => other,
+    }
+}
+
+/// The question before a removal.
+fn confirm_removal(plan: &pb::RemoveReleasesResponse, yes: bool) -> anyhow::Result<bool> {
+    let question = format!(
+        "Remove {} release{}, freeing {}?",
+        plan.removed.len(),
+        if plan.removed.len() == 1 { "" } else { "s" },
+        human_size(plan.freed)
+    );
+
+    confirm(&question, yes)
+}
+
+/// Report a removal and fail if any part of it did.
+fn finish_removal(answer: &pb::RemoveReleasesResponse, json: bool) -> anyhow::Result<()> {
+    if json {
+        print_answer(answer)?;
+    } else {
+        println!("muru: removed, freeing {}", human_size(answer.freed));
+    }
+
+    let failures: Vec<String> = answer
+        .removed
+        .iter()
+        .filter(|release| !release.error.is_empty())
+        .map(|release| format!("{}@{}: {}", release.app, release.id, release.error))
+        .collect();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
 }
 
 /// The WORKERS column of `release list`: what runs now, or `-` when

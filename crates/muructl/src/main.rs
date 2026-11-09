@@ -972,6 +972,7 @@ fn main() -> anyhow::Result<()> {
                     socket,
                     output,
                 } => admin::release_list(app, socket, output.json).await,
+                admin::ReleaseCommand::Prune(args) => admin::release_prune(*args).await,
                 admin::ReleaseCommand::Show {
                     release,
                     socket,

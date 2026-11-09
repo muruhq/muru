@@ -34,7 +34,8 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Configuration | muructl config show RELEASE --effective | Merged settings with their sources | 3.3 |
 | Configuration | muructl config schema | Print the JSON Schema for configuration files | 10.3 |
 | Applications | muructl app create, list, show, delete | Manage applications | 3.1 |
-| Applications | muructl release create, list, show, delete, wait | Manage releases and wait for states | 9.1 |
+| Applications | muructl release list, show, wait | Manage releases and wait for states; list shows the disk each takes | 9.1 |
+| Applications | muructl release prune [APP] --keep N | Remove old releases, of one application or all: the N newest that have not failed stay, with the serving, rollback and running releases and those a route or rollout uses. Failed releases stay until older than both the serving and the rollback release. Asks first. Flags: --force (take releases applied files declare), --keep-logs, --dry-run, --yes, --json | 9.1 |
 | Applications | muructl deploy APP PATH or IMAGE | Create a release and apply the default strategy. Flags: --entrypoint, --interface, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --factory, --release, --no-wait, --retain, --retain-workers, --fresh (take nothing from the previous release, section 3.3), --static (a directory of the release's own files, section 4.9), --build MODE, --build-extra, --build-group (the build table for this deploy, section 8.2), --dry-run (report what the deploy would do and change nothing, section 10.4) | 9.2 |
 | Applications | muructl reload APP | New release from the current source | 9.8 |
 | Applications | muructl command list [APP[@RELEASE]] | The commands the release declares, with their inputs and each one's last run; with no application, those of the project in the current directory. Flags: --chdir, --config | 9.12 |

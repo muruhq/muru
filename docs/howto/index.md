@@ -41,6 +41,7 @@ Recipes for specific tasks, assuming you already know the basics. The
   sizing in a pod.
 - [Upgrading Muru](upgrading.md): a new version of muructl and the
   daemon.
+- [Disk space](disk-space.md): clearing old releases and applications.
 
 ## Releases and traffic
 
@@ -132,6 +133,7 @@ migrations
 containers
 kubernetes
 upgrading
+disk-space
 traffic
 rollouts
 overlays

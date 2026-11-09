@@ -1307,6 +1307,43 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "prune_releases",
+            description: "Remove old releases, of app or of all applications, keeping the keep newest that have not failed. Never takes the serving or rollback release, a running one or one a route or rollout uses. dry_run lists what would go; anything else is refused unless yes is true.",
+            changes: true,
+            properties: json!({
+                "app": {"type": "string", "description": "The application; every application when not given"},
+                "keep": {"type": "integer", "description": "How many of the newest releases that have not failed to keep"},
+                "force": {"type": "boolean", "description": "Also take releases applied files declare"},
+                "keep_logs": {"type": "boolean", "description": "Leave the logs of what is removed"},
+                "dry_run": {"type": "boolean"},
+                "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
+            }),
+            required: &["keep"],
+            command: |arguments| {
+                let mut command = words(&["release", "prune"]);
+                command.extend(
+                    arguments
+                        .get("app")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+                command.extend(option(arguments, "keep", "--keep"));
+
+                for (key, name) in [
+                    ("force", "--force"),
+                    ("keep_logs", "--keep-logs"),
+                    ("dry_run", "--dry-run"),
+                    ("yes", "--yes"),
+                ] {
+                    if flag(arguments, key) {
+                        command.push(name.to_owned());
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "reopen_logs",
             description: "Reopen every log file by name, after something outside Muru has renamed them; workers also runs each worker's on_reopen_logs hook.",
             changes: true,
@@ -1407,6 +1444,18 @@ mod tests {
                 "2".into(),
                 "--dry-run".into()
             ])
+        );
+
+        assert_eq!(
+            command("prune_releases", json!({"app": "shop", "keep": 2})),
+            Ok(vec![
+                "release".into(),
+                "prune".into(),
+                "shop".into(),
+                "--keep".into(),
+                "2".into()
+            ]),
+            "without yes the command runs with no --yes, and refuses"
         );
 
         // Every environment value is for a person at a terminal, never

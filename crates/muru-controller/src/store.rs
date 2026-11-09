@@ -3,6 +3,7 @@
 //! 10.2). Every access goes through one connection behind a mutex; the
 //! store is small and the reconciler is the only writer.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -145,7 +146,7 @@ CREATE TABLE IF NOT EXISTS log_periods (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// The store.
 pub struct Store {
@@ -175,8 +176,10 @@ impl Store {
         // 10 the last run of each command (section 9.12), version 11 the
         // application's own access log choice (section 11.2), added to
         // an older table here, version 12 the virtual hosts in
-        // maintenance mode (section 4.12), and version 13 the period each
-        // log file was last seen in (section 11.3).
+        // maintenance mode (section 4.12), version 13 the period each log
+        // file was last seen in (section 11.3), and version 14 whether
+        // applied files declare a release (section 9.1), added to an older
+        // table here.
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -432,13 +435,49 @@ impl Store {
         })
     }
 
-    /// Remove a release record. The caller makes sure it is not running.
+    /// Remove a release record and its scale pins. The caller makes sure
+    /// it is not running.
     pub fn delete_release(&self, app: &str, id: &str) -> Result<(), StoreError> {
         self.with(|connection| {
+            connection.execute(
+                "DELETE FROM scale_pins WHERE app = ?1 AND release = ?2",
+                params![app, id],
+            )?;
             connection.execute(
                 "DELETE FROM releases WHERE app = ?1 AND id = ?2",
                 params![app, id],
             )?;
+            Ok(())
+        })
+    }
+
+    /// The releases of an application that applied files declare (section
+    /// 9.1), which `release prune` leaves unless forced.
+    pub fn declared_releases(&self, app: &str) -> Result<BTreeSet<String>, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT id FROM releases WHERE app = ?1 AND declared = 1")?;
+            let rows = statement.query_map([app], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<BTreeSet<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Record the releases of an application that the files of an apply
+    /// declare, in place of those an earlier apply declared.
+    pub fn set_declared_releases(&self, app: &str, ids: &[String]) -> Result<(), StoreError> {
+        self.with(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute("UPDATE releases SET declared = 0 WHERE app = ?1", [app])?;
+
+            for id in ids {
+                transaction.execute(
+                    "UPDATE releases SET declared = 1 WHERE app = ?1 AND id = ?2",
+                    params![app, id],
+                )?;
+            }
+
+            transaction.commit()?;
             Ok(())
         })
     }
@@ -1130,20 +1169,41 @@ fn app_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<App> {
 /// the access log choice of version 11 to an applications table that
 /// predates them.
 fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
-    let mut statement = connection.prepare("PRAGMA table_info(apps)")?;
-    let columns: Vec<String> = statement
+    add_columns(
+        connection,
+        "apps",
+        &[
+            ("user", "TEXT"),
+            ("grp", "TEXT"),
+            ("umask", "TEXT"),
+            ("priority", "INTEGER"),
+            ("access_log", "TEXT"),
+        ],
+    )?;
+    add_columns(
+        connection,
+        "releases",
+        &[("declared", "INTEGER NOT NULL DEFAULT 0")],
+    )
+}
+
+/// Add to `table` each of `columns` an older store lacks.
+fn add_columns(
+    connection: &Connection,
+    table: &str,
+    columns: &[(&str, &str)],
+) -> Result<(), StoreError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
 
-    for (column, kind) in [
-        ("user", "TEXT"),
-        ("grp", "TEXT"),
-        ("umask", "TEXT"),
-        ("priority", "INTEGER"),
-        ("access_log", "TEXT"),
-    ] {
-        if !columns.iter().any(|name| name == column) {
-            connection.execute(&format!("ALTER TABLE apps ADD COLUMN {column} {kind}"), [])?;
+    for (column, kind) in columns {
+        if !existing.iter().any(|name| name == column) {
+            connection.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
+                [],
+            )?;
         }
     }
 
