@@ -30,6 +30,8 @@ def direct(daemon: Daemon, *arguments: str, check: bool = True) -> subprocess.Co
             str(daemon.base / "state"),
             "--log-dir",
             str(daemon.base / "logs"),
+            "--config",
+            str(daemon.base / "muru.toml"),
         ],
         capture_output=True,
         text=True,
@@ -140,6 +142,25 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
         assert daemon.get("/catalogue").status == 200
         wait_for(lambda: release_log.stat().st_size > 0, "the host to write on")
 
+        # logs rotate rotates through the daemon's policy, here zstd and
+        # 14 archives by default: the edge moves to a fresh file.
+
+        assert daemon.get("/catalogue").status == 200
+        wait_for(lambda: access.stat().st_size > 0, "a line in the access log")
+        answer = json.loads(daemon.muructl("logs", "rotate", "--access", "--json").stdout)
+        assert answer["logs"][0]["name"] == "access.log"
+        assert answer["logs"][0]["archive"].startswith("access.log.")
+        assert answer["logs"][0]["error"] == ""
+        assert "logs.rotated" in daemon.muructl("events").stdout
+
+        wait_for(lambda: access.stat().st_size == 0, "the access log to be moved aside")
+        assert daemon.get("/rotated").status in (200, 404)
+        wait_for(lambda: "/rotated" in access.read_text(), "the edge to write to a new file")
+        wait_for(
+            lambda: any(path.suffix == ".zst" for path in logs.glob("access.log.*")),
+            "the archive to be compressed",
+        )
+
         # An archive is left alone by truncate.
 
         assert (orphan.parent / "r9.log.20260101-000000").exists()
@@ -156,5 +177,10 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
             direct(daemon, "logs", "truncate", "--access", "--keep", "0", "--yes", "--json").stdout
         )
         assert access.stat().st_size == 0 and answer["freed"] > 0
+
+        access.write_text('{"line": 1}\n')
+        answer = json.loads(direct(daemon, "logs", "rotate", "--access", "--json").stdout)
+        assert answer["logs"][0]["archive"].endswith(".zst")
+        assert access.stat().st_size == 0
     finally:
         daemon.stop()

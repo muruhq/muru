@@ -199,13 +199,29 @@ impl Rotator {
         self.finish(path, archive)
     }
 
+    /// Rotate a file in place and finish the archive before returning,
+    /// for a command with nothing to carry on in the background once it
+    /// exits. Returns the finished archive's path.
+    pub fn rotate_in_place_now(&self, path: &Path, now: SystemTime) -> std::io::Result<PathBuf> {
+        let archive = archive_path(path, now);
+        std::fs::copy(path, &archive)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+
+        let finished = compress(&archive, self.policy.compress)?;
+        prune(path, self.policy.keep);
+        Ok(finished)
+    }
+
     /// Compress an archive in the background and prune the old ones.
     fn finish(&self, path: &Path, archive: PathBuf) -> std::io::Result<PathBuf> {
         let policy = self.policy.clone();
         let base = path.to_path_buf();
         let renamed = archive.clone();
         tokio::task::spawn_blocking(move || {
-            if let Err(error) = compress(&renamed, policy.compress) {
+            if let Err(error) = compress(&renamed, policy.compress).map(drop) {
                 tracing::warn!(%error, path = %renamed.display(), "compressing a rotated log failed");
             }
 
@@ -215,11 +231,29 @@ impl Rotator {
     }
 }
 
-/// Where a file rotated now is archived: the file's path with a stamp.
+/// Where a file rotated now is archived: the file's path with a stamp,
+/// the next second's if this one already has an archive in any form, so
+/// that a second rotation within a second cannot replace the first.
 fn archive_path(path: &Path, now: SystemTime) -> PathBuf {
-    let mut archive = path.as_os_str().to_owned();
-    archive.push(format!(".{}", stamp(now)));
-    PathBuf::from(archive)
+    let mut moment = now;
+
+    loop {
+        let mut archive = path.as_os_str().to_owned();
+        archive.push(format!(".{}", stamp(moment)));
+        let archive = PathBuf::from(archive);
+
+        let taken = ["", ".zst", ".gz"].iter().any(|suffix| {
+            let mut name = archive.as_os_str().to_owned();
+            name.push(suffix);
+            Path::new(&name).exists()
+        });
+
+        if !taken {
+            return archive;
+        }
+
+        moment += Duration::from_secs(1);
+    }
 }
 
 /// Create the log afresh with the archive's mode and owner, so a writer
@@ -303,9 +337,10 @@ fn civil(days: u64) -> (u64, u64, u64) {
 }
 
 /// Compress an archive in place, replacing it with the compressed file.
-fn compress(archive: &Path, how: Compress) -> std::io::Result<()> {
+/// Returns the path it ends up at.
+fn compress(archive: &Path, how: Compress) -> std::io::Result<PathBuf> {
     let suffix = match how {
-        Compress::Off => return Ok(()),
+        Compress::Off => return Ok(archive.to_path_buf()),
         Compress::Zstd => "zst",
         Compress::Gzip => "gz",
     };
@@ -330,7 +365,8 @@ fn compress(archive: &Path, how: Compress) -> std::io::Result<()> {
         Compress::Off => {}
     }
 
-    std::fs::remove_file(archive)
+    std::fs::remove_file(archive)?;
+    Ok(target)
 }
 
 /// Keep only the newest `keep` archives of a log, by name, which sorts
@@ -478,6 +514,26 @@ mod tests {
         std::fs::write(&new, "x").unwrap();
         assert!(!third.due(&new, day_two));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_rotation_within_a_second_gets_an_archive_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("a.log");
+        std::fs::write(&log, "one").unwrap();
+        let rotator = Rotator::new(Policy {
+            size: None,
+            every: Every::Off,
+            keep: 5,
+            compress: Compress::Off,
+        });
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_793_000_000);
+        let first = rotator.rotate_in_place_now(&log, now).unwrap();
+        std::fs::write(&log, "two").unwrap();
+        let second = rotator.rotate_in_place_now(&log, now).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        assert_eq!(std::fs::read(&second).unwrap(), b"two");
     }
 
     #[test]

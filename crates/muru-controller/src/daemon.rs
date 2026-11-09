@@ -497,6 +497,15 @@ pub enum Command {
         /// Where the count of what was told goes.
         done: oneshot::Sender<Reopened>,
     },
+    /// Rotate these log files now (section 11.3), on the policy in
+    /// force. Answered with each one's archive or error, by log name, or
+    /// why none could be: rotation is external.
+    RotateLogs {
+        /// Each log's name and path.
+        logs: Vec<(String, PathBuf)>,
+        /// Where the answer goes.
+        done: oneshot::Sender<Result<Vec<RotatedLog>, String>>,
+    },
     /// Hold log files against rotation while a command cuts them
     /// (section 11.3). Answered with whether each file's writers cannot
     /// reopen it, or why the files could not be held.
@@ -831,6 +840,15 @@ impl Interfaces {
             _ => configured,
         }
     }
+}
+
+/// One log rotated at a command's asking: its archive, or why not.
+#[derive(Debug, Clone)]
+pub struct RotatedLog {
+    /// The log's name.
+    pub name: String,
+    /// Its archive, relative to the log directory.
+    pub archive: Result<String, String>,
 }
 
 /// What a ReopenLogs command reached.
@@ -4244,6 +4262,9 @@ impl Daemon {
             }
             Command::ReopenLogs { workers, done } => {
                 let _ = done.send(self.reopen_logs(workers));
+            }
+            Command::RotateLogs { logs, done } => {
+                let _ = done.send(self.rotate_named_logs(logs));
             }
             Command::ClaimLogs { paths, done } => {
                 let _ = done.send(self.claim_logs(paths));
@@ -9153,6 +9174,11 @@ impl Daemon {
             }
         }
 
+        self.after_rotation(&rotated);
+    }
+
+    /// Have the writers reopen what was rotated, and say so.
+    fn after_rotation(&mut self, rotated: &[PathBuf]) {
         if rotated.is_empty() {
             return;
         }
@@ -9185,6 +9211,67 @@ impl Daemon {
         );
     }
 
+    /// Rotate named logs now, as a command asks.
+    fn rotate_named_logs(
+        &mut self,
+        logs: Vec<(String, PathBuf)>,
+    ) -> Result<Vec<RotatedLog>, String> {
+        if self.rotation.is_none() {
+            return Err(
+                "log rotation is external ([logs] rotate = 'external'): whatever \
+                 rotates the files does this, followed by muructl logs reopen"
+                    .to_owned(),
+            );
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut rotated = Vec::new();
+        let mut archives = Vec::new();
+
+        for (name, path) in logs {
+            let archive = if self.claimed_logs.contains(&path) {
+                Err("it is being cut by another command".to_owned())
+            } else {
+                let in_place = self.cannot_reopen(&path);
+                let rotator = self.rotation.as_ref().expect("checked above");
+
+                let outcome = if in_place {
+                    rotator.rotate_in_place(&path, now)
+                } else {
+                    rotator.rotate(&path, now)
+                };
+
+                outcome
+                    .map(|archive| {
+                        let relative = archive
+                            .strip_prefix(&self.locations.logs.path)
+                            .unwrap_or(&archive)
+                            .display()
+                            .to_string();
+                        archives.push(archive);
+                        relative
+                    })
+                    .map_err(|error| error.to_string())
+            };
+
+            rotated.push(RotatedLog { name, archive });
+        }
+
+        self.after_rotation(&archives);
+        Ok(rotated)
+    }
+
+    /// Whether a log's writers cannot be told to reopen it: the
+    /// instances of a managed HTTP server, and the edge for its own log.
+    fn cannot_reopen(&self, path: &Path) -> bool {
+        let edge_log = self.locations.logs.path.join("edge.log");
+
+        path == edge_log
+            || self.running.iter().any(|((app, id), running)| {
+                running.backend.servers().is_some() && self.locations.release_log(app, id) == path
+            })
+    }
+
     /// Hold log files against rotation, saying of each whether its
     /// writers cannot reopen it: the instances of a managed HTTP server
     /// and the edge's own log, which it does not reopen.
@@ -9196,17 +9283,7 @@ impl Daemon {
             ));
         }
 
-        let edge_log = self.locations.logs.path.join("edge.log");
-        let in_place = paths
-            .iter()
-            .map(|path| {
-                *path == edge_log
-                    || self.running.iter().any(|((app, id), running)| {
-                        running.backend.servers().is_some()
-                            && self.locations.release_log(app, id) == *path
-                    })
-            })
-            .collect();
+        let in_place = paths.iter().map(|path| self.cannot_reopen(path)).collect();
 
         self.claimed_logs.extend(paths);
         Ok(in_place)

@@ -214,6 +214,9 @@ def test_external_rotation_leaves_the_files_alone(tmp_path: Path) -> None:
         assert archives(logs, "access.log") == []
         assert "logs.rotated" not in daemon.muructl("events").stdout
         assert (logs / "access.log").stat().st_size > 1024
+
+        refused = daemon.muructl("logs", "rotate", "--access", check=False)
+        assert refused.returncode != 0 and "rotation is external" in refused.stderr
     finally:
         daemon.stop()
 

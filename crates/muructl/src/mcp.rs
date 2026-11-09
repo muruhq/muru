@@ -1259,6 +1259,24 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "rotate_logs",
+            description: "Rotate logs now, on the daemon's policy: all of them with content unless one is named. Refused when rotation is external.",
+            changes: true,
+            properties: json!({
+                "target": {"type": "string", "description": "One release's log, as app@release"},
+                "access": {"type": "boolean", "description": "The access log"},
+                "host": {"type": "string", "description": "The file a virtual host names for its records"},
+                "all": {"type": "boolean", "description": "Every log"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["logs", "rotate"]);
+                command.extend(text(arguments, "target"));
+                command.extend(log_target_flags(arguments));
+                Ok(command)
+            },
+        },
+        Spec {
             name: "reopen_logs",
             description: "Reopen every log file by name, after something outside Muru has renamed them; workers also runs each worker's on_reopen_logs hook.",
             changes: true,

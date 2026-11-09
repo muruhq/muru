@@ -882,6 +882,13 @@ impl Admin for Service {
         Err(self.no_log_files())
     }
 
+    async fn rotate_logs(
+        &self,
+        _: Request<pb::RotateLogsRequest>,
+    ) -> Result<Response<pb::RotateLogsResponse>, Status> {
+        Err(self.no_log_files())
+    }
+
     async fn list_logs(
         &self,
         _: Request<pb::ListLogsRequest>,

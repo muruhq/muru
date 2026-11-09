@@ -1051,6 +1051,7 @@ fn main() -> anyhow::Result<()> {
                     output,
                 }) => admin::logs_list(socket, files, output.json).await,
                 Some(admin::LogsCommand::Truncate(args)) => admin::logs_truncate(*args).await,
+                Some(admin::LogsCommand::Rotate(args)) => admin::logs_rotate(*args).await,
                 None => admin::logs(args).await,
             }
         }),

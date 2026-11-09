@@ -1030,6 +1030,62 @@ impl Admin for Service {
             .map(Response::new)
     }
 
+    async fn rotate_logs(
+        &self,
+        request: Request<pb::RotateLogsRequest>,
+    ) -> Result<Response<pb::RotateLogsResponse>, Status> {
+        let target = request.into_inner().target.unwrap_or_default();
+        let existing = crate::log_files::Existing::read(&self.handle.store).map_err(internal)?;
+        let directory = self.handle.info.locations.logs.path.clone();
+        let selected = tokio::task::spawn_blocking(move || {
+            let logs = crate::log_files::list(&directory, Some(&existing))
+                .map_err(|error| format!("reading the log directory: {error}"))?;
+
+            crate::log_files::select_for_rotation(&logs, &target).map(|selected| {
+                selected
+                    .iter()
+                    .map(|log| (log.name.clone(), log.size, directory.join(&log.name)))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .map_err(Status::failed_precondition)?;
+
+        let sizes: std::collections::HashMap<String, u64> = selected
+            .iter()
+            .map(|(name, size, _)| (name.clone(), *size))
+            .collect();
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::RotateLogs {
+                logs: selected
+                    .into_iter()
+                    .map(|(name, _, path)| (name, path))
+                    .collect(),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let rotated = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+
+        Ok(Response::new(pb::RotateLogsResponse {
+            logs: rotated
+                .into_iter()
+                .map(|log| pb::RotatedLog {
+                    size: sizes.get(&log.name).copied().unwrap_or_default(),
+                    error: log.archive.as_ref().err().cloned().unwrap_or_default(),
+                    archive: log.archive.unwrap_or_default(),
+                    name: log.name,
+                })
+                .collect(),
+        }))
+    }
+
     async fn get_metrics(
         &self,
         _: Request<pb::GetMetricsRequest>,

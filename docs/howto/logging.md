@@ -516,3 +516,17 @@ and neither can the edge for its own log, `edge.log`, so those two are
 cut in place: the kept part is written aside, the file truncated and
 the kept part put back, and lines written while it is copied are lost.
 The same applies to every log when no daemon is running.
+
+`muructl logs rotate` rotates now, with the compression and `keep` of the
+policy in force, for when there is disk to spare and the history is
+worth having. With `APP@RELEASE`, `--access`, `--host HOST` or `--all` it
+rotates that log; with none it rotates every log with content except
+those flagged `orphaned`. A log with no content is left alone. It writes a
+`logs.rotated` event like any other rotation.
+
+With `rotate = 'external'`, `muructl logs rotate` refuses, since something
+else owns the rotation of those files.
+
+As with truncating, the instances of a managed HTTP server and the edge
+for its own log are rotated in place, and so is every log when no daemon
+is running: lines written while the file is copied are lost.

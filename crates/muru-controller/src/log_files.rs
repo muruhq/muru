@@ -387,6 +387,60 @@ pub fn select<'a>(logs: &'a [LogFile], target: &pb::LogTarget) -> Result<Vec<&'a
     Ok(logs.iter().filter(|log| log.present).collect())
 }
 
+/// The logs a rotation acts on: those named, with content. With none
+/// named or `all`, every log but those orphaned, which prune removes.
+pub fn select_for_rotation<'a>(
+    logs: &'a [LogFile],
+    target: &pb::LogTarget,
+) -> Result<Vec<&'a LogFile>, String> {
+    let every = target.app.is_empty() && target.host.is_empty() && !target.access;
+    let selected = select(logs, target)?;
+
+    Ok(selected
+        .into_iter()
+        .filter(|log| log.size > 0 && !(every && log.orphaned))
+        .collect())
+}
+
+/// Rotate the named logs directly, with no daemon running: in place, as
+/// for truncating, and finished before returning.
+pub fn rotate_directly(
+    directory: &Path,
+    existing: Option<&Existing>,
+    target: &pb::LogTarget,
+    rotator: &crate::rotation::Rotator,
+) -> Result<pb::RotateLogsResponse, String> {
+    let logs =
+        list(directory, existing).map_err(|error| format!("reading the log directory: {error}"))?;
+    let selected = select_for_rotation(&logs, target)?;
+    let now = SystemTime::now();
+    let mut rotated = Vec::new();
+
+    for log in selected {
+        let path = directory.join(&log.name);
+        let mut result = pb::RotatedLog {
+            name: log.name.clone(),
+            size: log.size,
+            ..Default::default()
+        };
+
+        match rotator.rotate_in_place_now(&path, now) {
+            Ok(archive) => {
+                result.archive = archive
+                    .strip_prefix(directory)
+                    .unwrap_or(&archive)
+                    .display()
+                    .to_string();
+            }
+            Err(error) => result.error = error.to_string(),
+        }
+
+        rotated.push(result);
+    }
+
+    Ok(pb::RotateLogsResponse { logs: rotated })
+}
+
 /// The start of what is kept, when `keep` bytes of a file's newest
 /// content are kept: just after a line ends, at or after `size - keep`.
 /// With no line ending there to cut at, nothing is kept.

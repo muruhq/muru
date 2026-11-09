@@ -91,6 +91,8 @@ service Admin {
   rpc ListLogs(ListLogsRequest) returns (ListLogsResponse);
   // Cut live logs down, or say what doing so would free.
   rpc TruncateLogs(TruncateLogsRequest) returns (TruncateLogsResponse);
+  // Rotate logs now, on the daemon's policy; refused when rotation is external.
+  rpc RotateLogs(RotateLogsRequest) returns (RotateLogsResponse);
 
   // Metrics (section 11.1): the node's Prometheus text exposition.
   rpc GetMetrics(GetMetricsRequest) returns (MetricsText);
@@ -1035,6 +1037,21 @@ message TruncateLogsResponse {
   repeated TruncatedLog logs = 1;
   uint64 freed = 2;                 // the bytes freed in all
   bool dry_run = 3;                 // nothing was changed
+}
+
+message RotateLogsRequest {
+  LogTarget target = 1;             // every log but orphaned ones when none is named
+}
+
+message RotatedLog {
+  string name = 1;                  // its path relative to the log directory
+  uint64 size = 2;                  // the bytes rotated
+  string archive = 3;               // the archive, before compression under a daemon
+  string error = 4;                 // why this log could not be rotated
+}
+
+message RotateLogsResponse {
+  repeated RotatedLog logs = 1;     // the logs with content that were named
 }
 
 message GetMetricsRequest {}

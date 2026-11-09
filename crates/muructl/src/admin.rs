@@ -6961,6 +6961,24 @@ pub struct LogsTruncateArgs {
     output: JsonArgs,
 }
 
+/// What `muructl logs rotate` takes.
+#[derive(Args, Clone)]
+pub struct LogsRotateArgs {
+    #[command(flatten)]
+    target: LogTargetArgs,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// With no daemon running, where its log directory, state and
+    /// configuration are.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
 /// The `muructl logs` subcommands.
 #[derive(Subcommand, Clone)]
 pub enum LogsCommand {
@@ -6977,6 +6995,10 @@ pub enum LogsCommand {
         #[command(flatten)]
         output: JsonArgs,
     },
+
+    /// Rotate logs now, on the policy in force: all of them when none
+    /// is named, compressing and keeping as configured.
+    Rotate(Box<LogsRotateArgs>),
 
     /// Cut a live log down to its newest SIZE, at a line boundary. Asks
     /// first; without a terminal it needs --yes.
@@ -7362,6 +7384,64 @@ pub async fn logs_truncate(args: LogsTruncateArgs) -> anyhow::Result<()> {
         print_answer(&answer)?;
     } else {
         println!("muru: truncated, freeing {}", human_size(answer.freed));
+    }
+
+    let failures: Vec<String> = answer
+        .logs
+        .iter()
+        .filter(|log| !log.error.is_empty())
+        .map(|log| format!("{}: {}", log.name, log.error))
+        .collect();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+/// Rotate logs now.
+pub async fn logs_rotate(args: LogsRotateArgs) -> anyhow::Result<()> {
+    let target = args.target.target(false, "rotate")?;
+
+    let answer = match logs_way(&args.socket, &args.files).await? {
+        LogsWay::Daemon(mut client) => client
+            .rotate_logs(pb::RotateLogsRequest {
+                target: Some(target),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => {
+            let document = read_config(&directory.locations.config.path)?;
+            let policy = muru_controller::rotation::Policy::from_table(document.logs.as_ref())?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "log rotation is external ([logs] rotate = 'external'): whatever rotates \
+                         the files does this, followed by muructl logs reopen"
+                    )
+                })?;
+
+            muru_controller::log_files::rotate_directly(
+                &directory.locations.logs.path,
+                directory.existing.as_ref(),
+                &target,
+                &muru_controller::rotation::Rotator::new(policy),
+            )
+            .map_err(anyhow::Error::msg)?
+        }
+    };
+
+    if args.output.json {
+        print_answer(&answer)?;
+    } else if answer.logs.is_empty() {
+        println!("muru: nothing to rotate");
+    } else {
+        for log in &answer.logs {
+            if log.error.is_empty() {
+                println!("{} rotated to {}", log.name, log.archive);
+            }
+        }
     }
 
     let failures: Vec<String> = answer

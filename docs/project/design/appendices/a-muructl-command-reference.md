@@ -57,6 +57,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Observability | muructl events | Show or follow events with filters. Flags: --follow, --after | 11.5 |
 | Observability | muructl logs RELEASE | Show or follow logs | 11.2 |
 | Observability | muructl logs reopen [--workers] | Reopen log files after external rotation | 11.3 |
+| Observability | muructl logs rotate [TARGET] | Rotate now on the policy in force: TARGET as for truncate, or every log with content except orphaned ones. Refused when rotation is external. Flags: --json, and with no daemon running --log-dir, --state-dir and --config | 11.3 |
 | Observability | muructl logs truncate TARGET --keep SIZE | Cut a live log down to its newest SIZE at a line boundary; TARGET is APP@RELEASE, --access, --host HOST or --all. Asks first. Flags: --yes, --json, and with no daemon running --log-dir and --state-dir | 11.3 |
 | Observability | muructl logs list | Each log with its size, archives and total, flagging logs whose release or host no longer exists. Flags: --json, and with no daemon running --log-dir and --state-dir | 11.3 |
 | Observability | muructl metrics | Print the node's metrics as Prometheus text | 11.1 |
