@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use muru_config::{ClientClass, Host as VirtualHost, Overlay, RateLimit, Route, Upstream};
 
@@ -191,6 +191,39 @@ impl Store {
             }
             Some(_) => {}
         }
+
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
+    }
+
+    /// Open an existing store only to read it, as a command does with no
+    /// daemon running: the schema is left as it is, so a store is only
+    /// ever migrated by the daemon that will use it, and any write fails.
+    ///
+    /// A store with no write-ahead log is opened as immutable, since
+    /// SQLite otherwise leaves `-wal` and `-shm` files beside it. One with
+    /// a log, as a daemon that crashed leaves, is read through the log, so
+    /// that nothing it holds is missed.
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        let mut log = path.as_os_str().to_owned();
+        log.push("-wal");
+
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+
+        let connection = if Path::new(&log).exists() {
+            Connection::open_with_flags(path, flags)?
+        } else {
+            let escaped = path
+                .to_string_lossy()
+                .replace('%', "%25")
+                .replace('?', "%3f")
+                .replace('#', "%23");
+
+            Connection::open_with_flags(format!("file:{escaped}?immutable=1"), flags)?
+        };
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -1404,6 +1437,53 @@ mod tests {
         );
         assert_eq!(store.app("shop").unwrap().current.as_deref(), Some("r1"));
         assert!(store.release("shop", "r9").is_err());
+    }
+
+    #[test]
+    fn a_store_opened_read_only_is_left_exactly_as_it_was() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("muru.sqlite");
+
+        // A store at an older schema, with no daemon running.
+
+        {
+            let store = Store::open(&path).unwrap();
+            store.ensure_app("shop").unwrap();
+        }
+
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch("DROP TABLE log_periods; UPDATE schema SET version = 12;")
+                .unwrap();
+        }
+
+        let before = std::fs::read(&path).unwrap();
+        let store = Store::open_read_only(&path).unwrap();
+        assert_eq!(store.apps().unwrap().len(), 1);
+        assert!(
+            store
+                .set_log_periods(&[("/a".to_owned(), "d1".to_owned())])
+                .is_err()
+        );
+        drop(store);
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let mut names: Vec<String> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["muru.sqlite"], "nothing is left beside it");
+
+        // What only a write-ahead log holds is still read.
+
+        let writer = Store::open(&path).unwrap();
+        writer.ensure_app("later").unwrap();
+        let reader = Store::open_read_only(&path).unwrap();
+        assert_eq!(reader.apps().unwrap().len(), 2);
     }
 
     #[test]

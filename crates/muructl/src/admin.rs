@@ -7217,7 +7217,7 @@ async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result
         let store_path = locations.state_store();
 
         let existing = if store_path.is_file() {
-            let store = muru_controller::store::Store::open(&store_path)
+            let store = muru_controller::store::Store::open_read_only(&store_path)
                 .with_context(|| format!("opening {}", store_path.display()))?;
             Some(muru_controller::log_files::Existing::read(&store)?)
         } else {

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import time
 from collections.abc import Callable
@@ -212,7 +213,27 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
         daemon.stop()
         orphan.parent.mkdir(parents=True)
         orphan.write_text("old\n")
+
+        # The stopped daemon's store is read and never migrated, however
+        # far behind this muructl it is.
+
+        store_path = tmp_path / "state" / "muru.sqlite"
+
+        with sqlite3.connect(store_path) as store:
+            store.execute("DROP TABLE log_periods")
+            store.execute("UPDATE schema SET version = 12")
+
         report = json.loads(direct(daemon, "logs", "list", "--json").stdout)
+
+        with sqlite3.connect(store_path) as store:
+            assert store.execute("SELECT version FROM schema").fetchone() == (12,)
+            assert (
+                store.execute(
+                    "SELECT count(*) FROM sqlite_master WHERE name = 'log_periods'"
+                ).fetchone()[0]
+                == 0
+            )
+
         assert report["orphans_known"] is True
         assert by_name(report)["apps/gone/r9.log"]["orphaned"] is True
         assert by_name(report)["apps/shop/r1.log"]["orphaned"] is False
