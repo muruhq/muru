@@ -70,10 +70,12 @@ Hooks live in a module named by the hooks setting. Each receives a context objec
 | post_fork | worker, after fork | reopen database connections, reseed, start background threads |
 | on_ready | worker, before its sockets are announced | final warm-up |
 | on_drain | worker, when told to stop, before requests in flight finish | stop background work, flush |
-| on_exit | worker, after the application threads have stopped | clean up |
+| on_exit | worker, after lifespan shutdown, before its `atexit` callbacks | clean up |
 | on_reopen_logs | worker, on SIGUSR1 | reopen application-owned log files |
 
 An exception from on_load, pre_fork, post_fork or on_ready fails the host or the worker it runs in; one from on_drain, on_exit or on_reopen_logs is logged. Before every fork the host checks that it is still single-threaded and logs a warning naming the thread count otherwise, since threads do not exist in the child.
+
+A worker stops in this order: SIGTERM, on_drain, its requests finish (section 7.6), lifespan shutdown, on_exit, the callbacks registered with `atexit` on the main thread, the loop stops, the output streams are flushed, and `os._exit`. A forked child ends with `os._exit` rather than interpreter finalization: it must not unwind through the host's frames, `Py_Finalize` would dirty preloaded pages, and there is no wait on non-daemon threads, whose join has no time limit. So the worker runs the `atexit` callbacks itself, before the loop stops so that one still needing the loop can use it, and a callback can stop and join a thread of its own. `atexit._run_exitfuncs()` clears the list, so a worker that fails to start runs them too and a `--single` run, which does finalize, does not run them twice. Callbacks inherited from preload run in every worker, as Python offers no way to tell them from those registered after the fork, so what they clean up is cleaned up by the first worker to exit. They come out of the worker's stop budget.
 
 ## 6.4 Process and threading models
 

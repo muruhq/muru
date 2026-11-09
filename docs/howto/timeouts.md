@@ -276,8 +276,8 @@ server is going away"): the application's handler gets
 reconnect to the release that serves, and the close is counted as
 `drained`. What is still running then gets `shutdown_timeout`. When that
 is up, the worker stops waiting for its requests and does its shutdown
-work: lifespan shutdown and the `on_exit` hook. `exit_grace` is the time
-for that work. It is added to the other two and it always applies, so a
+work: lifespan shutdown, the `on_exit` hook and the callbacks registered
+with `atexit`. `exit_grace` is the time for that work. It is added to the other two and it always applies, so a
 worker is gone at most `websocket_drain_grace` plus `shutdown_timeout`
 plus `exit_grace` after it was told to stop, and the host kills it if it
 is still there then. A worker that finishes sooner exits sooner, and

@@ -35,7 +35,7 @@ return value is ignored.
 | `post_fork(context)` | In each worker, right after the fork |
 | `on_ready(context)` | In each worker, after `post_fork`, before it accepts requests |
 | `on_drain(context)` | In each worker when it is told to stop, before requests in flight finish |
-| `on_exit(context)` | In each worker after its last request, before it exits |
+| `on_exit(context)` | In each worker after its last request and lifespan shutdown, before its `atexit` callbacks |
 | `on_reopen_logs(context)` | In each worker that receives SIGUSR1 |
 
 With per-worker imports (preload `false`, or the fallback when the import

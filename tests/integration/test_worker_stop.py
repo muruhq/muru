@@ -53,8 +53,11 @@ def test_a_stuck_request_leaves_time_for_the_shutdown_work(app: str) -> None:
         began = log.index("STOP lifespan shutdown began")
         finished = log.index("STOP lifespan shutdown finished")
         assert began < finished < log.index("STOP on_exit ran")
+        assert "STOP atexit used the loop" in log
     else:
         assert "STOP on_exit ran" in log
+
+    assert log.index("STOP on_exit ran") < log.index("STOP atexit ran")
 
 
 def test_a_slow_lifespan_shutdown_is_reported_and_the_hook_still_runs() -> None:
@@ -105,3 +108,21 @@ def test_a_whole_shutdown_leaves_the_workers_time_past_a_long_shutdown_timeout(
     finished = output.index("STOP lifespan shutdown finished")
     assert finished < output.index("STOP on_exit ran")
     assert "did not stop, killing" not in output
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_atexit_callbacks_run_once_under_single(tmp_path: Path, fails: bool) -> None:
+    server_args = ["--hooks", "stop_hooks", "--single"]
+    env = {"MURU_TEST_FAIL_ON_READY": "1"} if fails else None
+
+    if fails:
+        with pytest.raises(RuntimeError) as start_failed:
+            support.start("plain_wsgi:application", workers=None, args=server_args, env=env)
+
+        output = str(start_failed.value)
+    else:
+        server = support.start("plain_wsgi:application", workers=None, args=server_args)
+        server.stop()
+        output = server.log()
+
+    assert output.count("STOP atexit ran") == 1, output

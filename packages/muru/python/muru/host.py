@@ -38,6 +38,7 @@ to it before the old worker is told to stop.
 from __future__ import annotations
 
 import argparse
+import atexit
 import faulthandler
 import gc
 import importlib
@@ -221,6 +222,20 @@ def resolve_app(
 # start-up lines of every worker.
 
 UNNAMED_EVENTS = frozenset({"worker.started", "worker.ready"})
+
+
+def run_exit_callbacks() -> None:
+    """Run the callbacks registered with ``atexit`` in this worker, on this thread.
+
+    A worker ends with ``os._exit``, which runs none of them. This clears
+    the list, so a second call runs nothing and a process that goes on to
+    finalize runs them once (section 6.3).
+    """
+
+    try:
+        atexit._run_exitfuncs()
+    except BaseException:
+        traceback.print_exc()
 
 
 def detect_interface(app: Any) -> str:
@@ -1243,8 +1258,12 @@ class Host:
             except BaseException:
                 traceback.print_exc()
             finally:
+                # A failure outside the worker's own handling still runs
+                # the atexit callbacks; they have already run otherwise.
                 # os._exit skips the flush that a normal exit would do, so
                 # whatever is still buffered would be lost.
+
+                run_exit_callbacks()
 
                 for stream in (sys.stdout, sys.stderr):
                     try:
@@ -1592,6 +1611,7 @@ class Host:
         except Exception as error:
             log(f"worker {index} failed to start: {error.__class__.__name__}: {error}")
             traceback.print_exc()
+            run_exit_callbacks()
             if loop is not None:
                 loop.stop()
             return 1
@@ -1599,11 +1619,13 @@ class Host:
         from muru import _native
 
         def on_exit(left: float) -> None:
-            """Run lifespan shutdown for every ASGI application and the hook, then stop the loop.
+            """Run the worker's shutdown work in order, then stop the loop.
 
-            `left` is how long the worker has before the host kills it.
-            Lifespan shutdown stops waiting with a little to spare, so a
-            slow application is reported and the rest can still run.
+            Lifespan shutdown of every ASGI application, the on_exit hook
+            and the ``atexit`` callbacks (section 6.3). `left` is how long
+            the worker has before the host kills it. Lifespan shutdown
+            stops waiting with a little to spare, so a slow application is
+            reported and the rest can still run.
             """
 
             deadline = time.monotonic() + left - EXIT_REPORT_SECONDS
@@ -1614,6 +1636,7 @@ class Host:
             if lifespan is not None:
                 lifespan.shutdown(deadline)
             hooks.call_logged("on_exit", context)
+            run_exit_callbacks()
             if loop is not None:
                 loop.stop()
 
@@ -1707,6 +1730,7 @@ class Host:
             )
         except Exception as error:
             log(f"worker {index} failed: {error}")
+            run_exit_callbacks()
             return 1
 
         return 0
