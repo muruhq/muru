@@ -11,7 +11,7 @@ runs:
 
 | Field | Value |
 | --- | --- |
-| `app` | The application name as `muructl deploy` gave it; under `muructl run` the name the terminal and the commands use, the entrypoint's top-level module with underscores as hyphens, so `shop_site.wsgi:application` is `shop-site` |
+| `app` | The application name as `muructl deploy` gave it; under `muructl run` and `muructl serve` the name the terminal and the commands use: `--name` (or `MURU_SERVE_NAME` for `muructl serve`) when given, else `[project] name` from the project's `pyproject.toml`, with underscores and dots as hyphens, else the entrypoint's top-level module with underscores as hyphens, so `shop_site.wsgi:application` is `shop-site` |
 | `release` | The release identifier; under `muructl run` the one the terminal names, `r1`, then `r2` after a reload |
 | `group` | The worker group; `default` until worker groups arrive |
 | `worker_id` | The worker's index from 0, or `None` in the host (and outside Muru) |

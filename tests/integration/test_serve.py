@@ -241,7 +241,14 @@ def test_everything_goes_to_standard_output_without_times(tmp_path: Path) -> Non
 
 
 def test_settings_come_from_the_environment(tmp_path: Path) -> None:
-    serve = start(tmp_path, env={"MURU_SERVE_ADMIN_STATUS": "true", "MURU_SERVE_THREADS": "2"})
+    serve = start(
+        tmp_path,
+        env={
+            "MURU_SERVE_ADMIN_STATUS": "true",
+            "MURU_SERVE_THREADS": "2",
+            "MURU_SERVE_NAME": "orders",
+        },
+    )
 
     try:
         status, body = serve.admin("/status")
@@ -250,6 +257,8 @@ def test_settings_come_from_the_environment(tmp_path: Path) -> None:
         assert report["state"] == "serving"
         assert report["settings"]["threads"] == 2
         assert report["groups"]["default"]["ready"] == 1
+        _status, metrics = serve.admin("/metrics")
+        assert 'app="orders"' in metrics, metrics
     finally:
         assert serve.stop() == 0
 

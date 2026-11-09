@@ -75,6 +75,12 @@ pub struct ServeArgs {
     #[arg(long, value_name = "N")]
     min_ready: Option<String>,
 
+    /// The application's name, in metrics, logs and the commands
+    /// (default: `[project] name` from pyproject.toml, else the
+    /// entrypoint's top-level module).
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
     /// The interface the entrypoint speaks: auto, wsgi, asgi or grpc.
     #[arg(long, value_name = "NAME")]
     interface: Option<String>,
@@ -240,6 +246,7 @@ const KEYS: &[(&str, Kind)] = &[
     ("concurrency", Kind::Text),
     ("preload", Kind::Text),
     ("hooks", Kind::Text),
+    ("name", Kind::Text),
     ("timeout", Kind::List),
     ("max_body_size", Kind::Text),
     ("max_requests", Kind::Text),
@@ -335,6 +342,7 @@ fn from_flags(args: &ServeArgs) -> BTreeMap<&'static str, Value> {
     text("concurrency", &args.concurrency);
     text("preload", &args.preload);
     text("hooks", &args.hooks);
+    text("name", &args.name);
     text("max_body_size", &args.max_body_size);
     text("max_requests", &args.max_requests);
     text("max_lifetime", &args.max_lifetime);
@@ -850,6 +858,7 @@ fn prepare(
     argv.push(listen.to_string());
 
     for (key, flag) in [
+        ("name", "--name"),
         ("interface", "--interface"),
         ("threads", "--threads"),
         ("sync_threads", "--sync-threads"),

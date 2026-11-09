@@ -299,6 +299,15 @@ setting over it.
 `--max-lifetime`, `--memory`, the connection limits, `--static` and
 `--no-compression` work as they do for [`muructl run`](run-settings.md).
 
+## The application's name
+
+The application is named after `[project] name` in `pyproject.toml` when
+there is one, with underscores and dots as hyphens, else after the
+entrypoint's top-level module with underscores as hyphens. `--name`, or
+`MURU_SERVE_NAME`, sets it. `muructl status`, the `app` label on the
+[metrics](metrics.md) and the `app` field of the logs use it, and
+`muructl run` names an application the same way.
+
 ## Sizing from the container's limits
 
 On Linux, `muructl serve` reads the container's CPU and memory limits at
