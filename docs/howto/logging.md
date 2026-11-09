@@ -487,3 +487,32 @@ apps/shop/r1.log                          570.0MB           1 (9.0MB)   579.0MB 
 edge.log                                    4.0KB                   -     4.0KB
 total 5.9GB, in /var/log/muru
 ```
+
+`muructl logs truncate` cuts a live log down. It needs a target
+(`APP@RELEASE`, `--access`, `--host HOST` or `--all`) and `--keep SIZE`,
+and leaves archives alone:
+
+```console
+$ muructl logs truncate --access --keep 100MB
+  access.log from 5.2GB to 99.8MB, freeing 5.1GB
+Truncate, freeing 5.1GB? [y/N]
+```
+
+It shows the space it will free and asks. `--yes` skips the question,
+and without a terminal the command refuses unless given `--yes`.
+
+- `--keep 0` empties the file in place. It needs no free disk space, so
+  it is the option for a full disk. The next line goes at the new end.
+
+- Any other size keeps that much of the newest content, cut at a line
+  boundary so JSON lines stay valid, and needs room for what is kept. The
+  kept part is written to a new file and swapped in, the writers open
+  the new file by name, and the lines that arrived during the swap are
+  added afterwards. No lines are lost, and those few lines can land
+  slightly out of order.
+
+The instances of a managed HTTP server cannot be told to reopen a file,
+and neither can the edge for its own log, `edge.log`, so those two are
+cut in place: the kept part is written aside, the file truncated and
+the kept part put back, and lines written while it is copied are lost.
+The same applies to every log when no daemon is running.

@@ -875,6 +875,13 @@ impl Admin for Service {
         )))
     }
 
+    async fn truncate_logs(
+        &self,
+        _: Request<pb::TruncateLogsRequest>,
+    ) -> Result<Response<pb::TruncateLogsResponse>, Status> {
+        Err(self.no_log_files())
+    }
+
     async fn list_logs(
         &self,
         _: Request<pb::ListLogsRequest>,

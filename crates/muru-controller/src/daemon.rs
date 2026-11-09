@@ -497,6 +497,20 @@ pub enum Command {
         /// Where the count of what was told goes.
         done: oneshot::Sender<Reopened>,
     },
+    /// Hold log files against rotation while a command cuts them
+    /// (section 11.3). Answered with whether each file's writers cannot
+    /// reopen it, or why the files could not be held.
+    ClaimLogs {
+        /// The files, in order.
+        paths: Vec<PathBuf>,
+        /// Where the answer goes.
+        done: oneshot::Sender<Result<Vec<bool>, String>>,
+    },
+    /// Let rotation consider these log files again.
+    ReleaseLogs {
+        /// The files.
+        paths: Vec<PathBuf>,
+    },
     /// Stop the daemon: detaching, with hosts and the edge left serving
     /// for the next daemon to re-adopt, or draining everything first.
     Shutdown {
@@ -1126,6 +1140,9 @@ struct Daemon {
     secrets: Vec<crate::secrets::Store>,
     /// Built-in log rotation (section 11.3), when it is on.
     rotation: Option<crate::rotation::Rotator>,
+    /// Section 11.3: the log files a command is cutting, which rotation
+    /// leaves alone.
+    claimed_logs: std::collections::HashSet<PathBuf>,
     /// Section 13.3: what SIGTERM means, and how a shutdown runs.
     shutdown: crate::shutdown::Policy,
     /// The service user (ADR 0026), when this daemon is root: whom the
@@ -1509,6 +1526,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         clock: (None, false),
         secrets: settings.secrets.clone(),
         rotation,
+        claimed_logs: std::collections::HashSet::new(),
         shutdown: settings.shutdown.clone(),
         service,
         debug_exec: settings.debug_exec,
@@ -4226,6 +4244,14 @@ impl Daemon {
             }
             Command::ReopenLogs { workers, done } => {
                 let _ = done.send(self.reopen_logs(workers));
+            }
+            Command::ClaimLogs { paths, done } => {
+                let _ = done.send(self.claim_logs(paths));
+            }
+            Command::ReleaseLogs { paths } => {
+                for path in paths {
+                    self.claimed_logs.remove(&path);
+                }
             }
             Command::Metrics { done } => {
                 let _ = done.send(self.metrics().await);
@@ -9098,7 +9124,9 @@ impl Daemon {
 
         let due: Vec<(PathBuf, bool)> = candidates
             .into_iter()
-            .filter(|(path, _)| path.is_file() && rotator.due(path, now))
+            .filter(|(path, _)| {
+                !self.claimed_logs.contains(path) && path.is_file() && rotator.due(path, now)
+            })
             .collect();
         let changed = rotator.take_changed();
 
@@ -9155,6 +9183,33 @@ impl Daemon {
             "info",
             &format!("rotated {}", names.join(", ")),
         );
+    }
+
+    /// Hold log files against rotation, saying of each whether its
+    /// writers cannot reopen it: the instances of a managed HTTP server
+    /// and the edge's own log, which it does not reopen.
+    fn claim_logs(&mut self, paths: Vec<PathBuf>) -> Result<Vec<bool>, String> {
+        if let Some(path) = paths.iter().find(|path| self.claimed_logs.contains(*path)) {
+            return Err(format!(
+                "{} is being cut by another command",
+                path.display()
+            ));
+        }
+
+        let edge_log = self.locations.logs.path.join("edge.log");
+        let in_place = paths
+            .iter()
+            .map(|path| {
+                *path == edge_log
+                    || self.running.iter().any(|((app, id), running)| {
+                        running.backend.servers().is_some()
+                            && self.locations.release_log(app, id) == *path
+                    })
+            })
+            .collect();
+
+        self.claimed_logs.extend(paths);
+        Ok(in_place)
     }
 
     fn reopen_logs(&mut self, workers: bool) -> Reopened {

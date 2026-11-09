@@ -6880,6 +6880,87 @@ pub struct LogsArgs {
     socket: SocketArgs,
 }
 
+/// Which logs a command on the log files acts on.
+#[derive(Args, Clone, Default)]
+pub struct LogTargetArgs {
+    /// One release's log, as app@release.
+    #[arg(value_name = "APP@RELEASE")]
+    target: Option<String>,
+
+    /// The access log.
+    #[arg(long)]
+    access: bool,
+
+    /// The file a virtual host names for its records.
+    #[arg(long, value_name = "HOST")]
+    host: Option<String>,
+
+    /// Every log.
+    #[arg(long)]
+    all: bool,
+}
+
+impl LogTargetArgs {
+    /// The target as the admin API takes it. `required` refuses none
+    /// being named, saying what `doing` would need.
+    fn target(&self, required: bool, doing: &str) -> anyhow::Result<pb::LogTarget> {
+        let named = usize::from(self.target.is_some())
+            + usize::from(self.access)
+            + usize::from(self.host.is_some())
+            + usize::from(self.all);
+
+        if named > 1 {
+            anyhow::bail!("name one of APP@RELEASE, --access, --host HOST or --all, not several");
+        }
+
+        if named == 0 && required {
+            anyhow::bail!("name what to {doing}: APP@RELEASE, --access, --host HOST or --all");
+        }
+
+        let (app, release) = match &self.target {
+            Some(target) => {
+                let (app, release) = split_release(target)?;
+                (app.to_owned(), release.to_owned())
+            }
+            None => (String::new(), String::new()),
+        };
+
+        Ok(pb::LogTarget {
+            app,
+            release,
+            access: self.access,
+            host: self.host.clone().unwrap_or_default(),
+            all: self.all,
+        })
+    }
+}
+
+/// What `muructl logs truncate` takes.
+#[derive(Args, Clone)]
+pub struct LogsTruncateArgs {
+    #[command(flatten)]
+    target: LogTargetArgs,
+
+    /// How much of the newest content to keep, as a size such as 100MB,
+    /// cut at a line boundary; 0 empties the file.
+    #[arg(long, value_name = "SIZE", value_parser = muru_config::parse_size)]
+    keep: u64,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// With no daemon running, where its log directory and state are.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
 /// The `muructl logs` subcommands.
 #[derive(Subcommand, Clone)]
 pub enum LogsCommand {
@@ -6896,6 +6977,10 @@ pub enum LogsCommand {
         #[command(flatten)]
         output: JsonArgs,
     },
+
+    /// Cut a live log down to its newest SIZE, at a line boundary. Asks
+    /// first; without a terminal it needs --yes.
+    Truncate(Box<LogsTruncateArgs>),
 
     /// List each log with its size, its archives and the total, and flag
     /// logs whose release or host no longer exists.
@@ -7027,7 +7112,7 @@ enum LogsWay {
     /// collides with its rotation.
     Daemon(Box<muru_proto::admin::v1::admin_client::AdminClient<tonic::transport::Channel>>),
     /// On the files directly, with none running.
-    Files(LogDirectory),
+    Files(Box<LogDirectory>),
 }
 
 /// A log directory with no daemon running.
@@ -7073,10 +7158,10 @@ async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result
             None
         };
 
-        return Ok(LogsWay::Files(LogDirectory {
+        return Ok(LogsWay::Files(Box::new(LogDirectory {
             locations,
             existing,
-        }));
+        })));
     }
 
     let mut client = client::connect(&path).await?;
@@ -7170,6 +7255,127 @@ pub async fn logs_list(
     }
 
     Ok(())
+}
+
+/// Ask a yes or no question on the terminal, on standard error so that
+/// standard output stays the command's answer. `--yes` answers without
+/// asking; with no terminal to ask on, the command is refused.
+fn confirm(question: &str, yes: bool) -> anyhow::Result<bool> {
+    use std::io::{IsTerminal as _, Write as _};
+
+    if yes {
+        return Ok(true);
+    }
+
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("{question} needs an answer, and there is no terminal to ask on; give --yes");
+    }
+
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Cut live logs down to their newest content.
+pub async fn logs_truncate(args: LogsTruncateArgs) -> anyhow::Result<()> {
+    let target = args.target.target(true, "truncate")?;
+    let keep = args.keep;
+    let way = logs_way(&args.socket, &args.files).await?;
+
+    // What it would free, for the question.
+
+    let plan = match &way {
+        LogsWay::Daemon(client) => client
+            .clone()
+            .truncate_logs(pb::TruncateLogsRequest {
+                target: Some(target.clone()),
+                keep,
+                dry_run: true,
+            })
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => muru_controller::log_files::plan_truncate(
+            &directory.locations.logs.path,
+            directory.existing.as_ref(),
+            &target,
+            keep,
+        )
+        .map_err(anyhow::Error::msg)?,
+    };
+
+    if plan.freed == 0 {
+        eprintln!(
+            "muru: nothing to truncate: every log named is within {}",
+            human_size(keep)
+        );
+        return if args.output.json {
+            print_answer(&plan)
+        } else {
+            Ok(())
+        };
+    }
+
+    for log in &plan.logs {
+        eprintln!(
+            "  {} from {} to {}, freeing {}",
+            log.name,
+            human_size(log.size),
+            human_size(log.kept),
+            human_size(log.freed)
+        );
+    }
+
+    let question = format!("Truncate, freeing {}?", human_size(plan.freed));
+
+    if !confirm(&question, args.yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    let answer = match way {
+        LogsWay::Daemon(mut client) => client
+            .truncate_logs(pb::TruncateLogsRequest {
+                target: Some(target),
+                keep,
+                dry_run: false,
+            })
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => muru_controller::log_files::truncate_directly(
+            &directory.locations.logs.path,
+            directory.existing.as_ref(),
+            &target,
+            keep,
+        )
+        .map_err(anyhow::Error::msg)?,
+    };
+
+    if args.output.json {
+        print_answer(&answer)?;
+    } else {
+        println!("muru: truncated, freeing {}", human_size(answer.freed));
+    }
+
+    let failures: Vec<String> = answer
+        .logs
+        .iter()
+        .filter(|log| !log.error.is_empty())
+        .map(|log| format!("{}: {}", log.name, log.error))
+        .collect();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
 }
 
 /// A byte count for a reader, in the units sizes are given in.

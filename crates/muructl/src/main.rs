@@ -1050,6 +1050,7 @@ fn main() -> anyhow::Result<()> {
                     files,
                     output,
                 }) => admin::logs_list(socket, files, output.json).await,
+                Some(admin::LogsCommand::Truncate(args)) => admin::logs_truncate(*args).await,
                 None => admin::logs(args).await,
             }
         }),

@@ -8,7 +8,8 @@ CloudEvents requests.
 
 Every change the daemon makes or notices is an event: a release created,
 ready, draining or stopped, traffic switched, a host restarted, a worker
-started, recycled or killed, the edge replaced, logs reopened, a
+started, recycled or killed, the edge replaced, logs reopened, rotated or
+truncated, a
 certificate that could not be read. Each has
 a node-wide sequence number, a time, a type such as `release.ready`, a
 subject such as `shop@r1`, a level (`info`, `notice`, `warning` or

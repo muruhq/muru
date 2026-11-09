@@ -89,6 +89,8 @@ service Admin {
   rpc ReopenLogs(ReopenLogsRequest) returns (ReopenLogsResponse);
   // The log files and their archives, what they take, and which belong to a release or host that is gone.
   rpc ListLogs(ListLogsRequest) returns (ListLogsResponse);
+  // Cut live logs down, or say what doing so would free.
+  rpc TruncateLogs(TruncateLogsRequest) returns (TruncateLogsResponse);
 
   // Metrics (section 11.1): the node's Prometheus text exposition.
   rpc GetMetrics(GetMetricsRequest) returns (MetricsText);
@@ -1003,6 +1005,36 @@ message ListLogsResponse {
   repeated LogInfo logs = 2;        // by name
   uint64 total = 3;                 // the bytes all of them take
   bool orphans_known = 4;           // whether orphaned is meaningful: the state store was available
+}
+
+message LogTarget {
+  string app = 1;                   // with release: one release's log
+  string release = 2;
+  bool access = 3;                  // the access log
+  string host = 4;                  // the file a virtual host names
+  bool all = 5;                     // every log
+}
+
+message TruncateLogsRequest {
+  LogTarget target = 1;
+  uint64 keep = 2;                  // bytes of the newest content to keep, 0 for none
+  bool dry_run = 3;                 // say what it would free, changing nothing
+}
+
+message TruncatedLog {
+  string name = 1;                  // its path relative to the log directory
+  uint64 size = 2;                  // its size before
+  uint64 kept = 3;                  // the bytes kept
+  uint64 freed = 4;                 // the bytes freed
+  bool in_place = 5;                // cut in place, so lines written meanwhile are lost
+  uint64 late = 6;                  // the bytes writers added during the swap, carried over
+  string error = 7;                 // why this log could not be cut
+}
+
+message TruncateLogsResponse {
+  repeated TruncatedLog logs = 1;
+  uint64 freed = 2;                 // the bytes freed in all
+  bool dry_run = 3;                 // nothing was changed
 }
 
 message GetMetricsRequest {}

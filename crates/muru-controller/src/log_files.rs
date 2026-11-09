@@ -1,9 +1,11 @@
-//! The log directory as logs and their archives, for `muructl logs list`
-//! (design specification section 11.3). The daemon and a muructl working
-//! with no daemon running share this, so both see the same files.
+//! The log directory as logs and their archives, and the cutting of a
+//! live log, for the `muructl logs` commands on the files (design
+//! specification section 11.3). The daemon and a muructl working with no
+//! daemon running share this, so both see the same files and cut them
+//! the same way.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io;
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -304,10 +306,7 @@ fn add(
 
 /// What `ListLogs` answers: every log in the directory, with what the
 /// store says about each.
-pub fn report(
-    directory: &PathBuf,
-    existing: Option<&Existing>,
-) -> io::Result<pb::ListLogsResponse> {
+pub fn report(directory: &Path, existing: Option<&Existing>) -> io::Result<pb::ListLogsResponse> {
     let logs = list(directory, existing)?;
     let total = logs.iter().map(LogFile::total).sum();
 
@@ -345,6 +344,345 @@ fn log_info(log: &LogFile) -> pb::LogInfo {
         total: log.total(),
         orphaned: log.orphaned,
     }
+}
+
+/// The logs a request names, which must exist. No target at all is
+/// every log, as `all` is.
+pub fn select<'a>(logs: &'a [LogFile], target: &pb::LogTarget) -> Result<Vec<&'a LogFile>, String> {
+    if target.access {
+        return logs
+            .iter()
+            .find(|log| log.kind == Kind::Access && log.present)
+            .map(|log| vec![log])
+            .ok_or_else(|| "there is no access log".to_owned());
+    }
+
+    if !target.host.is_empty() {
+        return logs
+            .iter()
+            .find(|log| log.present && log.hosts.contains(&target.host))
+            .map(|log| vec![log])
+            .ok_or_else(|| {
+                format!(
+                    "no log file for virtual host {}: its records are in access.log unless it \
+                     names an access_log_file",
+                    target.host
+                )
+            });
+    }
+
+    if !target.app.is_empty() {
+        return logs
+            .iter()
+            .find(|log| {
+                log.kind == Kind::Release
+                    && log.present
+                    && log.app == target.app
+                    && log.release == target.release
+            })
+            .map(|log| vec![log])
+            .ok_or_else(|| format!("no log for {}@{}", target.app, target.release));
+    }
+
+    Ok(logs.iter().filter(|log| log.present).collect())
+}
+
+/// The start of what is kept, when `keep` bytes of a file's newest
+/// content are kept: just after a line ends, at or after `size - keep`.
+/// With no line ending there to cut at, nothing is kept.
+pub fn cut_point(path: &Path, size: u64, keep: u64) -> io::Result<u64> {
+    if keep >= size {
+        return Ok(0);
+    }
+
+    if keep == 0 {
+        return Ok(size);
+    }
+
+    let start = size - keep;
+    let mut file = std::fs::File::open(path)?;
+
+    // The byte before the window decides whether the window opens on a
+    // line start, so the search begins there.
+
+    file.seek(SeekFrom::Start(start - 1))?;
+    let mut position = start - 1;
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        let read = file.read(&mut buffer)?;
+
+        if read == 0 {
+            return Ok(size);
+        }
+
+        if let Some(at) = buffer[..read].iter().position(|byte| *byte == b'\n') {
+            return Ok((position + at as u64 + 1).min(size));
+        }
+
+        position += read as u64;
+    }
+}
+
+/// What a truncate of the named logs would do, or did.
+fn truncated(log: &LogFile, cut: u64, in_place: bool) -> pb::TruncatedLog {
+    pb::TruncatedLog {
+        name: log.name.clone(),
+        size: log.size,
+        kept: log.size - cut,
+        freed: cut,
+        in_place,
+        ..Default::default()
+    }
+}
+
+/// What truncating the named logs to `keep` bytes each would free.
+pub fn plan_truncate(
+    directory: &Path,
+    existing: Option<&Existing>,
+    target: &pb::LogTarget,
+    keep: u64,
+) -> Result<pb::TruncateLogsResponse, String> {
+    let logs =
+        list(directory, existing).map_err(|error| format!("reading the log directory: {error}"))?;
+    let selected = select(&logs, target)?;
+    let mut planned = Vec::new();
+
+    for log in selected {
+        let cut = cut_point(&directory.join(&log.name), log.size, keep)
+            .map_err(|error| format!("reading {}: {error}", log.name))?;
+        planned.push(truncated(log, cut, false));
+    }
+
+    Ok(pb::TruncateLogsResponse {
+        freed: planned.iter().map(|log| log.freed).sum(),
+        logs: planned,
+        dry_run: true,
+    })
+}
+
+/// A log file being cut, by the plan the daemon carries out.
+#[derive(Debug, Clone)]
+pub struct Target {
+    /// Its path.
+    pub path: PathBuf,
+    /// Its name, relative to the log directory.
+    pub name: String,
+    /// How many of its bytes to keep.
+    pub keep: u64,
+    /// Whether its writers cannot be told to reopen it.
+    pub in_place: bool,
+}
+
+/// A file replaced by a shorter copy, whose old file is held open so
+/// that what writers added before they reopened can be carried over.
+#[derive(Debug)]
+pub struct Swapped {
+    path: PathBuf,
+    name: String,
+    old: std::fs::File,
+    copied_to: u64,
+}
+
+impl Swapped {
+    /// The size of the old file now.
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.old.metadata()?.len())
+    }
+}
+
+/// How long the old file's size must stay still for its writers to have
+/// moved on, and the longest to wait for that.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+const SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Where the kept part of a log is written before it replaces the log.
+fn temporary_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".truncating");
+    PathBuf::from(name)
+}
+
+/// Write the part of a file from `cut` to its end to the temporary file,
+/// with the file's mode and owner, returning the position copied to.
+fn write_kept(path: &Path, cut: u64) -> io::Result<(PathBuf, std::fs::File, u64)> {
+    let temporary = temporary_path(path);
+    let mut source = std::fs::File::open(path)?;
+    let metadata = source.metadata()?;
+
+    let copied = (|| -> io::Result<u64> {
+        let mut output = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)?;
+        crate::rotation::match_mode_and_owner(&output, &temporary, &metadata)?;
+        source.seek(SeekFrom::Start(cut))?;
+        let copied = io::copy(&mut source, &mut output)?;
+        output.sync_all()?;
+        Ok(cut + copied)
+    })();
+
+    match copied {
+        Ok(copied) => Ok((temporary, source, copied)),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+/// Replace a log with a copy holding only what is kept. The old file is
+/// held open until `finish_swap` has carried over what writers added
+/// while they moved to the new file.
+pub fn swap_in(target: &Target) -> io::Result<Option<Swapped>> {
+    let size = std::fs::metadata(&target.path)?.len();
+    let cut = cut_point(&target.path, size, target.keep)?;
+
+    if cut == 0 {
+        return Ok(None);
+    }
+
+    let (temporary, old, copied_to) = write_kept(&target.path, cut)?;
+
+    if let Err(error) = std::fs::rename(&temporary, &target.path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    Ok(Some(Swapped {
+        path: target.path.clone(),
+        name: target.name.clone(),
+        old,
+        copied_to,
+    }))
+}
+
+/// Wait for writers to have moved off the old files, then add what they
+/// wrote there during the swap to the new ones. Returns the bytes added
+/// to each, by the log's name.
+pub async fn finish_swaps(swapped: Vec<Swapped>) -> Vec<(String, io::Result<u64>)> {
+    let started = tokio::time::Instant::now();
+    let mut sizes: Vec<Option<u64>> = swapped.iter().map(|one| one.len().ok()).collect();
+    let mut still_since = tokio::time::Instant::now();
+
+    while started.elapsed() < SETTLE_LIMIT {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let now: Vec<Option<u64>> = swapped.iter().map(|one| one.len().ok()).collect();
+
+        if now == sizes {
+            if still_since.elapsed() >= SETTLE {
+                break;
+            }
+        } else {
+            sizes = now;
+            still_since = tokio::time::Instant::now();
+        }
+    }
+
+    tokio::task::spawn_blocking(move || {
+        swapped
+            .into_iter()
+            .map(|one| {
+                let name = one.name.clone();
+                (name, append_tail(one))
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Add to the new file what the old one gained after the copy, as one
+/// write, so a concurrent line does not land in the middle of it.
+fn append_tail(mut swapped: Swapped) -> io::Result<u64> {
+    let mut tail = Vec::new();
+    swapped.old.seek(SeekFrom::Start(swapped.copied_to))?;
+    swapped.old.read_to_end(&mut tail)?;
+
+    if tail.is_empty() {
+        return Ok(0);
+    }
+
+    let mut new = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&swapped.path)?;
+    new.write_all(&tail)?;
+    Ok(tail.len() as u64)
+}
+
+/// Cut a log whose writers cannot reopen it, in place: the kept part is
+/// written aside, the file truncated and the kept part appended. Lines
+/// written while the kept part is copied are lost. `keep` of 0 truncates
+/// the file and needs no free disk space.
+pub fn cut_in_place(target: &Target) -> io::Result<u64> {
+    let size = std::fs::metadata(&target.path)?.len();
+    let cut = cut_point(&target.path, size, target.keep)?;
+
+    if cut == 0 {
+        return Ok(0);
+    }
+
+    if target.keep == 0 {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&target.path)?;
+        return Ok(size);
+    }
+
+    let (temporary, _, _) = write_kept(&target.path, cut)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&target.path)?;
+    let mut kept = std::fs::File::open(&temporary)?;
+    let mut appended = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&target.path)?;
+    io::copy(&mut kept, &mut appended)?;
+    std::fs::remove_file(&temporary)?;
+    Ok(cut)
+}
+
+/// Truncate the named logs directly, with no daemon running. Everything
+/// is cut in place, since an edge or a host left running by a detached
+/// daemon may still have the files open.
+pub fn truncate_directly(
+    directory: &Path,
+    existing: Option<&Existing>,
+    target: &pb::LogTarget,
+    keep: u64,
+) -> Result<pb::TruncateLogsResponse, String> {
+    let logs =
+        list(directory, existing).map_err(|error| format!("reading the log directory: {error}"))?;
+    let selected = select(&logs, target)?;
+    let mut done = Vec::new();
+
+    for log in selected {
+        let one = Target {
+            path: directory.join(&log.name),
+            name: log.name.clone(),
+            keep,
+            in_place: true,
+        };
+        let cut = cut_point(&one.path, log.size, keep).unwrap_or(0);
+        let mut result = truncated(log, cut, keep > 0);
+
+        if let Err(error) = cut_in_place(&one) {
+            result.error = error.to_string();
+            result.freed = 0;
+            result.kept = log.size;
+        }
+
+        done.push(result);
+    }
+
+    Ok(pb::TruncateLogsResponse {
+        freed: done.iter().map(|log| log.freed).sum(),
+        logs: done,
+        dry_run: false,
+    })
 }
 
 #[cfg(test)]
@@ -434,6 +772,77 @@ mod tests {
 
         let logs = list(directory, None).unwrap();
         assert!(logs.iter().all(|log| !log.orphaned));
+    }
+
+    #[test]
+    fn a_cut_is_at_the_start_of_a_line_and_keeps_at_most_the_size() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("a.log");
+        std::fs::write(&path, "first\nsecond\nthird\n").unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+
+        assert_eq!(cut_point(&path, size, 0).unwrap(), size);
+        assert_eq!(cut_point(&path, size, size).unwrap(), 0);
+        assert_eq!(cut_point(&path, size, 100).unwrap(), 0);
+        assert_eq!(cut_point(&path, size, 6).unwrap(), 13, "third is six bytes");
+        assert_eq!(
+            cut_point(&path, size, 7).unwrap(),
+            13,
+            "starts inside second"
+        );
+        assert_eq!(
+            cut_point(&path, size, 5).unwrap(),
+            size,
+            "inside the last line"
+        );
+    }
+
+    #[test]
+    fn cutting_in_place_keeps_whole_newest_lines() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("a.log");
+        std::fs::write(&path, "first\nsecond\nthird\n").unwrap();
+        let target = Target {
+            path: path.clone(),
+            name: "a.log".to_owned(),
+            keep: 6,
+            in_place: true,
+        };
+
+        assert_eq!(cut_in_place(&target).unwrap(), 13);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "third\n");
+
+        let empty = Target { keep: 0, ..target };
+        assert_eq!(cut_in_place(&empty).unwrap(), 6);
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+    }
+
+    #[tokio::test]
+    async fn a_swap_carries_over_what_a_writer_added_before_reopening() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("a.log");
+        std::fs::write(&path, "first\nsecond\nthird\n").unwrap();
+        let target = Target {
+            path: path.clone(),
+            name: "a.log".to_owned(),
+            keep: 6,
+            in_place: false,
+        };
+
+        // A writer holds the file open across the swap, as the edge and
+        // a host do until they are told to reopen.
+
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let swapped = swap_in(&target).unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "third\n");
+
+        writeln!(writer, "late").unwrap();
+        let added = finish_swaps(vec![swapped]).await;
+        assert_eq!(added[0].1.as_ref().unwrap(), &5);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "third\nlate\n");
     }
 
     #[test]

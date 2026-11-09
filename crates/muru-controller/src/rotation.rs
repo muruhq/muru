@@ -226,17 +226,28 @@ fn archive_path(path: &Path, now: SystemTime) -> PathBuf {
 /// that runs as another user (ADR 0026) reopens a file it may write,
 /// in a directory it may not create one in.
 fn recreate(path: &Path, archive: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
     let metadata = std::fs::metadata(archive)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
+    match_mode_and_owner(&file, path, &metadata)
+}
+
+/// Give a file the mode and owner of another, so a writer that runs as
+/// another user keeps access to it; a chown this user may not make is
+/// left, since a daemon that is not root has one user only.
+pub(crate) fn match_mode_and_owner(
+    file: &std::fs::File,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
     file.set_permissions(std::fs::Permissions::from_mode(metadata.mode() & 0o7777))?;
 
     if let Err(error) = std::os::unix::fs::chown(path, Some(metadata.uid()), Some(metadata.gid())) {
-        tracing::debug!(%error, path = %path.display(), "the recreated log keeps this user");
+        tracing::debug!(%error, path = %path.display(), "the new log keeps this user");
     }
 
     Ok(())

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,16 @@ def direct(daemon: Daemon, *arguments: str, check: bool = True) -> subprocess.Co
     return completed
 
 
+def wait_for(predicate: Callable[[], bool], what: str, timeout: float = 20.0) -> None:
+    """Wait for the predicate, failing with what was awaited."""
+
+    deadline = time.monotonic() + timeout
+
+    while not predicate():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.1)
+
+
 def by_name(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {log["name"]: log for log in report["logs"]}
 
@@ -54,7 +66,7 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
             "muru: release shop@r1 is ready and serving"
         )
 
-        for _ in range(5):
+        for _ in range(30):
             assert daemon.get("/catalogue").status == 200
 
         # A log whose release no longer exists, with an archive, and a
@@ -89,12 +101,60 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
         refused = daemon.muructl("logs", "list", "--log-dir", str(tmp_path), check=False)
         assert refused.returncode != 0 and "writes its logs to" in refused.stderr
 
-        # With the daemon stopped the same listing comes from the files.
+        # truncate needs a target and --keep, and a --yes with no terminal.
+
+        access = logs / "access.log"
+        assert (
+            "name what to truncate"
+            in daemon.muructl("logs", "truncate", "--keep", "0", check=False).stderr
+        )
+        refused = daemon.muructl("logs", "truncate", "--access", "--keep", "1KB", check=False)
+        assert refused.returncode != 0 and "--yes" in refused.stderr
+        before = access.stat().st_size
+        assert before > 4096
+
+        # Keeping some cuts at a line and leaves valid JSON lines, and the
+        # edge goes on into the file that replaced it.
+
+        answer = json.loads(
+            daemon.muructl(
+                "logs", "truncate", "--access", "--keep", "1KB", "--yes", "--json"
+            ).stdout
+        )
+        assert answer["freed"] > 0 and answer["logs"][0]["error"] == ""
+        assert 0 < access.stat().st_size <= 1024 + 2048
+        kept = access.read_text()
+        assert kept.endswith("\n") and all(json.loads(line) for line in kept.splitlines())
+        assert daemon.get("/truncated").status in (200, 404)
+        wait_for(lambda: "/truncated" in access.read_text(), "the edge to write to the new file")
+        assert "logs.truncated" in daemon.muructl("events").stdout
+
+        # Keeping none empties the file in place, and the host writes on.
+
+        release_log = logs / "apps" / "shop" / "r1.log"
+        answer = json.loads(
+            daemon.muructl("logs", "truncate", "shop@r1", "--keep", "0", "--yes", "--json").stdout
+        )
+        assert answer["logs"][0]["kept"] == 0
+        assert release_log.stat().st_size == 0
+        assert daemon.get("/catalogue").status == 200
+        wait_for(lambda: release_log.stat().st_size > 0, "the host to write on")
+
+        # An archive is left alone by truncate.
+
+        assert (orphan.parent / "r9.log.20260101-000000").exists()
+
+        # With the daemon stopped the same commands work on the files.
 
         daemon.stop()
         report = json.loads(direct(daemon, "logs", "list", "--json").stdout)
         assert report["orphans_known"] is True
         assert by_name(report)["apps/gone/r9.log"]["orphaned"] is True
         assert by_name(report)["apps/shop/r1.log"]["orphaned"] is False
+
+        answer = json.loads(
+            direct(daemon, "logs", "truncate", "--access", "--keep", "0", "--yes", "--json").stdout
+        )
+        assert access.stat().st_size == 0 and answer["freed"] > 0
     finally:
         daemon.stop()

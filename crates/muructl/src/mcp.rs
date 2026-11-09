@@ -496,6 +496,23 @@ fn pairs(arguments: &JsonObject, key: &str) -> Result<Vec<(String, String)>, Str
 }
 
 /// Words, all owned.
+/// The options of a tool that names logs the way `muructl logs` commands do.
+fn log_target_flags(arguments: &JsonObject) -> Vec<String> {
+    let mut flags = Vec::new();
+
+    if flag(arguments, "access") {
+        flags.push("--access".to_owned());
+    }
+
+    flags.extend(option(arguments, "host", "--host"));
+
+    if flag(arguments, "all") {
+        flags.push("--all".to_owned());
+    }
+
+    flags
+}
+
 fn words(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_owned()).collect()
 }
@@ -1216,6 +1233,32 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "truncate_logs",
+            description: "Cut a live log down to its newest bytes, at a line boundary; keep of 0 empties it. Refused unless yes is true; log_files shows what there is to cut.",
+            changes: true,
+            properties: json!({
+                "target": {"type": "string", "description": "One release's log, as app@release"},
+                "access": {"type": "boolean", "description": "The access log"},
+                "host": {"type": "string", "description": "The file a virtual host names for its records"},
+                "all": {"type": "boolean", "description": "Every log"},
+                "keep": {"type": "string", "description": "How much to keep, as a size such as 100MB; 0 for none"},
+                "yes": {"type": "boolean", "description": "Confirm the cut; without it the command refuses"},
+            }),
+            required: &["keep"],
+            command: |arguments| {
+                let mut command = words(&["logs", "truncate"]);
+                command.extend(text(arguments, "target"));
+                command.extend(log_target_flags(arguments));
+                command.extend(option(arguments, "keep", "--keep"));
+
+                if flag(arguments, "yes") {
+                    command.push("--yes".to_owned());
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "reopen_logs",
             description: "Reopen every log file by name, after something outside Muru has renamed them; workers also runs each worker's on_reopen_logs hook.",
             changes: true,
@@ -1296,6 +1339,17 @@ mod tests {
             ])
         );
         assert!(command("debug", json!({"what": "exec", "target": "shop"})).is_err());
+        assert_eq!(
+            command("truncate_logs", json!({"access": true, "keep": "1MB"})),
+            Ok(vec![
+                "logs".into(),
+                "truncate".into(),
+                "--access".into(),
+                "--keep".into(),
+                "1MB".into()
+            ]),
+            "without yes the command runs with no --yes, and refuses"
+        );
 
         // Every environment value is for a person at a terminal, never
         // for the agent's context.
