@@ -702,6 +702,14 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "log_files",
+            description: "Each log file with its size, its archives and the total, and whether its release or host no longer exists.",
+            changes: false,
+            properties: json!({}),
+            required: &[],
+            command: |_| Ok(words(&["logs", "list"])),
+        },
+        Spec {
             name: "events",
             description: "The daemon's events in order (deploys, state changes, rollouts, worker faults), up to 200 after a sequence number.",
             changes: false,

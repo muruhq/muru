@@ -87,6 +87,8 @@ service Admin {
   // and reopening every log file after an external rotation.
   rpc TailLogs(TailLogsRequest) returns (stream LogLine);
   rpc ReopenLogs(ReopenLogsRequest) returns (ReopenLogsResponse);
+  // The log files and their archives, what they take, and which belong to a release or host that is gone.
+  rpc ListLogs(ListLogsRequest) returns (ListLogsResponse);
 
   // Metrics (section 11.1): the node's Prometheus text exposition.
   rpc GetMetrics(GetMetricsRequest) returns (MetricsText);
@@ -972,6 +974,35 @@ message ReopenLogsRequest {
 message ReopenLogsResponse {
   bool edge = 1;                    // the edge was told
   uint32 hosts = 2;                 // hosts told
+}
+
+message ListLogsRequest {}
+
+message LogArchive {
+  string name = 1;                  // its path relative to the log directory
+  uint64 size = 2;                  // in bytes
+  uint64 modified_unix_ms = 3;      // when it was last changed
+}
+
+message LogInfo {
+  string name = 1;                  // its path relative to the log directory
+  string kind = 2;                  // access, edge, daemon, host or release
+  string app = 3;                   // the application of a release's log
+  string release = 4;               // the release of a release's log
+  repeated string hosts = 5;        // the virtual hosts that name this file
+  uint64 size = 6;                  // in bytes, 0 when the file is gone
+  bool present = 7;                 // the file itself exists, not only archives of it
+  repeated LogArchive archives = 8; // oldest first
+  uint64 archives_size = 9;         // the bytes the archives take
+  uint64 total = 10;                // the bytes the log and its archives take
+  bool orphaned = 11;               // its release or host no longer exists
+}
+
+message ListLogsResponse {
+  string directory = 1;             // the log directory
+  repeated LogInfo logs = 2;        // by name
+  uint64 total = 3;                 // the bytes all of them take
+  bool orphans_known = 4;           // whether orphaned is meaningful: the state store was available
 }
 
 message GetMetricsRequest {}

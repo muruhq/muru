@@ -57,6 +57,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | ListCommands | GET /v1/apps/{app}/releases/{release}/commands | the release's declared commands, their inputs and each one's last run |
 | TailLogs | GET /v1/apps/{app}/releases/{release}/logs | stream logs |
 | ReopenLogs | POST /v1/logs:reopen | reopen log files, optionally in workers |
+| ListLogs | GET /v1/logs | each log with its size, archives and total, and whether its release or host still exists |
 | GetMetrics | GET /metrics | the Prometheus text exposition (11.1) |
 | SetLogLevel | POST /v1/apps/{app}/releases/{release}:loglevel | time-limited logger levels |
 | OverrideAccessLog | POST /v1/access-log:override | time-limited changes to which requests the access log writes, listed or reset |

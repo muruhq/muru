@@ -6896,6 +6896,20 @@ pub enum LogsCommand {
         #[command(flatten)]
         output: JsonArgs,
     },
+
+    /// List each log with its size, its archives and the total, and flag
+    /// logs whose release or host no longer exists.
+    List {
+        #[command(flatten)]
+        socket: SocketArgs,
+
+        /// With no daemon running, where its log directory and state are.
+        #[command(flatten)]
+        files: DaemonFileArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
+    },
 }
 
 /// Show or follow a release's output or the access log.
@@ -7004,6 +7018,171 @@ pub async fn logs_reopen(workers: bool, socket: SocketArgs, json: bool) -> anyho
         if workers { " and their workers" } else { "" }
     );
     Ok(())
+}
+
+/// How a command on the log files reaches them: through the running
+/// daemon, or with none running on the files themselves.
+enum LogsWay {
+    /// Through the daemon, so that it can tell the writers and nothing
+    /// collides with its rotation.
+    Daemon(Box<muru_proto::admin::v1::admin_client::AdminClient<tonic::transport::Channel>>),
+    /// On the files directly, with none running.
+    Files(LogDirectory),
+}
+
+/// A log directory with no daemon running.
+struct LogDirectory {
+    locations: Locations,
+    /// What the state store says exists, when there is a store.
+    existing: Option<muru_controller::log_files::Existing>,
+}
+
+/// Find how to reach the log files. A command that names no socket looks
+/// for the daemon alone, since only a daemon writes log files; with none
+/// listening it works on the files in the resolved log directory.
+async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result<LogsWay> {
+    let locations = Locations::resolve(&Options {
+        config: files.config.clone(),
+        state_dir: files.state_dir.clone(),
+        run_dir: socket.locations.run_dir.clone(),
+        log_dir: files.log_dir.clone(),
+        cache_dir: files.cache_dir.clone(),
+        system: socket.locations.system,
+    });
+    let path = socket
+        .socket
+        .clone()
+        .unwrap_or_else(|| locations.admin_socket());
+
+    let nothing_listens = socket.socket.is_none()
+        && std::os::unix::net::UnixStream::connect(&path).is_err_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+        });
+
+    if nothing_listens {
+        let store_path = locations.state_store();
+
+        let existing = if store_path.is_file() {
+            let store = muru_controller::store::Store::open(&store_path)
+                .with_context(|| format!("opening {}", store_path.display()))?;
+            Some(muru_controller::log_files::Existing::read(&store)?)
+        } else {
+            None
+        };
+
+        return Ok(LogsWay::Files(LogDirectory {
+            locations,
+            existing,
+        }));
+    }
+
+    let mut client = client::connect(&path).await?;
+
+    if let Some(asked) = &files.log_dir {
+        let answer = client
+            .list_logs(pb::ListLogsRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner();
+        let same = asked.canonicalize().ok() == Path::new(&answer.directory).canonicalize().ok();
+
+        if !same {
+            anyhow::bail!(
+                "the daemon running at {} writes its logs to {}, not {}",
+                path.display(),
+                answer.directory,
+                asked.display()
+            );
+        }
+    }
+
+    Ok(LogsWay::Daemon(Box::new(client)))
+}
+
+/// List the log files and what they take.
+pub async fn logs_list(
+    socket: SocketArgs,
+    files: DaemonFileArgs,
+    json: bool,
+) -> anyhow::Result<()> {
+    let report = match logs_way(&socket, &files).await? {
+        LogsWay::Daemon(mut client) => client
+            .list_logs(pb::ListLogsRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => muru_controller::log_files::report(
+            &directory.locations.logs.path,
+            directory.existing.as_ref(),
+        )
+        .with_context(|| format!("reading {}", directory.locations.logs.path.display()))?,
+    };
+
+    if json {
+        return print_answer(&report);
+    }
+
+    if report.logs.is_empty() {
+        println!("no log files in {}", report.directory);
+        return Ok(());
+    }
+
+    println!(
+        "{:<40} {:>9} {:>18} {:>9}",
+        "LOG", "SIZE", "ARCHIVES", "TOTAL"
+    );
+
+    for log in &report.logs {
+        let archives = if log.archives.is_empty() {
+            "-".to_owned()
+        } else {
+            format!("{} ({})", log.archives.len(), human_size(log.archives_size))
+        };
+
+        let size = if log.present {
+            human_size(log.size)
+        } else {
+            "-".to_owned()
+        };
+
+        println!(
+            "{:<40} {size:>9} {archives:>18} {:>9}{}",
+            log.name,
+            human_size(log.total),
+            if log.orphaned { "  orphaned" } else { "" }
+        );
+    }
+
+    println!(
+        "total {}, in {}",
+        human_size(report.total),
+        report.directory
+    );
+
+    if !report.orphans_known {
+        println!(
+            "no state store was found, so logs of releases and hosts that no longer exist \
+             are not flagged"
+        );
+    }
+
+    Ok(())
+}
+
+/// A byte count for a reader, in the units sizes are given in.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
+
+    for (scale, unit) in UNITS {
+        if bytes >= scale {
+            return format!("{:.1}{unit}", bytes as f64 / scale as f64);
+        }
+    }
+
+    format!("{bytes}B")
 }
 
 /// An access log record as the compact line a development run prints,

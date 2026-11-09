@@ -656,6 +656,14 @@ type LogStream = Pin<Box<dyn Stream<Item = Result<pb::LogLine, Status>> + Send>>
 type CommandStream = Pin<Box<dyn Stream<Item = Result<pb::CommandOutput, Status>> + Send>>;
 
 impl Service {
+    /// What a command on the log files gets from a development run.
+    fn no_log_files(&self) -> Status {
+        Status::failed_precondition(format!(
+            "a development run writes no log files: the output of {} goes to the terminal",
+            self.state.app
+        ))
+    }
+
     /// Why a command that manages the daemon's state is refused here.
     fn needs_the_daemon(&self, what: &str) -> Status {
         Status::failed_precondition(format!(
@@ -865,6 +873,13 @@ impl Admin for Service {
              terminal",
             self.state.app
         )))
+    }
+
+    async fn list_logs(
+        &self,
+        _: Request<pb::ListLogsRequest>,
+    ) -> Result<Response<pb::ListLogsResponse>, Status> {
+        Err(self.no_log_files())
     }
 
     async fn get_metrics(

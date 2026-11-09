@@ -821,6 +821,22 @@ impl Admin for Service {
         }))
     }
 
+    async fn list_logs(
+        &self,
+        _: Request<pb::ListLogsRequest>,
+    ) -> Result<Response<pb::ListLogsResponse>, Status> {
+        let existing = crate::log_files::Existing::read(&self.handle.store).map_err(internal)?;
+        let directory = self.handle.info.locations.logs.path.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            crate::log_files::report(&directory, Some(&existing))
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .map_err(|error| Status::internal(format!("reading the log directory: {error}")))?;
+
+        Ok(Response::new(report))
+    }
+
     async fn get_metrics(
         &self,
         _: Request<pb::GetMetricsRequest>,

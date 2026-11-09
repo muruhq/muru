@@ -463,3 +463,27 @@ their release's file themselves and cannot be told to reopen it, so the
 built-in rotation copies that file to its archive and truncates it in
 place, and lines written while it is copied are lost. With
 `rotate = 'external'`, give those files logrotate's `copytruncate`.
+
+## Reclaiming disk space
+
+`muructl logs` has subcommands that show and reclaim the space logs take.
+They work on the log files of a daemon, through the daemon when one is
+running. With none running they work on the files themselves, in the
+daemon's log directory, or the one named by `--log-dir`. `--state-dir`
+names where the daemon's state store is, which is how they know what
+still exists. `muructl serve` writes its logs to standard output, so
+these commands have nothing to do for it.
+
+`muructl logs list` shows each log, its size, its archives and the total
+it takes, and flags as `orphaned` a log whose release or virtual host no
+longer exists. `--json` prints the same for scripts:
+
+```console
+$ muructl logs list
+LOG                                           SIZE           ARCHIVES     TOTAL
+access.log                                  5.2GB          3 (61.0MB)     5.3GB
+apps/shop/r3.log                           12.0MB                   -    12.0MB
+apps/shop/r1.log                          570.0MB           1 (9.0MB)   579.0MB  orphaned
+edge.log                                    4.0KB                   -     4.0KB
+total 5.9GB, in /var/log/muru
+```

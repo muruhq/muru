@@ -57,6 +57,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Observability | muructl events | Show or follow events with filters. Flags: --follow, --after | 11.5 |
 | Observability | muructl logs RELEASE | Show or follow logs | 11.2 |
 | Observability | muructl logs reopen [--workers] | Reopen log files after external rotation | 11.3 |
+| Observability | muructl logs list | Each log with its size, archives and total, flagging logs whose release or host no longer exists. Flags: --json, and with no daemon running --log-dir and --state-dir | 11.3 |
 | Observability | muructl metrics | Print the node's metrics as Prometheus text | 11.1 |
 | Observability | muructl logging level RELEASE | Time-limited logger levels, or --reset | 11.4 |
 | Observability | muructl logging access MODE | Time-limited changes to which requests the access log writes, for an application and paths, the list of those in force, or --reset | 11.2 |
