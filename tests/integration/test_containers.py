@@ -398,6 +398,10 @@ def test_serve_runs_as_an_arbitrary_user_on_a_read_only_root(
             "/run/muru:mode=0770,gid=0",
             "--tmpfs",
             "/tmp",
+            "--memory",
+            "512m",
+            "--memory-swap",
+            "512m",
         ),
     )
     wait_until_serving(instance)
@@ -432,6 +436,16 @@ def test_serve_runs_as_an_arbitrary_user_on_a_read_only_root(
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert completed.stdout.strip() == "release none"
+
+    # Section 13.9: over its hard limit with no room for a second worker
+    # of that size, the worker stops first and its successor starts after.
+
+    thread, _ = instance.request_in_the_background("/grow?mb=360")
+    wait_for(lambda: "stops before its replacement starts" in instance.logs(), timeout=30)
+    thread.join(timeout=30)
+    wait_for(lambda: ": worker.recycled: worker 0" in instance.logs(), timeout=30)
+    wait_until_serving(instance)
+    assert "worker.oom_killed" not in instance.logs(), instance.logs()
 
     elapsed, code = instance.stop()
     assert code == 0, instance.logs()

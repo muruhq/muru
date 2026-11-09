@@ -907,6 +907,11 @@ class Replacement:
 
     retire: bool = False
 
+    # Section 13.9: short of memory, so the successor is forked only once
+    # this worker has gone.
+
+    stop_first: bool = False
+
 
 @dataclass
 class Orphan:
@@ -2995,10 +3000,39 @@ class Host:
                 self.hard_drain_grace if grace is None else grace
             )
 
+        # Section 13.9: two large workers alive at once is what the kernel
+        # would kill for, so with no room for a second this one leaves
+        # routing and stops first, and reap() forks its successor.
+
+        short = self.short_of_memory(index) if cause == "memory" else None
+
+        if short is not None:
+            log(
+                f"worker {index} (pid {state.pid}) stops before its replacement starts: "
+                f"{format_size(short)} is left under the container's memory limit"
+            )
+            replacement.stop_first = True
+            replacement.terminate_at = None
+            self.routed[index] = None
+            replacement.announced = self.announce()
+            replacement.announced_at = time.monotonic()
+            return
+
         replacement.new_pid = self.spawn(index, replacing=True)
 
         if kind == "worker.timeout_killed":
             self.report_timeout_kill(replacement)
+
+    def short_of_memory(self, index: int) -> int | None:
+        """Return what is left under the container's limit, if less than one worker may use."""
+
+        policy = self.group_of(index).memory or self.memory
+        left = memory_left(self.cgroup)
+
+        if left is None or policy.hard_limit is None or left >= policy.hard_limit:
+            return None
+
+        return left
 
     def report_timeout_kill(self, replacement: Replacement) -> None:
         """Raise a timeout kill's event, once, when both halves of it are known.
@@ -3463,6 +3497,13 @@ class Host:
             if replacement is not None and replacement.old_pid == pid:
                 del self.replacing[index]
 
+                # Section 13.9: the worker was stopped first, so its
+                # successor starts now and is routed to once it is ready.
+
+                if replacement.stop_first:
+                    self.starting.add(index)
+                    replacement.new_pid = self.spawn(index, replacing=True)
+
                 if oom_killed:
                     self.report_oom_kill(
                         index,
@@ -3794,6 +3835,37 @@ def oom_kills(cgroup: str | None) -> int | None:
         pass
 
     return None
+
+
+def memory_left(cgroup: str | None) -> int | None:
+    """Read what is left under the cgroup's memory limit, or None with no limit.
+
+    Inactive file pages count as free, since the kernel reclaims those
+    before it kills anything.
+    """
+
+    if cgroup is None:
+        return None
+
+    try:
+        with open(os.path.join(cgroup, "memory.max")) as limit_file:
+            limit = int(limit_file.read())
+
+        with open(os.path.join(cgroup, "memory.current")) as current_file:
+            current = int(current_file.read())
+
+        inactive = 0
+
+        with open(os.path.join(cgroup, "memory.stat")) as stat:
+            for line in stat:
+                name, _, count = line.partition(" ")
+
+                if name == "inactive_file":
+                    inactive = int(count)
+    except (OSError, ValueError):
+        return None
+
+    return limit - max(current - inactive, 0)
 
 
 def format_size(size: int) -> str:

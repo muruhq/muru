@@ -354,6 +354,75 @@ def test_a_kill_for_memory_during_a_replacement_is_counted_and_reported(
     assert instance.oom_kills == 1
 
 
+def container_memory(cgroup: Path, used: int, inactive: int = 0, limit: int = 1000) -> None:
+    (cgroup / "memory.max").write_text(f"{limit}\n")
+    (cgroup / "memory.current").write_text(f"{used}\n")
+    (cgroup / "memory.stat").write_text(f"anon 1\ninactive_file {inactive}\n")
+
+
+def test_memory_left_counts_reclaimable_file_pages_and_needs_a_limit(tmp_path: Path) -> None:
+    assert host.memory_left(None) is None
+    container_memory(tmp_path, used=800, inactive=300)
+    assert host.memory_left(str(tmp_path)) == 500
+    (tmp_path / "memory.max").write_text("max\n")
+    assert host.memory_left(str(tmp_path)) is None
+
+
+def test_a_worker_short_of_room_stops_before_its_replacement_is_forked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "memory.events").write_text("oom_kill 0\n")
+    container_memory(tmp_path, used=800, limit=1000)
+    instance, state, sent, _asked = replacing_host(tmp_path, monkeypatch)
+    forked: list[int] = []
+
+    def spawn(index: int, replacing: bool = False) -> int:
+        assert replacing
+        forked.append(index)
+        return 5001
+
+    instance.cgroup = str(tmp_path)
+    instance.memory.hard_limit = 300
+    instance.spawn = spawn  # type: ignore[method-assign]
+    instance.routed[0] = state.path
+
+    # It leaves routing and nothing is forked while it holds its memory.
+
+    instance.replace(state, "uss is over the hard limit", "worker.recycled", "memory", hard=True)
+    replacement = instance.replacing[0]
+    assert forked == [] and replacement.stop_first and replacement.terminate_at is None
+    assert instance.routed[0] is None and replacement.announced is not None
+
+    # Told to stop once the edge has moved off it, then replaced on exit.
+
+    instance.acked = replacement.announced
+    instance.advance(replacement, time.monotonic())
+    assert replacement.terminate_at is not None and not replacement.terminated
+    exits(monkeypatch, (4242, 0))
+    instance.reap()
+    assert forked == [0] and 0 in instance.starting
+    (event,) = [message for message in sent if message.get("kind") == "worker.recycled"]
+    assert "replaced by pid 5001" in str(event["message"])
+
+
+def test_a_worker_with_room_or_condemned_for_something_else_is_replaced_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container_memory(tmp_path, used=200, limit=1000)
+    instance, state, _sent, _asked = replacing_host(tmp_path, monkeypatch)
+    instance.cgroup = str(tmp_path)
+    instance.memory.hard_limit = 300
+
+    instance.replace(state, "over the limit", "worker.recycled", "memory")
+    assert not instance.replacing[0].stop_first and instance.replacing[0].new_pid == 5001
+
+    container_memory(tmp_path, used=900, limit=1000)
+    instance.replacing.clear()
+    state.replaced = False
+    instance.replace(state, "served its share", "worker.recycled", "max_requests")
+    assert not instance.replacing[0].stop_first and instance.replacing[0].new_pid == 5001
+
+
 def test_arguments_are_checked_against_the_interface(monkeypatch: pytest.MonkeyPatch) -> None:
     def wsgi(environ: object, start_response: object) -> None: ...
     def factory() -> None: ...

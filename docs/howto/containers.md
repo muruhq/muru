@@ -315,11 +315,22 @@ workers, not 64.
   what the application holds in memory after it is imported. The rest is
   divided between the workers. A worker that grows past its share is
   replaced as the [memory policy](memory.md) replaces one, with no request
-  lost, before the kernel's out-of-memory killer chooses a process to
-  kill.
+  lost, at the next memory check, every `check_interval` (5 seconds by
+  default). The headroom is what a worker may grow by between checks: in
+  a 1GB container with two workers, about 13MB a second each. A workload
+  that grows faster than that can reach the limit first, so it sets a
+  shorter interval with `--memory check_interval=1s`.
+- **Replacing a worker near the limit.** A worker replaced for memory
+  normally stays until its replacement is ready. When less is left under
+  the container's limit than one worker's hard limit, it leaves routing
+  and stops first, and its replacement is forked once it has gone. The
+  requests it holds finish, and for that moment the container has one
+  worker fewer. With a single worker, requests wait for the replacement
+  up to the [queue timeout](timeouts.md).
 - **Out-of-memory kills.** A worker the kernel kills anyway is reported
-  as a `worker.oom_killed` event and counted in `muru_worker_exits_total`
-  with the reason `oom_killed`, and the host starts another.
+  as a `worker.oom_killed` event and counted once in
+  `muru_worker_exits_total` with the reason `oom_killed`, whatever it was
+  doing, including being replaced, and the host starts another.
 
 The lines at start say what was worked out and from what, here under
 `docker run --cpus 2 --memory 1g`:
