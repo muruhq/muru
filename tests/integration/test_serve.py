@@ -11,6 +11,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -212,13 +213,18 @@ def test_sigterm_fails_readiness_and_keeps_accepting_for_the_delay(tmp_path: Pat
 
         assert serve.process.wait(timeout=10) == 0
         assert 2 <= time.monotonic() - signalled < 6
+        assert (
+            "stopping: readiness now fails; serving for the shutdown delay of 2s, "
+            "then draining for up to 6s" in serve.output()
+        ), serve.output()
+        assert re.search(
+            r"stopped accepting connections; \d+ still open, draining", serve.output()
+        ), serve.output()
     finally:
         serve.stop()
 
 
 def test_everything_goes_to_standard_output_without_times(tmp_path: Path) -> None:
-    import re
-
     serve = start(tmp_path)
 
     try:
@@ -405,7 +411,7 @@ def test_json_lines_carry_their_kind_time_and_pod(tmp_path: Path) -> None:
 
     records = [json.loads(line) for line in serve.output().splitlines()]
     kinds = {record["kind"] for record in records}
-    assert {"muru", "app", "access"} <= kinds, kinds
+    assert {"muru", "app", "access", "serve.stopping", "serve.draining"} <= kinds, kinds
     assert all(record["time"].endswith("Z") for record in records)
     assert all((record["pod"], record["namespace"]) == ("shop-1", "prod") for record in records)
     host = next(record for record in records if record["kind"] == "app")

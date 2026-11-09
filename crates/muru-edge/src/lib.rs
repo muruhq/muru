@@ -677,6 +677,11 @@ impl Drainer {
         });
     }
 
+    /// How many connections are open, for what a stop reports.
+    pub fn open_connections(&self) -> usize {
+        Arc::strong_count(&self.shared.connections).saturating_sub(1)
+    }
+
     /// Stop accepting, let the requests in flight finish and close idle
     /// keep-alive connections (with GOAWAY on HTTP/2), waiting at most
     /// `grace` for them. Returns whether every connection finished in

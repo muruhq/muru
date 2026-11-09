@@ -409,7 +409,8 @@ in front of every line, for a supervisor that adds none.
 
 `--log-format json` writes one JSON object per line instead, for a log
 collector, each with its `time`, a `kind` (`access`, `app` for the
-application's output, or `muru`), and the line's fields:
+application's output, `muru`, or `serve.stopping` and `serve.draining`
+for the lines that mark a [stop](#stopping)), and the line's fields:
 
 ```json
 {"time":"2026-11-02T05:42:22.836Z","kind":"app","source":"muru.worker[0]","message":"worker 0 is ready"}
@@ -536,6 +537,16 @@ order:
 3. The listener closes and the requests in flight finish.
 4. The workers stop, closing their WebSockets with 1001, and the
    container exits 0.
+
+Two lines mark the sequence, with `kind` values of their own in JSON logs:
+
+```
+muru: stopping: readiness now fails; serving for the shutdown delay of 5s, then draining for up to 25s
+muru: stopped accepting connections; 3 still open, draining
+```
+
+The first, `serve.stopping`, comes at SIGTERM, and the second,
+`serve.draining`, when the listener closes.
 
 All of it fits inside `--shutdown-budget`; whatever has not finished by
 then is killed. A project command running through the container, as

@@ -2269,6 +2269,28 @@ fn project_name(project: &Path) -> Option<String> {
     muru_config::valid_name(&normalised).then_some(normalised)
 }
 
+/// The line that marks SIGTERM under `muructl serve`: what readiness does
+/// and how long the delay and the drain may take.
+fn stopping_line(policy: &muru_controller::shutdown::Policy) {
+    let budget = muru_config::format_duration(policy.budget);
+
+    let plan = if policy.delay.is_zero() {
+        format!("draining for up to {budget}")
+    } else {
+        format!(
+            "serving for the shutdown delay of {}, then draining for up to {budget}",
+            muru_config::format_duration(policy.delay)
+        )
+    };
+
+    muru_common::log::line_of_kind(
+        muru_common::log::Stream::Stdout,
+        "serve.stopping",
+        "muru",
+        format_args!("stopping: readiness now fails; {plan}"),
+    );
+}
+
 /// How TLS was set up: the listener configuration and, for a development
 /// certificate, where it came from.
 struct Tls {
@@ -3628,6 +3650,12 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         health.stopping();
     }
 
+    if let Some(mode) = &serve
+        && signalled
+    {
+        stopping_line(&mode.shutdown);
+    }
+
     // Section 9.12: the commands running through the admin socket are
     // stopped as at their timeout while the rest stops, inside the same
     // budget, and waited for, so each caller hears how its command ended
@@ -3688,6 +3716,19 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         let for_drain = deadline
             .saturating_duration_since(Instant::now())
             .saturating_sub(muru_controller::shutdown::WORKERS_RESERVE);
+
+        if signalled {
+            muru_common::log::line_of_kind(
+                muru_common::log::Stream::Stdout,
+                "serve.draining",
+                "muru",
+                format_args!(
+                    "stopped accepting connections; {} still open, draining",
+                    drainer.open_connections()
+                ),
+            );
+        }
+
         drainer.drain(stop_budget.min(for_drain)).await;
         current
             .stop_until(
