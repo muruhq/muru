@@ -885,9 +885,9 @@ impl Backend {
 
     /// Stop the processes as `stop` does, killing what is still there at
     /// `kill_at` (section 13.3).
-    async fn stop_until(self, kill_at: Instant) {
+    async fn stop_until(self, kill_at: Instant, workers_by: Instant) {
         match self {
-            Self::Host(host) => host.stop_until(kill_at).await,
+            Self::Host(host) => host.stop_until(kill_at, Some(workers_by)).await,
             Self::Servers(servers) => servers.stop_until(kill_at).await,
             Self::Dormant => {}
         }
@@ -5011,6 +5011,7 @@ impl Daemon {
             hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
             shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),
             websocket_drain_grace: Duration::from_millis(spec.timeouts.websocket_drain_grace_ms),
+            exit_grace: Duration::from_millis(spec.timeouts.exit_grace_ms),
             loop_stall_timeout: Duration::from_millis(spec.timeouts.loop_stall_timeout_ms),
             gil_stall_timeout: Duration::from_millis(spec.timeouts.gil_stall_timeout_ms),
             memory: spec.memory.clone(),
@@ -8888,17 +8889,32 @@ impl Daemon {
         self.shutdown.shuts_down()
     }
 
+    /// The longest exit grace among the releases with workers, for what a
+    /// shutdown's drain leaves of its budget (section 13.3).
+    fn largest_exit_grace(&self) -> Duration {
+        let largest = self
+            .running
+            .iter()
+            .filter(|(_, running)| running.backend.host().is_some())
+            .filter_map(|((app, id), _)| self.store.release(app, id).ok())
+            .map(|release| release.spec.timeouts.exit_grace_ms)
+            .max()
+            .unwrap_or(0);
+
+        Duration::from_millis(largest)
+    }
+
     /// Section 13.3: the edge's part of a shutdown. For the policy's
     /// delay it keeps accepting, with every connection closing after its
     /// response, then it stops accepting and the requests in flight
-    /// finish, within what the budget leaves after a moment for the
-    /// workers. The edge itself stays up for the WebSockets until it is
+    /// finish, within what the budget leaves for the workers' shutdown
+    /// work and a moment for the edge. The edge itself stays up for the WebSockets until it is
     /// stopped last.
     async fn drain_edge(&mut self, policy: &crate::shutdown::Policy, deadline: Instant) {
         let grace = deadline
             .saturating_duration_since(Instant::now())
             .saturating_sub(policy.delay)
-            .saturating_sub(crate::shutdown::WORKERS_RESERVE);
+            .saturating_sub(crate::shutdown::drain_reserve(self.largest_exit_grace()));
 
         match self.edge.drain(policy.delay, grace).await {
             Ok(true) => {}
@@ -8942,7 +8958,10 @@ impl Daemon {
             let run_dir = self.locations.run.path.join("apps").join(&app).join(&id);
             let record = running.backend.record_path(&run_dir);
             stopping.push(async move {
-                running.backend.stop_until(kill_at).await;
+                running
+                    .backend
+                    .stop_until(kill_at, crate::shutdown::workers_deadline(deadline))
+                    .await;
                 forget_release_dir(&run_dir, &record);
                 release
             });

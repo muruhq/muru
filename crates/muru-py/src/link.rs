@@ -16,7 +16,7 @@ use std::io;
 use std::os::fd::{AsFd as _, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -81,9 +81,12 @@ pub struct Lifecycle {
     /// How long open WebSockets keep running once the worker is told to
     /// stop, before they are closed with 1001.
     pub websocket_drain: Duration,
-    /// How long the event loop's requests then get to finish, the host's
-    /// shutdown timeout, before the worker stops waiting for them.
+    /// How long the requests then get to finish, the host's shutdown
+    /// timeout, before the worker stops waiting for them.
     pub drain: Duration,
+    /// How long the worker keeps for its shutdown work once it stops
+    /// waiting for requests, before the host kills it.
+    pub exit_grace: Duration,
 }
 
 /// What a signal asks of the worker.
@@ -97,6 +100,18 @@ enum Asked {
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Lifecycle {
+    /// Call `on_exit` with the seconds left before the host kills the
+    /// worker, reporting any exception.
+    fn call_exit(hook: Option<&Py<PyAny>>, left: Duration) {
+        if let Some(hook) = hook {
+            Python::attach(|py| {
+                if let Err(error) = hook.call1(py, (left.as_secs_f64(),)) {
+                    wsgi::report(py, &error);
+                }
+            });
+        }
+    }
+
     /// Call a hook with the interpreter attached, reporting any exception.
     fn call(hook: Option<&Py<PyAny>>) {
         if let Some(hook) = hook {
@@ -232,31 +247,57 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
         Ok(())
     });
 
-    // Requests already running finish on their threads, or on the event
-    // loop, while the runtime still carries their responses; then
-    // everything stops.
+    // Section 7.6: the host kills the worker its stop budget after telling
+    // it to stop, so everything here is measured from that moment. The
+    // requests get no longer than the WebSockets' grace and the shutdown
+    // timeout, whatever on_drain took, which leaves the exit grace for the
+    // shutdown work below. In a shutdown with a budget of its own the host
+    // may say sooner (`stop_within`), and the wait gives way to the exit
+    // grace then too.
 
+    let told = Instant::now();
+    let budget_end = told + lifecycle.websocket_drain + lifecycle.drain + lifecycle.exit_grace;
+    let exit_grace = lifecycle.exit_grace;
+    let kill_at = move || match STOP_BY_MS.load(Ordering::Relaxed) {
+        0 => budget_end,
+        by => budget_end.min(Instant::now() + Duration::from_millis(by.saturating_sub(clock_ms()))),
+    };
+    let requests_end = move || {
+        kill_at()
+            .checked_sub(exit_grace)
+            .unwrap_or_else(Instant::now)
+    };
     Lifecycle::call(lifecycle.on_drain.as_ref());
-    shared.shutdown_pools();
 
-    // The pool joins its threads; the loop's requests are waited for here.
+    // Requests already running finish on their threads, or on the event
+    // loop, while the runtime still carries their responses. No new one
+    // starts on a thread from here.
+
+    shared.close_pools();
+
+    let wait = |deadline: Instant| {
+        while shared.in_flight() > 0 && Instant::now() < deadline.min(requests_end()) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
     // Open WebSockets keep running for their grace, then are closed with
-    // 1001 (section 5.6), and what is left gets the shutdown timeout.
+    // 1001 (section 5.6), and what is left gets the shutdown timeout. A
+    // thread still running a request at the end is left behind: it ends
+    // with the process.
 
     if shared.asgi.is_some() {
-        let wait = |deadline: Instant| {
-            while shared.in_flight() > 0 && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        };
-
-        wait(Instant::now() + lifecycle.websocket_drain);
+        wait(told + lifecycle.websocket_drain);
         shared.close_websockets();
-        wait(Instant::now() + lifecycle.drain);
     }
 
+    wait(budget_end);
+    shared.join_pools(requests_end());
     stop_watchdog.store(true, Ordering::Relaxed);
-    Lifecycle::call(lifecycle.on_exit.as_ref());
+    Lifecycle::call_exit(
+        lifecycle.on_exit.as_ref(),
+        kill_at().saturating_duration_since(Instant::now()),
+    );
     drop(runtime);
     served
 }
@@ -301,6 +342,10 @@ fn watchdog_loop(shared: &Arc<Shared>, timeout: Duration, stop: &AtomicBool, rep
         }
     }
 }
+
+/// When the host wants this worker gone (`stop_within`), in milliseconds
+/// of `clock_ms`, or 0 when it has not said.
+static STOP_BY_MS: AtomicU64 = AtomicU64::new(0);
 
 /// When the event loop last beat, in milliseconds since the first look
 /// at the clock, or 0 before it first did.
@@ -529,11 +574,61 @@ impl Lifeline {
     }
 }
 
+/// What the control connection is written through: an answer goes out
+/// whole, whichever thread has it.
+type ControlWriter = Mutex<std::os::unix::net::UnixStream>;
+
+/// Write one answer line, reporting whether the connection still takes them.
+fn write_answer(writer: &ControlWriter, text: &str) -> bool {
+    use std::io::Write as _;
+
+    let mut line = String::with_capacity(text.len() + 1);
+    line.push_str(text);
+    line.push('\n');
+
+    writer
+        .lock()
+        .expect("control writer poisoned")
+        .write_all(line.as_bytes())
+        .is_ok()
+}
+
+/// Answer one request line through the Python handler, attaching to the
+/// interpreter for it. An error says which request it answers, since the
+/// host matches answers to requests by id and these need not come in the
+/// order the requests did.
+fn python_answer(line: &str, handler: &Py<PyAny>, shared: &Shared) -> String {
+    let answer = Python::attach(|py| {
+        let active = shared.active_requests(py)?;
+        let names = crate::pool::thread_names(py)?;
+        let reply = handler.call1(py, (line, active, names))?;
+        reply.extract::<String>(py)
+    });
+
+    match answer {
+        Ok(text) => text,
+        Err(error) => match control_id(line) {
+            Some(id) => format!(
+                "{{\"id\":{id},\"ok\":false,\"error\":{}}}",
+                serde_json_string(&error.to_string())
+            ),
+            None => format!(
+                "{{\"ok\":false,\"error\":{}}}",
+                serde_json_string(&error.to_string())
+            ),
+        },
+    }
+}
+
 /// Answer control requests from the host, one JSON line each, until the
-/// connection closes: each is handed to the Python handler with the
-/// requests in flight, and its answer written back as one line.
+/// connection closes. What needs no interpreter is answered here, and
+/// the rest handed to the Python handler with the requests in flight,
+/// its answer written back as one line. An operation over a period runs
+/// on a thread of its own, so this one is free for the requests a stuck
+/// worker is asked (section 11.7); only one runs at a time per worker,
+/// and a second is refused.
 fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
-    use std::io::{BufRead as _, Write as _};
+    use std::io::BufRead as _;
 
     // SAFETY: the descriptor was inherited from the host for this
     // purpose and nothing else in the worker holds it.
@@ -542,10 +637,13 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
         unsafe { <std::os::unix::net::UnixStream as std::os::fd::FromRawFd>::from_raw_fd(fd) };
     crate::pool::name_this_thread("muru-control");
     let _ = socket.set_nonblocking(false);
-    let Ok(mut writer) = socket.try_clone() else {
+    let Ok(writer) = socket.try_clone() else {
         return;
     };
+    let writer = Arc::new(Mutex::new(writer));
     let reader = std::io::BufReader::new(socket);
+    let handler = Arc::new(handler);
+    let period_running = Arc::new(AtomicBool::new(false));
 
     for line in reader.lines() {
         let Ok(line) = line else {
@@ -556,15 +654,22 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
             continue;
         }
 
+        // Section 7.6: the host says how long this worker has in a shutdown
+        // with a budget of its own. No answer goes back: the host has
+        // moved on to stopping the worker.
+
+        if let Some(ms) = stop_within_request(&line) {
+            STOP_BY_MS.store((clock_ms() + ms).max(1), Ordering::Relaxed);
+            continue;
+        }
+
         // Section 11.7: the bookkeeping is answered here, without the
         // interpreter, so a worker whose threads hold it still says which
         // request each thread serves while its stacks are read from
         // outside.
 
         if let Some(id) = bookkeeping_request(&line) {
-            let text = bookkeeping_answer(id, &shared);
-
-            if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+            if !write_answer(&writer, &bookkeeping_answer(id, &shared)) {
                 break;
             }
 
@@ -580,7 +685,7 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
                 shared.sides().json_members()
             );
 
-            if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+            if !write_answer(&writer, &text) {
                 break;
             }
 
@@ -601,32 +706,95 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
                 given_up.join(",")
             );
 
-            if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+            if !write_answer(&writer, &text) {
                 break;
             }
 
             continue;
         }
 
-        let answer = Python::attach(|py| {
-            let active = shared.active_requests(py)?;
-            let names = crate::pool::thread_names(py)?;
-            let reply = handler.call1(py, (line.as_str(), active, names))?;
-            reply.extract::<String>(py)
-        });
+        // An operation over a period goes to a thread of its own, one at a
+        // time, so the requests above keep being answered through it.
 
-        let text = match answer {
-            Ok(text) => text,
-            Err(error) => format!(
-                "{{\"ok\":false,\"error\":{}}}",
-                serde_json_string(&error.to_string())
-            ),
-        };
+        if period_operation(&line) {
+            let running = Arc::clone(&period_running);
 
-        if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+            if running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                let text = format!(
+                    "{{\"id\":{},\"ok\":false,\"error\":{}}}",
+                    control_id(&line).unwrap_or(0),
+                    serde_json_string(PERIOD_BUSY)
+                );
+
+                if !write_answer(&writer, &text) {
+                    break;
+                }
+
+                continue;
+            }
+
+            let writer = Arc::clone(&writer);
+            let handler = Arc::clone(&handler);
+            let shared = Arc::clone(&shared);
+            let started = std::thread::Builder::new()
+                .name("muru-control-period".to_owned())
+                .spawn(move || {
+                    crate::pool::name_this_thread("muru-control-period");
+                    let text = python_answer(&line, &handler, &shared);
+                    running.store(false, Ordering::SeqCst);
+                    write_answer(&writer, &text);
+                });
+
+            if let Err(error) = started {
+                eprintln!("muru: could not start a debug operation: {error}");
+                period_running.store(false, Ordering::SeqCst);
+            }
+
+            continue;
+        }
+
+        if !write_answer(&writer, &python_answer(&line, &handler, &shared)) {
             break;
         }
     }
+}
+
+/// The answer to an operation over a period while another is running.
+const PERIOD_BUSY: &str =
+    "another long debug operation is running in this worker; try again when it has finished";
+
+/// Whether a request line asks for something that runs over a period,
+/// as the host writes it: `profile`, `trace`, `exec`, whose code runs for
+/// as long as it runs, or `memory` with `"trace": true` and no snapshot to
+/// keep or compare.
+fn period_operation(line: &str) -> bool {
+    if ["profile", "trace", "exec"]
+        .iter()
+        .any(|op| line.contains(&format!("\"op\": \"{op}\"")))
+    {
+        return true;
+    }
+
+    line.contains("\"op\": \"memory\"")
+        && line.contains("\"trace\": true")
+        && control_string(line, "snapshot").is_none_or(|snapshot| snapshot.is_empty())
+}
+
+/// The milliseconds a request line says the worker has left, as the host
+/// writes it: `{"op": "stop_within", "args": {"ms": N}}`.
+fn stop_within_request(line: &str) -> Option<u64> {
+    if !line.contains("\"op\": \"stop_within\"") {
+        return None;
+    }
+
+    let rest = line.split_once("\"ms\": ")?.1;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// The id of a request line asking for the bookkeeping, as the host
@@ -2052,5 +2220,42 @@ async fn write_body(
             }
         }
         None => frame::write(writer, kind::BODY, flags, data).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{period_operation, stop_within_request};
+
+    #[test]
+    fn the_operations_over_a_period_are_told_from_the_rest() {
+        assert!(period_operation(
+            r#"{"id": 1, "op": "profile", "args": {}}"#
+        ));
+        assert!(period_operation(r#"{"id": 1, "op": "trace", "args": {}}"#));
+        assert!(period_operation(
+            r#"{"id": 1, "op": "exec", "args": {"code": "1"}}"#
+        ));
+        assert!(period_operation(
+            r#"{"id": 1, "op": "memory", "args": {"trace": true, "snapshot": ""}}"#
+        ));
+        assert!(!period_operation(
+            r#"{"id": 1, "op": "memory", "args": {"trace": false}}"#
+        ));
+        assert!(!period_operation(
+            r#"{"id": 1, "op": "memory", "args": {"trace": true, "snapshot": "take"}}"#
+        ));
+        assert!(!period_operation(
+            r#"{"id": 1, "op": "stacks", "args": {}}"#
+        ));
+    }
+
+    #[test]
+    fn the_time_a_worker_is_told_it_has_is_read_from_the_line() {
+        assert_eq!(
+            stop_within_request(r#"{"op": "stop_within", "args": {"ms": 2500}}"#),
+            Some(2500)
+        );
+        assert_eq!(stop_within_request(r#"{"op": "stacks", "args": {}}"#), None);
     }
 }

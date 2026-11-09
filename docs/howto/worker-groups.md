@@ -119,7 +119,7 @@ describes.
 Each key a group leaves out is the release's: its `timeouts` and
 `memory` tables and its `max_requests` and `max_lifetime`, or the
 `--timeout`, `--memory`, `--max-requests` and `--max-lifetime` settings
-given on the command line. `shutdown_timeout` and `websocket_drain_grace` belong to
+given on the command line. `shutdown_timeout`, `websocket_drain_grace` and `exit_grace` belong to
 the release, since they bound how long every worker gets to stop, and a
 group may not set them. A group's hard timeout must exceed its soft
 timeout by at least five seconds, as the release's must. `muructl config

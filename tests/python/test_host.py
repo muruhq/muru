@@ -596,3 +596,32 @@ def test_a_worker_that_does_not_answer_for_stacks_is_read_from_outside_on_3_14(
     else:
         assert answer["ok"] and answer["result"]["outside"]
         assert answer["result"]["threads"][0]["frames"][0]["function"] == "application"
+
+
+def test_a_shutdown_with_a_budget_of_its_own_leaves_the_workers_less_time(
+    tmp_path: Path,
+) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(
+        release, str(tmp_path), workers=1, threads=1, shutdown_timeout=5.0, exit_grace=2.0
+    )
+
+    # No file: the worker's own stop budget.
+
+    assert instance.time_to_stop() == 7.0
+
+    # What the shutdown leaves is less than the budget and comes off it,
+    # more than the budget is no reason to take longer.
+
+    stop_by = tmp_path / host.STOP_BY_FILE
+    stop_by.write_text(str(int((time.time() + 3.0) * 1000)))
+    assert 2.5 < instance.time_to_stop() <= 3.0
+    stop_by.write_text(str(int((time.time() + 60.0) * 1000)))
+    assert instance.time_to_stop() == 7.0
+
+    # Past already, or unreadable.
+
+    stop_by.write_text(str(int((time.time() - 1.0) * 1000)))
+    assert instance.time_to_stop() == 0.0
+    stop_by.write_text("not a time")
+    assert instance.time_to_stop() == 7.0

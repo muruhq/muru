@@ -428,6 +428,7 @@ impl GroupTimeouts {
                 .unwrap_or(release.hard_drain_grace_ms),
             shutdown_timeout_ms: release.shutdown_timeout_ms,
             websocket_drain_grace_ms: release.websocket_drain_grace_ms,
+            exit_grace_ms: release.exit_grace_ms,
             loop_stall_timeout_ms: self
                 .loop_stall_timeout_ms
                 .unwrap_or(release.loop_stall_timeout_ms),
@@ -1081,6 +1082,10 @@ pub struct WorkerTimeouts {
     /// closes them with 1001.
     #[serde(default)]
     pub websocket_drain_grace_ms: u64,
+    /// How long a worker has for its shutdown work once its requests have
+    /// had the WebSockets' grace and the shutdown timeout.
+    #[serde(default = "default_exit_grace_ms")]
+    pub exit_grace_ms: u64,
     /// How long an ASGI worker's event loop may go without running
     /// before the worker is replaced.
     #[serde(default = "default_loop_stall_timeout_ms")]
@@ -1099,6 +1104,7 @@ impl Default for WorkerTimeouts {
             hard_drain_grace_ms: default_hard_drain_grace_ms(),
             shutdown_timeout_ms: default_shutdown_timeout_ms(),
             websocket_drain_grace_ms: 0,
+            exit_grace_ms: default_exit_grace_ms(),
             loop_stall_timeout_ms: default_loop_stall_timeout_ms(),
             gil_stall_timeout_ms: default_gil_stall_timeout_ms(),
         }
@@ -1107,11 +1113,12 @@ impl Default for WorkerTimeouts {
 
 impl WorkerTimeouts {
     /// How long a worker told to stop may take before it is killed: the
-    /// WebSockets' grace, then the shutdown timeout.
+    /// WebSockets' grace, the shutdown timeout, then the exit grace.
     pub fn stop_budget(&self) -> std::time::Duration {
         std::time::Duration::from_millis(
             self.websocket_drain_grace_ms
-                .saturating_add(self.shutdown_timeout_ms),
+                .saturating_add(self.shutdown_timeout_ms)
+                .saturating_add(self.exit_grace_ms),
         )
     }
 }
@@ -1179,6 +1186,10 @@ fn default_hard_drain_grace_ms() -> u64 {
 
 fn default_shutdown_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_exit_grace_ms() -> u64 {
+    2_000
 }
 
 fn default_loop_stall_timeout_ms() -> u64 {
@@ -1550,5 +1561,23 @@ mod tests {
         }
 
         assert!("running".parse::<ReleaseState>().is_err());
+    }
+
+    #[test]
+    fn the_stop_budget_is_the_requests_time_and_the_exit_grace() {
+        let timeouts = WorkerTimeouts {
+            websocket_drain_grace_ms: 250,
+            shutdown_timeout_ms: 1_000,
+            exit_grace_ms: 3_000,
+            ..WorkerTimeouts::default()
+        };
+        assert_eq!(
+            timeouts.stop_budget(),
+            std::time::Duration::from_millis(4_250)
+        );
+        assert_eq!(
+            WorkerTimeouts::default().stop_budget(),
+            std::time::Duration::from_secs(7)
+        );
     }
 }

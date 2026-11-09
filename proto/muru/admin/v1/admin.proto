@@ -321,6 +321,7 @@ message DeployRequest {
   string handoff = 56;                      // section 6.14: asgi or wsgi; the table's, else the previous release's, when empty
   optional bool build_source_builds = 57;   // section 8.2: allow sdists to be built on the node; the table's, else false, when absent
   optional bool build_compile_bytecode = 58; // section 8.2: compile bytecode at build time; the table's, else true, when absent
+  optional uint64 exit_grace_ms = 59;      // section 7.6: how long a worker has for its shutdown work after its requests have had theirs
 }
 
 // What a deploy would do. With refusals nothing would be deployed.

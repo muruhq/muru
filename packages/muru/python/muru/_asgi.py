@@ -13,6 +13,7 @@ import asyncio
 import math
 import sys
 import threading
+import time
 import traceback
 from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -37,6 +38,10 @@ ASGIApp = Callable[[MutableMapping[str, Any], Any, Any], Awaitable[None]]
 
 STARTUP_TIMEOUT = 60.0
 SHUTDOWN_TIMEOUT = 10.0
+
+# What the waiter off the loop allows over the waiter on it.
+
+LOOP_MARGIN = 0.1
 
 # Section 7.6: how often the loop tells the native watchdog it still runs.
 
@@ -386,7 +391,7 @@ class Lifespan:
         if not self._startup.done():
             self.supported = False
 
-    async def _stop(self) -> None:
+    async def _stop(self, timeout: float) -> None:
         if self._task is None or self._task.done() or self._queue is None or self._shutdown is None:
             return
 
@@ -395,7 +400,7 @@ class Lifespan:
         await self._queue.put({"type": "lifespan.shutdown"})
 
         try:
-            await asyncio.wait_for(asyncio.shield(self._task), SHUTDOWN_TIMEOUT)
+            await asyncio.wait_for(asyncio.shield(self._task), timeout)
         except TimeoutError:
             print(f"muru: {self.name} did not complete lifespan shutdown in time", file=sys.stderr)
             self._task.cancel()
@@ -421,11 +426,23 @@ class Lifespan:
         except Exception as error:
             raise LifespanFailed(f"{self.name} failed during lifespan startup: {error}") from error
 
-    def shutdown(self) -> None:
-        """Send shutdown on the loop and wait for the application, within limits."""
+    def shutdown(self, deadline: float | None = None) -> None:
+        """Send shutdown on the loop and wait for the application, within limits.
+
+        `deadline` is when, on the monotonic clock, to stop waiting: the
+        worker's own time, shorter than the application might take. An
+        application still going then is reported, and its task cancelled.
+        """
+
+        timeout = SHUTDOWN_TIMEOUT if deadline is None else max(0.0, deadline - time.monotonic())
+
+        # The wait on the loop reports a slow application itself. This one
+        # is for a loop that never gets to it, blocked by the application.
 
         try:
-            self.loop.run(self._stop(), SHUTDOWN_TIMEOUT + 1)
+            self.loop.run(self._stop(timeout), timeout + LOOP_MARGIN)
+        except TimeoutError:
+            print(f"muru: {self.name} did not complete lifespan shutdown in time", file=sys.stderr)
         except Exception as error:  # shutdown must not fail the worker
             print(f"muru: lifespan shutdown of {self.name} failed: {error}", file=sys.stderr)
 
@@ -501,11 +518,11 @@ def start_registered(loop: Loop | None) -> None:
         _registered[id(app)] = lifespan
 
 
-def stop_registered() -> None:
+def stop_registered(deadline: float | None = None) -> None:
     """Run the shutdown of every registered application, most recent first."""
 
     for lifespan in reversed(list(_registered.values())):
-        lifespan.shutdown()
+        lifespan.shutdown(deadline)
 
     _registered.clear()
 

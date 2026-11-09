@@ -3689,6 +3689,13 @@ pub fn resolve_spec(
         )?
         .or(carried.map(|carried| carried.websocket_drain_grace_ms))
         .unwrap_or_default(),
+        exit_grace_ms: duration_ms(
+            request.exit_grace_ms,
+            table_timeouts.exit_grace.as_ref(),
+            "exit_grace",
+        )?
+        .or(carried.map(|carried| carried.exit_grace_ms))
+        .unwrap_or_else(|| crate::model::WorkerTimeouts::default().exit_grace_ms),
         loop_stall_timeout_ms: duration_ms(
             request.loop_stall_timeout_ms,
             table_timeouts.loop_stall_timeout.as_ref(),
@@ -4419,6 +4426,15 @@ fn resolve_layers(
             ),
         ),
         (
+            "timeouts.exit_grace",
+            layer(
+                request.exit_grace_ms.is_some(),
+                timeouts.exit_grace.is_some(),
+                before,
+                declared,
+            ),
+        ),
+        (
             "timeouts.shutdown_timeout",
             layer(
                 request.shutdown_timeout_ms.is_some(),
@@ -4568,6 +4584,10 @@ pub fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
         (
             "timeouts.websocket_drain_grace",
             format_ms(spec.timeouts.websocket_drain_grace_ms),
+        ),
+        (
+            "timeouts.exit_grace",
+            format_ms(spec.timeouts.exit_grace_ms),
         ),
         (
             "timeouts.loop_stall_timeout",
@@ -5015,6 +5035,7 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         || request.hard_drain_grace_ms.is_some()
         || request.shutdown_timeout_ms.is_some()
         || request.websocket_drain_grace_ms.is_some()
+        || request.exit_grace_ms.is_some()
         || request.loop_stall_timeout_ms.is_some()
         || request.gil_stall_timeout_ms.is_some();
     let memory_given = !request.memory_measure.is_empty()
@@ -5071,6 +5092,7 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
             hard_drain_grace: request.hard_drain_grace_ms.map(format_ms),
             shutdown_timeout: request.shutdown_timeout_ms.map(format_ms),
             websocket_drain_grace: request.websocket_drain_grace_ms.map(format_ms),
+            exit_grace: request.exit_grace_ms.map(format_ms),
             loop_stall_timeout: request.loop_stall_timeout_ms.map(format_ms),
             gil_stall_timeout: request.gil_stall_timeout_ms.map(format_ms),
             ..muru_config::Timeouts::default()
@@ -5169,6 +5191,7 @@ fn resolve_http_spec(
         max_lifetime_ms: None,
         timeouts: crate::model::WorkerTimeouts {
             shutdown_timeout_ms,
+            exit_grace_ms: 0,
             ..crate::model::WorkerTimeouts::default()
         },
         memory: crate::model::MemoryPolicy::default(),
@@ -5621,6 +5644,7 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
                 .as_ref()
                 .and_then(|t| t.websocket_drain_grace.as_ref()),
         ),
+        exit_grace_ms: duration_field(table.timeouts.as_ref().and_then(|t| t.exit_grace.as_ref())),
         loop_stall_timeout_ms: duration_field(
             table
                 .timeouts
@@ -5840,6 +5864,9 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                     websocket_drain_grace: Some(muru_config::format_duration(
                         Duration::from_millis(spec.timeouts.websocket_drain_grace_ms),
                     )),
+                    exit_grace: Some(muru_config::format_duration(Duration::from_millis(
+                        spec.timeouts.exit_grace_ms,
+                    ))),
                     loop_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
                         spec.timeouts.loop_stall_timeout_ms,
                     ))),
@@ -6148,6 +6175,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "websocket_drain_grace",
         describe_ms(Some(declared.timeouts.websocket_drain_grace_ms)),
         describe_ms(Some(recorded.timeouts.websocket_drain_grace_ms)),
+    );
+    compare(
+        "exit_grace",
+        describe_ms(Some(declared.timeouts.exit_grace_ms)),
+        describe_ms(Some(recorded.timeouts.exit_grace_ms)),
     );
     compare(
         "loop_stall_timeout",

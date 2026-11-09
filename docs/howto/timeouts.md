@@ -227,7 +227,8 @@ a `worker.timeout_killed` event records what happened.
 | `hard` | off | from the request reaching the worker | the worker is replaced |
 | `hard_drain_grace` | 10s | from the worker leaving routing | the worker is told to stop |
 | `websocket_drain_grace` | 0s | from the worker being told to stop | its open WebSockets are closed with 1001 |
-| `shutdown` | 5s | from the worker's WebSockets being closed | the worker is killed |
+| `shutdown` | 5s | from the worker's WebSockets being closed | the worker stops waiting for its requests |
+| `exit_grace` | 2s | from the worker no longer waiting for its requests | the worker is killed |
 
 ```
 muructl run app:application --timeout hard=60s
@@ -244,6 +245,7 @@ hard_timeout = "60s"
 hard_drain_grace = "10s"
 websocket_drain_grace = "0s"
 shutdown_timeout = "5s"
+exit_grace = "2s"
 loop_stall_timeout = "10s"
 gil_stall_timeout = "30s"
 ```
@@ -272,9 +274,29 @@ the `on_drain` hook. Its open WebSockets keep running for
 server is going away"): the application's handler gets
 `websocket.disconnect` with 1001, the client gets the same code and can
 reconnect to the release that serves, and the close is counted as
-`drained`. What is still running then gets `shutdown_timeout` before the
-host kills the worker, so a worker is gone at most
-`websocket_drain_grace` plus `shutdown_timeout` after it was told to stop.
+`drained`. What is still running then gets `shutdown_timeout`. When that
+is up, the worker stops waiting for its requests and does its shutdown
+work: lifespan shutdown, the `on_exit` hook and the callbacks registered
+with `atexit`. `exit_grace` is the time for that work. It is added to the other two and it always applies, so a
+worker is gone at most `websocket_drain_grace` plus `shutdown_timeout`
+plus `exit_grace` after it was told to stop, and the host kills it if it
+is still there then. A worker that finishes sooner exits sooner, and
+time its requests did not use is there for its shutdown work too.
+
+`shutdown_timeout` covers the worker's threads as it does its event
+loop. A thread still running a request when it is up is left behind and
+ends with the worker.
+
+Stopping as part of a whole shutdown, a worker can be told to stop with
+less than its budget left: the edge has already waited for the requests,
+inside the shutdown's own budget. The host tells it how long it has, and
+the worker stops waiting for its requests in time to leave `exit_grace`
+for its shutdown work, so that work still runs.
+
+An application whose lifespan shutdown does not finish before the worker
+would be killed gets a line in the log saying that it did not complete
+lifespan shutdown in time, and its task is cancelled. The `on_exit` hook
+then still runs.
 
 A grace longer than nothing lets a socket finish what it is doing, such
 as a message being sent; most clients reconnect on 1001 at once, so the

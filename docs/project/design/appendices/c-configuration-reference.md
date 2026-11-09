@@ -75,7 +75,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | serving (the release that serves the application's traffic; the others an apply adds are held) | application | the last release in id order an apply adds, else the one that serves | 10.4 |
 | max_requests, max_lifetime, max_surge | group | off, off, 1 | 7.7 |
 | memory.measure, soft_limit, soft_for, reclaim_first, hard_limit, check_interval, malloc_arena_max, allocator | group | uss, off, 2m, true, off, 5s, unset, system | 7.7 |
-| timeouts (soft_timeout, hard_timeout, hard_drain_grace, shutdown_timeout, loop_stall_timeout, gil_stall_timeout, idle_timeout) | release, group | off, off, 10s, 5s, 10s, 30s, 60s | 7.6 |
+| timeouts (soft_timeout, hard_timeout, hard_drain_grace, shutdown_timeout, websocket_drain_grace, exit_grace, loop_stall_timeout, gil_stall_timeout, idle_timeout) | release, group, except shutdown_timeout, websocket_drain_grace and exit_grace, which are the release's | off, off, 10s, 5s, 0s, 2s, 10s, 30s, 60s | 7.6 |
 | timeouts (queue_timeout, request_deadline, body_idle_timeout, response_idle_timeout) | host, release, group, route | 5s, 300s, 60s, 60s, from `[limits]` | 4.6 |
 | response.flush, coalesce_min_bytes, coalesce_max_delay, first_block | release, route | coalesce, 16KiB, 10ms, immediate | 5.4 |
 | max_body_size | `[limits]`, host, release, group, mount, route | 10MB | 4.6 |

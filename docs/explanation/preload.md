@@ -76,7 +76,7 @@ functions, each taking the context described below:
 | `post_fork` | in each worker, right after the fork | opening connections, starting threads, seeding random state |
 | `on_ready` | in each worker, before it takes requests | signalling readiness to something else |
 | `on_drain` | in each worker when it is told to stop, before in-flight requests finish | stopping background work |
-| `on_exit` | in each worker after its last request | flushing and closing |
+| `on_exit` | in each worker after its last request, before its `atexit` callbacks | flushing and closing |
 | `on_reopen_logs` | in each worker on SIGUSR1 | log rotation |
 
 So a connection pool created at import time becomes: create it lazily, or
@@ -85,6 +85,17 @@ becomes: start it in `post_fork`. When the fallback to per-worker imports is
 in effect, `on_load` and `pre_fork` run in each worker before its
 `post_fork`, so hooks behave the same in both modes. An exception in a hook
 stops the worker, and the terminal says which hook and why.
+
+Callbacks registered with `atexit` run in each worker as it stops, after
+the `on_exit` hook and while the event loop still runs, and in a worker
+that fails to start. Callbacks registered during preload run in every
+worker, as those registered after the fork do. Anything created during
+preload and cleaned up from `atexit` is therefore cleaned up by the first
+worker to exit, while the others are still using it: a
+`tempfile.TemporaryDirectory` made at import time is deleted when the
+first worker stops. Create such things in `post_fork` instead. A worker
+does not wait for its non-daemon threads when it stops; a callback can
+stop and join a thread of its own.
 
 ## Knowing where you are
 

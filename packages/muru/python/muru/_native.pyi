@@ -15,7 +15,7 @@ def serve(
     runner: Callable[[Any, Channel], None] | None = None,
     concurrency: int = 0,
     on_drain: Callable[[], Any] | None = None,
-    on_exit: Callable[[], Any] | None = None,
+    on_exit: Callable[[float], Any] | None = None,
     on_reopen_logs: Callable[[], Any] | None = None,
     lifeline: int | None = None,
     mounts: list[
@@ -39,6 +39,7 @@ def serve(
     loop_stall_timeout_ms: int | None = None,
     websocket_drain_ms: int = 0,
     drain_ms: int = 5000,
+    exit_grace_ms: int = 2000,
     gil_stall_timeout_ms: int | None = None,
     handoff: bool = False,
 ) -> None:

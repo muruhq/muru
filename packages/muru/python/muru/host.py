@@ -38,6 +38,7 @@ to it before the old worker is told to stop.
 from __future__ import annotations
 
 import argparse
+import atexit
 import faulthandler
 import gc
 import importlib
@@ -67,6 +68,17 @@ from muru.hooks import Hooks
 WSGIApplication = Callable[..., Any]
 
 RESTART_DELAY_SECONDS = 0.5
+
+# Section 13.3: the file in the run directory saying when a shutdown wants
+# the workers gone, written by the supervisor before it signals the host
+# (the name is STOP_BY_FILE in the supervisor too).
+
+STOP_BY_FILE = "stop-by"
+
+# What the worker keeps back from lifespan shutdown of the time it has
+# left, so a slow application is reported rather than ending with SIGKILL.
+
+EXIT_REPORT_SECONDS = 0.25
 
 # How long a replacement waits for the supervisor to say the edge routes
 # to the new worker before the old one is told to stop regardless, and
@@ -210,6 +222,20 @@ def resolve_app(
 # start-up lines of every worker.
 
 UNNAMED_EVENTS = frozenset({"worker.started", "worker.ready"})
+
+
+def run_exit_callbacks() -> None:
+    """Run the callbacks registered with ``atexit`` in this worker, on this thread.
+
+    A worker ends with ``os._exit``, which runs none of them. This clears
+    the list, so a second call runs nothing and a process that goes on to
+    finalize runs them once (section 6.3).
+    """
+
+    try:
+        atexit._run_exitfuncs()
+    except BaseException:
+        traceback.print_exc()
 
 
 def detect_interface(app: Any) -> str:
@@ -949,6 +975,7 @@ class Host:
         hard_drain_grace: float = 10.0,
         shutdown_timeout: float = 5.0,
         websocket_drain_grace: float = 0.0,
+        exit_grace: float = 2.0,
         loop_stall_timeout: float = 10.0,
         gil_stall_timeout: float = 30.0,
         memory: MemoryPolicy | None = None,
@@ -974,6 +1001,7 @@ class Host:
         self.hard_drain_grace = hard_drain_grace
         self.shutdown_timeout = shutdown_timeout
         self.websocket_drain_grace = websocket_drain_grace
+        self.exit_grace = exit_grace
         self.loop_stall_timeout = loop_stall_timeout
         self.gil_stall_timeout = gil_stall_timeout
         self.memory = memory or MemoryPolicy()
@@ -1230,8 +1258,12 @@ class Host:
             except BaseException:
                 traceback.print_exc()
             finally:
+                # A failure outside the worker's own handling still runs
+                # the atexit callbacks; they have already run otherwise.
                 # os._exit skips the flush that a normal exit would do, so
                 # whatever is still buffered would be lost.
+
+                run_exit_callbacks()
 
                 for stream in (sys.stdout, sys.stderr):
                     try:
@@ -1579,22 +1611,32 @@ class Host:
         except Exception as error:
             log(f"worker {index} failed to start: {error.__class__.__name__}: {error}")
             traceback.print_exc()
+            run_exit_callbacks()
             if loop is not None:
                 loop.stop()
             return 1
 
         from muru import _native
 
-        def on_exit() -> None:
-            """Run lifespan shutdown for every ASGI application and the hook, then stop the loop."""
+        def on_exit(left: float) -> None:
+            """Run the worker's shutdown work in order, then stop the loop.
 
-            _asgi.stop_registered()
+            Lifespan shutdown of every ASGI application, the on_exit hook
+            and the ``atexit`` callbacks (section 6.3). `left` is how long
+            the worker has before the host kills it. Lifespan shutdown
+            stops waiting with a little to spare, so a slow application is
+            reported and the rest can still run.
+            """
+
+            deadline = time.monotonic() + left - EXIT_REPORT_SECONDS
+            _asgi.stop_registered(deadline)
 
             for mounted_lifespan in lifespans:
-                mounted_lifespan.shutdown()
+                mounted_lifespan.shutdown(deadline)
             if lifespan is not None:
-                lifespan.shutdown()
+                lifespan.shutdown(deadline)
             hooks.call_logged("on_exit", context)
+            run_exit_callbacks()
             if loop is not None:
                 loop.stop()
 
@@ -1626,6 +1668,7 @@ class Host:
         timeout_arguments: dict[str, Any] = {
             "websocket_drain_ms": int(self.websocket_drain_grace * 1000),
             "drain_ms": int(self.shutdown_timeout * 1000),
+            "exit_grace_ms": int(self.exit_grace * 1000),
         }
 
         if group.soft_timeout is not None:
@@ -1687,6 +1730,7 @@ class Host:
             )
         except Exception as error:
             log(f"worker {index} failed: {error}")
+            run_exit_callbacks()
             return 1
 
         return 0
@@ -3752,13 +3796,54 @@ class Host:
     def stop_budget(self) -> float:
         """Return how long a worker told to stop may take before it is killed.
 
-        That is the WebSockets' grace, then the shutdown timeout.
+        That is the WebSockets' grace, the shutdown timeout, then the
+        exit grace for the worker's shutdown work.
         """
 
-        return self.websocket_drain_grace + self.shutdown_timeout
+        return self.websocket_drain_grace + self.shutdown_timeout + self.exit_grace
+
+    def time_to_stop(self) -> float:
+        """Return how long the workers have to stop, in seconds.
+
+        Their stop budget, or less when a shutdown with a budget of its
+        own has said when it wants them gone (section 13.3).
+        """
+
+        budget = self.stop_budget()
+
+        try:
+            with open(os.path.join(self.socket_dir, STOP_BY_FILE)) as stop_by:
+                left = int(stop_by.read()) / 1000 - time.time()
+        except (OSError, ValueError):
+            return budget
+
+        return max(0.0, min(left, budget))
+
+    def tell_workers_time_left(self, left: float) -> None:
+        """Tell every worker how long it has, without waiting for an answer.
+
+        Sent before the signal: the worker's control thread takes it
+        without the interpreter, and its wait for requests looks at it
+        every few milliseconds, so it stops waiting in time to leave the
+        exit grace for its shutdown work.
+        """
+
+        message = {"op": "stop_within", "args": {"ms": int(left * 1000)}}
+        line = json.dumps(message).encode() + b"\n"
+
+        for control in self.control_sockets.values():
+            try:
+                control.sendall(line)
+            except OSError:
+                pass
 
     def terminate_all(self) -> None:
-        """Stop every worker: SIGTERM, its stop budget, then SIGKILL."""
+        """Stop every worker: SIGTERM, the time it has, then SIGKILL."""
+
+        left = self.time_to_stop()
+
+        if left < self.stop_budget():
+            self.tell_workers_time_left(left)
 
         for pid in self.workers:
             try:
@@ -3768,7 +3853,7 @@ class Host:
 
         # Reap whatever exits within the grace period.
 
-        deadline = time.monotonic() + self.stop_budget()
+        deadline = time.monotonic() + left
 
         while self.workers and time.monotonic() < deadline:
             try:
@@ -4224,6 +4309,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="how long a worker told to stop keeps its open WebSockets before closing them",
     )
     parser.add_argument(
+        "--exit-grace",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="how long a worker has for its shutdown work once its requests have had theirs",
+    )
+    parser.add_argument(
         "--memory-measure",
         choices=("uss", "pss", "rss"),
         default="uss",
@@ -4481,6 +4573,7 @@ def main(argv: list[str] | None = None) -> int:
         hard_drain_grace=args.hard_drain_grace,
         shutdown_timeout=args.shutdown_timeout,
         websocket_drain_grace=args.websocket_drain_grace,
+        exit_grace=args.exit_grace,
         loop_stall_timeout=args.loop_stall_timeout,
         gil_stall_timeout=args.gil_stall_timeout,
         memory=MemoryPolicy(

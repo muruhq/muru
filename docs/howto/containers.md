@@ -549,7 +549,12 @@ The first, `serve.stopping`, comes at SIGTERM, and the second,
 `serve.draining`, when the listener closes.
 
 All of it fits inside `--shutdown-budget`; whatever has not finished by
-then is killed. A project command running through the container, as
+then is killed. A budget has to cover the requests, then the workers'
+`exit_grace` for their shutdown work (`--timeout exit_grace=`), then a
+second for the edge. The edge stops waiting for requests `exit_grace`
+plus 1 second before the end of the budget, and each worker is told how
+long it has. With the defaults, a stuck request gets 5 seconds, the
+workers 2 and the edge 1, inside the budget of 8. A project command running through the container, as
 `kubectl exec` starts one, gets SIGTERM when the stop begins and SIGKILL
 if it is still running when the budget ends, and the `muructl command run`
 that started it says it was stopped. A second SIGTERM, or a second Ctrl-C,
@@ -570,7 +575,8 @@ env:
 
 No `preStop` hook is needed. The budget is 8 seconds by default, under the
 10 that `docker stop` gives before SIGKILL; an application with long
-requests raises both the budget and the platform's grace period, with
+requests or a long shutdown raises both the budget and the platform's
+grace period, with
 `stop_grace_period` in Compose or `terminationGracePeriodSeconds` in
 Kubernetes.
 
