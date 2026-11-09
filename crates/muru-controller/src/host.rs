@@ -437,6 +437,12 @@ pub fn stop_wait(budget: Duration) -> Duration {
     budget + STOP_MARGIN * 2
 }
 
+/// The file in a host's run directory saying when a shutdown wants its
+/// workers gone, in milliseconds since the Unix epoch (section 13.3). It
+/// is written before the host is told to stop, so the host always finds
+/// it; `muru.host` reads it under this name.
+pub const STOP_BY_FILE: &str = "stop-by";
+
 /// The variable naming, comma separated, the release's variables whose
 /// values `debug inspect` shows (section 11.7); the runtime library reads
 /// it as `muru._inspect.DECLARED`.
@@ -1338,13 +1344,21 @@ impl HostProcess {
     /// them, and is itself killed if it has not exited `STOP_MARGIN`
     /// after that.
     pub async fn stop(self, budget: Duration) {
-        self.stop_until(Instant::now() + budget + STOP_MARGIN).await;
+        self.stop_until(Instant::now() + budget + STOP_MARGIN, None)
+            .await;
     }
 
     /// Stop the host as `stop` does, killing it at `kill_at` if it is
     /// still there: for a shutdown that has a budget of its own (section
-    /// 13.3), which may be shorter than the workers' stop budget.
-    pub async fn stop_until(mut self, kill_at: Instant) {
+    /// 13.3), which may be shorter than the workers' stop budget. With
+    /// `workers_by`, the host is told when the shutdown wants its workers
+    /// gone, which it tells each of them, so that a worker told to stop
+    /// late in a shutdown still leaves itself the exit grace.
+    pub async fn stop_until(mut self, kill_at: Instant, workers_by: Option<Instant>) {
+        if let Some(workers_by) = workers_by {
+            self.tell_stop_by(workers_by);
+        }
+
         if let Some(pid) = self.pid() {
             // SAFETY: kill(2) with a valid pid and signal has no memory-safety
             // preconditions; the pid is a host this daemon started or adopted.
@@ -1383,6 +1397,28 @@ impl HostProcess {
         }
 
         let _ = std::fs::remove_dir_all(&self.run_dir);
+    }
+
+    /// Write when the workers must be gone where the host looks for it, by
+    /// the clock both sides read. Before the signal, so the host finds it
+    /// whenever the signal lands. A host that cannot read it stops by its
+    /// own budget and is killed at the shutdown's deadline.
+    fn tell_stop_by(&self, workers_by: Instant) {
+        let at = SystemTime::now() + workers_by.saturating_duration_since(Instant::now());
+        let path = self.run_dir.join(STOP_BY_FILE);
+        let Ok(since_epoch) = at.duration_since(SystemTime::UNIX_EPOCH) else {
+            return;
+        };
+
+        if let Err(error) = std::fs::write(&path, since_epoch.as_millis().to_string()) {
+            tracing::warn!(%error, "could not tell the host when its workers must be gone");
+            return;
+        }
+
+        // The host may run as another user than this process.
+
+        let permissions = std::os::unix::fs::PermissionsExt::from_mode(0o644);
+        let _ = std::fs::set_permissions(&path, permissions);
     }
 
     /// Leave the host running and forget it, for a daemon that detaches.

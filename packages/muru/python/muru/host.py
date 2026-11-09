@@ -68,6 +68,17 @@ WSGIApplication = Callable[..., Any]
 
 RESTART_DELAY_SECONDS = 0.5
 
+# Section 13.3: the file in the run directory saying when a shutdown wants
+# the workers gone, written by the supervisor before it signals the host
+# (the name is STOP_BY_FILE in the supervisor too).
+
+STOP_BY_FILE = "stop-by"
+
+# What the worker keeps back from lifespan shutdown of the time it has
+# left, so a slow application is reported rather than ending with SIGKILL.
+
+EXIT_REPORT_SECONDS = 0.25
+
 # How long a replacement waits for the supervisor to say the edge routes
 # to the new worker before the old one is told to stop regardless, and
 # how long after that word the old worker is left alone, so a request
@@ -1587,15 +1598,21 @@ class Host:
 
         from muru import _native
 
-        def on_exit() -> None:
-            """Run lifespan shutdown for every ASGI application and the hook, then stop the loop."""
+        def on_exit(left: float) -> None:
+            """Run lifespan shutdown for every ASGI application and the hook, then stop the loop.
 
-            _asgi.stop_registered()
+            `left` is how long the worker has before the host kills it.
+            Lifespan shutdown stops waiting with a little to spare, so a
+            slow application is reported and the rest can still run.
+            """
+
+            deadline = time.monotonic() + left - EXIT_REPORT_SECONDS
+            _asgi.stop_registered(deadline)
 
             for mounted_lifespan in lifespans:
-                mounted_lifespan.shutdown()
+                mounted_lifespan.shutdown(deadline)
             if lifespan is not None:
-                lifespan.shutdown()
+                lifespan.shutdown(deadline)
             hooks.call_logged("on_exit", context)
             if loop is not None:
                 loop.stop()
@@ -1628,6 +1645,7 @@ class Host:
         timeout_arguments: dict[str, Any] = {
             "websocket_drain_ms": int(self.websocket_drain_grace * 1000),
             "drain_ms": int(self.shutdown_timeout * 1000),
+            "exit_grace_ms": int(self.exit_grace * 1000),
         }
 
         if group.soft_timeout is not None:
@@ -3760,8 +3778,48 @@ class Host:
 
         return self.websocket_drain_grace + self.shutdown_timeout + self.exit_grace
 
+    def time_to_stop(self) -> float:
+        """Return how long the workers have to stop, in seconds.
+
+        Their stop budget, or less when a shutdown with a budget of its
+        own has said when it wants them gone (section 13.3).
+        """
+
+        budget = self.stop_budget()
+
+        try:
+            with open(os.path.join(self.socket_dir, STOP_BY_FILE)) as stop_by:
+                left = int(stop_by.read()) / 1000 - time.time()
+        except (OSError, ValueError):
+            return budget
+
+        return max(0.0, min(left, budget))
+
+    def tell_workers_time_left(self, left: float) -> None:
+        """Tell every worker how long it has, without waiting for an answer.
+
+        Sent before the signal: the worker's control thread takes it
+        without the interpreter, and its wait for requests looks at it
+        every few milliseconds, so it stops waiting in time to leave the
+        exit grace for its shutdown work.
+        """
+
+        message = {"op": "stop_within", "args": {"ms": int(left * 1000)}}
+        line = json.dumps(message).encode() + b"\n"
+
+        for control in self.control_sockets.values():
+            try:
+                control.sendall(line)
+            except OSError:
+                pass
+
     def terminate_all(self) -> None:
-        """Stop every worker: SIGTERM, its stop budget, then SIGKILL."""
+        """Stop every worker: SIGTERM, the time it has, then SIGKILL."""
+
+        left = self.time_to_stop()
+
+        if left < self.stop_budget():
+            self.tell_workers_time_left(left)
 
         for pid in self.workers:
             try:
@@ -3771,7 +3829,7 @@ class Host:
 
         # Reap whatever exits within the grace period.
 
-        deadline = time.monotonic() + self.stop_budget()
+        deadline = time.monotonic() + left
 
         while self.workers and time.monotonic() < deadline:
             try:

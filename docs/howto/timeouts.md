@@ -287,6 +287,17 @@ time its requests did not use is there for its shutdown work too.
 loop. A thread still running a request when it is up is left behind and
 ends with the worker.
 
+Stopping as part of a whole shutdown, a worker can be told to stop with
+less than its budget left: the edge has already waited for the requests,
+inside the shutdown's own budget. The host tells it how long it has, and
+the worker stops waiting for its requests in time to leave `exit_grace`
+for its shutdown work, so that work still runs.
+
+An application whose lifespan shutdown does not finish before the worker
+would be killed gets a line in the log saying that it did not complete
+lifespan shutdown in time, and its task is cancelled. The `on_exit` hook
+then still runs.
+
 A grace longer than nothing lets a socket finish what it is doing, such
 as a message being sent; most clients reconnect on 1001 at once, so the
 default closes sockets as soon as the worker is told to stop.

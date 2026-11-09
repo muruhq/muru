@@ -55,7 +55,8 @@ type MountArgument = (
 /// requests the loop takes at once (section 6.6).
 ///
 /// `on_drain` is called when the stop signal arrives, before the
-/// application threads finish their requests, `on_exit` once they have, and
+/// application threads finish their requests, `on_exit` once they have,
+/// with the seconds left before the host kills the worker, and
 /// `on_reopen_logs` whenever SIGUSR1 arrives (section 6.3). `lifeline` is
 /// a descriptor whose end of file also stops the server: the read end of a
 /// pipe the host holds the write end of, so a worker never outlives it.
@@ -88,7 +89,7 @@ type MountArgument = (
 /// The arguments are the Python signature, keyword by keyword.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new(), loop_stall_timeout_ms=None, websocket_drain_ms=0, drain_ms=5000, gil_stall_timeout_ms=None, handoff=false, sync_threads=0))]
+#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new(), loop_stall_timeout_ms=None, websocket_drain_ms=0, drain_ms=5000, exit_grace_ms=2000, gil_stall_timeout_ms=None, handoff=false, sync_threads=0))]
 fn serve(
     py: Python<'_>,
     socket_path: String,
@@ -114,6 +115,7 @@ fn serve(
     loop_stall_timeout_ms: Option<u64>,
     websocket_drain_ms: u64,
     drain_ms: u64,
+    exit_grace_ms: u64,
     gil_stall_timeout_ms: Option<u64>,
     handoff: bool,
     sync_threads: usize,
@@ -234,6 +236,7 @@ fn serve(
         on_control,
         websocket_drain: std::time::Duration::from_millis(websocket_drain_ms),
         drain: std::time::Duration::from_millis(drain_ms),
+        exit_grace: std::time::Duration::from_millis(exit_grace_ms),
     };
 
     py.detach(move || link::serve(&socket_path, shared, lifecycle))

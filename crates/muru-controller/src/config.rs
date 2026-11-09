@@ -5191,6 +5191,7 @@ fn resolve_http_spec(
         max_lifetime_ms: None,
         timeouts: crate::model::WorkerTimeouts {
             shutdown_timeout_ms,
+            exit_grace_ms: 0,
             ..crate::model::WorkerTimeouts::default()
         },
         memory: crate::model::MemoryPolicy::default(),

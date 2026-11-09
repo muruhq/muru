@@ -84,6 +84,9 @@ pub struct Lifecycle {
     /// How long the requests then get to finish, the host's shutdown
     /// timeout, before the worker stops waiting for them.
     pub drain: Duration,
+    /// How long the worker keeps for its shutdown work once it stops
+    /// waiting for requests, before the host kills it.
+    pub exit_grace: Duration,
 }
 
 /// What a signal asks of the worker.
@@ -97,6 +100,18 @@ enum Asked {
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Lifecycle {
+    /// Call `on_exit` with the seconds left before the host kills the
+    /// worker, reporting any exception.
+    fn call_exit(hook: Option<&Py<PyAny>>, left: Duration) {
+        if let Some(hook) = hook {
+            Python::attach(|py| {
+                if let Err(error) = hook.call1(py, (left.as_secs_f64(),)) {
+                    wsgi::report(py, &error);
+                }
+            });
+        }
+    }
+
     /// Call a hook with the interpreter attached, reporting any exception.
     fn call(hook: Option<&Py<PyAny>>) {
         if let Some(hook) = hook {
@@ -236,10 +251,22 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
     // it to stop, so everything here is measured from that moment. The
     // requests get no longer than the WebSockets' grace and the shutdown
     // timeout, whatever on_drain took, which leaves the exit grace for the
-    // shutdown work below.
+    // shutdown work below. In a shutdown with a budget of its own the host
+    // may say sooner (`stop_within`), and the wait gives way to the exit
+    // grace then too.
 
     let told = Instant::now();
-    let requests_end = told + lifecycle.websocket_drain + lifecycle.drain;
+    let budget_end = told + lifecycle.websocket_drain + lifecycle.drain + lifecycle.exit_grace;
+    let exit_grace = lifecycle.exit_grace;
+    let kill_at = move || match STOP_BY_MS.load(Ordering::Relaxed) {
+        0 => budget_end,
+        by => budget_end.min(Instant::now() + Duration::from_millis(by.saturating_sub(clock_ms()))),
+    };
+    let requests_end = move || {
+        kill_at()
+            .checked_sub(exit_grace)
+            .unwrap_or_else(Instant::now)
+    };
     Lifecycle::call(lifecycle.on_drain.as_ref());
 
     // Requests already running finish on their threads, or on the event
@@ -249,7 +276,7 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
     shared.close_pools();
 
     let wait = |deadline: Instant| {
-        while shared.in_flight() > 0 && Instant::now() < deadline {
+        while shared.in_flight() > 0 && Instant::now() < deadline.min(requests_end()) {
             std::thread::sleep(Duration::from_millis(10));
         }
     };
@@ -264,10 +291,13 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
         shared.close_websockets();
     }
 
-    wait(requests_end);
-    shared.join_pools(requests_end);
+    wait(budget_end);
+    shared.join_pools(requests_end());
     stop_watchdog.store(true, Ordering::Relaxed);
-    Lifecycle::call(lifecycle.on_exit.as_ref());
+    Lifecycle::call_exit(
+        lifecycle.on_exit.as_ref(),
+        kill_at().saturating_duration_since(Instant::now()),
+    );
     drop(runtime);
     served
 }
@@ -312,6 +342,10 @@ fn watchdog_loop(shared: &Arc<Shared>, timeout: Duration, stop: &AtomicBool, rep
         }
     }
 }
+
+/// When the host wants this worker gone (`stop_within`), in milliseconds
+/// of `clock_ms`, or 0 when it has not said.
+static STOP_BY_MS: AtomicU64 = AtomicU64::new(0);
 
 /// When the event loop last beat, in milliseconds since the first look
 /// at the clock, or 0 before it first did.
@@ -567,6 +601,15 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
             continue;
         }
 
+        // Section 7.6: the host says how long this worker has in a shutdown
+        // with a budget of its own. No answer goes back: the host has
+        // moved on to stopping the worker.
+
+        if let Some(ms) = stop_within_request(&line) {
+            STOP_BY_MS.store((clock_ms() + ms).max(1), Ordering::Relaxed);
+            continue;
+        }
+
         // Section 11.7: the bookkeeping is answered here, without the
         // interpreter, so a worker whose threads hold it still says which
         // request each thread serves while its stacks are read from
@@ -638,6 +681,20 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
             break;
         }
     }
+}
+
+/// The milliseconds a request line says the worker has left, as the host
+/// writes it: `{"op": "stop_within", "args": {"ms": N}}`.
+fn stop_within_request(line: &str) -> Option<u64> {
+    if !line.contains("\"op\": \"stop_within\"") {
+        return None;
+    }
+
+    let rest = line.split_once("\"ms\": ")?.1;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// The id of a request line asking for the bookkeeping, as the host

@@ -3752,7 +3752,9 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
 
         let for_drain = deadline
             .saturating_duration_since(Instant::now())
-            .saturating_sub(muru_controller::shutdown::WORKERS_RESERVE);
+            .saturating_sub(muru_controller::shutdown::drain_reserve(
+                timeouts.exit_grace,
+            ));
 
         if signalled {
             muru_common::log::line_of_kind(
@@ -3770,17 +3772,21 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         current
             .stop_until(
                 deadline.min(Instant::now() + stop_budget + muru_controller::host::STOP_MARGIN),
+                Some(muru_controller::shutdown::workers_deadline(deadline)),
             )
             .await;
     } else if muru_controller::shutdown::is_main_process() {
         let deadline = Instant::now() + muru_controller::shutdown::DEFAULT_BUDGET;
         let for_drain = deadline
             .saturating_duration_since(Instant::now())
-            .saturating_sub(muru_controller::shutdown::WORKERS_RESERVE);
+            .saturating_sub(muru_controller::shutdown::drain_reserve(
+                timeouts.exit_grace,
+            ));
         drainer.drain(requests_budget.min(for_drain)).await;
         current
             .stop_until(
                 deadline.min(Instant::now() + stop_budget + muru_controller::host::STOP_MARGIN),
+                Some(muru_controller::shutdown::workers_deadline(deadline)),
             )
             .await;
     } else {

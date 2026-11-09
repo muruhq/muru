@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
@@ -25,7 +26,7 @@ async def application(scope: Scope, receive: Receive, send: Send) -> None:
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 say("lifespan shutdown began")
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(float(os.environ.get("MURU_TEST_LIFESPAN_SECONDS", "0.2")))
                 say("lifespan shutdown finished")
                 await send({"type": "lifespan.shutdown.complete"})
                 return

@@ -97,7 +97,9 @@ The pieces, in turn:
   endpoints and the ingress stop sending to it, closing each connection
   after its response. Then the requests in flight finish and the
   container exits, all within `MURU_SERVE_SHUTDOWN_BUDGET`, which is set
-  under `terminationGracePeriodSeconds`. A rolling update loses no
+  under `terminationGracePeriodSeconds` and has to cover the delay, the
+  requests, the workers' `exit_grace` (2 seconds by default) and a second
+  for the edge. A rolling update loses no
   requests and needs no `preStop` hook; [stopping](containers.md#stopping)
   covers the sequence.
 - **Restarts in place.** A container restarted in place, by a resize, a
