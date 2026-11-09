@@ -730,6 +730,9 @@ pub struct Info {
     pub no_host: std::sync::Mutex<String>,
     /// Section 8.7: `[daemon] pass_env`, as a reload may change it.
     pub pass_env: std::sync::RwLock<Vec<String>>,
+    /// The service user (ADR 0026), when this daemon is root, for what a
+    /// deploy's plan says a release would run as.
+    pub service: Option<crate::host::Identity>,
     /// Section 8.4: uv as found and how it is run, from the `[tools]`
     /// table read at start.
     pub provisioning: crate::provision::Provisioning,
@@ -1356,6 +1359,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         live: std::sync::Mutex::new(HashMap::new()),
         no_host: std::sync::Mutex::new(String::new()),
         pass_env: std::sync::RwLock::new(settings.pass_env.clone()),
+        service,
         servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
     });
@@ -4037,7 +4041,7 @@ impl Daemon {
                     return false;
                 }
             };
-        let env = self.server_environment(env, app, id, &release.spec);
+        let env = self.server_environment(env, app, id, &release.spec, identity);
         let adopted = Servers::adopt(
             &http,
             &run_dir.join("r1"),
@@ -4563,6 +4567,14 @@ impl Daemon {
                 .open(&log_path)
                 .map_err(|error| format!("opening {}: {error}", log_path.display()))?;
             let mut command = build.command(&uv, &isolation);
+
+            // The build runs as the release's user, so it has that user's
+            // home too and not the daemon's (section 8.7).
+
+            if let Some(identity) = identity {
+                command.envs(identity.account());
+            }
+
             crate::host::own_session_std(&mut command, identity);
             let _ = writeln!(log, "[build] {}", build.describe());
 
@@ -4747,7 +4759,7 @@ impl Daemon {
         let library = self.runtime_library(&python).await?;
         let pycache = self.pycache_prefix(app, id, spec, identity);
         let bytecode = Some(spec.bytecode.effective());
-        let base = self.daemon_base(bytecode);
+        let base = self.daemon_base(bytecode, identity);
         let env = crate::commands::environment(
             env,
             &crate::commands::Interpreter {
@@ -4900,7 +4912,7 @@ impl Daemon {
         // instances instead of a host.
 
         if let Some(http) = spec.http.clone() {
-            let env = self.server_environment(env, app, id, spec);
+            let env = self.server_environment(env, app, id, spec, identity);
 
             return self
                 .start_servers(app, id, &release, &http, env, identity, &run_dir, started)
@@ -4953,7 +4965,7 @@ impl Daemon {
         // once for its host and workers.
 
         let bytecode = Some(spec.bytecode.effective());
-        let base = self.daemon_base(bytecode);
+        let base = self.daemon_base(bytecode, identity);
         let env = crate::commands::environment(
             env,
             &crate::commands::Interpreter {
@@ -8433,8 +8445,12 @@ impl Daemon {
     }
 
     /// Section 8.7: what a release's processes start from, from the
-    /// daemon's own environment.
-    fn daemon_base(&self, bytecode: Option<muru_config::Bytecode>) -> Vec<(String, String)> {
+    /// daemon's own environment and whom they run as.
+    fn daemon_base(
+        &self,
+        bytecode: Option<muru_config::Bytecode>,
+        identity: Option<crate::host::Identity>,
+    ) -> Vec<(String, String)> {
         let pass_env = self
             .info
             .pass_env
@@ -8442,7 +8458,7 @@ impl Daemon {
             .expect("pass_env poisoned")
             .clone();
 
-        crate::commands::passed_from_daemon(std::env::vars(), &pass_env, bytecode)
+        crate::commands::passed_from_daemon(std::env::vars(), &pass_env, bytecode, identity)
     }
 
     /// A managed server's whole environment: its release's variables over
@@ -8453,8 +8469,9 @@ impl Daemon {
         app: &str,
         id: &str,
         spec: &crate::model::ReleaseSpec,
+        identity: Option<crate::host::Identity>,
     ) -> Vec<(String, String)> {
-        let base = self.daemon_base(None);
+        let base = self.daemon_base(None, identity);
 
         crate::commands::environment(
             env,

@@ -33,6 +33,7 @@ slow = "500ms"
 dashboard = "127.0.0.1:8082"    # or "off"
 compression = false
 timestamps = true               # the full UTC time in front of every line
+env_file = ".env"               # variables the run starts with
 ```
 
 In a `muru.toml` the same keys go in a `[run]` table at the top level.
@@ -102,6 +103,53 @@ with a message naming the committed file where the application's settings
 belong. It is never committed: `muructl run` says once per run that it is
 using the file, and if the project's `.gitignore` does not cover it, the
 start-up line says so. `muructl deploy` does not read it.
+
+## Variables from a .env file
+
+`muructl run --env-file FILE`, or `env_file` in the run table or in
+`muru.local.toml`, gives the run the variables of a `.env` file. A
+relative path is the project's. A file is only read when one of these
+names it: a `.env` beside the project is not picked up by itself.
+
+```sh
+# Lines starting with # and blank lines are skipped.
+DEBUG=1
+export DATABASE_URL=postgres://localhost/shop
+SECRET_KEY='not a real one'     # a comment
+GREETING="line one\nline two"
+```
+
+- A line is `NAME=VALUE`, with an optional `export` in front.
+
+- An unquoted value ends at the end of the line, or at a `#` with a
+  space before it.
+
+- A single-quoted value is taken literally.
+
+- A double-quoted value takes the escapes `\"`, `\\`, `\$`, `\n`, `\r`
+  and `\t`.
+
+- A value is never expanded, so `$HOME` stays as it is written. A quoted
+  value ends on its own line.
+
+A line that cannot be read stops the run, naming the file and the line
+number. The file's values override `[tool.muru.env]`, which overrides
+the environment `muructl run` was started with. The file is read when
+the run starts, so a change to it takes a restart.
+
+`muructl run --print-config` shows the file as the layer it came from
+and names the variables it sets, without their values:
+
+```text
+[run]
+env_file = ".env"    # [run] in ./muru.local.toml
+...
+
+# .env sets DEBUG, DATABASE_URL, SECRET_KEY. Over [tool.muru.env]: DEBUG.
+```
+
+`muructl check --env-file FILE` reads the same format, for settings the
+import needs. `muructl deploy` and `muructl serve` do not read one.
 
 ## What wins
 

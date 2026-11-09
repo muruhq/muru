@@ -168,6 +168,10 @@ clean environment, whoever started the daemon and from wherever:
 
 2. A small base taken from the daemon's own environment when set there:
    `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TZ` and `TMPDIR`.
+   A release run as another user has that user's `HOME`, `USER` and
+   `LOGNAME` from the system's password database instead, and
+   `muructl deploy --dry-run` lists them as set by Muru (see
+   [per-application users](users.md)).
 
 3. Variables `pass_env` in the `[daemon]` table of the daemon's file
    passes through by name, with a `*` suffix allowed:
@@ -687,7 +691,10 @@ daemon through its admin socket: `--socket` or `MURU_SOCKET`, else a
 development run started from the current directory, else the daemon's
 socket in the runtime directory, else the one development run listening;
 with several runs and no daemon the command names them, so one can be
-chosen with `--socket`. `muructl status` says which was found.
+chosen with `--socket`. `muructl status` says which was found. A run
+directory you may not enter is passed over like one that is not there;
+when nothing else is found, the command says permission was denied on
+its socket.
 
 ## In a container
 

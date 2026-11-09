@@ -260,47 +260,80 @@ impl SocketArgs {
         );
         let serve_socket = serve_dir.join(crate::serve::ADMIN_SOCKET);
 
-        if serve_dir.join("serve.json").is_file() && serve_socket.exists() {
+        let serve_file = serve_dir.join("serve.json");
+
+        if serve_file.is_file() && serve_socket.exists() {
             return Ok(serve_socket);
         }
 
+        // A run directory this user may not enter is not the same as none:
+        // discovery carries on past it, and comes back to it only if it
+        // finds nothing else, so that `connect` can say what was denied.
+
+        let denied = may_not_enter(&serve_file).then_some(serve_socket);
+
         let locations = self.locations.resolve();
         let daemon = locations.admin_socket();
+        let daemon_listening = daemon.exists();
         let runs = crate::run_admin::runs(&locations.run.path);
         let here = std::env::current_dir()
             .and_then(|directory| directory.canonicalize())
             .ok();
 
-        if let Some(run) = runs
-            .iter()
-            .find(|run| here.as_ref().is_some_and(|here| run.project == *here))
-        {
-            return Ok(run.socket.clone());
-        }
+        discovered(&runs, here.as_deref(), daemon, daemon_listening, denied)
+    }
+}
 
-        if daemon.exists() {
-            return Ok(daemon);
-        }
+/// Whether looking at `path` is refused because a directory on the way
+/// to it may not be entered, as opposed to the path being absent.
+fn may_not_enter(path: &Path) -> bool {
+    matches!(
+        path.try_exists(),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+    )
+}
 
-        match runs.as_slice() {
-            [] => Ok(daemon),
-            [run] => Ok(run.socket.clone()),
-            several => anyhow::bail!(
-                "no daemon is running and several development runs are: {}; name one with \
-                 --socket, or run the command from its project directory",
-                several
-                    .iter()
-                    .map(|run| format!(
-                        "{} on http://{} from {} (--socket {})",
-                        run.app,
-                        run.listen,
-                        run.project.display(),
-                        run.socket.display()
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-        }
+/// The rest of discovery (design specification section 13.8), once there
+/// is no usable serve: a development run from the current project, the
+/// daemon's socket when it listens, then the one run listening. With
+/// nothing there, the socket of a run directory this user may not enter
+/// when there is one, so the permission error is reported, or the daemon's.
+fn discovered(
+    runs: &[crate::run_admin::RunInfo],
+    here: Option<&Path>,
+    daemon: PathBuf,
+    daemon_listening: bool,
+    denied: Option<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(run) = runs
+        .iter()
+        .find(|run| here.is_some_and(|here| run.project == here))
+    {
+        return Ok(run.socket.clone());
+    }
+
+    if daemon_listening {
+        return Ok(daemon);
+    }
+
+    match runs {
+        [] => Ok(denied.unwrap_or(daemon)),
+        [run] => Ok(run.socket.clone()),
+        several => anyhow::bail!(
+            "no daemon is running and several development runs are: {}; name one with \
+             --socket, or run the command from its project directory",
+            several
+                .iter()
+                .map(|run| format!(
+                    "{} on http://{} from {} (--socket {})",
+                    run.app,
+                    run.listen,
+                    run.project.display(),
+                    run.socket.display()
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
     }
 }
 
@@ -7134,6 +7167,69 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 mod tests {
     use super::metric_samples;
     use super::pb;
+
+    #[test]
+    fn discovery_reports_a_denied_run_directory_only_with_nothing_else_to_offer() {
+        use std::path::{Path, PathBuf};
+
+        use crate::run_admin::RunInfo;
+
+        let run = |socket: &str, project: &str| RunInfo {
+            pid: 1,
+            app: "app".to_owned(),
+            project: PathBuf::from(project),
+            listen: "127.0.0.1:8080".to_owned(),
+            socket: PathBuf::from(socket),
+        };
+        let daemon = PathBuf::from("/user/admin.sock");
+        let denied = PathBuf::from("/run/muru/admin.sock");
+        let found = |runs: &[RunInfo], here, listening, denied: Option<&Path>| {
+            super::discovered(
+                runs,
+                here,
+                daemon.clone(),
+                listening,
+                denied.map(Path::to_path_buf),
+            )
+            .expect("found")
+        };
+        let mine = [run("/user/runs/8080/admin.sock", "/mine")];
+
+        // A non-member's own run or daemon wins, nothing said about the
+        // directory.
+
+        let here = Some(Path::new("/mine"));
+        assert_eq!(found(&mine, here, true, Some(&denied)), mine[0].socket);
+        assert_eq!(found(&mine, None, false, Some(&denied)), mine[0].socket);
+        assert_eq!(found(&[], None, true, Some(&denied)), daemon);
+
+        // With nothing else the denied socket is the answer, and only then.
+
+        assert_eq!(found(&[], None, false, Some(&denied)), denied);
+        assert_eq!(found(&[], None, false, None), daemon);
+    }
+
+    #[test]
+    fn a_directory_that_may_not_be_entered_is_told_from_an_absent_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: geteuid has no preconditions.
+
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root enters anything, so there is nothing to refuse
+        }
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let locked = directory.path().join("locked");
+        std::fs::create_dir(&locked).expect("mkdir");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        assert!(super::may_not_enter(&locked.join("serve.json")));
+        assert!(!super::may_not_enter(&directory.path().join("absent/x")));
+        assert!(!super::may_not_enter(&directory.path().join("x")));
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
 
     #[test]
     fn a_debug_reply_past_the_limit_says_what_to_narrow() {

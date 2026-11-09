@@ -7,10 +7,16 @@ serve` and for the daemon, and serve runs under an arbitrary user ID with a
 read-only root filesystem, answering its probes from inside.
 
 The image takes minutes to build the first time and is cached after; the
-suite carries the requires_docker marker and runs with `just test-docker`."""
+suite carries the requires_docker marker and runs with `just test-docker`.
+
+The image tag and the container names carry a short hash of the checkout's
+path, so two checkouts can run the suite at once and a rerun in the same
+checkout reuses its image layers. An image is left behind for that reason:
+images from checkouts that are gone are left to `docker image prune`."""
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import shutil
 import subprocess
@@ -24,7 +30,8 @@ import pytest
 pytestmark = pytest.mark.requires_docker
 
 ROOT = Path(__file__).resolve().parents[2]
-IMAGE = "muru-test:working-tree"
+CHECKOUT = hashlib.sha256(str(ROOT).encode()).hexdigest()[:8]
+IMAGE = f"muru-test:{CHECKOUT}"
 
 # A short worker stop budget, so the scenarios run in seconds.
 
@@ -170,9 +177,9 @@ def container(image: str, request: pytest.FixtureRequest) -> Iterator[Callable[.
     def start(
         *command: str, env: dict[str, str] | None = None, options: tuple[str, ...] = ()
     ) -> Container:
-        name = f"muru-test-{request.node.name[:40]}-{len(started)}".replace("[", "-").replace(
-            "]", ""
-        )
+        name = f"muru-test-{CHECKOUT}-{request.node.name[:40]}-{len(started)}".replace(
+            "[", "-"
+        ).replace("]", "")
         subprocess.run(["docker", "rm", "-f", name], check=False, capture_output=True)
         environment = [f"--env={key}={value}" for key, value in (env or {}).items()]
         subprocess.run(
@@ -445,6 +452,45 @@ def test_serve_runs_as_an_arbitrary_user_on_a_read_only_root(
     assert outside.returncode != 0
     assert "permission denied on /run/muru/admin.sock" in outside.stderr, outside.stderr
     assert "belongs to UID" in outside.stderr, outside.stderr
+
+    # Without --socket the same user is told the same, having nothing else
+    # to find, and with a run of their own finds that and is told nothing
+    # about a directory they may not enter.
+
+    nothing = instance.exec("muructl", "status", check=False, user="5555:5555")
+    assert nothing.returncode != 0
+    assert "permission denied on /run/muru/admin.sock" in nothing.stderr, nothing.stderr
+    subprocess.run(
+        [
+            "docker",
+            "exec",
+            "--detach",
+            "--user",
+            "5555:5555",
+            "--env",
+            "HOME=/tmp/five",
+            instance.name,
+            "muructl",
+            "run",
+            "plain_wsgi:application",
+            "--port",
+            "auto",
+            "--dashboard",
+            "off",
+            "--no-reload",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    def own_run_found() -> bool:
+        return instance.exec("muructl", "status", check=False, user="5555:5555").returncode == 0
+
+    wait_for(own_run_found)
+    own = instance.exec("muructl", "status", check=False, user="5555:5555")
+    assert "/run/muru" not in own.stdout + own.stderr, own.stdout + own.stderr
 
     # Section 9.12: a command of the project runs through the serve, and
     # in a container of its own, where nothing serves, by muructl itself.

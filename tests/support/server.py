@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import http.client
 import os
 import re
@@ -16,6 +18,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import IO
 
 import pytest
 
@@ -93,20 +96,52 @@ def remove_short_dirs() -> None:
 
 # Ports free_port has handed out. A port is free again once its probe
 # socket closes, so two picks before either is bound can return the same
-# one, as a dashboard port and a daemon's listener once did on Linux.
+# one, as a dashboard port and a daemon's listener once did on Linux. A
+# lock file per port does the same between processes, two checkouts' test
+# runs above all: the lock is held until the process ends, and a port some
+# other process holds is passed over. The files are empty and stay behind.
+
+PORT_LOCKS = Path("/tmp/muru-test-ports")
 
 _handed_out: set[int] = set()
+_port_locks: list[IO[bytes]] = []
+
+
+def _reserve_port(port: int) -> bool:
+    """Take this process's lock on a port, or say that another holds it."""
+
+    PORT_LOCKS.mkdir(exist_ok=True)
+
+    # The directory is shared by whoever runs the tests on this machine.
+
+    with contextlib.suppress(PermissionError):
+        PORT_LOCKS.chmod(0o1777)
+
+    try:
+        lock = (PORT_LOCKS / str(port)).open("ab")
+    except PermissionError:
+        return False
+
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return False
+
+    _port_locks.append(lock)
+    return True
 
 
 def free_port() -> int:
-    """Pick a port that is free right now and not handed out before."""
+    """Pick a port that is free right now, not handed out before and not
+    reserved by another process on this machine."""
 
     while True:
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = int(sock.getsockname()[1])
 
-        if port not in _handed_out:
+        if port not in _handed_out and _reserve_port(port):
             _handed_out.add(port)
             return port
 

@@ -219,6 +219,11 @@ const BASE_VARIABLES: &[&str] = &[
     "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_*", "TZ", "TMPDIR",
 ];
 
+/// The variables of the base that say who the process runs as, which a
+/// release run as another user takes from that user and not from the
+/// daemon (section 8.7).
+pub const ACCOUNT_VARIABLES: &[&str] = &["HOME", "USER", "LOGNAME"];
+
 /// Whether a variable's name is matched by a name or `PREFIX*` pattern.
 fn name_matches(name: &str, pattern: &str) -> bool {
     match pattern.strip_suffix('*') {
@@ -238,25 +243,33 @@ pub fn valid_pass_env(entry: &str) -> bool {
 /// Section 8.7: what a release's processes start from under the daemon,
 /// from the daemon's own `variables`: the base and whatever the daemon's
 /// `pass_env` names, less what Muru alone sets and what the bytecode
-/// setting says must not be inherited.
+/// setting says must not be inherited. A release run as another user has
+/// that user's `HOME`, `USER` and `LOGNAME` in place of the daemon's.
 pub fn passed_from_daemon(
     variables: impl IntoIterator<Item = (String, String)>,
     pass_env: &[String],
     bytecode: Option<Bytecode>,
+    identity: Option<Identity>,
 ) -> Vec<(String, String)> {
     let not_inherited = not_inherited(bytecode);
-
-    variables
+    let mut passed: Vec<(String, String)> = variables
         .into_iter()
         .filter(|(name, _)| {
             !name.starts_with("MURU_")
                 && !not_inherited.contains(name)
+                && !(identity.is_some() && ACCOUNT_VARIABLES.contains(&name.as_str()))
                 && (BASE_VARIABLES
                     .iter()
                     .any(|pattern| name_matches(name, pattern))
                     || pass_env.iter().any(|pattern| name_matches(name, pattern)))
         })
-        .collect()
+        .collect();
+
+    if let Some(identity) = identity {
+        passed.extend(identity.account());
+    }
+
+    passed
 }
 
 /// The variables of the daemon's own environment that a release's host
@@ -1345,7 +1358,7 @@ mod tests {
         .map(|(name, value)| (name.to_owned(), value.to_owned()));
         let names = |pass: &[&str], bytecode| {
             let pass: Vec<String> = pass.iter().map(|name| (*name).to_owned()).collect();
-            let mut names: Vec<String> = passed_from_daemon(daemon.clone(), &pass, bytecode)
+            let mut names: Vec<String> = passed_from_daemon(daemon.clone(), &pass, bytecode, None)
                 .into_iter()
                 .map(|(name, _)| name)
                 .collect();
@@ -1363,6 +1376,51 @@ mod tests {
             ["HOME", "LC_ALL", "PATH"],
             "what the release's bytecode setting does not inherit is not passed"
         );
+    }
+
+    #[test]
+    fn a_release_run_as_another_user_has_that_users_account() {
+        let daemon = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/daemon"),
+            ("USER", "daemon-user"),
+            ("LOGNAME", "daemon-user"),
+        ]
+        .map(|(name, value)| (name.to_owned(), value.to_owned()));
+        let pass = vec!["HOME".to_owned(), "USER".to_owned()];
+        let value = |passed: &[(String, String)], name: &str| {
+            passed
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        let identity = |uid| Identity {
+            uid,
+            gid: 0,
+            umask: None,
+        };
+
+        // Without one the daemon's own are passed on; every system's
+        // superuser is called root and has a home.
+
+        let own = passed_from_daemon(daemon.clone(), &pass, None, None);
+        assert_eq!(value(&own, "HOME").as_deref(), Some("/home/daemon"));
+
+        let root = passed_from_daemon(daemon.clone(), &pass, None, Some(identity(0)));
+        assert_eq!(value(&root, "USER").as_deref(), Some("root"));
+        assert_eq!(value(&root, "LOGNAME").as_deref(), Some("root"));
+        assert_ne!(value(&root, "HOME").as_deref(), Some("/home/daemon"));
+        assert!(value(&root, "HOME").is_some_and(|home| home.starts_with('/')));
+        assert_eq!(value(&root, "PATH").as_deref(), Some("/usr/bin"));
+        assert_eq!(root.iter().filter(|(key, _)| key == "USER").count(), 1);
+
+        // A user id with no entry is told nothing rather than the
+        // daemon's own, which `pass_env` cannot bring back.
+
+        let unknown = passed_from_daemon(daemon, &pass, None, Some(identity(0x7fff_fff0)));
+        assert_eq!(value(&unknown, "HOME"), None);
+        assert_eq!(value(&unknown, "USER"), None);
+        assert_eq!(value(&unknown, "LOGNAME"), None);
     }
 
     #[test]

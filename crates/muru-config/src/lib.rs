@@ -496,6 +496,124 @@ pub fn check_env_name(name: &str) -> Result<(), String> {
     }
 }
 
+/// Section 13.1: the variables of a `.env` file, in the file's order.
+/// Blank lines and lines starting with `#` are skipped. A line is
+/// `NAME=VALUE`, optionally after `export`, and the value is taken as it
+/// stands: an unquoted one ends at the end of the line or at a `#` with
+/// space before it, a single-quoted one is literal, and a double-quoted
+/// one takes the escapes `\"`, `\\`, `\$`, `\n`, `\r` and `\t`. Nothing is
+/// expanded. A line it cannot read is refused by its number, and the
+/// message never repeats the line, which may hold a secret.
+pub fn parse_env_file(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut variables = Vec::new();
+
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let variable =
+            parse_env_line(line).map_err(|error| format!("line {}: {error}", index + 1))?;
+        variables.push(variable);
+    }
+
+    Ok(variables)
+}
+
+/// One `NAME=VALUE` line of a `.env` file.
+fn parse_env_line(line: &str) -> Result<(String, String), String> {
+    let line = line
+        .strip_prefix("export")
+        .filter(|rest| rest.starts_with([' ', '\t']))
+        .map_or(line, str::trim_start);
+
+    let Some((name, value)) = line.split_once('=') else {
+        return Err("expected NAME=VALUE".to_owned());
+    };
+    let name = name.trim_end();
+
+    if !valid_env_name(name) {
+        return Err(
+            "the name before = is not a variable name: letters, digits and underscores, \
+             not starting with a digit"
+                .to_owned(),
+        );
+    }
+
+    Ok((name.to_owned(), parse_env_value(value)?))
+}
+
+/// The value of a `.env` line, from just after the `=`.
+fn parse_env_value(value: &str) -> Result<String, String> {
+    let trimmed = value.trim_start();
+
+    let (parsed, rest) = match trimmed.chars().next() {
+        Some('\'') => {
+            let body = &trimmed[1..];
+            let close = body
+                .find('\'')
+                .ok_or_else(|| "the single quote is not closed on this line".to_owned())?;
+
+            (body[..close].to_owned(), &body[close + 1..])
+        }
+        Some('"') => double_quoted(&trimmed[1..])?,
+        _ => return Ok(unquoted(value)),
+    };
+
+    let rest = rest.trim_start();
+
+    if rest.is_empty() || rest.starts_with('#') {
+        Ok(parsed)
+    } else {
+        Err("only a comment may follow the closing quote".to_owned())
+    }
+}
+
+/// An unquoted value: up to a `#` with space before it, trimmed.
+fn unquoted(value: &str) -> String {
+    let end = value
+        .char_indices()
+        .find(|(index, character)| {
+            *character == '#'
+                && value[..*index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace)
+        })
+        .map_or(value.len(), |(index, _)| index);
+
+    value[..end].trim().to_owned()
+}
+
+/// A double-quoted value, from just after its opening quote: the value
+/// and what follows the closing quote.
+fn double_quoted(body: &str) -> Result<(String, &str), String> {
+    let mut parsed = String::new();
+    let mut characters = body.char_indices();
+
+    while let Some((index, character)) = characters.next() {
+        match character {
+            '"' => return Ok((parsed, &body[index + 1..])),
+            '\\' => match characters.next().map(|(_, next)| next) {
+                Some('n') => parsed.push('\n'),
+                Some('r') => parsed.push('\r'),
+                Some('t') => parsed.push('\t'),
+                Some(next @ ('"' | '\\' | '$')) => parsed.push(next),
+                Some(next) => {
+                    parsed.push('\\');
+                    parsed.push(next);
+                }
+                None => parsed.push('\\'),
+            },
+            other => parsed.push(other),
+        }
+    }
+
+    Err("the double quote is not closed on this line".to_owned())
+}
+
 /// Section 6.14: check a handoff against the interface it hands from. A
 /// gRPC application takes none, and an application declared with the
 /// interface it names would hand a request to itself.
@@ -4992,6 +5110,11 @@ pub struct RunSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub timestamps: Option<bool>,
+    /// A `.env` file whose variables the run starts with, relative to the
+    /// project. Its values override `[tool.muru.env]`. None is read unless
+    /// this names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_file: Option<String>,
 }
 
 impl RunSettings {
@@ -5024,6 +5147,7 @@ impl RunSettings {
             dashboard: over.dashboard.clone().or_else(|| self.dashboard.clone()),
             compression: over.compression.or(self.compression),
             timestamps: over.timestamps.or(self.timestamps),
+            env_file: over.env_file.clone().or_else(|| self.env_file.clone()),
         }
     }
 
@@ -6407,6 +6531,79 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(error.contains("workers"), "{error}");
         let error = parse_pyproject("[tool.muru]\npreload = 'maybe'\n").unwrap_err();
         assert!(error.contains("maybe"), "{error}");
+    }
+
+    #[test]
+    fn an_env_file_reads_exports_quotes_and_comments() {
+        let text = concat!(
+            "# a comment\n",
+            "\n",
+            "PLAIN=value\n",
+            "export EXPORTED=one\n",
+            "export\tTABBED=two\n",
+            "  INDENTED = spaced out  \n",
+            "EMPTY=\n",
+            "EMPTY_COMMENT= # nothing\n",
+            "TRAILING=value # a comment\n",
+            "HASH=a#b\n",
+            "SINGLE='it is $literal \\n # all'  # a comment\n",
+            "DOUBLE=\"a \\\"b\\\" \\\\ \\$HOME\\n\\t\\q\"# a comment\n",
+            "URL=postgres://u:p@db/x?a=b\n",
+            "NOT_EXPANDED=$HOME\n",
+            "QUOTE_INSIDE=a'b\n",
+            "PLAIN=later wins by being last\n",
+        );
+        let parsed = parse_env_file(text).expect("parses");
+        let value = |name: &str| {
+            parsed
+                .iter()
+                .rev()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+
+        assert_eq!(value("PLAIN"), Some("later wins by being last"));
+        assert_eq!(value("EXPORTED"), Some("one"));
+        assert_eq!(value("TABBED"), Some("two"));
+        assert_eq!(value("INDENTED"), Some("spaced out"));
+        assert_eq!(value("EMPTY"), Some(""));
+        assert_eq!(value("EMPTY_COMMENT"), Some(""));
+        assert_eq!(value("TRAILING"), Some("value"));
+        assert_eq!(value("HASH"), Some("a#b"));
+        assert_eq!(value("SINGLE"), Some("it is $literal \\n # all"));
+        assert_eq!(value("DOUBLE"), Some("a \"b\" \\ $HOME\n\t\\q"));
+        assert_eq!(value("URL"), Some("postgres://u:p@db/x?a=b"));
+        assert_eq!(value("NOT_EXPANDED"), Some("$HOME"));
+        assert_eq!(value("QUOTE_INSIDE"), Some("a'b"));
+
+        // A variable called export is still a variable.
+
+        assert_eq!(
+            parse_env_file("export=1\n").expect("parses"),
+            [("export".to_owned(), "1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_env_file_refuses_a_line_it_cannot_read_without_repeating_it() {
+        for (text, wanted) in [
+            ("OK=1\nno equals sign\n", "line 2: expected NAME=VALUE"),
+            ("export ONLY_A_NAME\n", "line 1: expected NAME=VALUE"),
+            ("A B=hunter2\n", "line 1: the name before ="),
+            ("1A=hunter2\n", "line 1: the name before ="),
+            ("\n\nA='hunter2\n", "line 3: the single quote is not closed"),
+            ("A=\"hunter2\n", "line 1: the double quote is not closed"),
+            (
+                "A=\"hunter2\\\"\n",
+                "line 1: the double quote is not closed",
+            ),
+            ("A='x'hunter2\n", "line 1: only a comment may follow"),
+            ("A=\"x\" hunter2\n", "line 1: only a comment may follow"),
+        ] {
+            let error = parse_env_file(text).expect_err(text);
+            assert!(error.starts_with(wanted), "{text:?}: {error}");
+            assert!(!error.contains("hunter2"), "{text:?}: {error}");
+        }
     }
 
     #[test]
