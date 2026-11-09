@@ -19,6 +19,7 @@ pub mod events;
 pub mod fdpass;
 pub mod host;
 pub mod locations;
+pub mod log_files;
 pub mod logs;
 pub mod metrics;
 pub mod model;

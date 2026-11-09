@@ -588,7 +588,9 @@ impl Drop for Registration {
 }
 
 /// The development runs listening now, from the runtime directory; the
-/// leavings of a run that is gone are removed on the way.
+/// leavings of a run that is gone are removed on the way. The socket is
+/// tried because the pid of a run that is gone can come to belong to
+/// another process.
 pub fn runs(runtime: &Path) -> Vec<RunInfo> {
     let Ok(entries) = std::fs::read_dir(runtime.join("runs")) else {
         return Vec::new();
@@ -601,7 +603,11 @@ pub fn runs(runtime: &Path) -> Vec<RunInfo> {
             .and_then(|bytes| serde_json::from_slice::<RunInfo>(&bytes).ok());
 
         match info {
-            Some(info) if muru_controller::host::alive(info.pid) && info.socket.exists() => {
+            Some(info)
+                if muru_controller::host::alive(info.pid)
+                    && info.socket.exists()
+                    && !muru_controller::client::left_behind(&info.socket) =>
+            {
                 found.push(info);
             }
             _ => {
@@ -656,6 +662,14 @@ type LogStream = Pin<Box<dyn Stream<Item = Result<pb::LogLine, Status>> + Send>>
 type CommandStream = Pin<Box<dyn Stream<Item = Result<pb::CommandOutput, Status>> + Send>>;
 
 impl Service {
+    /// What a command on the log files gets from a development run.
+    fn no_log_files(&self) -> Status {
+        Status::failed_precondition(format!(
+            "a development run writes no log files: the output of {} goes to the terminal",
+            self.state.app
+        ))
+    }
+
     /// Why a command that manages the daemon's state is refused here.
     fn needs_the_daemon(&self, what: &str) -> Status {
         Status::failed_precondition(format!(
@@ -865,6 +879,34 @@ impl Admin for Service {
              terminal",
             self.state.app
         )))
+    }
+
+    async fn truncate_logs(
+        &self,
+        _: Request<pb::TruncateLogsRequest>,
+    ) -> Result<Response<pb::TruncateLogsResponse>, Status> {
+        Err(self.no_log_files())
+    }
+
+    async fn rotate_logs(
+        &self,
+        _: Request<pb::RotateLogsRequest>,
+    ) -> Result<Response<pb::RotateLogsResponse>, Status> {
+        Err(self.no_log_files())
+    }
+
+    async fn prune_logs(
+        &self,
+        _: Request<pb::PruneLogsRequest>,
+    ) -> Result<Response<pb::PruneLogsResponse>, Status> {
+        Err(self.no_log_files())
+    }
+
+    async fn list_logs(
+        &self,
+        _: Request<pb::ListLogsRequest>,
+    ) -> Result<Response<pb::ListLogsResponse>, Status> {
+        Err(self.no_log_files())
     }
 
     async fn get_metrics(

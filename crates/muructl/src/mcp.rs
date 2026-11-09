@@ -496,6 +496,23 @@ fn pairs(arguments: &JsonObject, key: &str) -> Result<Vec<(String, String)>, Str
 }
 
 /// Words, all owned.
+/// The options of a tool that names logs the way `muructl logs` commands do.
+fn log_target_flags(arguments: &JsonObject) -> Vec<String> {
+    let mut flags = Vec::new();
+
+    if flag(arguments, "access") {
+        flags.push("--access".to_owned());
+    }
+
+    flags.extend(option(arguments, "host", "--host"));
+
+    if flag(arguments, "all") {
+        flags.push("--all".to_owned());
+    }
+
+    flags
+}
+
 fn words(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_owned()).collect()
 }
@@ -700,6 +717,14 @@ fn specs() -> Vec<Spec> {
                 ]
                 .concat())
             },
+        },
+        Spec {
+            name: "log_files",
+            description: "Each log file with its size, its archives and the total, and whether its release or host no longer exists.",
+            changes: false,
+            properties: json!({}),
+            required: &[],
+            command: |_| Ok(words(&["logs", "list"])),
         },
         Spec {
             name: "events",
@@ -1208,6 +1233,80 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "truncate_logs",
+            description: "Cut a live log down to its newest bytes, at a line boundary; keep of 0 empties it. Refused unless yes is true; log_files shows what there is to cut.",
+            changes: true,
+            properties: json!({
+                "target": {"type": "string", "description": "One release's log, as app@release"},
+                "access": {"type": "boolean", "description": "The access log"},
+                "host": {"type": "string", "description": "The file a virtual host names for its records"},
+                "all": {"type": "boolean", "description": "Every log"},
+                "keep": {"type": "string", "description": "How much to keep, as a size such as 100MB; 0 for none"},
+                "yes": {"type": "boolean", "description": "Confirm the cut; without it the command refuses"},
+            }),
+            required: &["keep"],
+            command: |arguments| {
+                let mut command = words(&["logs", "truncate"]);
+                command.extend(text(arguments, "target"));
+                command.extend(log_target_flags(arguments));
+                command.extend(option(arguments, "keep", "--keep"));
+
+                if flag(arguments, "yes") {
+                    command.push("--yes".to_owned());
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "rotate_logs",
+            description: "Rotate logs now, on the daemon's policy: all of them with content unless one is named. Refused when rotation is external.",
+            changes: true,
+            properties: json!({
+                "target": {"type": "string", "description": "One release's log, as app@release"},
+                "access": {"type": "boolean", "description": "The access log"},
+                "host": {"type": "string", "description": "The file a virtual host names for its records"},
+                "all": {"type": "boolean", "description": "Every log"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["logs", "rotate"]);
+                command.extend(text(arguments, "target"));
+                command.extend(log_target_flags(arguments));
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "prune_logs",
+            description: "Remove log archives by keep (per log) or older_than, and with orphaned the logs and archives of what no longer exists. dry_run lists what would go; anything else is refused unless yes is true.",
+            changes: true,
+            properties: json!({
+                "keep": {"type": "integer", "description": "How many of the newest archives to keep per log"},
+                "older_than": {"type": "string", "description": "Remove archives older than this, as a duration such as 30d"},
+                "orphaned": {"type": "boolean", "description": "Also remove the logs and archives of what no longer exists"},
+                "dry_run": {"type": "boolean"},
+                "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["logs", "prune"]);
+                command.extend(option(arguments, "keep", "--keep"));
+                command.extend(option(arguments, "older_than", "--older-than"));
+
+                for (key, name) in [
+                    ("orphaned", "--orphaned"),
+                    ("dry_run", "--dry-run"),
+                    ("yes", "--yes"),
+                ] {
+                    if flag(arguments, key) {
+                        command.push(name.to_owned());
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "reopen_logs",
             description: "Reopen every log file by name, after something outside Muru has renamed them; workers also runs each worker's on_reopen_logs hook.",
             changes: true,
@@ -1288,6 +1387,27 @@ mod tests {
             ])
         );
         assert!(command("debug", json!({"what": "exec", "target": "shop"})).is_err());
+        assert_eq!(
+            command("truncate_logs", json!({"access": true, "keep": "1MB"})),
+            Ok(vec![
+                "logs".into(),
+                "truncate".into(),
+                "--access".into(),
+                "--keep".into(),
+                "1MB".into()
+            ]),
+            "without yes the command runs with no --yes, and refuses"
+        );
+        assert_eq!(
+            command("prune_logs", json!({"keep": 2, "dry_run": true})),
+            Ok(vec![
+                "logs".into(),
+                "prune".into(),
+                "--keep".into(),
+                "2".into(),
+                "--dry-run".into()
+            ])
+        );
 
         // Every environment value is for a person at a terminal, never
         // for the agent's context.

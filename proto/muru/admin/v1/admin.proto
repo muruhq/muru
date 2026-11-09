@@ -87,6 +87,14 @@ service Admin {
   // and reopening every log file after an external rotation.
   rpc TailLogs(TailLogsRequest) returns (stream LogLine);
   rpc ReopenLogs(ReopenLogsRequest) returns (ReopenLogsResponse);
+  // The log files and their archives, what they take, and which belong to a release or host that is gone.
+  rpc ListLogs(ListLogsRequest) returns (ListLogsResponse);
+  // Cut live logs down, or say what doing so would free.
+  rpc TruncateLogs(TruncateLogsRequest) returns (TruncateLogsResponse);
+  // Rotate logs now, on the daemon's policy; refused when rotation is external.
+  rpc RotateLogs(RotateLogsRequest) returns (RotateLogsResponse);
+  // Remove log archives by count or age and, when asked, the logs of what no longer exists.
+  rpc PruneLogs(PruneLogsRequest) returns (PruneLogsResponse);
 
   // Metrics (section 11.1): the node's Prometheus text exposition.
   rpc GetMetrics(GetMetricsRequest) returns (MetricsText);
@@ -972,6 +980,100 @@ message ReopenLogsRequest {
 message ReopenLogsResponse {
   bool edge = 1;                    // the edge was told
   uint32 hosts = 2;                 // hosts told
+}
+
+message ListLogsRequest {}
+
+message LogArchive {
+  string name = 1;                  // its path relative to the log directory
+  uint64 size = 2;                  // in bytes
+  uint64 modified_unix_ms = 3;      // when it was last changed
+}
+
+message LogInfo {
+  string name = 1;                  // its path relative to the log directory
+  string kind = 2;                  // access, edge, daemon, host or release
+  string app = 3;                   // the application of a release's log
+  string release = 4;               // the release of a release's log
+  repeated string hosts = 5;        // the virtual hosts that name this file
+  uint64 size = 6;                  // in bytes, 0 when the file is gone
+  bool present = 7;                 // the file itself exists, not only archives of it
+  repeated LogArchive archives = 8; // oldest first
+  uint64 archives_size = 9;         // the bytes the archives take
+  uint64 total = 10;                // the bytes the log and its archives take
+  bool orphaned = 11;               // its release or host no longer exists
+}
+
+message ListLogsResponse {
+  string directory = 1;             // the log directory
+  repeated LogInfo logs = 2;        // by name
+  uint64 total = 3;                 // the bytes all of them take
+  bool orphans_known = 4;           // whether orphaned is meaningful: the state store was available
+}
+
+message LogTarget {
+  string app = 1;                   // with release: one release's log
+  string release = 2;
+  bool access = 3;                  // the access log
+  string host = 4;                  // the file a virtual host names
+  bool all = 5;                     // every log
+}
+
+message TruncateLogsRequest {
+  LogTarget target = 1;
+  uint64 keep = 2;                  // bytes of the newest content to keep, 0 for none
+  bool dry_run = 3;                 // say what it would free, changing nothing
+}
+
+message TruncatedLog {
+  string name = 1;                  // its path relative to the log directory
+  uint64 size = 2;                  // its size before
+  uint64 kept = 3;                  // the bytes kept
+  uint64 freed = 4;                 // the bytes freed
+  bool in_place = 5;                // cut in place, so lines written meanwhile are lost
+  uint64 late = 6;                  // the bytes writers added during the swap, carried over
+  string error = 7;                 // why this log could not be cut
+}
+
+message TruncateLogsResponse {
+  repeated TruncatedLog logs = 1;
+  uint64 freed = 2;                 // the bytes freed in all
+  bool dry_run = 3;                 // nothing was changed
+}
+
+message RotateLogsRequest {
+  LogTarget target = 1;             // every log but orphaned ones when none is named
+}
+
+message RotatedLog {
+  string name = 1;                  // its path relative to the log directory
+  uint64 size = 2;                  // the bytes rotated
+  string archive = 3;               // the archive, before compression under a daemon
+  string error = 4;                 // why this log could not be rotated
+}
+
+message RotateLogsResponse {
+  repeated RotatedLog logs = 1;     // the logs with content that were named
+}
+
+message PruneLogsRequest {
+  optional uint32 keep = 1;         // keep this many of the newest archives per log
+  uint64 older_than_s = 2;          // remove archives older than this; 0 for no limit
+  bool orphaned = 3;                // also remove the logs and archives of releases and hosts that no longer exist
+  bool dry_run = 4;                 // only list what would go
+}
+
+message PrunedFile {
+  string name = 1;                  // its path relative to the log directory
+  uint64 size = 2;                  // in bytes
+  string why = 3;                   // keep, older_than or orphaned
+  string error = 4;                 // why it could not be removed
+}
+
+message PruneLogsResponse {
+  repeated PrunedFile removed = 1;
+  uint64 freed = 2;                 // the bytes freed, or that would be
+  bool dry_run = 3;                 // nothing was changed
 }
 
 message GetMetricsRequest {}

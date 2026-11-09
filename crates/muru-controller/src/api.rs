@@ -66,6 +66,172 @@ struct Service {
     applying: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// The instant `seconds` ago, for an age limit; none for 0.
+fn older_than(seconds: u64) -> Option<std::time::SystemTime> {
+    (seconds > 0).then(|| std::time::SystemTime::now() - std::time::Duration::from_secs(seconds))
+}
+
+/// Cut the named logs to `keep` bytes each, holding them against
+/// rotation: section 11.3 has `keep` of 0 truncate in place, and any
+/// other size swap in the kept part, have the writers reopen, and add
+/// what arrived meanwhile.
+async fn truncate_logs(
+    handle: Handle,
+    directory: std::path::PathBuf,
+    existing: crate::log_files::Existing,
+    target: pb::LogTarget,
+    keep: u64,
+) -> Result<pb::TruncateLogsResponse, Status> {
+    use crate::log_files::Target;
+
+    let logs = crate::log_files::list(&directory, Some(&existing))
+        .map_err(|error| Status::internal(format!("reading the log directory: {error}")))?;
+    let selected = crate::log_files::select(&logs, &target).map_err(Status::failed_precondition)?;
+    let paths: Vec<std::path::PathBuf> = selected
+        .iter()
+        .map(|log| directory.join(&log.name))
+        .collect();
+
+    let (done_tx, done_rx) = oneshot::channel();
+    handle
+        .commands
+        .send(Command::ClaimLogs {
+            paths: paths.clone(),
+            done: done_tx,
+        })
+        .await
+        .map_err(|_| Status::unavailable(STOPPING))?;
+    let in_place = done_rx
+        .await
+        .map_err(|_| Status::unavailable(STOPPING))?
+        .map_err(Status::failed_precondition)?;
+
+    let targets: Vec<Target> = selected
+        .iter()
+        .zip(paths.iter().zip(in_place))
+        .map(|(log, (path, in_place))| Target {
+            path: path.clone(),
+            name: log.name.clone(),
+            keep,
+            in_place,
+        })
+        .collect();
+    let sizes: std::collections::HashMap<String, (u64, u64)> = selected
+        .iter()
+        .map(|log| {
+            let cut = crate::log_files::cut_point(&directory.join(&log.name), log.size, keep)
+                .unwrap_or(0);
+            (log.name.clone(), (log.size, cut))
+        })
+        .collect();
+
+    let outcome = run_truncate(&handle, targets, keep, sizes).await;
+    let _ = handle.commands.send(Command::ReleaseLogs { paths }).await;
+
+    if let Ok(answer) = &outcome {
+        let names: Vec<&str> = answer
+            .logs
+            .iter()
+            .filter(|log| log.error.is_empty() && log.freed > 0)
+            .map(|log| log.name.as_str())
+            .collect();
+
+        if !names.is_empty() {
+            handle.events.emit(
+                "logs.truncated",
+                "logs",
+                "info",
+                &format!("truncated {}", names.join(", ")),
+            );
+        }
+    }
+
+    outcome
+}
+
+/// Cut each of the targets: the steps, in order, of section 11.3.
+async fn run_truncate(
+    handle: &Handle,
+    targets: Vec<crate::log_files::Target>,
+    keep: u64,
+    sizes: std::collections::HashMap<String, (u64, u64)>,
+) -> Result<pb::TruncateLogsResponse, Status> {
+    let cut = tokio::task::spawn_blocking(move || {
+        let mut swapped = Vec::new();
+        let mut results = Vec::new();
+
+        for target in targets {
+            let (size, cut) = sizes.get(&target.name).copied().unwrap_or_default();
+            let mut result = pb::TruncatedLog {
+                name: target.name.clone(),
+                size,
+                kept: size - cut,
+                freed: cut,
+                in_place: target.in_place && keep > 0,
+                ..Default::default()
+            };
+
+            let done = if target.in_place || keep == 0 {
+                crate::log_files::cut_in_place(&target).map(|_| None)
+            } else {
+                crate::log_files::swap_in(&target)
+            };
+
+            match done {
+                Ok(Some(one)) => swapped.push(one),
+                Ok(None) => {}
+                Err(error) => {
+                    result.error = error.to_string();
+                    result.freed = 0;
+                    result.kept = size;
+                }
+            }
+
+            results.push(result);
+        }
+
+        (results, swapped)
+    })
+    .await
+    .map_err(|error| Status::internal(error.to_string()))?;
+
+    let (mut results, swapped) = cut;
+
+    if !swapped.is_empty() {
+        let (done_tx, done_rx) = oneshot::channel();
+        handle
+            .commands
+            .send(Command::ReopenLogs {
+                workers: false,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        done_rx.await.map_err(|_| Status::unavailable(STOPPING))?;
+
+        for (name, added) in crate::log_files::finish_swaps(swapped).await {
+            let Some(result) = results.iter_mut().find(|result| result.name == name) else {
+                continue;
+            };
+
+            match added {
+                Ok(bytes) => result.late = bytes,
+                Err(error) => result.error = format!("adding the lines written meanwhile: {error}"),
+            }
+        }
+    }
+
+    Ok(pb::TruncateLogsResponse {
+        freed: results
+            .iter()
+            .filter(|log| log.error.is_empty())
+            .map(|log| log.freed)
+            .sum(),
+        logs: results,
+        dry_run: false,
+    })
+}
+
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send>>;
 type LogStream = Pin<Box<dyn Stream<Item = Result<pb::LogLine, Status>> + Send>>;
 type CommandStream = Pin<Box<dyn Stream<Item = Result<pb::CommandOutput, Status>> + Send>>;
@@ -819,6 +985,167 @@ impl Admin for Service {
             edge: reopened.edge,
             hosts: reopened.hosts,
         }))
+    }
+
+    async fn list_logs(
+        &self,
+        _: Request<pb::ListLogsRequest>,
+    ) -> Result<Response<pb::ListLogsResponse>, Status> {
+        let existing = crate::log_files::Existing::read(&self.handle.store).map_err(internal)?;
+        let directory = self.handle.info.locations.logs.path.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            crate::log_files::report(&directory, Some(&existing))
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .map_err(|error| Status::internal(format!("reading the log directory: {error}")))?;
+
+        Ok(Response::new(report))
+    }
+
+    async fn truncate_logs(
+        &self,
+        request: Request<pb::TruncateLogsRequest>,
+    ) -> Result<Response<pb::TruncateLogsResponse>, Status> {
+        let request = request.into_inner();
+        let target = request.target.unwrap_or_default();
+        let keep = request.keep;
+        let existing = crate::log_files::Existing::read(&self.handle.store).map_err(internal)?;
+        let directory = self.handle.info.locations.logs.path.clone();
+
+        if request.dry_run {
+            let plan = tokio::task::spawn_blocking(move || {
+                crate::log_files::plan_truncate(&directory, Some(&existing), &target, keep)
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .map_err(Status::failed_precondition)?;
+
+            return Ok(Response::new(plan));
+        }
+
+        // A task of its own carries the cut to its end: a caller that
+        // goes away must not leave files held against rotation.
+
+        let handle = self.handle.clone();
+
+        tokio::spawn(truncate_logs(handle, directory, existing, target, keep))
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .map(Response::new)
+    }
+
+    async fn rotate_logs(
+        &self,
+        request: Request<pb::RotateLogsRequest>,
+    ) -> Result<Response<pb::RotateLogsResponse>, Status> {
+        let target = request.into_inner().target.unwrap_or_default();
+        let existing = crate::log_files::Existing::read(&self.handle.store).map_err(internal)?;
+        let directory = self.handle.info.locations.logs.path.clone();
+        let selected = tokio::task::spawn_blocking(move || {
+            let logs = crate::log_files::list(&directory, Some(&existing))
+                .map_err(|error| format!("reading the log directory: {error}"))?;
+
+            crate::log_files::select_for_rotation(&logs, &target).map(|selected| {
+                selected
+                    .iter()
+                    .map(|log| (log.name.clone(), log.size, directory.join(&log.name)))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .map_err(Status::failed_precondition)?;
+
+        let sizes: std::collections::HashMap<String, u64> = selected
+            .iter()
+            .map(|(name, size, _)| (name.clone(), *size))
+            .collect();
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::RotateLogs {
+                logs: selected
+                    .into_iter()
+                    .map(|(name, _, path)| (name, path))
+                    .collect(),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let rotated = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+
+        Ok(Response::new(pb::RotateLogsResponse {
+            logs: rotated
+                .into_iter()
+                .map(|log| pb::RotatedLog {
+                    size: sizes.get(&log.name).copied().unwrap_or_default(),
+                    error: log.archive.as_ref().err().cloned().unwrap_or_default(),
+                    archive: log.archive.unwrap_or_default(),
+                    name: log.name,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn prune_logs(
+        &self,
+        request: Request<pb::PruneLogsRequest>,
+    ) -> Result<Response<pb::PruneLogsResponse>, Status> {
+        let request = request.into_inner();
+        let rules = crate::log_files::PruneRules {
+            keep: request.keep,
+            older_than: older_than(request.older_than_s),
+            orphaned: request.orphaned,
+        };
+
+        if rules.keep.is_none() && rules.older_than.is_none() && !rules.orphaned {
+            return Err(Status::invalid_argument(
+                "name what to prune: --keep, --older-than or --orphaned",
+            ));
+        }
+
+        let store = self.handle.store.clone();
+        let existing = crate::log_files::Existing::read(&store).map_err(internal)?;
+        let directory = self.handle.info.locations.logs.path.clone();
+        let dry_run = request.dry_run;
+        let events = self.handle.events.clone();
+
+        // The store is read again after the listing, so a log whose
+        // release was created in between is not taken for an orphan.
+
+        let answer = tokio::task::spawn_blocking(move || -> Result<_, Status> {
+            let logs = crate::log_files::list(&directory, Some(&existing))
+                .map_err(|error| Status::internal(format!("reading the log directory: {error}")))?;
+            let latest = crate::log_files::Existing::read(&store).map_err(internal)?;
+            let mut removed = crate::log_files::plan_prune(&logs, &rules, Some(&latest));
+
+            if !dry_run {
+                crate::log_files::carry_out_prune(&directory, &mut removed);
+            }
+
+            Ok(crate::log_files::prune_answer(removed, dry_run))
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))??;
+
+        if !dry_run && !answer.removed.is_empty() {
+            events.emit(
+                "logs.pruned",
+                "logs",
+                "info",
+                &format!(
+                    "pruned {} file{}",
+                    answer.removed.len(),
+                    if answer.removed.len() == 1 { "" } else { "s" }
+                ),
+            );
+        }
+
+        Ok(Response::new(answer))
     }
 
     async fn get_metrics(

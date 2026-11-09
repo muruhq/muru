@@ -27,11 +27,7 @@ pub async fn connect(socket: &Path) -> anyhow::Result<AdminClient<Channel>> {
     }
 
     if found.is_err() {
-        anyhow::bail!(
-            "nothing is listening at {}: no daemon (muructl daemon start, or muructl up) and no \
-             development run (muructl run)",
-            socket.display()
-        );
+        anyhow::bail!(nothing_listening(&socket));
     }
 
     // The URI is required by the channel but never used: the connector
@@ -49,8 +45,10 @@ pub async fn connect(socket: &Path) -> anyhow::Result<AdminClient<Channel>> {
         }))
         .await
         .map_err(|error| {
-            if refused_permission(&error) {
+            if caused_by(&error, std::io::ErrorKind::PermissionDenied) {
                 anyhow::anyhow!(permission_denied(&socket))
+            } else if caused_by(&error, std::io::ErrorKind::ConnectionRefused) {
+                anyhow::anyhow!(nothing_listening(&socket))
             } else {
                 anyhow::Error::from(error)
             }
@@ -59,14 +57,31 @@ pub async fn connect(socket: &Path) -> anyhow::Result<AdminClient<Channel>> {
     Ok(AdminClient::new(channel).max_decoding_message_size(MAX_REPLY_MIB * 1024 * 1024))
 }
 
-/// Whether a failed connection came down to a permission error, somewhere
+/// Whether `socket` refuses connections: a file left behind by something
+/// that has gone. A socket that answers, or that fails in another way
+/// such as a permission error, is not one.
+pub fn left_behind(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
+}
+
+/// Whether a failed connection came down to this kind of error, somewhere
 /// in the transport's chain of causes.
-fn refused_permission(error: &(dyn std::error::Error + 'static)) -> bool {
+fn caused_by(error: &(dyn std::error::Error + 'static), kind: std::io::ErrorKind) -> bool {
     std::iter::successors(Some(error), |error| error.source()).any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+            .is_some_and(|io| io.kind() == kind)
     })
+}
+
+/// What to say when no daemon or development run is at the admin socket.
+fn nothing_listening(socket: &Path) -> String {
+    format!(
+        "nothing is listening at {}: no daemon (muructl daemon start, or muructl up) and no \
+         development run (muructl run)",
+        socket.display()
+    )
 }
 
 /// What to say when the admin socket may not be used: the socket and who
@@ -90,6 +105,22 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_socket_left_behind_is_told_from_one_listening() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("admin.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        assert!(!left_behind(&path));
+
+        // Closing the listener leaves the socket's file where it was.
+
+        drop(listener);
+        assert!(left_behind(&path));
+
+        let error = connect(&path).await.expect_err("nothing is listening");
+        assert_eq!(error.to_string(), nothing_listening(&path));
+    }
 
     #[tokio::test]
     async fn a_socket_that_may_not_be_used_is_named_with_its_owner() {

@@ -405,6 +405,14 @@ its file again by name, compresses the archive in the background
 (`.zst` by default) and keeps the newest `keep` archives. A
 `logs.rotated` event names what was rotated.
 
+The daemon records the period each file was last seen in, in its state
+store, and compares against that record whenever it checks the file, so
+a period that ends while the daemon is stopped still rotates the file,
+once, when the daemon next runs. An empty file is not rotated. A file
+the daemon has no record of, such as one it sees for the first time,
+waits for its period to end. The record keeps a file from being
+rotated again by a later restart in the same period.
+
 ```toml
 [logs]
 every = 'daily'          # off, hourly, daily or weekly, at the period's start in UTC
@@ -453,5 +461,92 @@ file, and SIGUSR1 to a worker runs the hook.
 The instances of a [managed HTTP server](managed-servers.md) write to
 their release's file themselves and cannot be told to reopen it, so the
 built-in rotation copies that file to its archive and truncates it in
-place, and lines written while it is copied are lost. With
-`rotate = 'external'`, give those files logrotate's `copytruncate`.
+place, and lines written while it is copied are lost. The edge keeps its
+own log, `edge.log`, open in the same way, so it is rotated in place too.
+With `rotate = 'external'`, give those files logrotate's `copytruncate`.
+
+## Reclaiming disk space
+
+`muructl logs` has subcommands that show and reclaim the space logs take.
+They work on the log files of a daemon, through the daemon when one is
+running. With none running they work on the files themselves, in the
+daemon's log directory, or the one named by `--log-dir`. `--state-dir`
+names where the daemon's state store is, which is how they know what
+still exists. `muructl serve` writes its logs to standard output, so
+these commands have nothing to do for it.
+
+`muructl logs list` shows each log, its size, its archives and the total
+it takes, and flags as `orphaned` a log whose release or virtual host no
+longer exists. `--json` prints the same for scripts:
+
+```console
+$ muructl logs list
+LOG                                           SIZE           ARCHIVES     TOTAL
+access.log                                  5.2GB          3 (61.0MB)     5.3GB
+apps/shop/r3.log                           12.0MB                   -    12.0MB
+apps/shop/r1.log                          570.0MB           1 (9.0MB)   579.0MB  orphaned
+edge.log                                    4.0KB                   -     4.0KB
+total 5.9GB, in /var/log/muru
+```
+
+`muructl logs truncate` cuts a live log down. It needs a target
+(`APP@RELEASE`, `--access`, `--host HOST` or `--all`) and `--keep SIZE`,
+and leaves archives alone:
+
+```console
+$ muructl logs truncate --access --keep 100MB
+  access.log from 5.2GB to 99.8MB, freeing 5.1GB
+Truncate, freeing 5.1GB? [y/N]
+```
+
+It shows the space it will free and asks. `--yes` skips the question,
+and without a terminal the command refuses unless given `--yes`.
+
+- `--keep 0` empties the file in place. It needs no free disk space, so
+  it is the option for a full disk. The next line goes at the new end.
+
+- Any other size keeps that much of the newest content, cut at a line
+  boundary so JSON lines stay valid, and needs room for what is kept. The
+  kept part is written to a new file and swapped in, the writers open
+  the new file by name, and the lines that arrived during the swap are
+  added afterwards. No lines are lost, and those few lines can land
+  slightly out of order.
+
+The instances of a managed HTTP server cannot be told to reopen a file,
+and neither can the edge for its own log, `edge.log`, so those two are
+cut in place: the kept part is written aside, the file truncated and
+the kept part put back, and lines written while it is copied are lost.
+The same applies to every log when no daemon is running.
+
+`muructl logs rotate` rotates now, with the compression and `keep` of the
+policy in force, for when there is disk to spare and the history is
+worth having. With `APP@RELEASE`, `--access`, `--host HOST` or `--all` it
+rotates that log; with none it rotates every log with content except
+those flagged `orphaned`. A log with no content is left alone. It writes a
+`logs.rotated` event like any other rotation.
+
+With `rotate = 'external'`, `muructl logs rotate` refuses, since something
+else owns the rotation of those files.
+
+As with truncating, the instances of a managed HTTP server and the edge
+for its own log are rotated in place, and so is every log when no daemon
+is running: lines written while the file is copied are lost.
+
+`muructl logs prune` removes archives, by `--keep N` (the newest N of each
+log) or `--older-than DURATION`, and with `--orphaned` the logs and
+archives of releases and hosts that no longer exist. It lists what it
+would remove and asks, as `truncate` does; `--yes` skips the question
+and without a terminal the command refuses unless given `--yes`.
+`--dry-run` only lists.
+
+```console
+$ muructl logs prune --keep 3 --orphaned
+  access.log.20260101-000000.zst (61.0MB)
+  apps/shop/r1.log (570.0MB)
+  apps/shop/r1.log.20260101-000000.zst (9.0MB)
+Remove 3 files, freeing 640.0MB? [y/N]
+```
+
+`--orphaned` needs the state store, which `--state-dir` names when no
+daemon is running. A release or virtual host that still exists keeps
+its log.

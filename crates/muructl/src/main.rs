@@ -256,8 +256,8 @@ enum Command {
         output: admin::JsonArgs,
     },
 
-    /// Show or follow a release's output or the access log, or reopen
-    /// the log files after an external rotation.
+    /// Show or follow a release's output or the access log, list what
+    /// the log files take, or reopen them after an external rotation.
     Logs(admin::LogsArgs),
 
     /// Print the node's metrics as Prometheus text.
@@ -1045,6 +1045,14 @@ fn main() -> anyhow::Result<()> {
                     socket,
                     output,
                 }) => admin::logs_reopen(workers, socket, output.json).await,
+                Some(admin::LogsCommand::List {
+                    socket,
+                    files,
+                    output,
+                }) => admin::logs_list(socket, files, output.json).await,
+                Some(admin::LogsCommand::Truncate(args)) => admin::logs_truncate(*args).await,
+                Some(admin::LogsCommand::Rotate(args)) => admin::logs_rotate(*args).await,
+                Some(admin::LogsCommand::Prune(args)) => admin::logs_prune(*args).await,
                 None => admin::logs(args).await,
             }
         }),

@@ -274,7 +274,7 @@ impl SocketArgs {
 
         let locations = self.locations.resolve();
         let daemon = locations.admin_socket();
-        let daemon_listening = daemon.exists();
+        let daemon_listening = daemon.exists() && !muru_controller::client::left_behind(&daemon);
         let runs = crate::run_admin::runs(&locations.run.path);
         let here = std::env::current_dir()
             .and_then(|directory| directory.canonicalize())
@@ -6880,6 +6880,140 @@ pub struct LogsArgs {
     socket: SocketArgs,
 }
 
+/// Which logs a command on the log files acts on.
+#[derive(Args, Clone, Default)]
+pub struct LogTargetArgs {
+    /// One release's log, as app@release.
+    #[arg(value_name = "APP@RELEASE")]
+    target: Option<String>,
+
+    /// The access log.
+    #[arg(long)]
+    access: bool,
+
+    /// The file a virtual host names for its records.
+    #[arg(long, value_name = "HOST")]
+    host: Option<String>,
+
+    /// Every log.
+    #[arg(long)]
+    all: bool,
+}
+
+impl LogTargetArgs {
+    /// The target as the admin API takes it. `required` refuses none
+    /// being named, saying what `doing` would need.
+    fn target(&self, required: bool, doing: &str) -> anyhow::Result<pb::LogTarget> {
+        let named = usize::from(self.target.is_some())
+            + usize::from(self.access)
+            + usize::from(self.host.is_some())
+            + usize::from(self.all);
+
+        if named > 1 {
+            anyhow::bail!("name one of APP@RELEASE, --access, --host HOST or --all, not several");
+        }
+
+        if named == 0 && required {
+            anyhow::bail!("name what to {doing}: APP@RELEASE, --access, --host HOST or --all");
+        }
+
+        let (app, release) = match &self.target {
+            Some(target) => {
+                let (app, release) = split_release(target)?;
+                (app.to_owned(), release.to_owned())
+            }
+            None => (String::new(), String::new()),
+        };
+
+        Ok(pb::LogTarget {
+            app,
+            release,
+            access: self.access,
+            host: self.host.clone().unwrap_or_default(),
+            all: self.all,
+        })
+    }
+}
+
+/// What `muructl logs truncate` takes.
+#[derive(Args, Clone)]
+pub struct LogsTruncateArgs {
+    #[command(flatten)]
+    target: LogTargetArgs,
+
+    /// How much of the newest content to keep, as a size such as 100MB,
+    /// cut at a line boundary; 0 empties the file.
+    #[arg(long, value_name = "SIZE", value_parser = muru_config::parse_size)]
+    keep: u64,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// With no daemon running, where its log directory and state are.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// What `muructl logs rotate` takes.
+#[derive(Args, Clone)]
+pub struct LogsRotateArgs {
+    #[command(flatten)]
+    target: LogTargetArgs,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// With no daemon running, where its log directory, state and
+    /// configuration are.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// What `muructl logs prune` takes.
+#[derive(Args, Clone)]
+pub struct LogsPruneArgs {
+    /// Keep only this many of the newest archives per log.
+    #[arg(long, value_name = "N", conflicts_with = "older_than")]
+    keep: Option<u32>,
+
+    /// Remove archives older than this, as a duration such as 30d.
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    older_than: Option<Duration>,
+
+    /// Also remove the logs and archives of releases and virtual hosts
+    /// that no longer exist.
+    #[arg(long)]
+    orphaned: bool,
+
+    /// Only list what would be removed.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// With no daemon running, where its log directory and state are.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
 /// The `muructl logs` subcommands.
 #[derive(Subcommand, Clone)]
 pub enum LogsCommand {
@@ -6892,6 +7026,33 @@ pub enum LogsCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
+    },
+
+    /// Remove log archives by count or age and, with --orphaned, the
+    /// logs and archives of releases and hosts that no longer exist.
+    /// Asks first; without a terminal it needs --yes.
+    Prune(Box<LogsPruneArgs>),
+
+    /// Rotate logs now, on the policy in force: all of them when none
+    /// is named, compressing and keeping as configured.
+    Rotate(Box<LogsRotateArgs>),
+
+    /// Cut a live log down to its newest SIZE, at a line boundary. Asks
+    /// first; without a terminal it needs --yes.
+    Truncate(Box<LogsTruncateArgs>),
+
+    /// List each log with its size, its archives and the total, and flag
+    /// logs whose release or host no longer exists.
+    List {
+        #[command(flatten)]
+        socket: SocketArgs,
+
+        /// With no daemon running, where its log directory and state are.
+        #[command(flatten)]
+        files: DaemonFileArgs,
 
         #[command(flatten)]
         output: JsonArgs,
@@ -7004,6 +7165,477 @@ pub async fn logs_reopen(workers: bool, socket: SocketArgs, json: bool) -> anyho
         if workers { " and their workers" } else { "" }
     );
     Ok(())
+}
+
+/// How a command on the log files reaches them: through the running
+/// daemon, or with none running on the files themselves.
+enum LogsWay {
+    /// Through the daemon, so that it can tell the writers and nothing
+    /// collides with its rotation.
+    Daemon(Box<muru_proto::admin::v1::admin_client::AdminClient<tonic::transport::Channel>>),
+    /// On the files directly, with none running.
+    Files(Box<LogDirectory>),
+}
+
+/// A log directory with no daemon running.
+struct LogDirectory {
+    locations: Locations,
+    /// What the state store says exists, when there is a store.
+    existing: Option<muru_controller::log_files::Existing>,
+}
+
+/// Find how to reach the log files. A command that names no socket looks
+/// for the daemon alone, since only a daemon writes log files; with none
+/// listening it works on the files in the resolved log directory.
+async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result<LogsWay> {
+    let locations = Locations::resolve(&Options {
+        config: files.config.clone(),
+        state_dir: files.state_dir.clone(),
+        run_dir: socket.locations.run_dir.clone(),
+        log_dir: files.log_dir.clone(),
+        cache_dir: files.cache_dir.clone(),
+        system: socket.locations.system,
+    });
+    let path = socket
+        .socket
+        .clone()
+        .unwrap_or_else(|| locations.admin_socket());
+
+    // A socket file that is absent, or one left behind that refuses the
+    // connection, is no daemon. Anything else, such as a permission
+    // refused, is left for the connection below to report.
+
+    let nothing_listens = socket.socket.is_none()
+        && match path.try_exists() {
+            Ok(false) => true,
+            Ok(true) => muru_controller::client::left_behind(&path),
+            Err(_) => false,
+        };
+
+    if nothing_listens {
+        let store_path = locations.state_store();
+
+        let existing = if store_path.is_file() {
+            let store = muru_controller::store::Store::open_read_only(&store_path)
+                .with_context(|| format!("opening {}", store_path.display()))?;
+            Some(muru_controller::log_files::Existing::read(&store)?)
+        } else {
+            None
+        };
+
+        return Ok(LogsWay::Files(Box::new(LogDirectory {
+            locations,
+            existing,
+        })));
+    }
+
+    let mut client = client::connect(&path).await?;
+
+    if let Some(asked) = &files.log_dir {
+        let answer = client
+            .list_logs(pb::ListLogsRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner();
+        let same = asked.canonicalize().ok() == Path::new(&answer.directory).canonicalize().ok();
+
+        if !same {
+            anyhow::bail!(
+                "the daemon running at {} writes its logs to {}, not {}",
+                path.display(),
+                answer.directory,
+                asked.display()
+            );
+        }
+    }
+
+    Ok(LogsWay::Daemon(Box::new(client)))
+}
+
+/// List the log files and what they take.
+pub async fn logs_list(
+    socket: SocketArgs,
+    files: DaemonFileArgs,
+    json: bool,
+) -> anyhow::Result<()> {
+    let report = match logs_way(&socket, &files).await? {
+        LogsWay::Daemon(mut client) => client
+            .list_logs(pb::ListLogsRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => muru_controller::log_files::report(
+            &directory.locations.logs.path,
+            directory.existing.as_ref(),
+        )
+        .with_context(|| format!("reading {}", directory.locations.logs.path.display()))?,
+    };
+
+    if json {
+        return print_answer(&report);
+    }
+
+    if report.logs.is_empty() {
+        println!("no log files in {}", report.directory);
+        return Ok(());
+    }
+
+    println!(
+        "{:<40} {:>9} {:>18} {:>9}",
+        "LOG", "SIZE", "ARCHIVES", "TOTAL"
+    );
+
+    for log in &report.logs {
+        let archives = if log.archives.is_empty() {
+            "-".to_owned()
+        } else {
+            format!("{} ({})", log.archives.len(), human_size(log.archives_size))
+        };
+
+        let size = if log.present {
+            human_size(log.size)
+        } else {
+            "-".to_owned()
+        };
+
+        println!(
+            "{:<40} {size:>9} {archives:>18} {:>9}{}",
+            log.name,
+            human_size(log.total),
+            if log.orphaned { "  orphaned" } else { "" }
+        );
+    }
+
+    println!(
+        "total {}, in {}",
+        human_size(report.total),
+        report.directory
+    );
+
+    if !report.orphans_known {
+        println!(
+            "no state store was found, so logs of releases and hosts that no longer exist \
+             are not flagged"
+        );
+    }
+
+    Ok(())
+}
+
+/// Ask a yes or no question on the terminal, on standard error so that
+/// standard output stays the command's answer. `--yes` answers without
+/// asking; with no terminal to ask on, the command is refused.
+fn confirm(question: &str, yes: bool) -> anyhow::Result<bool> {
+    use std::io::{IsTerminal as _, Write as _};
+
+    if yes {
+        return Ok(true);
+    }
+
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("there is no terminal to ask {question:?}; give --yes to go ahead");
+    }
+
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Cut live logs down to their newest content.
+pub async fn logs_truncate(args: LogsTruncateArgs) -> anyhow::Result<()> {
+    let target = args.target.target(true, "truncate")?;
+    let keep = args.keep;
+    let way = logs_way(&args.socket, &args.files).await?;
+
+    // What it would free, for the question.
+
+    let plan = match &way {
+        LogsWay::Daemon(client) => client
+            .clone()
+            .truncate_logs(pb::TruncateLogsRequest {
+                target: Some(target.clone()),
+                keep,
+                dry_run: true,
+            })
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => muru_controller::log_files::plan_truncate(
+            &directory.locations.logs.path,
+            directory.existing.as_ref(),
+            &target,
+            keep,
+        )
+        .map_err(anyhow::Error::msg)?,
+    };
+
+    if plan.freed == 0 {
+        eprintln!(
+            "muru: nothing to truncate: every log named is within {}",
+            human_size(keep)
+        );
+        return if args.output.json {
+            print_answer(&plan)
+        } else {
+            Ok(())
+        };
+    }
+
+    for log in &plan.logs {
+        eprintln!(
+            "  {} from {} to {}, freeing {}",
+            log.name,
+            human_size(log.size),
+            human_size(log.kept),
+            human_size(log.freed)
+        );
+    }
+
+    let question = format!("Truncate, freeing {}?", human_size(plan.freed));
+
+    if !confirm(&question, args.yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    let answer = match way {
+        LogsWay::Daemon(mut client) => client
+            .truncate_logs(pb::TruncateLogsRequest {
+                target: Some(target),
+                keep,
+                dry_run: false,
+            })
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => muru_controller::log_files::truncate_directly(
+            &directory.locations.logs.path,
+            directory.existing.as_ref(),
+            &target,
+            keep,
+        )
+        .map_err(anyhow::Error::msg)?,
+    };
+
+    if args.output.json {
+        print_answer(&answer)?;
+    } else {
+        println!("muru: truncated, freeing {}", human_size(answer.freed));
+    }
+
+    let failures: Vec<String> = answer
+        .logs
+        .iter()
+        .filter(|log| !log.error.is_empty())
+        .map(|log| format!("{}: {}", log.name, log.error))
+        .collect();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+/// Rotate logs now.
+pub async fn logs_rotate(args: LogsRotateArgs) -> anyhow::Result<()> {
+    let target = args.target.target(false, "rotate")?;
+
+    let answer = match logs_way(&args.socket, &args.files).await? {
+        LogsWay::Daemon(mut client) => client
+            .rotate_logs(pb::RotateLogsRequest {
+                target: Some(target),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => {
+            let document = read_config(&directory.locations.config.path)?;
+            let policy = muru_controller::rotation::Policy::from_table(document.logs.as_ref())?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "log rotation is external ([logs] rotate = 'external'): whatever rotates \
+                         the files does this, followed by muructl logs reopen"
+                    )
+                })?;
+
+            muru_controller::log_files::rotate_directly(
+                &directory.locations.logs.path,
+                directory.existing.as_ref(),
+                &target,
+                &muru_controller::rotation::Rotator::new(policy),
+            )
+            .map_err(anyhow::Error::msg)?
+        }
+    };
+
+    if args.output.json {
+        print_answer(&answer)?;
+    } else if answer.logs.is_empty() {
+        println!("muru: nothing to rotate");
+    } else {
+        for log in &answer.logs {
+            if log.error.is_empty() {
+                println!("{} rotated to {}", log.name, log.archive);
+            }
+        }
+    }
+
+    let failures: Vec<String> = answer
+        .logs
+        .iter()
+        .filter(|log| !log.error.is_empty())
+        .map(|log| format!("{}: {}", log.name, log.error))
+        .collect();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+/// Remove log archives, and the logs of what no longer exists.
+pub async fn logs_prune(args: LogsPruneArgs) -> anyhow::Result<()> {
+    if args.keep.is_none() && args.older_than.is_none() && !args.orphaned {
+        anyhow::bail!("name what to prune: --keep, --older-than or --orphaned");
+    }
+
+    let way = logs_way(&args.socket, &args.files).await?;
+    let older_than_s = args.older_than.map_or(0, |limit| limit.as_secs());
+    let request = pb::PruneLogsRequest {
+        keep: args.keep,
+        older_than_s,
+        orphaned: args.orphaned,
+        dry_run: true,
+    };
+
+    // Plans and carries out a prune with no daemon running.
+
+    let directly =
+        |directory: &LogDirectory, dry_run: bool| -> anyhow::Result<pb::PruneLogsResponse> {
+            use muru_controller::log_files;
+
+            if args.orphaned && directory.existing.is_none() {
+                anyhow::bail!(
+                    "--orphaned needs the state store to tell what no longer exists; name it with \
+                 --state-dir"
+                );
+            }
+
+            let rules = log_files::PruneRules {
+                keep: args.keep,
+                older_than: (older_than_s > 0)
+                    .then(|| std::time::SystemTime::now() - Duration::from_secs(older_than_s)),
+                orphaned: args.orphaned,
+            };
+            let root = &directory.locations.logs.path;
+            let logs = log_files::list(root, directory.existing.as_ref())
+                .with_context(|| format!("reading {}", root.display()))?;
+            let mut removed = log_files::plan_prune(&logs, &rules, None);
+
+            if !dry_run {
+                log_files::carry_out_prune(root, &mut removed);
+            }
+
+            Ok(log_files::prune_answer(removed, dry_run))
+        };
+
+    let plan = match &way {
+        LogsWay::Daemon(client) => client
+            .clone()
+            .prune_logs(request)
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => directly(directory, true)?,
+    };
+
+    if args.dry_run || plan.removed.is_empty() {
+        if args.output.json {
+            return print_answer(&plan);
+        }
+
+        if plan.removed.is_empty() {
+            println!("muru: nothing to prune");
+        }
+
+        for file in &plan.removed {
+            println!("{} ({}, {})", file.name, human_size(file.size), file.why);
+        }
+
+        if args.dry_run && !plan.removed.is_empty() {
+            println!("would free {}", human_size(plan.freed));
+        }
+
+        return Ok(());
+    }
+
+    for file in &plan.removed {
+        eprintln!("  {} ({})", file.name, human_size(file.size));
+    }
+
+    let question = format!(
+        "Remove {} file{}, freeing {}?",
+        plan.removed.len(),
+        if plan.removed.len() == 1 { "" } else { "s" },
+        human_size(plan.freed)
+    );
+
+    if !confirm(&question, args.yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    let answer = match way {
+        LogsWay::Daemon(mut client) => client
+            .prune_logs(pb::PruneLogsRequest {
+                dry_run: false,
+                ..request
+            })
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => directly(&directory, false)?,
+    };
+
+    if args.output.json {
+        print_answer(&answer)?;
+    } else {
+        println!("muru: pruned, freeing {}", human_size(answer.freed));
+    }
+
+    let failures: Vec<String> = answer
+        .removed
+        .iter()
+        .filter(|file| !file.error.is_empty())
+        .map(|file| format!("{}: {}", file.name, file.error))
+        .collect();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+/// A byte count for a reader, in the units sizes are given in.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
+
+    for (scale, unit) in UNITS {
+        if bytes >= scale {
+            return format!("{:.1}{unit}", bytes as f64 / scale as f64);
+        }
+    }
+
+    format!("{bytes}B")
 }
 
 /// An access log record as the compact line a development run prints,

@@ -497,6 +497,29 @@ pub enum Command {
         /// Where the count of what was told goes.
         done: oneshot::Sender<Reopened>,
     },
+    /// Rotate these log files now (section 11.3), on the policy in
+    /// force. Answered with each one's archive or error, by log name, or
+    /// why none could be: rotation is external.
+    RotateLogs {
+        /// Each log's name and path.
+        logs: Vec<(String, PathBuf)>,
+        /// Where the answer goes.
+        done: oneshot::Sender<Result<Vec<RotatedLog>, String>>,
+    },
+    /// Hold log files against rotation while a command cuts them
+    /// (section 11.3). Answered with whether each file's writers cannot
+    /// reopen it, or why the files could not be held.
+    ClaimLogs {
+        /// The files, in order.
+        paths: Vec<PathBuf>,
+        /// Where the answer goes.
+        done: oneshot::Sender<Result<Vec<bool>, String>>,
+    },
+    /// Let rotation consider these log files again.
+    ReleaseLogs {
+        /// The files.
+        paths: Vec<PathBuf>,
+    },
     /// Stop the daemon: detaching, with hosts and the edge left serving
     /// for the next daemon to re-adopt, or draining everything first.
     Shutdown {
@@ -819,6 +842,15 @@ impl Interfaces {
     }
 }
 
+/// One log rotated at a command's asking: its archive, or why not.
+#[derive(Debug, Clone)]
+pub struct RotatedLog {
+    /// The log's name.
+    pub name: String,
+    /// Its archive, relative to the log directory.
+    pub archive: Result<String, String>,
+}
+
 /// What a ReopenLogs command reached.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Reopened {
@@ -1126,6 +1158,9 @@ struct Daemon {
     secrets: Vec<crate::secrets::Store>,
     /// Built-in log rotation (section 11.3), when it is on.
     rotation: Option<crate::rotation::Rotator>,
+    /// Section 11.3: the log files a command is cutting, which rotation
+    /// leaves alone.
+    claimed_logs: std::collections::HashSet<PathBuf>,
     /// Section 13.3: what SIGTERM means, and how a shutdown runs.
     shutdown: crate::shutdown::Policy,
     /// The service user (ADR 0026), when this daemon is root: whom the
@@ -1484,6 +1519,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         ),
     }
 
+    let rotation = settings
+        .rotation
+        .clone()
+        .map(|policy| restored_rotator(policy, &store));
+
     let mut daemon = Daemon {
         store,
         events,
@@ -1503,7 +1543,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         warm_ups: BTreeMap::new(),
         clock: (None, false),
         secrets: settings.secrets.clone(),
-        rotation: settings.rotation.clone().map(crate::rotation::Rotator::new),
+        rotation,
+        claimed_logs: std::collections::HashSet::new(),
         shutdown: settings.shutdown.clone(),
         service,
         debug_exec: settings.debug_exec,
@@ -2877,7 +2918,9 @@ impl Daemon {
         if settings.rotation != rotation {
             match (settings.rotation, self.rotation.as_mut()) {
                 (Some(policy), Some(rotator)) => rotator.set_policy(policy),
-                (Some(policy), None) => self.rotation = Some(crate::rotation::Rotator::new(policy)),
+                (Some(policy), None) => {
+                    self.rotation = Some(restored_rotator(policy, &self.store));
+                }
                 (None, _) => self.rotation = None,
             }
 
@@ -4219,6 +4262,17 @@ impl Daemon {
             }
             Command::ReopenLogs { workers, done } => {
                 let _ = done.send(self.reopen_logs(workers));
+            }
+            Command::RotateLogs { logs, done } => {
+                let _ = done.send(self.rotate_named_logs(logs));
+            }
+            Command::ClaimLogs { paths, done } => {
+                let _ = done.send(self.claim_logs(paths));
+            }
+            Command::ReleaseLogs { paths } => {
+                for path in paths {
+                    self.claimed_logs.remove(&path);
+                }
             }
             Command::Metrics { done } => {
                 let _ = done.send(self.metrics().await);
@@ -9049,9 +9103,13 @@ impl Daemon {
             return;
         };
         let now = std::time::SystemTime::now();
+
+        // The edge reopens the access log when told, but keeps its own log
+        // open on its standard streams, so that one is rotated in place.
+
         let mut candidates = vec![
             (self.locations.access_log(), false),
-            (self.locations.logs.path.join("edge.log"), false),
+            (self.locations.logs.path.join("edge.log"), true),
         ];
 
         if self.owns_log {
@@ -9085,13 +9143,27 @@ impl Daemon {
             ));
         }
 
+        // The period each file is now in is recorded before anything is
+        // rotated, so a daemon started after a crash does not rotate a
+        // file a second time.
+
+        let due: Vec<(PathBuf, bool)> = candidates
+            .into_iter()
+            .filter(|(path, _)| {
+                !self.claimed_logs.contains(path) && path.is_file() && rotator.due(path, now)
+            })
+            .collect();
+        let changed = rotator.take_changed();
+
+        if !changed.is_empty()
+            && let Err(error) = self.store.set_log_periods(&changed)
+        {
+            tracing::warn!(%error, "recording the log files' periods failed");
+        }
+
         let mut rotated = Vec::new();
 
-        for (path, in_place) in candidates {
-            if !path.is_file() || !rotator.due(&path, now) {
-                continue;
-            }
-
+        for (path, in_place) in due {
             let outcome = if in_place {
                 rotator.rotate_in_place(&path, now)
             } else {
@@ -9106,6 +9178,11 @@ impl Daemon {
             }
         }
 
+        self.after_rotation(&rotated);
+    }
+
+    /// Have the writers reopen what was rotated, and say so.
+    fn after_rotation(&mut self, rotated: &[PathBuf]) {
         if rotated.is_empty() {
             return;
         }
@@ -9136,6 +9213,84 @@ impl Daemon {
             "info",
             &format!("rotated {}", names.join(", ")),
         );
+    }
+
+    /// Rotate named logs now, as a command asks.
+    fn rotate_named_logs(
+        &mut self,
+        logs: Vec<(String, PathBuf)>,
+    ) -> Result<Vec<RotatedLog>, String> {
+        if self.rotation.is_none() {
+            return Err(
+                "log rotation is external ([logs] rotate = 'external'): whatever \
+                 rotates the files does this, followed by muructl logs reopen"
+                    .to_owned(),
+            );
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut rotated = Vec::new();
+        let mut archives = Vec::new();
+
+        for (name, path) in logs {
+            let archive = if self.claimed_logs.contains(&path) {
+                Err("it is being cut by another command".to_owned())
+            } else {
+                let in_place = self.cannot_reopen(&path);
+                let rotator = self.rotation.as_ref().expect("checked above");
+
+                let outcome = if in_place {
+                    rotator.rotate_in_place(&path, now)
+                } else {
+                    rotator.rotate(&path, now)
+                };
+
+                outcome
+                    .map(|archive| {
+                        let relative = archive
+                            .strip_prefix(&self.locations.logs.path)
+                            .unwrap_or(&archive)
+                            .display()
+                            .to_string();
+                        archives.push(archive);
+                        relative
+                    })
+                    .map_err(|error| error.to_string())
+            };
+
+            rotated.push(RotatedLog { name, archive });
+        }
+
+        self.after_rotation(&archives);
+        Ok(rotated)
+    }
+
+    /// Whether a log's writers cannot be told to reopen it: the
+    /// instances of a managed HTTP server, and the edge for its own log.
+    fn cannot_reopen(&self, path: &Path) -> bool {
+        let edge_log = self.locations.logs.path.join("edge.log");
+
+        path == edge_log
+            || self.running.iter().any(|((app, id), running)| {
+                running.backend.servers().is_some() && self.locations.release_log(app, id) == path
+            })
+    }
+
+    /// Hold log files against rotation, saying of each whether its
+    /// writers cannot reopen it: the instances of a managed HTTP server
+    /// and the edge's own log, which it does not reopen.
+    fn claim_logs(&mut self, paths: Vec<PathBuf>) -> Result<Vec<bool>, String> {
+        if let Some(path) = paths.iter().find(|path| self.claimed_logs.contains(*path)) {
+            return Err(format!(
+                "{} is being cut by another command",
+                path.display()
+            ));
+        }
+
+        let in_place = paths.iter().map(|path| self.cannot_reopen(path)).collect();
+
+        self.claimed_logs.extend(paths);
+        Ok(in_place)
     }
 
     fn reopen_logs(&mut self, workers: bool) -> Reopened {
@@ -9250,6 +9405,29 @@ fn writes_to(path: &std::path::Path) -> bool {
     described
         && current.dev() as libc::dev_t == stat.st_dev
         && current.ino() as libc::ino_t == stat.st_ino
+}
+
+/// A rotator that carries on from the periods the state store records,
+/// less those of log files that are gone (section 11.3).
+fn restored_rotator(policy: crate::rotation::Policy, store: &Store) -> crate::rotation::Rotator {
+    let (present, gone): (Vec<_>, Vec<_>) = store
+        .log_periods()
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "reading the log files' periods failed");
+            Vec::new()
+        })
+        .into_iter()
+        .partition(|(path, _)| std::path::Path::new(path).is_file());
+
+    let gone: Vec<String> = gone.into_iter().map(|(path, _)| path).collect();
+
+    if !gone.is_empty()
+        && let Err(error) = store.forget_log_periods(&gone)
+    {
+        tracing::warn!(%error, "forgetting the periods of removed log files failed");
+    }
+
+    crate::rotation::Rotator::restored(policy, present)
 }
 
 /// Open the daemon's log file again on standard output and error: once
