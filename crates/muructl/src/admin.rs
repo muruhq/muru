@@ -274,7 +274,7 @@ impl SocketArgs {
 
         let locations = self.locations.resolve();
         let daemon = locations.admin_socket();
-        let daemon_listening = daemon.exists();
+        let daemon_listening = daemon.exists() && !muru_controller::client::left_behind(&daemon);
         let runs = crate::run_admin::runs(&locations.run.path);
         let here = std::env::current_dir()
             .and_then(|directory| directory.canonicalize())
@@ -7208,8 +7208,7 @@ async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result
     let nothing_listens = socket.socket.is_none()
         && match path.try_exists() {
             Ok(false) => true,
-            Ok(true) => std::os::unix::net::UnixStream::connect(&path)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused),
+            Ok(true) => muru_controller::client::left_behind(&path),
             Err(_) => false,
         };
 

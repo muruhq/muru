@@ -588,7 +588,9 @@ impl Drop for Registration {
 }
 
 /// The development runs listening now, from the runtime directory; the
-/// leavings of a run that is gone are removed on the way.
+/// leavings of a run that is gone are removed on the way. The socket is
+/// tried because the pid of a run that is gone can come to belong to
+/// another process.
 pub fn runs(runtime: &Path) -> Vec<RunInfo> {
     let Ok(entries) = std::fs::read_dir(runtime.join("runs")) else {
         return Vec::new();
@@ -601,7 +603,11 @@ pub fn runs(runtime: &Path) -> Vec<RunInfo> {
             .and_then(|bytes| serde_json::from_slice::<RunInfo>(&bytes).ok());
 
         match info {
-            Some(info) if muru_controller::host::alive(info.pid) && info.socket.exists() => {
+            Some(info)
+                if muru_controller::host::alive(info.pid)
+                    && info.socket.exists()
+                    && !muru_controller::client::left_behind(&info.socket) =>
+            {
                 found.push(info);
             }
             _ => {
