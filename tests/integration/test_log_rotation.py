@@ -198,6 +198,42 @@ def test_logs_are_rotated_by_size_compressed_and_pruned(tmp_path: Path) -> None:
         daemon.stop()
 
 
+def test_the_edge_goes_on_writing_its_own_log_after_it_is_rotated(tmp_path: Path) -> None:
+    daemon = start_daemon(
+        tmp_path,
+        config_extra="[logs]\nsize = '100B'\nkeep = 20\ncompress = 'off'\nevery = 'off'\n",
+    )
+    logs = tmp_path / "logs"
+
+    def state() -> str:
+        return f"{listing(logs)}\n{daemon.muructl('events').stdout}"
+
+    def traffic() -> None:
+        for _ in range(30):
+            assert daemon.get("/catalogue").status == 200
+
+    def rotated() -> bool:
+        traffic()
+        return len(archives(logs, "edge.log")) >= 1
+
+    def written_again() -> bool:
+        traffic()
+        return (logs / "edge.log").stat().st_size > 0
+
+    try:
+        assert daemon.deploy("shop", SHOP, "--processes", "1") == (
+            "muru: release shop@r1 is ready and serving"
+        )
+
+        # The edge says when it reopens the access log. Those lines belong
+        # in edge.log, which it keeps open across its own rotation.
+
+        wait_for(rotated, "an edge log archive", describe=state)
+        wait_for(written_again, "the edge to write to edge.log again", describe=state)
+    finally:
+        daemon.stop()
+
+
 def test_external_rotation_leaves_the_files_alone(tmp_path: Path) -> None:
     daemon = start_daemon(tmp_path, config_extra="[logs]\nrotate = 'external'\nsize = '1KB'\n")
     logs = tmp_path / "logs"

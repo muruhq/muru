@@ -9103,9 +9103,13 @@ impl Daemon {
             return;
         };
         let now = std::time::SystemTime::now();
+
+        // The edge reopens the access log when told, but keeps its own log
+        // open on its standard streams, so that one is rotated in place.
+
         let mut candidates = vec![
             (self.locations.access_log(), false),
-            (self.locations.logs.path.join("edge.log"), false),
+            (self.locations.logs.path.join("edge.log"), true),
         ];
 
         if self.owns_log {

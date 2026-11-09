@@ -461,8 +461,9 @@ file, and SIGUSR1 to a worker runs the hook.
 The instances of a [managed HTTP server](managed-servers.md) write to
 their release's file themselves and cannot be told to reopen it, so the
 built-in rotation copies that file to its archive and truncates it in
-place, and lines written while it is copied are lost. With
-`rotate = 'external'`, give those files logrotate's `copytruncate`.
+place, and lines written while it is copied are lost. The edge keeps its
+own log, `edge.log`, open in the same way, so it is rotated in place too.
+With `rotate = 'external'`, give those files logrotate's `copytruncate`.
 
 ## Reclaiming disk space
 

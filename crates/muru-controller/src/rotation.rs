@@ -185,7 +185,8 @@ impl Rotator {
     }
 
     /// Rotate a file whose writers cannot reopen it (section 9.9: the
-    /// instances of a managed HTTP server): the contents are copied to
+    /// instances of a managed HTTP server, and section 11.3: the edge for
+    /// its own log): the contents are copied to
     /// the archive and the file truncated in place, which a writer with
     /// the file open in append mode carries on into. Lines written
     /// between the copy and the truncation are lost.
