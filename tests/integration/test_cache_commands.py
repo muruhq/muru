@@ -153,5 +153,5 @@ def test_cache_list_through_a_daemon_and_without_one(tmp_path: Path) -> None:
 
     answer = json.loads(muructl("cache", "clear", "daemon", *where, "--yes", "--json").stdout)
     names = {item["name"] for item in answer["daemon"]["removed"]}
-    assert names == {"uv-cache/alice"}, answer
+    assert names == {"uv-cache/alice", f"{version}/cp313"}, answer
     assert not (state / "uv-cache/alice").exists()
