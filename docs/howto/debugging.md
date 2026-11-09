@@ -482,6 +482,8 @@ interpreter only to answer, and sends the answer back the same way. A
 `exec` its code, on a thread of its own, so the worker goes on answering
 `status` and `stacks`, and giving up requests stuck past the hard
 timeout, while one runs. A worker runs one of them at a time, and
-refuses a second with a message saying that another is running. The daemon never reaches into a worker process directly, which is what lets
+refuses a second with a message saying that another is running. A
+profile read from outside the worker takes no thread of the worker and
+is not counted. The daemon never reaches into a worker process directly, which is what lets
 the same commands work on a release running as another user, and on
 an application in a container under `muructl serve`.
