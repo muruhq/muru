@@ -5155,6 +5155,12 @@ pub enum ReleaseCommand {
     /// without a terminal it needs --yes.
     Prune(Box<ReleasePruneArgs>),
 
+    /// Remove one release: its record, environment, bytecode and logs.
+    /// Refused for the serving or rollback release, a running one or one
+    /// a route or rollout uses. Asks first; without a terminal it needs
+    /// --yes.
+    Remove(Box<ReleaseRemoveArgs>),
+
     /// Wait until a release reaches a state.
     Wait {
         /// The release, as app@release.
@@ -5197,6 +5203,31 @@ pub struct ReleasePruneArgs {
     keep_logs: bool,
 
     /// Only list what would be removed.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// What `muructl release remove` takes.
+#[derive(Args, Clone)]
+pub struct ReleaseRemoveArgs {
+    /// The release, as app@release.
+    release: String,
+
+    /// Leave its log and log archives.
+    #[arg(long)]
+    keep_logs: bool,
+
+    /// Only say what would be removed.
     #[arg(long)]
     dry_run: bool,
 
@@ -5289,6 +5320,44 @@ pub async fn release_prune(args: ReleasePruneArgs) -> anyhow::Result<()> {
 
     let answer = client
         .prune_releases(pb::PruneReleasesRequest {
+            dry_run: false,
+            ..request
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    finish_removal(&answer, args.output.json)
+}
+
+/// Remove one release.
+pub async fn release_remove(args: ReleaseRemoveArgs) -> anyhow::Result<()> {
+    let (app, id) = split_release(&args.release)?;
+    let mut client = client::connect(&args.socket.socket()?).await?;
+    let request = pb::RemoveReleaseRequest {
+        app: app.to_owned(),
+        release: id.to_owned(),
+        keep_logs: args.keep_logs,
+        dry_run: true,
+    };
+
+    let plan = client
+        .remove_release(request.clone())
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if !show_removal_plan(&plan, args.dry_run, args.output.json)? {
+        return Ok(());
+    }
+
+    if !confirm_removal(&plan, args.yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    let answer = client
+        .remove_release(pb::RemoveReleaseRequest {
             dry_run: false,
             ..request
         })

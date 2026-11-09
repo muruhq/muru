@@ -131,5 +131,40 @@ def test_release_prune_takes_only_what_it_may(tmp_path: Path) -> None:
         assert removed_ids(answer) == ["r5"]
         assert answer["removed"][0]["why"] == "failed"
         assert not (tmp_path / "state/envs/shop/r5").exists()
+
+        # release remove refuses what prune never takes, and says why.
+
+        status = as_json(daemon, "release", "show", "shop@r8")
+        assert status["serving"] is True
+        refused = daemon.muructl("release", "remove", "shop@r8", "--yes", check=False)
+        assert refused.returncode != 0 and "serves" in refused.stderr
+        refused = daemon.muructl("release", "remove", "shop@r7", "--yes", check=False)
+        assert refused.returncode != 0 and "rollback" in refused.stderr
+        refused = daemon.muructl("release", "remove", "shop@r3", check=False)
+        assert refused.returncode != 0 and "--yes" in refused.stderr
+        missing = daemon.muructl("release", "remove", "shop@r99", "--yes", check=False)
+        assert missing.returncode != 0
+
+        # A failed release named goes at once, newer than the cutoff or not.
+
+        failed = daemon.muructl(
+            "deploy",
+            "shop",
+            str(SHOP),
+            "--python",
+            sys.executable,
+            "--entrypoint",
+            "shop.missing:application",
+            check=False,
+        )
+        assert failed.returncode != 0, failed.stdout
+        answer = as_json(daemon, "release", "remove", "shop@r9", "--yes")
+        assert removed_ids(answer) == ["r9"]
+        assert answer["removed"][0]["why"] == "named"
+        assert not (logs / "r9.log").exists()
+
+        answer = as_json(daemon, "release", "remove", "shop@r3", "--keep-logs", "--yes")
+        assert removed_ids(answer) == ["r3"]
+        assert (logs / "r3.log").exists()
     finally:
         daemon.stop()

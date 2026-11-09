@@ -60,14 +60,6 @@ impl Keep {
         }
     }
 
-    /// Whether the release may never be removed, by name or by prune.
-    pub fn protected(self) -> bool {
-        matches!(
-            self,
-            Keep::Serving | Keep::Rollback | Keep::InUse(_) | Keep::Referenced
-        )
-    }
-
     /// What it means, for a person.
     pub fn describe(self) -> String {
         match self {

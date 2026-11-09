@@ -1344,6 +1344,39 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "remove_release",
+            description: "Remove one release, as app@release, with its environment, bytecode and logs. Refused for the serving or rollback release, a running one or one a route or rollout uses. dry_run says what would go; anything else is refused unless yes is true.",
+            changes: true,
+            properties: json!({
+                "release": {"type": "string", "description": "The release, as app@release"},
+                "keep_logs": {"type": "boolean", "description": "Leave its log and archives"},
+                "dry_run": {"type": "boolean"},
+                "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
+            }),
+            required: &["release"],
+            command: |arguments| {
+                let mut command = words(&["release", "remove"]);
+                command.extend(
+                    arguments
+                        .get("release")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+
+                for (key, name) in [
+                    ("keep_logs", "--keep-logs"),
+                    ("dry_run", "--dry-run"),
+                    ("yes", "--yes"),
+                ] {
+                    if flag(arguments, key) {
+                        command.push(name.to_owned());
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "reopen_logs",
             description: "Reopen every log file by name, after something outside Muru has renamed them; workers also runs each worker's on_reopen_logs hook.",
             changes: true,
@@ -1456,6 +1489,15 @@ mod tests {
                 "2".into()
             ]),
             "without yes the command runs with no --yes, and refuses"
+        );
+        assert_eq!(
+            command("remove_release", json!({"release": "shop@r1", "yes": true})),
+            Ok(vec![
+                "release".into(),
+                "remove".into(),
+                "shop@r1".into(),
+                "--yes".into()
+            ])
         );
 
         // Every environment value is for a person at a terminal, never

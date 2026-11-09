@@ -66,5 +66,25 @@ With the release go its environment, its bytecode and its log and log
 archives. `--keep-logs` leaves the log and archives. A release's source
 directory is never touched.
 
+## Removing one release
+
+`muructl release remove` removes the one release named:
+
+```console
+$ muructl release remove shop@r2
+  shop@r2 (failed, 40.1KB)
+Remove 1 release, freeing 40.1KB? [y/N]
+```
+
+It asks in the same way, with `--yes`, `--dry-run` and `--keep-logs`. A
+failed release named this way goes at once, without waiting for the serving
+and rollback releases to be newer. The releases prune never takes are
+refused:
+
+```console
+$ muructl release remove shop@r5
+muru: error: shop@r5 cannot be removed: it serves the application's traffic
+```
+
 `muructl apply -f config/ --prune` removes the releases the files do not
 declare in the same way, logs included.

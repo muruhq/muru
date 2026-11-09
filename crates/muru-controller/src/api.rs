@@ -799,6 +799,56 @@ impl Admin for Service {
         Ok(Response::new(answer))
     }
 
+    async fn remove_release(
+        &self,
+        request: Request<pb::RemoveReleaseRequest>,
+    ) -> Result<Response<pb::RemoveReleasesResponse>, Status> {
+        let request = request.into_inner();
+        let app = self.handle.store.app(&request.app).map_err(not_found)?;
+
+        let _applying = if request.dry_run {
+            None
+        } else {
+            Some(self.applying.clone().lock_owned().await)
+        };
+
+        let referenced = self.referenced_releases().await?;
+        let candidates = self.candidates(&app.name, &referenced)?;
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.id == request.release)
+            .ok_or_else(|| {
+                Status::not_found(format!("no release {}@{}", app.name, request.release))
+            })?;
+
+        // Section 9.1: the protected releases are refused by name too. A
+        // failed release named goes without waiting for the cutoff.
+
+        if let Some(why) =
+            removal::protection(app.current.as_deref(), app.previous.as_deref(), candidate)
+        {
+            return Err(Status::failed_precondition(format!(
+                "{}@{} cannot be removed: {}",
+                app.name,
+                candidate.id,
+                why.describe()
+            )));
+        }
+
+        let planned = vec![Planned {
+            app: app.name.clone(),
+            id: candidate.id.clone(),
+            state: candidate.state,
+            created_unix_ms: candidate.created_unix_ms,
+            why: removal::Reason::Named,
+        }];
+
+        Ok(Response::new(
+            self.carry_out(planned, request.keep_logs, request.dry_run)
+                .await?,
+        ))
+    }
+
     async fn get_release(
         &self,
         request: Request<pb::GetReleaseRequest>,

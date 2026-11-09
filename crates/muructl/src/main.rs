@@ -973,6 +973,7 @@ fn main() -> anyhow::Result<()> {
                     output,
                 } => admin::release_list(app, socket, output.json).await,
                 admin::ReleaseCommand::Prune(args) => admin::release_prune(*args).await,
+                admin::ReleaseCommand::Remove(args) => admin::release_remove(*args).await,
                 admin::ReleaseCommand::Show {
                     release,
                     socket,
