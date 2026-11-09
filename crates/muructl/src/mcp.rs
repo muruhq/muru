@@ -1277,6 +1277,36 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "prune_logs",
+            description: "Remove log archives by keep (per log) or older_than, and with orphaned the logs and archives of what no longer exists. dry_run lists what would go; anything else is refused unless yes is true.",
+            changes: true,
+            properties: json!({
+                "keep": {"type": "integer", "description": "How many of the newest archives to keep per log"},
+                "older_than": {"type": "string", "description": "Remove archives older than this, as a duration such as 30d"},
+                "orphaned": {"type": "boolean", "description": "Also remove the logs and archives of what no longer exists"},
+                "dry_run": {"type": "boolean"},
+                "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["logs", "prune"]);
+                command.extend(option(arguments, "keep", "--keep"));
+                command.extend(option(arguments, "older_than", "--older-than"));
+
+                for (key, name) in [
+                    ("orphaned", "--orphaned"),
+                    ("dry_run", "--dry-run"),
+                    ("yes", "--yes"),
+                ] {
+                    if flag(arguments, key) {
+                        command.push(name.to_owned());
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "reopen_logs",
             description: "Reopen every log file by name, after something outside Muru has renamed them; workers also runs each worker's on_reopen_logs hook.",
             changes: true,
@@ -1367,6 +1397,16 @@ mod tests {
                 "1MB".into()
             ]),
             "without yes the command runs with no --yes, and refuses"
+        );
+        assert_eq!(
+            command("prune_logs", json!({"keep": 2, "dry_run": true})),
+            Ok(vec![
+                "logs".into(),
+                "prune".into(),
+                "--keep".into(),
+                "2".into(),
+                "--dry-run".into()
+            ])
         );
 
         // Every environment value is for a person at a terminal, never

@@ -93,6 +93,8 @@ service Admin {
   rpc TruncateLogs(TruncateLogsRequest) returns (TruncateLogsResponse);
   // Rotate logs now, on the daemon's policy; refused when rotation is external.
   rpc RotateLogs(RotateLogsRequest) returns (RotateLogsResponse);
+  // Remove log archives by count or age and, when asked, the logs of what no longer exists.
+  rpc PruneLogs(PruneLogsRequest) returns (PruneLogsResponse);
 
   // Metrics (section 11.1): the node's Prometheus text exposition.
   rpc GetMetrics(GetMetricsRequest) returns (MetricsText);
@@ -1052,6 +1054,26 @@ message RotatedLog {
 
 message RotateLogsResponse {
   repeated RotatedLog logs = 1;     // the logs with content that were named
+}
+
+message PruneLogsRequest {
+  optional uint32 keep = 1;         // keep this many of the newest archives per log
+  uint64 older_than_s = 2;          // remove archives older than this; 0 for no limit
+  bool orphaned = 3;                // also remove the logs and archives of releases and hosts that no longer exist
+  bool dry_run = 4;                 // only list what would go
+}
+
+message PrunedFile {
+  string name = 1;                  // its path relative to the log directory
+  uint64 size = 2;                  // in bytes
+  string why = 3;                   // keep, older_than or orphaned
+  string error = 4;                 // why it could not be removed
+}
+
+message PruneLogsResponse {
+  repeated PrunedFile removed = 1;
+  uint64 freed = 2;                 // the bytes freed, or that would be
+  bool dry_run = 3;                 // nothing was changed
 }
 
 message GetMetricsRequest {}

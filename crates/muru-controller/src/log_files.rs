@@ -21,6 +21,18 @@ pub struct Existing {
 }
 
 impl Existing {
+    /// Whether a log still looks orphaned on a later reading of the
+    /// store: what was created just after an earlier reading is kept.
+    fn still_orphaned(&self, log: &LogFile) -> bool {
+        match log.kind {
+            Kind::Release => !self
+                .releases
+                .contains(&(log.app.clone(), log.release.clone())),
+            Kind::Host => !self.hosts.contains_key(&log.name),
+            _ => false,
+        }
+    }
+
     /// The releases and the virtual hosts' files the store records.
     pub fn read(store: &Store) -> Result<Self, StoreError> {
         let releases = store
@@ -387,6 +399,96 @@ pub fn select<'a>(logs: &'a [LogFile], target: &pb::LogTarget) -> Result<Vec<&'a
     Ok(logs.iter().filter(|log| log.present).collect())
 }
 
+/// What a prune removes: archives by count or age and, with `orphaned`,
+/// everything of a log whose release or host no longer exists.
+#[derive(Debug, Clone, Default)]
+pub struct PruneRules {
+    /// Keep only this many newest archives per log.
+    pub keep: Option<u32>,
+    /// Remove archives last changed before this.
+    pub older_than: Option<SystemTime>,
+    /// Also remove orphaned logs and their archives.
+    pub orphaned: bool,
+}
+
+/// The files a prune removes, by name relative to the log directory.
+pub fn plan_prune(
+    logs: &[LogFile],
+    rules: &PruneRules,
+    latest: Option<&Existing>,
+) -> Vec<pb::PrunedFile> {
+    let mut removed = Vec::new();
+    let file = |name: &str, size: u64, why: &str| pb::PrunedFile {
+        name: name.to_owned(),
+        size,
+        why: why.to_owned(),
+        ..Default::default()
+    };
+
+    for log in logs {
+        let gone = rules.orphaned
+            && log.orphaned
+            && latest.is_none_or(|latest| latest.still_orphaned(log));
+
+        if gone {
+            if log.present {
+                removed.push(file(&log.name, log.size, "orphaned"));
+            }
+
+            removed.extend(
+                log.archives
+                    .iter()
+                    .map(|archive| file(&archive.name, archive.size, "orphaned")),
+            );
+            continue;
+        }
+
+        let by_keep = rules
+            .keep
+            .map_or(0, |keep| log.archives.len().saturating_sub(keep as usize));
+
+        for (index, archive) in log.archives.iter().enumerate() {
+            let old = rules
+                .older_than
+                .is_some_and(|cutoff| archive.modified < cutoff);
+
+            if index < by_keep {
+                removed.push(file(&archive.name, archive.size, "keep"));
+            } else if old {
+                removed.push(file(&archive.name, archive.size, "older_than"));
+            }
+        }
+    }
+
+    removed
+}
+
+/// Remove the planned files, ignoring one already gone, and any `apps/APP`
+/// directory left empty. Returns those that could not be removed, each
+/// with why.
+pub fn carry_out_prune(directory: &Path, planned: &mut [pb::PrunedFile]) {
+    let mut parents = HashSet::new();
+
+    for file in planned.iter_mut() {
+        let path = directory.join(&file.name);
+
+        if let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            file.error = error.to_string();
+            continue;
+        }
+
+        if let Some(parent) = path.parent().filter(|parent| *parent != directory) {
+            parents.insert(parent.to_path_buf());
+        }
+    }
+
+    for parent in parents {
+        let _ = std::fs::remove_dir(parent);
+    }
+}
+
 /// The logs a rotation acts on: those named, with content. With none
 /// named or `all`, every log but those orphaned, which prune removes.
 pub fn select_for_rotation<'a>(
@@ -439,6 +541,19 @@ pub fn rotate_directly(
     }
 
     Ok(pb::RotateLogsResponse { logs: rotated })
+}
+
+/// What `PruneLogs` answers for a plan carried out or only listed.
+pub fn prune_answer(removed: Vec<pb::PrunedFile>, dry_run: bool) -> pb::PruneLogsResponse {
+    pb::PruneLogsResponse {
+        freed: removed
+            .iter()
+            .filter(|file| file.error.is_empty())
+            .map(|file| file.size)
+            .sum(),
+        removed,
+        dry_run,
+    }
 }
 
 /// The start of what is kept, when `keep` bytes of a file's newest
@@ -897,6 +1012,71 @@ mod tests {
         let added = finish_swaps(vec![swapped]).await;
         assert_eq!(added[0].1.as_ref().unwrap(), &5);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "third\nlate\n");
+    }
+
+    #[test]
+    fn prune_takes_the_oldest_archives_and_every_part_of_an_orphan() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
+
+        write(directory, "access.log", 1);
+        write(directory, "access.log.20260101-000000.zst", 2);
+        write(directory, "access.log.20260102-000000.zst", 3);
+        write(directory, "access.log.20260103-000000.zst", 4);
+        write(directory, "apps/gone/r9.log", 5);
+        write(directory, "apps/gone/r9.log.20260101-000000", 6);
+
+        let logs = list(directory, Some(&existing())).unwrap();
+        let names = |removed: &[pb::PrunedFile]| {
+            removed
+                .iter()
+                .map(|file| file.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let by_keep = plan_prune(
+            &logs,
+            &PruneRules {
+                keep: Some(2),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(names(&by_keep), ["access.log.20260101-000000.zst",]);
+
+        let mut every_orphan = plan_prune(
+            &logs,
+            &PruneRules {
+                orphaned: true,
+                ..Default::default()
+            },
+            Some(&existing()),
+        );
+        assert_eq!(
+            names(&every_orphan),
+            ["apps/gone/r9.log", "apps/gone/r9.log.20260101-000000",]
+        );
+
+        // A release created after the first reading of the store is kept.
+
+        let mut later = existing();
+        later.releases.insert(("gone".to_owned(), "r9".to_owned()));
+        let kept = plan_prune(
+            &logs,
+            &PruneRules {
+                orphaned: true,
+                ..Default::default()
+            },
+            Some(&later),
+        );
+        assert!(kept.is_empty());
+
+        carry_out_prune(directory, &mut every_orphan);
+        assert!(
+            !directory.join("apps/gone").exists(),
+            "an emptied directory goes"
+        );
+        assert!(directory.join("access.log").exists());
     }
 
     #[test]

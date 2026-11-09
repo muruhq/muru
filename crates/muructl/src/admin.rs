@@ -6979,6 +6979,41 @@ pub struct LogsRotateArgs {
     output: JsonArgs,
 }
 
+/// What `muructl logs prune` takes.
+#[derive(Args, Clone)]
+pub struct LogsPruneArgs {
+    /// Keep only this many of the newest archives per log.
+    #[arg(long, value_name = "N", conflicts_with = "older_than")]
+    keep: Option<u32>,
+
+    /// Remove archives older than this, as a duration such as 30d.
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    older_than: Option<Duration>,
+
+    /// Also remove the logs and archives of releases and virtual hosts
+    /// that no longer exist.
+    #[arg(long)]
+    orphaned: bool,
+
+    /// Only list what would be removed.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// With no daemon running, where its log directory and state are.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
 /// The `muructl logs` subcommands.
 #[derive(Subcommand, Clone)]
 pub enum LogsCommand {
@@ -6995,6 +7030,11 @@ pub enum LogsCommand {
         #[command(flatten)]
         output: JsonArgs,
     },
+
+    /// Remove log archives by count or age and, with --orphaned, the
+    /// logs and archives of releases and hosts that no longer exist.
+    /// Asks first; without a terminal it needs --yes.
+    Prune(Box<LogsPruneArgs>),
 
     /// Rotate logs now, on the policy in force: all of them when none
     /// is named, compressing and keeping as configured.
@@ -7161,13 +7201,17 @@ async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result
         .clone()
         .unwrap_or_else(|| locations.admin_socket());
 
+    // A socket file that is absent, or one left behind that refuses the
+    // connection, is no daemon. Anything else, such as a permission
+    // refused, is left for the connection below to report.
+
     let nothing_listens = socket.socket.is_none()
-        && std::os::unix::net::UnixStream::connect(&path).is_err_and(|error| {
-            matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            )
-        });
+        && match path.try_exists() {
+            Ok(false) => true,
+            Ok(true) => std::os::unix::net::UnixStream::connect(&path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused),
+            Err(_) => false,
+        };
 
     if nothing_listens {
         let store_path = locations.state_store();
@@ -7290,7 +7334,7 @@ fn confirm(question: &str, yes: bool) -> anyhow::Result<bool> {
     }
 
     if !std::io::stdin().is_terminal() {
-        anyhow::bail!("{question} needs an answer, and there is no terminal to ask on; give --yes");
+        anyhow::bail!("there is no terminal to ask {question:?}; give --yes to go ahead");
     }
 
     eprint!("{question} [y/N] ");
@@ -7449,6 +7493,130 @@ pub async fn logs_rotate(args: LogsRotateArgs) -> anyhow::Result<()> {
         .iter()
         .filter(|log| !log.error.is_empty())
         .map(|log| format!("{}: {}", log.name, log.error))
+        .collect();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+/// Remove log archives, and the logs of what no longer exists.
+pub async fn logs_prune(args: LogsPruneArgs) -> anyhow::Result<()> {
+    if args.keep.is_none() && args.older_than.is_none() && !args.orphaned {
+        anyhow::bail!("name what to prune: --keep, --older-than or --orphaned");
+    }
+
+    let way = logs_way(&args.socket, &args.files).await?;
+    let older_than_s = args.older_than.map_or(0, |limit| limit.as_secs());
+    let request = pb::PruneLogsRequest {
+        keep: args.keep,
+        older_than_s,
+        orphaned: args.orphaned,
+        dry_run: true,
+    };
+
+    // Plans and carries out a prune with no daemon running.
+
+    let directly =
+        |directory: &LogDirectory, dry_run: bool| -> anyhow::Result<pb::PruneLogsResponse> {
+            use muru_controller::log_files;
+
+            if args.orphaned && directory.existing.is_none() {
+                anyhow::bail!(
+                    "--orphaned needs the state store to tell what no longer exists; name it with \
+                 --state-dir"
+                );
+            }
+
+            let rules = log_files::PruneRules {
+                keep: args.keep,
+                older_than: (older_than_s > 0)
+                    .then(|| std::time::SystemTime::now() - Duration::from_secs(older_than_s)),
+                orphaned: args.orphaned,
+            };
+            let root = &directory.locations.logs.path;
+            let logs = log_files::list(root, directory.existing.as_ref())
+                .with_context(|| format!("reading {}", root.display()))?;
+            let mut removed = log_files::plan_prune(&logs, &rules, None);
+
+            if !dry_run {
+                log_files::carry_out_prune(root, &mut removed);
+            }
+
+            Ok(log_files::prune_answer(removed, dry_run))
+        };
+
+    let plan = match &way {
+        LogsWay::Daemon(client) => client
+            .clone()
+            .prune_logs(request)
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => directly(directory, true)?,
+    };
+
+    if args.dry_run || plan.removed.is_empty() {
+        if args.output.json {
+            return print_answer(&plan);
+        }
+
+        if plan.removed.is_empty() {
+            println!("muru: nothing to prune");
+        }
+
+        for file in &plan.removed {
+            println!("{} ({}, {})", file.name, human_size(file.size), file.why);
+        }
+
+        if args.dry_run && !plan.removed.is_empty() {
+            println!("would free {}", human_size(plan.freed));
+        }
+
+        return Ok(());
+    }
+
+    for file in &plan.removed {
+        eprintln!("  {} ({})", file.name, human_size(file.size));
+    }
+
+    let question = format!(
+        "Remove {} file{}, freeing {}?",
+        plan.removed.len(),
+        if plan.removed.len() == 1 { "" } else { "s" },
+        human_size(plan.freed)
+    );
+
+    if !confirm(&question, args.yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    let answer = match way {
+        LogsWay::Daemon(mut client) => client
+            .prune_logs(pb::PruneLogsRequest {
+                dry_run: false,
+                ..request
+            })
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => directly(&directory, false)?,
+    };
+
+    if args.output.json {
+        print_answer(&answer)?;
+    } else {
+        println!("muru: pruned, freeing {}", human_size(answer.freed));
+    }
+
+    let failures: Vec<String> = answer
+        .removed
+        .iter()
+        .filter(|file| !file.error.is_empty())
+        .map(|file| format!("{}: {}", file.name, file.error))
         .collect();
 
     if failures.is_empty() {

@@ -5,6 +5,7 @@ and with none running."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from collections.abc import Callable
@@ -114,6 +115,8 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
         assert refused.returncode != 0 and "--yes" in refused.stderr
         before = access.stat().st_size
         assert before > 4096
+        archive = logs / "access.log.20260103-000000.zst"
+        archive.write_bytes(b"kept")
 
         # Keeping some cuts at a line and leaves valid JSON lines, and the
         # edge goes on into the file that replaced it.
@@ -125,6 +128,7 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
         )
         assert answer["freed"] > 0 and answer["logs"][0]["error"] == ""
         assert 0 < access.stat().st_size <= 1024 + 2048
+        assert archive.read_bytes() == b"kept", "truncate leaves archives alone"
         kept = access.read_text()
         assert kept.endswith("\n") and all(json.loads(line) for line in kept.splitlines())
         assert daemon.get("/truncated").status in (200, 404)
@@ -161,13 +165,53 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
             "the archive to be compressed",
         )
 
-        # An archive is left alone by truncate.
+        # logs prune lists first, then removes by count, by age and the
+        # orphans, asking unless told not to.
 
-        assert (orphan.parent / "r9.log.20260101-000000").exists()
+        wait_for(
+            lambda: not list(logs.glob("access.log.*[0-9]")),
+            "the archive to be compressed so it is settled",
+        )
+        (logs / "access.log.20260101-000000.zst").write_bytes(b"old")
+        (logs / "access.log.20260102-000000.zst").write_bytes(b"old")
+        older = time.time() - 100 * 86400
+        os.utime(logs / "access.log.20260101-000000.zst", (older, older))
+
+        assert "name what to prune" in daemon.muructl("logs", "prune", check=False).stderr
+        refused = daemon.muructl("logs", "prune", "--orphaned", check=False)
+        assert refused.returncode != 0 and "--yes" in refused.stderr
+
+        plan = json.loads(
+            daemon.muructl("logs", "prune", "--orphaned", "--dry-run", "--json").stdout
+        )
+        assert plan["dry_run"] is True
+        assert {item["name"] for item in plan["removed"]} == {
+            "apps/gone/r9.log",
+            "apps/gone/r9.log.20260101-000000",
+        }
+        assert orphan.exists(), "a dry run changes nothing"
+
+        answer = json.loads(
+            daemon.muructl("logs", "prune", "--older-than", "30d", "--yes", "--json").stdout
+        )
+        assert [item["why"] for item in answer["removed"]] == ["older_than"]
+        assert not (logs / "access.log.20260101-000000.zst").exists()
+
+        answer = json.loads(
+            daemon.muructl("logs", "prune", "--keep", "1", "--orphaned", "--yes", "--json").stdout
+        )
+        whys = {item["why"] for item in answer["removed"]}
+        assert whys == {"keep", "orphaned"}, answer
+        assert answer["freed"] > 0
+        assert not orphan.parent.exists(), "the orphan's directory goes with it"
+        assert len(list(logs.glob("access.log.*"))) == 1, "the newest archive stays"
+        assert "logs.pruned" in daemon.muructl("events").stdout
 
         # With the daemon stopped the same commands work on the files.
 
         daemon.stop()
+        orphan.parent.mkdir(parents=True)
+        orphan.write_text("old\n")
         report = json.loads(direct(daemon, "logs", "list", "--json").stdout)
         assert report["orphans_known"] is True
         assert by_name(report)["apps/gone/r9.log"]["orphaned"] is True
@@ -182,5 +226,10 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
         answer = json.loads(direct(daemon, "logs", "rotate", "--access", "--json").stdout)
         assert answer["logs"][0]["archive"].endswith(".zst")
         assert access.stat().st_size == 0
+
+        answer = json.loads(
+            direct(daemon, "logs", "prune", "--keep", "0", "--yes", "--json").stdout
+        )
+        assert answer["removed"] and not list(logs.glob("access.log.*"))
     finally:
         daemon.stop()

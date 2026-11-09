@@ -889,6 +889,13 @@ impl Admin for Service {
         Err(self.no_log_files())
     }
 
+    async fn prune_logs(
+        &self,
+        _: Request<pb::PruneLogsRequest>,
+    ) -> Result<Response<pb::PruneLogsResponse>, Status> {
+        Err(self.no_log_files())
+    }
+
     async fn list_logs(
         &self,
         _: Request<pb::ListLogsRequest>,

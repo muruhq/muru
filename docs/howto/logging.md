@@ -530,3 +530,22 @@ else owns the rotation of those files.
 As with truncating, the instances of a managed HTTP server and the edge
 for its own log are rotated in place, and so is every log when no daemon
 is running: lines written while the file is copied are lost.
+
+`muructl logs prune` removes archives, by `--keep N` (the newest N of each
+log) or `--older-than DURATION`, and with `--orphaned` the logs and
+archives of releases and hosts that no longer exist. It lists what it
+would remove and asks, as `truncate` does; `--yes` skips the question
+and without a terminal the command refuses unless given `--yes`.
+`--dry-run` only lists.
+
+```console
+$ muructl logs prune --keep 3 --orphaned
+  access.log.20260101-000000.zst (61.0MB)
+  apps/shop/r1.log (570.0MB)
+  apps/shop/r1.log.20260101-000000.zst (9.0MB)
+Remove 3 files, freeing 640.0MB? [y/N]
+```
+
+`--orphaned` needs the state store, which `--state-dir` names when no
+daemon is running. A release or virtual host that still exists keeps
+its log.

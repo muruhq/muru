@@ -40,6 +40,7 @@ ones it names.
 | `log_level` | changes | `muructl logging level` | `target`, `levels`, `for`, `reset` |
 | `access_log` | changes | `muructl logging access` | `mode`, `app`, `paths`, `for`, `reset` |
 | `reopen_logs` | changes | `muructl logs reopen` | `workers` |
+| `prune_logs` | changes | `muructl logs prune`, refused unless `yes` is true or `dry_run` asked for | `keep`, `older_than`, `orphaned`, `dry_run`, `yes` |
 | `rotate_logs` | changes | `muructl logs rotate` | `target` (app@release), `access`, `host`, `all` |
 | `truncate_logs` | changes | `muructl logs truncate`, refused unless `yes` is true | `target` (app@release), `access`, `host`, `all`, `keep`, `yes` |
 | `reload_config` | changes | `muructl daemon reload` | none |

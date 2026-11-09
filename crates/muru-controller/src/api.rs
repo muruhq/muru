@@ -66,6 +66,11 @@ struct Service {
     applying: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// The instant `seconds` ago, for an age limit; none for 0.
+fn older_than(seconds: u64) -> Option<std::time::SystemTime> {
+    (seconds > 0).then(|| std::time::SystemTime::now() - std::time::Duration::from_secs(seconds))
+}
+
 /// Cut the named logs to `keep` bytes each, holding them against
 /// rotation: section 11.3 has `keep` of 0 truncate in place, and any
 /// other size swap in the kept part, have the writers reopen, and add
@@ -1084,6 +1089,63 @@ impl Admin for Service {
                 })
                 .collect(),
         }))
+    }
+
+    async fn prune_logs(
+        &self,
+        request: Request<pb::PruneLogsRequest>,
+    ) -> Result<Response<pb::PruneLogsResponse>, Status> {
+        let request = request.into_inner();
+        let rules = crate::log_files::PruneRules {
+            keep: request.keep,
+            older_than: older_than(request.older_than_s),
+            orphaned: request.orphaned,
+        };
+
+        if rules.keep.is_none() && rules.older_than.is_none() && !rules.orphaned {
+            return Err(Status::invalid_argument(
+                "name what to prune: --keep, --older-than or --orphaned",
+            ));
+        }
+
+        let store = self.handle.store.clone();
+        let existing = crate::log_files::Existing::read(&store).map_err(internal)?;
+        let directory = self.handle.info.locations.logs.path.clone();
+        let dry_run = request.dry_run;
+        let events = self.handle.events.clone();
+
+        // The store is read again after the listing, so a log whose
+        // release was created in between is not taken for an orphan.
+
+        let answer = tokio::task::spawn_blocking(move || -> Result<_, Status> {
+            let logs = crate::log_files::list(&directory, Some(&existing))
+                .map_err(|error| Status::internal(format!("reading the log directory: {error}")))?;
+            let latest = crate::log_files::Existing::read(&store).map_err(internal)?;
+            let mut removed = crate::log_files::plan_prune(&logs, &rules, Some(&latest));
+
+            if !dry_run {
+                crate::log_files::carry_out_prune(&directory, &mut removed);
+            }
+
+            Ok(crate::log_files::prune_answer(removed, dry_run))
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))??;
+
+        if !dry_run && !answer.removed.is_empty() {
+            events.emit(
+                "logs.pruned",
+                "logs",
+                "info",
+                &format!(
+                    "pruned {} file{}",
+                    answer.removed.len(),
+                    if answer.removed.len() == 1 { "" } else { "s" }
+                ),
+            );
+        }
+
+        Ok(Response::new(answer))
     }
 
     async fn get_metrics(

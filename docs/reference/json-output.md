@@ -95,6 +95,7 @@ $ muructl release show shop@r9 --json
 | `muructl command run` | As `muructl exec` prints it |
 | `muructl exec` | One object per line of output, with `release`, `line` and `stderr`, then one with `finished` true, the `exit_code`, `ok`, true when the command exited with 0 and was not stopped, and the ending as a `message`. `release` is empty for a command `muructl` runs itself |
 | `muructl logs reopen` | What reopened its files: `edge`, `hosts` |
+| `muructl logs prune` | `freed` (bytes), `dry_run` and `removed`, each with `name`, `size`, `why` (`keep`, `older_than` or `orphaned`) and `error` when it could not be removed |
 | `muructl logs rotate` | `logs`, each with `name`, `size`, `archive` (relative to the log directory, before compression through a daemon) and `error` when that log could not be rotated |
 | `muructl logs truncate` | `freed`, `dry_run` and `logs`, each with `name`, `size`, `kept`, `freed`, `in_place` (the log was cut in place, so lines written while it was copied are lost), `late` (the bytes writers added during the swap, carried over) and `error` when that log could not be cut |
 | `muructl logs list` | `directory`, `total`, `orphans_known` (whether the state store was available to tell) and `logs`, each with `name`, relative to the directory, `kind` (`access`, `edge`, `daemon`, `host` or `release`), `app`, `release`, `hosts`, `size`, `present`, `archives_size`, `total`, `orphaned`, and `archives`, oldest first, each with `name`, `size` and `modified_unix_ms` |

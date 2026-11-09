@@ -85,7 +85,9 @@ directory and `deploy`'s settings, without the daemon.
    `run_command`; `commands` lists them and their inputs.
 
 6. Clean up: `rollback` when a release made things worse, `drain` a
-   release that is no longer needed.
+   release that is no longer needed. `log_files` shows what the logs
+   take. `truncate_logs` and `prune_logs` remove what they name and are
+   refused unless `yes` is true, so ask the developer first.
 
 ## What to check after each operation
 
