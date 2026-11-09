@@ -405,6 +405,14 @@ its file again by name, compresses the archive in the background
 (`.zst` by default) and keeps the newest `keep` archives. A
 `logs.rotated` event names what was rotated.
 
+The daemon records the period each file was last seen in, in its state
+store, and compares against that record whenever it checks the file, so
+a period that ends while the daemon is stopped still rotates the file,
+once, when the daemon next runs. An empty file is not rotated. A file
+the daemon has no record of, such as one it sees for the first time,
+waits for its period to end. The record keeps a file from being
+rotated again by a later restart in the same period.
+
 ```toml
 [logs]
 every = 'daily'          # off, hourly, daily or weekly, at the period's start in UTC

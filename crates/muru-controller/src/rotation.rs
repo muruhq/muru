@@ -109,17 +109,30 @@ impl Policy {
 pub struct Rotator {
     policy: Policy,
     /// The period each file was last seen in, so a change of period
-    /// rotates it once.
+    /// rotates it once. Restored from the state store at start, so the
+    /// comparison carries across a restart of the daemon.
     periods: HashMap<PathBuf, String>,
+    /// The records changed since they were last taken for the state store.
+    changed: Vec<(String, String)>,
 }
 
 impl Rotator {
-    /// A rotator for the policy, starting now: nothing is due for the
-    /// clock until the period changes.
+    /// A rotator for the policy with no record of any file: nothing is
+    /// due for the clock until a file's period changes.
     pub fn new(policy: Policy) -> Self {
+        Self::restored(policy, Vec::new())
+    }
+
+    /// A rotator that carries on from the records the state store holds,
+    /// so a file last seen in an earlier period is due at its next check.
+    pub fn restored(policy: Policy, periods: Vec<(String, String)>) -> Self {
         Self {
             policy,
-            periods: HashMap::new(),
+            periods: periods
+                .into_iter()
+                .map(|(path, period)| (PathBuf::from(path), period))
+                .collect(),
+            changed: Vec::new(),
         }
     }
 
@@ -136,16 +149,29 @@ impl Rotator {
 
     /// Whether a file is due: it has reached the size, or the period has
     /// changed since it was last seen. A file seen for the first time
-    /// only notes its period.
+    /// only notes its period, and an empty file is never due, its period
+    /// still being noted.
     pub fn due(&mut self, path: &Path, now: SystemTime) -> bool {
         let period = period(self.policy.every, now);
         let previous = self.periods.insert(path.to_path_buf(), period.clone());
-        let by_clock = previous.is_some_and(|previous| previous != period);
-        let by_size = self.policy.size.is_some_and(|limit| {
-            std::fs::metadata(path).is_ok_and(|metadata| metadata.len() >= limit)
-        });
 
-        by_clock || by_size
+        if previous.as_ref() != Some(&period) {
+            self.changed
+                .push((path.display().to_string(), period.clone()));
+        }
+
+        let by_clock = previous.is_some_and(|previous| previous != period);
+        let length = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+        let by_size = self.policy.size.is_some_and(|limit| length >= limit);
+
+        length > 0 && (by_clock || by_size)
+    }
+
+    /// The records changed since this was last called, for the state
+    /// store. Taken before anything is rotated, so a file is not rotated
+    /// again by a daemon started after a crash.
+    pub fn take_changed(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.changed)
     }
 
     /// Rotate a file: rename it with a timestamp, compress the archive in
@@ -391,6 +417,55 @@ mod tests {
             "a new hour"
         );
         assert!(!rotator.due(&log, now + Duration::from_secs(3601)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restart_carries_the_period_so_a_file_rotates_once() {
+        let dir = std::env::temp_dir().join(format!("muru-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("a.log");
+        let empty = dir.join("empty.log");
+        let new = dir.join("new.log");
+        std::fs::write(&log, "x").unwrap();
+        std::fs::write(&empty, "").unwrap();
+        let policy = Policy {
+            size: None,
+            every: Every::Daily,
+            keep: 2,
+            compress: Compress::Off,
+        };
+        let day_one = SystemTime::UNIX_EPOCH + Duration::from_secs(1_793_000_000);
+        let day_two = day_one + Duration::from_secs(86_400);
+
+        // A daemon sees both files, stops, and one the next day carries
+        // on from what the first recorded.
+
+        let mut first = Rotator::new(policy.clone());
+        assert!(!first.due(&log, day_one));
+        assert!(!first.due(&empty, day_one));
+        let records = first.take_changed();
+        assert_eq!(records.len(), 2);
+
+        let mut second = Rotator::restored(policy, records);
+        assert!(second.due(&log, day_two), "left over from yesterday");
+        assert!(!second.due(&empty, day_two), "nothing to rotate");
+
+        // The change is recorded, so another start the same day and a
+        // later check of this one leave the file alone.
+
+        let records = second.take_changed();
+        assert_eq!(records.len(), 2);
+        assert!(!second.due(&log, day_two + Duration::from_secs(60)));
+        assert!(second.take_changed().is_empty());
+
+        let mut third = Rotator::restored(second.policy().clone(), records);
+        assert!(!third.due(&log, day_two + Duration::from_secs(120)));
+
+        // A file with no record only notes its period, as it always has.
+
+        std::fs::write(&new, "x").unwrap();
+        assert!(!third.due(&new, day_two));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

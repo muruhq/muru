@@ -135,13 +135,17 @@ CREATE TABLE IF NOT EXISTS command_runs (
     message TEXT NOT NULL,
     PRIMARY KEY (app, command)
 );
+CREATE TABLE IF NOT EXISTS log_periods (
+    path TEXT PRIMARY KEY,
+    period TEXT NOT NULL
+);
 ";
 
 /// How many events are kept.
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// The store.
 pub struct Store {
@@ -170,8 +174,9 @@ impl Store {
         // priority (section 7.4), added to an older table here, version
         // 10 the last run of each command (section 9.12), version 11 the
         // application's own access log choice (section 11.2), added to
-        // an older table here, and version 12 the virtual hosts in
-        // maintenance mode (section 4.12).
+        // an older table here, version 12 the virtual hosts in
+        // maintenance mode (section 4.12), and version 13 the period each
+        // log file was last seen in (section 11.3).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -999,6 +1004,45 @@ impl Store {
         })
     }
 
+    /// The period each log file was last seen in (section 11.3).
+    pub fn log_periods(&self) -> Result<Vec<(String, String)>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare("SELECT path, period FROM log_periods")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Record the period of each of these log files, in one write.
+    pub fn set_log_periods(&self, periods: &[(String, String)]) -> Result<(), StoreError> {
+        self.with(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+
+            for (path, period) in periods {
+                transaction.execute(
+                    "INSERT INTO log_periods (path, period) VALUES (?1, ?2) \
+                     ON CONFLICT(path) DO UPDATE SET period = excluded.period",
+                    params![path, period],
+                )?;
+            }
+
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Forget the periods of log files that no longer exist.
+    pub fn forget_log_periods(&self, paths: &[String]) -> Result<(), StoreError> {
+        self.with(|connection| {
+            for path in paths {
+                connection.execute("DELETE FROM log_periods WHERE path = ?1", params![path])?;
+            }
+
+            Ok(())
+        })
+    }
+
     /// Events after a sequence number, oldest first, up to `limit`.
     pub fn events_after(&self, after: u64, limit: usize) -> Result<Vec<Event>, StoreError> {
         self.with(|connection| {
@@ -1360,6 +1404,19 @@ mod tests {
         );
         assert_eq!(store.app("shop").unwrap().current.as_deref(), Some("r1"));
         assert!(store.release("shop", "r9").is_err());
+    }
+
+    #[test]
+    fn log_periods_are_kept_by_path_and_can_be_forgotten() {
+        let store = Store::in_memory().unwrap();
+        let record = |path: &str, period: &str| (path.to_owned(), period.to_owned());
+
+        store
+            .set_log_periods(&[record("/a.log", "d1"), record("/b.log", "d1")])
+            .unwrap();
+        store.set_log_periods(&[record("/a.log", "d2")]).unwrap();
+        store.forget_log_periods(&["/b.log".to_owned()]).unwrap();
+        assert_eq!(store.log_periods().unwrap(), vec![record("/a.log", "d2")]);
     }
 
     #[test]

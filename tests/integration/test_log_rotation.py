@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import sqlite3
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -44,6 +45,53 @@ def listing(directory: Path) -> str:
 
 def archives(directory: Path, name: str) -> list[Path]:
     return sorted(path for path in directory.glob(f"{name}.*") if path.name != name)
+
+
+def test_a_period_passed_while_the_daemon_was_stopped_rotates_the_log_once(
+    tmp_path: Path,
+) -> None:
+    daemon = start_daemon(tmp_path, listeners=[(support.free_port(), False)])
+    logs = tmp_path / "logs"
+
+    def state() -> str:
+        return f"{listing(logs)}\n{daemon.muructl('events').stdout}"
+
+    try:
+        assert daemon.deploy("shop", SHOP, "--processes", "1") == (
+            "muru: release shop@r1 is ready and serving"
+        )
+
+        for _ in range(5):
+            assert daemon.get("/catalogue").status == 200
+
+        # The first daemon has checked every file once, so each has a
+        # period recorded; stopping it leaves the edge and the host
+        # writing. The records are put back a day, standing in for a
+        # stop over midnight.
+
+        wait_for(lambda: (logs / "access.log").stat().st_size > 0, "the access log", describe=state)
+        time.sleep(1.5)
+        daemon.stop(shutdown=False)
+
+        with sqlite3.connect(tmp_path / "state" / "muru.sqlite") as store:
+            assert store.execute("SELECT count(*) FROM log_periods").fetchone()[0] > 0
+            store.execute("UPDATE log_periods SET period = 'd1'")
+
+        daemon = start_daemon(tmp_path, run_dir=daemon.run_dir, listeners=daemon.listeners)
+        wait_for(lambda: len(archives(logs, "access.log")) == 1, "one archive", describe=state)
+
+        # The record is updated, so a later check and a further restart
+        # leave the file alone.
+
+        assert daemon.get("/catalogue").status == 200
+        time.sleep(2.5)
+        daemon.stop(shutdown=False)
+        daemon = start_daemon(tmp_path, run_dir=daemon.run_dir, listeners=daemon.listeners)
+        assert daemon.get("/catalogue").status == 200
+        time.sleep(2.5)
+        assert len(archives(logs, "access.log")) == 1, listing(logs)
+    finally:
+        daemon.stop()
 
 
 def test_a_rotation_policy_added_by_reload_takes_effect(tmp_path: Path) -> None:

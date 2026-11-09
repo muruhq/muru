@@ -1484,6 +1484,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         ),
     }
 
+    let rotation = settings
+        .rotation
+        .clone()
+        .map(|policy| restored_rotator(policy, &store));
+
     let mut daemon = Daemon {
         store,
         events,
@@ -1503,7 +1508,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         warm_ups: BTreeMap::new(),
         clock: (None, false),
         secrets: settings.secrets.clone(),
-        rotation: settings.rotation.clone().map(crate::rotation::Rotator::new),
+        rotation,
         shutdown: settings.shutdown.clone(),
         service,
         debug_exec: settings.debug_exec,
@@ -2877,7 +2882,9 @@ impl Daemon {
         if settings.rotation != rotation {
             match (settings.rotation, self.rotation.as_mut()) {
                 (Some(policy), Some(rotator)) => rotator.set_policy(policy),
-                (Some(policy), None) => self.rotation = Some(crate::rotation::Rotator::new(policy)),
+                (Some(policy), None) => {
+                    self.rotation = Some(restored_rotator(policy, &self.store));
+                }
                 (None, _) => self.rotation = None,
             }
 
@@ -9085,13 +9092,25 @@ impl Daemon {
             ));
         }
 
+        // The period each file is now in is recorded before anything is
+        // rotated, so a daemon started after a crash does not rotate a
+        // file a second time.
+
+        let due: Vec<(PathBuf, bool)> = candidates
+            .into_iter()
+            .filter(|(path, _)| path.is_file() && rotator.due(path, now))
+            .collect();
+        let changed = rotator.take_changed();
+
+        if !changed.is_empty()
+            && let Err(error) = self.store.set_log_periods(&changed)
+        {
+            tracing::warn!(%error, "recording the log files' periods failed");
+        }
+
         let mut rotated = Vec::new();
 
-        for (path, in_place) in candidates {
-            if !path.is_file() || !rotator.due(&path, now) {
-                continue;
-            }
-
+        for (path, in_place) in due {
             let outcome = if in_place {
                 rotator.rotate_in_place(&path, now)
             } else {
@@ -9250,6 +9269,29 @@ fn writes_to(path: &std::path::Path) -> bool {
     described
         && current.dev() as libc::dev_t == stat.st_dev
         && current.ino() as libc::ino_t == stat.st_ino
+}
+
+/// A rotator that carries on from the periods the state store records,
+/// less those of log files that are gone (section 11.3).
+fn restored_rotator(policy: crate::rotation::Policy, store: &Store) -> crate::rotation::Rotator {
+    let (present, gone): (Vec<_>, Vec<_>) = store
+        .log_periods()
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "reading the log files' periods failed");
+            Vec::new()
+        })
+        .into_iter()
+        .partition(|(path, _)| std::path::Path::new(path).is_file());
+
+    let gone: Vec<String> = gone.into_iter().map(|(path, _)| path).collect();
+
+    if !gone.is_empty()
+        && let Err(error) = store.forget_log_periods(&gone)
+    {
+        tracing::warn!(%error, "forgetting the periods of removed log files failed");
+    }
+
+    crate::rotation::Rotator::restored(policy, present)
 }
 
 /// Open the daemon's log file again on standard output and error: once

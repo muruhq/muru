@@ -34,7 +34,7 @@ The reconciler is level-triggered and idempotent: each pass compares desired and
 
 ## 10.2 State store, persistence and recovery
 
-- SQLite in WAL mode in the state directory (section 13.8), holding desired state, release records, rollout history, events within retention and the audit log. Schema migrations are forward-compatible for one version, so a failed daemon upgrade can be reversed.
+- SQLite in WAL mode in the state directory (section 13.8), holding desired state, release records, rollout history, events within retention, the audit log and the period each log file was last seen in (section 11.3). Schema migrations are forward-compatible for one version, so a failed daemon upgrade can be reversed.
 - Each host is started with a random token and a run directory containing its control socket. After a daemon restart the daemon scans run directories, verifies tokens and process start times, and re-adopts hosts. Hosts not in desired state are drained and removed after a grace period.
 - muructl daemon backup and restore save and load the whole store.
 
