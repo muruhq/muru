@@ -8,6 +8,12 @@ use hyper_util::rt::TokioIo;
 use muru_proto::admin::v1::admin_client::AdminClient;
 use tonic::transport::{Channel, Endpoint, Uri};
 
+/// The largest reply the client takes, in MiB. A `Debug` reply holds
+/// every worker's answer in one message, so tonic's default of 4 MiB is
+/// too small, and a limit remains so that a reply cannot take all of the
+/// client's memory. The servers set no encoding limit.
+pub const MAX_REPLY_MIB: usize = 256;
+
 /// Connect to the daemon's admin socket.
 pub async fn connect(socket: &Path) -> anyhow::Result<AdminClient<Channel>> {
     let socket: PathBuf = socket.to_path_buf();
@@ -50,7 +56,7 @@ pub async fn connect(socket: &Path) -> anyhow::Result<AdminClient<Channel>> {
             }
         })?;
 
-    Ok(AdminClient::new(channel))
+    Ok(AdminClient::new(channel).max_decoding_message_size(MAX_REPLY_MIB * 1024 * 1024))
 }
 
 /// Whether a failed connection came down to a permission error, somewhere

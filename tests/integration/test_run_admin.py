@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
@@ -73,6 +74,21 @@ def start(runtime: Path, port: int | None = None, **kwargs: object) -> support.S
     )
     assert server.wait_for_log("admin socket"), server.log()
     return server
+
+
+def test_a_debug_reply_larger_than_the_default_limit_arrives(runtime: Path) -> None:
+    server = start(runtime)
+
+    try:
+        deep = threading.Thread(target=lambda: server.get("/deep?depth=70000&seconds=6"))
+        deep.start()
+        time.sleep(2)
+        large = muructl(runtime, "debug", "stacks", "plain-wsgi", cwd=support.FIXTURES).stdout
+        deep.join(timeout=30)
+        assert len(large) > 4 * 1024 * 1024, len(large)
+        assert "in descend" in large
+    finally:
+        server.stop()
 
 
 def test_the_commands_reach_a_development_run(runtime: Path) -> None:

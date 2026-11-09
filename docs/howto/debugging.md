@@ -467,6 +467,10 @@ changed this way revert when the period ends, on `--reset`, and when the
 worker is replaced, since a new worker starts from the release's
 [logging defaults](logging.md).
 
+A reply is held to 256 MiB. Past that, the command says the reply was
+too large and to ask one worker with `--worker`, or a shorter `--for`
+for `profile`, or a smaller `--top` for `trace` and `memory`.
+
 ## How it reaches the worker
 
 Every worker has a control connection to its host, created at fork, and
