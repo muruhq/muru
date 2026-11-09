@@ -178,8 +178,9 @@ these:
   except a value that comes from a secret store. A secret delivered as
   a file shows its `NAME_FILE` path;
 
-- under the daemon, what it passes on: `HOME`, `USER`, `LOGNAME`,
-  `TMPDIR` and the variables `[daemon] pass_env` names.
+- under the daemon, what it passes on: `HOME`, `USER`, `LOGNAME` (the
+  release's own user's, when it runs as another user), `TMPDIR` and the
+  variables `[daemon] pass_env` names.
 
 Every other variable is named without its value. Under `muructl run`
 and `muructl serve`, which keep the environment they were started with,

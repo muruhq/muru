@@ -591,6 +591,65 @@ impl Identity {
         Ok(Self { uid, gid, umask })
     }
 
+    /// Section 8.7: `HOME`, `USER` and `LOGNAME` for the user this is, from
+    /// the password database. None for a user id with no entry, and an
+    /// empty field is left out.
+    pub fn account(&self) -> Vec<(String, String)> {
+        let mut buffer = vec![0u8; 4096];
+
+        // SAFETY: an all-zero passwd is a valid value of a C struct of
+        // integers and pointers, and getpwuid_r overwrites it.
+
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+
+        // getpwuid_r, not getpwuid: the daemon has many threads, and the
+        // other's static storage is shared between them.
+
+        loop {
+            // SAFETY: every pointer is to a live local, and the length is
+            // that of the buffer; on return the strings in `entry` point
+            // into the buffer.
+
+            let status = unsafe {
+                libc::getpwuid_r(
+                    self.uid as libc::uid_t,
+                    &mut entry,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut found,
+                )
+            };
+
+            if status == libc::ERANGE && buffer.len() < 1 << 20 {
+                buffer.resize(buffer.len() * 2, 0);
+                continue;
+            }
+
+            break;
+        }
+
+        if found.is_null() {
+            return Vec::new();
+        }
+
+        let field = |pointer: *const libc::c_char| {
+            // SAFETY: getpwuid_r found an entry, so its string fields are
+            // NUL-terminated within the buffer, which is still alive.
+
+            unsafe { std::ffi::CStr::from_ptr(pointer) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        let (home, name) = (field(entry.pw_dir), field(entry.pw_name));
+
+        [("HOME", home), ("USER", name.clone()), ("LOGNAME", name)]
+            .into_iter()
+            .filter(|(_, value)| !value.is_empty())
+            .map(|(variable, value)| (variable.to_owned(), value))
+            .collect()
+    }
+
     /// Whether this process may switch to another user.
     pub fn can_switch() -> bool {
         // SAFETY: geteuid has no preconditions.

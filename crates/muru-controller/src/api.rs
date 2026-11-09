@@ -502,7 +502,7 @@ impl Admin for Service {
                 .unwrap_or_default(),
             env: spec
                 .as_ref()
-                .map(|spec| planned_env(spec, &self.handle))
+                .map(|spec| planned_env(&request.app, spec, &self.handle))
                 .unwrap_or_default(),
             builds: spec.as_ref().is_some_and(|spec| spec.build.builds),
             serving: app.and_then(|app| app.current).unwrap_or_default(),
@@ -2652,8 +2652,10 @@ fn rollout_message(rollout: &Rollout) -> pb::Rollout {
 
 /// Section 8.7: the variables a planned release would get, by name and
 /// never by value, with where each comes from: what it declares, then
-/// what the daemon would pass on, through the code a start uses.
-fn planned_env(spec: &crate::model::ReleaseSpec, handle: &Handle) -> Vec<pb::DeployEnv> {
+/// what the daemon would pass on, through the code a start uses. Under
+/// another user, `HOME`, `USER` and `LOGNAME` are that user's and so are
+/// Muru's rather than the daemon's.
+fn planned_env(app: &str, spec: &crate::model::ReleaseSpec, handle: &Handle) -> Vec<pb::DeployEnv> {
     let mut planned: Vec<pb::DeployEnv> = spec
         .env
         .iter()
@@ -2680,20 +2682,50 @@ fn planned_env(spec: &crate::model::ReleaseSpec, handle: &Handle) -> Vec<pb::Dep
         .expect("pass_env poisoned")
         .clone();
     let bytecode = spec.http.is_none().then(|| spec.bytecode.effective());
+    let identity = planned_identity(app, handle);
     let mut passed: Vec<String> =
-        crate::commands::passed_from_daemon(std::env::vars(), &pass_env, bytecode)
+        crate::commands::passed_from_daemon(std::env::vars(), &pass_env, bytecode, identity)
             .into_iter()
             .map(|(name, _)| name)
             .filter(|name| !planned.iter().any(|entry| &entry.name == name))
             .collect();
     passed.sort();
 
-    planned.extend(passed.into_iter().map(|name| pb::DeployEnv {
-        name,
-        layer: "passed from the daemon".to_owned(),
-        ..Default::default()
+    planned.extend(passed.into_iter().map(|name| {
+        let account =
+            identity.is_some() && crate::commands::ACCOUNT_VARIABLES.contains(&name.as_str());
+
+        pb::DeployEnv {
+            name,
+            layer: if account {
+                "set by Muru"
+            } else {
+                "passed from the daemon"
+            }
+            .to_owned(),
+            ..Default::default()
+        }
     }));
     planned
+}
+
+/// Section 10.9: whom a release of the application would run as, as a
+/// start decides it, without the events a start raises. A user the
+/// system does not have is left to the start to report.
+fn planned_identity(app: &str, handle: &Handle) -> Option<crate::host::Identity> {
+    let named = handle
+        .store
+        .app(app)
+        .ok()
+        .and_then(|record| record.user.map(|user| (user, record.group)));
+
+    match named {
+        Some((user, group)) if crate::host::Identity::can_switch() => {
+            crate::host::Identity::lookup(&user, group.as_deref(), None).ok()
+        }
+        Some(_) => None,
+        None => handle.info.service,
+    }
 }
 
 /// How long a deploy's answer waits for what the host has to say.
