@@ -375,6 +375,14 @@ pub fn for_run(args: &crate::RunArgs, resolved: &crate::Resolved, interpreter: &
         ));
     }
 
+    if let Some(file) = &serving.env_file {
+        rows.push(Row::new(
+            "env_file",
+            file.display().to_string(),
+            run(args.env_file.is_some(), "env_file"),
+        ));
+    }
+
     rows.push(Row::new("reload", serving.reload, reload));
 
     let paths = |paths: &[std::path::PathBuf]| -> Vec<String> {
@@ -479,7 +487,44 @@ pub fn for_run(args: &crate::RunArgs, resolved: &crate::Resolved, interpreter: &
         trailer.push("The serve table is muructl serve's, and is not read here.".to_owned());
     }
 
+    // What the run's .env file sets, by name and never by value.
+
+    if let Some(file) = &serving.env_file {
+        trailer.push(env_file_note(
+            file,
+            &resolved.env_file_names,
+            layers.table.get("env"),
+        ));
+    }
+
     render("run", &notes, &top, "run", &rows, &trailer)
+}
+
+/// The line of the report for the run's `.env` file: what it sets, and
+/// which of those it takes from the project's `[tool.muru.env]`.
+fn env_file_note(
+    file: &std::path::Path,
+    names: &[String],
+    table: Option<&serde_json::Value>,
+) -> String {
+    let declared = |name: &str| table.and_then(|table| table.get(name)).is_some();
+    let overrides: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| declared(name))
+        .collect();
+
+    let mut note = if names.is_empty() {
+        format!("{} sets no variables.", file.display())
+    } else {
+        format!("{} sets {}.", file.display(), names.join(", "))
+    };
+
+    if !overrides.is_empty() {
+        let _ = write!(note, " Over [tool.muru.env]: {}.", overrides.join(", "));
+    }
+
+    note
 }
 
 /// What `muructl serve` adds to the report: its own table's settings,

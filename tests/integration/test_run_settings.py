@@ -277,3 +277,74 @@ def test_mistakes_name_the_file_they_are_in(tmp_path: Path) -> None:
     assert refused.returncode != 0
     assert "entrypoint is not a key of muru.local.toml" in refused.stderr
     assert "belong in" in refused.stderr and "pyproject.toml" in refused.stderr
+
+
+def test_a_named_env_file_overrides_the_table_and_is_shown_as_a_layer(tmp_path: Path) -> None:
+    directory = project(tmp_path / "project", "env_file = 'settings.env'\n")
+    (directory / "app.py").write_text(
+        "import json, os\n"
+        "def application(environ, start_response):\n"
+        "    start_response('200 OK', [('Content-Type', 'application/json')])\n"
+        "    names = ('FROM_TABLE', 'FROM_BOTH', 'FROM_FILE')\n"
+        "    return [json.dumps({name: os.environ.get(name) for name in names}).encode()]\n"
+    )
+    pyproject = directory / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text() + "\n[tool.muru.env]\nFROM_TABLE = 'table'\nFROM_BOTH = 'table'\n"
+    )
+    (directory / "settings.env").write_text(
+        "export FROM_BOTH='file'\nFROM_FILE=\"hidden\" # note\n"
+    )
+    (directory / ".env").write_text("FROM_FILE=picked up by itself\n")
+
+    def printed(*flags: str) -> str:
+        return subprocess.run(
+            [str(muructl()), "run", str(directory), "--print-config", *flags],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout
+
+    # The table's file is one layer and a flag's is the one above it, and
+    # the report names the variables but never their values.
+
+    output = printed()
+    assert f'env_file = "settings.env"    # [tool.muru.run] in {pyproject}' in output, output
+    assert "settings.env sets FROM_BOTH, FROM_FILE. Over [tool.muru.env]: FROM_BOTH." in output
+    assert "hidden" not in output, output
+
+    (directory / "other.env").write_text("FROM_FILE=other\n")
+    output = printed("--env-file", "other.env")
+    assert 'env_file = "other.env"    # command line' in output, output
+
+    # The run starts with the file over the table, and only a named file
+    # is read, so .env beside it changes nothing.
+
+    server = start(directory, "--port", str(support.free_port()))
+
+    try:
+        seen = json.loads(server.get("/").body)
+    finally:
+        server.stop()
+
+    assert seen == {"FROM_TABLE": "table", "FROM_BOTH": "file", "FROM_FILE": "hidden"}
+
+
+def test_an_env_file_that_cannot_be_read_stops_the_run(tmp_path: Path) -> None:
+    directory = project(tmp_path / "project")
+    (directory / "bad.env").write_text("GOOD=1\nNO EQUALS SIGN\n")
+
+    def refused(name: str) -> str:
+        completed = subprocess.run(
+            [str(muructl()), "run", str(directory), "--env-file", name, "--print-config"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert completed.returncode != 0, completed.stdout
+        return completed.stderr
+
+    assert "bad.env: line 2: expected NAME=VALUE" in refused("bad.env")
+    assert "missing.env" in refused("missing.env")

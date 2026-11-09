@@ -760,6 +760,10 @@
           "type": "string",
           "x-default": "`127.0.0.1:8081`; off under `--allow-public`"
         },
+        "env_file": {
+          "description": "A `.env` file whose variables the run starts with, relative to the project. Its values override `[tool.muru.env]`. None is read unless this names one.",
+          "type": "string"
+        },
         "hosts": {
           "description": "Names the development certificate covers besides localhost.",
           "items": {

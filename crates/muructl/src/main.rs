@@ -633,6 +633,12 @@ struct RunArgs {
     #[arg(long = "host", value_name = "NAME")]
     hosts: Vec<String>,
 
+    /// A .env file of variables the run starts with, over the project's
+    /// [tool.muru.env]; a relative path is the project's. None is read
+    /// unless this or env_file in the run table names one.
+    #[arg(long, value_name = "FILE")]
+    env_file: Option<PathBuf>,
+
     /// Print the settings the run would use, each with where it came
     /// from, in the shape of the project's file, and exit.
     #[arg(long)]
@@ -1526,6 +1532,8 @@ struct Serving {
     tls_key: Option<PathBuf>,
     /// Names the development certificate covers besides localhost.
     hosts: Vec<String>,
+    /// A .env file, relative to the project, the run starts with.
+    env_file: Option<PathBuf>,
     /// Whether the run reloads on changes.
     reload: bool,
     reload_dirs: Vec<PathBuf>,
@@ -1600,6 +1608,10 @@ impl Serving {
                 .clone()
                 .or_else(|| settings.tls_key.as_deref().map(PathBuf::from)),
             hosts: strings(&settings.hosts, &args.hosts),
+            env_file: args
+                .env_file
+                .clone()
+                .or_else(|| settings.env_file.as_deref().map(PathBuf::from)),
             reload,
             reload_dirs: settings
                 .reload_dirs
@@ -1696,8 +1708,11 @@ struct Resolved {
     error_override: Option<muru_config::ErrorOverride>,
     /// The memory table (section 7.7).
     memory: Option<muru_config::Memory>,
-    /// Environment variables from the table (section 10.8).
+    /// Environment variables from the table (section 10.8), with those of
+    /// the run's `.env` file over them (section 13.1).
     env: std::collections::BTreeMap<String, muru_config::EnvValue>,
+    /// The names the run's `.env` file sets, for --print-config.
+    env_file_names: Vec<String>,
     /// How the run serves (section 13.1).
     serving: Serving,
     /// The tables as they were read, for --print-config.
@@ -1799,6 +1814,22 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
 
     let layers = print_config::Layers::new(&table, &run_table, &local_run);
     let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
+
+    // Section 13.1: the run's .env file, named explicitly, over what the
+    // project's table declares. The file is read once, as the run starts.
+
+    let mut env = table.env.clone();
+    let mut env_file_names = Vec::new();
+
+    if let Some(file) = &serving.env_file {
+        for (name, value) in read_env_file(&project.join(file))? {
+            if !env_file_names.contains(&name) {
+                env_file_names.push(name.clone());
+            }
+
+            env.insert(name, muru_config::EnvValue::Plain(value));
+        }
+    }
 
     // Whether the entrypoint is a factory belongs to the entrypoint: the
     // table's factory settings apply to the table's entrypoint only.
@@ -1962,7 +1993,8 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         },
         timeouts: table.timeouts,
         memory: table.memory,
-        env: table.env,
+        env,
+        env_file_names,
         serving,
         layers,
     })
@@ -2397,9 +2429,18 @@ struct CheckArgs {
     #[arg(long)]
     strict: bool,
 
-    /// A file of NAME=VALUE lines, for settings the import reads.
+    /// A .env file of NAME=VALUE lines, for settings the import reads.
     #[arg(long, value_name = "FILE")]
     env_file: Option<PathBuf>,
+}
+
+/// The variables of a `.env` file, or why it cannot be used.
+fn read_env_file(path: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+
+    muru_config::parse_env_file(&text)
+        .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))
 }
 
 /// What the interpreter's check reports (muru.check).
@@ -2571,22 +2612,7 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
     }
 
     if let Some(file) = &args.env_file {
-        let text =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-
-        for line in text.lines() {
-            let line = line.trim();
-
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            let Some((name, value)) = line.split_once('=') else {
-                anyhow::bail!("{}: {line:?} is not NAME=VALUE", file.display());
-            };
-
-            command.env(name.trim(), value.trim().trim_matches('"'));
-        }
+        command.envs(read_env_file(file)?);
     }
 
     let output = command
