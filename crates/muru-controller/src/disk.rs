@@ -54,12 +54,21 @@ impl Measure {
     }
 
     fn count(&mut self, metadata: &std::fs::Metadata) {
+        // A directory's link count says how many subdirectories it has,
+        // not who else holds it, so one removed gives back what it took.
+
+        let links = if metadata.is_dir() {
+            1
+        } else {
+            metadata.nlink()
+        };
+
         let inode = self
             .inodes
             .entry((metadata.dev(), metadata.ino()))
             .or_insert(Inode {
                 bytes: metadata.blocks() * 512,
-                links: metadata.nlink(),
+                links,
                 seen: 0,
             });
 
