@@ -449,10 +449,13 @@ Everything `muructl serve` writes goes under one directory, `/run/muru`
 unless `--run-dir` or `MURU_RUN_DIR` names another: the admin socket, the
 workers' sockets, and request bodies too large to hold in memory, up to
 `--spool-quota`, beyond which an upload is refused with 507. It assumes no
-user account for its user ID and creates what it writes group-writable,
-so it runs under whatever user ID the platform assigns with group 0, as
-OpenShift does. With a read-only root filesystem, that directory and
-`/tmp` are the only writable mounts it needs:
+user account for its user ID and creates the directory, the admin and
+probe sockets, the `release` directory and `serve.json` group-writable, so it runs under
+whatever user ID the platform assigns with group 0, as OpenShift does, and
+`muructl` run under another user ID with group 0 can use the socket. The
+`spool` directory holds request bodies and is private to the user ID that
+serves. With a read-only root filesystem, that directory and `/tmp` are
+the only writable mounts it needs:
 
 ```yaml
 securityContext:

@@ -2794,6 +2794,11 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     };
 
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+
+    if serve.is_some() {
+        serve::group_writable(&run_dir, 0o770);
+    }
+
     let access_log_file = resolved
         .serving
         .access_log_file

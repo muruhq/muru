@@ -75,11 +75,13 @@ class Container:
         self.name = name
         self.port = port
 
-    def exec(self, *command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-        """Run a command in the container."""
+    def exec(
+        self, *command: str, check: bool = True, user: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a command in the container, as its own user unless told otherwise."""
 
         return subprocess.run(
-            ["docker", "exec", self.name, *command],
+            ["docker", "exec", *(["--user", user] if user else []), self.name, *command],
             capture_output=True,
             text=True,
             check=check,
@@ -416,6 +418,33 @@ def test_serve_runs_as_an_arbitrary_user_on_a_read_only_root(
     assert instance.exec("python3", "-c", "import os; print(os.getuid())").stdout.strip() == (
         "1000770000"
     )
+
+    # Section 13.9: another user ID with group 0 may use the serve too,
+    # the spool stays its owner's, and a user outside the group that names
+    # the socket is told which it may not use and whose it is.
+
+    other = instance.exec("muructl", "status", check=False, user="5555:0")
+    assert other.returncode == 0, other.stdout + other.stderr
+    modes = instance.exec(
+        "python3",
+        "-c",
+        "import os\n"
+        "for name in ('admin.sock', 'probe.sock', 'serve.json', 'release', 'spool'):\n"
+        "    print(name, oct(os.stat(f'/run/muru/{name}').st_mode & 0o777))\n",
+    ).stdout.split("\n")
+    assert modes[:5] == [
+        "admin.sock 0o770",
+        "probe.sock 0o770",
+        "serve.json 0o660",
+        "release 0o770",
+        "spool 0o700",
+    ], modes
+    outside = instance.exec(
+        "muructl", "status", "--socket", "/run/muru/admin.sock", check=False, user="5555:5555"
+    )
+    assert outside.returncode != 0
+    assert "permission denied on /run/muru/admin.sock" in outside.stderr, outside.stderr
+    assert "belongs to UID" in outside.stderr, outside.stderr
 
     # Section 9.12: a command of the project runs through the serve, and
     # in a container of its own, where nothing serves, by muructl itself.

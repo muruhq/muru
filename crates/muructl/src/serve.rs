@@ -1042,7 +1042,7 @@ pub fn make_run_dir(dir: &Path) -> anyhow::Result<()> {
         let uid = unsafe { libc::getuid() };
         anyhow::anyhow!(run_dir_error(dir, &error, uid))
     })?;
-    group_writable(dir);
+    group_writable(dir, 0o770);
     Ok(())
 }
 
@@ -1073,10 +1073,10 @@ fn run_dir_error(dir: &Path, error: &std::io::Error, uid: u32) -> String {
 /// Make a directory serve creates writable by its group, which a
 /// platform that runs containers under an arbitrary user ID shares as
 /// group 0.
-pub fn group_writable(dir: &Path) {
+pub fn group_writable(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o770));
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
 }
 
 /// The runtime library the interpreter's own environment holds, when it
