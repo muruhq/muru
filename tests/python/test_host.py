@@ -216,6 +216,79 @@ def test_a_request_past_its_deadline_is_one_event_until_it_ends(tmp_path: Path) 
     assert state.past_deadline == {}
 
 
+def replacing_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spawned: int = 5001
+) -> tuple[host.Host, host.WorkerState, list[dict[str, Any]], list[host.Pending]]:
+    """A host with one worker, nothing forked, and every ask held for the test to answer."""
+
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1)
+    sent: list[dict[str, Any]] = []
+    asked: list[host.Pending] = []
+
+    def ask(
+        state: host.WorkerState, op: str, args: dict[str, Any], timeout: float, then: Any
+    ) -> None:
+        asked.append(host.Pending(0, op, {state.pid: state.index}, then=then))
+
+    state = host.WorkerState(0, 4242, 0, "w0.sock", time.monotonic(), -1)
+    instance.states[state.pid] = state
+    instance.workers[state.pid] = state.index
+    monkeypatch.setattr(_outside, "WHOLE", False)
+    instance.control_listener = object()  # type: ignore[assignment]
+    instance.send_to_supervisor = sent.append  # type: ignore[method-assign]
+    instance.ask = ask  # type: ignore[method-assign]
+    instance.spawn = lambda index, replacing=False: spawned  # type: ignore[method-assign]
+    return instance, state, sent, asked
+
+
+def exits(monkeypatch: pytest.MonkeyPatch, *statuses: tuple[int, int]) -> None:
+    """Have os.waitpid report these (pid, status) pairs, then nothing."""
+
+    waiting = list(statuses)
+    monkeypatch.setattr(os, "waitpid", lambda _pid, _flags: waiting.pop(0) if waiting else (0, 0))
+
+
+def test_a_timeout_kill_is_reported_at_the_decision_and_not_again_at_the_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    instance, state, sent, asked = replacing_host(tmp_path, monkeypatch)
+    instance.replace(state, "a request ran too long", "worker.timeout_killed", "hard_timeout")
+
+    # Waiting only for the stacks, at most a second, not the drain grace.
+
+    assert not [message for message in sent if message.get("type") == "event"]
+    stacks = next(pending for pending in asked if pending.op == "stacks")
+    stacks.answers[4242] = {
+        "ok": True,
+        "result": {
+            "threads": [
+                {
+                    "name": "t",
+                    "request": {"elapsed_ms": 9},
+                    "frames": [{"file": "/srv/app.py", "line": 13, "function": "application"}],
+                }
+            ]
+        },
+    }
+    assert stacks.then is not None
+    stacks.then(stacks)
+    (event,) = [message for message in sent if message.get("type") == "event"]
+    assert event["kind"] == "worker.timeout_killed"
+    assert event["reason"] == "hard_timeout"
+    assert event["message"] == (
+        "worker 0 (pid 4242) replaced by pid 5001: a request ran too long; "
+        "at app.py line 13 in application"
+    )
+
+    # The old worker going is a line in the log and no second event.
+
+    exits(monkeypatch, (4242, 0))
+    instance.reap()
+    assert len([message for message in sent if message.get("type") == "event"]) == 1
+    assert "worker 0 (pid 4242) exited after its drain grace" in capsys.readouterr().err
+
+
 def test_arguments_are_checked_against_the_interface(monkeypatch: pytest.MonkeyPatch) -> None:
     def wsgi(environ: object, start_response: object) -> None: ...
     def factory() -> None: ...

@@ -886,6 +886,12 @@ class Replacement:
     # stuck request's stack, or its commonest objects), for the event.
 
     capture: str | None = None
+
+    # Section 9.3: a timeout kill is reported at the decision, as soon as
+    # the replacement exists and the stacks asked for have been answered.
+
+    captured: bool = False
+    reported: bool = False
     announced: int | None = None
     announced_at: float | None = None
 
@@ -2982,7 +2988,7 @@ class Host:
                 self.abandon_requests(state, abandon)
 
             if kind == "worker.timeout_killed":
-                self.capture_stacks(state, replacement)
+                self.capture_stacks(state, replacement, self.report_timeout_kill)
 
             grace = self.group_of(index).hard_drain_grace
             replacement.terminate_at = time.monotonic() + (
@@ -2990,6 +2996,33 @@ class Host:
             )
 
         replacement.new_pid = self.spawn(index, replacing=True)
+
+        if kind == "worker.timeout_killed":
+            self.report_timeout_kill(replacement)
+
+    def report_timeout_kill(self, replacement: Replacement) -> None:
+        """Raise a timeout kill's event, once, when both halves of it are known.
+
+        Section 9.3: the host's decision to replace the worker is the
+        evidence a rollout counts, so this does not wait for the old
+        worker to go. The event names the new pid, known once the fork
+        returns, and where the stuck request was, which the worker answers
+        within the second capture_stacks allows it.
+        """
+
+        if replacement.reported or replacement.new_pid is None or not replacement.captured:
+            return
+
+        replacement.reported = True
+        capture = f"; {replacement.capture}" if replacement.capture else ""
+        self.emit(
+            replacement.kind,
+            "warning",
+            f"worker {replacement.index} (pid {replacement.old_pid}) replaced by pid "
+            f"{replacement.new_pid}: {replacement.reason}{capture}",
+            group=self.group_of(replacement.index).name,
+            reason=replacement.cause,
+        )
 
     def abandon_requests(self, state: WorkerState, args: dict[str, str]) -> None:
         """Have a condemned worker give up requests that cannot finish.
@@ -3174,7 +3207,12 @@ class Host:
         self.ask_workers(targets, "bookkeeping", {}, 1.0, named)
         return True
 
-    def capture_stacks(self, state: WorkerState, replacement: Replacement) -> None:
+    def capture_stacks(
+        self,
+        state: WorkerState,
+        replacement: Replacement,
+        then: Callable[[Replacement], None] | None = None,
+    ) -> None:
         """Take a worker's stacks before it is killed for the hard timeout.
 
         Section 11.7: the stacks go to the log and where the oldest request
@@ -3182,8 +3220,15 @@ class Host:
         every frame; otherwise the worker is asked, and one that cannot
         answer within a second gets SIGQUIT, so faulthandler writes its
         stacks to the log, and is read from outside as well where that is
-        possible.
+        possible. `then` is called once the capture is settled, answered
+        or not.
         """
+
+        def settled() -> None:
+            replacement.captured = True
+
+            if then is not None:
+                then(replacement)
 
         outside = self.read_outside(state.pid) if _outside.WHOLE else None
 
@@ -3194,6 +3239,7 @@ class Host:
                 bookkeeping = answer.get("result", {}) if answer.get("ok") else {}
                 result = _outside.stacks_result(outside, bookkeeping)
                 self.record_capture(state, replacement, result["threads"])
+                settled()
 
             self.ask(state, "bookkeeping", {}, 1.0, read)
             return
@@ -3201,11 +3247,12 @@ class Host:
         def answered(pending: Pending) -> None:
             answer = pending.answers.get(state.pid, {})
 
-            if not answer.get("ok"):
+            if answer.get("ok"):
+                self.record_capture(state, replacement, answer.get("result", {}).get("threads", []))
+            else:
                 replacement.capture = "its stacks were written to the log by faulthandler"
-                return
 
-            self.record_capture(state, replacement, answer.get("result", {}).get("threads", []))
+            settled()
 
         self.ask(state, "stacks", {}, 1.0, answered)
 
@@ -3384,7 +3431,8 @@ class Host:
                 continue
 
             # The old worker of a replacement is done with: its event
-            # says why it went, and nothing restarts it.
+            # says why it went, and nothing restarts it. A timeout kill's
+            # event was raised at the decision, so nothing is counted here.
 
             replacement = self.replacing.get(index)
 
@@ -3402,11 +3450,15 @@ class Host:
 
             if replacement is not None and replacement.old_pid == pid:
                 del self.replacing[index]
-                level = "warning" if replacement.kind == "worker.timeout_killed" else "info"
+
+                if replacement.kind == "worker.timeout_killed":
+                    log(f"worker {index} (pid {pid}) exited after its drain grace")
+                    continue
+
                 capture = f"; {replacement.capture}" if replacement.capture else ""
                 self.emit(
                     replacement.kind,
-                    level,
+                    "info",
                     f"worker {index} (pid {pid}) replaced by pid {replacement.new_pid}: "
                     f"{replacement.reason}{capture}",
                     group=self.group_of(index).name,

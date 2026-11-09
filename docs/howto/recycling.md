@@ -56,9 +56,12 @@ ready and its stacks are written to the log first, and so does a worker
 over its [memory limits](memory.md).
 
 Events record each replacement: `worker.started` and `worker.ready` for
-the new worker, then `worker.recycled` (or `worker.timeout_killed`, or
-`worker.restarted`) with the reason once the old one has gone, under the
-release's subject; a worker that exits on its own is `worker.exited`.
+the new worker, then `worker.recycled` (or `worker.restarted`) with the
+reason once the old one has gone, under the release's subject. A
+`worker.timeout_killed` event comes when the host decides to replace the
+worker, with the replacement already forked, and the old worker's exit
+after its drain grace is a line in the log. A worker that exits on its
+own is `worker.exited`.
 The [metrics](metrics.md) count them too, as `muru_worker_recycles_total`
 by reason and `muru_worker_exits_total`. The daemon restarts a release
 whose host dies, and a host that cannot start a replacement three times

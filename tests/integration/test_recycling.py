@@ -138,6 +138,16 @@ def test_a_request_past_the_hard_timeout_replaces_its_worker() -> None:
             r"at plain_wsgi\.py line \d+ in application",
             server.log(),
         ), server.log()
+
+        # Section 9.3: raised at the decision, not when the old worker
+        # exits after its drain grace, which is a plain line after it.
+
+        wait_for(lambda: "exited after its drain grace" in server.log(), timeout=30)
+        log = server.log()
+        assert log.index(": worker.timeout_killed: worker 0") < log.index(
+            "exited after its drain grace"
+        )
+        assert log.count(": worker.timeout_killed: worker 0") == 1
         thread.join(timeout=30)
         assert outcome and outcome[0] != "status 200", outcome
 
