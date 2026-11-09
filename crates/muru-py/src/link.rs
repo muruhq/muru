@@ -16,7 +16,7 @@ use std::io;
 use std::os::fd::{AsFd as _, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -574,11 +574,61 @@ impl Lifeline {
     }
 }
 
+/// What the control connection is written through: an answer goes out
+/// whole, whichever thread has it.
+type ControlWriter = Mutex<std::os::unix::net::UnixStream>;
+
+/// Write one answer line, reporting whether the connection still takes them.
+fn write_answer(writer: &ControlWriter, text: &str) -> bool {
+    use std::io::Write as _;
+
+    let mut line = String::with_capacity(text.len() + 1);
+    line.push_str(text);
+    line.push('\n');
+
+    writer
+        .lock()
+        .expect("control writer poisoned")
+        .write_all(line.as_bytes())
+        .is_ok()
+}
+
+/// Answer one request line through the Python handler, attaching to the
+/// interpreter for it. An error says which request it answers, since the
+/// host matches answers to requests by id and these need not come in the
+/// order the requests did.
+fn python_answer(line: &str, handler: &Py<PyAny>, shared: &Shared) -> String {
+    let answer = Python::attach(|py| {
+        let active = shared.active_requests(py)?;
+        let names = crate::pool::thread_names(py)?;
+        let reply = handler.call1(py, (line, active, names))?;
+        reply.extract::<String>(py)
+    });
+
+    match answer {
+        Ok(text) => text,
+        Err(error) => match control_id(line) {
+            Some(id) => format!(
+                "{{\"id\":{id},\"ok\":false,\"error\":{}}}",
+                serde_json_string(&error.to_string())
+            ),
+            None => format!(
+                "{{\"ok\":false,\"error\":{}}}",
+                serde_json_string(&error.to_string())
+            ),
+        },
+    }
+}
+
 /// Answer control requests from the host, one JSON line each, until the
-/// connection closes: each is handed to the Python handler with the
-/// requests in flight, and its answer written back as one line.
+/// connection closes. What needs no interpreter is answered here, and
+/// the rest handed to the Python handler with the requests in flight,
+/// its answer written back as one line. An operation over a period runs
+/// on a thread of its own, so this one is free for the requests a stuck
+/// worker is asked (section 11.7); only one runs at a time per worker,
+/// and a second is refused.
 fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
-    use std::io::{BufRead as _, Write as _};
+    use std::io::BufRead as _;
 
     // SAFETY: the descriptor was inherited from the host for this
     // purpose and nothing else in the worker holds it.
@@ -587,10 +637,13 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
         unsafe { <std::os::unix::net::UnixStream as std::os::fd::FromRawFd>::from_raw_fd(fd) };
     crate::pool::name_this_thread("muru-control");
     let _ = socket.set_nonblocking(false);
-    let Ok(mut writer) = socket.try_clone() else {
+    let Ok(writer) = socket.try_clone() else {
         return;
     };
+    let writer = Arc::new(Mutex::new(writer));
     let reader = std::io::BufReader::new(socket);
+    let handler = Arc::new(handler);
+    let period_running = Arc::new(AtomicBool::new(false));
 
     for line in reader.lines() {
         let Ok(line) = line else {
@@ -616,9 +669,7 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
         // outside.
 
         if let Some(id) = bookkeeping_request(&line) {
-            let text = bookkeeping_answer(id, &shared);
-
-            if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+            if !write_answer(&writer, &bookkeeping_answer(id, &shared)) {
                 break;
             }
 
@@ -634,7 +685,7 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
                 shared.sides().json_members()
             );
 
-            if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+            if !write_answer(&writer, &text) {
                 break;
             }
 
@@ -655,32 +706,76 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
                 given_up.join(",")
             );
 
-            if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+            if !write_answer(&writer, &text) {
                 break;
             }
 
             continue;
         }
 
-        let answer = Python::attach(|py| {
-            let active = shared.active_requests(py)?;
-            let names = crate::pool::thread_names(py)?;
-            let reply = handler.call1(py, (line.as_str(), active, names))?;
-            reply.extract::<String>(py)
-        });
+        // An operation over a period goes to a thread of its own, one at a
+        // time, so the requests above keep being answered through it.
 
-        let text = match answer {
-            Ok(text) => text,
-            Err(error) => format!(
-                "{{\"ok\":false,\"error\":{}}}",
-                serde_json_string(&error.to_string())
-            ),
-        };
+        if period_operation(&line) {
+            let running = Arc::clone(&period_running);
 
-        if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+            if running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                let text = format!(
+                    "{{\"id\":{},\"ok\":false,\"error\":{}}}",
+                    control_id(&line).unwrap_or(0),
+                    serde_json_string(PERIOD_BUSY)
+                );
+
+                if !write_answer(&writer, &text) {
+                    break;
+                }
+
+                continue;
+            }
+
+            let writer = Arc::clone(&writer);
+            let handler = Arc::clone(&handler);
+            let shared = Arc::clone(&shared);
+            let started = std::thread::Builder::new()
+                .name("muru-control-period".to_owned())
+                .spawn(move || {
+                    crate::pool::name_this_thread("muru-control-period");
+                    let text = python_answer(&line, &handler, &shared);
+                    running.store(false, Ordering::SeqCst);
+                    write_answer(&writer, &text);
+                });
+
+            if let Err(error) = started {
+                eprintln!("muru: could not start a debug operation: {error}");
+                period_running.store(false, Ordering::SeqCst);
+            }
+
+            continue;
+        }
+
+        if !write_answer(&writer, &python_answer(&line, &handler, &shared)) {
             break;
         }
     }
+}
+
+/// The answer to an operation over a period while another is running.
+const PERIOD_BUSY: &str = "another debug operation over a period is running in this worker; try again when it has finished";
+
+/// Whether a request line asks for something that runs over a period,
+/// as the host writes it: `profile`, `trace`, or `memory` with `"trace":
+/// true` and no snapshot to keep or compare.
+fn period_operation(line: &str) -> bool {
+    if line.contains("\"op\": \"profile\"") || line.contains("\"op\": \"trace\"") {
+        return true;
+    }
+
+    line.contains("\"op\": \"memory\"")
+        && line.contains("\"trace\": true")
+        && control_string(line, "snapshot").is_none_or(|snapshot| snapshot.is_empty())
 }
 
 /// The milliseconds a request line says the worker has left, as the host
@@ -2120,5 +2215,39 @@ async fn write_body(
             }
         }
         None => frame::write(writer, kind::BODY, flags, data).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{period_operation, stop_within_request};
+
+    #[test]
+    fn the_operations_over_a_period_are_told_from_the_rest() {
+        assert!(period_operation(
+            r#"{"id": 1, "op": "profile", "args": {}}"#
+        ));
+        assert!(period_operation(r#"{"id": 1, "op": "trace", "args": {}}"#));
+        assert!(period_operation(
+            r#"{"id": 1, "op": "memory", "args": {"trace": true, "snapshot": ""}}"#
+        ));
+        assert!(!period_operation(
+            r#"{"id": 1, "op": "memory", "args": {"trace": false}}"#
+        ));
+        assert!(!period_operation(
+            r#"{"id": 1, "op": "memory", "args": {"trace": true, "snapshot": "take"}}"#
+        ));
+        assert!(!period_operation(
+            r#"{"id": 1, "op": "stacks", "args": {}}"#
+        ));
+    }
+
+    #[test]
+    fn the_time_a_worker_is_told_it_has_is_read_from_the_line() {
+        assert_eq!(
+            stop_within_request(r#"{"op": "stop_within", "args": {"ms": 2500}}"#),
+            Some(2500)
+        );
+        assert_eq!(stop_within_request(r#"{"op": "stacks", "args": {}}"#), None);
     }
 }

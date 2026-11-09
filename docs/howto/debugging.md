@@ -477,7 +477,11 @@ for `profile`, or a smaller `--top` for `trace` and `memory`.
 Every worker has a control connection to its host, created at fork, and
 the host has one to the daemon. A request travels daemon to host to
 worker, where a thread of the runtime library takes it, attaches to the
-interpreter only to answer, and sends the answer back the same way. The
-daemon never reaches into a worker process directly, which is what lets
+interpreter only to answer, and sends the answer back the same way. A
+`profile`, a `trace` or a `memory --trace` runs its period on a thread
+of its own, so the worker goes on answering `status` and `stacks`, and
+giving up requests stuck past the hard timeout, while one runs. A worker
+runs one of them at a time, and refuses a second with a message saying
+that another is running. The daemon never reaches into a worker process directly, which is what lets
 the same commands work on a release running as another user, and on
 an application in a container under `muructl serve`.

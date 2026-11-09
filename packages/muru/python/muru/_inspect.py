@@ -11,6 +11,10 @@ Each request is one JSON object with an ``op`` and ``args``; each answer
 is one JSON object with ``ok`` and a ``result`` or an ``error``. The
 runtime's control thread calls :func:`handle` with the request line and
 the requests in flight, attached to the interpreter only for the call.
+An operation over a period (``profile``, ``trace``, ``memory`` with a
+trace) is called on a thread of its own, so the control thread goes on
+answering meanwhile; the runtime runs one of them at a time and refuses
+a second.
 """
 
 from __future__ import annotations

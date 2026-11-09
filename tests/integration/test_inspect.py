@@ -50,6 +50,53 @@ def deploy_plain(daemon: Daemon, processes: int = 2, *arguments: str) -> None:
     ) == ("muru: release plain@r1 is ready and serving")
 
 
+def test_a_worker_goes_on_answering_during_a_profile(daemon: Daemon, tmp_path: Path) -> None:
+    deploy_plain(daemon, 1, "--timeout", "hard=1500ms", "--timeout", "hard_drain_grace=300ms")
+    outcome: list[int] = []
+
+    def ask_stuck() -> None:
+        connection = http.client.HTTPConnection("127.0.0.1", daemon.port, timeout=30)
+        connection.request("GET", "/sleep?seconds=40")
+        outcome.append(connection.getresponse().status)
+
+    profile = subprocess.Popen(
+        [
+            str(support.muructl_path()),
+            "debug",
+            "profile",
+            "plain",
+            "--for",
+            "6s",
+            "--output",
+            str(tmp_path / "profile.txt"),
+            "--socket",
+            str(daemon.run_dir / "admin.sock"),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # The first profile holds the one period the worker runs; a second
+    # is refused at once.
+
+    wait_for(lambda: "debug.profile" in daemon.events())
+    time.sleep(0.5)
+    refused = daemon.muructl("debug", "profile", "plain", "--for", "1s", check=False)
+    assert "another debug operation over a period is running" in refused.stderr + refused.stdout
+
+    # What the host asks without the interpreter is answered meanwhile:
+    # a stuck request is given up at the hard timeout, while the profile
+    # still runs.
+
+    assert "from the worker's last report" not in daemon.muructl("debug", "status", "plain").stdout
+    thread = threading.Thread(target=ask_stuck, daemon=True)
+    thread.start()
+    wait_for(lambda: bool(outcome), timeout=4)
+    assert outcome == [504]
+    assert profile.poll() is None
+    assert profile.wait(timeout=20) == 0
+
+
 def test_status_lists_every_worker_with_its_figures(daemon: Daemon) -> None:
     deploy_plain(daemon)
     pids = {json.loads(daemon.get("/info").body)["pid"] for _ in range(20)}
