@@ -3430,15 +3430,27 @@ class Host:
             if self.stopping:
                 continue
 
+            replacement = self.replacing.get(index)
+            killed_here = (
+                replacement is not None and replacement.old_pid == pid and replacement.killed
+            )
+            oom_killed = not killed_here and self.took_oom_kill(status)
+
             # The old worker of a replacement is done with: its event
             # says why it went, and nothing restarts it. A timeout kill's
-            # event was raised at the decision, so nothing is counted here.
-
-            replacement = self.replacing.get(index)
+            # event was raised at the decision, so nothing is counted here
+            # unless the kernel took it first.
 
             if replacement is not None and replacement.old_pid == pid and replacement.retire:
                 del self.replacing[index]
                 self.retired.add(index)
+
+                if oom_killed:
+                    self.report_oom_kill(
+                        index, f"worker {index} (pid {pid}) was killed by the kernel for memory"
+                    )
+                    continue
+
                 self.emit(
                     "worker.exited",
                     "info",
@@ -3450,6 +3462,14 @@ class Host:
 
             if replacement is not None and replacement.old_pid == pid:
                 del self.replacing[index]
+
+                if oom_killed:
+                    self.report_oom_kill(
+                        index,
+                        f"worker {index} (pid {pid}) was killed by the kernel for memory while "
+                        f"being replaced by pid {replacement.new_pid}",
+                    )
+                    continue
 
                 if replacement.kind == "worker.timeout_killed":
                     log(f"worker {index} (pid {pid}) exited after its drain grace")
@@ -3476,6 +3496,15 @@ class Host:
                 if replacement.announced is None and old is not None:
                     old.replaced = False
                     self.start_failures[index] = self.start_failures.get(index, 0) + 1
+
+                    if oom_killed:
+                        self.report_oom_kill(
+                            index,
+                            f"worker {index} replacement (pid {pid}) was killed by the kernel "
+                            f"for memory before it was ready; pid {old.pid} keeps serving",
+                        )
+                        continue
+
                     self.emit(
                         "worker.exited",
                         "error",
@@ -3506,16 +3535,21 @@ class Host:
                         self.routed[index] = None
                         self.retired.add(index)
                         self.emit(
-                            "worker.exited",
+                            "worker.oom_killed" if oom_killed else "worker.exited",
                             "error",
                             f"worker {index} (pid {pid}) of the optional group {group.name} "
                             f"failed {MAX_START_FAILURES} times at start, last with "
                             f"{describe(status)}; it is given up",
                             group=group.name,
-                            reason="start_failed",
+                            reason="oom_killed" if oom_killed else "start_failed",
                         )
                         self.announce()
                         continue
+
+                    if oom_killed:
+                        self.report_oom_kill(
+                            index, f"worker {index} (pid {pid}) was killed by the kernel for memory"
+                        )
 
                     log(
                         f"worker {index} failed {MAX_START_FAILURES} times at start, "
@@ -3527,26 +3561,10 @@ class Host:
             else:
                 self.start_failures[index] = 0
 
-            # Section 13.9: a SIGKILL nobody here sent, while the cgroup
-            # counts another kill for memory, is the kernel's.
-
-            kills = oom_kills(self.cgroup)
-            oom_killed = (
-                os.WIFSIGNALED(status)
-                and os.WTERMSIG(status) == signal.SIGKILL
-                and kills is not None
-                and self.oom_kills is not None
-                and kills > self.oom_kills
-            )
-            self.oom_kills = kills
-
             if oom_killed:
-                self.emit(
-                    "worker.oom_killed",
-                    "error",
+                self.report_oom_kill(
+                    index,
                     f"worker {index} (pid {pid}) was killed by the kernel for memory, restarting",
-                    group=self.group_of(index).name,
-                    reason="oom_killed",
                 )
             else:
                 self.emit(
@@ -3558,6 +3576,37 @@ class Host:
                 )
 
             self.restart_after[index] = time.monotonic() + RESTART_DELAY_SECONDS
+
+    def took_oom_kill(self, status: int) -> bool:
+        """Say whether a worker's exit is one of the kernel's kills for memory.
+
+        Section 13.9: a SIGKILL the host did not send, while the cgroup
+        counts more kills than have been put down to a worker, is the
+        kernel's. Each exit uses up one kill, so workers killed together
+        are each reported, whichever is reaped first.
+        """
+
+        if not os.WIFSIGNALED(status) or os.WTERMSIG(status) != signal.SIGKILL:
+            return False
+
+        kills = oom_kills(self.cgroup)
+
+        if kills is None or self.oom_kills is None or kills <= self.oom_kills:
+            return False
+
+        self.oom_kills += 1
+        return True
+
+    def report_oom_kill(self, index: int, message: str) -> None:
+        """Raise the event for a worker the kernel killed for memory."""
+
+        self.emit(
+            "worker.oom_killed",
+            "error",
+            message,
+            group=self.group_of(index).name,
+            reason="oom_killed",
+        )
 
     def restart_due(self) -> None:
         """Start replacements whose delay has passed."""

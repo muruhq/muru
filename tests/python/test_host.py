@@ -289,6 +289,71 @@ def test_a_timeout_kill_is_reported_at_the_decision_and_not_again_at_the_exit(
     assert "worker 0 (pid 4242) exited after its drain grace" in capsys.readouterr().err
 
 
+def kinds(sent: list[dict[str, Any]]) -> list[object]:
+    return [message["kind"] for message in sent if message.get("type") == "event"]
+
+
+def test_each_kill_for_memory_is_one_oom_killed_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = tmp_path / "memory.events"
+    events.write_text("oom 0\noom_kill 0\n")
+    instance, _state, sent, _asked = replacing_host(tmp_path, monkeypatch)
+    instance.cgroup = str(tmp_path)
+    instance.oom_kills = 0
+    instance.workers[4243] = 0
+
+    # Two workers killed together: the first reaped sees the count at 2.
+
+    events.write_text("oom 2\noom_kill 2\n")
+    exits(monkeypatch, (4242, signal.SIGKILL), (4243, signal.SIGKILL))
+    instance.reap()
+    assert kinds(sent) == ["worker.oom_killed", "worker.oom_killed"]
+    assert instance.oom_kills == 2
+
+    # With every kill put down to a worker, a SIGKILL is someone else's.
+
+    instance.workers[4244] = 0
+    exits(monkeypatch, (4244, signal.SIGKILL))
+    instance.reap()
+    assert kinds(sent)[-1] == "worker.exited"
+
+
+def test_a_kill_for_memory_during_a_replacement_is_counted_and_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = tmp_path / "memory.events"
+    events.write_text("oom_kill 0\n")
+    instance, state, sent, _asked = replacing_host(tmp_path, monkeypatch)
+    instance.cgroup = str(tmp_path)
+    instance.oom_kills = 0
+
+    # The kernel takes the condemned worker: not a recycle, and the kill
+    # is used up, so it cannot be put on a later exit.
+
+    instance.replace(state, "over the limit", "worker.recycled", "memory")
+    events.write_text("oom_kill 1\n")
+    exits(monkeypatch, (4242, signal.SIGKILL))
+    instance.reap()
+    assert kinds(sent) == ["worker.oom_killed"]
+    assert sent[-1]["reason"] == "oom_killed"
+    assert instance.oom_kills == 1
+
+    # A SIGKILL the host sent itself, past the stop budget, leaves a kill
+    # the cgroup counted for the exit it belongs to.
+
+    state = host.WorkerState(0, 4300, 0, "w0.sock", time.monotonic(), -1)
+    instance.states[4300] = state
+    instance.workers[4300] = 0
+    instance.replace(state, "served its share", "worker.recycled", "max_requests")
+    instance.replacing[0].killed = True
+    events.write_text("oom_kill 2\n")
+    exits(monkeypatch, (4300, signal.SIGKILL))
+    instance.reap()
+    assert kinds(sent)[-1] == "worker.recycled"
+    assert instance.oom_kills == 1
+
+
 def test_arguments_are_checked_against_the_interface(monkeypatch: pytest.MonkeyPatch) -> None:
     def wsgi(environ: object, start_response: object) -> None: ...
     def factory() -> None: ...
