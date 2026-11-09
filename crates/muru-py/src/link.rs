@@ -763,13 +763,18 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
 }
 
 /// The answer to an operation over a period while another is running.
-const PERIOD_BUSY: &str = "another debug operation over a period is running in this worker; try again when it has finished";
+const PERIOD_BUSY: &str =
+    "another long debug operation is running in this worker; try again when it has finished";
 
 /// Whether a request line asks for something that runs over a period,
-/// as the host writes it: `profile`, `trace`, or `memory` with `"trace":
-/// true` and no snapshot to keep or compare.
+/// as the host writes it: `profile`, `trace`, `exec`, whose code runs for
+/// as long as it runs, or `memory` with `"trace": true` and no snapshot to
+/// keep or compare.
 fn period_operation(line: &str) -> bool {
-    if line.contains("\"op\": \"profile\"") || line.contains("\"op\": \"trace\"") {
+    if ["profile", "trace", "exec"]
+        .iter()
+        .any(|op| line.contains(&format!("\"op\": \"{op}\"")))
+    {
         return true;
     }
 
@@ -2228,6 +2233,9 @@ mod tests {
             r#"{"id": 1, "op": "profile", "args": {}}"#
         ));
         assert!(period_operation(r#"{"id": 1, "op": "trace", "args": {}}"#));
+        assert!(period_operation(
+            r#"{"id": 1, "op": "exec", "args": {"code": "1"}}"#
+        ));
         assert!(period_operation(
             r#"{"id": 1, "op": "memory", "args": {"trace": true, "snapshot": ""}}"#
         ));

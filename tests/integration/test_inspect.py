@@ -82,7 +82,7 @@ def test_a_worker_goes_on_answering_during_a_profile(daemon: Daemon, tmp_path: P
     wait_for(lambda: "debug.profile" in daemon.events())
     time.sleep(0.5)
     refused = daemon.muructl("debug", "profile", "plain", "--for", "1s", check=False)
-    assert "another debug operation over a period is running" in refused.stderr + refused.stdout
+    assert "another long debug operation is running" in refused.stderr + refused.stdout
 
     # What the host asks without the interpreter is answered meanwhile:
     # a stuck request is given up at the hard timeout, while the profile
