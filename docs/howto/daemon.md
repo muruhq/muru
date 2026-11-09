@@ -691,7 +691,10 @@ daemon through its admin socket: `--socket` or `MURU_SOCKET`, else a
 development run started from the current directory, else the daemon's
 socket in the runtime directory, else the one development run listening;
 with several runs and no daemon the command names them, so one can be
-chosen with `--socket`. `muructl status` says which was found.
+chosen with `--socket`. `muructl status` says which was found. A run
+directory you may not enter is passed over like one that is not there;
+when nothing else is found, the command says permission was denied on
+its socket.
 
 ## In a container
 

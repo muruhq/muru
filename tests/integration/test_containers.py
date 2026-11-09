@@ -446,6 +446,45 @@ def test_serve_runs_as_an_arbitrary_user_on_a_read_only_root(
     assert "permission denied on /run/muru/admin.sock" in outside.stderr, outside.stderr
     assert "belongs to UID" in outside.stderr, outside.stderr
 
+    # Without --socket the same user is told the same, having nothing else
+    # to find, and with a run of their own finds that and is told nothing
+    # about a directory they may not enter.
+
+    nothing = instance.exec("muructl", "status", check=False, user="5555:5555")
+    assert nothing.returncode != 0
+    assert "permission denied on /run/muru/admin.sock" in nothing.stderr, nothing.stderr
+    subprocess.run(
+        [
+            "docker",
+            "exec",
+            "--detach",
+            "--user",
+            "5555:5555",
+            "--env",
+            "HOME=/tmp/five",
+            instance.name,
+            "muructl",
+            "run",
+            "plain_wsgi:application",
+            "--port",
+            "auto",
+            "--dashboard",
+            "off",
+            "--no-reload",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    def own_run_found() -> bool:
+        return instance.exec("muructl", "status", check=False, user="5555:5555").returncode == 0
+
+    wait_for(own_run_found)
+    own = instance.exec("muructl", "status", check=False, user="5555:5555")
+    assert "/run/muru" not in own.stdout + own.stderr, own.stdout + own.stderr
+
     # Section 9.12: a command of the project runs through the serve, and
     # in a container of its own, where nothing serves, by muructl itself.
 
