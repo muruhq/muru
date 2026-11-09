@@ -560,10 +560,12 @@ impl Registration {
             listen: listen.to_string(),
             socket: socket.to_path_buf(),
         };
-        std::fs::write(
-            socket.with_file_name("serve.json"),
-            serde_json::to_vec(&info)?,
-        )?;
+        let registration = socket.with_file_name("serve.json");
+        std::fs::write(&registration, serde_json::to_vec(&info)?)?;
+
+        // Section 13.9: any user ID with the group may use the serve.
+
+        crate::serve::group_writable(&registration, 0o660);
         Ok(Self {
             directory: None,
             socket: socket.to_path_buf(),
@@ -626,6 +628,11 @@ pub async fn serve(
             socket.display()
         )
     })?;
+
+    // Whoever may enter its directory may connect: only the owner for a
+    // run, the group as well under muructl serve (section 13.9).
+
+    crate::serve::group_writable(&socket, 0o770);
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
     let service = AdminServer::new(Service { state });
 

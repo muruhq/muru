@@ -444,6 +444,12 @@ struct RunArgs {
     #[arg(value_name = "ENTRYPOINT or PATH")]
     app: Option<String>,
 
+    /// The application's name, in metrics, logs and the commands
+    /// (default: `[project] name` from pyproject.toml, else the
+    /// entrypoint's top-level module).
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
     /// The interface the entrypoint speaks: auto (detected from the
     /// callable), wsgi, asgi, or grpc for a function that registers gRPC
     /// services.
@@ -2234,17 +2240,55 @@ fn mount_paths(resolved: &Resolved) -> Vec<muru_edge::routing::MountPath> {
         .collect()
 }
 
-/// The application's name: the top-level module of its entrypoint, as
-/// the host names it for muru.context().
-fn app_name(entrypoint: &str) -> String {
+/// The application's name, as the edge labels it and the host names it
+/// for muru.context(): the project's `[project] name` when there is one,
+/// else the top-level module of its entrypoint, underscores as hyphens.
+fn app_name(project: &Path, entrypoint: &str) -> String {
+    if let Some(name) = project_name(project) {
+        return name;
+    }
+
     let module = entrypoint.split(':').next().unwrap_or(entrypoint);
     let top = module.split('.').next().unwrap_or(module);
 
     if top.is_empty() {
         "default".to_owned()
     } else {
-        top.to_owned()
+        top.replace('_', "-")
     }
+}
+
+/// `[project] name` from the project's pyproject.toml, normalised as
+/// Python package names are, when it makes a valid application name.
+fn project_name(project: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(project.join("pyproject.toml")).ok()?;
+    let file: toml::Table = text.parse().ok()?;
+    let name = file.get("project")?.get("name")?.as_str()?;
+    let normalised = name.to_ascii_lowercase().replace(['_', '.'], "-");
+
+    muru_config::valid_name(&normalised).then_some(normalised)
+}
+
+/// The line that marks SIGTERM under `muructl serve`: what readiness does
+/// and how long the delay and the drain may take.
+fn stopping_line(policy: &muru_controller::shutdown::Policy) {
+    let budget = muru_config::format_duration(policy.budget);
+
+    let plan = if policy.delay.is_zero() {
+        format!("draining for up to {budget}")
+    } else {
+        format!(
+            "serving for the shutdown delay of {}, then draining for up to {budget}",
+            muru_config::format_duration(policy.delay)
+        )
+    };
+
+    muru_common::log::line_of_kind(
+        muru_common::log::Stream::Stdout,
+        "serve.stopping",
+        "muru",
+        format_args!("stopping: readiness now fails; {plan}"),
+    );
 }
 
 /// How TLS was set up: the listener configuration and, for a development
@@ -2794,6 +2838,11 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     };
 
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+
+    if serve.is_some() {
+        serve::group_writable(&run_dir, 0o770);
+    }
+
     let access_log_file = resolved
         .serving
         .access_log_file
@@ -2815,7 +2864,15 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     // The application's name, as the edge labels it and muru.context()
     // reports it, so a command the log names works as it is.
 
-    let label = app_name(&resolved.entrypoint).replace('_', "-");
+    let label = match &args.name {
+        Some(name) if muru_config::valid_name(name) => name.clone(),
+        Some(name) => anyhow::bail!(
+            "{name:?} is not a valid application name: lowercase letters, digits and hyphens, up \
+             to 63 characters"
+        ),
+        None => app_name(&resolved.project, &resolved.entrypoint),
+    };
+
     let mut spec = HostSpec {
         python: python.python.clone(),
         pythonpath: library.pythonpath.clone(),
@@ -3593,6 +3650,12 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         health.stopping();
     }
 
+    if let Some(mode) = &serve
+        && signalled
+    {
+        stopping_line(&mode.shutdown);
+    }
+
     // Section 9.12: the commands running through the admin socket are
     // stopped as at their timeout while the rest stops, inside the same
     // budget, and waited for, so each caller hears how its command ended
@@ -3653,6 +3716,19 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         let for_drain = deadline
             .saturating_duration_since(Instant::now())
             .saturating_sub(muru_controller::shutdown::WORKERS_RESERVE);
+
+        if signalled {
+            muru_common::log::line_of_kind(
+                muru_common::log::Stream::Stdout,
+                "serve.draining",
+                "muru",
+                format_args!(
+                    "stopped accepting connections; {} still open, draining",
+                    drainer.open_connections()
+                ),
+            );
+        }
+
         drainer.drain(stop_budget.min(for_drain)).await;
         current
             .stop_until(
@@ -3741,6 +3817,39 @@ mod tests {
     use clap::CommandFactory as _;
 
     use super::Cli;
+
+    #[test]
+    fn an_application_is_named_after_its_project_else_its_module() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let project = directory.path();
+
+        // With no pyproject.toml, the entrypoint's top-level module.
+
+        assert_eq!(
+            super::app_name(project, "shop_site.wsgi:application"),
+            "shop-site"
+        );
+
+        // The project's name wins, normalised as a package name is.
+
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = 'Shop_Front.v2'\n",
+        )
+        .expect("write");
+        assert_eq!(
+            super::app_name(project, "shop_site.wsgi:application"),
+            "shop-front-v2"
+        );
+
+        // A pyproject.toml with no usable name leaves the module.
+
+        std::fs::write(project.join("pyproject.toml"), "[tool.muru]\nthreads = 2\n")
+            .expect("write");
+        assert_eq!(super::app_name(project, "app:application"), "app");
+        std::fs::write(project.join("pyproject.toml"), "[project]\nname = '-x-'\n").expect("write");
+        assert_eq!(super::app_name(project, "app:application"), "app");
+    }
 
     /// Whether a line names a part of the design documents: a section, a
     /// phase or an ADR, followed by its number.

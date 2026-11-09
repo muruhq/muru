@@ -299,6 +299,15 @@ setting over it.
 `--max-lifetime`, `--memory`, the connection limits, `--static` and
 `--no-compression` work as they do for [`muructl run`](run-settings.md).
 
+## The application's name
+
+The application is named after `[project] name` in `pyproject.toml` when
+there is one, with underscores and dots as hyphens, else after the
+entrypoint's top-level module with underscores as hyphens. `--name`, or
+`MURU_SERVE_NAME`, sets it. `muructl status`, the `app` label on the
+[metrics](metrics.md) and the `app` field of the logs use it, and
+`muructl run` names an application the same way.
+
 ## Sizing from the container's limits
 
 On Linux, `muructl serve` reads the container's CPU and memory limits at
@@ -315,11 +324,22 @@ workers, not 64.
   what the application holds in memory after it is imported. The rest is
   divided between the workers. A worker that grows past its share is
   replaced as the [memory policy](memory.md) replaces one, with no request
-  lost, before the kernel's out-of-memory killer chooses a process to
-  kill.
+  lost, at the next memory check, every `check_interval` (5 seconds by
+  default). The headroom is what a worker may grow by between checks: in
+  a 1GB container with two workers, about 13MB a second each. A workload
+  that grows faster than that can reach the limit first, so it sets a
+  shorter interval with `--memory check_interval=1s`.
+- **Replacing a worker near the limit.** A worker replaced for memory
+  normally stays until its replacement is ready. When less is left under
+  the container's limit than one worker's hard limit, it leaves routing
+  and stops first, and its replacement is forked once it has gone. The
+  requests it holds finish, and for that moment the container has one
+  worker fewer. With a single worker, requests wait for the replacement
+  up to the [queue timeout](timeouts.md).
 - **Out-of-memory kills.** A worker the kernel kills anyway is reported
-  as a `worker.oom_killed` event and counted in `muru_worker_exits_total`
-  with the reason `oom_killed`, and the host starts another.
+  as a `worker.oom_killed` event and counted once in
+  `muru_worker_exits_total` with the reason `oom_killed`, whatever it was
+  doing, including being replaced, and the host starts another.
 
 The lines at start say what was worked out and from what, here under
 `docker run --cpus 2 --memory 1g`:
@@ -389,7 +409,8 @@ in front of every line, for a supervisor that adds none.
 
 `--log-format json` writes one JSON object per line instead, for a log
 collector, each with its `time`, a `kind` (`access`, `app` for the
-application's output, or `muru`), and the line's fields:
+application's output, `muru`, or `serve.stopping` and `serve.draining`
+for the lines that mark a [stop](#stopping)), and the line's fields:
 
 ```json
 {"time":"2026-11-02T05:42:22.836Z","kind":"app","source":"muru.worker[0]","message":"worker 0 is ready"}
@@ -438,10 +459,13 @@ Everything `muructl serve` writes goes under one directory, `/run/muru`
 unless `--run-dir` or `MURU_RUN_DIR` names another: the admin socket, the
 workers' sockets, and request bodies too large to hold in memory, up to
 `--spool-quota`, beyond which an upload is refused with 507. It assumes no
-user account for its user ID and creates what it writes group-writable,
-so it runs under whatever user ID the platform assigns with group 0, as
-OpenShift does. With a read-only root filesystem, that directory and
-`/tmp` are the only writable mounts it needs:
+user account for its user ID and creates the directory, the admin and
+probe sockets, the `release` directory and `serve.json` group-writable, so it runs under
+whatever user ID the platform assigns with group 0, as OpenShift does, and
+`muructl` run under another user ID with group 0 can use the socket. The
+`spool` directory holds request bodies and is private to the user ID that
+serves. With a read-only root filesystem, that directory and `/tmp` are
+the only writable mounts it needs:
 
 ```yaml
 securityContext:
@@ -513,6 +537,16 @@ order:
 3. The listener closes and the requests in flight finish.
 4. The workers stop, closing their WebSockets with 1001, and the
    container exits 0.
+
+Two lines mark the sequence, with `kind` values of their own in JSON logs:
+
+```
+muru: stopping: readiness now fails; serving for the shutdown delay of 5s, then draining for up to 25s
+muru: stopped accepting connections; 3 still open, draining
+```
+
+The first, `serve.stopping`, comes at SIGTERM, and the second,
+`serve.draining`, when the listener closes.
 
 All of it fits inside `--shutdown-budget`; whatever has not finished by
 then is killed. A project command running through the container, as

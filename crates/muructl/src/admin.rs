@@ -1770,7 +1770,7 @@ async fn ask(
             args_json: args.to_string(),
         })
         .await
-        .map_err(explain)?
+        .map_err(|status| explain_debug(op, status))?
         .into_inner();
 
     if response.workers.is_empty() {
@@ -7093,6 +7093,26 @@ fn explain(status: tonic::Status) -> anyhow::Error {
     anyhow::anyhow!("{}", status.message())
 }
 
+/// A debug reply past the client's limit says what to narrow; any other
+/// error is passed on as `explain` would.
+fn explain_debug(op: &str, status: tonic::Status) -> anyhow::Error {
+    if status.code() != tonic::Code::OutOfRange {
+        return explain(status);
+    }
+
+    let hint = match op {
+        "profile" => ", or a shorter --for",
+        "trace" | "memory" => ", or a smaller --top",
+        _ => "",
+    };
+
+    anyhow::anyhow!(
+        "the reply to debug {op} is larger than the {} MiB muructl accepts; ask one worker with \
+         --worker{hint}",
+        muru_controller::client::MAX_REPLY_MIB
+    )
+}
+
 fn process_alive(pid: u32) -> bool {
     // SAFETY: kill with signal 0 checks for the process and sends nothing.
 
@@ -7114,6 +7134,26 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 mod tests {
     use super::metric_samples;
     use super::pb;
+
+    #[test]
+    fn a_debug_reply_past_the_limit_says_what_to_narrow() {
+        let status = tonic::Status::out_of_range("Error, decoded message length too large");
+        let message = super::explain_debug("profile", status).to_string();
+        assert!(
+            message.starts_with("the reply to debug profile is larger than"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("--worker, or a shorter --for"),
+            "{message}"
+        );
+
+        let other = tonic::Status::not_found("no such release");
+        assert_eq!(
+            super::explain_debug("stacks", other).to_string(),
+            "no such release"
+        );
+    }
 
     #[test]
     fn the_workers_column_says_what_runs_beside_the_shape() {

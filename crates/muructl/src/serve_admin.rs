@@ -243,6 +243,10 @@ pub fn listen_unix(path: &Path, health: Arc<Health>) -> anyhow::Result<()> {
     let listener = tokio::net::UnixListener::bind(path)
         .map_err(|error| anyhow::anyhow!("{} cannot be bound: {error}", path.display()))?;
 
+    // Section 13.9: any user ID with the group may ask.
+
+    crate::serve::group_writable(path, 0o770);
+
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             tokio::spawn(connection(TokioIo::new(stream), Arc::clone(&health)));

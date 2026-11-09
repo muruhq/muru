@@ -886,6 +886,12 @@ class Replacement:
     # stuck request's stack, or its commonest objects), for the event.
 
     capture: str | None = None
+
+    # Section 9.3: a timeout kill is reported at the decision, as soon as
+    # the replacement exists and the stacks asked for have been answered.
+
+    captured: bool = False
+    reported: bool = False
     announced: int | None = None
     announced_at: float | None = None
 
@@ -900,6 +906,11 @@ class Replacement:
     # Section 7.4: a retirement, which stops the worker without a successor.
 
     retire: bool = False
+
+    # Section 13.9: short of memory, so the successor is forked only once
+    # this worker has gone.
+
+    stop_first: bool = False
 
 
 @dataclass
@@ -2982,14 +2993,70 @@ class Host:
                 self.abandon_requests(state, abandon)
 
             if kind == "worker.timeout_killed":
-                self.capture_stacks(state, replacement)
+                self.capture_stacks(state, replacement, self.report_timeout_kill)
 
             grace = self.group_of(index).hard_drain_grace
             replacement.terminate_at = time.monotonic() + (
                 self.hard_drain_grace if grace is None else grace
             )
 
+        # Section 13.9: two large workers alive at once is what the kernel
+        # would kill for, so with no room for a second this one leaves
+        # routing and stops first, and reap() forks its successor.
+
+        short = self.short_of_memory(index) if cause == "memory" else None
+
+        if short is not None:
+            log(
+                f"worker {index} (pid {state.pid}) stops before its replacement starts: "
+                f"{format_size(short)} is left under the container's memory limit"
+            )
+            replacement.stop_first = True
+            replacement.terminate_at = None
+            self.routed[index] = None
+            replacement.announced = self.announce()
+            replacement.announced_at = time.monotonic()
+            return
+
         replacement.new_pid = self.spawn(index, replacing=True)
+
+        if kind == "worker.timeout_killed":
+            self.report_timeout_kill(replacement)
+
+    def short_of_memory(self, index: int) -> int | None:
+        """Return what is left under the container's limit, if less than one worker may use."""
+
+        policy = self.group_of(index).memory or self.memory
+        left = memory_left(self.cgroup)
+
+        if left is None or policy.hard_limit is None or left >= policy.hard_limit:
+            return None
+
+        return left
+
+    def report_timeout_kill(self, replacement: Replacement) -> None:
+        """Raise a timeout kill's event, once, when both halves of it are known.
+
+        Section 9.3: the host's decision to replace the worker is the
+        evidence a rollout counts, so this does not wait for the old
+        worker to go. The event names the new pid, known once the fork
+        returns, and where the stuck request was, which the worker answers
+        within the second capture_stacks allows it.
+        """
+
+        if replacement.reported or replacement.new_pid is None or not replacement.captured:
+            return
+
+        replacement.reported = True
+        capture = f"; {replacement.capture}" if replacement.capture else ""
+        self.emit(
+            replacement.kind,
+            "warning",
+            f"worker {replacement.index} (pid {replacement.old_pid}) replaced by pid "
+            f"{replacement.new_pid}: {replacement.reason}{capture}",
+            group=self.group_of(replacement.index).name,
+            reason=replacement.cause,
+        )
 
     def abandon_requests(self, state: WorkerState, args: dict[str, str]) -> None:
         """Have a condemned worker give up requests that cannot finish.
@@ -3174,7 +3241,12 @@ class Host:
         self.ask_workers(targets, "bookkeeping", {}, 1.0, named)
         return True
 
-    def capture_stacks(self, state: WorkerState, replacement: Replacement) -> None:
+    def capture_stacks(
+        self,
+        state: WorkerState,
+        replacement: Replacement,
+        then: Callable[[Replacement], None] | None = None,
+    ) -> None:
         """Take a worker's stacks before it is killed for the hard timeout.
 
         Section 11.7: the stacks go to the log and where the oldest request
@@ -3182,8 +3254,15 @@ class Host:
         every frame; otherwise the worker is asked, and one that cannot
         answer within a second gets SIGQUIT, so faulthandler writes its
         stacks to the log, and is read from outside as well where that is
-        possible.
+        possible. `then` is called once the capture is settled, answered
+        or not.
         """
+
+        def settled() -> None:
+            replacement.captured = True
+
+            if then is not None:
+                then(replacement)
 
         outside = self.read_outside(state.pid) if _outside.WHOLE else None
 
@@ -3194,6 +3273,7 @@ class Host:
                 bookkeeping = answer.get("result", {}) if answer.get("ok") else {}
                 result = _outside.stacks_result(outside, bookkeeping)
                 self.record_capture(state, replacement, result["threads"])
+                settled()
 
             self.ask(state, "bookkeeping", {}, 1.0, read)
             return
@@ -3201,11 +3281,12 @@ class Host:
         def answered(pending: Pending) -> None:
             answer = pending.answers.get(state.pid, {})
 
-            if not answer.get("ok"):
+            if answer.get("ok"):
+                self.record_capture(state, replacement, answer.get("result", {}).get("threads", []))
+            else:
                 replacement.capture = "its stacks were written to the log by faulthandler"
-                return
 
-            self.record_capture(state, replacement, answer.get("result", {}).get("threads", []))
+            settled()
 
         self.ask(state, "stacks", {}, 1.0, answered)
 
@@ -3383,14 +3464,27 @@ class Host:
             if self.stopping:
                 continue
 
-            # The old worker of a replacement is done with: its event
-            # says why it went, and nothing restarts it.
-
             replacement = self.replacing.get(index)
+            killed_here = (
+                replacement is not None and replacement.old_pid == pid and replacement.killed
+            )
+            oom_killed = not killed_here and self.took_oom_kill(status)
+
+            # The old worker of a replacement is done with: its event
+            # says why it went, and nothing restarts it. A timeout kill's
+            # event was raised at the decision, so nothing is counted here
+            # unless the kernel took it first.
 
             if replacement is not None and replacement.old_pid == pid and replacement.retire:
                 del self.replacing[index]
                 self.retired.add(index)
+
+                if oom_killed:
+                    self.report_oom_kill(
+                        index, f"worker {index} (pid {pid}) was killed by the kernel for memory"
+                    )
+                    continue
+
                 self.emit(
                     "worker.exited",
                     "info",
@@ -3402,11 +3496,30 @@ class Host:
 
             if replacement is not None and replacement.old_pid == pid:
                 del self.replacing[index]
-                level = "warning" if replacement.kind == "worker.timeout_killed" else "info"
+
+                # Section 13.9: the worker was stopped first, so its
+                # successor starts now and is routed to once it is ready.
+
+                if replacement.stop_first:
+                    self.starting.add(index)
+                    replacement.new_pid = self.spawn(index, replacing=True)
+
+                if oom_killed:
+                    self.report_oom_kill(
+                        index,
+                        f"worker {index} (pid {pid}) was killed by the kernel for memory while "
+                        f"being replaced by pid {replacement.new_pid}",
+                    )
+                    continue
+
+                if replacement.kind == "worker.timeout_killed":
+                    log(f"worker {index} (pid {pid}) exited after its drain grace")
+                    continue
+
                 capture = f"; {replacement.capture}" if replacement.capture else ""
                 self.emit(
                     replacement.kind,
-                    level,
+                    "info",
                     f"worker {index} (pid {pid}) replaced by pid {replacement.new_pid}: "
                     f"{replacement.reason}{capture}",
                     group=self.group_of(index).name,
@@ -3424,6 +3537,15 @@ class Host:
                 if replacement.announced is None and old is not None:
                     old.replaced = False
                     self.start_failures[index] = self.start_failures.get(index, 0) + 1
+
+                    if oom_killed:
+                        self.report_oom_kill(
+                            index,
+                            f"worker {index} replacement (pid {pid}) was killed by the kernel "
+                            f"for memory before it was ready; pid {old.pid} keeps serving",
+                        )
+                        continue
+
                     self.emit(
                         "worker.exited",
                         "error",
@@ -3454,16 +3576,21 @@ class Host:
                         self.routed[index] = None
                         self.retired.add(index)
                         self.emit(
-                            "worker.exited",
+                            "worker.oom_killed" if oom_killed else "worker.exited",
                             "error",
                             f"worker {index} (pid {pid}) of the optional group {group.name} "
                             f"failed {MAX_START_FAILURES} times at start, last with "
                             f"{describe(status)}; it is given up",
                             group=group.name,
-                            reason="start_failed",
+                            reason="oom_killed" if oom_killed else "start_failed",
                         )
                         self.announce()
                         continue
+
+                    if oom_killed:
+                        self.report_oom_kill(
+                            index, f"worker {index} (pid {pid}) was killed by the kernel for memory"
+                        )
 
                     log(
                         f"worker {index} failed {MAX_START_FAILURES} times at start, "
@@ -3475,26 +3602,10 @@ class Host:
             else:
                 self.start_failures[index] = 0
 
-            # Section 13.9: a SIGKILL nobody here sent, while the cgroup
-            # counts another kill for memory, is the kernel's.
-
-            kills = oom_kills(self.cgroup)
-            oom_killed = (
-                os.WIFSIGNALED(status)
-                and os.WTERMSIG(status) == signal.SIGKILL
-                and kills is not None
-                and self.oom_kills is not None
-                and kills > self.oom_kills
-            )
-            self.oom_kills = kills
-
             if oom_killed:
-                self.emit(
-                    "worker.oom_killed",
-                    "error",
+                self.report_oom_kill(
+                    index,
                     f"worker {index} (pid {pid}) was killed by the kernel for memory, restarting",
-                    group=self.group_of(index).name,
-                    reason="oom_killed",
                 )
             else:
                 self.emit(
@@ -3506,6 +3617,37 @@ class Host:
                 )
 
             self.restart_after[index] = time.monotonic() + RESTART_DELAY_SECONDS
+
+    def took_oom_kill(self, status: int) -> bool:
+        """Say whether a worker's exit is one of the kernel's kills for memory.
+
+        Section 13.9: a SIGKILL the host did not send, while the cgroup
+        counts more kills than have been put down to a worker, is the
+        kernel's. Each exit uses up one kill, so workers killed together
+        are each reported, whichever is reaped first.
+        """
+
+        if not os.WIFSIGNALED(status) or os.WTERMSIG(status) != signal.SIGKILL:
+            return False
+
+        kills = oom_kills(self.cgroup)
+
+        if kills is None or self.oom_kills is None or kills <= self.oom_kills:
+            return False
+
+        self.oom_kills += 1
+        return True
+
+    def report_oom_kill(self, index: int, message: str) -> None:
+        """Raise the event for a worker the kernel killed for memory."""
+
+        self.emit(
+            "worker.oom_killed",
+            "error",
+            message,
+            group=self.group_of(index).name,
+            reason="oom_killed",
+        )
 
     def restart_due(self) -> None:
         """Start replacements whose delay has passed."""
@@ -3693,6 +3835,37 @@ def oom_kills(cgroup: str | None) -> int | None:
         pass
 
     return None
+
+
+def memory_left(cgroup: str | None) -> int | None:
+    """Read what is left under the cgroup's memory limit, or None with no limit.
+
+    Inactive file pages count as free, since the kernel reclaims those
+    before it kills anything.
+    """
+
+    if cgroup is None:
+        return None
+
+    try:
+        with open(os.path.join(cgroup, "memory.max")) as limit_file:
+            limit = int(limit_file.read())
+
+        with open(os.path.join(cgroup, "memory.current")) as current_file:
+            current = int(current_file.read())
+
+        inactive = 0
+
+        with open(os.path.join(cgroup, "memory.stat")) as stat:
+            for line in stat:
+                name, _, count = line.partition(" ")
+
+                if name == "inactive_file":
+                    inactive = int(count)
+    except (OSError, ValueError):
+        return None
+
+    return limit - max(current - inactive, 0)
 
 
 def format_size(size: int) -> str:

@@ -75,6 +75,27 @@ def start(runtime: Path, port: int | None = None, **kwargs: object) -> support.S
     return server
 
 
+def test_a_debug_reply_larger_than_the_default_limit_arrives(runtime: Path) -> None:
+    server = start(runtime)
+
+    try:
+        size = 5 * 1024 * 1024
+        large = muructl(
+            runtime,
+            "debug",
+            "exec",
+            "plain-wsgi",
+            "--worker",
+            "0",
+            "--",
+            f"print('x' * {size})",
+            cwd=support.FIXTURES,
+        ).stdout
+        assert large.count("x") >= size, len(large)
+    finally:
+        server.stop()
+
+
 def test_the_commands_reach_a_development_run(runtime: Path) -> None:
     server = start(runtime, args=["--timeout", "deadline=2s"])
 

@@ -304,12 +304,19 @@ pub fn split_time(line: &str) -> (Option<&str>, &str) {
 /// then `tag: ` and the message, in one write so lines from several
 /// threads never interleave.
 pub fn line(stream: Stream, tag: &str, message: fmt::Arguments<'_>) {
+    line_of_kind(stream, "muru", tag, message);
+}
+
+/// Write one of Muru's own lines as `line` does, with a `kind` of its own
+/// in JSON, so a log collector can pick it out.
+pub fn line_of_kind(stream: Stream, kind: &str, tag: &str, message: fmt::Arguments<'_>) {
     let mut text = String::with_capacity(128);
 
     if json() {
         text.push_str(&format!(
-            "{{\"time\":\"{}\",\"kind\":\"muru\",\"message\":{}{}}}\n",
+            "{{\"time\":\"{}\",\"kind\":{},\"message\":{}{}}}\n",
             full(SystemTime::now()),
+            json_string(kind),
             json_string(&message.to_string()),
             identity()
         ));
