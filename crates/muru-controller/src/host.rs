@@ -1465,9 +1465,10 @@ pub(crate) fn own_session(command: &mut Command, identity: Option<Identity>) {
 /// gave it. Returns whether it was delivered.
 pub(crate) fn signal_group(pid: u32, signal: i32) -> bool {
     // SAFETY: kill with the negated pid of a process this one started in
-    // a session of its own, whose process group has the same id.
+    // a session of its own, whose process group has the same id. Pid 0
+    // would name this process's own group and is never sent to.
 
-    unsafe { libc::kill(-(pid as libc::pid_t), signal) == 0 }
+    pid != 0 && unsafe { libc::kill(-(pid as libc::pid_t), signal) == 0 }
 }
 
 /// Send a signal to one process. Returns whether it was delivered.
@@ -1524,6 +1525,13 @@ pub(crate) fn own_session_std(command: &mut std::process::Command, identity: Opt
 /// hosts and the edge are children the previous image started, which
 /// nothing else waits for.
 pub fn alive(pid: u32) -> bool {
+    // Pid 0 is no process: as a pid it names this process's own group,
+    // which is always there, and waiting on it would reap any child.
+
+    if pid == 0 {
+        return false;
+    }
+
     let mut status = 0;
 
     // SAFETY: waitpid with WNOHANG on one pid returns at once and reaps
