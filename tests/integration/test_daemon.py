@@ -367,6 +367,8 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
             timeout=60,
         )
         assert f"http://127.0.0.1:{port}" in status.stdout
+        assert f"logs     {tmp_path / 'logs'}\n" in status.stdout
+        assert "cache    " in status.stdout and "config   " in status.stdout
     finally:
         stopped = subprocess.run(
             [str(muructl), "daemon", "stop", "--shutdown", *location],
@@ -380,6 +382,29 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
     assert "releases drained and stopped" in stopped.stdout
     assert (tmp_path / "logs" / "daemon.log").is_file()
     assert not (run_dir / "daemon.pid").exists()
+
+    # With the daemon stopped, its own log is read from the file, and its
+    # status says where its files would be.
+
+    shown = subprocess.run(
+        [str(muructl), "logs", "--daemon", *location],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert shown.returncode == 0 and shown.stdout, shown.stderr
+    status = subprocess.run(
+        [str(muructl), "daemon", "status", *location],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert status.returncode == 3, status.stdout + status.stderr
+    assert status.stdout.startswith("daemon   not running\n")
+    assert f"logs     {tmp_path / 'logs'}\n" in status.stdout
+    assert f"socket   {run_dir / 'admin.sock'}\n" in status.stdout
 
 
 def test_status_names_the_edge_process(daemon: Daemon) -> None:

@@ -213,6 +213,11 @@ impl Locations {
         self.logs.path.join("daemon.log")
     }
 
+    /// The edge process's own output.
+    pub fn edge_log(&self) -> PathBuf {
+        self.logs.path.join("edge.log")
+    }
+
     /// The daemon's pid file, for a background daemon.
     pub fn pid_file(&self) -> PathBuf {
         self.run.path.join("daemon.pid")

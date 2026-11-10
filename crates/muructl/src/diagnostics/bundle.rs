@@ -1368,7 +1368,7 @@ impl<W: Write> Bundle<'_, W> {
                     follow: false,
                     lines: EVERY_LINE,
                     access: records,
-                    host: String::new(),
+                    ..pb::TailLogsRequest::default()
                 })
                 .await
                 .map_err(|status| status.message().to_owned())?

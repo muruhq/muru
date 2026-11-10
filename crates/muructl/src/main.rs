@@ -198,7 +198,7 @@ enum Command {
         command: admin::DashboardCommand,
     },
 
-    /// Show the daemon's status.
+    /// Show the status of the daemon or the development run.
     Status {
         #[command(flatten)]
         socket: admin::SocketArgs,
@@ -936,6 +936,14 @@ fn main() -> anyhow::Result<()> {
         Command::Build(args) => runtime.block_on(provision::build(*args)),
         Command::Check(args) => runtime.block_on(check(*args)),
         Command::ServeStatic(args) => runtime.block_on(serve_static(*args)),
+        Command::Daemon {
+            command:
+                admin::DaemonCommand::Status {
+                    socket,
+                    files,
+                    output,
+                },
+        } => exit_with(runtime, admin::daemon_status(socket, files, output.json)),
         Command::Daemon { command } => runtime.block_on(async move {
             match command {
                 admin::DaemonCommand::Run(args) => admin::daemon_run(args).await,
@@ -954,8 +962,8 @@ fn main() -> anyhow::Result<()> {
                     socket,
                     files,
                 } => admin::daemon_upgrade(socket, files, timeout).await,
-                admin::DaemonCommand::Status { socket, output, .. } => {
-                    admin::daemon_status(socket, output.json).await
+                admin::DaemonCommand::Status { .. } => {
+                    unreachable!("daemon status is matched on its own")
                 }
             }
         }),
@@ -1029,9 +1037,8 @@ fn main() -> anyhow::Result<()> {
         Command::Maintenance { command } => runtime.block_on(admin::maintenance(command)),
         Command::Dashboard { command } => runtime.block_on(admin::dashboard(command)),
         Command::Overlay { command } => runtime.block_on(admin::overlay(command)),
-        Command::Status { socket, output } => {
-            runtime.block_on(admin::daemon_status(socket, output.json))
-        }
+        Command::Status { socket, output } => runtime
+            .block_on(async move { admin::show_status(&socket.socket()?, output.json).await }),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
         Command::Config { command } => match command {
             admin::ConfigCommand::Export {

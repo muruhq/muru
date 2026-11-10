@@ -417,7 +417,8 @@ pub enum DaemonCommand {
         files: DaemonFileArgs,
     },
 
-    /// Show the daemon's status.
+    /// Show the daemon's status, or where its files would be when none
+    /// is running, exiting 3 then.
     Status {
         #[command(flatten)]
         socket: SocketArgs,
@@ -2587,9 +2588,51 @@ pub async fn daemon_reload(socket: SocketArgs, json: bool) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Show the daemon's status.
-pub async fn daemon_status(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+/// The exit status of `muructl daemon status` when no daemon is
+/// running, as for an init script's status.
+const NOT_RUNNING: i32 = 3;
+
+/// Show the daemon's status, exiting 3 when none is running. With none
+/// running and no socket named, it says where a daemon started with the
+/// same options and environment would keep its files.
+pub async fn daemon_status(
+    socket: SocketArgs,
+    files: DaemonFileArgs,
+    json: bool,
+) -> anyhow::Result<i32> {
+    let path = socket.socket()?;
+    let locations = daemon_locations(&socket, &files);
+
+    if path == locations.admin_socket() && no_daemon(&socket, &path) {
+        let status = pb::Status {
+            kind: "stopped".to_owned(),
+            socket: path.display().to_string(),
+            config: locations.config.path.display().to_string(),
+            state_dir: locations.state.path.display().to_string(),
+            run_dir: locations.run.path.display().to_string(),
+            log_dir: locations.logs.path.display().to_string(),
+            cache_dir: locations.cache.path.display().to_string(),
+            ..pb::Status::default()
+        };
+
+        if json {
+            print_answer(&status)?;
+        } else {
+            println!("daemon   not running");
+            print_daemon_files(&status);
+        }
+
+        return Ok(NOT_RUNNING);
+    }
+
+    show_status(&path, json).await?;
+    Ok(0)
+}
+
+/// Show the status of what answers at an admin socket: a daemon or a
+/// development run.
+pub async fn show_status(path: &Path, json: bool) -> anyhow::Result<()> {
+    let mut client = client::connect(path).await?;
     let status = client
         .get_status(pb::GetStatusRequest {})
         .await?
@@ -2622,7 +2665,6 @@ pub async fn daemon_status(socket: SocketArgs, json: bool) -> anyhow::Result<()>
     println!("daemon   pid {} version {}", status.pid, status.version);
     println!("edge     pid {}", status.edge_pid);
     println!("serving  {}", status.listeners.join(", "));
-    println!("socket   {}", status.socket);
 
     if !status.metrics.is_empty() {
         println!("metrics  http://{}/metrics", status.metrics);
@@ -2632,8 +2674,7 @@ pub async fn daemon_status(socket: SocketArgs, json: bool) -> anyhow::Result<()>
         println!("dashboard http://{}/", status.dashboard);
     }
 
-    println!("state    {}", status.state_dir);
-    println!("run      {}", status.run_dir);
+    print_daemon_files(&status);
     println!(
         "apps     {} ({} releases)",
         status.app_count, status.release_count
@@ -2652,6 +2693,17 @@ pub async fn daemon_status(socket: SocketArgs, json: bool) -> anyhow::Result<()>
     }
 
     Ok(())
+}
+
+/// The daemon's socket, configuration file and directories, as `daemon
+/// status` prints them.
+fn print_daemon_files(status: &pb::Status) {
+    println!("socket   {}", status.socket);
+    println!("config   {}", status.config);
+    println!("state    {}", status.state_dir);
+    println!("run      {}", status.run_dir);
+    println!("logs     {}", status.log_dir);
+    println!("cache    {}", status.cache_dir);
 }
 
 /// Make sure a daemon runs: start one when none answers.
@@ -7220,8 +7272,9 @@ async fn relay(
     }
 }
 
-/// What `muructl logs` takes: a release's output, or the access log,
-/// shown or followed; or `logs reopen` after an external rotation.
+/// What `muructl logs` takes: a release's output, the access log, or
+/// the edge's or the daemon's own log, shown or followed; or a
+/// subcommand on the log files.
 #[derive(Args, Clone)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct LogsArgs {
@@ -7230,8 +7283,9 @@ pub struct LogsArgs {
 
     /// The application, or app@release; the current release when only
     /// the application is named. A development run's application when
-    /// left out; the daemon needs it, unless --access is given.
-    #[arg(value_name = "APP[@RELEASE]")]
+    /// left out; the daemon needs it, unless --access, --edge or
+    /// --daemon is given.
+    #[arg(value_name = "APP[@RELEASE]", conflicts_with_all = ["edge", "daemon"])]
     target: Option<String>,
 
     /// Keep printing lines as they are written.
@@ -7243,8 +7297,19 @@ pub struct LogsArgs {
     lines: u32,
 
     /// The access log the edge writes, instead of a release's output.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["edge", "daemon"])]
     access: bool,
+
+    /// The daemon's edge process's own output, edge.log. Read from the
+    /// log directory when no daemon is running.
+    #[arg(long, conflicts_with = "daemon")]
+    edge: bool,
+
+    /// The daemon's own output, daemon.log, which a daemon started with
+    /// muructl daemon start writes. Read from the log directory when no
+    /// daemon is running.
+    #[arg(long)]
+    daemon: bool,
 
     /// With --access, the records of one virtual host: from the file it
     /// names for them, or else those in the access log that name it.
@@ -7262,6 +7327,11 @@ pub struct LogsArgs {
 
     #[command(flatten)]
     socket: SocketArgs,
+
+    /// With --edge or --daemon and no daemon running, where its log
+    /// directory is.
+    #[command(flatten)]
+    files: DaemonFileArgs,
 }
 
 /// Which logs a command on the log files acts on.
@@ -7515,6 +7585,10 @@ impl LogsListArgs {
 
 /// Show or follow a release's output or the access log.
 pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
+    if args.edge || args.daemon {
+        return own_logs(args).await;
+    }
+
     let (app, release) = match &args.target {
         Some(target) if target.contains('@') => {
             let (app, release) = split_release(target)?;
@@ -7562,6 +7636,7 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
             lines: args.lines,
             access: args.access,
             host: args.host.clone().filter(|_| own_file).unwrap_or_default(),
+            ..pb::TailLogsRequest::default()
         })
         .await
         .map_err(explain)?
@@ -7592,6 +7667,64 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
                 println!("{}", muru_common::log::split_time(&line.line).1);
             }
             (false, false) => println!("{}", line.line),
+        }
+    }
+
+    Ok(())
+}
+
+/// Show or follow the edge's or the daemon's own log: through the
+/// daemon when one is running, else from the file in the log directory,
+/// which is where a daemon that failed to start says why.
+async fn own_logs(args: LogsArgs) -> anyhow::Result<()> {
+    // The lines, from the daemon or from the file, as one stream.
+
+    let mut lines: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = anyhow::Result<String>>>> =
+        match logs_way(&args.socket, &args.files).await? {
+            LogsWay::Daemon(mut client) => {
+                let stream = client
+                    .tail_logs(pb::TailLogsRequest {
+                        follow: args.follow,
+                        lines: args.lines,
+                        edge: args.edge,
+                        daemon: args.daemon,
+                        ..pb::TailLogsRequest::default()
+                    })
+                    .await
+                    .map_err(explain)?
+                    .into_inner();
+
+                Box::pin(stream.map(|line| line.map(|line| line.line).map_err(explain)))
+            }
+            LogsWay::Files(directory) => {
+                let path = if args.edge {
+                    directory.locations.edge_log()
+                } else {
+                    directory.locations.daemon_log()
+                };
+
+                if !args.follow && !path.exists() {
+                    anyhow::bail!(muru_controller::logs::missing(&path));
+                }
+
+                let stream = muru_controller::logs::tail(path, args.lines as usize, args.follow);
+                Box::pin(stream.map(Ok))
+            }
+        };
+
+    while let Some(line) = lines.next().await {
+        let line = line?;
+
+        if args.json {
+            let line = pb::LogLine {
+                line,
+                ..pb::LogLine::default()
+            };
+            println!("{}", serde_json::to_string(&line)?);
+        } else if args.no_timestamps {
+            println!("{}", muru_common::log::split_time(&line).1);
+        } else {
+            println!("{line}");
         }
     }
 

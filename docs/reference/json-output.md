@@ -52,7 +52,7 @@ $ muructl release show shop@r9 --json
 | Command | Prints |
 | --- | --- |
 | `muructl status` | The daemon's or run's status: `version`, `pid`, `listeners`, `app_count`, `release_count`, `edge_pid`, `no_host` (the applications serving with no hosts declared to choose between them, empty otherwise) and the rest |
-| `muructl daemon status` | The same as `muructl status` |
+| `muructl daemon status` | The same as `muructl status`, with `config`, `state_dir`, `run_dir`, `log_dir`, `cache_dir` and `socket`. With no daemon running, `kind` is `stopped` and those six say where a daemon started with the same options would keep them, the rest being empty or 0, and the command exits with status 3 |
 | `muructl daemon reload` | What was reloaded: `message` |
 | `muructl app list` | `{"apps": [...]}`, each with `name`, `current_release`, `previous_release`, `user`, `maintenance` and the rest |
 | `muructl release list` | `{"releases": [...]}`, each a release as `release show` prints it |
@@ -90,7 +90,7 @@ $ muructl release show shop@r9 --json
 | `muructl mcp skill status` | How the project's copy of the skill compares: `path`, `state` (`current`, `missing`, `out_of_date`, `edited` or `edited_out_of_date`), `edited`, `version` and `installed_version` |
 | `muructl secret list` | `{"store": ..., "keys": [...]}`; values are never shown |
 | `muructl events` | `{"events": [...]}`, each with `sequence`, `time_unix_ms`, `type`, `subject`, `level`, `message`; with `--follow`, one event per line |
-| `muructl logs` | One line per log line: a release's output as `{"app", "release", "line"}`, the access log (`--access`) as the records it keeps |
+| `muructl logs` | One line per log line: a release's output as `{"app", "release", "line"}`, the access log (`--access`) as the records it keeps, the edge's and the daemon's own logs (`--edge`, `--daemon`) as `{"app", "release", "line"}` with `app` and `release` empty |
 | `muructl command list` | `app`, `release` and `commands`, each with `name`, `description`, `run` or `call`, `inputs` (`name`, `description`, `required`, `default`, `pattern`, `secret`), `timeout`, `exclusive` and its `last_run` (`release`, `started_unix_ms`, `duration_ms`, `exit_code`, `ok`, `message`), which only the daemon keeps. `release` is empty for a project's commands listed with nothing serving it |
 | `muructl command run` | As `muructl exec` prints it |
 | `muructl exec` | One object per line of output, with `release`, `line` and `stderr`, then one with `finished` true, the `exit_code`, `ok`, true when the command exited with 0 and was not stopped, and the ending as a `message`. `release` is empty for a command `muructl` runs itself |

@@ -609,7 +609,32 @@ daemon writes its pid to `daemon.pid` in the runtime directory and
 removes the file when it exits. `muructl
 up` does the same and is harmless when one already runs. `muructl daemon
 status` and `muructl status` show the daemon, its edge process, its
-listener and its locations. `--metrics ADDRESS`, or a `[metrics]` table
+listener, its admin socket, its configuration file and its state, run,
+log and cache directories:
+
+```console
+$ muructl daemon status
+daemon   pid 4242 version 1.0.0
+edge     pid 4250
+serving  http://0.0.0.0:80
+socket   /run/muru/admin.sock
+config   /etc/muru/muru.toml
+state    /var/lib/muru
+run      /run/muru
+logs     /var/log/muru
+cache    /var/cache/muru
+apps     2 (3 releases)
+websockets 0 open
+```
+
+With no daemon running, `muructl daemon status` says so, names where a
+daemon started with the same location options and environment would
+keep the same files, and exits with status 3. That is where to look
+for `daemon.log` when a daemon did not start, and `muructl logs
+--daemon` reads it. `muructl status` with nothing running says that
+nothing is listening.
+
+`--metrics ADDRESS`, or a `[metrics]` table
 in the configuration file, serves Prometheus metrics on an internal
 address; the [metrics guide](metrics.md) lists them. `--dashboard
 ADDRESS`, or a `[dashboard]` table, serves the [dashboard and JSON

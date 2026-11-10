@@ -831,6 +831,13 @@ impl Admin for Service {
         let state = &self.state;
         let lines = request.lines as usize;
 
+        if request.edge || request.daemon {
+            return Err(Status::failed_precondition(
+                "the edge's and the daemon's own logs are the daemon's: a development run and \
+                 muructl serve write no log files",
+            ));
+        }
+
         // The lines are read after subscribing, so none is missed between
         // the two; the ring and the stream are both in memory, since a
         // run writes no log files (section 13.8).

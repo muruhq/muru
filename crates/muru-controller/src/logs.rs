@@ -72,6 +72,20 @@ const TAIL_BYTES: u64 = 256 * 1024;
 /// How often a followed file is checked for new lines.
 const POLL: Duration = Duration::from_millis(200);
 
+/// What to say when a log file asked for is not there. The daemon's own
+/// log is written only by a daemon started in the background.
+pub fn missing(path: &Path) -> String {
+    if path.file_name().is_some_and(|name| name == "daemon.log") {
+        return format!(
+            "no log file at {}: the daemon writes daemon.log only when started with muructl \
+             daemon start",
+            path.display()
+        );
+    }
+
+    format!("no log file at {}", path.display())
+}
+
 /// The last `lines` lines of a log file, then, with `follow`, every line
 /// appended to it, as a stream. A file renamed away and created again,
 /// which is what an external rotation does, is followed from the start of

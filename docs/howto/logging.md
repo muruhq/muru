@@ -275,7 +275,26 @@ $ muructl logs --access --lines 1
 have none to leave off and are shown as they are. The same command against a
 development run shows the run's lines with their times as well, and
 there the application can be left out, as `muructl logs` alone, since a
-run serves one; the daemon needs it named unless `--access` is given.
+run serves one; the daemon needs it named unless `--access`, `--edge` or
+`--daemon` is given.
+
+`muructl logs --edge` shows `edge.log` and `muructl logs --daemon`
+`daemon.log`, with the same `--follow`, `--lines`, `--no-timestamps` and
+`--json`. With the daemon stopped they read the file in the log
+directory, or the one named by `--log-dir`, so `muructl logs --daemon`
+shows why a daemon started with `muructl daemon start` did not stay up:
+
+```console
+$ muructl logs --daemon --lines 5
+muru: cache: /var/cache/muru (default)
+Error: cannot listen on 0.0.0.0:80
+
+Caused by:
+    Address already in use (os error 98)
+```
+
+`muructl daemon status` names the log directory, with the daemon
+running or stopped.
 
 ### What the daemon's access log writes
 
