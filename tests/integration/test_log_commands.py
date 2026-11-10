@@ -258,6 +258,13 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
         shown = direct(daemon, "logs", "--edge", "--lines", "1", "--no-timestamps").stdout
         assert shown == "muru.edge: the last line\n"
 
+        # A release's output and the access log, from their files, the
+        # application's current release from the store.
+
+        shown = direct(daemon, "logs", "shop", "--lines", "1", "--json").stdout
+        assert json.loads(shown)["release"] == "r1"
+        assert "time" in json.loads(direct(daemon, "logs", "--access", "--json", "-n", "1").stdout)
+
         answer = json.loads(
             direct(daemon, "logs", "truncate", "--access", "--keep", "0", "--yes", "--json").stdout
         )

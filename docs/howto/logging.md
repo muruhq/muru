@@ -280,9 +280,16 @@ run serves one; the daemon needs it named unless `--access`, `--edge` or
 
 `muructl logs --edge` shows `edge.log` and `muructl logs --daemon`
 `daemon.log`, with the same `--follow`, `--lines`, `--no-timestamps` and
-`--json`. With the daemon stopped they read the file in the log
-directory, or the one named by `--log-dir`, so `muructl logs --daemon`
-shows why a daemon started with `muructl daemon start` did not stay up:
+`--json`.
+
+With the daemon stopped, `muructl logs` reads the file in the log
+directory, or the one named by `--log-dir`. A release named as
+`APP@RELEASE`, the access log, `edge.log` and `daemon.log` need nothing
+else. An application named alone needs the daemon's state store to find
+its current release, and `--access --host HOST` needs it to find where
+the host's records are; `--state-dir` names the store when it is not in
+the default place. So `muructl logs --daemon` shows why a daemon started
+with `muructl daemon start` did not stay up:
 
 ```console
 $ muructl logs --daemon --lines 2

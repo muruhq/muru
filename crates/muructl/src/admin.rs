@@ -7347,14 +7347,12 @@ pub struct LogsArgs {
     #[arg(long, conflicts_with_all = ["edge", "daemon"])]
     access: bool,
 
-    /// The daemon's edge process's own output, edge.log. Read from the
-    /// log directory when no daemon is running.
+    /// The daemon's edge process's own output, edge.log.
     #[arg(long, conflicts_with = "daemon")]
     edge: bool,
 
     /// The daemon's own output, daemon.log, which a daemon started with
-    /// muructl daemon start writes. Read from the log directory when no
-    /// daemon is running.
+    /// muructl daemon start writes.
     #[arg(long)]
     daemon: bool,
 
@@ -7375,8 +7373,8 @@ pub struct LogsArgs {
     #[command(flatten)]
     socket: SocketArgs,
 
-    /// With --edge or --daemon and no daemon running, where its log
-    /// directory is.
+    /// With no daemon running, where its log directory and state are:
+    /// the files are read from there.
     #[command(flatten)]
     files: DaemonFileArgs,
 }
@@ -7630,72 +7628,27 @@ impl LogsListArgs {
     }
 }
 
-/// Show or follow a release's output or the access log.
-pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
-    if args.edge || args.daemon {
-        return own_logs(args).await;
-    }
+/// The lines `muructl logs` prints, from the daemon or from a file.
+type LogLines = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = anyhow::Result<pb::LogLine>>>>;
 
-    let (app, release) = match &args.target {
-        Some(target) if target.contains('@') => {
-            let (app, release) = split_release(target)?;
-            (app.to_owned(), release.to_owned())
-        }
-        Some(app) => (app.clone(), String::new()),
-        None => (String::new(), String::new()),
+/// Show or follow a release's output, the access log, or the edge's or
+/// the daemon's own log: through whatever answers at the admin socket,
+/// else, with no daemon running, from the file in the log directory.
+pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
+    let (mut lines, named) = if args.edge || args.daemon {
+        (own_log_lines(&args).await?, None)
+    } else {
+        log_lines(&args).await?
     };
 
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    // Access log records are kept as JSON lines already; any other line
+    // becomes a JSON line of the admin API's log line. `named` is a host
+    // whose records are picked out of access.log by its name.
 
-    // Section 11.2: a virtual host's records are in the file it names
-    // for them, or else among the access log's, where each JSON record
-    // names its virtual host.
+    while let Some(line) = lines.next().await {
+        let line = line?;
 
-    let mut own_file = false;
-
-    if let Some(name) = &args.host {
-        let hosts = client
-            .list_hosts(pb::ListHostsRequest {})
-            .await
-            .map_err(explain)?
-            .into_inner()
-            .hosts;
-        let host = hosts
-            .iter()
-            .find(|host| host.name == *name)
-            .ok_or_else(|| anyhow::anyhow!("no virtual host named {name}"))?;
-        own_file = !host.access_log_file.is_empty();
-
-        if !own_file && host.access_log_format == "combined" {
-            anyhow::bail!(
-                "host {name} writes its records to access.log in the combined format, which \
-                 does not name the host; give the host an access_log_file to keep them apart"
-            );
-        }
-    }
-
-    let named = args.host.as_deref().filter(|_| !own_file);
-    let mut stream = client
-        .tail_logs(pb::TailLogsRequest {
-            app,
-            release,
-            follow: args.follow,
-            lines: args.lines,
-            access: args.access,
-            host: args.host.clone().filter(|_| own_file).unwrap_or_default(),
-            ..pb::TailLogsRequest::default()
-        })
-        .await
-        .map_err(explain)?
-        .into_inner();
-
-    // Access log records are kept as JSON lines already; a release's
-    // output becomes JSON lines of the admin API's log lines.
-
-    while let Some(line) = stream.next().await {
-        let line = line.map_err(explain)?;
-
-        if let Some(name) = named {
+        if let Some(name) = &named {
             let of_host = serde_json::from_str::<serde_json::Value>(&line.line)
                 .ok()
                 .and_then(|record| Some(record.get("virtual_host")?.as_str()? == name))
@@ -7720,62 +7673,218 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Show or follow the edge's or the daemon's own log: through the
-/// daemon when one is running, else from the file in the log directory,
-/// which is where a daemon that failed to start says why.
-async fn own_logs(args: LogsArgs) -> anyhow::Result<()> {
-    // The lines, from the daemon or from the file, as one stream.
+/// Whether a virtual host's records are in a file of its own, which it
+/// names, rather than among access.log's. A host whose records go to
+/// access.log in the combined format cannot be picked out of it.
+fn host_has_own_file(name: &str, access_log_file: &str, format: &str) -> anyhow::Result<bool> {
+    let own_file = !access_log_file.is_empty();
 
-    let mut lines: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = anyhow::Result<String>>>> =
-        match logs_way(&args.socket, &args.files).await? {
-            LogsWay::Daemon(mut client) => {
-                let stream = client
-                    .tail_logs(pb::TailLogsRequest {
-                        follow: args.follow,
-                        lines: args.lines,
-                        edge: args.edge,
-                        daemon: args.daemon,
-                        ..pb::TailLogsRequest::default()
-                    })
-                    .await
-                    .map_err(explain)?
-                    .into_inner();
+    if !own_file && format == "combined" {
+        anyhow::bail!(
+            "host {name} writes its records to access.log in the combined format, which does \
+             not name the host; give the host an access_log_file to keep them apart"
+        );
+    }
 
-                Box::pin(stream.map(|line| line.map(|line| line.line).map_err(explain)))
-            }
-            LogsWay::Files(directory) => {
-                let path = if args.edge {
-                    directory.locations.edge_log()
+    Ok(own_file)
+}
+
+/// A release's output or the access log, with the host whose records are
+/// to be picked out of it. With no daemon listening and no socket named,
+/// they come from the files.
+async fn log_lines(args: &LogsArgs) -> anyhow::Result<(LogLines, Option<String>)> {
+    let path = args.socket.socket()?;
+    let locations = daemon_locations(&args.socket, &args.files);
+
+    if path == locations.admin_socket() && no_daemon(&args.socket, &path) {
+        return file_log_lines(args, &locations);
+    }
+
+    let (app, release) = match &args.target {
+        Some(target) if target.contains('@') => {
+            let (app, release) = split_release(target)?;
+            (app.to_owned(), release.to_owned())
+        }
+        Some(app) => (app.clone(), String::new()),
+        None => (String::new(), String::new()),
+    };
+
+    let mut client = client::connect(&path).await?;
+
+    // Section 11.2: a virtual host's records are in the file it names
+    // for them, or else among the access log's, where each JSON record
+    // names its virtual host.
+
+    let mut own_file = false;
+
+    if let Some(name) = &args.host {
+        let hosts = client
+            .list_hosts(pb::ListHostsRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner()
+            .hosts;
+        let host = hosts
+            .iter()
+            .find(|host| host.name == *name)
+            .ok_or_else(|| anyhow::anyhow!("no virtual host named {name}"))?;
+        own_file = host_has_own_file(name, &host.access_log_file, &host.access_log_format)?;
+    }
+
+    let stream = client
+        .tail_logs(pb::TailLogsRequest {
+            app,
+            release,
+            follow: args.follow,
+            lines: args.lines,
+            access: args.access,
+            host: args.host.clone().filter(|_| own_file).unwrap_or_default(),
+            ..pb::TailLogsRequest::default()
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    let named = args.host.clone().filter(|_| !own_file);
+    Ok((Box::pin(stream.map(|line| line.map_err(explain))), named))
+}
+
+/// A release's output or the access log read from its file, with no
+/// daemon running. A release named in full and the access log need only
+/// the log directory; an application's current release and a virtual
+/// host's file are found in the state store, opened read-only.
+fn file_log_lines(
+    args: &LogsArgs,
+    locations: &Locations,
+) -> anyhow::Result<(LogLines, Option<String>)> {
+    let store = |needed_for: &str| -> anyhow::Result<muru_controller::store::Store> {
+        let path = locations.state_store();
+
+        if !path.is_file() {
+            anyhow::bail!(
+                "no daemon is running, and {needed_for} needs its state store, which is not at \
+                 {}; name it with --state-dir",
+                path.display()
+            );
+        }
+
+        muru_controller::store::Store::open_read_only(&path)
+            .with_context(|| format!("opening {}", path.display()))
+    };
+
+    let (app, release, path, named) = if args.access {
+        match &args.host {
+            None => (String::new(), String::new(), locations.access_log(), None),
+            Some(name) => {
+                let hosts = store("finding a virtual host's records")?
+                    .hosts()
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let (_, host) = hosts
+                    .iter()
+                    .find(|(host, _)| host == name)
+                    .ok_or_else(|| anyhow::anyhow!("no virtual host named {name}"))?;
+                let file = host.access_log_file.clone().unwrap_or_default();
+                let format = host.access_log_format.clone().unwrap_or_default();
+
+                if host_has_own_file(name, &file, &format)? {
+                    (
+                        String::new(),
+                        String::new(),
+                        locations.logs.path.join(file),
+                        None,
+                    )
                 } else {
-                    directory.locations.daemon_log()
-                };
-
-                if !args.follow && !path.exists() {
-                    anyhow::bail!(muru_controller::logs::missing(&path));
+                    (
+                        String::new(),
+                        String::new(),
+                        locations.access_log(),
+                        Some(name.clone()),
+                    )
                 }
+            }
+        }
+    } else {
+        let Some(target) = &args.target else {
+            anyhow::bail!("name an application, or give --access, --edge or --daemon");
+        };
 
-                let stream = muru_controller::logs::tail(path, args.lines as usize, args.follow);
-                Box::pin(stream.map(Ok))
+        let (app, release) = match target.split_once('@') {
+            Some(_) => {
+                let (app, release) = split_release(target)?;
+                (app.to_owned(), release.to_owned())
+            }
+            None => {
+                let found = store("finding an application's current release")?
+                    .app(target)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let current = found
+                    .current
+                    .ok_or_else(|| anyhow::anyhow!("{target} has no current release"))?;
+                (target.clone(), current)
             }
         };
 
-    while let Some(line) = lines.next().await {
-        let line = line?;
+        let path = locations.release_log(&app, &release);
+        (app, release, path, None)
+    };
 
-        if args.json {
-            let line = pb::LogLine {
-                line,
-                ..pb::LogLine::default()
-            };
-            println!("{}", serde_json::to_string(&line)?);
-        } else if args.no_timestamps {
-            println!("{}", muru_common::log::split_time(&line).1);
-        } else {
-            println!("{line}");
-        }
+    if !args.follow && !path.exists() {
+        anyhow::bail!(muru_controller::logs::missing(&path));
     }
 
-    Ok(())
+    let lines = muru_controller::logs::tail(path, args.lines as usize, args.follow);
+    let stream = lines.map(move |line| {
+        Ok(pb::LogLine {
+            app: app.clone(),
+            release: release.clone(),
+            line,
+        })
+    });
+
+    Ok((Box::pin(stream), named))
+}
+
+/// The edge's or the daemon's own log: through the daemon when one is
+/// running, else from the file in the log directory, which is where a
+/// daemon that failed to start says why.
+async fn own_log_lines(args: &LogsArgs) -> anyhow::Result<LogLines> {
+    match logs_way(&args.socket, &args.files).await? {
+        LogsWay::Daemon(mut client) => {
+            let stream = client
+                .tail_logs(pb::TailLogsRequest {
+                    follow: args.follow,
+                    lines: args.lines,
+                    edge: args.edge,
+                    daemon: args.daemon,
+                    ..pb::TailLogsRequest::default()
+                })
+                .await
+                .map_err(explain)?
+                .into_inner();
+
+            Ok(Box::pin(stream.map(|line| line.map_err(explain))))
+        }
+        LogsWay::Files(directory) => {
+            let path = if args.edge {
+                directory.locations.edge_log()
+            } else {
+                directory.locations.daemon_log()
+            };
+
+            if !args.follow && !path.exists() {
+                anyhow::bail!(muru_controller::logs::missing(&path));
+            }
+
+            let lines = muru_controller::logs::tail(path, args.lines as usize, args.follow);
+
+            Ok(Box::pin(lines.map(|line| {
+                Ok(pb::LogLine {
+                    line,
+                    ..pb::LogLine::default()
+                })
+            })))
+        }
+    }
 }
 
 /// Reopen every log file after an external rotation.
