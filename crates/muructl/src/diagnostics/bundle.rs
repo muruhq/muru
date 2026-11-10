@@ -18,8 +18,9 @@ use anyhow::Context as _;
 use clap::Args;
 use muru_controller::diagnostics::archive::{Archive, Entry, FORMAT, Manifest, layout};
 use muru_controller::diagnostics::facts::{self, Platform};
+use muru_controller::diagnostics::stored;
 use muru_controller::diagnostics::window::Window;
-use muru_controller::diagnostics::{ReleaseFacts, period};
+use muru_controller::diagnostics::{ReleaseFacts, changes_configuration, mask, period};
 use muru_proto::admin::v1 as pb;
 use serde::Serialize;
 
@@ -28,6 +29,10 @@ use crate::admin::{DaemonFileArgs, SocketArgs, format_time, human_size};
 
 /// What a planned archive says of a part a running daemon is asked for.
 const ASKED: &str = "asked for when the bundle is made";
+
+/// Why a part that only what runs can answer for is missing when
+/// nothing runs.
+const NOTHING_RUNS: &str = "nothing is running to ask";
 
 /// What a bundle never holds, as its manifest says.
 const NEVER_HELD: [&str; 3] = [
@@ -144,6 +149,18 @@ struct Bundle<'a, W: Write> {
     archive: Archive<W>,
     window: Window,
     target: &'a Target,
+    /// The events of the window, once they have been read.
+    events: Option<Vec<pb::Event>>,
+    /// The metrics as the daemon gave them, once it has been asked.
+    metrics: Option<Result<String, String>>,
+}
+
+/// A bundle collected: its archive, and what collecting it found out.
+struct Collected<W: Write> {
+    archive: Archive<W>,
+    /// Whether the configuration changed during the window, when the
+    /// events could be read to tell.
+    configuration_changed: Option<bool>,
 }
 
 impl<W: Write> Bundle<'_, W> {
@@ -161,25 +178,16 @@ impl<W: Write> Bundle<'_, W> {
 
     /// Add a part as JSON, or record why there is none.
     fn put<T: Serialize>(&mut self, path: &str, found: Result<T, String>) -> io::Result<()> {
-        match found {
-            Ok(found) => {
-                let mut text = serde_json::to_vec_pretty(&found).map_err(io::Error::other)?;
-                text.push(b'\n');
-                self.archive.bytes(path, &text, None)
-            }
-            Err(why) => {
-                self.archive.missing(path, why);
-                Ok(())
-            }
-        }
+        put_into(&mut self.archive, path, found)
     }
 
     /// Collect every part. Only a failure to write the archive itself is
     /// an error: a part that cannot be collected is recorded and the
     /// rest carries on.
-    async fn collect(mut self) -> io::Result<Archive<W>> {
+    async fn collect(mut self) -> io::Result<Collected<W>> {
         self.summary().await?;
         self.events().await?;
+        let configuration_changed = self.configuration().await?;
 
         // What was noted while collecting, such as a worker that did not
         // answer, is recorded as what it left out.
@@ -188,7 +196,240 @@ impl<W: Write> Bundle<'_, W> {
             self.archive.missing(&note.part, note.why);
         }
 
-        Ok(self.archive)
+        Ok(Collected {
+            archive: self.archive,
+            configuration_changed,
+        })
+    }
+
+    /// Add a part as text, or record why there is none.
+    fn put_text(&mut self, path: &str, found: Result<String, String>) -> io::Result<()> {
+        match found {
+            Ok(text) => self.archive.bytes(path, text.as_bytes(), None),
+            Err(why) => {
+                self.archive.missing(path, why);
+                Ok(())
+            }
+        }
+    }
+
+    /// The metrics of what runs, asked for once.
+    async fn metrics(&mut self) -> Result<String, String> {
+        if self.metrics.is_none() {
+            let asked = match &mut self.installation.live {
+                Some(live) => within(live.client.get_metrics(pb::GetMetricsRequest {}))
+                    .await
+                    .map(|answer| answer.text),
+                None => Err(NOTHING_RUNS.to_owned()),
+            };
+
+            self.metrics = Some(asked);
+        }
+
+        self.metrics
+            .clone()
+            .expect("the metrics were just asked for")
+    }
+
+    /// `config/`: the configuration in force on the system. With the
+    /// state store in reach, every release's effective settings and its
+    /// specification, the whole effective configuration and what is in
+    /// force outside it; without, what `muructl config show --effective`
+    /// prints. Beside them the daemon's own file, what only the running
+    /// daemon knows, and every change the window's events record.
+    ///
+    /// The answer is whether the configuration changed in the window.
+    async fn configuration(&mut self) -> io::Result<Option<bool>> {
+        let config = layout::CONFIG;
+        let target = self.target;
+        let app = (!target.app.is_empty()).then_some(target.app.as_str());
+
+        if let Ok(store) = &self.installation.store {
+            let releases = stored::releases(store).map_err(|error| error.to_string());
+
+            match releases {
+                Ok(releases) => {
+                    for release in releases
+                        .iter()
+                        .filter(|release| target.holds(&release.app, &release.id))
+                    {
+                        let record = stored::release_record(store, release)
+                            .map_err(|error| error.to_string());
+                        let path = format!("{config}/releases/{}.json", release.name());
+                        put_into(&mut self.archive, &path, record)?;
+                    }
+                }
+                Err(why) => self.archive.missing(&format!("{config}/releases"), why),
+            }
+
+            let effective = stored::effective(store, app);
+            let in_force = stored::in_force(store).map_err(|error| error.to_string());
+            self.put_text(&format!("{config}/effective.toml"), effective)?;
+            self.put(&format!("{config}/in-force.json"), in_force)?;
+        } else {
+            let path = format!("{config}/effective.toml");
+
+            if self.asks(&path) {
+                let shown = self.effective_as_shown().await;
+                self.put_text(&path, shown)?;
+            }
+
+            let why = self.installation.store.as_ref().err().cloned();
+            self.archive
+                .missing(&format!("{config}/in-force.json"), why.unwrap_or_default());
+        }
+
+        // The daemon's own file, with what looks like a secret masked.
+
+        if self.installation.runs().is_daemon() {
+            let path = format!("{config}/daemon.toml");
+
+            match self.installation.daemon_file() {
+                Ok(Some((_, mut table))) => {
+                    mask::toml_table(&mut table);
+                    let text = toml::to_string(&table).map_err(|error| error.to_string());
+                    self.put_text(&path, text)?;
+                }
+                Ok(None) => self.archive.missing(
+                    &path,
+                    format!(
+                        "there is no configuration file at {}",
+                        self.installation
+                            .locations()
+                            .map(|locations| locations.config.path.display().to_string())
+                            .unwrap_or_default()
+                    ),
+                ),
+                Err(why) => self.archive.missing(&path, why),
+            }
+        }
+
+        // What only the running daemon knows: the changes to the access
+        // log in force, and the routing snapshot the edge routes by,
+        // which an access log record names.
+
+        let path = format!("{config}/access-log-overrides.json");
+
+        if self.asks(&path) {
+            let asked = match &mut self.installation.live {
+                Some(live) => within(live.client.override_access_log(
+                    pb::OverrideAccessLogRequest {
+                        mode: String::new(),
+                        app: String::new(),
+                        paths: Vec::new(),
+                        duration_ms: 0,
+                        reset: false,
+                    },
+                ))
+                .await
+                .map(|answer| answer.overrides),
+                None => Err(NOTHING_RUNS.to_owned()),
+            };
+
+            self.put(&path, asked)?;
+        }
+
+        let path = format!("{config}/routing-snapshot.json");
+
+        if self.asks(&path) {
+            let version = self.metrics().await.and_then(|text| {
+                crate::admin::metric_samples(&text)
+                    .iter()
+                    .find(|sample| sample["name"] == "muru_snapshot_version")
+                    .map(|sample| serde_json::json!({"version": sample["value"]}))
+                    .ok_or_else(|| "the metrics name no routing snapshot".to_owned())
+            });
+            self.put(&path, version)?;
+        }
+
+        // What Muru keeps no record of.
+
+        self.archive.missing(
+            &format!("{config}/routing-snapshots"),
+            "only the routing snapshot in force is kept, not those before it: the events in              changes.jsonl say what changed, and when",
+        );
+        self.archive.missing(
+            &format!("{config}/logger-levels.json"),
+            "the levels muructl logging level changed are held by each worker, and nothing              lists them",
+        );
+
+        // Every change the window's events record.
+
+        let Some(events) = &self.events else {
+            self.archive.missing(
+                &format!("{config}/changes.jsonl"),
+                "the events of the window were not read",
+            );
+            return Ok(None);
+        };
+
+        let mut lines = Vec::new();
+        let mut changes = 0;
+
+        for event in events
+            .iter()
+            .filter(|event| changes_configuration(&event.r#type))
+        {
+            lines.extend(serde_json::to_vec(event).unwrap_or_default());
+            lines.push(b'\n');
+            changes += 1;
+        }
+
+        let note = match changes {
+            0 => "the configuration did not change during the window".to_owned(),
+            changes => format!(
+                "the configuration changed {} during the window: the rest of config/ is as it \
+                 was when the bundle was made",
+                crate::admin::counted(changes, "time", "times")
+            ),
+        };
+
+        self.archive
+            .bytes(&format!("{config}/changes.jsonl"), &lines, Some(note))?;
+        Ok(Some(changes > 0))
+    }
+
+    /// The effective configuration as `muructl config show --effective`
+    /// prints it, asked of what runs: what each overlay sets, each
+    /// release's settings with where each came from, then the document,
+    /// its variables masked as a worker's environment is.
+    async fn effective_as_shown(&mut self) -> Result<String, String> {
+        let Some(live) = &mut self.installation.live else {
+            return Err(NOTHING_RUNS.to_owned());
+        };
+
+        let export = within(live.client.export_config(pb::ExportConfigRequest {
+            app: self.target.app.clone(),
+            effective: true,
+            resolve_rollouts: false,
+        }))
+        .await?;
+        let mut text = String::new();
+
+        for (heading, lines) in [
+            (
+                "# The active overlays set, and the routes below include:",
+                &export.attributions,
+            ),
+            (
+                "# The releases' settings and the routes' limits, and the layer each came from:",
+                &export.layers,
+            ),
+        ] {
+            if !lines.is_empty() {
+                text.push_str(heading);
+                text.push('\n');
+
+                for line in lines {
+                    text.push_str(&format!("#   {line}\n"));
+                }
+
+                text.push('\n');
+            }
+        }
+
+        text.push_str(&mask::document_env(&export.document)?);
+        Ok(text)
     }
 
     /// `installation.json`: how Muru runs and its releases.
@@ -257,27 +498,35 @@ impl<W: Write> Bundle<'_, W> {
         let target = self.target;
 
         let found = self.installation.events().await.map(|events| {
-            let mut lines = Vec::new();
+            events
+                .into_iter()
+                .filter(|event| {
+                    let (app, release) = event
+                        .subject
+                        .split_once('@')
+                        .unwrap_or((event.subject.as_str(), ""));
+                    let another = others.iter().any(|other| other == app)
+                        || (app == target.app
+                            && !release.is_empty()
+                            && !target.holds(app, release));
 
-            for event in events {
-                let (app, release) = event
-                    .subject
-                    .split_once('@')
-                    .unwrap_or((event.subject.as_str(), ""));
-                let another = others.iter().any(|other| other == app)
-                    || (app == target.app && !release.is_empty() && !target.holds(app, release));
-
-                if window.holds(event.time_unix_ms) && !another {
-                    lines.extend(serde_json::to_vec(&event).unwrap_or_default());
-                    lines.push(b'\n');
-                }
-            }
-
-            lines
+                    window.holds(event.time_unix_ms) && !another
+                })
+                .collect::<Vec<_>>()
         });
 
         match found {
-            Ok(lines) => self.archive.bytes(layout::EVENTS, &lines, None),
+            Ok(events) => {
+                let mut lines = Vec::new();
+
+                for event in &events {
+                    lines.extend(serde_json::to_vec(event).unwrap_or_default());
+                    lines.push(b'\n');
+                }
+
+                self.events = Some(events);
+                self.archive.bytes(layout::EVENTS, &lines, None)
+            }
             Err(why) => {
                 self.archive.missing(layout::EVENTS, why);
                 Ok(())
@@ -302,6 +551,25 @@ impl<W: Write> Bundle<'_, W> {
             .collect();
         others.dedup();
         others
+    }
+}
+
+/// Add a part as JSON to an archive, or record why there is none.
+fn put_into<W: Write, T: Serialize>(
+    archive: &mut Archive<W>,
+    path: &str,
+    found: Result<T, String>,
+) -> io::Result<()> {
+    match found {
+        Ok(found) => {
+            let mut text = serde_json::to_vec_pretty(&found).map_err(io::Error::other)?;
+            text.push(b'\n');
+            archive.bytes(path, &text, None)
+        }
+        Err(why) => {
+            archive.missing(path, why);
+            Ok(())
+        }
     }
 }
 
@@ -366,8 +634,10 @@ pub async fn bundle(args: BundleArgs) -> anyhow::Result<()> {
             archive: Archive::planned(&root),
             window,
             target: &target,
+            events: None,
+            metrics: None,
         };
-        Some(plan.collect().await?)
+        Some(plan.collect().await?.archive)
     } else {
         None
     };
@@ -467,8 +737,13 @@ impl Making<'_> {
             archive: Archive::new(writer, self.root, self.window.until_unix_ms / 1000),
             window: self.window,
             target: self.target,
+            events: None,
+            metrics: None,
         };
-        let archive = collecting.collect().await?;
+        let Collected {
+            archive,
+            configuration_changed,
+        } = collecting.collect().await?;
         let entries = archive.entries().to_vec();
 
         let manifest = Manifest {
@@ -482,7 +757,7 @@ impl Making<'_> {
             runs: installation.runs().describe().to_owned(),
             running: installation.running(),
             options: serde_json::json!({}),
-            configuration_changed: None,
+            configuration_changed,
             recorded: self.recorded,
             left_out: NEVER_HELD.iter().map(|held| (*held).to_owned()).collect(),
             parts: Vec::new(),

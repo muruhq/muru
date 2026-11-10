@@ -131,6 +131,112 @@ pub fn settings(store: &Store, app: &str, id: &str) -> Result<Vec<Setting>, Stor
     Ok(settings)
 }
 
+/// Everything the store records of one release, for an archive: what it
+/// is, its effective settings with where each came from, and its whole
+/// specification, in which the value of a variable whose name says it
+/// is a secret is masked, as is the password of a URL. A secret from a
+/// store is recorded only as its store and key.
+pub fn release_record(
+    store: &Store,
+    release: &ReleaseFacts,
+) -> Result<serde_json::Value, StoreError> {
+    let stored = store.release(&release.app, &release.id)?;
+    let mut spec = serde_json::to_value(&stored.spec)
+        .map_err(|error| StoreError::Decode(error.to_string()))?;
+
+    for variable in spec["env"].as_array_mut().into_iter().flatten() {
+        let name = variable["name"].as_str().unwrap_or_default().to_owned();
+
+        if let Some(value) = variable.get_mut("value")
+            && let Some(written) = value.as_str()
+        {
+            *value = super::mask::value(&name, written).into();
+        }
+    }
+
+    Ok(serde_json::json!({
+        "release": release,
+        "created_unix_ms": stored.created_unix_ms,
+        "settings": settings(store, &release.app, &release.id)?,
+        "spec": spec,
+    }))
+}
+
+/// What is in force outside the configuration: each rollout and where it
+/// stands, the sizes releases are pinned at, the applications and
+/// virtual hosts in maintenance mode, and each overlay's state.
+pub fn in_force(store: &Store) -> Result<serde_json::Value, StoreError> {
+    let mut pins = Vec::new();
+
+    for release in store.releases(None)? {
+        for (group, processes) in store.scale_pins(&release.app, &release.id)? {
+            pins.push(serde_json::json!({
+                "release": format!("{}@{}", release.app, release.id),
+                "group": group,
+                "processes": processes,
+            }));
+        }
+    }
+
+    let since = |held: Vec<(String, u64)>| -> Vec<serde_json::Value> {
+        held.into_iter()
+            .map(|(name, since)| serde_json::json!({"name": name, "since_unix_ms": since}))
+            .collect()
+    };
+
+    let overlays: Vec<serde_json::Value> = store
+        .overlay_states()?
+        .into_iter()
+        .map(|state| {
+            serde_json::json!({
+                "name": state.name,
+                "active": state.active,
+                "source": state.source,
+                "since_unix_ms": state.since_unix_ms,
+                "until_unix_ms": state.until_unix_ms,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "rollouts": store.rollouts(None)?,
+        "scale_pins": pins,
+        "maintenance": {
+            "applications": since(store.maintenance()?),
+            "hosts": since(store.host_maintenance()?),
+        },
+        "overlays": overlays,
+    }))
+}
+
+/// The effective configuration as `muructl config show --effective`
+/// writes it: desired state as the active overlays leave it, as TOML,
+/// headed by what each overlay sets that is in force. For `app` alone
+/// when one is given. The variables a release's table writes with their
+/// values are masked as a worker's environment is.
+pub fn effective(store: &Store, app: Option<&str>) -> Result<String, String> {
+    let mut document = config::export(store, app).map_err(|error| error.to_string())?;
+    let attributions =
+        config::make_effective(store, &mut document, app).map_err(|error| error.to_string())?;
+    let mut text = String::new();
+
+    if attributions.is_empty() {
+        text.push_str("# No active overlay changes this configuration.\n\n");
+    } else {
+        text.push_str("# The active overlays set, and the routes below include:\n");
+
+        for line in &attributions {
+            text.push_str(&format!("#   {line}\n"));
+        }
+
+        text.push('\n');
+    }
+
+    let document = document.to_toml().map_err(|error| error.to_string())?;
+    text.push_str(&super::mask::document_env(&document)?);
+    Ok(text)
+}
+
 /// Every event the store keeps, oldest first.
 pub fn events(store: &Store) -> Result<Vec<pb::Event>, StoreError> {
     Ok(store
@@ -228,6 +334,95 @@ mod tests {
         assert_eq!(of("max_body_size").value, "1MB");
         assert_eq!(of("max_body_size").source, "the release");
         assert!(settings.iter().all(|setting| setting.scope == "shop@r2"));
+    }
+
+    #[test]
+    fn a_releases_record_masks_what_looks_like_a_secret() {
+        let store = store();
+        let mut spec = crate::store::tests::spec();
+        let variable = |name: &str, value: &str| crate::model::EnvSpec {
+            name: name.to_owned(),
+            value: Some(value.to_owned()),
+            secret_store: None,
+            secret_key: None,
+            as_file: false,
+        };
+        spec.env = vec![
+            variable("API_TOKEN", "abc123"),
+            variable("DATABASE_URL", "postgres://shop:hunter2@db/shop"),
+            variable("MODE", "production"),
+            crate::model::EnvSpec {
+                name: "STRIPE".to_owned(),
+                value: None,
+                secret_store: Some("file".to_owned()),
+                secret_key: Some("stripe".to_owned()),
+                as_file: false,
+            },
+        ];
+        store.create_release("shop", "r3", &spec).unwrap();
+
+        let release = releases(&store)
+            .unwrap()
+            .into_iter()
+            .find(|release| release.id == "r3")
+            .unwrap();
+        let record = release_record(&store, &release).unwrap();
+
+        assert_eq!(record["release"]["app"], "shop");
+        assert_eq!(record["spec"]["entrypoint"], "shop.wsgi:application");
+        assert!(record["settings"].as_array().unwrap().len() > 20);
+        assert_eq!(
+            record["spec"]["env"],
+            serde_json::json!([
+                {"name": "API_TOKEN", "value": "***"},
+                {"name": "DATABASE_URL", "value": "postgres://shop:***@db/shop"},
+                {"name": "MODE", "value": "production"},
+                {"name": "STRIPE", "secret_store": "file", "secret_key": "stripe"},
+            ])
+        );
+        assert!(!record.to_string().contains("hunter2"));
+    }
+
+    #[test]
+    fn what_is_in_force_outside_configuration_is_read() {
+        let store = store();
+        store.put_scale_pin("shop", "r2", "default", 6).unwrap();
+        store.set_maintenance("shop", Some(1234)).unwrap();
+        store
+            .set_overlay_state(
+                "sale",
+                Some(&crate::model::OverlayState {
+                    name: "sale".to_owned(),
+                    active: true,
+                    source: "manual".to_owned(),
+                    since_unix_ms: 1000,
+                    until_unix_ms: Some(2000),
+                }),
+            )
+            .unwrap();
+
+        let found = in_force(&store).unwrap();
+        assert_eq!(
+            found["scale_pins"],
+            serde_json::json!([{"release": "shop@r2", "group": "default", "processes": 6}])
+        );
+        assert_eq!(
+            found["maintenance"],
+            serde_json::json!({
+                "applications": [{"name": "shop", "since_unix_ms": 1234}],
+                "hosts": [],
+            })
+        );
+        assert_eq!(found["overlays"][0]["name"], "sale");
+        assert_eq!(found["overlays"][0]["until_unix_ms"], 2000);
+        assert_eq!(found["rollouts"], serde_json::json!([]));
+
+        // The effective configuration is the document the command shows.
+
+        let text = effective(&store, None).unwrap();
+        assert!(text.starts_with("# No active overlay changes this configuration.\n\n"));
+        assert!(text.contains("[app.shop"));
+        assert!(effective(&store, Some("nope")).is_err());
     }
 
     #[test]

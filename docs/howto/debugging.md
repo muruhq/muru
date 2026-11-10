@@ -672,13 +672,37 @@ Everything is under one directory named as the file is.
 | `manifest.json` | What the bundle is of, its window, and every part: whether it was collected, its size, and why not when it was not |
 | `installation.json` | Muru's version, the platform, how Muru runs and where its directories are, and every release with its state, interface, Python version and workers' states |
 | `events.jsonl` | Every event of the window, in full, a JSON object a line |
+| `config/releases/APP@RELEASE.json` | For every release, serving or not: what it is, its effective settings with where each came from, as `muructl config show --effective` lists them, and its whole specification |
+| `config/effective.toml` | The configuration in force as `muructl config show --effective` writes it: applications, releases, virtual hosts and routes as the active overlays leave them |
+| `config/in-force.json` | What is in force outside the configuration: each rollout and where it stands, the sizes releases are pinned at, the applications and virtual hosts in maintenance mode, and each overlay's state |
+| `config/daemon.toml` | The daemon's own configuration file |
+| `config/access-log-overrides.json` | The changes `muructl logging access` has in force |
+| `config/routing-snapshot.json` | The version of the routing snapshot in force, which an access log record's `snapshot` names |
+| `config/changes.jsonl` | The events of the window that changed the configuration: an apply or a reload, traffic moved, a deploy, a rollout's step, an overlay starting or ending |
 
-With a target, the events of other applications are left out, and those
-of the node stay.
+With a target, the releases and events of other applications are left
+out, and the events of the node stay.
+
+`config/` holds the configuration as it was when the bundle was made.
+The manifest's `configuration_changed` says whether it changed during
+the window, and `config/changes.jsonl` what changed and when. Muru keeps
+only the routing snapshot in force, and no record of the levels
+`muructl logging level` changed, so the manifest lists the earlier
+snapshots and the logger levels as not collected.
+
+A development run and `muructl serve` have no state store, so their
+`config/` holds `effective.toml`, with the settings in force and where
+each came from, and no release files.
 
 A bundle never holds secret values, the value of an environment
 variable beyond those [`muructl debug inspect`](#inspect) shows, or a
-request's or a response's body.
+request's or a response's body. A variable a release declares is given
+with its value, masked as `***` when its name looks like a secret's
+(`SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `KEY`, `CREDENTIAL` or `AUTH`
+in it, or `_DSN` at its end), and a password in a URL is masked alone.
+A secret from a store is named by its store and key. In the daemon's
+file, a setting whose key says it is a secret (`secret`, `token`,
+`password`, or a key such as `signing_key`) is masked the same way.
 
 ### The manifest
 
@@ -692,6 +716,7 @@ request's or a response's body.
 | `target` | What it was limited to, as `app` or `app@release`; empty for the whole node |
 | `window` | `since_unix_ms` and `until_unix_ms`, the period it covers |
 | `runs`, `running` | How Muru runs, and whether it was running |
+| `configuration_changed` | Whether the configuration changed during the window; `null` when the events could not be read to tell |
 | `recorded` | How the making of the bundle was recorded, or why it was not |
 | `left_out` | What a bundle never holds |
 | `parts` | Every part, each with its `path` and `collected`; `bytes` for one in the archive, `why` for one that is not, and a `note` where there is something to know about it |

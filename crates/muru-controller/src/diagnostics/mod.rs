@@ -12,6 +12,7 @@
 
 pub mod archive;
 pub mod facts;
+pub mod mask;
 pub mod stored;
 pub mod window;
 
@@ -214,6 +215,40 @@ pub fn frameworks(modules: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// The events that change the configuration in force, by type, a type
+/// ending in a full stop standing for every type that starts with it.
+const CONFIGURATION_EVENTS: [&str; 16] = [
+    "config.applied",
+    "config.reloaded",
+    "traffic.",
+    "traffic_policy.",
+    "route.",
+    "maintenance.changed",
+    "access_log.",
+    "release.created",
+    "release.removed",
+    "rollout.",
+    "overlay.activated",
+    "overlay.ended",
+    "overlay.promoted",
+    "schedule.",
+    "client_class.list_reloaded",
+    "deploy.freeze_overridden",
+];
+
+/// Whether an event of this type is a change to the configuration in
+/// force: an apply or a reload, traffic moved, a deploy, a rollout's
+/// step, an overlay or a schedule starting or ending, and the like.
+pub fn changes_configuration(kind: &str) -> bool {
+    CONFIGURATION_EVENTS.iter().any(|known| {
+        if known.ends_with('.') {
+            kind.starts_with(known)
+        } else {
+            kind == *known
+        }
+    })
+}
+
 /// The event that records a bundle being made: what it is about (the
 /// application or release the bundle is limited to, else the daemon) and
 /// its sentence, which says how far back the bundle reaches.
@@ -330,6 +365,30 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    #[test]
+    fn the_events_that_change_configuration_are_told_from_the_rest() {
+        for kind in [
+            "config.reloaded",
+            "traffic.switched",
+            "release.created",
+            "rollout.step",
+            "overlay.ended",
+            "access_log.reverted",
+        ] {
+            assert!(changes_configuration(kind), "{kind}");
+        }
+
+        for kind in [
+            "release.ready",
+            "worker.exited",
+            "config.apply_failed",
+            "overlay.skipped",
+            "debug.bundle",
+        ] {
+            assert!(!changes_configuration(kind), "{kind}");
+        }
     }
 
     #[test]

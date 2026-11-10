@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import stat
 import subprocess
 import tarfile
@@ -106,22 +107,39 @@ def events_of(found: dict[str, bytes]) -> list[dict[str, Any]]:
 
 
 def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
-    daemon = start_daemon(tmp_path, listeners=[(support.free_port(), False)])
+    daemon = start_daemon(
+        tmp_path,
+        listeners=[(support.free_port(), False)],
+        config_extra=(
+            f"[overlay_webhook]\nlisten = '127.0.0.1:{support.free_port()}'\nsecret = 'hunter2'\n"
+        ),
+    )
     out = tmp_path / "out"
     out.mkdir()
 
     try:
-        assert daemon.deploy("shop", SHOP, "--processes", "2") == (
-            "muru: release shop@r1 is ready and serving"
+        deployed = daemon.deploy(
+            "shop",
+            SHOP,
+            "--processes",
+            "2",
+            "--env",
+            "API_TOKEN=abc123",
+            "--env",
+            "DATABASE_URL=postgres://shop:s3cret@db.example/shop",
         )
+        assert deployed == "muru: release shop@r1 is ready and serving"
 
         # A dry run says what the bundle would hold, writes nothing and
         # records nothing.
 
         planned = bundle(daemon, "--dry-run", cwd=out)
         assert planned.startswith("A bundle of the whole node, reaching back 1h to ")
-        assert "  installation.json  asked for when the bundle is made" in planned
-        assert "  events.jsonl " in planned
+        assert re.search(
+            r"^  installation\.json +asked for when the bundle is made$", planned, re.M
+        )
+        assert re.search(r"^  events\.jsonl +\d+B$", planned, re.M)
+        assert re.search(r"^  config/releases/shop@r1\.json +[\d.]+KB$", planned, re.M)
         assert f"{out} has " in planned and " free." in planned
         assert list(out.iterdir()) == []
         assert "debug.bundle" not in daemon.muructl("events").stdout
@@ -145,7 +163,6 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         window = manifest["window"]
         assert window["until_unix_ms"] - window["since_unix_ms"] == 3_600_000
         assert "secret values" in manifest["left_out"]
-        assert [part for part in manifest["parts"] if not part["collected"]] == []
 
         # The summary is the report's facts, with the names as they are.
 
@@ -155,6 +172,57 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         (release,) = installation["releases"]
         assert release["app"] == "shop" and release["id"] == "r1"
         assert [worker["state"] for worker in release["workers"]] == ["ready", "ready"]
+
+        # The configuration in force: the release's settings with where
+        # each came from, its specification, the effective document, what
+        # is in force outside it and the daemon's own file, with what
+        # looks like a secret masked wherever it is.
+
+        record = json.loads(found["config/releases/shop@r1.json"])
+        assert record["release"]["serving"] is True
+        assert {
+            "scope": "shop@r1",
+            "key": "processes",
+            "value": "2",
+            "source": "deploy flags",
+        } in record["settings"]
+        assert record["spec"]["entrypoint"] == "shop.wsgi:application"
+        assert {"name": "API_TOKEN", "value": "***"} in record["spec"]["env"]
+        assert {
+            "name": "DATABASE_URL",
+            "value": "postgres://shop:***@db.example/shop",
+        } in record["spec"]["env"]
+
+        effective = found["config/effective.toml"].decode()
+        assert effective.startswith("# No active overlay changes this configuration.\n")
+        assert "[app.shop" in effective
+        assert sorted(json.loads(found["config/in-force.json"])) == [
+            "maintenance",
+            "overlays",
+            "rollouts",
+            "scale_pins",
+        ]
+        daemon_file = found["config/daemon.toml"].decode()
+        assert "[overlay_webhook]" in daemon_file and 'secret = "***"' in daemon_file
+        assert json.loads(found["config/access-log-overrides.json"]) == []
+        assert json.loads(found["config/routing-snapshot.json"])["version"] >= 1
+
+        for secret in (b"abc123", b"s3cret", b"hunter2"):
+            holding = [path for path, content in found.items() if secret in content]
+            assert holding == [], f"{secret!r} is in {holding}"
+
+        # The deploy changed the configuration in the window, which the
+        # manifest says plainly, and what Muru keeps no record of is
+        # listed as not collected with why.
+
+        assert manifest["configuration_changed"] is True
+        changes = [json.loads(line)["type"] for line in found["config/changes.jsonl"].splitlines()]
+        assert changes == ["release.created", "traffic.switched"]
+        changed = next(part for part in manifest["parts"] if part["path"] == "config/changes.jsonl")
+        assert changed["note"].startswith("the configuration changed 2 times during the window")
+        missing = {part["path"]: part["why"] for part in manifest["parts"] if not part["collected"]}
+        assert sorted(missing) == ["config/logger-levels.json", "config/routing-snapshots"]
+        assert "only the routing snapshot in force is kept" in missing["config/routing-snapshots"]
 
         # Every event of the window is there in full, and the making of
         # the bundle is an event of its own.
@@ -192,6 +260,7 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         bundle(daemon, "shop@r1", "--output", str(target))
         found = members(target.read_bytes())
         assert manifest_of(found)["target"] == "shop@r1"
+        assert "config/releases/shop@r1.json" in found
         assert json.loads(found["installation.json"])["releases"][0]["id"] == "r1"
         assert "a diagnostic bundle of shop@r1 was made" in daemon.muructl("events").stdout
         assert "no application named nope" in refused(daemon, "nope")
@@ -217,6 +286,16 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
     assert release["state"] == "stopped" and release["workers"] == []
     types = [event["type"] for event in events_of(found)]
     assert "daemon.stopped" in types and types.count("debug.bundle") == 3
+
+    # What the files hold is all there, and what only the running daemon
+    # knows is listed with why it is not.
+
+    assert json.loads(found["config/releases/shop@r1.json"])["release"]["state"] == "stopped"
+    assert "[app.shop" in found["config/effective.toml"].decode()
+    assert 'secret = "***"' in found["config/daemon.toml"].decode()
+    missing = {part["path"]: part["why"] for part in manifest["parts"] if not part["collected"]}
+    assert missing["config/access-log-overrides.json"] == "nothing is running to ask"
+    assert missing["config/routing-snapshot.json"] == "nothing is running to ask"
 
     assert {path.name: path.stat().st_mtime_ns for path in state.iterdir()} == before
     assert (state / "muru.sqlite").read_bytes() == stored
@@ -252,6 +331,16 @@ def test_bundle_of_a_development_run_and_of_a_serve(tmp_path: Path) -> None:
         # A run keeps the events its hosts raise, and none has been yet.
 
         assert events_of(found) == []
+
+        # A run has no state store: its settings are what config show
+        # --effective prints, and it has no daemon's file.
+
+        effective = found["config/effective.toml"].decode()
+        assert "#   plain-wsgi@r1: processes = 2 (command line)" in effective
+        assert "config/daemon.toml" not in found
+        missing = {part["path"]: part["why"] for part in manifest["parts"] if not part["collected"]}
+        assert missing["config/in-force.json"] == "muructl run keeps no state store"
+        assert manifest["configuration_changed"] is False
     finally:
         server.stop()
 
