@@ -487,3 +487,120 @@ profile read from outside the worker takes no thread of the worker and
 is not counted. The daemon never reaches into a worker process directly, which is what lets
 the same commands work on a release running as another user, and on
 an application in a container under `muructl serve`.
+
+## A report for a bug report
+
+`muructl debug report` prints a short summary of an installation, to
+attach to a bug report on Muru. It is safe to post in public, and small
+enough to paste into the report's form:
+
+```
+muructl debug report
+muructl debug report --format markdown
+muructl debug report --json
+```
+
+`--format markdown` is the form to paste into an issue: it shows there
+as tables, where plain text pasted without a code fence is reformatted.
+Every value that came from the system is in a code span or a fenced
+block, so nothing in it is read as markup, and a name such as `@alice`
+or `#123` in it notifies no one and links to nothing. `--json` gives the
+same as [JSON](../reference/json-output.md).
+
+```
+Muru 1.0.0 on linux x86_64 (kernel 6.8.0)
+Runs as a user daemon, running, not in a container
+
+RELEASES
+  RELEASE STATE   SERVING INTERFACE FRAMEWORK   PYTHON         WORKERS
+  app1@r3 ready   yes     wsgi      flask 3.0.3 3.13.1 regular 2 ready
+  app1@r2 stopped no      auto      -           3.13.1 regular -
+
+SETTINGS OF THE SERVING RELEASES
+  app1@r3
+    entrypoint = <module1>:application  ([tool.muru])
+    python = ~/<path1>                  (deploy flags)
+    processes = 2                       (deploy flags)
+    at their defaults:
+      build.when = auto, bytecode = source (precompiled), interface = auto,
+      preload = auto, threads = 1, sync_threads = 8, concurrency = 1000
+
+DAEMON SETTINGS
+  limits.max_body_size = 2MB
+  listener[0].address = <address1>:443
+
+EVENTS IN THE LAST 24 HOURS
+      3  info     release.ready
+      1  warning  worker.timeout_killed
+
+MOST RECENT WARNINGS AND ERRORS
+  2026-11-02T05:42:22Z warning worker.timeout_killed app1@r3: worker 1 (pid 41214): a request has run for 61.0 s, past the hard timeout of 60 s
+
+Placeholders stand for 1 application name, 1 path, 1 address, 1 module. Read the report before posting it.
+```
+
+The report holds:
+
+- Muru's version, the operating system, its kernel and the architecture.
+
+- How Muru runs: `muructl run`, a user daemon, a system daemon or
+  `muructl serve`, whether it is running, and whether it is in a
+  container.
+
+- Every release: its state, whether it serves, its interface, the
+  frameworks one of its workers has loaded, the Python version and
+  build (regular or free-threaded) and its workers' states. The
+  frameworks are the known ones among the worker's loaded modules, so
+  no module of the application's own is named.
+
+- The effective settings of the serving releases, each with where it
+  came from, as [`muructl config show
+  --effective`](daemon.md#what-an-apply-does) reports them. For a
+  development run and `muructl serve` these are the settings
+  `--print-config` prints. A setting left at its default is listed with
+  the others at their defaults.
+
+- What the daemon's configuration file sets. The tables that configure
+  the daemon itself (`daemon`, `tools`, `listener`, `limits`, `proxy`,
+  `compression`, `logs`, `shutdown`, `metrics` and `dashboard`) are
+  listed setting by setting, and any other table, such as the virtual
+  hosts, routes and event sinks, only by how many entries it has.
+
+- How many events of each type and level the last 24 hours hold, and
+  the ten most recent warnings and errors.
+
+It holds no application logs, access log lines, request data or client
+addresses, no environment variables, and no secret values. What
+identifies the system is replaced by a placeholder, the same one
+wherever the same value appears:
+
+| What | Reads as |
+| --- | --- |
+| An application's name | `app1`, `app2`, so `shop@r3` reads as `app1@r3` |
+| A virtual host's name, and the host of a URL | `host1`, `host2` |
+| The machine's own name | `node` |
+| A user's or a group's name | `user1`, `user2` |
+| Muru's own directories and the daemon's configuration file | `<state-dir>`, `<run-dir>`, `<log-dir>`, `<cache-dir>` and `<daemon-config>`, with what follows kept |
+| The home directory, and a path under it | `~`, and `~/<path1>` |
+| Any other path, except the system's own such as `/usr/bin/python3` | `<path1>`, `<path2>` |
+| A network address, except loopback and the unspecified address | `<address1>`, `<address2>` |
+| The module of an entry point or of hooks | `<module1>`, so `shop.wsgi:application` reads as `<module1>:application` |
+| The value of a setting whose name marks it as a secret | `<redacted>` |
+| The value of a setting that is free text, such as a list of host names | `<set>` |
+
+An event's sentence is given with the same replacements. The sentence
+of an event that quotes a request, a command or the application's code
+(the `request.`, `command.` and `debug.exec` events and the breakpoint
+ones) is left out. A sentence can still quote an error the application
+raised, such as the exception that stopped a release from loading, so
+read the report before posting it. Nothing in it is hidden or encoded,
+and the last line says how many values of each kind were replaced.
+
+The command works with no daemon running: it reads the stopped daemon's
+state store and configuration file, and changes neither. It takes the
+daemon's location options for that (`--state-dir`, `--config`,
+`--run-dir` and `--system`), and with a daemon running it reads the
+configuration file those options and the environment name, so pass
+`--config` when the daemon was started with one. A part that cannot be
+collected is listed under `NOT COLLECTED` with the reason, in place of
+its figures, and the command still succeeds.

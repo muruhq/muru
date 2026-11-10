@@ -1428,14 +1428,15 @@ fn release_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Release> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
 
     use super::*;
     use crate::model::ScalingSpec;
     use muru_config::{Interface, Preload};
 
-    fn spec() -> ReleaseSpec {
+    /// A release's spec, for this crate's tests.
+    pub(crate) fn spec() -> ReleaseSpec {
         ReleaseSpec {
             limits: crate::model::ServedLimits::default(),
             source: PathBuf::from("/srv/shop"),

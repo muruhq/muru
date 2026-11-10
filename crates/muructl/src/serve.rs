@@ -532,14 +532,15 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 );
             })
         }
-        Ok((run_args, mode, _)) => {
+        Ok((run_args, mode, layered)) => {
             muru_common::log::json_lines(mode.json);
 
             for line in &mode.sizing {
                 muru_common::muru_println!("{line}");
             }
 
-            crate::run_with(run_args, Some(mode)).await
+            let settings = report(&layered, &mode);
+            crate::run_with(run_args, Some(mode), Some(settings)).await
         }
         Err(error) => Err(error),
     };

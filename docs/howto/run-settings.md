@@ -87,6 +87,11 @@ reload = true            # default
 # The interpreter is Python 3.13.1 (cp313) at ./.venv/bin/python (the project's .venv).
 ```
 
+While the run serves, `muructl config show --effective` from the project
+directory lists the settings it runs with, each with where it came from,
+the `[run]` table's as `run.port` and so on. `muructl serve` answers the
+same way, with its own table's as `serve.listen`.
+
 ## Your own machine: muru.local.toml
 
 A `muru.local.toml` beside the project's `pyproject.toml` or `muru.toml`

@@ -82,6 +82,11 @@ pub struct DaemonFileArgs {
 }
 
 impl DaemonFileArgs {
+    /// The state directory an option names, if one does.
+    pub(crate) fn state_dir(&self) -> Option<&Path> {
+        self.state_dir.as_deref()
+    }
+
     /// The same options, for a daemon started in the background.
     pub fn as_arguments(&self) -> Vec<String> {
         let mut arguments = Vec::new();
@@ -835,6 +840,14 @@ pub enum DebugCommand {
     /// its [daemon] table sets debug_exec.
     Exec(ExecArgs),
 
+    /// A short summary of the installation to attach to a bug report:
+    /// versions, how Muru runs, each release's interface, framework and
+    /// state, the serving releases' settings and recent events. Safe to
+    /// post: no log lines, request data, environment or secrets, and
+    /// application names, host names, paths and addresses replaced by
+    /// placeholders. Works with no daemon running, on its files.
+    Report(crate::diagnostics::report::ReportArgs),
+
     /// Open a pdb session in a worker: on the thread stopped at
     /// breakpoint(), else on a thread of its own. Each line read is a pdb
     /// command, and the end of input lets the code go on. Without
@@ -1057,6 +1070,14 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         return attach(args).await;
     }
 
+    // The diagnostic commands look at the whole installation, not into
+    // one release's workers.
+
+    let command = match command {
+        DebugCommand::Report(args) => return crate::diagnostics::report::report(args).await,
+        other => other,
+    };
+
     if let DebugCommand::Profile(profile) = &command
         && profile.format == ProfileFormat::Pstats
         && profile.output.is_none()
@@ -1126,7 +1147,9 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
                 "timeout_s": exec.timeout.as_secs_f64(),
             }),
         ),
-        DebugCommand::Attach(_) => unreachable!("attach is handled above"),
+        DebugCommand::Attach(_) | DebugCommand::Report(_) => {
+            unreachable!("attach and report are handled above")
+        }
     };
 
     let target = args.target.as_deref().unwrap_or_default();
@@ -1146,7 +1169,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::Trace(_) => print_trace(&response),
         DebugCommand::Memory(_) => print_memory(&response),
         DebugCommand::Exec(_) => print_exec(&response),
-        DebugCommand::Attach(_) => {}
+        DebugCommand::Attach(_) | DebugCommand::Report(_) => {}
     }
 
     Ok(())
@@ -6487,14 +6510,14 @@ fn exit_code(report: &pb::ConfigReport, planning: bool) -> i32 {
 }
 
 /// The time now, as Unix milliseconds.
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64)
 }
 
 /// Unix milliseconds as an RFC 3339 instant in UTC.
-fn format_time(unix_ms: u64) -> String {
+pub(crate) fn format_time(unix_ms: u64) -> String {
     time::OffsetDateTime::from_unix_timestamp((unix_ms / 1000) as i64)
         .map(|time| {
             format!(
@@ -7522,7 +7545,7 @@ struct LogDirectory {
 }
 
 /// The locations the daemon's location options resolve to.
-fn daemon_locations(socket: &SocketArgs, files: &DaemonFileArgs) -> Locations {
+pub(crate) fn daemon_locations(socket: &SocketArgs, files: &DaemonFileArgs) -> Locations {
     Locations::resolve(&Options {
         config: files.config.clone(),
         state_dir: files.state_dir.clone(),
@@ -8589,7 +8612,7 @@ pub async fn cache_clear(args: CacheClearArgs) -> anyhow::Result<()> {
 }
 
 /// A byte count for a reader, in the units sizes are given in.
-fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
 
     for (scale, unit) in UNITS {
