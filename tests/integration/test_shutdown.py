@@ -235,7 +235,11 @@ def test_a_bad_shutdown_table_is_refused_at_start(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
-        env={"MURU_STATE_DIR": str(tmp_path / "state"), "MURU_LOG_DIR": str(tmp_path / "logs")},
+        env={
+            "MURU_STATE_DIR": str(tmp_path / "state"),
+            "MURU_LOG_DIR": str(tmp_path / "logs"),
+            "MURU_CACHE_DIR": str(tmp_path / "cache"),
+        },
         timeout=60,
     )
     assert completed.returncode != 0

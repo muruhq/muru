@@ -372,12 +372,16 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
     run_dir = support.short_dir("muru-run-")
     port = support.free_port()
     location = [
+        "--config",
+        str(tmp_path / "muru.toml"),
         "--state-dir",
         str(tmp_path / "state"),
         "--run-dir",
         str(run_dir),
         "--log-dir",
         str(tmp_path / "logs"),
+        "--cache-dir",
+        str(tmp_path / "cache"),
     ]
 
     started = subprocess.run(
@@ -619,6 +623,8 @@ def test_a_relative_or_deep_run_directory_is_refused_at_start(tmp_path: Path) ->
                 str(tmp_path / "logs"),
                 "--config",
                 str(tmp_path / "muru.toml"),
+                "--cache-dir",
+                str(tmp_path / "cache"),
             ],
             capture_output=True,
             text=True,
@@ -654,6 +660,7 @@ def test_the_daemons_file_is_named_only_where_it_is_read(daemon: Daemon, tmp_pat
         "MURU_STATE_DIR": str(tmp_path / "state"),
         "MURU_LOG_DIR": str(tmp_path / "logs"),
         "MURU_RUN_DIR": str(support.short_dir("muru-rt-")),
+        "MURU_CACHE_DIR": str(tmp_path / "cache"),
     }
     config = tmp_path / "node.toml"
     config.write_text("[[listener]]\naddress = 'not an address'\n")

@@ -304,14 +304,20 @@ def start_daemon(
 
     run_dir = run_dir or support.short_dir("muru-run-")
 
+    # The configuration file and the cache directory are always named,
+    # under `base`, so that no test daemon reads the configuration of the
+    # user running the tests or writes into their cache (issue #570). With
+    # --listen alone the file is not written, and none is read.
+
+    config = base / "muru.toml"
+
     if listeners is None and not config_extra:
         port = port or support.free_port()
         listeners = [(port, False)]
-        where = ["--listen", f"127.0.0.1:{port}"]
+        where = ["--listen", f"127.0.0.1:{port}", "--config", str(config)]
     else:
         listeners = listeners or [(port or support.free_port(), False)]
         port = listeners[0][0]
-        config = base / "muru.toml"
         config.write_text(
             "".join(
                 f"[[listener]]\naddress = '127.0.0.1:{port}'\n" + ("tls = true\n" if tls else "")
@@ -335,6 +341,8 @@ def start_daemon(
                 str(run_dir),
                 "--log-dir",
                 str(base / "logs"),
+                "--cache-dir",
+                str(base / "cache"),
                 *where,
                 *(arguments or []),
             ],
