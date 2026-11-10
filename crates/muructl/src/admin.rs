@@ -92,6 +92,16 @@ impl DaemonFileArgs {
         self.log_dir.as_deref()
     }
 
+    /// The cache directory an option names, if one does.
+    pub(crate) fn cache_dir(&self) -> Option<&Path> {
+        self.cache_dir.as_deref()
+    }
+
+    /// The daemon's configuration file an option names, if one does.
+    pub(crate) fn config(&self) -> Option<&Path> {
+        self.config.as_deref()
+    }
+
     /// The same options, for a daemon started in the background.
     pub fn as_arguments(&self) -> Vec<String> {
         let mut arguments = Vec::new();

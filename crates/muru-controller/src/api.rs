@@ -295,6 +295,9 @@ impl Admin for Service {
             release: String::new(),
             project: String::new(),
             no_host: info.no_host.lock().expect("no_host poisoned").clone(),
+            config: info.locations.config.path.display().to_string(),
+            log_dir: info.locations.logs.path.display().to_string(),
+            cache_dir: info.locations.cache.path.display().to_string(),
         }))
     }
 

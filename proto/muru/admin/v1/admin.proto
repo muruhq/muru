@@ -177,6 +177,9 @@ message Status {
   string release = 17;              // a run's release, r1 and so on; empty for a daemon
   string project = 18;              // a run's project directory; empty for a daemon
   string no_host = 19;              // several applications serve with no hosts declared, and which; empty otherwise
+  string config = 20;               // the daemon's configuration file, which need not exist; empty for a run
+  string log_dir = 21;              // the daemon's log directory; empty for a run, which writes no log files
+  string cache_dir = 22;            // the daemon's cache directory; empty for a run
 }
 
 message ListWebSocketsRequest {

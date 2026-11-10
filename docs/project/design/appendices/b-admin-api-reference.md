@@ -73,7 +73,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | DumpStacks | POST /v1/.../workers/{worker}:stacks | Python stacks |
 | NoteBundle | POST /v1/debug:bundle | say that a diagnostic bundle is being made, with what it is limited to and its window, which is recorded as the event debug.bundle (11.9); the collection is the command's own |
 | WatchEvents | GET /v1/events (Server-Sent Events) | event stream from a sequence number |
-| GetStatus | GET /v1/status | daemon, edges, snapshot version |
+| GetStatus | GET /v1/status | daemon, edges, snapshot version, and where the daemon's state, run, log and cache directories and its configuration file are |
 | ReloadDaemonConfig | POST /v1/daemon:reload | re-read the daemon configuration |
 | UpgradeDaemon | POST /v1/daemon:upgrade | re-exec and replace edges |
 | Backup, Restore | POST /v1/daemon:backup, :restore | state store |

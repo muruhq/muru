@@ -301,7 +301,15 @@ impl<W: Write> Bundle<'_, W> {
         // What was noted while collecting, such as a worker that did not
         // answer, is recorded as what it left out.
 
-        for note in self.installation.take_notes() {
+        // A plan leaves them for the bundle it is the plan of.
+
+        let notes = if self.archive.is_planned() {
+            self.installation.notes.clone()
+        } else {
+            self.installation.take_notes()
+        };
+
+        for note in notes {
             self.archive.missing(&note.part, note.why);
         }
 

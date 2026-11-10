@@ -111,6 +111,7 @@ def test_report_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         by_socket = json.loads(daemon.muructl("debug", "report", "--json").stdout)
         assert by_socket["releases"] == found["releases"]
         assert by_socket["settings"] == found["settings"]
+        assert by_socket["daemon_settings"] == found["daemon_settings"]
 
         # Nothing that names the system is in any format, and the
         # Markdown is headed for an issue.

@@ -599,11 +599,10 @@ and the last line says how many values of each kind were replaced.
 The command works with no daemon running: it reads the stopped daemon's
 state store and configuration file, and changes neither. It takes the
 daemon's location options for that (`--state-dir`, `--config`,
-`--run-dir` and `--system`), and with a daemon running it reads the
-configuration file those options and the environment name, so pass
-`--config` when the daemon was started with one. A part that cannot be
-collected is listed under `NOT COLLECTED` with the reason, in place of
-its figures, and the command still succeeds.
+`--run-dir` and `--system`). A running daemon says where its files are,
+so no option is needed then. A part that cannot be collected is listed
+under `NOT COLLECTED` with the reason, in place of its figures, and the
+command still succeeds.
 
 ## A bundle of a system for triage
 
@@ -827,8 +826,9 @@ bundle with parts missing is a normal result, and the command succeeds.
 
 With no daemon running the bundle is made from the daemon's files, and
 the command takes the daemon's location options for that (`--state-dir`,
-`--log-dir`, `--config`, `--run-dir` and `--system`). It works against a
-development run and `muructl serve` as well, which keep no files, so
+`--log-dir`, `--config`, `--run-dir` and `--system`). A running daemon
+says where its files are, so no option is needed then. It works against
+a development run and `muructl serve` as well, which keep no files, so
 everything is asked of them.
 
 Each bundle made of a running daemon is the event `debug.bundle`, which

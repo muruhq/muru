@@ -177,20 +177,24 @@ impl Installation {
             });
         }
 
-        // A running daemon says where its state is, which an option to
-        // this command may not match.
+        // A running daemon says where its files are, which is where they
+        // are read from unless an option to this command names another
+        // place: what this command's own environment would resolve to may
+        // be another daemon's.
 
-        let mut live = live;
+        if let Some(live) = &live {
+            let status = &live.status;
 
-        if let Some(live) = &mut live {
-            if !live.status.state_dir.is_empty() && files.state_dir().is_none() {
-                locations.state.path = PathBuf::from(&live.status.state_dir);
-            }
-
-            if files.log_dir().is_none()
-                && let Ok(logs) = within(live.client.list_logs(pb::ListLogsRequest {})).await
-            {
-                locations.logs.path = PathBuf::from(logs.directory);
+            for (said, given, location) in [
+                (&status.state_dir, files.state_dir(), &mut locations.state),
+                (&status.log_dir, files.log_dir(), &mut locations.logs),
+                (&status.cache_dir, files.cache_dir(), &mut locations.cache),
+                (&status.config, files.config(), &mut locations.config),
+            ] {
+                if !said.is_empty() && given.is_none() {
+                    location.path = PathBuf::from(said);
+                    location.rule = "daemon";
+                }
             }
         }
 
@@ -605,9 +609,8 @@ impl Installation {
     }
 
     /// The daemon's own configuration file as a table, or none when
-    /// there is no file: where the options and the environment of this
-    /// command put it, which is where the daemon reads it when it was
-    /// started with the same.
+    /// there is no file: the one a running daemon names, else where the
+    /// options and the environment of this command put it.
     pub fn daemon_file(&self) -> Result<Option<(PathBuf, toml::Table)>, String> {
         let Some(locations) = &self.locations else {
             return Ok(None);

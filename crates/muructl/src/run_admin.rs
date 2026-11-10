@@ -817,6 +817,9 @@ impl Admin for Service {
             release: state.release_id(),
             project: state.project.display().to_string(),
             no_host: String::new(),
+            config: String::new(),
+            log_dir: String::new(),
+            cache_dir: String::new(),
         }))
     }
 

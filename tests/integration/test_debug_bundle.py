@@ -14,6 +14,7 @@ import platform
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -405,6 +406,16 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         assert manifest["window"]["until_unix_ms"] - manifest["window"]["since_unix_ms"] == 600_000
         assert "config/releases/shop@r1.json" in found
         assert json.loads(found["installation.json"])["releases"][0]["id"] == "r1"
+
+        # The command was given only the socket: the daemon says where
+        # its files are, and they are read from there.
+
+        assert "[overlay_webhook]" in found["config/daemon.toml"].decode()
+        assert json.loads(found["installation.json"])["locations"]["logs"] == {
+            "path": str(tmp_path / "logs"),
+            "rule": "daemon",
+        }
+        assert b"/catalogue?page=2" in found["logs/access.log"]
         assert manifest["options"] == {"scrub": False, "memory": True, "profile_s": 1.0}
         assert (
             "a diagnostic bundle of shop@r1 was made, reaching back 10m, with memory, profile"
@@ -491,18 +502,34 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         f"{stamp(40)} muru.worker[0]: saw 203.0.113.9 at /pay?card=4111\n"
     )
 
-    # The window is cut from the log, and its archives come with it.
+    # The window is cut from the log, and its archives come with it. A
+    # socket that listens and gives no answer, as a daemon that hangs
+    # would leave it, costs the time one question is given and what only
+    # the daemon knows: the manifest says so, and the files are all read.
 
     whole = tmp_path / "whole.tar.gz"
-    bundle(daemon, "--output", str(whole))
+
+    with socket.socket(socket.AF_UNIX) as listener:
+        listener.bind(str(daemon.run_dir / "admin.sock"))
+        listener.listen(64)
+        bundle(daemon, "--output", str(whole))
+
+    (daemon.run_dir / "admin.sock").unlink()
     found = members(whole.read_bytes())
+    manifest = manifest_of(found)
+    missing = {part["path"]: part["why"] for part in manifest["parts"] if not part["collected"]}
+    assert manifest["running"] is False
+    assert missing["live state"] == (
+        f"what listens at {daemon.run_dir}/admin.sock gave no answer within 5 seconds"
+    )
+    assert "config/releases/shop@r1.json" in found and "events.jsonl" in found
     targets = [entry["target"] for entry in records_of(found["logs/access.log"])]
     assert targets == ["/catalogue?page=2", "/other?id=1", "/orders?id=7&token=abc"]
     assert "logs/access.log.20250101-000000" not in found
     packed = records_of(gzip.decompress(found["logs/access.log.20260101-000000.gz"]))
     assert [entry["target"] for entry in packed] == ["/archived?page=1", "/archived"]
     assert b"/pay?card=4111" in found["logs/apps/other/r1.log"]
-    noted = {part["path"]: part.get("note") for part in manifest_of(found)["parts"]}
+    noted = {part["path"]: part.get("note") for part in manifest["parts"]}
     assert noted["logs/access.log.20260101-000000.gz"] == (
         "the whole archive, which was last written in the window"
     )
