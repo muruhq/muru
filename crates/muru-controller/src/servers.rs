@@ -119,14 +119,18 @@ pub struct Servers {
 impl Servers {
     /// Start every instance under the run directory, each with its own
     /// address, running `spec.command` in `cwd` with `env`, as
-    /// `identity` when one is set, its output appended to `log`.
-    pub fn start(
+    /// `identity` when one is set, its output appended to `log`. When
+    /// an instance cannot be started, those started before it are
+    /// stopped, with `grace` to stop in before they are killed.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start(
         spec: &HttpServerSpec,
         run_dir: &Path,
         cwd: &Path,
         env: Vec<(String, String)>,
         identity: Option<Identity>,
         log: &Path,
+        grace: Duration,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(run_dir)
             .with_context(|| format!("creating {}", run_dir.display()))?;
@@ -137,11 +141,21 @@ impl Servers {
             .zip(&binds)
             .map(|(index, bind)| instance_spec(spec, index, bind))
             .collect();
-        let supervisor = Supervisor::start(
+        let started = Supervisor::start(
             process_spec(spec, cwd, env, identity, log),
             RestartPolicy::default(),
             instances,
-        )?;
+            grace,
+        )
+        .await;
+
+        let supervisor = match started {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(run_dir);
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             readiness_path: spec.readiness_path.clone(),

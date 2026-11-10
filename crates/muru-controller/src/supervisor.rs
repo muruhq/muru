@@ -431,11 +431,14 @@ pub struct Supervisor {
 
 impl Supervisor {
     /// Start an instance for each of `instances`, indexed from 0 in that
-    /// order.
-    pub fn start(
+    /// order. When one cannot be started, those started before it are
+    /// stopped, with `stop_within` to stop in before they are killed,
+    /// so a start that fails leaves nothing running.
+    pub async fn start(
         spec: Spec,
         policy: RestartPolicy,
         instances: Vec<InstanceSpec>,
+        stop_within: Duration,
     ) -> anyhow::Result<Self> {
         let instances = (0..)
             .zip(instances)
@@ -448,7 +451,10 @@ impl Supervisor {
         };
 
         for position in 0..supervisor.instances.len() {
-            supervisor.spawn(position)?;
+            if let Err(error) = supervisor.spawn(position) {
+                supervisor.stop_until(Instant::now() + stop_within).await;
+                return Err(error);
+            }
         }
 
         Ok(supervisor)
@@ -735,6 +741,9 @@ impl Supervisor {
 mod tests {
     use super::*;
 
+    /// What a start that fails gives the instances it started to stop in.
+    const STOP_WITHIN: Duration = Duration::from_secs(5);
+
     const EVENTS: EventNames = EventNames {
         exited: "thing.exited",
         started: "thing.started",
@@ -814,18 +823,68 @@ mod tests {
 
     /// Start one instance that is a shell running `script`, and wait
     /// for the script to say it is set up by writing the file `ready`.
-    fn start_script(dir: &Path, spec: Spec, script: &str) -> (Supervisor, u32) {
+    async fn start_script(dir: &Path, spec: Spec, script: &str) -> (Supervisor, u32) {
         let supervisor = Supervisor::start(
             spec,
             RestartPolicy::default(),
             vec![instance(&["/bin/sh", "-c", script])],
+            STOP_WITHIN,
         )
+        .await
         .unwrap();
         let pid = pids(&supervisor)[0];
         wait_for("the script to be set up", || {
             dir.join("ready").exists().then_some(())
         });
         (supervisor, pid)
+    }
+
+    /// The pids of the processes whose command line holds the text: a
+    /// path under a test's own directory, which names them alone.
+    fn running_under(text: &str) -> Vec<u32> {
+        let listing = std::process::Command::new("ps")
+            .args(["-ax", "-o", "pid=,command="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&listing.stdout)
+            .lines()
+            .filter(|line| line.contains(text))
+            .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_start_that_fails_part_way_stops_the_instances_it_started() {
+        // The first instance runs a program from the test's directory,
+        // so its command line names it, and the second has no program.
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink("/bin/sleep", dir.path().join("bin/sleep")).unwrap();
+        let program = dir.path().join("bin/sleep").display().to_string();
+        let started = Supervisor::start(
+            spec(dir.path()),
+            RestartPolicy::default(),
+            vec![
+                instance(&["bin/sleep", "600"]),
+                instance(&["bin/missing", "600"]),
+            ],
+            STOP_WITHIN,
+        )
+        .await;
+        let error = started.err().expect("the second instance cannot start");
+        assert!(error.to_string().starts_with("starting "), "{error}");
+
+        // Nothing is left of the first. Whatever is found is killed
+        // before the test fails, so that the test leaves nothing either.
+
+        let left = running_under(&program);
+
+        for pid in &left {
+            kill(*pid);
+        }
+
+        assert!(left.is_empty(), "left running: {left:?}");
     }
 
     #[test]
@@ -847,7 +906,9 @@ mod tests {
             spec(dir.path()),
             RestartPolicy::default(),
             vec![instance(&["/bin/sh", "-c", "exit 3"])],
+            STOP_WITHIN,
         )
+        .await
         .unwrap();
 
         for wait in [1, 2, 4] {
@@ -885,7 +946,9 @@ mod tests {
             spec(dir.path()),
             RestartPolicy::default(),
             vec![instance(&["/bin/sleep", "600"])],
+            STOP_WITHIN,
         )
+        .await
         .unwrap();
 
         // Two exits in a row double the wait.
@@ -924,7 +987,9 @@ mod tests {
             spec(dir.path()),
             RestartPolicy::default(),
             vec![instance(&["bin/sleep", "600"])],
+            STOP_WITHIN,
         )
+        .await
         .unwrap();
 
         std::fs::remove_file(dir.path().join("bin/sleep")).unwrap();
@@ -957,7 +1022,9 @@ mod tests {
                 instance(&["/bin/sleep", "600"]),
                 instance(&["/bin/sleep", "601"]),
             ],
+            STOP_WITHIN,
         )
+        .await
         .unwrap();
 
         let started = pids(&supervisor);
@@ -1038,7 +1105,9 @@ mod tests {
                 stale: vec![left_behind.clone()],
                 ..instance(&["/bin/sleep", "600"])
             }],
+            STOP_WITHIN,
         )
+        .await
         .unwrap();
         let pid = pids(&supervisor)[0];
         std::fs::write(&left_behind, "").unwrap();
@@ -1066,7 +1135,8 @@ mod tests {
             dir.path(),
             spec(dir.path()),
             "trap '' TERM; /bin/sleep 600 & : > ready; wait",
-        );
+        )
+        .await;
 
         // The stop takes the whole of the time allowed, since the signal
         // does nothing, and neither the shell nor its child outlives it.
@@ -1089,7 +1159,8 @@ mod tests {
             dir.path(),
             spec(dir.path()),
             "(trap '' TERM; : > ready; exec /bin/sleep 600) & wait",
-        );
+        )
+        .await;
 
         // The child is asked to stop once the shell has gone, and killed
         // when the time allowed ends.
@@ -1115,7 +1186,8 @@ mod tests {
                 ..spec(dir.path())
             },
             "trap : TERM; /bin/sleep 600 & : > ready; wait; wait",
-        );
+        )
+        .await;
 
         // The deadline is far off, so the stop returning at all shows
         // the signal reached the child.

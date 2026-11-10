@@ -88,8 +88,12 @@ instances = 2
 ## Readiness, supervision and stopping
 
 The release is `warming` until every instance answers its probe, and
-`failed` if one exits first or the timeout passes, with the instance and
-the reason in the release's message. An instance that exits later is
+`failed` if one cannot be started, one exits first or the timeout passes,
+with the instance and the reason in the release's message. A release
+that fails leaves nothing running: the instances that had started are
+stopped as a drain stops them.
+
+An instance that exits later is
 started again after a wait that doubles with each exit in a row, from one
 second up to thirty, and starts over once an instance has run for a
 minute; the exit and the restart are `server.exited` and `server.started`

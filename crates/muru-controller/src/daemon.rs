@@ -5460,14 +5460,19 @@ impl Daemon {
     ) -> Result<(), String> {
         let subject = format!("{app}@{id}");
         let log = self.host_log(app, id);
-        let mut servers = match Servers::start(
+        let grace = Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms);
+        let spawned = Servers::start(
             http,
             &run_dir.join("r1"),
             &release.spec.source,
             env,
             identity,
             &log,
-        ) {
+            grace,
+        )
+        .await;
+
+        let mut servers = match spawned {
             Ok(servers) => servers,
             Err(error) => {
                 let message = format!("the server could not be started: {error:#}");
@@ -5483,11 +5488,7 @@ impl Daemon {
 
         if let Err(error) = servers.wait_ready(timeout).await {
             let message = format!("{error:#}");
-            servers
-                .stop(Duration::from_millis(
-                    release.spec.timeouts.shutdown_timeout_ms,
-                ))
-                .await;
+            servers.stop(grace).await;
             self.set_state(release, ReleaseState::Failed, &message);
             self.events
                 .emit("release.failed", &subject, "error", &message);
