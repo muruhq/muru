@@ -12,6 +12,7 @@
 
 pub mod archive;
 pub mod facts;
+pub mod logs;
 pub mod mask;
 pub mod stored;
 pub mod window;

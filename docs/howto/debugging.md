@@ -617,6 +617,7 @@ and configuration, and is not for posting. For a public bug report, use
 muructl debug bundle
 muructl debug bundle --since 30m --output /mnt/scratch/shop.tar.gz
 muructl debug bundle shop@r3 --since 2d
+muructl debug bundle shop --scrub
 muructl debug bundle --dry-run
 ssh web1 muructl debug bundle --output - > web1.tar.gz
 kubectl exec deploy/shop -- muructl debug bundle --output - > shop.tar.gz
@@ -646,9 +647,14 @@ would be, writes nothing, and asks nothing of the workers:
 ```
 $ muructl debug bundle --dry-run
 A bundle of the whole node, reaching back 1h to 2026-11-02T04:42:22Z, would hold:
-  installation.json  asked for when the bundle is made
-  events.jsonl       48.2KB
-About 76.1KB once compressed, from 48.2KB on disk and what is asked for when it is made.
+  installation.json             asked for when the bundle is made
+  events.jsonl                  48.2KB
+  config/releases/shop@r3.json  6.1KB
+  config/effective.toml         1.9KB
+  logs/access.log               212.4MB, the lines of the window
+  logs/apps/shop/r3.log         18.0MB, the lines of the window
+  logs/edge.log                 3.1KB, the lines of the window
+About 57.7MB once compressed, from 230.5MB on disk and what is asked for when it is made.
 /home/ops has 41.0GB free.
 ```
 
@@ -680,8 +686,48 @@ Everything is under one directory named as the file is.
 | `config/routing-snapshot.json` | The version of the routing snapshot in force, which an access log record's `snapshot` names |
 | `config/changes.jsonl` | The events of the window that changed the configuration: an apply or a reload, traffic moved, a deploy, a rollout's step, an overlay starting or ending |
 
-With a target, the releases and events of other applications are left
-out, and the events of the node stay.
+| `logs/` | The logs of the window, by their names in the log directory: `access.log`, `edge.log`, `daemon.log`, a file virtual hosts name for their records, and each release's output as `apps/APP/RELEASE.log` |
+
+With a target, the releases, events and output of other applications
+are left out, the access log's records are those of the target alone,
+and the events and logs of the node stay.
+
+### The logs of the window
+
+A log is taken from where the window starts in it. The place is found
+from the times the lines carry, by halving the file, so a log of
+several gigabytes is not read to find its last hour, and only the
+window is read and compressed. A line without a time, as the second
+line of a traceback, comes with the line before it.
+
+An archive the rotation left is included when it was last written in
+the window. A plain one gives its lines of the window. A compressed one
+is included whole, as the `.gz` or `.zst` file it is, since the window
+cannot be found in it without decompressing all of it; the manifest's
+note on each part says which it is.
+
+A development run and `muructl serve` write no log files, so the bundle
+holds the lines of the window among those they keep in memory: the last
+2000 lines of output, and the access records the run keeps.
+
+### Scrubbing
+
+A bundle keeps client addresses and query strings. `--scrub` takes them
+out, for a bundle that has to go to someone with a narrower need:
+
+- A client address reads as `<address1>`, `<address2>` and so on, the
+  same placeholder for the same address throughout the bundle, so a
+  client can still be followed. Loopback addresses stay.
+
+- A request target or a URL loses its query string, which reads as
+  `?...`.
+
+Every string of an access log record and of an event is scrubbed this
+way. A line of an application's own output is free text, in which only
+what has the shape of an address, or of a target with a query, is
+found. A compressed archive is decompressed to be scrubbed, and is in
+the bundle under its name without the `.gz` or `.zst`. The manifest's
+`left_out` says the bundle was scrubbed.
 
 `config/` holds the configuration as it was when the bundle was made.
 The manifest's `configuration_changed` says whether it changed during
@@ -717,8 +763,9 @@ file, a setting whose key says it is a secret (`secret`, `token`,
 | `window` | `since_unix_ms` and `until_unix_ms`, the period it covers |
 | `runs`, `running` | How Muru runs, and whether it was running |
 | `configuration_changed` | Whether the configuration changed during the window; `null` when the events could not be read to tell |
+| `options` | What was asked for: `scrub` |
 | `recorded` | How the making of the bundle was recorded, or why it was not |
-| `left_out` | What a bundle never holds |
+| `left_out` | What a bundle never holds, and what `--scrub` took out of this one |
 | `parts` | Every part, each with its `path` and `collected`; `bytes` for one in the archive, `why` for one that is not, and a `note` where there is something to know about it |
 
 ### On a system in trouble

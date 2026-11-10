@@ -87,6 +87,11 @@ impl DaemonFileArgs {
         self.state_dir.as_deref()
     }
 
+    /// The log directory an option names, if one does.
+    pub(crate) fn log_dir(&self) -> Option<&Path> {
+        self.log_dir.as_deref()
+    }
+
     /// The same options, for a daemon started in the background.
     pub fn as_arguments(&self) -> Vec<String> {
         let mut arguments = Vec::new();

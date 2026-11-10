@@ -16,6 +16,7 @@ pub mod bundle;
 pub mod markdown;
 pub mod redact;
 pub mod report;
+pub mod scrub;
 
 use std::future::Future;
 use std::os::unix::fs::MetadataExt as _;
@@ -179,11 +180,18 @@ impl Installation {
         // A running daemon says where its state is, which an option to
         // this command may not match.
 
-        if let Some(live) = &live
-            && !live.status.state_dir.is_empty()
-            && files.state_dir().is_none()
-        {
-            locations.state.path = PathBuf::from(&live.status.state_dir);
+        let mut live = live;
+
+        if let Some(live) = &mut live {
+            if !live.status.state_dir.is_empty() && files.state_dir().is_none() {
+                locations.state.path = PathBuf::from(&live.status.state_dir);
+            }
+
+            if files.log_dir().is_none()
+                && let Ok(logs) = within(live.client.list_logs(pb::ListLogsRequest {})).await
+            {
+                locations.logs.path = PathBuf::from(logs.directory);
+            }
         }
 
         let store_path = locations.state_store();

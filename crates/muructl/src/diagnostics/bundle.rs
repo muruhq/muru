@@ -9,7 +9,7 @@
 //! the manifest and carries on. The archive is written as a stream at a
 //! low priority, readable by its owner alone.
 
-use std::io::{self, IsTerminal as _, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal as _, Read, Seek as _, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,13 +18,17 @@ use anyhow::Context as _;
 use clap::Args;
 use muru_controller::diagnostics::archive::{Archive, Entry, FORMAT, Manifest, layout};
 use muru_controller::diagnostics::facts::{self, Platform};
+use muru_controller::diagnostics::logs::{Packed, Stretch, stretches};
 use muru_controller::diagnostics::stored;
-use muru_controller::diagnostics::window::Window;
+use muru_controller::diagnostics::window::{Window, line_time};
 use muru_controller::diagnostics::{ReleaseFacts, changes_configuration, mask, period};
+use muru_controller::log_files::{self, Kind, LogFile};
 use muru_proto::admin::v1 as pb;
 use serde::Serialize;
+use tokio_stream::StreamExt as _;
 
-use super::{Installation, within};
+use super::scrub::Scrubber;
+use super::{ASK, Installation, within};
 use crate::admin::{DaemonFileArgs, SocketArgs, format_time, human_size};
 
 /// What a planned archive says of a part a running daemon is asked for.
@@ -34,6 +38,10 @@ const ASKED: &str = "asked for when the bundle is made";
 /// nothing runs.
 const NOTHING_RUNS: &str = "nothing is running to ask";
 
+/// How many lines a development run or `muructl serve` is asked for:
+/// more than it keeps in memory.
+const EVERY_LINE: u32 = 1_000_000;
+
 /// What a bundle never holds, as its manifest says.
 const NEVER_HELD: [&str; 3] = [
     "secret values",
@@ -41,6 +49,12 @@ const NEVER_HELD: [&str; 3] = [
      ones that look like secrets",
     "request and response bodies",
 ];
+
+/// What --scrub takes out of a bundle, as its manifest says.
+const SCRUBBED: &str = "client addresses, which read as <address1> and so on, the same one for the \
+                        same address, and the query strings of request targets (--scrub); a line \
+                        of an application's own output is free text, where only what has the \
+                        shape of either is found";
 
 /// `muructl debug bundle`.
 #[derive(Args)]
@@ -63,6 +77,11 @@ pub struct BundleArgs {
     /// and write nothing.
     #[arg(long)]
     dry_run: bool,
+
+    /// Replace client addresses with placeholders and cut query strings,
+    /// for a bundle that goes to someone with a narrower need.
+    #[arg(long)]
+    scrub: bool,
 
     #[command(flatten)]
     socket: SocketArgs,
@@ -149,6 +168,8 @@ struct Bundle<'a, W: Write> {
     archive: Archive<W>,
     window: Window,
     target: &'a Target,
+    /// What takes client addresses and query strings out, with --scrub.
+    scrubber: Option<Scrubber>,
     /// The events of the window, once they have been read.
     events: Option<Vec<pb::Event>>,
     /// The metrics as the daemon gave them, once it has been asked.
@@ -188,6 +209,7 @@ impl<W: Write> Bundle<'_, W> {
         self.summary().await?;
         self.events().await?;
         let configuration_changed = self.configuration().await?;
+        self.logs().await?;
 
         // What was noted while collecting, such as a worker that did not
         // answer, is recorded as what it left out.
@@ -370,8 +392,7 @@ impl<W: Write> Bundle<'_, W> {
             .iter()
             .filter(|event| changes_configuration(&event.r#type))
         {
-            lines.extend(serde_json::to_vec(event).unwrap_or_default());
-            lines.push(b'\n');
+            lines.extend(event_line(&mut self.scrubber, event));
             changes += 1;
         }
 
@@ -520,8 +541,7 @@ impl<W: Write> Bundle<'_, W> {
                 let mut lines = Vec::new();
 
                 for event in &events {
-                    lines.extend(serde_json::to_vec(event).unwrap_or_default());
-                    lines.push(b'\n');
+                    lines.extend(self.event_line(event));
                 }
 
                 self.events = Some(events);
@@ -532,6 +552,231 @@ impl<W: Write> Bundle<'_, W> {
                 Ok(())
             }
         }
+    }
+
+    /// An event as a line of JSON, its sentence scrubbed when asked.
+    fn event_line(&mut self, event: &pb::Event) -> Vec<u8> {
+        event_line(&mut self.scrubber, event)
+    }
+
+    /// `logs/`: the logs of the window, by their names in the log
+    /// directory. A daemon's are read from its files, each from where the
+    /// window starts in it, with the archives the rotation left in the
+    /// window; a development run and `muructl serve` write none, and are
+    /// asked for the lines they keep in memory.
+    async fn logs(&mut self) -> io::Result<()> {
+        let Some(directory) = self
+            .installation
+            .locations()
+            .map(|locations| locations.logs.path.clone())
+        else {
+            return self.kept_lines().await;
+        };
+
+        let existing = self
+            .installation
+            .store
+            .as_ref()
+            .ok()
+            .and_then(|store| log_files::Existing::read(store).ok());
+
+        let listed = match log_files::list(&directory, existing.as_ref()) {
+            Ok(listed) => listed,
+            Err(error) => {
+                self.archive.missing(
+                    layout::LOGS,
+                    format!("{} could not be read: {error}", directory.display()),
+                );
+                return Ok(());
+            }
+        };
+
+        for log in &listed {
+            // Another application's output is not part of a bundle of one.
+
+            if log.kind == Kind::Release && !self.target.holds(&log.app, &log.release) {
+                continue;
+            }
+
+            for found in stretches(&directory, log, self.window) {
+                match found {
+                    Ok(stretch) => self.stretch(log, stretch)?,
+                    Err((name, why)) => self
+                        .archive
+                        .missing(&format!("{}/{name}", layout::LOGS), why),
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Add one stretch of a log. It is copied as it is, unless its lines
+    /// are to be scrubbed or, for the records of an access log, limited
+    /// to the bundle's application: then each line is passed through,
+    /// and a compressed archive is decompressed to do it.
+    fn stretch(&mut self, log: &LogFile, mut stretch: Stretch) -> io::Result<()> {
+        let records = matches!(log.kind, Kind::Access | Kind::Host);
+        let wanted = (records && !self.target.app.is_empty()).then(|| self.target.clone());
+        let path = format!("{}/{}", layout::LOGS, stretch.name);
+
+        let mut note = match (stretch.packed, stretch.archive) {
+            (Some(_), _) => "the whole archive, which was last written in the window".to_owned(),
+            (None, true) => "the lines of the window, from an archive".to_owned(),
+            (None, false) => "the lines of the window".to_owned(),
+        };
+
+        if wanted.is_none() && self.scrubber.is_none() {
+            stretch.file.seek(SeekFrom::Start(stretch.start))?;
+            return self
+                .archive
+                .stream(&path, stretch.length, &stretch.file, Some(note));
+        }
+
+        // Each line is passed through, so the size of what comes out is
+        // not known until it has been. A plan gives the size going in.
+
+        if let Some(target) = &wanted {
+            note.push_str(&format!(", the records of {} alone", target.name()));
+        }
+
+        if self.scrubber.is_some() {
+            note.push_str(", scrubbed");
+        }
+
+        let path = Packed::stem(&path).to_owned();
+
+        if self.archive.is_planned() {
+            note.push_str(": its size before that");
+            return self
+                .archive
+                .stream(&path, stretch.length, io::empty(), Some(note));
+        }
+
+        // Once to learn the size, and again to write: what comes out is
+        // the same both times, since the stretch is.
+
+        let mut passing = Passing {
+            wanted: wanted.as_ref(),
+            scrubber: self.scrubber.as_mut(),
+        };
+
+        let size = match passed(&mut stretch, &mut passing) {
+            Ok(mut lines) => io::copy(&mut lines, &mut io::sink()),
+            Err(error) => Err(error),
+        };
+
+        let size = match size {
+            Ok(size) => size,
+            Err(error) => {
+                self.archive.missing(&path, format!("reading it: {error}"));
+                return Ok(());
+            }
+        };
+
+        match passed(&mut stretch, &mut passing) {
+            Ok(lines) => self.archive.stream(&path, size, lines, Some(note)),
+            Err(error) => {
+                self.archive.missing(&path, format!("reading it: {error}"));
+                Ok(())
+            }
+        }
+    }
+
+    /// The logs of a development run or `muructl serve`, which writes no
+    /// files: the lines of the window among those it keeps in memory.
+    async fn kept_lines(&mut self) -> io::Result<()> {
+        let Some(status) = self.installation.status().cloned() else {
+            return Ok(());
+        };
+
+        let output = format!(
+            "{}/apps/{}/{}.log",
+            layout::LOGS,
+            status.app,
+            status.release
+        );
+        let access = format!("{}/access.log", layout::LOGS);
+
+        for (path, records) in [(output, false), (access, true)] {
+            if !self.asks(&path) {
+                continue;
+            }
+
+            match self.tailed(records).await {
+                Ok(lines) => {
+                    let mut text = Vec::new();
+                    let mut within_window = false;
+
+                    // A line without a time goes with the one before it.
+
+                    for line in &lines {
+                        // A record is kept with its line end, and a line
+                        // of output without.
+
+                        let line = line.trim_end_matches('\n');
+
+                        if let Some(time) = line_time(line.as_bytes()) {
+                            within_window = self.window.holds(time);
+                        }
+
+                        if within_window {
+                            let line = match &mut self.scrubber {
+                                Some(scrubber) => scrubber.line(line),
+                                None => line.to_owned(),
+                            };
+
+                            text.extend(line.into_bytes());
+                            text.push(b'\n');
+                        }
+                    }
+
+                    let note = format!(
+                        "the lines of the window among those {} keeps in memory",
+                        self.installation.runs().describe()
+                    );
+                    self.archive.bytes(&path, &text, Some(note))?;
+                }
+                Err(why) => self.archive.missing(&path, why),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The lines a development run or `muructl serve` keeps: its output,
+    /// or with `records` its access log's.
+    async fn tailed(&mut self, records: bool) -> Result<Vec<String>, String> {
+        let Some(live) = &mut self.installation.live else {
+            return Err(NOTHING_RUNS.to_owned());
+        };
+
+        let asked = async {
+            let mut stream = live
+                .client
+                .tail_logs(pb::TailLogsRequest {
+                    app: String::new(),
+                    release: String::new(),
+                    follow: false,
+                    lines: EVERY_LINE,
+                    access: records,
+                    host: String::new(),
+                })
+                .await
+                .map_err(|status| status.message().to_owned())?
+                .into_inner();
+            let mut lines = Vec::new();
+
+            while let Some(line) = stream.next().await {
+                lines.push(line.map_err(|status| status.message().to_owned())?.line);
+            }
+
+            Ok(lines)
+        };
+
+        tokio::time::timeout(ASK, asked)
+            .await
+            .map_err(|_| format!("no answer within {} seconds", ASK.as_secs()))?
     }
 
     /// The applications the bundle is not of, when it is limited to one.
@@ -552,6 +797,129 @@ impl<W: Write> Bundle<'_, W> {
         others.dedup();
         others
     }
+}
+
+/// An event as a line of JSON, its subject and sentence scrubbed when a
+/// scrubber is given.
+fn event_line(scrubber: &mut Option<Scrubber>, event: &pb::Event) -> Vec<u8> {
+    let mut line = match scrubber {
+        Some(scrubber) => {
+            let mut event = event.clone();
+            event.subject = scrubber.text(&event.subject);
+            event.message = scrubber.text(&event.message);
+            serde_json::to_vec(&event)
+        }
+        None => serde_json::to_vec(event),
+    }
+    .unwrap_or_default();
+    line.push(b'\n');
+    line
+}
+
+/// What each line of a log is passed through on its way into a bundle.
+struct Passing<'a> {
+    /// The application, or the release, whose access records alone are
+    /// kept, when the bundle is limited to one.
+    wanted: Option<&'a Target>,
+    /// What scrubs each line, with --scrub.
+    scrubber: Option<&'a mut Scrubber>,
+}
+
+impl Passing<'_> {
+    /// Pass one line, with its line end, into `out`: nothing for a
+    /// record of another application.
+    fn pass(&mut self, line: &[u8], out: &mut Vec<u8>) {
+        // A record names its application and release as JSON strings,
+        // and a quote inside a string is escaped, so the field is found
+        // as written. A line that is no JSON record names neither, and
+        // is kept.
+
+        if let Some(target) = self.wanted
+            && line.starts_with(b"{")
+        {
+            let named = |field: &str, value: &str| {
+                let written = format!("\"{field}\":\"{value}\"");
+                line.windows(written.len())
+                    .any(|found| found == written.as_bytes())
+            };
+
+            if !named("app", &target.app)
+                || (!target.release.is_empty() && !named("release", &target.release))
+            {
+                return;
+            }
+        }
+
+        let Some(scrubber) = &mut self.scrubber else {
+            out.extend_from_slice(line);
+            return;
+        };
+
+        let text = String::from_utf8_lossy(line);
+
+        let (text, ending) = match text.strip_suffix('\n') {
+            Some(text) => (text, "\n"),
+            None => (&*text, ""),
+        };
+
+        out.extend_from_slice(scrubber.line(text).as_bytes());
+        out.extend_from_slice(ending.as_bytes());
+    }
+}
+
+/// The lines of a source, each passed through, as a reader.
+struct Passed<'a, 'b, R> {
+    source: R,
+    passing: &'a mut Passing<'b>,
+    /// What has been passed and not yet read.
+    ready: Vec<u8>,
+    /// How much of `ready` has been read.
+    read: usize,
+}
+
+impl<R: BufRead> Read for Passed<'_, '_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut line = Vec::new();
+
+        while self.read == self.ready.len() {
+            self.ready.clear();
+            self.read = 0;
+            line.clear();
+
+            if self.source.read_until(b'\n', &mut line)? == 0 {
+                return Ok(0);
+            }
+
+            self.passing.pass(&line, &mut self.ready);
+        }
+
+        let most = buffer.len().min(self.ready.len() - self.read);
+        buffer[..most].copy_from_slice(&self.ready[self.read..self.read + most]);
+        self.read += most;
+        Ok(most)
+    }
+}
+
+/// A reader of a stretch's lines, each passed through, from its start: a
+/// compressed archive decompressed on the way.
+fn passed<'a, 'b, 's>(
+    stretch: &'s mut Stretch,
+    passing: &'a mut Passing<'b>,
+) -> io::Result<Passed<'a, 'b, BufReader<Box<dyn Read + 's>>>> {
+    stretch.file.seek(SeekFrom::Start(stretch.start))?;
+    let bytes = (&stretch.file).take(stretch.length);
+
+    let source: Box<dyn Read + 's> = match stretch.packed {
+        Some(packed) => packed.reader(bytes)?,
+        None => Box::new(bytes),
+    };
+
+    Ok(Passed {
+        source: BufReader::with_capacity(64 * 1024, source),
+        passing,
+        ready: Vec::new(),
+        read: 0,
+    })
 }
 
 /// Add a part as JSON to an archive, or record why there is none.
@@ -634,6 +1002,7 @@ pub async fn bundle(args: BundleArgs) -> anyhow::Result<()> {
             archive: Archive::planned(&root),
             window,
             target: &target,
+            scrubber: args.scrub.then(Scrubber::default),
             events: None,
             metrics: None,
         };
@@ -647,6 +1016,14 @@ pub async fn bundle(args: BundleArgs) -> anyhow::Result<()> {
         print_plan(&planned, &target, window, &output);
         return Ok(());
     }
+
+    // What was asked for beyond the default, for the event to say.
+
+    let options: Vec<String> = [(args.scrub, "scrub")]
+        .iter()
+        .filter(|(asked, _)| *asked)
+        .map(|(_, option)| (*option).to_owned())
+        .collect();
 
     // The collection competes with nothing that serves.
 
@@ -663,11 +1040,12 @@ pub async fn bundle(args: BundleArgs) -> anyhow::Result<()> {
                 );
             }
 
-            let recorded = record(&mut installation, &target, window).await;
+            let recorded = record(&mut installation, &target, window, options).await;
             let making = Making {
                 root: &root,
                 window,
                 target: &target,
+                scrub: args.scrub,
                 recorded,
             };
             let (_, entries) = making
@@ -684,11 +1062,12 @@ pub async fn bundle(args: BundleArgs) -> anyhow::Result<()> {
             let planned = planned.expect("a file's room is checked against a plan");
             check_room(&path, &planned)?;
             let file = create(&path)?;
-            let recorded = record(&mut installation, &target, window).await;
+            let recorded = record(&mut installation, &target, window, options).await;
             let making = Making {
                 root: &root,
                 window,
                 target: &target,
+                scrub: args.scrub,
                 recorded,
             };
 
@@ -721,6 +1100,8 @@ struct Making<'a> {
     root: &'a str,
     window: Window,
     target: &'a Target,
+    /// Whether client addresses and query strings are taken out.
+    scrub: bool,
     recorded: String,
 }
 
@@ -737,6 +1118,7 @@ impl Making<'_> {
             archive: Archive::new(writer, self.root, self.window.until_unix_ms / 1000),
             window: self.window,
             target: self.target,
+            scrubber: self.scrub.then(Scrubber::default),
             events: None,
             metrics: None,
         };
@@ -756,10 +1138,14 @@ impl Making<'_> {
             window: self.window,
             runs: installation.runs().describe().to_owned(),
             running: installation.running(),
-            options: serde_json::json!({}),
+            options: serde_json::json!({"scrub": self.scrub}),
             configuration_changed,
             recorded: self.recorded,
-            left_out: NEVER_HELD.iter().map(|held| (*held).to_owned()).collect(),
+            left_out: NEVER_HELD
+                .iter()
+                .chain(self.scrub.then_some(&SCRUBBED))
+                .map(|held| (*held).to_owned())
+                .collect(),
             parts: Vec::new(),
         };
 
@@ -800,7 +1186,12 @@ async fn check_target(installation: &mut Installation, target: &Target) -> anyho
 
 /// Have what runs record that a bundle is being made of it, and say for
 /// the manifest how it was recorded, or why it was not.
-async fn record(installation: &mut Installation, target: &Target, window: Window) -> String {
+async fn record(
+    installation: &mut Installation,
+    target: &Target,
+    window: Window,
+    options: Vec<String>,
+) -> String {
     let Some(live) = &mut installation.live else {
         return "no event: nothing is running to record one".to_owned();
     };
@@ -810,7 +1201,7 @@ async fn record(installation: &mut Installation, target: &Target, window: Window
         release: target.release.clone(),
         since_unix_ms: window.since_unix_ms,
         until_unix_ms: window.until_unix_ms,
-        options: Vec::new(),
+        options,
     }))
     .await;
 

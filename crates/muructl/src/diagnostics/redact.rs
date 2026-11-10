@@ -217,6 +217,17 @@ impl Redactor {
         self.text(value)
     }
 
+    /// A text with only the addresses in it replaced, as `text` replaces
+    /// them.
+    pub fn addresses(&mut self, text: &str) -> String {
+        self.addresses_in(text)
+            .into_iter()
+            .map(|piece| match piece {
+                Piece::Open(text) | Piece::Done(text) => text,
+            })
+            .collect()
+    }
+
     /// A text with every path, address and known name in it replaced.
     pub fn text(&mut self, text: &str) -> String {
         let mut pieces = self.paths_and_urls(text);

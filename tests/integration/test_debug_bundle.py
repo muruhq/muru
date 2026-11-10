@@ -5,6 +5,8 @@ it is written and how its making is recorded."""
 
 from __future__ import annotations
 
+import datetime
+import gzip
 import io
 import json
 import os
@@ -12,6 +14,7 @@ import re
 import stat
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +109,36 @@ def events_of(found: dict[str, bytes]) -> list[dict[str, Any]]:
     return [json.loads(line) for line in found["events.jsonl"].splitlines()]
 
 
+def records_of(content: bytes) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in content.splitlines()]
+
+
+def stamp(ago: float) -> str:
+    """The full time Muru writes, for a moment so many seconds ago."""
+
+    moment = datetime.datetime.now(datetime.UTC) - datetime.timedelta(seconds=ago)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+
+def access_record(ago: float, app: str, client: str, target: str) -> str:
+    """An access log record, as the edge writes one."""
+
+    return (
+        json.dumps(
+            {
+                "time": stamp(ago),
+                "client": client,
+                "app": app,
+                "release": "r1",
+                "target": target,
+                "status": 200,
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
 def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
     daemon = start_daemon(
         tmp_path,
@@ -129,6 +162,7 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
             "DATABASE_URL=postgres://shop:s3cret@db.example/shop",
         )
         assert deployed == "muru: release shop@r1 is ready and serving"
+        assert daemon.get("/catalogue?page=2").status == 200
 
         # A dry run says what the bundle would hold, writes nothing and
         # records nothing.
@@ -224,6 +258,15 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         assert sorted(missing) == ["config/logger-levels.json", "config/routing-snapshots"]
         assert "only the routing snapshot in force is kept" in missing["config/routing-snapshots"]
 
+        # The logs of the window, by their names in the log directory.
+
+        (served,) = records_of(found["logs/access.log"])
+        assert served["target"] == "/catalogue?page=2" and served["client"] == "127.0.0.1"
+        assert b"muru.host[" in found["logs/apps/shop/r1.log"]
+        assert b"edge serving" in found["logs/edge.log"]
+        noted = {part["path"]: part.get("note") for part in manifest["parts"]}
+        assert noted["logs/access.log"] == "the lines of the window"
+
         # Every event of the window is there in full, and the making of
         # the bundle is an event of its own.
 
@@ -300,12 +343,93 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
     assert {path.name: path.stat().st_mtime_ns for path in state.iterdir()} == before
     assert (state / "muru.sqlite").read_bytes() == stored
 
+    # Logs of the test's own making: an access log that starts three
+    # hours ago, with another application's records and a client's
+    # address in it, an archive the rotation left in the window and one
+    # from before it, and the output of another application.
+
+    logs = tmp_path / "logs"
+    served = (logs / "access.log").read_text()
+    (logs / "access.log").write_text(
+        "".join(access_record(3 * 3600 + ago, "shop", "203.0.113.9", "/old") for ago in (20, 10, 0))
+        + served
+        + access_record(60, "other", "203.0.113.9", "/other?id=1")
+        + access_record(30, "shop", "203.0.113.9", "/orders?id=7&token=abc")
+    )
+
+    with gzip.open(logs / "access.log.20260101-000000.gz", "wt") as archive:
+        archive.write(access_record(1800, "shop", "198.51.100.4", "/archived?page=1"))
+        archive.write(access_record(1700, "other", "198.51.100.4", "/archived"))
+
+    before_window = logs / "access.log.20250101-000000"
+    before_window.write_text(access_record(4 * 3600, "shop", "203.0.113.9", "/long-ago"))
+    os.utime(before_window, (time.time() - 4 * 3600,) * 2)
+    (logs / "apps" / "other").mkdir()
+    (logs / "apps" / "other" / "r1.log").write_text(
+        f"{stamp(40)} muru.worker[0]: saw 203.0.113.9 at /pay?card=4111\n"
+    )
+
+    # The window is cut from the log, and its archives come with it.
+
+    whole = tmp_path / "whole.tar.gz"
+    bundle(daemon, "--output", str(whole))
+    found = members(whole.read_bytes())
+    targets = [entry["target"] for entry in records_of(found["logs/access.log"])]
+    assert targets == ["/catalogue?page=2", "/other?id=1", "/orders?id=7&token=abc"]
+    assert "logs/access.log.20250101-000000" not in found
+    packed = records_of(gzip.decompress(found["logs/access.log.20260101-000000.gz"]))
+    assert [entry["target"] for entry in packed] == ["/archived?page=1", "/archived"]
+    assert b"/pay?card=4111" in found["logs/apps/other/r1.log"]
+    noted = {part["path"]: part.get("note") for part in manifest_of(found)["parts"]}
+    assert noted["logs/access.log.20260101-000000.gz"] == (
+        "the whole archive, which was last written in the window"
+    )
+
+    # A bundle of one application leaves out the others' output and
+    # records, and --scrub takes the clients' addresses and the query
+    # strings out, the same address reading the same throughout.
+
+    scrubbed = tmp_path / "scrubbed.tar.gz"
+    planned = bundle(daemon, "shop", "--scrub", "--dry-run")
+    assert "the records of shop alone, scrubbed: its size before that" in planned
+    bundle(daemon, "shop", "--scrub", "--output", str(scrubbed))
+    found = members(scrubbed.read_bytes())
+    manifest = manifest_of(found)
+    assert manifest["options"] == {"scrub": True}
+    assert "--scrub" in manifest["left_out"][-1]
+    assert "logs/apps/other/r1.log" not in found
+
+    kept = records_of(found["logs/access.log"])
+    assert [(entry["client"], entry["target"]) for entry in kept] == [
+        ("127.0.0.1", "/catalogue?..."),
+        ("<address2>", "/orders?..."),
+    ]
+    assert records_of(found["logs/access.log.20260101-000000"]) == [
+        {
+            "app": "shop",
+            "client": "<address1>",
+            "release": "r1",
+            "status": 200,
+            "target": "/archived?...",
+            "time": packed[0]["time"],
+        }
+    ]
+    noted = {part["path"]: part.get("note") for part in manifest["parts"]}
+    assert noted["logs/access.log"] == (
+        "the lines of the window, the records of shop alone, scrubbed"
+    )
+
+    for held in (b"203.0.113.9", b"198.51.100.4", b"token=abc", b"page="):
+        holding = [path for path, content in found.items() if held in content]
+        assert holding == [], f"{held!r} is in {holding}"
+
 
 def test_bundle_of_a_development_run_and_of_a_serve(tmp_path: Path) -> None:
     runtime = support.short_dir("muru-rt-")
     server = start_run(runtime)
 
     try:
+        server.get("/marker?x=1")
         written = tmp_path / "run.tar.gz"
         completed = muructl(
             "debug",
@@ -331,6 +455,17 @@ def test_bundle_of_a_development_run_and_of_a_serve(tmp_path: Path) -> None:
         # A run keeps the events its hosts raise, and none has been yet.
 
         assert events_of(found) == []
+
+        # A run writes no log files: the lines it keeps in memory are
+        # asked for.
+
+        assert b"worker 0 started as pid" in found["logs/apps/plain-wsgi/r1.log"]
+        (served,) = records_of(found["logs/access.log"])
+        assert served["target"] == "/marker?x=1"
+        noted = {part["path"]: part.get("note") for part in manifest["parts"]}
+        assert noted["logs/access.log"] == (
+            "the lines of the window among those muructl run keeps in memory"
+        )
 
         # A run has no state store: its settings are what config show
         # --effective prints, and it has no daemon's file.
