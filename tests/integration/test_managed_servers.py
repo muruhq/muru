@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import time
 from collections.abc import Callable
@@ -540,3 +541,58 @@ def test_a_daemon_restart_readopts_the_instances(tmp_path: Path) -> None:
         second.stop(shutdown=True)
 
     wait_for(lambda: not alive(replacement))
+
+
+def test_a_daemon_restart_adopts_the_instances_still_there_and_starts_the_rest(
+    tmp_path: Path,
+) -> None:
+    first = start_daemon(tmp_path)
+    second = None
+
+    try:
+        deploy_server(first, "legacy", "--bind", "port", "--instances", "2")
+        before = instances(first, "legacy@r1")
+        survivor, lost = before[0]["pid"], before[1]["pid"]
+
+        # The daemon detaches, and one instance exits while none is there.
+
+        assert "detached" in first.muructl("daemon", "stop").stdout
+        first.process.wait(timeout=30)
+        os.kill(lost, signal.SIGKILL)
+        wait_for(lambda: not alive(lost))
+
+        # The next daemon takes over the instance that is still there, as
+        # it was, and starts the other again at its address. The release
+        # is the one it was, not a fresh start beside the survivor.
+
+        second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+        wait_for(lambda: instances(second, "legacy@r1")[1]["pid"] not in (0, lost), 20)
+        after = instances(second, "legacy@r1")
+        assert after[0] == before[0]
+        assert after[1]["index"] == 1
+        assert after[1]["address"] == before[1]["address"]
+        replacement = after[1]["pid"]
+        assert second.releases("legacy") == [
+            {"release": "legacy@r1", "state": "ready", "serving": "yes"}
+        ]
+        events = second.muructl("events").stdout
+        assert f"re-adopted the server instances (pid {survivor})" in events
+        assert "instance 1 was gone and is started again" in events
+        assert f"instance 1 started again (pid {replacement})" in events
+
+        # Both serve.
+
+        def serving() -> set[int]:
+            responses = [second.request(f"/n/{n}") for n in range(8)]
+            return {json.loads(r.body)["pid"] for r in responses if r.status == 200}
+
+        wait_for(lambda: serving() == {survivor, replacement}, 20)
+    finally:
+        if second is None:
+            second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+
+        second.stop(shutdown=True)
+
+    # The shutdown stops them both: the survivor was not left behind.
+
+    wait_for(lambda: not alive(survivor) and not alive(replacement))

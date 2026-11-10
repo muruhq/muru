@@ -249,6 +249,7 @@ impl Instance {
             } else {
                 0
             },
+            quick_exits: self.quick_exits,
         }
     }
 }
@@ -280,6 +281,10 @@ pub struct InstanceRecord {
     /// When its process was started, Unix milliseconds; 0 when not known.
     #[serde(default)]
     pub started_unix_ms: u64,
+    /// Its exits and failed starts in a row, so that the waits between
+    /// starts carry on under the next daemon.
+    #[serde(default)]
+    pub quick_exits: u32,
 }
 
 /// The instances of one supervised program.
@@ -315,44 +320,59 @@ impl Supervisor {
     }
 
     /// Take over the instances a previous daemon recorded, each of
-    /// `instances` matching the record's instance at the same place:
-    /// every one must still be there. They are stopped with signals
-    /// rather than waited for, and one that exits is started again as a
-    /// child of this daemon.
+    /// `instances` matching the record's instance at the same place.
+    ///
+    /// Adoption is instance by instance. One whose process is still
+    /// there is taken over: it is stopped with signals rather than
+    /// waited for, and when it exits it is started again as a child of
+    /// this daemon. One that is not there, because it exited while no
+    /// daemon was looking or was waiting to be started when the record
+    /// was written (pid 0), is an instance that exited: it is due at
+    /// once, so the next `check` starts it, and its exits in a row are
+    /// as recorded. Only a record that names no instance is refused.
     pub fn adopt(
         spec: Spec,
         policy: RestartPolicy,
         instances: Vec<InstanceSpec>,
         record: &Record,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!record.instances.is_empty(), "no instances were recorded");
         anyhow::ensure!(
             instances.len() == record.instances.len(),
             "{} instances were recorded, not {}",
             record.instances.len(),
             instances.len()
         );
-        let mut adopted = Vec::new();
+        let now = Instant::now();
+        let instances = record
+            .instances
+            .iter()
+            .zip(instances)
+            .map(|(recorded, instance)| {
+                let instance = Instance {
+                    quick_exits: recorded.quick_exits,
+                    ..Instance::new(recorded.index, instance)
+                };
 
-        for (recorded, instance) in record.instances.iter().zip(instances) {
-            anyhow::ensure!(
-                alive(recorded.pid),
-                "instance {} (pid {}) is gone",
-                recorded.index,
-                recorded.pid
-            );
-            adopted.push(Instance {
-                process: Some(Process::Adopted(recorded.pid)),
-                started_unix_ms: recorded.started_unix_ms,
-                ..Instance::new(recorded.index, instance)
-            });
-        }
-
-        anyhow::ensure!(!adopted.is_empty(), "no instances were recorded");
+                if still_there(recorded) {
+                    Instance {
+                        process: Some(Process::Adopted(recorded.pid)),
+                        started_unix_ms: recorded.started_unix_ms,
+                        ..instance
+                    }
+                } else {
+                    Instance {
+                        due: Some(now),
+                        ..instance
+                    }
+                }
+            })
+            .collect();
 
         Ok(Self {
             spec,
             policy,
-            instances: adopted,
+            instances,
         })
     }
 
@@ -534,6 +554,14 @@ impl Supervisor {
             }
         }
     }
+}
+
+/// Whether the process an instance was recorded with is still there.
+/// Pid 0 is how the record shows an instance that had no process, and
+/// is never looked for: as a pid it would name this daemon's own process
+/// group.
+fn still_there(recorded: &InstanceRecord) -> bool {
+    recorded.pid != 0 && alive(recorded.pid)
 }
 
 #[cfg(test)]
@@ -857,59 +885,142 @@ mod tests {
         assert!(!exists(pid));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn adoption_takes_over_processes_that_are_still_there() {
-        // The processes of a previous daemon are stood in for by
-        // children of the test, which a supervisor did not start.
+    /// A record of processes with these pids, each with two exits in a
+    /// row behind it.
+    fn recorded(pids: &[u32]) -> Record {
+        Record {
+            instances: (0..)
+                .zip(pids)
+                .map(|(index, pid)| InstanceRecord {
+                    index,
+                    pid: *pid,
+                    started_unix_ms: if *pid == 0 { 0 } else { 1234 },
+                    quick_exits: 2,
+                })
+                .collect(),
+        }
+    }
 
-        let dir = tempfile::tempdir().unwrap();
-        let mut previous = std::process::Command::new("/bin/sleep")
+    /// A process that stands in for one a previous daemon started: a
+    /// child of the test, which no supervisor of the test started.
+    fn previous() -> std::process::Child {
+        std::process::Command::new("/bin/sleep")
             .arg("600")
             .spawn()
-            .unwrap();
-        let record = Record {
-            instances: vec![InstanceRecord {
-                index: 0,
-                pid: previous.id(),
-                started_unix_ms: 1234,
-            }],
-        };
+            .unwrap()
+    }
+
+    /// A pid that names no process: that of a child that was reaped.
+    fn dead_pid() -> u32 {
+        let mut child = previous();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        child.id()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adoption_takes_over_what_is_there_and_starts_the_rest() {
+        // Three instances were recorded: one still runs, one exited
+        // while no daemon was there, and one was waiting to be started,
+        // which the record shows as pid 0.
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut survivor = previous();
+        let record = recorded(&[survivor.id(), dead_pid(), 0]);
         let mut supervisor = Supervisor::adopt(
             spec(dir.path()),
             RestartPolicy::default(),
-            vec![instance(&["/bin/sleep", "600"])],
+            vec![
+                instance(&["/bin/sleep", "600"]),
+                instance(&["/bin/sleep", "601"]),
+                instance(&["/bin/sleep", "602"]),
+            ],
             &record,
         )
         .unwrap();
-        assert_eq!(pids(&supervisor), [previous.id()]);
+
+        // The survivor is taken over as it was recorded, and the others
+        // have no process yet.
+
+        assert_eq!(pids(&supervisor), [survivor.id(), 0, 0]);
+        assert_eq!(supervisor.running(), 1);
         assert_eq!(supervisor.record().instances[0].started_unix_ms, 1234);
-        assert!(supervisor.check().is_empty());
+
+        // The first check starts the two that were not there, and
+        // leaves the survivor alone.
+
+        let started = supervisor.check();
+        let started: Vec<&str> = started
+            .iter()
+            .map(|report| report.message.as_str())
+            .collect();
+        let now = pids(&supervisor);
+        assert_eq!(
+            started,
+            [
+                format!("instance 1 started again (pid {})", now[1]),
+                format!("instance 2 started again (pid {})", now[2]),
+            ]
+        );
+        assert_eq!(now[0], survivor.id());
+        assert_eq!(supervisor.running(), 3);
+
+        // The exits in a row carry on from the record: with two behind
+        // it, an instance's next exit waits as the third does.
+
+        kill(now[1]);
+        assert_eq!(
+            reports(&mut supervisor),
+            [
+                "thing.exited warning: instance 1 exited with signal: 9 (SIGKILL); \
+              starting it again in 4s"
+            ]
+        );
 
         // An adopted process that exits is seen to be gone and started
         // again as a child.
 
-        previous.kill().unwrap();
-        previous.wait().unwrap();
+        survivor.kill().unwrap();
+        survivor.wait().unwrap();
         assert_eq!(
             reports(&mut supervisor),
-            ["thing.exited warning: instance 0 is gone; starting it again in 1s"]
+            ["thing.exited warning: instance 0 is gone; starting it again in 4s"]
         );
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(reports(&mut supervisor)[0].starts_with("thing.started"));
-        assert_ne!(pids(&supervisor), [previous.id()]);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert_eq!(supervisor.check().len(), 2);
+        assert_eq!(supervisor.running(), 3);
+        assert!(!pids(&supervisor).contains(&survivor.id()));
 
-        // A record naming a process that is gone is refused.
+        supervisor.stop_until(Instant::now()).await;
+    }
 
+    #[tokio::test(start_paused = true)]
+    async fn adoption_refuses_only_a_record_with_no_instances() {
+        let dir = tempfile::tempdir().unwrap();
         let refused = Supervisor::adopt(
             spec(dir.path()),
             RestartPolicy::default(),
-            vec![instance(&["/bin/sleep", "600"])],
-            &record,
+            Vec::new(),
+            &recorded(&[]),
         );
         assert_eq!(
             refused.err().map(|error| error.to_string()),
-            Some(format!("instance 0 (pid {}) is gone", previous.id()))
+            Some("no instances were recorded".to_owned())
         );
+
+        // A record whose every instance is gone is taken over, and its
+        // instances are started by the first check.
+
+        let mut supervisor = Supervisor::adopt(
+            spec(dir.path()),
+            RestartPolicy::default(),
+            vec![instance(&["/bin/sleep", "600"])],
+            &recorded(&[dead_pid()]),
+        )
+        .unwrap();
+        assert_eq!(supervisor.running(), 0);
+        assert_eq!(supervisor.check().len(), 1);
+        assert_eq!(supervisor.running(), 1);
 
         supervisor.stop_until(Instant::now()).await;
     }

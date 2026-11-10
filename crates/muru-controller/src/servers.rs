@@ -84,6 +84,9 @@ pub struct InstanceRecord {
     /// When its process was started, Unix milliseconds; 0 when not known.
     #[serde(default)]
     pub started_unix_ms: u64,
+    /// Its exits and failed starts in a row.
+    #[serde(default)]
+    pub quick_exits: u32,
 }
 
 impl InstanceRecord {
@@ -93,6 +96,7 @@ impl InstanceRecord {
             index: self.index,
             pid: self.pid,
             started_unix_ms: self.started_unix_ms,
+            quick_exits: self.quick_exits,
         }
     }
 }
@@ -142,10 +146,10 @@ impl Servers {
         })
     }
 
-    /// Take over the instances a previous daemon recorded: each must
-    /// still be there. They are stopped with signals rather than waited
-    /// for, and one that exits is started again as a child of this
-    /// daemon.
+    /// Take over the instances a previous daemon recorded, each one
+    /// that is still there, with those that are not due to be started
+    /// by the next `check`. Only a record with no instances, or with an
+    /// address that cannot be read, is refused.
     #[allow(clippy::too_many_arguments)]
     pub fn adopt(
         spec: &HttpServerSpec,
@@ -277,6 +281,7 @@ impl Servers {
                     pid: process.pid,
                     address: bind.address(),
                     started_unix_ms: process.started_unix_ms,
+                    quick_exits: process.quick_exits,
                 })
                 .collect(),
         }

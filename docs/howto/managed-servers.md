@@ -141,9 +141,24 @@ it: Muru puts no time in front of it and no tag naming the instance, so a
 time or a process id on a line is whatever the server's own logging puts
 there, and the lines of a release's instances are interleaved in the one
 file. The daemon rotates that file by copying it and truncating it in
-place, since the server cannot be told to reopen it. A daemon that stops without `--shutdown`, or upgrades itself, leaves
-the instances running and the next daemon takes them over from the
-record in the release's run directory. `muructl release list` shows a
+place, since the server cannot be told to reopen it.
+
+A daemon that stops without `--shutdown`, or upgrades itself, leaves
+the instances running, and the next daemon takes them over from the
+record in the release's run directory, one instance at a time. An
+instance that is still running is taken over as it is, with its pid and
+start time. An instance that exited while no daemon was running, or that
+was waiting to be started again when the daemon stopped, is started
+again within a second at the same address, and its waits carry on from
+the exits it had in a row. The release stays `ready`, and its
+`release.adopted` event names the pids taken over and the instances
+started again:
+
+```
+re-adopted the server instances (pid 48213); instance 1 was gone and is started again
+```
+
+`muructl release list` shows a
 managed server as its instance count and profile in the workers column.
 `muructl release show` lists each instance with its pid and address, and
 with `--json` as `server_instances`, each with `index`, `pid` (0 while it
