@@ -136,9 +136,12 @@ records each request under the application and release with `http` as
 its group and the instance's address as its mount.
 
 The instances' standard output and error go to the release's log file,
-shown by `muructl logs APP`, and the daemon rotates that file by copying
-it and truncating it in place, since the server cannot be told to reopen
-it. A daemon that stops without `--shutdown`, or upgrades itself, leaves
+shown by `muructl logs APP`. Each line is in the file as the server wrote
+it: Muru puts no time in front of it and no tag naming the instance, so a
+time or a process id on a line is whatever the server's own logging puts
+there, and the lines of a release's instances are interleaved in the one
+file. The daemon rotates that file by copying it and truncating it in
+place, since the server cannot be told to reopen it. A daemon that stops without `--shutdown`, or upgrades itself, leaves
 the instances running and the next daemon takes them over from the
 record in the release's run directory. `muructl release list` shows a
 managed server as its instance count and profile in the workers column.

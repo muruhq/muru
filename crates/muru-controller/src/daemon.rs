@@ -971,8 +971,10 @@ impl Backend {
         }
     }
 
-    /// Send the host a signal; a managed server's instances take none,
-    /// since the daemon writes their log lines itself.
+    /// Send the host a signal, which is how it is told to reopen its log
+    /// file. A managed server's instances take none: each writes to the
+    /// release's log file itself, on a descriptor it was started with,
+    /// and cannot be told to reopen it, so that file is rotated in place.
     fn signal(&self, signal: i32) -> bool {
         match self {
             Self::Host(host) => host.signal(signal),
