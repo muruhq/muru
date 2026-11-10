@@ -19,6 +19,45 @@ pub struct Row {
     source: String,
 }
 
+/// The settings a run or a serve uses, as its report sets them out: the
+/// application's own, then the command's table.
+pub struct Settings {
+    /// What the report says before the settings.
+    notes: Vec<String>,
+    /// The application's settings.
+    top: Vec<Row>,
+    /// The command's table: `run` or `serve`.
+    section: &'static str,
+    /// The settings of the command's table.
+    rows: Vec<Row>,
+    /// What the report says after the settings.
+    trailer: Vec<String>,
+}
+
+impl Settings {
+    /// Each setting as a line of `muructl config show --effective`, which
+    /// reads `SCOPE: KEY = VALUE (SOURCE)`, with those of the command's
+    /// table under its name, as `run.port`.
+    pub fn layers(&self, scope: &str) -> Vec<String> {
+        let top = self.top.iter().map(|row| (row.key.to_owned(), row));
+        let rows = self
+            .rows
+            .iter()
+            .map(|row| (format!("{}.{}", self.section, row.key), row));
+
+        top.chain(rows)
+            .map(|(key, row)| {
+                let value = match &row.value {
+                    toml::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+
+                format!("{scope}: {key} = {value} ({})", row.source)
+            })
+            .collect()
+    }
+}
+
 impl Row {
     /// A setting, or none for a value TOML cannot write.
     pub fn new(
@@ -96,16 +135,16 @@ pub fn table_name(source: Option<&std::path::Path>, table: &str) -> String {
 
 /// The report: a comment saying what it is, the application's settings,
 /// then the command's own table.
-fn render(
-    command: &str,
-    notes: &[String],
-    top: &[Row],
-    section: &str,
-    rows: &[Row],
-    trailer: &[String],
-) -> String {
+fn render(settings: &Settings) -> String {
+    let Settings {
+        notes,
+        top,
+        section,
+        rows,
+        trailer,
+    } = settings;
     let mut out =
-        format!("# The settings this muructl {command} would use, and where each came from.\n");
+        format!("# The settings this muructl {section} would use, and where each came from.\n");
 
     for note in notes {
         let _ = writeln!(out, "# {note}");
@@ -183,6 +222,15 @@ fn other_tables_note(tables: &[String], source: Option<&std::path::Path>) -> Vec
 /// project's run table over the defaults, and the application's settings
 /// from the flags over the project's table.
 pub fn for_run(args: &crate::RunArgs, resolved: &crate::Resolved, interpreter: &str) -> String {
+    let mut settings = run_settings(args, resolved);
+    settings
+        .trailer
+        .insert(0, format!("The interpreter is {interpreter}."));
+    render(&settings)
+}
+
+/// The settings a `muructl run` uses, each with where it came from.
+pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settings {
     let layers = &resolved.layers;
     let serving = &resolved.serving;
     let source = resolved.source.as_deref();
@@ -477,11 +525,7 @@ pub fn for_run(args: &crate::RunArgs, resolved: &crate::Resolved, interpreter: &
         notes.push("--single gives one process of one thread.".to_owned());
     }
 
-    let mut trailer = vec![format!("The interpreter is {interpreter}.")];
-    trailer.extend(other_tables_note(
-        &other_tables(&layers.table, &top),
-        source,
-    ));
+    let mut trailer = other_tables_note(&other_tables(&layers.table, &top), source);
 
     if has(&layers.table, "serve") {
         trailer.push("The serve table is muructl serve's, and is not read here.".to_owned());
@@ -497,7 +541,13 @@ pub fn for_run(args: &crate::RunArgs, resolved: &crate::Resolved, interpreter: &
         ));
     }
 
-    render("run", &notes, &top, "run", &rows, &trailer)
+    Settings {
+        notes,
+        top,
+        section: "run",
+        rows,
+        trailer,
+    }
 }
 
 /// The line of the report for the run's `.env` file: what it sets, and
@@ -542,6 +592,11 @@ pub struct Serve {
 /// `muructl serve --print-config`: the flags over the environment over
 /// the serve table of the project's settings over the defaults.
 pub fn for_serve(resolved: &crate::Resolved, serve: Serve) -> String {
+    render(&serve_settings(resolved, serve))
+}
+
+/// The settings a `muructl serve` uses, each with where it came from.
+pub fn serve_settings(resolved: &crate::Resolved, serve: Serve) -> Settings {
     let layers = &resolved.layers;
     let source = resolved.source.as_deref();
     let project = table_name(source, "");
@@ -600,7 +655,14 @@ pub fn for_serve(resolved: &crate::Resolved, serve: Serve) -> String {
     }
 
     trailer.extend(serve.trailer);
-    render("serve", &notes, &top, "serve", &serve.rows, &trailer)
+
+    Settings {
+        notes,
+        top,
+        section: "serve",
+        rows: serve.rows,
+        trailer,
+    }
 }
 
 #[cfg(test)]
@@ -648,14 +710,14 @@ mod tests {
             Row::new("threads", 8, COMMAND_LINE).expect("a row"),
         ];
         let rows = [Row::new("hosts", ["a.test", "b.test"], DEFAULT).expect("a row")];
-        let report = render(
-            "run",
-            &["A note.".to_owned()],
-            &top,
-            "run",
-            &rows,
-            &["After.".to_owned()],
-        );
+        let settings = Settings {
+            notes: vec!["A note.".to_owned()],
+            top: top.into(),
+            section: "run",
+            rows: rows.into(),
+            trailer: vec!["After.".to_owned()],
+        };
+        let report = render(&settings);
 
         assert_eq!(
             report,
@@ -671,5 +733,16 @@ mod tests {
              # After.\n"
         );
         report.parse::<toml::Table>().expect("valid TOML");
+
+        // The same settings as lines of the effective configuration.
+
+        assert_eq!(
+            settings.layers("shop@r1"),
+            [
+                "shop@r1: entrypoint = shop:application (muru.toml)",
+                "shop@r1: threads = 8 (command line)",
+                "shop@r1: run.hosts = [\"a.test\", \"b.test\"] (default)",
+            ]
+        );
     }
 }

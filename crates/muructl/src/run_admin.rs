@@ -204,6 +204,8 @@ pub struct RunState {
     pub commands: muru_controller::commands::Underway,
     /// The events the run's hosts raised.
     pub events: Arc<RunEvents>,
+    /// The settings in force, each with where it came from.
+    pub settings: Arc<crate::print_config::Settings>,
 }
 
 /// What the run serves the application with, which a command of the
@@ -815,6 +817,9 @@ impl Admin for Service {
             release: state.release_id(),
             project: state.project.display().to_string(),
             no_host: String::new(),
+            config: String::new(),
+            log_dir: String::new(),
+            cache_dir: String::new(),
         }))
     }
 
@@ -1048,6 +1053,21 @@ impl Admin for Service {
         }))
     }
 
+    /// A bundle being made of the run, which the daemon records as an
+    /// event and the run prints, as it does the debug operations.
+    async fn note_bundle(
+        &self,
+        request: Request<pb::NoteBundleRequest>,
+    ) -> Result<Response<pb::NoteBundleResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .target(&request.app, &request.release)
+            .map_err(Status::not_found)?;
+        let (_, message) = muru_controller::diagnostics::bundle_event(&request);
+        muru_common::muru_println!("debug.bundle: {message}");
+        Ok(Response::new(pb::NoteBundleResponse {}))
+    }
+
     async fn override_access_log(
         &self,
         request: Request<pb::OverrideAccessLogRequest>,
@@ -1133,6 +1153,36 @@ impl Admin for Service {
         }))
     }
 
+    /// The settings the run serves with, each with where it came from,
+    /// as the daemon gives a release's with the effective configuration
+    /// (section 3.3). A run has no desired state, so nothing else of the
+    /// configuration is answered for.
+    async fn export_config(
+        &self,
+        request: Request<pb::ExportConfigRequest>,
+    ) -> Result<Response<pb::ExportConfigResponse>, Status> {
+        let request = request.into_inner();
+        let state = &self.state;
+
+        if !request.effective {
+            return Err(self.needs_the_daemon("muructl config"));
+        }
+
+        let release = state.target(&request.app, "").map_err(Status::not_found)?;
+
+        Ok(Response::new(pb::ExportConfigResponse {
+            document: String::new(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            node: muru_controller::config::hostname(),
+            time_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as u64),
+            state_version: 0,
+            attributions: Vec::new(),
+            layers: state.settings.layers(&format!("{}@{release}", state.app)),
+        }))
+    }
+
     async fn list_events(
         &self,
         request: Request<pb::ListEventsRequest>,
@@ -1215,7 +1265,6 @@ impl Admin for Service {
         list_upstreams(pb::ListUpstreamsRequest) -> pb::ListUpstreamsResponse, "muructl upstream";
         apply_config(pb::ApplyConfigRequest) -> pb::ConfigReport, "muructl apply";
         diff_config(pb::DiffConfigRequest) -> pb::ConfigReport, "muructl config diff";
-        export_config(pb::ExportConfigRequest) -> pb::ExportConfigResponse, "muructl config show";
         reload_config(pb::ReloadConfigRequest) -> pb::ReloadConfigResponse, "muructl daemon reload";
         upgrade_daemon(pb::UpgradeDaemonRequest) -> pb::UpgradeDaemonResponse, "muructl daemon upgrade";
         list_overlays(pb::ListOverlaysRequest) -> pb::ListOverlaysResponse, "muructl overlay";

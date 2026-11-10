@@ -86,7 +86,8 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Traffic | muructl overlay promote NAME | Fold an active overlay into the base configuration | 9.10 |
 | Traffic | muructl client-class list, test | Show classes, classify a sample request | 4.14 |
 | Traffic | muructl ratelimit list, status | Rate limits and current rejections | 4.15 |
-| Observability | muructl debug report | Redacted diagnostic bundle for bug reports | 18.6 |
+| Observability | muructl debug report | A short summary of the installation to attach to a bug report, safe to post: no log lines, request data, environment or secrets, and names, paths and addresses as placeholders. Works with no daemon running, on its files. Flags: --format (text or markdown), --json, and the daemon's location options --state-dir, --config, --run-dir and --system | 11.9, 18.6 |
+| Observability | muructl debug bundle [TARGET] | An archive of the whole system for a time window, for the people who own it to triage with; it holds production data. TARGET is app or app@release, the whole node by default. Works with no daemon running, on its files, and records what it could not collect in its manifest. Flags: --since DURATION (1h), --output FILE or - for standard output, --dry-run, --scrub (client addresses as placeholders, query strings cut), --memory and --profile DURATION (the workers' object counts and a profile, which cost the workers and are collected only when asked for), and the daemon's location options --state-dir, --log-dir, --config, --run-dir and --system | 11.9 |
 | Development | muructl serve-static DIR | Serve a directory with no configuration. Flags: --listing, --index, --fallback, --https and port options | 4.9 |
 | Daemon | muructl daemon stop --shutdown [--timeout] | Drain every release and stop everything, instead of detaching | 13.3 |
 | Configuration | muructl secret set, list, remove | Manage the file secret store; values never appear in output | 10.8 |

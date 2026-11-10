@@ -654,6 +654,7 @@ def inspect(every: bool = False) -> dict[str, Any]:
             "app": current.app,
             "group": current.group,
             "worker": current.worker_id,
+            "interface": current.interface,
             "process_model": current.process_model,
             "gil_enabled": getattr(sys, "_is_gil_enabled", lambda: True)(),
         },

@@ -487,3 +487,353 @@ profile read from outside the worker takes no thread of the worker and
 is not counted. The daemon never reaches into a worker process directly, which is what lets
 the same commands work on a release running as another user, and on
 an application in a container under `muructl serve`.
+
+## A report for a bug report
+
+`muructl debug report` prints a short summary of an installation, to
+attach to a bug report on Muru. It is safe to post in public, and small
+enough to paste into the report's form:
+
+```
+muructl debug report
+muructl debug report --format markdown
+muructl debug report --json
+```
+
+`--format markdown` is the form to paste into an issue: it shows there
+as tables, where plain text pasted without a code fence is reformatted.
+Every value that came from the system is in a code span or a fenced
+block, so nothing in it is read as markup, and a name such as `@alice`
+or `#123` in it notifies no one and links to nothing. `--json` gives the
+same as [JSON](../reference/json-output.md).
+
+```
+Muru 1.0.0 on linux x86_64 (kernel 6.8.0)
+Runs as a user daemon, running, not in a container
+
+RELEASES
+  RELEASE STATE   SERVING INTERFACE FRAMEWORK   PYTHON         WORKERS
+  app1@r3 ready   yes     wsgi      flask 3.0.3 3.13.1 regular 2 ready
+  app1@r2 stopped no      auto      -           3.13.1 regular -
+
+SETTINGS OF THE SERVING RELEASES
+  app1@r3
+    entrypoint = <module1>:application  ([tool.muru])
+    python = ~/<path1>                  (deploy flags)
+    processes = 2                       (deploy flags)
+    at their defaults:
+      build.when = auto, bytecode = source (precompiled), interface = auto,
+      preload = auto, threads = 1, sync_threads = 8, concurrency = 1000
+
+DAEMON SETTINGS
+  limits.max_body_size = 2MB
+  listener[0].address = <address1>:443
+
+EVENTS IN THE LAST 24 HOURS
+      3  info     release.ready
+      1  warning  worker.timeout_killed
+
+MOST RECENT WARNINGS AND ERRORS
+  2026-11-02T05:42:22Z warning worker.timeout_killed app1@r3: worker 1 (pid 41214): a request has run for 61.0 s, past the hard timeout of 60 s
+
+Placeholders stand for 1 application name, 1 path, 1 address, 1 module. Read the report before posting it.
+```
+
+The report holds:
+
+- Muru's version, the operating system, its kernel and the architecture.
+
+- How Muru runs: `muructl run`, a user daemon, a system daemon or
+  `muructl serve`, whether it is running, and whether it is in a
+  container.
+
+- Every release: its state, whether it serves, its interface, the
+  frameworks one of its workers has loaded, the Python version and
+  build (regular or free-threaded) and its workers' states. The
+  frameworks are the known ones among the worker's loaded modules, so
+  no module of the application's own is named.
+
+- The effective settings of the serving releases, each with where it
+  came from, as [`muructl config show
+  --effective`](daemon.md#what-an-apply-does) reports them. For a
+  development run and `muructl serve` these are the settings
+  `--print-config` prints. A setting left at its default is listed with
+  the others at their defaults.
+
+- What the daemon's configuration file sets. The tables that configure
+  the daemon itself (`daemon`, `tools`, `listener`, `limits`, `proxy`,
+  `compression`, `logs`, `shutdown`, `metrics` and `dashboard`) are
+  listed setting by setting, and any other table, such as the virtual
+  hosts, routes and event sinks, only by how many entries it has.
+
+- How many events of each type and level the last 24 hours hold, and
+  the ten most recent warnings and errors.
+
+It holds no application logs, access log lines, request data or client
+addresses, no environment variables, and no secret values. What
+identifies the system is replaced by a placeholder, the same one
+wherever the same value appears:
+
+| What | Reads as |
+| --- | --- |
+| An application's name | `app1`, `app2`, so `shop@r3` reads as `app1@r3` |
+| A virtual host's name, and the host of a URL | `host1`, `host2` |
+| The machine's own name | `node` |
+| A user's or a group's name | `user1`, `user2` |
+| Muru's own directories and the daemon's configuration file | `<state-dir>`, `<run-dir>`, `<log-dir>`, `<cache-dir>` and `<daemon-config>`, with what follows kept |
+| The home directory, and a path under it | `~`, and `~/<path1>` |
+| Any other path, except the system's own such as `/usr/bin/python3` | `<path1>`, `<path2>` |
+| A network address, except loopback and the unspecified address | `<address1>`, `<address2>` |
+| The module of an entry point or of hooks, wherever it is named | `<module1>`, so `shop.wsgi:application` reads as `<module1>:application` |
+| A package such a module is in | `<package1>`, `<package2>` |
+| The value of a setting whose name marks it as a secret | `<redacted>` |
+| The value of a setting that is free text, such as a list of host names | `<set>` |
+
+An event's sentence is given with the same replacements. The sentence
+of an event that quotes a request, a command or the application's code
+(the `request.`, `command.` and `debug.exec` events and the breakpoint
+ones) is left out. A sentence can still quote an error the application
+raised, such as the exception that stopped a release from loading, so
+read the report before posting it. Nothing in it is hidden or encoded,
+and the last line says how many values of each kind were replaced.
+
+The command works with no daemon running: it reads the stopped daemon's
+state store and configuration file, and changes neither. It takes the
+daemon's location options for that (`--state-dir`, `--config`,
+`--run-dir` and `--system`). A running daemon says where its files are,
+so no option is needed then. A part that cannot be collected is listed
+under `NOT COLLECTED` with the reason, in place of its figures, and the
+command still succeeds.
+
+## A bundle of a system for triage
+
+`muructl debug bundle` writes one archive of a whole system for a time
+window, to triage a problem with afterwards, somewhere else. It is for
+the people who own the system: it holds real log lines, client addresses
+and configuration, and is not for posting. For a public bug report, use
+[the report](#a-report-for-a-bug-report).
+
+```
+muructl debug bundle
+muructl debug bundle --since 30m --output /mnt/scratch/shop.tar.gz
+muructl debug bundle shop@r3 --since 2d
+muructl debug bundle shop --scrub
+muructl debug bundle shop --memory --profile 30s
+muructl debug bundle --dry-run
+ssh web1 muructl debug bundle --output - > web1.tar.gz
+kubectl exec deploy/shop -- muructl debug bundle --output - > shop.tar.gz
+```
+
+The archive is a `.tar.gz` that any tool opens. `--since` says how far
+back it reaches, an hour when left out. A target limits it to one
+application, or to one release as `app@release`; the whole node is the
+default.
+
+`--output` names the file, and `-` writes the archive to standard
+output, to send through `ssh` or `kubectl exec`. With no `--output` the
+file is `muru-bundle-` and the time in UTC, in the current directory.
+The file is created readable and writable by its owner alone, and a
+file that already exists is refused. Before writing, the command checks
+that the file system has room, and refuses with how much the bundle
+needs when it has not:
+
+```
+$ muructl debug bundle
+error: the bundle needs about 1.2GB, and /var/lib/muru has 310.0MB free: write it elsewhere with --output, or to standard output with --output -
+```
+
+`--dry-run` prints what the bundle would hold and about how large it
+would be, writes nothing, and asks nothing of the workers:
+
+```
+$ muructl debug bundle --dry-run
+A bundle of the whole node, reaching back 1h to 2026-11-02T04:42:22Z, would hold:
+  installation.json             asked for when the bundle is made
+  events.jsonl                  48.2KB
+  config/releases/shop@r3.json  6.1KB
+  config/effective.toml         1.9KB
+  logs/access.log               212.4MB, the lines of the window
+  logs/apps/shop/r3.log         18.0MB, the lines of the window
+  logs/edge.log                 3.1KB, the lines of the window
+About 57.7MB once compressed, from 230.5MB on disk and what is asked for when it is made.
+/home/ops has 41.0GB free.
+```
+
+When it finishes, the command says where the archive is, how many parts
+it holds, each part it could not collect, and that it holds production
+data:
+
+```
+$ muructl debug bundle
+muru: wrote the bundle to muru-bundle-20261102-054222.tar.gz (3.4MB): 31 parts, 1 not collected
+  live/shop@r3/stacks-2.json: no answer within 5 seconds
+muru: it holds production data (logs, client addresses and configuration) and only its owner can read it: handle it as such
+```
+
+### What it holds
+
+Everything is under one directory named as the file is.
+
+| Path | Holds |
+| --- | --- |
+| `manifest.json` | What the bundle is of, its window, and every part: whether it was collected, its size, and why not when it was not |
+| `installation.json` | Muru's version, the platform, how Muru runs and where its directories are, and every release with its state, interface, Python version and workers' states |
+| `events.jsonl` | Every event of the window, in full, a JSON object a line |
+| `config/releases/APP@RELEASE.json` | For every release, serving or not: what it is, its effective settings with where each came from, as `muructl config show --effective` lists them, and its whole specification |
+| `config/effective.toml` | The configuration in force as `muructl config show --effective` writes it: applications, releases, virtual hosts and routes as the active overlays leave them |
+| `config/in-force.json` | What is in force outside the configuration: each rollout and where it stands, the sizes releases are pinned at, the applications and virtual hosts in maintenance mode, and each overlay's state |
+| `config/daemon.toml` | The daemon's own configuration file |
+| `config/access-log-overrides.json` | The changes `muructl logging access` has in force |
+| `config/routing-snapshot.json` | The version of the routing snapshot in force, which an access log record's `snapshot` names |
+| `config/changes.jsonl` | The events of the window that changed the configuration: an apply or a reload, traffic moved, a deploy, a rollout's step, an overlay starting or ending |
+
+| `logs/` | The logs of the window, by their names in the log directory: `access.log`, `edge.log`, `daemon.log`, a file virtual hosts name for their records, and each release's output as `apps/APP/RELEASE.log` |
+| `live/APP@RELEASE/status.json` | Each worker's state, requests and memory, as [`muructl debug status --json`](#status) gives them |
+| `live/APP@RELEASE/stacks-1.json`, `stacks-2.json`, `stacks-3.json` | The workers' [stacks](#stacks), taken three times two seconds apart |
+| `live/APP@RELEASE/tasks.json` | The asyncio [tasks](#tasks) of the workers' event loops |
+| `live/requests.json` | The [requests in flight](#requests-in-flight), up to a thousand, as `muructl requests --list --json` gives them |
+| `live/websockets.json` | The open WebSockets, up to a thousand, as `muructl websockets --list --json` gives them |
+| `figures/metrics.txt` | The [metrics](metrics.md) as a scrape reads them, the garbage collection figures among them |
+| `figures/scaling/APP@RELEASE.json` | Each worker group's scaling, as [`muructl scale status --json`](scaling.md) gives it |
+| `host/host.json` | The machine: the kernel, the CPUs, the load averages, the memory and how much is available, the limit on open files, the room on the file system of each of Muru's directories, and on Linux the limits of the daemon's and the edge's processes and of the container's cgroup |
+| `host/APP@RELEASE/packages.txt` | The distributions installed in the release's environment, each with its version |
+| `host/APP@RELEASE/uv.lock` and the like | The lock files of the release's source that are there: `uv.lock`, `pylock.toml`, `requirements.txt`, `poetry.lock`, `pdm.lock` and `Pipfile.lock` |
+| `host/APP@RELEASE/inspect.json` | What the release's workers have loaded: the interpreter and its build, `sys.path`, the modules with their versions, the threads and descriptors, and the environment as [`muructl debug inspect --json`](#inspect) gives it |
+| `failures/events.jsonl` | Every event Muru still keeps that records something going wrong, from before the window too: a request past its soft timeout or its deadline, a worker killed for a timeout or for memory, recycled, stalled or gone, a release that failed |
+
+With a target, the releases, events and output of other applications
+are left out, the access log's records are those of the target alone,
+and the events and logs of the node stay.
+
+The `live/` parts are of each release that has workers. One sample of
+the stacks cannot tell a thread that is stuck from one that is busy, so
+they are taken three times: a thread at the same place in all three is
+waiting there. The history the dashboard's charts draw is not in a
+bundle, and the manifest lists it as not collected.
+
+An event in `failures/events.jsonl` carries in its sentence what was
+[captured](#automatic-captures) when it happened: where a request was
+at its soft timeout, where a worker's oldest request was when it was
+killed, the object types a worker held most of when it was recycled for
+memory. The stacks a worker dumped before it was killed are in its
+release's log, under `logs/`.
+
+The packages are read from the names of the directories in the
+environment's `site-packages`, so nothing is run to list them. A
+password in a URL in a lock file is masked.
+
+### What is collected only when asked for
+
+Two parts cost the workers something, and are collected only with their
+flag:
+
+| Flag | Adds | Costs |
+| --- | --- | --- |
+| `--memory` | `live/APP@RELEASE/memory.json`: each worker's memory, gc state and most common object types, as [`muructl debug memory --json`](#memory) gives them | Each worker's interpreter is held while its objects are counted |
+| `--profile DURATION` | `live/APP@RELEASE/profile.collapsed`: a [profile](#profile) of every worker of the release over the period, as collapsed stacks merged across the workers, the heaviest first | The bundle takes that much longer; the releases are profiled at once, over the same period |
+
+Each is the event the debug command raises, `debug.memory` or
+`debug.profile`, as well as the bundle's own.
+
+### The logs of the window
+
+A log is taken from where the window starts in it. The place is found
+from the times the lines carry, by halving the file, so a log of
+several gigabytes is not read to find its last hour, and only the
+window is read and compressed. A line without a time, as the second
+line of a traceback, comes with the line before it.
+
+An archive the rotation left is included when it was last written in
+the window. A plain one gives its lines of the window. A compressed one
+is included whole, as the `.gz` or `.zst` file it is, since the window
+cannot be found in it without decompressing all of it; the manifest's
+note on each part says which it is.
+
+A development run and `muructl serve` write no log files, so the bundle
+holds the lines of the window among those they keep in memory: the last
+2000 lines of output, and the access records the run keeps.
+
+### Scrubbing
+
+A bundle keeps client addresses and query strings. `--scrub` takes them
+out, for a bundle that has to go to someone with a narrower need:
+
+- A client address reads as `<address1>`, `<address2>` and so on, the
+  same placeholder for the same address throughout the bundle, so a
+  client can still be followed. Loopback addresses stay.
+
+- A request target or a URL loses its query string, which reads as
+  `?...`.
+
+Every string of an access log record, of an event and of a `live/` part
+is scrubbed this way. A line of an application's own output is free text, in which only
+what has the shape of an address, or of a target with a query, is
+found. A compressed archive is decompressed to be scrubbed, and is in
+the bundle under its name without the `.gz` or `.zst`. The manifest's
+`left_out` says the bundle was scrubbed.
+
+`config/` holds the configuration as it was when the bundle was made.
+The manifest's `configuration_changed` says whether it changed during
+the window, and `config/changes.jsonl` what changed and when. Muru keeps
+only the routing snapshot in force, and no record of the levels
+`muructl logging level` changed, so the manifest lists the earlier
+snapshots and the logger levels as not collected.
+
+A development run and `muructl serve` have no state store, so their
+`config/` holds `effective.toml`, with the settings in force and where
+each came from, and no release files.
+
+A bundle never holds secret values, the value of an environment
+variable beyond those [`muructl debug inspect`](#inspect) shows, or a
+request's or a response's body. A variable a release declares is given
+with its value, masked as `***` when its name looks like a secret's
+(`SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `KEY`, `CREDENTIAL` or `AUTH`
+in it, or `_DSN` at its end), and a password in a URL is masked alone.
+A secret from a store is named by its store and key. In the daemon's
+file, a setting whose key says it is a secret (`secret`, `token`,
+`password`, or a key such as `signing_key`) is masked the same way.
+
+### The manifest
+
+`manifest.json` is the last member of the archive:
+
+| Field | Meaning |
+| --- | --- |
+| `format` | The version of the layout, `1` |
+| `kind` | `bundle` |
+| `created`, `muru`, `node` | When the bundle was made, Muru's version and the machine's name |
+| `target` | What it was limited to, as `app` or `app@release`; empty for the whole node |
+| `window` | `since_unix_ms` and `until_unix_ms`, the period it covers |
+| `runs`, `running` | How Muru runs, and whether it was running |
+| `configuration_changed` | Whether the configuration changed during the window; `null` when the events could not be read to tell |
+| `options` | What was asked for: `scrub`, `memory`, and `profile_s`, the period profiled, `null` without |
+| `recorded` | How the making of the bundle was recorded, or why it was not |
+| `left_out` | What a bundle never holds, and what `--scrub` took out of this one |
+| `parts` | Every part, each with its `path` and `collected`; `bytes` for one in the archive, `why` for one that is not, and a `note` where there is something to know about it |
+
+### On a system in trouble
+
+The command reads the daemon's files where they hold what it needs (the
+state store, which it opens read-only and never changes), and asks the
+daemon only for what the daemon alone knows. It runs at a lower
+priority than what serves, compresses at the fastest setting, and
+writes the archive as a stream, so nothing is held in memory or written
+beside it.
+
+Each question it asks has a time limit of its own. A part that cannot
+be collected, because a worker hangs or the daemon does not answer, is
+listed in the manifest with the reason, and the rest is collected: a
+bundle with parts missing is a normal result, and the command succeeds.
+
+With no daemon running the bundle is made from the daemon's files, and
+the command takes the daemon's location options for that (`--state-dir`,
+`--log-dir`, `--config`, `--run-dir` and `--system`). A running daemon
+says where its files are, so no option is needed then. It works against
+a development run and `muructl serve` as well, which keep no files, so
+everything is asked of them.
+
+Each bundle made of a running daemon is the event `debug.bundle`, which
+says what the bundle was of, how far back it reached, and which of
+`--scrub`, `--memory` and `--profile` it was made with. A development
+run and `muructl serve` print the same as a line of their output. A dry
+run records nothing.

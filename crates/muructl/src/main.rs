@@ -10,6 +10,7 @@
 mod admin;
 mod dashboard;
 mod devcert;
+mod diagnostics;
 mod edge;
 mod init;
 mod log_format;
@@ -221,7 +222,9 @@ enum Command {
         command: admin::SecretCommand,
     },
 
-    /// Look into a release's workers: status, stacks, tasks, inspect.
+    /// Look into a release's workers (status, stacks, tasks, inspect),
+    /// and collect diagnostics: a report for a bug report, a bundle of
+    /// the system for triage.
     Debug {
         #[command(subcommand)]
         command: admin::DebugCommand,
@@ -2746,13 +2749,19 @@ fn interface_label(interface: &str) -> &str {
 /// Development mode: one host with forked workers behind an embedded edge,
 /// replaced by a new one when --reload sees a source change.
 async fn run(args: RunArgs) -> anyhow::Result<()> {
-    run_with(args, None).await
+    run_with(args, None, None).await
 }
 
 /// Serve as `muructl run` does, or as `muructl serve` with `serve`
 /// (section 13.9): production behaviours, one run directory, no
 /// installs, the admin port, and every line on standard output.
-async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<()> {
+/// `serve_settings` is what serve's own layers set, for the settings the
+/// admin socket answers with.
+async fn run_with(
+    args: RunArgs,
+    serve: Option<serve::Mode>,
+    serve_settings: Option<print_config::Serve>,
+) -> anyhow::Result<()> {
     let mut resolved = resolve_for(&args, serve.as_ref())?;
     muru_common::log::show_timestamps(resolved.serving.timestamps);
 
@@ -2796,6 +2805,14 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         resolved.processes = 1;
         resolved.threads = 1;
     }
+
+    // The settings in force with where each came from, which the admin
+    // socket gives a command that asks for the effective configuration.
+
+    let settings = Arc::new(match serve_settings {
+        Some(serve) => print_config::serve_settings(&resolved, serve),
+        None => print_config::run_settings(&args, &resolved),
+    });
 
     // The interpreter is found as the run would find it, so that one the
     // run could not use is refused here with the same words.
@@ -3399,6 +3416,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
             served: Arc::clone(&served),
             commands: commands.clone(),
             events: Arc::clone(&run_events),
+            settings: Arc::clone(&settings),
         });
 
         match run_admin::serve(state, admin_stop_rx).await {

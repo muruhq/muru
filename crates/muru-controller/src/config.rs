@@ -4663,7 +4663,7 @@ pub fn release_layers(store: &Store, document: &Document) -> Result<Vec<String>,
 
 /// A level's own limits on a request by the key a table gives each, with
 /// its value as the table writes it, those set alone.
-fn served_settings(limits: &crate::model::ServedLimits) -> Vec<(String, String)> {
+pub(crate) fn served_settings(limits: &crate::model::ServedLimits) -> Vec<(String, String)> {
     limits
         .max_body_size_text()
         .map(|size| ("max_body_size".to_owned(), size))
