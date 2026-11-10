@@ -233,6 +233,10 @@ is when Muru received it, so the access line of a slow request can carry
 an earlier time than lines written before it. An application that puts
 `%(asctime)s` in its own logging format gets two times in a file.
 
+The lines of a [managed HTTP server](managed-servers.md) get no time from
+Muru, in a file or anywhere else: they are written as the server writes
+them.
+
 ## Under the daemon
 
 The daemon writes everything to its log directory (`~/.local/state/muru/logs`
@@ -241,12 +245,17 @@ or `--log-dir`):
 
 | File | Holds |
 | --- | --- |
-| `apps/APP/RELEASE.log` | the release's host output and its workers' lines, tagged as above |
+| `apps/APP/RELEASE.log` | the release's host output and its workers' lines, tagged as above, or the output of the instances of a [managed HTTP server](managed-servers.md) |
 | `access.log` | the access log as JSON lines |
 | `edge.log` | the edge process's own output |
 | `daemon.log` | the daemon's output when started with `muructl daemon start` |
 
-Every line in these files starts with the full UTC time.
+Every line in these files starts with the full UTC time, except the
+lines of a managed HTTP server. Its instances write to the release's file
+themselves, so each line is in the file as the server wrote it: with no
+time in front, unless the server writes one of its own, and no tag naming
+the instance. The lines of a release's instances are interleaved in the
+one file, with nothing to tell which instance wrote a line.
 
 `muructl logs APP` shows the last hundred lines of the application's
 current release, `muructl logs APP@RELEASE` a particular release's, and
@@ -262,7 +271,8 @@ $ muructl logs --access --lines 1
 2026-11-02T05:42:23.101Z 200 GET /catalogue 118B 1.2ms release=shop@r1 host=127.0.0.1 queue=0.1ms app=0.9ms worker=1 id=01M5P6WZBK740HFT2N80MAV4YV
 ```
 
-`--no-timestamps` leaves the times off. The same command against a
+`--no-timestamps` leaves the times off; a managed HTTP server's lines
+have none to leave off and are shown as they are. The same command against a
 development run shows the run's lines with their times as well, and
 there the application can be left out, as `muructl logs` alone, since a
 run serves one; the daemon needs it named unless `--access` is given.

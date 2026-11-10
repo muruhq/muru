@@ -971,8 +971,10 @@ impl Backend {
         }
     }
 
-    /// Send the host a signal; a managed server's instances take none,
-    /// since the daemon writes their log lines itself.
+    /// Send the host a signal, which is how it is told to reopen its log
+    /// file. A managed server's instances take none: each writes to the
+    /// release's log file itself, on a descriptor it was started with,
+    /// and cannot be told to reopen it, so that file is rotated in place.
     fn signal(&self, signal: i32) -> bool {
         match self {
             Self::Host(host) => host.signal(signal),
@@ -2431,6 +2433,48 @@ fn write_record<T: serde::Serialize>(path: &Path, record: &T) {
 
     if let Err(error) = written {
         tracing::error!(%error, path = %path.display(), "writing a record failed");
+    }
+}
+
+/// What the event says when a managed server's instances are taken
+/// over: the pids of those that were still there, and which were gone
+/// and are started again by the next check. In the record of the
+/// instances as adopted, one that is to be started has pid 0.
+fn adoption_message(adopted: &ServersRecord) -> String {
+    let list = |words: Vec<String>| match words.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [most @ .., last] => format!("{} and {last}", most.join(", ")),
+    };
+    let (gone, there): (Vec<_>, Vec<_>) = adopted
+        .instances
+        .iter()
+        .partition(|instance| instance.pid == 0);
+    let pids: Vec<String> = there
+        .iter()
+        .map(|instance| instance.pid.to_string())
+        .collect();
+    let indexes: Vec<String> = gone
+        .iter()
+        .map(|instance| instance.index.to_string())
+        .collect();
+
+    let taken_over = if pids.is_empty() {
+        "none of the server instances was still there".to_owned()
+    } else {
+        format!("re-adopted the server instances (pid {})", pids.join(", "))
+    };
+
+    match indexes.len() {
+        0 => taken_over,
+        1 => format!(
+            "{taken_over}; instance {} was gone and is started again",
+            list(indexes)
+        ),
+        _ => format!(
+            "{taken_over}; instances {} were gone and are started again",
+            list(indexes)
+        ),
     }
 }
 
@@ -4130,17 +4174,14 @@ impl Daemon {
             identity,
             &self.host_log(app, id),
             record,
-        );
+        )
+        .await;
 
         match adopted {
             Ok(servers) => {
                 let retained_until = matches!(release.state, ReleaseState::Retained)
                     .then(|| Instant::now() + RETENTION);
-                let pids: Vec<String> = record
-                    .instances
-                    .iter()
-                    .map(|instance| instance.pid.to_string())
-                    .collect();
+                let message = adoption_message(&servers.record());
                 self.running.insert(
                     (app.to_owned(), id.to_owned()),
                     Running {
@@ -4166,12 +4207,8 @@ impl Daemon {
                     },
                 );
                 self.publish_servers();
-                self.events.emit(
-                    "release.adopted",
-                    &subject,
-                    "info",
-                    &format!("re-adopted the server instances (pid {})", pids.join(", ")),
-                );
+                self.events
+                    .emit("release.adopted", &subject, "info", &message);
                 true
             }
             Err(error) => {
@@ -5423,14 +5460,19 @@ impl Daemon {
     ) -> Result<(), String> {
         let subject = format!("{app}@{id}");
         let log = self.host_log(app, id);
-        let mut servers = match Servers::start(
+        let grace = Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms);
+        let spawned = Servers::start(
             http,
             &run_dir.join("r1"),
             &release.spec.source,
             env,
             identity,
             &log,
-        ) {
+            grace,
+        )
+        .await;
+
+        let mut servers = match spawned {
             Ok(servers) => servers,
             Err(error) => {
                 let message = format!("the server could not be started: {error:#}");
@@ -5446,11 +5488,7 @@ impl Daemon {
 
         if let Err(error) = servers.wait_ready(timeout).await {
             let message = format!("{error:#}");
-            servers
-                .stop(Duration::from_millis(
-                    release.spec.timeouts.shutdown_timeout_ms,
-                ))
-                .await;
+            servers.stop(grace).await;
             self.set_state(release, ReleaseState::Failed, &message);
             self.events
                 .emit("release.failed", &subject, "error", &message);
@@ -9932,6 +9970,37 @@ fn step_message(steps: &[RolloutStep], step: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_adoption_event_names_the_instances_kept_and_those_started_again() {
+        let adopted = |pids: &[u32]| ServersRecord {
+            instances: (0..)
+                .zip(pids)
+                .map(|(index, pid)| crate::servers::InstanceRecord {
+                    index,
+                    pid: *pid,
+                    address: String::new(),
+                    started_unix_ms: 0,
+                    quick_exits: 0,
+                    start_time: 0,
+                })
+                .collect(),
+        };
+
+        assert_eq!(
+            adoption_message(&adopted(&[41, 42])),
+            "re-adopted the server instances (pid 41, 42)"
+        );
+        assert_eq!(
+            adoption_message(&adopted(&[41, 0])),
+            "re-adopted the server instances (pid 41); instance 1 was gone and is started again"
+        );
+        assert_eq!(
+            adoption_message(&adopted(&[0, 0, 0])),
+            "none of the server instances was still there; \
+             instances 0, 1 and 2 were gone and are started again"
+        );
+    }
 
     #[test]
     fn a_group_that_may_scale_to_zero_retains_no_worker_by_default() {
