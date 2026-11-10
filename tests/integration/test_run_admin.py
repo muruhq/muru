@@ -10,7 +10,9 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import threading
+import time
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
@@ -435,3 +437,72 @@ def in_background(
     thread = threading.Thread(target=lambda: answers.append(call()))
     thread.start()
     return thread, answers
+
+
+SPEWING_APP = """
+import sys
+import threading
+import time
+
+
+def spew():
+    for _ in range(20000):
+        sys.stderr.write("x" * 99 + "\\n")
+
+
+def application(environ, start_response):
+    if environ["PATH_INFO"] == "/spew":
+        threading.Thread(target=spew, daemon=True).start()
+
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    return [b"ok"]
+"""
+
+
+def test_a_stalled_terminal_leaves_the_run_answering(runtime: Path, tmp_path: Path) -> None:
+    """Output the terminal does not read holds up the thread that writes
+    it, not muructl's runtime: with one runtime thread, the run still
+    answers its admin socket while its standard error is full."""
+
+    muructl_path = support.muructl_path()
+    if muructl_path is None or not support.extension_available():
+        support.unavailable("muructl or the extension is not built")
+    (tmp_path / "spewing.py").write_text(SPEWING_APP)
+    port = support.free_port()
+
+    # Its output goes to a pipe nothing reads, as a terminal paused with
+    # Ctrl-S or a pager that is not paged.
+
+    process = subprocess.Popen(
+        [
+            str(muructl_path),
+            "run",
+            "spewing:application",
+            "--chdir",
+            str(tmp_path),
+            "--bind",
+            f"127.0.0.1:{port}",
+            "--python",
+            sys.executable,
+            "--processes",
+            "1",
+            "--no-reload",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "MURU_RUN_DIR": str(runtime), "TOKIO_WORKER_THREADS": "1"},
+    )
+
+    try:
+        support.wait_for_port(port, process)
+        assert urllib.request.urlopen(f"http://127.0.0.1:{port}/spew", timeout=30).read() == b"ok"
+
+        # About 2 MB of output fills every pipe on the way; the admin
+        # socket still answers.
+
+        time.sleep(2)
+        status = muructl(runtime, "status", cwd=tmp_path)
+        assert "spewing" in status.stdout, status.stdout + status.stderr
+    finally:
+        process.kill()
+        process.communicate(timeout=30)

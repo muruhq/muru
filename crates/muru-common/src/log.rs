@@ -340,6 +340,12 @@ pub fn line_of_kind(stream: Stream, kind: &str, tag: &str, message: fmt::Argumen
 /// worker's relayed output, with the time in front when the stream is
 /// stamped. `time` is when the line arrived.
 pub fn relayed(stream: Stream, time: SystemTime, text: &str) {
+    write(stream, relayed_line(stream, time, text).as_bytes());
+}
+
+/// A relayed line as `relayed` writes it, newline included, for a caller
+/// that writes it itself.
+pub fn relayed_line(stream: Stream, time: SystemTime, text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 32);
 
     if json() {
@@ -353,8 +359,7 @@ pub fn relayed(stream: Stream, time: SystemTime, text: &str) {
 
         out.push_str(&app_record(time, source, message));
         out.push('\n');
-        write(stream, out.as_bytes());
-        return;
+        return out;
     }
 
     if stamped(stream) {
@@ -364,7 +369,7 @@ pub fn relayed(stream: Stream, time: SystemTime, text: &str) {
 
     out.push_str(text);
     out.push('\n');
-    write(stream, out.as_bytes());
+    out
 }
 
 /// The JSON record of a line of the application's output. A line that

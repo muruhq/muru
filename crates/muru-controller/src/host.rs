@@ -743,6 +743,9 @@ pub struct HostProcess {
     run_dir: PathBuf,
     /// The release number within this run, from 1.
     pub release: u32,
+    /// The tasks relaying its standard output and error, which end when
+    /// it closes them.
+    relays: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// A host this process spawned, or one it adopted from a previous daemon.
@@ -1119,12 +1122,14 @@ impl HostProcess {
 
         let stdin = child.stdin.take();
 
+        let mut relays = Vec::new();
+
         if let Some(stdout) = child.stdout.take() {
-            tokio::spawn(relay(stdout, logs.clone(), false));
+            relays.push(tokio::spawn(relay(stdout, logs.clone(), false)));
         }
 
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(relay(stderr, logs.clone(), true));
+            relays.push(tokio::spawn(relay(stderr, logs.clone(), true)));
         }
 
         // Sockets are numbered across every group in the order the host
@@ -1170,6 +1175,7 @@ impl HostProcess {
                 .collect(),
             run_dir,
             release,
+            relays,
         })
     }
 
@@ -1193,6 +1199,7 @@ impl HostProcess {
             optional,
             run_dir,
             release,
+            relays: Vec::new(),
         };
         anyhow::ensure!(
             host.required_sockets()
@@ -1310,10 +1317,14 @@ impl HostProcess {
         }
     }
 
-    /// Resolve when the host exits.
+    /// Resolve when the host exits, once what it wrote last is written.
     pub async fn exited(&mut self) -> std::io::Result<ExitStatus> {
         match &mut self.process {
-            Process::Child(child) => child.wait().await,
+            Process::Child(child) => {
+                let status = child.wait().await;
+                relayed_to_the_end(&mut self.relays).await;
+                status
+            }
             Process::Adopted(pid) => {
                 let pid = *pid;
 
@@ -1381,6 +1392,8 @@ impl HostProcess {
 
                     let _ = child.wait().await;
                 }
+
+                relayed_to_the_end(&mut self.relays).await;
             }
             Process::Adopted(pid) => {
                 let pid = *pid;
@@ -1673,18 +1686,22 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
             Some(_) => break,
         };
 
-        gathering.retain(|source, gathered| {
-            let stale = gathered
-                .updated
-                .elapsed()
-                .is_ok_and(|age| age >= TRACEBACK_WAIT);
+        let stale: Vec<String> = gathering
+            .iter()
+            .filter(|(_, gathered)| {
+                gathered
+                    .updated
+                    .elapsed()
+                    .is_ok_and(|age| age >= TRACEBACK_WAIT)
+            })
+            .map(|(source, _)| source.clone())
+            .collect();
 
-            if stale {
-                write_traceback(out, source, gathered);
+        for source in stale {
+            if let Some(mut gathered) = gathering.remove(&source) {
+                write_traceback(out, &source, &mut gathered).await;
             }
-
-            !stale
-        });
+        }
 
         let Some(line) = line else {
             continue;
@@ -1694,7 +1711,7 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
         logs.push(time, &line);
 
         if !muru_common::log::json() {
-            muru_common::log::relayed(out, time, &line);
+            write_relayed(out, time, &line).await;
             continue;
         }
 
@@ -1710,7 +1727,7 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
                     continue;
                 }
                 Gathered::Finished(text) => {
-                    muru_common::log::relayed(out, gathered.started, &tagged(source, &text));
+                    write_relayed(out, gathered.started, &tagged(source, &text)).await;
                     gathering.remove(source);
                 }
             }
@@ -1728,11 +1745,11 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
             continue;
         }
 
-        muru_common::log::relayed(out, time, &line);
+        write_relayed(out, time, &line).await;
     }
 
     for (source, gathered) in &mut gathering {
-        write_traceback(out, source, gathered);
+        write_traceback(out, source, gathered).await;
     }
 }
 
@@ -1749,9 +1766,120 @@ struct Gathering {
     traceback: Traceback,
 }
 
-fn write_traceback(out: Stream, source: &str, gathered: &mut Gathering) {
+async fn write_traceback(out: Stream, source: &str, gathered: &mut Gathering) {
     let text = gathered.traceback.take();
-    muru_common::log::relayed(out, gathered.started, &tagged(source, &text));
+    write_relayed(out, gathered.started, &tagged(source, &text)).await;
+}
+
+/// What the relays hand the thread that writes their lines.
+enum Relayed {
+    /// A line, newline included, for one of this process's streams.
+    Line(Stream, String),
+    /// Answered once every line handed over before it is written.
+    Flushed(tokio::sync::oneshot::Sender<()>),
+}
+
+/// How many lines may wait for the writer before a relay waits for room.
+const RELAY_QUEUE: usize = 1024;
+
+/// The most a batch of one stream's lines holds in one write.
+const RELAY_BATCH: usize = 64 * 1024;
+
+/// The thread that writes what the relays read, so that a terminal or a
+/// container runtime that stops reading holds up that thread alone,
+/// never one of the runtime's: a relay awaits room in the channel, and
+/// its host's pipe fills behind it. None when the thread could not be
+/// started, and the relays write themselves.
+fn relay_writer() -> Option<&'static mpsc::Sender<Relayed>> {
+    static WRITER: std::sync::OnceLock<Option<mpsc::Sender<Relayed>>> = std::sync::OnceLock::new();
+
+    WRITER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::channel(RELAY_QUEUE);
+
+            std::thread::Builder::new()
+                .name("muru-relay-writer".to_owned())
+                .spawn(move || write_relays(receiver))
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
+
+/// Write what the relays hand over, gathering a stream's lines that are
+/// already waiting into one write of up to `RELAY_BATCH` bytes.
+fn write_relays(mut receiver: mpsc::Receiver<Relayed>) {
+    let mut next = receiver.blocking_recv();
+
+    while let Some(relayed) = next.take() {
+        let (stream, mut batch) = match relayed {
+            Relayed::Line(stream, line) => (stream, line),
+            Relayed::Flushed(answer) => {
+                let _ = answer.send(());
+                next = receiver.blocking_recv();
+                continue;
+            }
+        };
+
+        // Gather what is already waiting for the same stream; anything
+        // else waits its turn, so the order is kept.
+
+        while batch.len() < RELAY_BATCH {
+            match receiver.try_recv() {
+                Ok(Relayed::Line(same, line)) if same == stream => batch.push_str(&line),
+                Ok(other) => {
+                    next = Some(other);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+
+        muru_common::log::write(stream, batch.as_bytes());
+
+        if next.is_none() {
+            next = receiver.blocking_recv();
+        }
+    }
+}
+
+/// Hand a relayed line to the writer, waiting while its channel is full.
+async fn write_relayed(out: Stream, time: SystemTime, text: &str) {
+    let line = muru_common::log::relayed_line(out, time, text);
+
+    match relay_writer() {
+        Some(writer) => {
+            if let Err(mpsc::error::SendError(Relayed::Line(stream, line))) =
+                writer.send(Relayed::Line(out, line)).await
+            {
+                muru_common::log::write(stream, line.as_bytes());
+            }
+        }
+        None => muru_common::log::write(out, line.as_bytes()),
+    }
+}
+
+/// How long a host's relays may take to reach the end of its output once
+/// it has exited: a process it left behind may hold its streams open.
+const RELAY_END: Duration = Duration::from_secs(2);
+
+/// Wait for a host's relays to read the last of its output, and for the
+/// writer to write it, so that a host's last lines come before whatever
+/// this process writes next.
+async fn relayed_to_the_end(relays: &mut Vec<tokio::task::JoinHandle<()>>) {
+    for relay in relays.drain(..) {
+        let _ = tokio::time::timeout(RELAY_END, relay).await;
+    }
+
+    let Some(writer) = relay_writer() else {
+        return;
+    };
+
+    let (answer, written) = tokio::sync::oneshot::channel();
+
+    if writer.send(Relayed::Flushed(answer)).await.is_ok() {
+        let _ = tokio::time::timeout(RELAY_END, written).await;
+    }
 }
 
 /// A message with its source in front, as the host writes it.
