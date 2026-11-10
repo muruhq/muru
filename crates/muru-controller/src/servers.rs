@@ -334,6 +334,7 @@ fn process_spec(
         identity,
         log: log.to_path_buf(),
         stop_signal: stop_signal(spec),
+        stop_group: false,
         events: EVENTS,
     }
 }

@@ -36,7 +36,7 @@ readiness = { path = '/healthz', timeout = '60s' }
 | `readiness` | none | `path` is probed with a GET every 100 ms until it answers 2xx or 3xx; without it any HTTP response makes the instance ready. `timeout` (default `60s`) is how long the instances get |
 | `stop_signal` | the profile's | the signal that stops an instance gracefully: `TERM`, `INT`, `QUIT`, `HUP`, `USR1`, `USR2` or `WINCH`; required by `generic` |
 | `env` | none | environment variables and secret references, as for a workers release |
-| `timeouts.shutdown_timeout` | `5s` | how long an instance told to stop gets before it is killed |
+| `timeouts.shutdown_timeout` | `5s` | how long an instance told to stop gets before it, and every process it started, is killed |
 
 The same release is deployed from the command line with `--server` and
 the command after `--`:
@@ -100,10 +100,29 @@ each instance by address under the release's name. The instance count is
 fixed: `muructl scale` refuses a managed server.
 
 Draining stops new requests at the edge, waits for those in flight, then
-sends each instance the profile's stop signal (`TERM` for every profile
-unless `stop_signal` says otherwise) and kills one still there after
-`shutdown_timeout`. A superseded release is kept warm as a workers release
-is, with its instances running, so a rollback to it is instant.
+sends the process of each instance the profile's stop signal (`TERM` for
+every profile unless `stop_signal` says otherwise). The signal goes to
+that process alone, the one the command started, such as a gunicorn
+master, and not to the processes it started in turn.
+
+Each instance runs in a process group of its own, which holds every
+process it started, such as a master's workers. What is left of an
+instance when `shutdown_timeout` ends is killed as a group:
+
+- An instance whose process is still there is killed, and every process
+  in its group with it.
+
+- An instance whose process exited in time but left processes of its
+  group running has those sent the stop signal as well, as soon as it
+  has exited, and they are killed when `shutdown_timeout` ends, or half
+  a second after the signal if less than that was left.
+
+A process that has moved itself out of the instance's process group, by
+starting a session of its own as a daemonising server does, is not found
+and is left running.
+
+A superseded release is kept warm as a workers release is, with its
+instances running, so a rollback to it is instant.
 
 ## uWSGI
 

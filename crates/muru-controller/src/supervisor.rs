@@ -17,11 +17,20 @@ use anyhow::Context as _;
 use tokio::process::{Child, Command};
 use tokio::time::Instant;
 
-use crate::host::{Identity, alive};
+use crate::host::{Identity, alive, leads_group, signal_group, signal_process};
 
 /// How often a process that is not a child of this daemon is looked at
 /// while it is waited for.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often a process group is looked at while it empties.
+const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The least that processes an instance left behind in its group get
+/// between the stop signal and SIGKILL, when the time allowed for the
+/// stop has less than this left; also how long a process that was
+/// killed is given to go.
+const LEFTOVER_GRACE: Duration = Duration::from_millis(500);
 
 /// The event types a supervisor reports under. Its user names them, so
 /// that an event says what kind of thing the instances are.
@@ -50,6 +59,10 @@ pub struct Spec {
     pub log: PathBuf,
     /// The signal that asks an instance to stop.
     pub stop_signal: i32,
+    /// Whether the stop signal goes to the instance's whole process
+    /// group. It goes to the instance's own process alone otherwise,
+    /// which is whom a server's stop signal is meant for.
+    pub stop_group: bool,
     /// The event types to report under.
     pub events: EventNames,
 }
@@ -132,61 +145,127 @@ impl fmt::Display for Exit {
 }
 
 /// A process this daemon started, or one it adopted from a previous
-/// daemon.
+/// daemon. Either way it was started in a session of its own, so its
+/// pid is also the id of its process group, which holds whatever it
+/// started that did not leave.
 enum Process {
-    Child(Child),
-    Adopted(u32),
+    /// A child, with the pid it was started with: its handle forgets the
+    /// pid once the child has been reaped, and the group is still looked
+    /// for under it then.
+    Child { child: Child, pid: u32 },
+    /// A process a previous daemon started.
+    Adopted { pid: u32 },
 }
 
 impl Process {
-    fn pid(&self) -> Option<u32> {
+    /// The pid the process was started with, and so its group's id.
+    fn pid(&self) -> u32 {
         match self {
-            Self::Child(child) => child.id(),
-            Self::Adopted(pid) => Some(*pid),
+            Self::Child { pid, .. } | Self::Adopted { pid } => *pid,
+        }
+    }
+
+    /// The pid to signal the process itself by: none for a child that
+    /// has been reaped, whose pid may be another process's by now.
+    fn own_pid(&self) -> Option<u32> {
+        match self {
+            Self::Child { child, .. } => child.id(),
+            Self::Adopted { pid } => Some(*pid),
         }
     }
 
     /// Whether the process has exited, without waiting.
     fn try_exited(&mut self) -> std::io::Result<Option<Exit>> {
         match self {
-            Self::Child(child) => Ok(child.try_wait()?.map(Exit::Status)),
-            Self::Adopted(pid) => Ok((!alive(*pid)).then_some(Exit::Gone)),
+            Self::Child { child, .. } => Ok(child.try_wait()?.map(Exit::Status)),
+            Self::Adopted { pid } => Ok((!alive(*pid)).then_some(Exit::Gone)),
         }
     }
 
-    fn signal(&self, signal: i32) {
-        if let Some(pid) = self.pid() {
-            // SAFETY: kill(2) with a pid this daemon started or adopted.
-
-            unsafe {
-                libc::kill(pid as libc::pid_t, signal);
-            }
+    /// Ask the process to stop: the signal to the process alone, or to
+    /// its whole group.
+    fn stop(&self, signal: i32, group: bool) {
+        if group {
+            signal_group(self.pid(), signal);
+        } else if let Some(pid) = self.own_pid() {
+            signal_process(pid, signal);
         }
     }
 
-    /// Wait for the process to exit until the deadline, then kill it.
-    async fn finish(self, deadline: Instant) {
+    /// Whether the process exits by the deadline, waiting for it until
+    /// then.
+    async fn exits_by(&mut self, deadline: Instant) -> bool {
         match self {
-            Self::Child(mut child) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-
-                if tokio::time::timeout(remaining, child.wait()).await.is_err() {
-                    let _ = child.kill().await;
-                }
-            }
-            Self::Adopted(pid) => {
-                while alive(pid) && Instant::now() < deadline {
+            Self::Child { child, .. } => tokio::time::timeout_at(deadline, child.wait())
+                .await
+                .is_ok(),
+            Self::Adopted { pid } => {
+                while alive(*pid) && Instant::now() < deadline {
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
 
-                if alive(pid) {
-                    // SAFETY: as in signal.
+                !alive(*pid)
+            }
+        }
+    }
 
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                    }
+    /// Kill the process and everything in its group, and wait for the
+    /// process to go. It is still there, so its pid, and the group under
+    /// it, are its own.
+    async fn kill(&mut self) {
+        match self {
+            Self::Child { child, pid } => {
+                signal_group(*pid, libc::SIGKILL);
+                let _ = child.kill().await;
+            }
+            Self::Adopted { pid } => {
+                // A process this daemon did not start is checked to lead
+                // its group before the group is signalled.
+
+                if leads_group(*pid) {
+                    signal_group(*pid, libc::SIGKILL);
+                }
+
+                signal_process(*pid, libc::SIGKILL);
+                let gone_by = Instant::now() + LEFTOVER_GRACE;
+
+                while alive(*pid) && Instant::now() < gone_by {
+                    tokio::time::sleep(GROUP_POLL_INTERVAL).await;
                 }
             }
+        }
+    }
+
+    /// Finish a stop that has been asked for: wait for the process to
+    /// exit until `kill_at`, kill its whole group if it has not, and
+    /// leave nothing of the group behind either way.
+    async fn finish(mut self, kill_at: Instant, stop_signal: i32) {
+        let group = self.pid();
+
+        if !self.exits_by(kill_at).await {
+            self.kill().await;
+        }
+
+        // The process is gone. Whatever is still in its group, workers
+        // that outlive their master say, is asked to stop as well, and
+        // killed at `kill_at`, or after a short grace when that has all
+        // but passed. A group id is not given to another group while
+        // any member is left, so what answers under it is the
+        // instance's; after a kill these are processes on their way out.
+
+        if !signal_group(group, 0) {
+            return;
+        }
+
+        signal_group(group, stop_signal);
+        let grace_ends = kill_at.max(Instant::now() + LEFTOVER_GRACE);
+
+        while signal_group(group, 0) && Instant::now() < grace_ends {
+            tokio::time::sleep(GROUP_POLL_INTERVAL).await;
+        }
+
+        if signal_group(group, 0) {
+            signal_group(group, libc::SIGKILL);
         }
     }
 }
@@ -228,7 +307,7 @@ impl Instance {
 
     /// The pid of the instance's process, when it has one.
     pub fn pid(&self) -> Option<u32> {
-        self.process.as_ref().and_then(Process::pid)
+        self.process.as_ref().map(Process::pid)
     }
 
     /// Remove what the process left behind.
@@ -356,7 +435,7 @@ impl Supervisor {
 
                 if still_there(recorded) {
                     Instance {
-                        process: Some(Process::Adopted(recorded.pid)),
+                        process: Some(Process::Adopted { pid: recorded.pid }),
                         started_unix_ms: recorded.started_unix_ms,
                         ..instance
                     }
@@ -421,8 +500,11 @@ impl Supervisor {
         let child = command
             .spawn()
             .with_context(|| format!("starting {}", program.display()))?;
+        let pid = child
+            .id()
+            .with_context(|| format!("{} started with no pid", program.display()))?;
         let instance = &mut self.instances[position];
-        instance.process = Some(Process::Child(child));
+        instance.process = Some(Process::Child { child, pid });
         instance.started = Instant::now();
         instance.started_unix_ms = crate::model::now_unix_ms();
         instance.due = None;
@@ -524,29 +606,36 @@ impl Supervisor {
         }
     }
 
-    /// Stop every instance: the stop signal to each, then SIGKILL for
-    /// one still there at `kill_at`, and what they left behind removed.
+    /// Stop every instance. Each is sent the stop signal, and one still
+    /// there at `kill_at` is killed with everything in its process
+    /// group. Processes an instance left in its group when it exited are
+    /// sent the stop signal too and killed at `kill_at`, or a moment
+    /// after it when it has all but passed. What the instances left
+    /// behind in files is removed.
     pub async fn stop_until(mut self, kill_at: Instant) {
+        let stop_signal = self.spec.stop_signal;
+
         for instance in &self.instances {
             if let Some(process) = &instance.process {
-                process.signal(self.spec.stop_signal);
+                process.stop(stop_signal, self.spec.stop_group);
             }
         }
 
-        for instance in &mut self.instances {
+        let stops = self.instances.iter_mut().map(|instance| async move {
             if let Some(process) = instance.process.take() {
-                process.finish(kill_at).await;
+                process.finish(kill_at, stop_signal).await;
             }
 
             instance.clear_stale();
-        }
+        });
+        futures::future::join_all(stops).await;
     }
 
     /// Leave the instances running and forget them, for a daemon that
     /// detaches.
     pub fn release(self) {
         for instance in self.instances {
-            if let Some(Process::Child(mut child)) = instance.process {
+            if let Some(Process::Child { mut child, .. }) = instance.process {
                 // The child must not be killed when its handle drops.
 
                 let _ = child.try_wait();
@@ -582,6 +671,7 @@ mod tests {
             identity: None,
             log: dir.join("output.log"),
             stop_signal: libc::SIGTERM,
+            stop_group: false,
             events: EVENTS,
         }
     }
@@ -629,20 +719,35 @@ mod tests {
 
     /// Kill a process a test's supervisor started.
     fn kill(pid: u32) {
-        assert_ne!(pid, 0);
-
-        // SAFETY: kill(2) with the pid of a child of this test.
-
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGKILL);
-        }
+        assert!(signal_process(pid, libc::SIGKILL));
     }
 
     /// Whether a process is there, without reaping it as `alive` would.
     fn exists(pid: u32) -> bool {
-        // SAFETY: kill(2) with signal 0 sends nothing.
+        signal_process(pid, 0)
+    }
 
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    /// Whether anything is left of the process group a test's instance
+    /// led.
+    fn group_exists(pid: u32) -> bool {
+        assert_ne!(pid, 0);
+        signal_group(pid, 0)
+    }
+
+    /// Start one instance that is a shell running `script`, and wait
+    /// for the script to say it is set up by writing the file `ready`.
+    fn start_script(dir: &Path, spec: Spec, script: &str) -> (Supervisor, u32) {
+        let supervisor = Supervisor::start(
+            spec,
+            RestartPolicy::default(),
+            vec![instance(&["/bin/sh", "-c", script])],
+        )
+        .unwrap();
+        let pid = pids(&supervisor)[0];
+        wait_for("the script to be set up", || {
+            dir.join("ready").exists().then_some(())
+        });
+        (supervisor, pid)
     }
 
     #[test]
@@ -855,34 +960,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_kills_an_instance_still_there_at_the_deadline() {
-        // The shell ignores TERM and so does the sleep it becomes, and
-        // says so in a file once the signal is ignored.
+    async fn stop_kills_the_whole_group_of_an_instance_still_there_at_the_deadline() {
+        // The shell ignores TERM and so does the child it waits for, as
+        // a master and its worker might.
 
         let dir = tempfile::tempdir().unwrap();
-        let supervisor = Supervisor::start(
+        let (supervisor, pid) = start_script(
+            dir.path(),
             spec(dir.path()),
-            RestartPolicy::default(),
-            vec![instance(&[
-                "/bin/sh",
-                "-c",
-                "trap '' TERM; : > ignoring; exec /bin/sleep 600",
-            ])],
-        )
-        .unwrap();
-        let pid = pids(&supervisor)[0];
-        wait_for("the trap", || {
-            dir.path().join("ignoring").exists().then_some(())
-        });
+            "trap '' TERM; /bin/sleep 600 & : > ready; wait",
+        );
 
         // The stop takes the whole of the time allowed, since the signal
-        // does nothing, and the instance is gone after it.
+        // does nothing, and neither the shell nor its child outlives it.
 
         let grace = Duration::from_millis(300);
         let began = std::time::Instant::now();
         supervisor.stop_until(Instant::now() + grace).await;
         assert!(began.elapsed() >= grace);
         assert!(!exists(pid));
+        wait_for("the group to empty", || (!group_exists(pid)).then_some(()));
+    }
+
+    #[tokio::test]
+    async fn stop_leaves_nothing_behind_an_instance_that_exits() {
+        // The shell takes TERM and exits, and the child it started
+        // ignores it.
+
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, pid) = start_script(
+            dir.path(),
+            spec(dir.path()),
+            "(trap '' TERM; : > ready; exec /bin/sleep 600) & wait",
+        );
+
+        // The child is asked to stop once the shell has gone, and killed
+        // when the time allowed ends.
+
+        supervisor
+            .stop_until(Instant::now() + Duration::from_millis(300))
+            .await;
+        assert!(!exists(pid));
+        wait_for("the group to empty", || (!group_exists(pid)).then_some(()));
+    }
+
+    #[tokio::test]
+    async fn the_stop_signal_goes_to_the_group_when_asked() {
+        // The shell lives through TERM, which only interrupts its first
+        // wait, and then waits for its child. Only the child's exit lets
+        // it go, and the child is signalled only when the group is.
+
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, pid) = start_script(
+            dir.path(),
+            Spec {
+                stop_group: true,
+                ..spec(dir.path())
+            },
+            "trap : TERM; /bin/sleep 600 & : > ready; wait; wait",
+        );
+
+        // The deadline is far off, so the stop returning at all shows
+        // the signal reached the child.
+
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            supervisor.stop_until(Instant::now() + Duration::from_secs(3600)),
+        )
+        .await
+        .expect("the group exits on the stop signal");
+        assert!(!exists(pid));
+        wait_for("the group to empty", || (!group_exists(pid)).then_some(()));
     }
 
     /// A record of processes with these pids, each with two exits in a

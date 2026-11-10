@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import sys
 import time
@@ -224,6 +225,38 @@ def test_a_crashed_instance_is_started_again(daemon: Daemon) -> None:
     assert daemon.releases("legacy") == [
         {"release": "legacy@r1", "state": "ready", "serving": "yes"}
     ]
+
+
+def group_gone(pgid: int) -> bool:
+    """Whether nothing is left of a process group; signal 0 sends nothing."""
+
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+
+    return False
+
+
+def test_a_drain_leaves_nothing_of_an_instance_that_ignores_its_stop_signal(
+    daemon: Daemon,
+) -> None:
+    # The instance is a shell that ignores TERM and runs the server as a
+    # child, which ignores it as well, as a master with a worker would.
+
+    script = f"trap '' TERM; {shlex.quote(sys.executable)} server.py --bind {{bind}} & wait"
+    deploy_server(daemon, "legacy", "--timeout", "shutdown=1s", command=["/bin/sh", "-c", script])
+    leader = instances(daemon, "legacy@r1")[0]["pid"]
+    child = report(daemon)["pid"]
+    assert child != leader
+    assert os.getpgid(child) == leader
+
+    # The stop signal does nothing, so the drain ends with the kill, which
+    # takes the child with the shell: nothing is left of the group.
+
+    assert "is stopped" in daemon.muructl("drain", "legacy@r1").stdout
+    wait_for(lambda: not alive(leader) and not alive(child))
+    wait_for(lambda: group_gone(leader))
 
 
 def test_gunicorn_and_uvicorn_profiles_add_their_own_flags(daemon: Daemon, tmp_path: Path) -> None:

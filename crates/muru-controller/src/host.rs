@@ -1470,6 +1470,23 @@ pub(crate) fn signal_group(pid: u32, signal: i32) -> bool {
     unsafe { libc::kill(-(pid as libc::pid_t), signal) == 0 }
 }
 
+/// Send a signal to one process. Returns whether it was delivered.
+/// Signal 0 sends nothing and so asks whether the process is there.
+pub(crate) fn signal_process(pid: u32, signal: i32) -> bool {
+    // SAFETY: kill(2) has no memory-safety preconditions. Pid 0 would
+    // name this process's own group and is never sent to.
+
+    pid != 0 && unsafe { libc::kill(pid as libc::pid_t, signal) == 0 }
+}
+
+/// Whether a process leads a process group of its own, as one that
+/// `own_session` started does.
+pub(crate) fn leads_group(pid: u32) -> bool {
+    // SAFETY: getpgid(2) has no memory-safety preconditions.
+
+    pid != 0 && unsafe { libc::getpgid(pid as libc::pid_t) == pid as libc::pid_t }
+}
+
 /// `own_session` for a standard library command, as a build runs.
 pub(crate) fn own_session_std(command: &mut std::process::Command, identity: Option<Identity>) {
     use std::os::unix::process::CommandExt;
