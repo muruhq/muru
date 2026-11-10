@@ -232,9 +232,11 @@ struct Summary<'a> {
     container: bool,
     /// What answered on the admin socket said of itself.
     status: Option<&'a pb::Status>,
-    /// The daemon's locations, each with the rule that chose it.
+    /// The daemon's locations, each with the rule that chose it:
+    /// `daemon` for one the running daemon named.
     locations: Option<serde_json::Value>,
-    releases: &'a [ReleaseFacts],
+    /// The releases of the target, or none when they could not be read.
+    releases: Option<&'a [ReleaseFacts]>,
 }
 
 /// A bundle on its way into an archive, written or only planned.
@@ -298,10 +300,10 @@ impl<W: Write> Bundle<'_, W> {
         self.failures()?;
         self.asked_for().await?;
 
-        // What was noted while collecting, such as a worker that did not
-        // answer, is recorded as what it left out.
-
-        // A plan leaves them for the bundle it is the plan of.
+        // What was noted while reaching the installation and collecting
+        // from it, such as a daemon or a worker that did not answer, is
+        // recorded as what it left out. A plan leaves the notes for the
+        // bundle it is the plan of.
 
         let notes = if self.archive.is_planned() {
             self.installation.notes.clone()
@@ -580,41 +582,52 @@ impl<W: Write> Bundle<'_, W> {
             );
         }
 
-        let found = releases.map(|releases| {
-            let installation = &*self.installation;
+        // The rest of the summary is known whether or not the releases
+        // are, so it is written either way.
 
-            let locations = installation.locations().map(|locations| {
-                let place = |location: &muru_controller::locations::Location| {
-                    serde_json::json!({
-                        "path": location.path.display().to_string(),
-                        "rule": location.rule,
-                    })
-                };
+        let (releases, unknown) = match releases {
+            Ok(releases) => (Some(releases), None),
+            Err(why) => (None, Some(why)),
+        };
 
+        let installation = &*self.installation;
+
+        let locations = installation.locations().map(|locations| {
+            let place = |location: &muru_controller::locations::Location| {
                 serde_json::json!({
-                    "config": place(&locations.config),
-                    "state": place(&locations.state),
-                    "run": place(&locations.run),
-                    "logs": place(&locations.logs),
-                    "cache": place(&locations.cache),
+                    "path": location.path.display().to_string(),
+                    "rule": location.rule,
                 })
-            });
+            };
 
-            serde_json::to_value(Summary {
-                muru: env!("CARGO_PKG_VERSION"),
-                platform: Platform::read(),
-                node: muru_controller::config::hostname(),
-                runs: installation.runs().describe(),
-                running: installation.running(),
-                container: facts::in_container(),
-                status: installation.status(),
-                locations,
-                releases: &releases,
+            serde_json::json!({
+                "config": place(&locations.config),
+                "state": place(&locations.state),
+                "run": place(&locations.run),
+                "logs": place(&locations.logs),
+                "cache": place(&locations.cache),
             })
-            .unwrap_or_default()
         });
 
-        self.put(layout::INSTALLATION, found)
+        let summary = serde_json::to_value(Summary {
+            muru: env!("CARGO_PKG_VERSION"),
+            platform: Platform::read(),
+            node: muru_controller::config::hostname(),
+            runs: installation.runs().describe(),
+            running: installation.running(),
+            container: facts::in_container(),
+            status: installation.status(),
+            locations,
+            releases: releases.as_deref(),
+        })
+        .map_err(|error| error.to_string());
+        self.put(layout::INSTALLATION, summary)?;
+
+        if let Some(why) = unknown {
+            self.archive.missing("releases", why);
+        }
+
+        Ok(())
     }
 
     /// `events.jsonl`: every event of the window, in full, a JSON object

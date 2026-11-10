@@ -584,7 +584,8 @@ wherever the same value appears:
 | The home directory, and a path under it | `~`, and `~/<path1>` |
 | Any other path, except the system's own such as `/usr/bin/python3` | `<path1>`, `<path2>` |
 | A network address, except loopback and the unspecified address | `<address1>`, `<address2>` |
-| The module of an entry point or of hooks | `<module1>`, so `shop.wsgi:application` reads as `<module1>:application` |
+| The module of an entry point or of hooks, wherever it is named | `<module1>`, so `shop.wsgi:application` reads as `<module1>:application` |
+| A package such a module is in | `<package1>`, `<package2>` |
 | The value of a setting whose name marks it as a secret | `<redacted>` |
 | The value of a setting that is free text, such as a list of host names | `<set>` |
 

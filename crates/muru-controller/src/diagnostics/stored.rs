@@ -49,6 +49,7 @@ fn release_facts(release: &Release, serving: bool) -> ReleaseFacts {
         } else {
             "workers".to_owned()
         },
+        entrypoint: release.spec.entrypoint.clone(),
         interface: release.spec.interface.as_str().to_owned(),
         detected_interface: String::new(),
         frameworks: Vec::new(),

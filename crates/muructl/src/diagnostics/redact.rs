@@ -105,6 +105,7 @@ pub struct Redactor {
     paths: Numbered,
     addresses: Numbered,
     modules: Numbered,
+    packages: Numbered,
 }
 
 impl Redactor {
@@ -179,13 +180,28 @@ impl Redactor {
             users: used("user"),
             paths: self.paths.seen.len(),
             addresses: self.addresses.seen.len(),
-            modules: self.modules.seen.len(),
+            modules: used("<module") + used("<package"),
         }
     }
 
     /// An entry point or a hooks module, `module:attribute`, with the
     /// module replaced: its dotted path names the application's code.
+    /// The module is from then on replaced wherever a text names it,
+    /// and a package it is in reads as `<package1>` and so on.
     pub fn module(&mut self, entrypoint: &str) -> String {
+        let shown = self.know_module(entrypoint);
+
+        if let Some(placeholder) = shown.split(':').next().filter(|_| shown != entrypoint) {
+            self.used.insert(placeholder.to_owned());
+        }
+
+        shown
+    }
+
+    /// Learn an entry point's module, so that a text which names it or a
+    /// package it is in has them replaced, and give the entry point as
+    /// `module` would.
+    pub fn know_module(&mut self, entrypoint: &str) -> String {
         let (module, attribute) = match entrypoint.split_once(':') {
             Some((module, attribute)) => (module, Some(attribute)),
             None => (entrypoint, None),
@@ -196,6 +212,19 @@ impl Redactor {
         }
 
         let placeholder = format!("<module{}>", self.modules.number(module));
+        self.name(module, placeholder.clone());
+
+        // The packages the module is in are as much the application's:
+        // an error that names one, as a failed import does, is replaced
+        // too.
+
+        let mut package = module;
+
+        while let Some((outer, _)) = package.rsplit_once('.') {
+            let standing = format!("<package{}>", self.packages.number(outer));
+            self.name(outer, standing);
+            package = outer;
+        }
 
         match attribute {
             Some(attribute) => format!("{placeholder}:{attribute}"),
@@ -773,6 +802,18 @@ mod tests {
             redactor.module("acme.billing.wsgi:create"),
             "<module1>:create"
         );
+
+        // A module that was replaced is replaced wherever it is named,
+        // and so are the packages it is in.
+
+        assert_eq!(
+            redactor.text("cannot load acme.billing.wsgi:application: No module named 'acme'"),
+            "cannot load <module1>:application: No module named '<package2>'"
+        );
+        assert_eq!(
+            redactor.text("acme.billing and acmecorp"),
+            "<package1> and acmecorp"
+        );
         assert_eq!(redactor.value("webhook.secret", "hunter2"), "<redacted>");
         assert_eq!(redactor.value("tls_key", "/etc/ssl/k.pem"), "<redacted>");
         assert_eq!(redactor.value("database_dsn", "postgres://x"), "<redacted>");
@@ -783,7 +824,13 @@ mod tests {
 
         let replaced = redactor.replaced();
         assert_eq!(replaced.applications, 0);
-        assert_eq!(replaced.modules, 2);
+        assert_eq!(replaced.modules, 4);
+
+        // A module that is known and never met is not counted.
+
+        let mut unmet = super::tests::redactor();
+        unmet.know_module("acme.billing.wsgi:application");
+        assert_eq!(unmet.replaced().modules, 0);
 
         redactor.text("shop on grumpy and shop.example.com, by graham for shop");
         let replaced = redactor.replaced();

@@ -36,6 +36,9 @@ pub struct ReleaseFacts {
     pub serving: bool,
     /// `workers`, or `http` for a managed HTTP server.
     pub kind: String,
+    /// The application as `module:callable`; empty for a development
+    /// run, which is asked for it with its settings.
+    pub entrypoint: String,
     /// The interface as declared: auto, wsgi, asgi or grpc.
     pub interface: String,
     /// The interface its host settled on, empty until one is known.
@@ -90,6 +93,7 @@ impl ReleaseFacts {
             } else {
                 release.kind.clone()
             },
+            entrypoint: release.entrypoint.clone(),
             interface: release.interface.clone(),
             detected_interface: release.detected_interface.clone(),
             frameworks: Vec::new(),

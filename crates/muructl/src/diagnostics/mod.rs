@@ -379,6 +379,7 @@ impl Installation {
             message: String::new(),
             serving: true,
             kind: "workers".to_owned(),
+            entrypoint: String::new(),
             interface: String::new(),
             detected_interface: String::new(),
             frameworks: Vec::new(),

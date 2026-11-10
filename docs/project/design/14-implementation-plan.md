@@ -67,6 +67,7 @@ muru/
 | Containers | Docker Engine API (bollard), which Podman also serves |
 | Files | notify for watching, a SHA-256 implementation for uploads |
 | Observability | tracing, prometheus-client, opentelemetry with OTLP exporters |
+| Diagnostic archives | tar, written through flate2's gzip encoder as a stream (section 11.9) |
 | Python extension | PyO3 with free-threaded support, version-specific builds by maturin |
 | HTTP/3 (later) | quinn and h3 |
 | Dashboard | Server-rendered askama templates, htmx with its Server-Sent Events extension, and uPlot for charts, vendored and embedded with rust-embed. No Node toolchain |

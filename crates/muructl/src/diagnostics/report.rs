@@ -370,13 +370,21 @@ impl Report {
         collected.user.iter().for_each(|user| redactor.user(user));
 
         // A name the installation did not list, as a run's application,
-        // is known from the releases.
+        // is known from the releases, and so are the modules that are
+        // the applications' code: every release's entry point, and the
+        // hooks of the serving ones. They are known before any text is
+        // replaced, so that an event that names one is.
 
-        collected
-            .releases
-            .iter()
-            .flatten()
-            .for_each(|release| redactor.app(&release.app));
+        for release in collected.releases.iter().flatten() {
+            redactor.app(&release.app);
+            redactor.know_module(&release.entrypoint);
+        }
+
+        for setting in collected.settings.iter().flatten() {
+            if MODULE_SETTINGS.contains(&setting_key(setting)) {
+                redactor.know_module(&setting.value);
+            }
+        }
 
         // What was noted on the way comes first, then each part that is
         // missing whole.
@@ -819,15 +827,20 @@ fn release_row(release: &ReleaseFacts, redactor: &mut Redactor) -> ReleaseRow {
     }
 }
 
+/// A setting's key less the `run.` or `serve.` of a command's own table.
+fn setting_key(setting: &Setting) -> &str {
+    setting
+        .key
+        .strip_prefix("run.")
+        .or_else(|| setting.key.strip_prefix("serve."))
+        .unwrap_or(&setting.key)
+}
+
 /// A setting as the report shows it: its value when the key is one
 /// whose values are shown, a module replaced, and otherwise only that it
 /// is set.
 fn shown_setting(setting: &Setting, redactor: &mut Redactor) -> Setting {
-    let key = setting
-        .key
-        .strip_prefix("run.")
-        .or_else(|| setting.key.strip_prefix("serve."))
-        .unwrap_or(&setting.key);
+    let key = setting_key(setting);
 
     let shown = SHOWN_SETTINGS.iter().any(|shown| {
         if shown.ends_with('.') {
@@ -1129,6 +1142,12 @@ mod tests {
             message: String::new(),
             serving,
             kind: "workers".to_owned(),
+            entrypoint: if serving {
+                "acme.shop.wsgi:application"
+            } else {
+                "acme.old.wsgi:application"
+            }
+            .to_owned(),
             interface: "auto".to_owned(),
             detected_interface: if serving { "wsgi" } else { "" }.to_owned(),
             frameworks: if serving {
@@ -1251,8 +1270,9 @@ mod tests {
                     "release.failed",
                     "error",
                     &format!(
-                        "release acme-shop@r4 failed on web1: /srv/acme/shop/app.py from \
-                         203.0.113.9 said {HOSTILE}"
+                        "release acme-shop@r4 failed on web1: cannot load \
+                         acme.old.wsgi:application (No module named 'acme'): \
+                         /srv/acme/shop/app.py from 203.0.113.9 said {HOSTILE}"
                     ),
                 ),
                 event(
@@ -1336,11 +1356,10 @@ mod tests {
 
         let events = report.events.as_ref().unwrap();
         assert_eq!(events.recent[0].subject, "app1@r3");
-        assert!(
-            events.recent[0]
-                .message
-                .starts_with("release app1@r4 failed on node: <path3> ")
-        );
+        assert!(events.recent[0].message.starts_with(
+            "release app1@r4 failed on node: cannot load <module2>:application (No \
+                     module named '<package2>'): <path3> "
+        ));
         assert!(events.recent[0].message.contains("from <address1> said"));
 
         // The listener's address is the one the event named.
@@ -1369,7 +1388,7 @@ mod tests {
                 users: 1,
                 paths: 3,
                 addresses: 1,
-                modules: 1,
+                modules: 3,
             }
         );
     }

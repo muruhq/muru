@@ -222,7 +222,9 @@ enum Command {
         command: admin::SecretCommand,
     },
 
-    /// Look into a release's workers: status, stacks, tasks, inspect.
+    /// Look into a release's workers (status, stacks, tasks, inspect),
+    /// and collect diagnostics: a report for a bug report, a bundle of
+    /// the system for triage.
     Debug {
         #[command(subcommand)]
         command: admin::DebugCommand,
