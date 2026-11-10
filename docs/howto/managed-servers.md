@@ -97,7 +97,15 @@ An instance that exits later is
 started again after a wait that doubles with each exit in a row, from one
 second up to thirty, and starts over once an instance has run for a
 minute; the exit and the restart are `server.exited` and `server.started`
-events, and a start that fails is `server.failed`. While an instance is
+events, and a start that fails is `server.failed`. An instance is never
+started beside what the one before it left running. Processes still in
+the process group of an instance that exited, such as workers whose
+master was killed, are sent the stop signal when the exit is seen, and
+the `server.exited` event says that processes were left behind. Any
+still running when the wait ends are killed, and the instance starts on
+the daemon's next check, a second later.
+
+While an instance is
 down its requests go to the others, or are answered 502
 `upstream_failed` when there is none, and `muru_upstream_health` reports
 each instance by address under the release's name. The instance count is

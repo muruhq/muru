@@ -239,7 +239,7 @@ def group_gone(pgid: int) -> bool:
     return False
 
 
-def test_a_drain_leaves_nothing_of_an_instance_that_ignores_its_stop_signal(
+def test_nothing_is_left_of_an_instance_whose_processes_ignore_the_stop_signal(
     daemon: Daemon,
 ) -> None:
     # The instance is a shell that ignores TERM and runs the server as a
@@ -247,9 +247,25 @@ def test_a_drain_leaves_nothing_of_an_instance_that_ignores_its_stop_signal(
 
     script = f"trap '' TERM; {shlex.quote(sys.executable)} server.py --bind {{bind}} & wait"
     deploy_server(daemon, "legacy", "--timeout", "shutdown=1s", command=["/bin/sh", "-c", script])
+    killed = instances(daemon, "legacy@r1")[0]["pid"]
+    orphan = report(daemon)["pid"]
+    assert orphan != killed
+    assert os.getpgid(orphan) == killed
+
+    # The shell is killed, as a master might be, and its child runs on.
+    # The instance is not left to start again beside it: the child is
+    # stopped, and killed since it ignores that, and then the instance
+    # starts.
+
+    os.kill(killed, signal.SIGKILL)
+    wait_for(lambda: instances(daemon, "legacy@r1")[0]["pid"] not in (0, killed), 20)
+    wait_for(lambda: not alive(orphan))
+    wait_for(lambda: group_gone(killed))
+    assert "leaving processes behind" in daemon.muructl("events").stdout
+    wait_for(lambda: daemon.request("/").status == 200, 20)
     leader = instances(daemon, "legacy@r1")[0]["pid"]
     child = report(daemon)["pid"]
-    assert child != leader
+    assert child not in (orphan, leader)
     assert os.getpgid(child) == leader
 
     # The stop signal does nothing, so the drain ends with the kill, which

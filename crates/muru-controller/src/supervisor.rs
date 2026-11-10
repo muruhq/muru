@@ -272,6 +272,12 @@ impl Process {
         }
     }
 
+    /// The process group of a process that has exited, if anything is
+    /// still running in it.
+    fn left_behind(&self) -> Option<u32> {
+        (self.group_is_own() && signal_group(self.pid(), 0)).then(|| self.pid())
+    }
+
     /// Whether the process group under the process's pid is the
     /// process's own. A child's is. An adopted process's is unless
     /// another process has its pid now, when a group under that id is
@@ -294,28 +300,44 @@ impl Process {
             self.kill().await;
         }
 
-        // The process is gone. Whatever is still in its group, workers
-        // that outlive their master say, is asked to stop as well, and
-        // killed at `kill_at`, or after a short grace when that has all
-        // but passed. A group id is not given to another group while
-        // any member is left, so what answers under it is the
-        // instance's; after a kill these are processes on their way out.
+        // The process is gone, and nothing is to be left of its group;
+        // after a kill what is found there is on its way out.
 
-        if !self.group_is_own() || !signal_group(group, 0) {
-            return;
-        }
-
-        signal_group(group, stop_signal);
-        let grace_ends = kill_at.max(Instant::now() + LEFTOVER_GRACE);
-
-        while signal_group(group, 0) && Instant::now() < grace_ends {
-            tokio::time::sleep(GROUP_POLL_INTERVAL).await;
-        }
-
-        if signal_group(group, 0) {
-            signal_group(group, libc::SIGKILL);
+        if self.group_is_own() {
+            clear_group(group, kill_at, stop_signal).await;
         }
     }
+}
+
+/// Leave nothing of a process group whose leader has gone. Whatever is
+/// still in it, workers that outlive their master say, is sent the stop
+/// signal, and killed at `kill_at`, or after a short grace when that
+/// has all but passed. A group id is not given to another group while
+/// any member is left, so what answers under it is the instance's.
+async fn clear_group(group: u32, kill_at: Instant, stop_signal: i32) {
+    if !signal_group(group, 0) {
+        return;
+    }
+
+    signal_group(group, stop_signal);
+    let grace_ends = kill_at.max(Instant::now() + LEFTOVER_GRACE);
+
+    while signal_group(group, 0) && Instant::now() < grace_ends {
+        tokio::time::sleep(GROUP_POLL_INTERVAL).await;
+    }
+
+    if signal_group(group, 0) {
+        signal_group(group, libc::SIGKILL);
+    }
+}
+
+/// Processes an instance left running in its process group when it
+/// exited, which are gone before the instance is started again.
+struct Leftover {
+    /// The group's id: the pid the instance's process had.
+    group: u32,
+    /// Whether the group has been sent SIGKILL.
+    killed: bool,
 }
 
 /// One supervised instance.
@@ -333,6 +355,8 @@ pub struct Instance {
     quick_exits: u32,
     /// When the next start is due, after an exit.
     due: Option<Instant>,
+    /// What the process that exited left running, until it has gone.
+    leftover: Option<Leftover>,
 }
 
 impl Instance {
@@ -345,6 +369,7 @@ impl Instance {
             started_unix_ms: 0,
             quick_exits: 0,
             due: None,
+            leftover: None,
         }
     }
 
@@ -614,6 +639,12 @@ impl Supervisor {
 
     /// Reap instances that exited and start again those whose wait has
     /// passed, with what happened for the event stream.
+    ///
+    /// An instance is not started beside what the one before it left
+    /// running. Processes still in the group of an instance that exited
+    /// are sent the stop signal when the exit is seen, and have the wait
+    /// before the next start to go in. Any still there when the wait
+    /// ends are killed, and the start is put off to the next check.
     pub fn check(&mut self) -> Vec<Report> {
         let now = Instant::now();
         let mut reports = Vec::new();
@@ -621,7 +652,19 @@ impl Supervisor {
         for position in 0..self.instances.len() {
             if let Ok(Some(exit)) = self.try_exited(position) {
                 let instance = &mut self.instances[position];
-                instance.process = None;
+                let left_behind = instance
+                    .process
+                    .take()
+                    .and_then(|process| process.left_behind());
+
+                if let Some(group) = left_behind {
+                    signal_group(group, self.spec.stop_signal);
+                }
+
+                instance.leftover = left_behind.map(|group| Leftover {
+                    group,
+                    killed: false,
+                });
 
                 if now.saturating_duration_since(instance.started) >= self.policy.stable_after {
                     instance.quick_exits = 0;
@@ -634,19 +677,56 @@ impl Supervisor {
                     kind: self.spec.events.exited,
                     level: "warning",
                     message: format!(
-                        "instance {} {exit}; starting it again in {}",
+                        "instance {} {exit}{}; starting it again in {}",
                         instance.index,
+                        if left_behind.is_some() {
+                            ", leaving processes behind that are being stopped"
+                        } else {
+                            ""
+                        },
                         muru_config::format_duration(wait)
                     ),
                 });
             }
 
-            let instance = &self.instances[position];
+            let instance = &mut self.instances[position];
 
-            if instance.process.is_some() || !instance.due.is_some_and(|due| due <= now) {
+            if instance.process.is_some() {
                 continue;
             }
 
+            // A group that has emptied is forgotten at once: its id may
+            // be given to another group from then on.
+
+            if instance
+                .leftover
+                .as_ref()
+                .is_some_and(|leftover| !signal_group(leftover.group, 0))
+            {
+                instance.leftover = None;
+            }
+
+            if !instance.due.is_some_and(|due| due <= now) {
+                continue;
+            }
+
+            // What is left after the wait is killed, once, and the start
+            // waits for the next check, by when it has gone.
+
+            if let Some(leftover) = &mut instance.leftover
+                && !leftover.killed
+            {
+                signal_group(leftover.group, libc::SIGKILL);
+                leftover.killed = true;
+                tracing::warn!(
+                    instance = instance.index,
+                    group = leftover.group,
+                    "processes an instance left behind did not stop and were killed"
+                );
+                continue;
+            }
+
+            instance.leftover = None;
             let index = instance.index;
 
             match self.spawn(position) {
@@ -716,6 +796,13 @@ impl Supervisor {
         let stops = self.instances.iter_mut().map(|instance| async move {
             if let Some(process) = instance.process.take() {
                 process.finish(kill_at, stop_signal).await;
+            }
+
+            // An instance that was waiting to be started may have left
+            // processes behind when it exited.
+
+            if let Some(leftover) = instance.leftover.take() {
+                clear_group(leftover.group, kill_at, stop_signal).await;
             }
 
             instance.clear_stale();
@@ -1169,6 +1256,69 @@ mod tests {
             .stop_until(Instant::now() + Duration::from_millis(300))
             .await;
         assert!(!exists(pid));
+        wait_for("the group to empty", || (!group_exists(pid)).then_some(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn what_an_instance_leaves_behind_is_gone_before_it_starts_again() {
+        // The shell starts a child that ignores TERM, and waits for it.
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut supervisor, pid) = start_script(
+            dir.path(),
+            spec(dir.path()),
+            "(trap '' TERM; : > ready; exec /bin/sleep 600) & wait",
+        )
+        .await;
+
+        // The shell is killed and its child runs on in its group, which
+        // is sent the stop signal.
+
+        kill(pid);
+        assert_eq!(
+            reports(&mut supervisor),
+            [
+                "thing.exited warning: instance 0 exited with signal: 9 (SIGKILL), \
+              leaving processes behind that are being stopped; starting it again in 1s"
+            ]
+        );
+        assert!(group_exists(pid));
+
+        // The child ignored the signal, so when the wait ends it is
+        // killed, and the instance is not started beside it.
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(supervisor.check().is_empty());
+        assert_eq!(supervisor.running(), 0);
+        wait_for("the group to empty", || (!group_exists(pid)).then_some(()));
+
+        // With nothing left, the next check starts the instance.
+
+        let started = supervisor.check();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].kind, "thing.started");
+        assert_eq!(supervisor.running(), 1);
+
+        supervisor.stop_until(Instant::now()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn what_an_instance_leaves_behind_is_stopped_with_it() {
+        // As above, and the stop comes while the instance waits to be
+        // started, with its child still running.
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut supervisor, pid) = start_script(
+            dir.path(),
+            spec(dir.path()),
+            "(trap '' TERM; : > ready; exec /bin/sleep 600) & wait",
+        )
+        .await;
+        kill(pid);
+        reports(&mut supervisor);
+        assert!(group_exists(pid));
+
+        supervisor.stop_until(Instant::now()).await;
         wait_for("the group to empty", || (!group_exists(pid)).then_some(()));
     }
 
