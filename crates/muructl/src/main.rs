@@ -1097,11 +1097,22 @@ fn main() -> anyhow::Result<()> {
 
     // A command asked for JSON fails in JSON too: the sentence muructl
     // would print, on standard output, with the same exit status.
+    // Section 11.8: where Muru's lines carry the time (a file such as
+    // daemon.log, or --timestamps) or are JSON records, the error is one
+    // of them, a single line, rather than the multi-line form printed
+    // for a terminal.
 
     match result {
         Err(error) if json => {
             let failure = serde_json::json!({ "error": format!("{error:#}") });
             println!("{}", serde_json::to_string_pretty(&failure)?);
+            std::process::exit(1)
+        }
+        Err(error)
+            if muru_common::log::json()
+                || muru_common::log::stamped(muru_common::log::Stream::Stderr) =>
+        {
+            muru_common::muru_eprintln!("error: {error:#}");
             std::process::exit(1)
         }
         other => other,

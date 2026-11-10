@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -353,6 +354,15 @@ def test_a_daemon_that_exits_at_start_is_reported_with_its_log(tmp_path: Path) -
     assert started.returncode != 0
     assert "the daemon exited before it answered (exit status: 1)" in started.stderr
     assert "cannot listen on" in started.stderr, started.stderr
+
+    # Every line of daemon.log, the error it exited with among them,
+    # starts with the full UTC time.
+
+    lines = (tmp_path / "logs" / "daemon.log").read_text().splitlines()
+    assert lines and all(re.match(r"\d{4}-\d\d-\d\dT[\d:.]+Z muru: ", line) for line in lines), (
+        lines
+    )
+    assert "muru: error: cannot listen on" in lines[-1]
 
 
 def test_background_daemon_start_status_stop(tmp_path: Path) -> None:

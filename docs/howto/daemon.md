@@ -612,15 +612,12 @@ wrote to `daemon.log`, the last twenty of them:
 ```console
 $ muructl daemon start
 Error: the daemon exited before it answered (exit status: 1); from /var/log/muru/daemon.log:
-  muru: config: /etc/muru/muru.toml (default)
-  muru: state: /var/lib/muru (default)
-  muru: run: /run/muru (default)
-  muru: logs: /var/log/muru (default)
-  muru: cache: /var/cache/muru (default)
-  Error: cannot listen on 0.0.0.0:80
-
-  Caused by:
-      Address already in use (os error 98)
+  2026-11-02T05:40:11.204Z muru: config: /etc/muru/muru.toml (default)
+  2026-11-02T05:40:11.204Z muru: state: /var/lib/muru (default)
+  2026-11-02T05:40:11.204Z muru: run: /run/muru (default)
+  2026-11-02T05:40:11.204Z muru: logs: /var/log/muru (default)
+  2026-11-02T05:40:11.204Z muru: cache: /var/cache/muru (default)
+  2026-11-02T05:40:11.209Z muru: error: cannot listen on 0.0.0.0:80: Address already in use (os error 98)
 ```
 
 The daemon writes its pid to `daemon.pid` in the runtime directory and

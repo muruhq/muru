@@ -526,12 +526,9 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         ("logs", &locations.logs),
         ("cache", &locations.cache),
     ] {
-        println!(
-            "muru: {name}: {} ({})",
-            location.path.display(),
-            location.rule
-        );
+        muru_common::muru_println!("{name}: {} ({})", location.path.display(), location.rule);
     }
+
     muru_controller::daemon::run(muru_controller::daemon::Config {
         locations,
         settings,

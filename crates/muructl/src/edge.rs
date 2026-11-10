@@ -115,8 +115,8 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     let spool = args.spool.as_ref().and_then(|path| {
         muru_edge::uploads::Spool::new(path.clone(), None)
             .map_err(|error| {
-                eprintln!(
-                    "muru: the upload spool {} is unusable: {error}",
+                muru_common::muru_eprintln!(
+                    "the upload spool {} is unusable: {error}",
                     path.display()
                 );
             })
@@ -262,8 +262,8 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         muru_common::muru_eprintln!("edge draining (pid {})", std::process::id());
 
         if !drainer.drain(grace).await {
-            eprintln!(
-                "muru: edge exiting with connections still open after {} seconds",
+            muru_common::muru_eprintln!(
+                "edge exiting with connections still open after {} seconds",
                 grace.as_secs()
             );
         }
@@ -579,8 +579,8 @@ impl EdgeControl for Control {
         // and waits for the requests in flight.
 
         if !delay.is_zero() {
-            eprintln!(
-                "muru: edge closing connections after their response for {} (pid {})",
+            muru_common::muru_eprintln!(
+                "edge closing connections after their response for {} (pid {})",
                 muru_config::format_duration(delay),
                 std::process::id()
             );
@@ -592,8 +592,8 @@ impl EdgeControl for Control {
         let finished = self.drainer.drain(grace).await;
 
         if !finished {
-            eprintln!(
-                "muru: edge still has connections open after {}",
+            muru_common::muru_eprintln!(
+                "edge still has connections open after {}",
                 muru_config::format_duration(grace)
             );
         }
