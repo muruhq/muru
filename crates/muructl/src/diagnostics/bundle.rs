@@ -21,7 +21,9 @@ use muru_controller::diagnostics::facts::{self, Platform};
 use muru_controller::diagnostics::logs::{Packed, Stretch, stretches};
 use muru_controller::diagnostics::stored;
 use muru_controller::diagnostics::window::{Window, line_time};
-use muru_controller::diagnostics::{ReleaseFacts, changes_configuration, mask, period};
+use muru_controller::diagnostics::{
+    ReleaseFacts, changes_configuration, is_failure, mask, period, site_packages,
+};
 use muru_controller::log_files::{self, Kind, LogFile};
 use muru_proto::admin::v1 as pb;
 use serde::Serialize;
@@ -49,6 +51,21 @@ const LISTED: u32 = 1000;
 /// The states of a release in which a host runs for it, by which a plan
 /// tells what would be asked when it may not ask.
 const RUNNING_STATES: [&str; 5] = ["starting", "warming", "ready", "draining", "retained"];
+
+/// The lock files of a release's source that a bundle takes, when they
+/// are there, and the size above which one is not taken.
+const LOCK_FILES: [&str; 6] = [
+    "uv.lock",
+    "pylock.toml",
+    "requirements.txt",
+    "poetry.lock",
+    "pdm.lock",
+    "Pipfile.lock",
+];
+const LOCK_FILE_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// How long the workers of a release are given to count their objects.
+const MEMORY_LIMIT: Duration = Duration::from_secs(30);
 
 /// How many lines a development run or `muructl serve` is asked for:
 /// more than it keeps in memory.
@@ -95,6 +112,16 @@ pub struct BundleArgs {
     #[arg(long)]
     scrub: bool,
 
+    /// Also count each worker's objects by type, as muructl debug memory
+    /// does, which holds the worker's interpreter while it counts.
+    #[arg(long)]
+    memory: bool,
+
+    /// Also profile every worker for this long, as muructl debug profile
+    /// does.
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    profile: Option<Duration>,
+
     #[command(flatten)]
     socket: SocketArgs,
 
@@ -102,6 +129,42 @@ pub struct BundleArgs {
     /// are not where the daemon in reach says or the defaults put them.
     #[command(flatten)]
     files: DaemonFileArgs,
+}
+
+/// What was asked for beyond what a bundle holds by default.
+#[derive(Debug, Clone, Copy, Default)]
+struct Asked {
+    /// Client addresses and query strings are taken out.
+    scrub: bool,
+    /// The workers' objects are counted.
+    memory: bool,
+    /// The workers are profiled for this long.
+    profile: Option<Duration>,
+}
+
+impl Asked {
+    /// What was asked for, by name, for the event that records the
+    /// bundle.
+    fn names(&self) -> Vec<String> {
+        [
+            (self.scrub, "scrub"),
+            (self.memory, "memory"),
+            (self.profile.is_some(), "profile"),
+        ]
+        .iter()
+        .filter(|(asked, _)| *asked)
+        .map(|(_, name)| (*name).to_owned())
+        .collect()
+    }
+
+    /// What was asked for, as the manifest gives it.
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "scrub": self.scrub,
+            "memory": self.memory,
+            "profile_s": self.profile.map(|period| period.as_secs_f64()),
+        })
+    }
 }
 
 /// What a bundle is limited to: an application, one release of it, or
@@ -180,11 +243,16 @@ struct Bundle<'a, W: Write> {
     archive: Archive<W>,
     window: Window,
     target: &'a Target,
+    /// What was asked for beyond the default.
+    asked: Asked,
     /// What takes client addresses and query strings out, with --scrub.
     scrubber: Option<Scrubber>,
     /// The releases of the target with workers to ask, once known.
     running: Option<Vec<(String, String)>>,
-    /// The events of the window, once they have been read.
+    /// Every event still kept that is within the target, once they have
+    /// been read.
+    kept: Option<Vec<pb::Event>>,
+    /// Those of them in the window.
     events: Option<Vec<pb::Event>>,
     /// The metrics as the daemon gave them, once it has been asked.
     metrics: Option<Result<String, String>>,
@@ -226,6 +294,9 @@ impl<W: Write> Bundle<'_, W> {
         self.logs().await?;
         self.live().await?;
         self.figures().await?;
+        self.host().await?;
+        self.failures()?;
+        self.asked_for().await?;
 
         // What was noted while collecting, such as a worker that did not
         // answer, is recorded as what it left out.
@@ -566,19 +637,25 @@ impl<W: Write> Bundle<'_, W> {
                             && !release.is_empty()
                             && !target.holds(app, release));
 
-                    window.holds(event.time_unix_ms) && !another
+                    !another
                 })
                 .collect::<Vec<_>>()
         });
 
         match found {
-            Ok(events) => {
+            Ok(kept) => {
+                let events: Vec<pb::Event> = kept
+                    .iter()
+                    .filter(|event| window.holds(event.time_unix_ms))
+                    .cloned()
+                    .collect();
                 let mut lines = Vec::new();
 
                 for event in &events {
                     lines.extend(self.event_line(event));
                 }
 
+                self.kept = Some(kept);
                 self.events = Some(events);
                 self.archive.bytes(layout::EVENTS, &lines, None)
             }
@@ -782,6 +859,285 @@ impl<W: Write> Bundle<'_, W> {
             "the history the dashboard's charts draw is kept in memory, and the admin socket \
              does not offer it",
         );
+        Ok(())
+    }
+
+    /// `host/`: the machine, and for each release what its environment
+    /// holds and what its workers have loaded.
+    async fn host(&mut self) -> io::Result<()> {
+        let host = layout::HOST;
+
+        // The machine: Muru's directories and processes are what its
+        // room and its limits are read for.
+
+        let status = self.installation.status().cloned();
+        let locations = self.installation.locations().cloned();
+        let run_dir = status.as_ref().map(|status| PathBuf::from(&status.run_dir));
+
+        let directories: Vec<(&str, &Path)> = match (&locations, &run_dir) {
+            (Some(locations), _) => vec![
+                ("state", &locations.state.path),
+                ("run", &locations.run.path),
+                ("logs", &locations.logs.path),
+                ("cache", &locations.cache.path),
+            ],
+            (None, Some(run_dir)) => vec![("run", run_dir)],
+            (None, None) => Vec::new(),
+        };
+
+        let processes: Vec<(&str, u32)> = status
+            .iter()
+            .flat_map(|status| [("daemon", status.pid), ("edge", status.edge_pid)])
+            .filter(|(_, pid)| *pid != 0)
+            .collect();
+        self.put(
+            &format!("{host}/host.json"),
+            Ok(facts::Host::read(&directories, &processes)),
+        )?;
+
+        // What each release's environment holds, from the files where the
+        // state store says where they are.
+
+        let mut located: Vec<(String, String, PathBuf, PathBuf)> = Vec::new();
+
+        if let Ok(store) = &self.installation.store {
+            for release in stored::releases(store).unwrap_or_default() {
+                if self.target.holds(&release.app, &release.id)
+                    && let Ok(stored) = store.release(&release.app, &release.id)
+                {
+                    located.push((
+                        release.app,
+                        release.id,
+                        stored.spec.python,
+                        stored.spec.source,
+                    ));
+                }
+            }
+        }
+
+        for (app, release, python, source) in &located {
+            self.environment(app, release, python, source)?;
+        }
+
+        // What the workers of each release have loaded: the interpreter,
+        // the modules with their versions, and the environment as debug
+        // inspect shows it. A development run's environment is found from
+        // its worker's interpreter.
+
+        for (app, release) in self.running_releases() {
+            let path = format!("{host}/{app}@{release}/inspect.json");
+
+            if !self.asks(&path) {
+                continue;
+            }
+
+            let answered = self
+                .installation
+                .debug(&app, &release, "inspect", None)
+                .await
+                .map(|answer| crate::admin::debug_json(&answer));
+
+            if located.is_empty()
+                && let Ok(answer) = &answered
+                && let Some(python) = answer["workers"][0]["result"]["executable"].as_str()
+                && let Some(project) = status.as_ref().map(|status| &status.project)
+            {
+                self.environment(&app, &release, Path::new(python), Path::new(project))?;
+            }
+
+            self.put_scrubbed(&path, answered)?;
+        }
+
+        Ok(())
+    }
+
+    /// What a release's environment holds: the distributions installed
+    /// beside its interpreter, and the lock files of its source.
+    fn environment(
+        &mut self,
+        app: &str,
+        release: &str,
+        python: &Path,
+        source: &Path,
+    ) -> io::Result<()> {
+        let directory = format!("{}/{app}@{release}", layout::HOST);
+        let path = format!("{directory}/packages.txt");
+        let mut installed = Vec::new();
+        let mut failed = None;
+
+        for site in site_packages(python) {
+            match muru_controller::diagnostics::installed(&site) {
+                Ok(found) => installed.extend(found),
+                Err(error) => failed = Some(format!("{}: {error}", site.display())),
+            }
+        }
+
+        match (installed.is_empty(), failed) {
+            (false, _) => {
+                installed.sort();
+                installed.dedup();
+                let text = installed.join("\n") + "\n";
+                self.archive.bytes(&path, text.as_bytes(), None)?;
+            }
+            (true, Some(why)) => self.archive.missing(&path, why),
+            (true, None) => self.archive.missing(
+                &path,
+                format!(
+                    "no site-packages directory was found beside {}",
+                    python.display()
+                ),
+            ),
+        }
+
+        // A lock file may name an index with a password in its URL.
+
+        for name in LOCK_FILES {
+            let file = source.join(name);
+
+            if !file.is_file() {
+                continue;
+            }
+
+            let part = format!("{directory}/{name}");
+
+            match std::fs::metadata(&file).map(|found| found.len()) {
+                Ok(size) if size > LOCK_FILE_LIMIT => self.archive.missing(
+                    &part,
+                    format!(
+                        "it is {}, more than a lock file is taken at",
+                        human_size(size)
+                    ),
+                ),
+                _ => {
+                    let text = std::fs::read_to_string(&file)
+                        .map(|text| mask::url_passwords(&text))
+                        .map_err(|error| error.to_string());
+                    self.put_text(&part, text)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// `failures/events.jsonl`: every event still kept that records
+    /// something going wrong, from before the window too: the requests
+    /// past a timeout, the workers killed, recycled or gone, with what
+    /// was captured at the time in each one's sentence.
+    fn failures(&mut self) -> io::Result<()> {
+        let path = format!("{}/events.jsonl", layout::FAILURES);
+
+        let Some(kept) = &self.kept else {
+            self.archive.missing(&path, "the events were not read");
+            return Ok(());
+        };
+
+        let mut lines = Vec::new();
+
+        for event in kept.iter().filter(|event| is_failure(&event.r#type)) {
+            lines.extend(event_line(&mut self.scrubber, event));
+        }
+
+        self.archive.bytes(
+            &path,
+            &lines,
+            Some(
+                "every such event still kept, from before the window too; the stacks a worker \
+                 dumped before it was killed are in its release's log"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// What is collected only when asked for, since it costs the workers
+    /// something: a count of each worker's objects, and a profile.
+    async fn asked_for(&mut self) -> io::Result<()> {
+        let live = layout::LIVE;
+        let releases = self.running_releases();
+
+        if self.asked.memory {
+            for (app, release) in &releases {
+                let path = format!("{live}/{app}@{release}/memory.json");
+
+                if !self.asks(&path) {
+                    continue;
+                }
+
+                let arguments = serde_json::json!({
+                    "trace": false,
+                    "snapshot": "",
+                    "duration_s": 0.0,
+                    "top": 20,
+                    "timeout_s": MEMORY_LIMIT.as_secs_f64(),
+                });
+                let answered = self
+                    .installation
+                    .debug_with(app, release, "memory", None, arguments, MEMORY_LIMIT + ASK)
+                    .await
+                    .map(|answer| crate::admin::debug_json(&answer));
+                self.put(&path, answered)?;
+            }
+        }
+
+        let Some(period) = self.asked.profile else {
+            return Ok(());
+        };
+
+        // Every release is profiled over the same period, at once, so
+        // that the bundle takes the period and not a period each.
+
+        let paths: Vec<String> = releases
+            .iter()
+            .map(|(app, release)| format!("{live}/{app}@{release}/profile.collapsed"))
+            .collect();
+
+        if self.archive.is_planned() {
+            for path in &paths {
+                self.archive.would_ask(path, ASKED);
+            }
+
+            return Ok(());
+        }
+
+        let Some(running) = &self.installation.live else {
+            return Ok(());
+        };
+
+        let limit = period + ASK + ASK;
+        let profiles = releases.iter().map(|(app, release)| {
+            let mut client = running.client.clone();
+            let request = pb::DebugRequest {
+                app: app.clone(),
+                release: release.clone(),
+                op: "profile".to_owned(),
+                worker: None,
+                args_json: serde_json::json!({
+                    "duration_s": period.as_secs_f64(),
+                    "interval_ms": 10.0,
+                    "requests": 0,
+                    "path": "",
+                    "timeout_s": (period + ASK).as_secs_f64(),
+                })
+                .to_string(),
+            };
+
+            async move {
+                match tokio::time::timeout(limit, client.debug(request)).await {
+                    Ok(Ok(response)) => Ok(response.into_inner()),
+                    Ok(Err(status)) => Err(status.message().to_owned()),
+                    Err(_) => Err(format!("no answer within {} seconds", limit.as_secs())),
+                }
+            }
+        });
+        let answers = futures::future::join_all(profiles).await;
+
+        for (path, answer) in paths.iter().zip(answers) {
+            match answer.and_then(|answer| collapsed(&answer)) {
+                Ok((text, note)) => self.archive.bytes(path, text.as_bytes(), Some(note))?,
+                Err(why) => self.archive.missing(path, why),
+            }
+        }
+
         Ok(())
     }
 
@@ -1030,6 +1386,48 @@ impl<W: Write> Bundle<'_, W> {
     }
 }
 
+/// The profiles the workers of a release answered with as one set of
+/// collapsed stacks, the heaviest first, a stack and its count a line,
+/// with a note of how many workers it is of. An error when none answered.
+fn collapsed(answer: &pb::DebugResponse) -> Result<(String, String), String> {
+    let mut stacks: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut answered = 0;
+    let mut refused = None;
+
+    for worker in &answer.workers {
+        let result = serde_json::from_str::<serde_json::Value>(&worker.result_json);
+
+        match result {
+            Ok(result) if worker.ok => {
+                answered += 1;
+
+                for (stack, count) in result["stacks"].as_object().into_iter().flatten() {
+                    *stacks.entry(stack.clone()).or_default() += count.as_u64().unwrap_or(0);
+                }
+            }
+            _ => refused = Some(format!("worker {}: {}", worker.index, worker.error)),
+        }
+    }
+
+    if answered == 0 {
+        return Err(refused.unwrap_or_else(|| "no worker answered".to_owned()));
+    }
+
+    let mut ordered: Vec<(&String, &u64)> = stacks.iter().collect();
+    ordered.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let mut text = String::new();
+
+    for (stack, count) in ordered {
+        text.push_str(&format!("{stack} {count}\n"));
+    }
+
+    let note = format!(
+        "collapsed stacks merged from {answered} of {}",
+        crate::admin::counted(answer.workers.len(), "worker", "workers")
+    );
+    Ok((text, note))
+}
+
 /// An event as a line of JSON, its subject and sentence scrubbed when a
 /// scrubber is given.
 fn event_line(scrubber: &mut Option<Scrubber>, event: &pb::Event) -> Vec<u8> {
@@ -1219,6 +1617,12 @@ pub async fn bundle(args: BundleArgs) -> anyhow::Result<()> {
     let window = Window::last(args.since, now);
     let target = Target::parse(args.target.as_deref())?;
     let root = format!("muru-bundle-{}", stamp(now));
+
+    let asked = Asked {
+        scrub: args.scrub,
+        memory: args.memory,
+        profile: args.profile,
+    };
     let mut installation = Installation::reach(&args.socket, &args.files).await?;
     check_target(&mut installation, &target).await?;
 
@@ -1233,8 +1637,10 @@ pub async fn bundle(args: BundleArgs) -> anyhow::Result<()> {
             archive: Archive::planned(&root),
             window,
             target: &target,
-            scrubber: args.scrub.then(Scrubber::default),
+            asked,
+            scrubber: asked.scrub.then(Scrubber::default),
             running: None,
+            kept: None,
             events: None,
             metrics: None,
         };
@@ -1248,14 +1654,6 @@ pub async fn bundle(args: BundleArgs) -> anyhow::Result<()> {
         print_plan(&planned, &target, window, &output);
         return Ok(());
     }
-
-    // What was asked for beyond the default, for the event to say.
-
-    let options: Vec<String> = [(args.scrub, "scrub")]
-        .iter()
-        .filter(|(asked, _)| *asked)
-        .map(|(_, option)| (*option).to_owned())
-        .collect();
 
     // The collection competes with nothing that serves.
 
@@ -1272,12 +1670,12 @@ pub async fn bundle(args: BundleArgs) -> anyhow::Result<()> {
                 );
             }
 
-            let recorded = record(&mut installation, &target, window, options).await;
+            let recorded = record(&mut installation, &target, window, asked.names()).await;
             let making = Making {
                 root: &root,
                 window,
                 target: &target,
-                scrub: args.scrub,
+                asked,
                 recorded,
             };
             let (_, entries) = making
@@ -1294,12 +1692,12 @@ pub async fn bundle(args: BundleArgs) -> anyhow::Result<()> {
             let planned = planned.expect("a file's room is checked against a plan");
             check_room(&path, &planned)?;
             let file = create(&path)?;
-            let recorded = record(&mut installation, &target, window, options).await;
+            let recorded = record(&mut installation, &target, window, asked.names()).await;
             let making = Making {
                 root: &root,
                 window,
                 target: &target,
-                scrub: args.scrub,
+                asked,
                 recorded,
             };
 
@@ -1332,8 +1730,8 @@ struct Making<'a> {
     root: &'a str,
     window: Window,
     target: &'a Target,
-    /// Whether client addresses and query strings are taken out.
-    scrub: bool,
+    /// What was asked for beyond the default.
+    asked: Asked,
     recorded: String,
 }
 
@@ -1350,8 +1748,10 @@ impl Making<'_> {
             archive: Archive::new(writer, self.root, self.window.until_unix_ms / 1000),
             window: self.window,
             target: self.target,
-            scrubber: self.scrub.then(Scrubber::default),
+            asked: self.asked,
+            scrubber: self.asked.scrub.then(Scrubber::default),
             running: None,
+            kept: None,
             events: None,
             metrics: None,
         };
@@ -1371,12 +1771,12 @@ impl Making<'_> {
             window: self.window,
             runs: installation.runs().describe().to_owned(),
             running: installation.running(),
-            options: serde_json::json!({"scrub": self.scrub}),
+            options: self.asked.json(),
             configuration_changed,
             recorded: self.recorded,
             left_out: NEVER_HELD
                 .iter()
-                .chain(self.scrub.then_some(&SCRUBBED))
+                .chain(self.asked.scrub.then_some(&SCRUBBED))
                 .map(|held| (*held).to_owned())
                 .collect(),
             parts: Vec::new(),
@@ -1595,6 +1995,68 @@ mod tests {
                 format!("{wrong:?} is not a release: expected app@release")
             );
         }
+    }
+
+    #[test]
+    fn what_was_asked_for_is_named_for_the_event_and_the_manifest() {
+        let plain = Asked::default();
+        assert!(plain.names().is_empty());
+        assert_eq!(
+            plain.json(),
+            serde_json::json!({"scrub": false, "memory": false, "profile_s": null})
+        );
+
+        let all = Asked {
+            scrub: true,
+            memory: true,
+            profile: Some(Duration::from_secs(30)),
+        };
+        assert_eq!(all.names(), ["scrub", "memory", "profile"]);
+        assert_eq!(
+            all.json(),
+            serde_json::json!({"scrub": true, "memory": true, "profile_s": 30.0})
+        );
+    }
+
+    #[test]
+    fn the_workers_profiles_are_merged_heaviest_first() {
+        let worker = |index: u32, ok: bool, result: &str| pb::WorkerDebug {
+            index,
+            pid: 100 + index,
+            ok,
+            error: if ok {
+                ""
+            } else {
+                "another operation is running"
+            }
+            .to_owned(),
+            result_json: result.to_owned(),
+        };
+        let answer = pb::DebugResponse {
+            release: "r3".to_owned(),
+            workers: vec![
+                worker(0, true, r#"{"stacks": {"main;view": 3, "main;render": 9}}"#),
+                worker(1, true, r#"{"stacks": {"main;view": 4}}"#),
+                worker(2, false, ""),
+            ],
+        };
+
+        assert_eq!(
+            collapsed(&answer).unwrap(),
+            (
+                "main;render 9\nmain;view 7\n".to_owned(),
+                "collapsed stacks merged from 2 of 3 workers".to_owned()
+            )
+        );
+
+        let refused = pb::DebugResponse {
+            release: "r3".to_owned(),
+            workers: vec![worker(2, false, "")],
+        };
+        assert_eq!(
+            collapsed(&refused).unwrap_err(),
+            "worker 2: another operation is running"
+        );
     }
 
     #[test]

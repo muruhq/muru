@@ -10,9 +10,13 @@ import gzip
 import io
 import json
 import os
+import platform
 import re
+import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tarfile
 import time
 from pathlib import Path
@@ -150,12 +154,23 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
     out = tmp_path / "out"
     out.mkdir()
 
+    # A copy of the project with a lock file of its own, which names an
+    # index by a URL with a password.
+
+    source = tmp_path / "source"
+    shutil.copytree(SHOP, source)
+    (source / "requirements.txt").write_text(
+        "--index-url https://mirror:hunter3@pypi.example/simple\nflask==3.0.3\n"
+    )
+
     try:
         deployed = daemon.deploy(
             "shop",
-            SHOP,
+            source,
             "--processes",
             "2",
+            "--build",
+            "never",
             "--env",
             "API_TOKEN=abc123",
             "--env",
@@ -163,6 +178,14 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         )
         assert deployed == "muru: release shop@r1 is ready and serving"
         assert daemon.get("/catalogue?page=2").status == 200
+
+        # The edge writes the record from a thread of its own.
+
+        deadline = time.monotonic() + 20
+
+        while b"/catalogue?page=2" not in (tmp_path / "logs" / "access.log").read_bytes():
+            assert time.monotonic() < deadline, "the access record was never written"
+            time.sleep(0.05)
 
         # A dry run says what the bundle would hold, writes nothing and
         # records nothing.
@@ -241,7 +264,7 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         assert json.loads(found["config/access-log-overrides.json"]) == []
         assert json.loads(found["config/routing-snapshot.json"])["version"] >= 1
 
-        for secret in (b"abc123", b"s3cret", b"hunter2"):
+        for secret in (b"abc123", b"s3cret", b"hunter2", b"hunter3"):
             holding = [path for path, content in found.items() if secret in content]
             assert holding == [], f"{secret!r} is in {holding}"
 
@@ -298,6 +321,41 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         assert b"muru_requests_total" in found["figures/metrics.txt"]
         assert json.loads(found["figures/scaling/shop@r1.json"])["groups"][0]["group"] == "default"
 
+        # The machine, what the release's environment holds, and what its
+        # workers have loaded, with the release's variables masked as
+        # debug inspect masks them.
+
+        host = json.loads(found["host/host.json"])
+        assert host["cpus"] >= 1 and len(host["kernel"]) == 4
+        assert host["memory_bytes"] > 0 and len(host["load"]) == 3
+        disks = {disk["of"]: disk for disk in host["disks"]}
+        assert disks["state"]["path"] == str(tmp_path / "state")
+        assert disks["state"]["free_bytes"] > 0
+
+        if sys.platform == "linux":
+            assert host["memory_available_bytes"] > 0
+            limited = dict(host["process_limits"])
+            assert "Max open files" in limited["daemon"] and "edge" in limited
+        else:
+            assert host["process_limits"] == [] and host["cgroup"] is None
+
+        packages = found["host/shop@r1/packages.txt"].decode().splitlines()
+        assert packages == sorted(packages) and any(line.startswith("pytest ") for line in packages)
+        assert found["host/shop@r1/requirements.txt"].decode() == (
+            "--index-url https://mirror:***@pypi.example/simple\nflask==3.0.3\n"
+        )
+        inspected = json.loads(found["host/shop@r1/inspect.json"])["workers"][0]["result"]
+        assert inspected["python"] == platform.python_version()
+        assert inspected["environment"]["API_TOKEN"] == "***"
+        assert "shop" in inspected["modules"]
+
+        # Nothing has gone wrong yet, and nothing was asked for beyond
+        # the default.
+
+        assert found["failures/events.jsonl"] == b""
+        assert manifest["options"] == {"scrub": False, "memory": False, "profile_s": None}
+        assert not any(path.endswith(("memory.json", "profile.collapsed")) for path in found)
+
         # Every event of the window is there in full, and the making of
         # the bundle is an event of its own.
 
@@ -307,9 +365,20 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         assert "debug.bundle" in recorded
         assert "a diagnostic bundle of the whole node was made, reaching back 1h" in recorded
 
+        # A worker that is killed is a failure the next bundle holds.
+
+        os.kill(status["workers"][0]["pid"], signal.SIGKILL)
+        deadline = time.monotonic() + 20
+
+        while "worker.exited" not in daemon.muructl("events").stdout:
+            assert time.monotonic() < deadline, daemon.muructl("events").stdout
+            time.sleep(0.1)
+
         # A file that exists is left alone. With - the archive goes to
-        # standard output, here of one release and a shorter window; a
-        # target that names nothing is refused.
+        # standard output, here of one release and a shorter window, with
+        # the workers' objects counted and a profile of them, which are
+        # collected only when asked for; a target that names nothing is
+        # refused.
 
         assert "exists: name another file with --output, or remove it" in refused(
             daemon, "--output", str(written)
@@ -320,6 +389,9 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
             "shop@r1",
             "--since",
             "10m",
+            "--memory",
+            "--profile",
+            "1s",
             "--output",
             "-",
             "--socket",
@@ -333,7 +405,20 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         assert manifest["window"]["until_unix_ms"] - manifest["window"]["since_unix_ms"] == 600_000
         assert "config/releases/shop@r1.json" in found
         assert json.loads(found["installation.json"])["releases"][0]["id"] == "r1"
-        assert "a diagnostic bundle of shop@r1 was made" in daemon.muructl("events").stdout
+        assert manifest["options"] == {"scrub": False, "memory": True, "profile_s": 1.0}
+        assert (
+            "a diagnostic bundle of shop@r1 was made, reaching back 10m, with memory, profile"
+            in daemon.muructl("events").stdout
+        )
+        (failure,) = [json.loads(line) for line in found["failures/events.jsonl"].splitlines()]
+        assert failure["type"] == "worker.exited" and failure["subject"] == "shop@r1"
+        counted = json.loads(found["live/shop@r1/memory.json"])["workers"]
+        assert counted and all(worker["ok"] for worker in counted)
+        noted = {part["path"]: part.get("note") for part in manifest["parts"]}
+        assert re.fullmatch(
+            r"collapsed stacks merged from \d of \d workers",
+            noted["live/shop@r1/profile.collapsed"],
+        )
         assert "no application named nope" in refused(daemon, "nope")
         assert "shop has no release r9" in refused(daemon, "shop@r9")
         assert "is not a release: expected app@release" in refused(daemon, "shop@")
@@ -362,6 +447,9 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
     # knows is listed with why it is not.
 
     assert json.loads(found["config/releases/shop@r1.json"])["release"]["state"] == "stopped"
+    assert "host/host.json" in found and "host/shop@r1/packages.txt" in found
+    assert "host/shop@r1/requirements.txt" in found
+    assert b"worker.exited" in found["failures/events.jsonl"]
     assert "[app.shop" in found["config/effective.toml"].decode()
     assert 'secret = "***"' in found["config/daemon.toml"].decode()
     missing = {part["path"]: part["why"] for part in manifest["parts"] if not part["collected"]}
@@ -429,7 +517,7 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
     bundle(daemon, "shop", "--scrub", "--output", str(scrubbed))
     found = members(scrubbed.read_bytes())
     manifest = manifest_of(found)
-    assert manifest["options"] == {"scrub": True}
+    assert manifest["options"] == {"scrub": True, "memory": False, "profile_s": None}
     assert "--scrub" in manifest["left_out"][-1]
     assert "logs/apps/other/r1.log" not in found
 
@@ -464,6 +552,7 @@ def test_bundle_of_a_development_run_and_of_a_serve(tmp_path: Path) -> None:
 
     try:
         server.get("/marker?x=1")
+        assert server.wait_for_log("/marker?x=1"), server.log()
         written = tmp_path / "run.tar.gz"
         completed = muructl(
             "debug",
@@ -486,9 +575,10 @@ def test_bundle_of_a_development_run_and_of_a_serve(tmp_path: Path) -> None:
         (release,) = installation["releases"]
         assert release["app"] == "plain-wsgi" and len(release["workers"]) == 2
 
-        # A run keeps the events its hosts raise, and none has been yet.
+        # A run keeps the events its hosts raise, of which there may be
+        # none yet.
 
-        assert events_of(found) == []
+        assert all(event["subject"] == "plain-wsgi@r1" for event in events_of(found))
 
         # A run writes no log files: the lines it keeps in memory are
         # asked for.
@@ -502,6 +592,9 @@ def test_bundle_of_a_development_run_and_of_a_serve(tmp_path: Path) -> None:
         )
 
         assert len(json.loads(found["live/plain-wsgi@r1/stacks-3.json"])["workers"]) == 2
+        assert json.loads(found["host/host.json"])["disks"][0]["of"] == "run"
+        assert "host/plain-wsgi@r1/inspect.json" in found
+        assert found["host/plain-wsgi@r1/packages.txt"]
         assert b"muru_requests_total" in found["figures/metrics.txt"]
         assert not any(path.startswith("figures/scaling/") for path in found)
 

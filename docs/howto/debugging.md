@@ -618,6 +618,7 @@ muructl debug bundle
 muructl debug bundle --since 30m --output /mnt/scratch/shop.tar.gz
 muructl debug bundle shop@r3 --since 2d
 muructl debug bundle shop --scrub
+muructl debug bundle shop --memory --profile 30s
 muructl debug bundle --dry-run
 ssh web1 muructl debug bundle --output - > web1.tar.gz
 kubectl exec deploy/shop -- muructl debug bundle --output - > shop.tar.gz
@@ -694,6 +695,11 @@ Everything is under one directory named as the file is.
 | `live/websockets.json` | The open WebSockets, up to a thousand, as `muructl websockets --list --json` gives them |
 | `figures/metrics.txt` | The [metrics](metrics.md) as a scrape reads them, the garbage collection figures among them |
 | `figures/scaling/APP@RELEASE.json` | Each worker group's scaling, as [`muructl scale status --json`](scaling.md) gives it |
+| `host/host.json` | The machine: the kernel, the CPUs, the load averages, the memory and how much is available, the limit on open files, the room on the file system of each of Muru's directories, and on Linux the limits of the daemon's and the edge's processes and of the container's cgroup |
+| `host/APP@RELEASE/packages.txt` | The distributions installed in the release's environment, each with its version |
+| `host/APP@RELEASE/uv.lock` and the like | The lock files of the release's source that are there: `uv.lock`, `pylock.toml`, `requirements.txt`, `poetry.lock`, `pdm.lock` and `Pipfile.lock` |
+| `host/APP@RELEASE/inspect.json` | What the release's workers have loaded: the interpreter and its build, `sys.path`, the modules with their versions, the threads and descriptors, and the environment as [`muructl debug inspect --json`](#inspect) gives it |
+| `failures/events.jsonl` | Every event Muru still keeps that records something going wrong, from before the window too: a request past its soft timeout or its deadline, a worker killed for a timeout or for memory, recycled, stalled or gone, a release that failed |
 
 With a target, the releases, events and output of other applications
 are left out, the access log's records are those of the target alone,
@@ -704,6 +710,30 @@ the stacks cannot tell a thread that is stuck from one that is busy, so
 they are taken three times: a thread at the same place in all three is
 waiting there. The history the dashboard's charts draw is not in a
 bundle, and the manifest lists it as not collected.
+
+An event in `failures/events.jsonl` carries in its sentence what was
+[captured](#automatic-captures) when it happened: where a request was
+at its soft timeout, where a worker's oldest request was when it was
+killed, the object types a worker held most of when it was recycled for
+memory. The stacks a worker dumped before it was killed are in its
+release's log, under `logs/`.
+
+The packages are read from the names of the directories in the
+environment's `site-packages`, so nothing is run to list them. A
+password in a URL in a lock file is masked.
+
+### What is collected only when asked for
+
+Two parts cost the workers something, and are collected only with their
+flag:
+
+| Flag | Adds | Costs |
+| --- | --- | --- |
+| `--memory` | `live/APP@RELEASE/memory.json`: each worker's memory, gc state and most common object types, as [`muructl debug memory --json`](#memory) gives them | Each worker's interpreter is held while its objects are counted |
+| `--profile DURATION` | `live/APP@RELEASE/profile.collapsed`: a [profile](#profile) of every worker of the release over the period, as collapsed stacks merged across the workers, the heaviest first | The bundle takes that much longer; the releases are profiled at once, over the same period |
+
+Each is the event the debug command raises, `debug.memory` or
+`debug.profile`, as well as the bundle's own.
 
 ### The logs of the window
 
@@ -776,7 +806,7 @@ file, a setting whose key says it is a secret (`secret`, `token`,
 | `window` | `since_unix_ms` and `until_unix_ms`, the period it covers |
 | `runs`, `running` | How Muru runs, and whether it was running |
 | `configuration_changed` | Whether the configuration changed during the window; `null` when the events could not be read to tell |
-| `options` | What was asked for: `scrub` |
+| `options` | What was asked for: `scrub`, `memory`, and `profile_s`, the period profiled, `null` without |
 | `recorded` | How the making of the bundle was recorded, or why it was not |
 | `left_out` | What a bundle never holds, and what `--scrub` took out of this one |
 | `parts` | Every part, each with its `path` and `collected`; `bytes` for one in the archive, `why` for one that is not, and a `note` where there is something to know about it |
@@ -802,6 +832,7 @@ development run and `muructl serve` as well, which keep no files, so
 everything is asked of them.
 
 Each bundle made of a running daemon is the event `debug.bundle`, which
-says what the bundle was of and how far back it reached. A development
+says what the bundle was of, how far back it reached, and which of
+`--scrub`, `--memory` and `--profile` it was made with. A development
 run and `muructl serve` print the same as a line of their output. A dry
 run records nothing.

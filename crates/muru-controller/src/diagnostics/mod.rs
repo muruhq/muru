@@ -250,6 +250,81 @@ pub fn changes_configuration(kind: &str) -> bool {
     })
 }
 
+/// The events that record something going wrong, by type, a type ending
+/// in a full stop standing for every type that starts with it: a request
+/// past a timeout, a worker killed, recycled or gone, a release or a
+/// server that failed.
+const FAILURE_EVENTS: [&str; 18] = [
+    "request.soft_timeout",
+    "request.past_deadline",
+    "worker.timeout_killed",
+    "worker.oom_killed",
+    "worker.recycled",
+    "worker.exited",
+    "worker.loop_stalled",
+    "worker.gil_stalled",
+    "worker.restarted",
+    "release.failed",
+    "release.import_failed",
+    "release.build_failed",
+    "host.exited",
+    "server.exited",
+    "server.failed",
+    "edge.failed",
+    "preload.fell_back",
+    "memory.leak_suspected",
+];
+
+/// Whether an event of this type records a failure: what the automatic
+/// captures of section 11.7 are attached to, and what replaced or lost a
+/// worker.
+pub fn is_failure(kind: &str) -> bool {
+    FAILURE_EVENTS.contains(&kind)
+}
+
+/// The distributions installed in a `site-packages` directory, each as
+/// `name version`, from the names of their `.dist-info` directories.
+/// Nothing is run and no file is opened.
+pub fn installed(site_packages: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let mut found = Vec::new();
+
+    for entry in std::fs::read_dir(site_packages)? {
+        let name = entry?.file_name();
+
+        if let Some(distribution) = name.to_string_lossy().strip_suffix(".dist-info") {
+            found.push(match distribution.rsplit_once('-') {
+                Some((name, version)) => format!("{name} {version}"),
+                None => distribution.to_owned(),
+            });
+        }
+    }
+
+    found.sort();
+    Ok(found)
+}
+
+/// The `site-packages` directories of the environment an interpreter is
+/// in: those under the `lib` beside its `bin`.
+pub fn site_packages(python: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Some(lib) = python
+        .parent()
+        .and_then(std::path::Path::parent)
+        .map(|root| root.join("lib"))
+    else {
+        return Vec::new();
+    };
+
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(lib)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path().join("site-packages"))
+        .filter(|path| path.is_dir())
+        .collect();
+    found.sort();
+    found
+}
+
 /// The event that records a bundle being made: what it is about (the
 /// application or release the bundle is limited to, else the daemon) and
 /// its sentence, which says how far back the bundle reaches.
@@ -390,6 +465,36 @@ mod tests {
         ] {
             assert!(!changes_configuration(kind), "{kind}");
         }
+    }
+
+    #[test]
+    fn the_distributions_of_an_environment_are_read_from_its_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let python = root.path().join("bin/python");
+        let site = root.path().join("lib/python3.13/site-packages");
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+
+        for directory in [
+            "flask-3.0.3.dist-info",
+            "Werkzeug-3.0.1.dist-info",
+            "typing_extensions-4.12.2.dist-info",
+            "flask",
+            "__pycache__",
+        ] {
+            std::fs::create_dir_all(site.join(directory)).unwrap();
+        }
+
+        assert_eq!(site_packages(&python), std::slice::from_ref(&site));
+        assert_eq!(
+            installed(&site).unwrap(),
+            ["Werkzeug 3.0.1", "flask 3.0.3", "typing_extensions 4.12.2"]
+        );
+        assert!(site_packages(std::path::Path::new("/no/such/bin/python")).is_empty());
+        assert!(installed(&root.path().join("nowhere")).is_err());
+
+        assert!(is_failure("worker.timeout_killed"));
+        assert!(is_failure("request.soft_timeout"));
+        assert!(!is_failure("worker.ready"));
     }
 
     #[test]
