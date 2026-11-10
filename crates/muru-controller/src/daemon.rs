@@ -455,6 +455,39 @@ pub enum Command {
         /// Where the outcome goes.
         done: oneshot::Sender<Result<Release, String>>,
     },
+    /// Section 9.1: the releases a route's traffic names and the
+    /// candidates of the rollouts under way, which removal leaves.
+    ReferencedReleases {
+        /// Where the answer goes.
+        done: oneshot::Sender<BTreeSet<(String, String)>>,
+    },
+    /// Section 9.1: drop a release's record unless it has become
+    /// protected since it was chosen. The check and the removal are one
+    /// step of the command loop, so a promotion or rollback cannot slip
+    /// between them.
+    ForgetRelease {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// Where the outcome goes.
+        done: oneshot::Sender<Result<(), String>>,
+    },
+    /// Section 9.1: why an application cannot be removed now, if so.
+    AppRemovalRefused {
+        /// The application.
+        app: String,
+        /// Where the answer goes.
+        done: oneshot::Sender<Option<String>>,
+    },
+    /// Section 9.1: drain whatever an application runs and drop it and
+    /// its release records, unless it cannot be removed now.
+    RemoveApp {
+        /// The application.
+        app: String,
+        /// Where the outcome goes.
+        done: oneshot::Sender<Result<(), String>>,
+    },
     /// Section 10.10: start a recorded release held, for an apply's
     /// prepare phase, unless it runs.
     StartHeld {
@@ -650,6 +683,10 @@ struct HostRecord {
     sockets: Vec<PathBuf>,
     #[serde(default)]
     groups: Vec<GroupRecord>,
+    /// The runtime library directory the host runs with, which `muructl
+    /// cache` leaves while the host is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime: Option<PathBuf>,
 }
 
 /// A named worker group's sockets and paths, for re-adoption and the
@@ -4235,6 +4272,18 @@ impl Daemon {
             Command::Drain { app, id, done } => {
                 let _ = done.send(self.drain_release(&app, &id).await);
             }
+            Command::ReferencedReleases { done } => {
+                let _ = done.send(self.referenced_releases());
+            }
+            Command::ForgetRelease { app, id, done } => {
+                let _ = done.send(self.forget_release(&app, &id));
+            }
+            Command::AppRemovalRefused { app, done } => {
+                let _ = done.send(self.app_removal_refused(&app));
+            }
+            Command::RemoveApp { app, done } => {
+                let _ = done.send(self.remove_app(&app).await);
+            }
             Command::StartHeld { app, id, done } => {
                 let _ = done.send(self.start_held(&app, &id).await);
             }
@@ -5192,6 +5241,7 @@ impl Daemon {
                 pid: host.pid().unwrap_or(0),
                 sockets: host.sockets.clone(),
                 groups: groups.clone(),
+                runtime: library.pythonpath.clone(),
             },
         );
         let now = Instant::now();
@@ -8419,6 +8469,126 @@ impl Daemon {
             .map_err(|error| error.to_string())
     }
 
+    /// Section 9.1: drop a release's record, unless it is protected now.
+    fn forget_release(&self, app: &str, id: &str) -> Result<(), String> {
+        let record = self.store.app(app).map_err(|error| error.to_string())?;
+        let release = self
+            .store
+            .release(app, id)
+            .map_err(|error| error.to_string())?;
+        let candidate = crate::removal::Candidate {
+            id: id.to_owned(),
+            state: release.state,
+            created_unix_ms: release.created_unix_ms,
+            declared: false,
+            referenced: self
+                .referenced_releases()
+                .contains(&(app.to_owned(), id.to_owned())),
+        };
+
+        if let Some(why) = crate::removal::protection(
+            record.current.as_deref(),
+            record.previous.as_deref(),
+            &candidate,
+        ) {
+            return Err(format!("{app}@{id} cannot be removed: {}", why.describe()));
+        }
+
+        if self.running.contains_key(&(app.to_owned(), id.to_owned())) {
+            return Err(format!("{app}@{id} cannot be removed: it is still running"));
+        }
+
+        self.store
+            .delete_release(app, id)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Section 9.1: why an application cannot be removed now, if so: a
+    /// route still sends it traffic, a rollout is under way, or a release
+    /// of it is being built or waits to be started.
+    fn app_removal_refused(&self, app: &str) -> Option<String> {
+        let (routes, _) = self.effective();
+
+        for route in self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .iter()
+            .chain(&routes)
+        {
+            if route_apps(route).contains(&app) {
+                return Some(format!(
+                    "route {} {} sends traffic to {app}; remove the route first",
+                    route.host,
+                    route.key()
+                ));
+            }
+        }
+
+        if let Ok(Some(rollout)) = self.store.active_rollout(app) {
+            return Some(format!(
+                "a rollout of {app} to {} is under way; promote or abort it first",
+                rollout.candidate
+            ));
+        }
+
+        self.store
+            .releases(Some(app))
+            .unwrap_or_default()
+            .iter()
+            .find(|release| {
+                matches!(
+                    release.state,
+                    ReleaseState::Pending | ReleaseState::Building
+                )
+            })
+            .map(|release| {
+                format!(
+                    "{app}@{} is {}; wait for it to finish",
+                    release.id, release.state
+                )
+            })
+    }
+
+    /// Section 9.1: drain whatever an application runs, then drop its
+    /// release records and the application.
+    async fn remove_app(&mut self, app: &str) -> Result<(), String> {
+        if let Some(why) = self.app_removal_refused(app) {
+            return Err(format!("{app} cannot be removed: {why}"));
+        }
+
+        let releases = self
+            .store
+            .releases(Some(app))
+            .map_err(|error| error.to_string())?;
+
+        for release in &releases {
+            let key = (app.to_owned(), release.id.clone());
+
+            if self.running.contains_key(&key) || !release.state.is_final() {
+                self.drain_release(app, &release.id).await?;
+            }
+        }
+
+        if let Some(((_, id), _)) = self.running.iter().find(|((name, _), _)| name == app) {
+            return Err(format!("{app}@{id} did not stop"));
+        }
+
+        self.store
+            .delete_app(app)
+            .map_err(|error| error.to_string())?;
+        self.serving.remove(app);
+        self.maintenance.remove(app);
+
+        // The edge forgets the application with its next snapshot.
+
+        if let Err(error) = self.push_snapshot().await {
+            tracing::warn!(%error, "pushing the snapshot after removing {app} failed");
+        }
+
+        Ok(())
+    }
+
     /// A host that exited on its own fails its release; the release that
     /// serves is started again once.
     async fn check_hosts(&mut self) {
@@ -8750,6 +8920,8 @@ impl Daemon {
                         pid,
                         sockets: all,
                         groups: running.groups.clone(),
+                        runtime: read_record::<HostRecord>(&record)
+                            .and_then(|previous| previous.runtime),
                     },
                 );
 

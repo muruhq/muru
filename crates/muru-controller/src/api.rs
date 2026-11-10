@@ -2,7 +2,7 @@
 //! `muru.admin.v1` service over the admin Unix socket, which muructl and
 //! the dashboard's gateway speak.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use crate::daemon::{CertificateChanges, Command, Handle, RolloutAction};
 use crate::model::{
     Event, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutStep, now_unix_ms,
 };
+use crate::removal;
 
 /// Serve the API on the socket until the returned future ends.
 pub async fn serve(
@@ -689,19 +690,246 @@ impl Admin for Service {
         &self,
         request: Request<pb::ListReleasesRequest>,
     ) -> Result<Response<pb::ListReleasesResponse>, Status> {
-        let app = request.into_inner().app;
-        let app = (!app.is_empty()).then_some(app);
+        let request = request.into_inner();
+        let app = (!request.app.is_empty()).then_some(request.app);
         let releases = self
             .handle
             .store
             .releases(app.as_deref())
             .map_err(internal)?;
-        Ok(Response::new(pb::ListReleasesResponse {
-            releases: releases
-                .into_iter()
-                .map(|release| release_message(release, &self.handle))
-                .collect(),
-        }))
+        let mut releases: Vec<pb::Release> = releases
+            .into_iter()
+            .map(|release| release_message(release, &self.handle))
+            .collect();
+
+        // Walking the environments is only done when asked for.
+
+        if request.disk {
+            let locations = self.handle.info.locations.clone();
+
+            releases = tokio::task::spawn_blocking(move || {
+                for release in &mut releases {
+                    let measure =
+                        removal::measure_release(&locations, &release.app, &release.id, false);
+                    let total = measure.total();
+                    release.disk_bytes = total.used;
+                    release.disk_freed_bytes = total.freed;
+                }
+
+                releases
+            })
+            .await
+            .map_err(internal)?;
+        }
+
+        Ok(Response::new(pb::ListReleasesResponse { releases }))
+    }
+
+    async fn prune_releases(
+        &self,
+        request: Request<pb::PruneReleasesRequest>,
+    ) -> Result<Response<pb::RemoveReleasesResponse>, Status> {
+        let request = request.into_inner();
+        let store = &self.handle.store;
+
+        let apps = if request.app.is_empty() {
+            store.apps().map_err(internal)?
+        } else {
+            vec![store.app(&request.app).map_err(not_found)?]
+        };
+
+        // Section 9.1: a removal waits for an apply under way, which may
+        // be about to start or promote what is chosen here.
+
+        let _applying = if request.dry_run {
+            None
+        } else {
+            Some(self.applying.clone().lock_owned().await)
+        };
+
+        let referenced = self.referenced_releases().await?;
+        let mut planned = Vec::new();
+        let mut kept = Vec::new();
+
+        for app in apps {
+            let candidates = self.candidates(&app.name, &referenced)?;
+            let decision = removal::decide_prune(
+                app.current.as_deref(),
+                app.previous.as_deref(),
+                &candidates,
+                request.keep,
+                request.force,
+            );
+
+            for (id, why) in decision.kept {
+                let state = candidates
+                    .iter()
+                    .find(|candidate| candidate.id == id)
+                    .map(|candidate| candidate.state.to_string())
+                    .unwrap_or_default();
+
+                kept.push(pb::KeptRelease {
+                    app: app.name.clone(),
+                    id,
+                    state,
+                    why: why.as_str().to_owned(),
+                });
+            }
+
+            for (id, why) in decision.removed {
+                let Some(candidate) = candidates.iter().find(|candidate| candidate.id == id) else {
+                    continue;
+                };
+
+                planned.push(Planned {
+                    app: app.name.clone(),
+                    id,
+                    state: candidate.state,
+                    created_unix_ms: candidate.created_unix_ms,
+                    why,
+                });
+            }
+        }
+
+        let mut answer = self
+            .carry_out(planned, request.keep_logs, request.dry_run)
+            .await?;
+        answer.kept = kept;
+
+        Ok(Response::new(answer))
+    }
+
+    async fn remove_app(
+        &self,
+        request: Request<pb::RemoveAppRequest>,
+    ) -> Result<Response<pb::RemoveReleasesResponse>, Status> {
+        let request = request.into_inner();
+        let store = &self.handle.store;
+        let app = store.app(&request.app).map_err(not_found)?;
+
+        let _applying = if request.dry_run {
+            None
+        } else {
+            Some(self.applying.clone().lock_owned().await)
+        };
+
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::AppRemovalRefused {
+                app: app.name.clone(),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+
+        if let Some(why) = done_rx.await.map_err(|_| Status::unavailable(STOPPING))? {
+            return Err(Status::failed_precondition(format!(
+                "{} cannot be removed: {why}",
+                app.name
+            )));
+        }
+
+        let planned: Vec<Planned> = store
+            .releases(Some(&app.name))
+            .map_err(internal)?
+            .into_iter()
+            .map(|release| Planned {
+                app: app.name.clone(),
+                id: release.id,
+                state: release.state,
+                created_unix_ms: release.created_unix_ms,
+                why: removal::Reason::Application,
+            })
+            .collect();
+        let mut answer = self.measured(&planned, false, request.dry_run).await?;
+
+        if request.dry_run {
+            return Ok(Response::new(answer));
+        }
+
+        // The daemon drains what runs and drops the records in one step;
+        // the files follow, since a release's environment can be large.
+
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::RemoveApp {
+                app: app.name.clone(),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+
+        for (item, message) in planned.iter().zip(answer.removed.iter_mut()) {
+            self.handle.events.emit(
+                "release.removed",
+                &format!("{}@{}", item.app, item.id),
+                "notice",
+                item.why.event_message(),
+            );
+            message.error = self
+                .remove_files(&item.app, &item.id, false)
+                .await
+                .join("; ");
+        }
+
+        settle_freed(&mut answer);
+        Ok(Response::new(answer))
+    }
+
+    async fn remove_release(
+        &self,
+        request: Request<pb::RemoveReleaseRequest>,
+    ) -> Result<Response<pb::RemoveReleasesResponse>, Status> {
+        let request = request.into_inner();
+        let app = self.handle.store.app(&request.app).map_err(not_found)?;
+
+        let _applying = if request.dry_run {
+            None
+        } else {
+            Some(self.applying.clone().lock_owned().await)
+        };
+
+        let referenced = self.referenced_releases().await?;
+        let candidates = self.candidates(&app.name, &referenced)?;
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.id == request.release)
+            .ok_or_else(|| {
+                Status::not_found(format!("no release {}@{}", app.name, request.release))
+            })?;
+
+        // Section 9.1: the protected releases are refused by name too. A
+        // failed release named goes without waiting for the cutoff.
+
+        if let Some(why) =
+            removal::protection(app.current.as_deref(), app.previous.as_deref(), candidate)
+        {
+            return Err(Status::failed_precondition(format!(
+                "{}@{} cannot be removed: {}",
+                app.name,
+                candidate.id,
+                why.describe()
+            )));
+        }
+
+        let planned = vec![Planned {
+            app: app.name.clone(),
+            id: candidate.id.clone(),
+            state: candidate.state,
+            created_unix_ms: candidate.created_unix_ms,
+            why: removal::Reason::Named,
+        }];
+
+        Ok(Response::new(
+            self.carry_out(planned, request.keep_logs, request.dry_run)
+                .await?,
+        ))
     }
 
     async fn get_release(
@@ -1144,6 +1372,57 @@ impl Admin for Service {
                 ),
             );
         }
+
+        Ok(Response::new(answer))
+    }
+
+    async fn list_cache(
+        &self,
+        _: Request<pb::ListCacheRequest>,
+    ) -> Result<Response<pb::ListCacheResponse>, Status> {
+        let releases = self.handle.store.releases(None).map_err(internal)?;
+        let locations = self.handle.info.locations.clone();
+
+        let answer =
+            tokio::task::spawn_blocking(move || crate::cache::state_report(&locations, &releases))
+                .await
+                .map_err(internal)?;
+
+        Ok(Response::new(answer))
+    }
+
+    async fn prune_cache(
+        &self,
+        request: Request<pb::PruneCacheRequest>,
+    ) -> Result<Response<pb::RemoveCacheResponse>, Status> {
+        let request = request.into_inner();
+        let releases = self.handle.store.releases(None).map_err(internal)?;
+        let locations = self.handle.info.locations.clone();
+        let named = |text: String| (!text.is_empty()).then_some(text);
+        let (version, tag) = (named(request.version), named(request.tag));
+
+        let answer = tokio::task::spawn_blocking(move || {
+            crate::cache::prune_state(&locations, &releases, version, tag, request.dry_run)
+        })
+        .await
+        .map_err(internal)?;
+
+        Ok(Response::new(answer))
+    }
+
+    async fn clear_cache(
+        &self,
+        request: Request<pb::ClearCacheRequest>,
+    ) -> Result<Response<pb::RemoveCacheResponse>, Status> {
+        let dry_run = request.into_inner().dry_run;
+        let releases = self.handle.store.releases(None).map_err(internal)?;
+        let locations = self.handle.info.locations.clone();
+
+        let answer = tokio::task::spawn_blocking(move || {
+            crate::cache::clear_state(&locations, &releases, dry_run)
+        })
+        .await
+        .map_err(internal)?;
 
         Ok(Response::new(answer))
     }
@@ -2384,11 +2663,24 @@ impl Service {
         report.applied = true;
         let mut failures = 0;
 
+        // Section 9.1: what the files declare, for release prune to leave.
+
+        for (app, ids) in &plan.declared {
+            if let Err(error) = self.handle.store.set_declared_releases(app, ids) {
+                tracing::warn!(%error, "recording what the applied files declare for {app} failed");
+            }
+        }
+
         for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
             let outcome = match &change.action {
                 Action::RemoveRelease { app, id } => {
-                    self.remove_release(app, id, "pruned: the applied files do not declare it")
-                        .await
+                    self.drain_and_remove(
+                        app,
+                        id,
+                        "pruned: the applied files do not declare it",
+                        false,
+                    )
+                    .await
                 }
                 Action::RemoveApp { app } => self
                     .handle
@@ -2620,8 +2912,10 @@ impl Service {
 
         let why = format!("the apply that added it was undone: {error}");
 
+        // Its log is left, since it may say why the apply failed.
+
         for (app, id) in prepared.releases.iter().rev() {
-            if let Err(why) = self.remove_release(app, id, &why).await {
+            if let Err(why) = self.drain_and_remove(app, id, &why, true).await {
                 tracing::warn!(%why, "removing {app}@{id} after a failed apply failed");
             }
         }
@@ -2663,9 +2957,17 @@ impl Service {
         report.errors.push(error);
     }
 
-    /// Drain a release if it runs, then drop its record, with a
-    /// `release.removed` event saying `why`.
-    async fn remove_release(&self, app: &str, id: &str, why: &str) -> Result<String, String> {
+    /// Drain a release if it runs, then drop its record and its files,
+    /// with a `release.removed` event saying `why`. This is the path of an
+    /// apply; what the protected releases of section 9.1 are does not
+    /// apply to it, since a prune there removes what the files do not name.
+    async fn drain_and_remove(
+        &self,
+        app: &str,
+        id: &str,
+        why: &str,
+        keep_logs: bool,
+    ) -> Result<String, String> {
         let running = self
             .handle
             .store
@@ -2697,23 +2999,145 @@ impl Service {
             .events
             .emit("release.removed", &format!("{app}@{id}"), "notice", why);
 
-        // Section 8.2: the environment built for the release and its
-        // bytecode go with it.
-
-        let state = &self.handle.info.locations.state.path;
-
-        for dir in [
-            crate::provision::Provisioning::environment_dir(state, app, id),
-            crate::provision::Provisioning::pycache_dir(state, app, id),
-        ] {
-            if dir.is_dir()
-                && let Err(error) = std::fs::remove_dir_all(&dir)
-            {
-                tracing::warn!(%error, "removing {} failed", dir.display());
-            }
+        for failure in self.remove_files(app, id, keep_logs).await {
+            tracing::warn!("removing a file of {app}@{id} failed: {failure}");
         }
 
         Ok(outcome.to_owned())
+    }
+
+    /// Remove a release's files off the async workers, saying what could
+    /// not be removed.
+    async fn remove_files(&self, app: &str, id: &str, keep_logs: bool) -> Vec<String> {
+        let locations = self.handle.info.locations.clone();
+        let (app, id) = (app.to_owned(), id.to_owned());
+
+        tokio::task::spawn_blocking(move || removal::remove_files(&locations, &app, &id, keep_logs))
+            .await
+            .unwrap_or_else(|error| vec![error.to_string()])
+    }
+
+    /// What the daemon's command loop says is referenced now.
+    async fn referenced_releases(&self) -> Result<BTreeSet<(String, String)>, Status> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::ReferencedReleases { done: done_tx })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+
+        done_rx.await.map_err(|_| Status::unavailable(STOPPING))
+    }
+
+    /// What deciding a removal needs to know of an application's releases.
+    fn candidates(
+        &self,
+        app: &str,
+        referenced: &BTreeSet<(String, String)>,
+    ) -> Result<Vec<removal::Candidate>, Status> {
+        let store = &self.handle.store;
+        let declared = store.declared_releases(app).map_err(internal)?;
+
+        Ok(store
+            .releases(Some(app))
+            .map_err(internal)?
+            .into_iter()
+            .map(|release| removal::Candidate {
+                declared: declared.contains(&release.id),
+                referenced: referenced.contains(&(app.to_owned(), release.id.clone())),
+                id: release.id,
+                state: release.state,
+                created_unix_ms: release.created_unix_ms,
+            })
+            .collect())
+    }
+
+    /// What the planned releases take, as the answer a removal gives
+    /// before anything has gone.
+    async fn measured(
+        &self,
+        planned: &[Planned],
+        keep_logs: bool,
+        dry_run: bool,
+    ) -> Result<pb::RemoveReleasesResponse, Status> {
+        let locations = self.handle.info.locations.clone();
+        let keys: Vec<(String, String)> = planned
+            .iter()
+            .map(|item| (item.app.clone(), item.id.clone()))
+            .collect();
+
+        let (each, together) = tokio::task::spawn_blocking(move || {
+            removal::measure_releases(&locations, &keys, keep_logs)
+        })
+        .await
+        .map_err(internal)?;
+
+        Ok(pb::RemoveReleasesResponse {
+            removed: planned
+                .iter()
+                .zip(&each)
+                .map(|(item, disk)| pb::RemovedRelease {
+                    app: item.app.clone(),
+                    id: item.id.clone(),
+                    state: item.state.to_string(),
+                    created_unix_ms: item.created_unix_ms,
+                    disk_bytes: disk.freed,
+                    why: item.why.as_str().to_owned(),
+                    error: String::new(),
+                })
+                .collect(),
+            kept: Vec::new(),
+            freed: together.freed,
+            dry_run,
+        })
+    }
+
+    /// Measure what the planned releases take and, unless this is a dry
+    /// run, remove them one at a time. The daemon checks each again as it
+    /// drops the record, so one that became protected since it was chosen
+    /// is reported and left.
+    async fn carry_out(
+        &self,
+        planned: Vec<Planned>,
+        keep_logs: bool,
+        dry_run: bool,
+    ) -> Result<pb::RemoveReleasesResponse, Status> {
+        let mut answer = self.measured(&planned, keep_logs, dry_run).await?;
+
+        if dry_run {
+            return Ok(answer);
+        }
+
+        for (item, message) in planned.iter().zip(answer.removed.iter_mut()) {
+            let (done_tx, done_rx) = oneshot::channel();
+            self.handle
+                .commands
+                .send(Command::ForgetRelease {
+                    app: item.app.clone(),
+                    id: item.id.clone(),
+                    done: done_tx,
+                })
+                .await
+                .map_err(|_| Status::unavailable(STOPPING))?;
+
+            if let Err(why) = done_rx.await.map_err(|_| Status::unavailable(STOPPING))? {
+                message.error = why;
+                continue;
+            }
+
+            self.handle.events.emit(
+                "release.removed",
+                &format!("{}@{}", item.app, item.id),
+                "notice",
+                item.why.event_message(),
+            );
+
+            let failures = self.remove_files(&item.app, &item.id, keep_logs).await;
+            message.error = failures.join("; ");
+        }
+
+        settle_freed(&mut answer);
+        Ok(answer)
     }
 
     /// Push a snapshot with the hosts and routes as they now are.
@@ -2731,6 +3155,28 @@ impl Service {
 
 /// The outcome when the daemon's command loop has gone.
 const STOPPING: &str = "the daemon is stopping";
+
+/// A release that was not removed gave nothing back, so with any left
+/// the total is what those that went gave back.
+fn settle_freed(answer: &mut pb::RemoveReleasesResponse) {
+    if answer.removed.iter().any(|item| !item.error.is_empty()) {
+        answer.freed = answer
+            .removed
+            .iter()
+            .filter(|item| item.error.is_empty())
+            .map(|item| item.disk_bytes)
+            .sum();
+    }
+}
+
+/// A release chosen for removal, before its disk use is known.
+struct Planned {
+    app: String,
+    id: String,
+    state: ReleaseState,
+    created_unix_ms: u64,
+    why: removal::Reason,
+}
 
 /// A report with one parse error and nothing else.
 fn parse_failure(error: String) -> pb::ConfigReport {
@@ -3238,6 +3684,8 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
             })
             .collect(),
         host_running: live.host,
+        disk_bytes: 0,
+        disk_freed_bytes: 0,
         retained_until_unix_ms: live.retained_until_unix_ms,
         kind: if release.spec.http.is_some() {
             "http".to_owned()

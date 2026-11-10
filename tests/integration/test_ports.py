@@ -7,7 +7,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -22,7 +21,7 @@ def run_muructl(*args: str) -> tuple[subprocess.Popen[bytes], Path]:
     muructl = support.muructl_path()
     if muructl is None or not support.extension_available():
         pytest.skip("muructl and the extension must be built")
-    log = Path(tempfile.mkstemp(prefix="muru-ports-", suffix=".log")[1])
+    log = support.temporary_log("muru-ports-")
 
     with log.open("wb") as handle:
         process = subprocess.Popen(

@@ -335,6 +335,9 @@ pub struct Plan {
     pub changes: Vec<Change>,
     /// Releases, hosts and routes already recorded as declared.
     pub unchanged: u32,
+    /// The releases the document declares, by application, which `release
+    /// prune` leaves unless forced (section 9.1).
+    pub declared: Vec<(String, Vec<String>)>,
 }
 
 /// The refusal for making `app` serve while other applications do and no
@@ -553,6 +556,8 @@ pub fn plan(
         .collect();
 
     for (name, app) in &document.app {
+        plan.declared
+            .push((name.clone(), app.release.keys().cloned().collect()));
         let applying = Applying { prune, hold };
         promotions.extend(plan_app(
             store,

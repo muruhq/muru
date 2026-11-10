@@ -2948,7 +2948,7 @@
           "x-default": "`python` in the state directory"
         },
         "uv": {
-          "description": "The uv to run, in place of the lookup order (`MURU_UV`, a uv beside muructl, uv on PATH, the managed copy).",
+          "description": "The uv to run, in place of the lookup order (`MURU_UV`, a uv beside muructl, uv on PATH).",
           "type": "string"
         },
         "uv_config": {

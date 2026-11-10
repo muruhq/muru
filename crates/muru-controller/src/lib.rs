@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod budget;
+pub mod cache;
 pub mod cgroup;
 pub mod client;
 pub mod clients;
@@ -14,6 +15,7 @@ pub mod commands;
 pub mod config;
 pub mod daemon;
 pub mod dashboard;
+pub mod disk;
 pub mod edges;
 pub mod events;
 pub mod fdpass;
@@ -27,6 +29,7 @@ pub mod notify;
 pub mod overlays;
 pub mod provision;
 pub mod reload;
+pub mod removal;
 pub mod render;
 pub mod rollouts;
 pub mod rotation;

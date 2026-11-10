@@ -310,7 +310,7 @@ pub async fn own(args: &ProjectArgs) -> anyhow::Result<Context> {
         .unwrap_or_else(|_| settings.project.clone());
     let table = found.map(|(_, table)| table).unwrap_or_default();
 
-    let uv = muru_provision::Uv::find(None, None);
+    let uv = muru_provision::Uv::find(None);
     let isolation = muru_provision::Isolation::default();
 
     let python = muru_provision::resolve(&muru_provision::Inputs {

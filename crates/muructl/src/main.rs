@@ -228,6 +228,11 @@ enum Command {
     },
 
     /// The runtime library on its own: unpack it for an image.
+    Cache {
+        #[command(subcommand)]
+        command: admin::CacheCommand,
+    },
+
     Runtime {
         #[command(subcommand)]
         command: provision::RuntimeCommand,
@@ -953,6 +958,13 @@ fn main() -> anyhow::Result<()> {
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
         Command::Debug { command } => runtime.block_on(admin::debug(command)),
+        Command::Cache { command } => runtime.block_on(async move {
+            match command {
+                admin::CacheCommand::List(args) => admin::cache_list(*args).await,
+                admin::CacheCommand::Prune(args) => admin::cache_prune(*args).await,
+                admin::CacheCommand::Clear(args) => admin::cache_clear(*args).await,
+            }
+        }),
         Command::Runtime { command } => runtime.block_on(provision::run(command)),
         Command::Secret { command } => runtime.block_on(admin::secret(command)),
         Command::Logging { command } => runtime.block_on(admin::logging(command)),
@@ -963,6 +975,7 @@ fn main() -> anyhow::Result<()> {
                 admin::AppCommand::List { socket, output } => {
                     admin::app_list(socket, output.json).await
                 }
+                admin::AppCommand::Remove(args) => admin::app_remove(*args).await,
             }
         }),
         Command::Release { command } => runtime.block_on(async move {
@@ -972,6 +985,8 @@ fn main() -> anyhow::Result<()> {
                     socket,
                     output,
                 } => admin::release_list(app, socket, output.json).await,
+                admin::ReleaseCommand::Prune(args) => admin::release_prune(*args).await,
+                admin::ReleaseCommand::Remove(args) => admin::release_remove(*args).await,
                 admin::ReleaseCommand::Show {
                     release,
                     socket,
@@ -2402,7 +2417,7 @@ fn interpreter(
     resolved: &Resolved,
     built: bool,
 ) -> anyhow::Result<muru_provision::Resolved> {
-    let uv = muru_provision::Uv::find(None, None);
+    let uv = muru_provision::Uv::find(None);
     let isolation = muru_provision::Isolation::default();
 
     // After a build the environment just made is what runs: the flag's
@@ -3341,7 +3356,13 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
             &label,
             &project,
         ),
-        None => run_admin::Registration::new(&runtime, edge.local_addr(), &label, &project),
+        None => run_admin::Registration::new(
+            &runtime,
+            edge.local_addr(),
+            &label,
+            &project,
+            library.pythonpath.as_deref(),
+        ),
     };
 
     let registration = match registered {
@@ -3609,6 +3630,12 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
                         spec.python = python.python.clone();
                         spec.pythonpath = library.pythonpath.clone();
                         served.replace(spec.python.clone(), spec.pythonpath.clone());
+
+                        if let (Some(registration), Some(directory)) =
+                            (&registration, &library.pythonpath)
+                        {
+                            registration.note_runtime(directory);
+                        }
                     }
                     Ok(false) => {}
                     Err(error) => {

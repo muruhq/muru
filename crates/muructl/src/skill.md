@@ -86,8 +86,10 @@ directory and `deploy`'s settings, without the daemon.
 
 6. Clean up: `rollback` when a release made things worse, `drain` a
    release that is no longer needed. `log_files` shows what the logs
-   take. `truncate_logs` and `prune_logs` remove what they name and are
-   refused unless `yes` is true, so ask the developer first.
+   take and `cache` what the caches do. `truncate_logs`, `prune_logs`,
+   `prune_releases`, `remove_release`, `remove_app`, `prune_cache` and
+   `clear_cache` remove what they name and are refused unless `yes` is
+   true, so ask the developer first; `dry_run` lists what they would take.
 
 ## What to check after each operation
 

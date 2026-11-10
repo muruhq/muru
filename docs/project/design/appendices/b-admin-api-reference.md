@@ -18,7 +18,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | Resource | Gateway path | Notes |
 | --- | --- | --- |
 | Application | /v1/apps/{app} | defaults, reload, memory and timeout settings |
-| Release | /v1/apps/{app}/releases/{release} | create starts it, immutable except scale and limits |
+| Release | /v1/apps/{app}/releases/{release} | create starts it, immutable except scale and limits; ListReleases measures disk use when asked |
 | WorkerGroup | /v1/apps/{app}/releases/{release}/groups/{group} | Get, List, Watch, Update of sizes and scaling |
 | Worker | /v1/apps/{app}/releases/{release}/groups/{group}/workers/{worker} | read only |
 | Schedule | /v1/apps/{app}/schedules/{schedule} | scheduled capacity |
@@ -50,6 +50,9 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | CheckRelease | POST /v1/apps/{app}:check | validate in a throwaway host |
 | PauseRollout, ResumeRollout, PromoteRollout, AbortRollout | POST /v1/apps/{app}/rollouts/{rollout}:pause, :resume, :promote, :abort | rollout control |
 | DrainRelease | POST /v1/apps/{app}/releases/{release}:drain | drain with timeouts |
+| RemoveRelease | DELETE /v1/apps/{app}/releases/{release} | remove one release, the protected ones of 9.1 refused, or say what it would free |
+| RemoveApp | DELETE /v1/apps/{app} | drain what runs and remove the application and its releases, refused while a route sends it traffic, or say what would go |
+| PruneReleases | POST /v1/apps/{app}/releases:prune | remove old releases by the rules of 9.1, of an application or of all, or list what would go |
 | SetScale | POST /v1/apps/{app}/releases/{release}:scale | sizes, bounds, temporary floors |
 | GetScaleStatus | GET /v1/apps/{app}/releases/{release}/scale | signals, decisions, churn |
 | SetMaintenance | POST /v1/apps/{app}:maintenance | maintenance mode |
@@ -61,6 +64,9 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | PruneLogs | POST /v1/logs:prune | remove archives by count or age and, when asked, the logs and archives of releases and hosts that no longer exist, or list what would go |
 | TruncateLogs | POST /v1/logs:truncate | cut live logs to their newest bytes at a line boundary, or say what that would free; a running daemon holds the files against rotation while it does |
 | ListLogs | GET /v1/logs | each log with its size, archives and total, and whether its release or host still exists |
+| ListCache | GET /v1/cache | what the daemon's re-creatable data takes and what uses each entry |
+| PruneCache | POST /v1/cache:prune | remove runtime libraries of other versions, or of the version or tag named, and downloaded Pythons no release uses, leaving what is in use, or list what would go |
+| ClearCache | POST /v1/cache:clear | remove everything in the daemon's re-creatable data that is not in use, or list it |
 | GetMetrics | GET /metrics | the Prometheus text exposition (11.1) |
 | SetLogLevel | POST /v1/apps/{app}/releases/{release}:loglevel | time-limited logger levels |
 | OverrideAccessLog | POST /v1/access-log:override | time-limited changes to which requests the access log writes, listed or reset |

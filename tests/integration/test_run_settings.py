@@ -10,7 +10,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -49,7 +48,7 @@ def start(directory: Path, *args: str, dashboard: bool = True) -> support.Server
     dashboard is on a free port unless `dashboard` is False, which leaves
     it to the table."""
 
-    log = Path(tempfile.mkstemp(prefix="muru-run-settings-", suffix=".log")[1])
+    log = support.temporary_log("muru-run-settings-")
     dashboard_options, dashboard_port = support.dashboard_args(args) if dashboard else ([], None)
 
     with log.open("wb") as handle:

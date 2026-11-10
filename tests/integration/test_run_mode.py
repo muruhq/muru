@@ -7,7 +7,6 @@ import json
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -35,7 +34,7 @@ def start_raw(*args: str) -> tuple[subprocess.Popen[bytes], Path]:
     muructl = support.muructl_path()
     if muructl is None or not support.extension_available():
         pytest.skip("muructl and the extension must be built")
-    log = Path(tempfile.mkstemp(prefix="muru-mode-", suffix=".log")[1])
+    log = support.temporary_log("muru-mode-")
 
     with log.open("wb") as handle:
         process = subprocess.Popen(
