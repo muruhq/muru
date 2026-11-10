@@ -56,7 +56,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Capacity | muructl restart RELEASE or APP --worker N | Replace one worker with a fresh one, or every worker in turn with --all; --pid names it by process id, --force kills it at once, --no-wait returns before the replacement serves | 7.6 |
 | Capacity | muructl schedule add, list, remove | Scheduled capacity | 7.5 |
 | Capacity | muructl edge pools, set | Edge pools and process counts | 4.2 |
-| Operations | muructl cache list [user or daemon] | What the user cache and the daemon's re-creatable data take, by runtime library version and tag, certificates, managed uv, uv's build cache and downloaded Pythons, with what uses each. Flags: --json, and with no daemon running --state-dir and --cache-dir | 13.8 |
+| Operations | muructl cache list [user or daemon] | What the user cache and the daemon's re-creatable data take, by runtime library version and tag, certificates, uv's build cache and downloaded Pythons, with what uses each. Flags: --json, and with no daemon running --state-dir and --cache-dir | 13.8 |
 | Operations | muructl cache prune [user or daemon] | Remove runtime libraries of other versions, or of the version or tag named, and downloaded Pythons no release uses; what is in use is left. Asks first. Flags: --version, --tag, --dry-run, --yes, --json, --state-dir, --cache-dir | 13.8 |
 | Operations | muructl cache clear user or daemon | Remove everything in the area that is not in use. Asks first. Flags: --certs (the development certificates too), --dry-run, --yes, --json, --state-dir, --cache-dir | 13.8 |
 | Observability | muructl watch | Live view of applications, releases and workers | 10.7 |
@@ -80,7 +80,6 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Observability | muructl debug inspect TARGET | sys.path, modules, redacted environment, settings, descriptors and threads | 11.7 |
 | Images and tools | muructl image check IMAGE | Probe an image against the contract | 8.6 |
 | Images and tools | muructl image build, dockerfile | Build an image or print the generated Dockerfile (later) | 8.6 |
-| Images and tools | muructl tools install uv | Managed copy of uv | 8.4 |
 | Images and tools | muructl runtime install --python PYTHON --target DIR | Unpack the runtime library for that interpreter's tag, the image build step | 8.3 |
 | Traffic | muructl overlay list, show, preview NAME | Overlays, triggers and effective changes | 9.10 |
 | Traffic | muructl overlay activate, end NAME [--for, --until] | Manual activation and ending | 9.10 |

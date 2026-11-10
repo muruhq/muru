@@ -1142,7 +1142,7 @@ message ListCacheRequest {}
 
 // One thing a cache area holds.
 message CacheEntry {
-  string kind = 1;                  // runtime, certs, uv, uv_cache or python
+  string kind = 1;                  // runtime, certs, uv_cache or python
   string name = 2;                  // its name within the area
   string path = 3;
   string version = 4;               // of a runtime library

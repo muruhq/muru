@@ -473,7 +473,7 @@ mod tests {
     fn a_project_without_a_lock_cannot_be_built() {
         let dir = tempfile::tempdir().unwrap();
         let fake = crate::uv::tests::fake_uv(dir.path(), None);
-        let uv = Uv::find(Some(&fake), None).unwrap();
+        let uv = Uv::find(Some(&fake)).unwrap();
         let build = Build {
             project: dir.path().to_path_buf(),
             python: None,

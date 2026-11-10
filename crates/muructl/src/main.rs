@@ -2417,7 +2417,7 @@ fn interpreter(
     resolved: &Resolved,
     built: bool,
 ) -> anyhow::Result<muru_provision::Resolved> {
-    let uv = muru_provision::Uv::find(None, None);
+    let uv = muru_provision::Uv::find(None);
     let isolation = muru_provision::Isolation::default();
 
     // After a build the environment just made is what runs: the flag's

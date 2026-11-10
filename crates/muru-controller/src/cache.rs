@@ -17,8 +17,6 @@ use crate::provision::Provisioning;
 pub const RUNTIME: &str = "runtime";
 /// The development certificates.
 pub const CERTS: &str = "certs";
-/// A managed uv.
-pub const UV: &str = "uv";
 /// uv's build cache, of one user.
 pub const UV_CACHE: &str = "uv_cache";
 /// A Python uv downloaded for the daemon.
@@ -91,23 +89,21 @@ fn children(root: &Path, name: &str, kind: &str) -> Vec<pb::CacheEntry> {
         .collect()
 }
 
-/// What the user cache holds: the runtime library by version and tag, the
-/// development certificates and a managed uv.
+/// What the user cache holds: the runtime library by version and tag and
+/// the development certificates.
 pub fn user_entries(root: &Path) -> Vec<pb::CacheEntry> {
     let mut entries = runtime_entries(root);
     entries.extend(whole(root, "certs", CERTS));
-    entries.extend(whole(root, "tools", UV));
     entries
 }
 
 /// What a daemon's state directory holds that can be re-created: the
-/// runtime library by version and tag, uv's build cache for each user,
-/// the Pythons it downloaded and a managed uv.
+/// runtime library by version and tag, uv's build cache for each user
+/// and the Pythons it downloaded.
 pub fn state_entries(root: &Path) -> Vec<pb::CacheEntry> {
     let mut entries = runtime_entries(root);
     entries.extend(children(root, "uv-cache", UV_CACHE));
     entries.extend(children(root, "python", PYTHON));
-    entries.extend(whole(root, "tools", UV));
     entries
 }
 
@@ -524,15 +520,18 @@ mod tests {
             runtime("1.0.0", "cp313", ""),
             runtime("1.0.0", "cp314", "the development run of shop"),
             other(CERTS, "certs", ""),
-            other(UV, "tools", ""),
+            other(UV_CACHE, "uv-cache/a", ""),
         ];
 
         let answer = plan_clear(report_of(entries.clone()), false, true);
-        assert_eq!(named(&answer.removed), ["1.0.0/cp313", "tools"]);
+        assert_eq!(named(&answer.removed), ["1.0.0/cp313", "uv-cache/a"]);
         assert_eq!(named(&answer.left), ["1.0.0/cp314"]);
 
         let answer = plan_clear(report_of(entries), true, true);
-        assert_eq!(named(&answer.removed), ["1.0.0/cp313", "certs", "tools"]);
+        assert_eq!(
+            named(&answer.removed),
+            ["1.0.0/cp313", "certs", "uv-cache/a"]
+        );
     }
 
     #[test]
@@ -612,18 +611,13 @@ mod tests {
         write(root.join("runtime/0.1.0a15/cp313/muru/__init__.py"));
         write(root.join("runtime/0.1.0a16/cp315t/muru/__init__.py"));
         write(root.join("certs/dev.pem"));
-        write(root.join("tools/uv"));
 
         let entries = user_entries(root);
         let names: Vec<&str> = entries.iter().map(|item| item.name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["0.1.0a15/cp313", "0.1.0a16/cp315t", "certs", "tools"]
-        );
+        assert_eq!(names, ["0.1.0a15/cp313", "0.1.0a16/cp315t", "certs"]);
         assert_eq!(entries[0].version, "0.1.0a15");
         assert_eq!(entries[1].tag, "cp315t");
         assert_eq!(entries[2].kind, CERTS);
-        assert_eq!(entries[3].kind, UV);
 
         let answer = report(root, entries);
         assert!(answer.total > 0);

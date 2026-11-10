@@ -7972,7 +7972,7 @@ pub async fn logs_prune(args: LogsPruneArgs) -> anyhow::Result<()> {
 /// The areas `muructl cache` works on.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum CacheArea {
-    /// The user cache: runtime libraries, certificates, a managed uv.
+    /// The user cache: runtime libraries and certificates.
     User,
     /// The daemon's state directory: its runtime libraries, uv's build
     /// cache and downloaded Pythons.
@@ -8002,7 +8002,7 @@ pub struct CacheListArgs {
 pub enum CacheCommand {
     /// Show what the user cache and the daemon's re-creatable data take,
     /// each runtime library by version and interpreter tag, the certificates,
-    /// a managed uv, uv's build cache and downloaded Pythons.
+    /// uv's build cache and downloaded Pythons.
     List(Box<CacheListArgs>),
 
     /// Remove what is stale: runtime libraries of other versions, or of
