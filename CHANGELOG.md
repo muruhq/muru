@@ -9,6 +9,38 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a22 (2026-11-10)
+
+### Added
+
+- Added `muructl cache list`, `prune` and `clear`, which show what the user cache and the daemon's re-creatable data take and remove what is stale or re-creatable, leaving what is in use. ([#364](https://github.com/muruhq/muru/issues/364))
+- Added `muructl app remove`, `muructl release prune` and `muructl release remove`, which remove an application or old releases with their environments, bytecode and logs, keeping the newest you name beside the serving, rollback and running releases. `muructl release list` shows the disk each release takes, and `muructl apply --prune` removes logs with the release. ([#526](https://github.com/muruhq/muru/issues/526))
+- Added `muructl logs list`, `truncate`, `rotate` and `prune`, which show what each log takes, cut a live log down to its newest content, rotate on demand and remove archives and the logs of releases and hosts that no longer exist, working on the files themselves when no daemon is running. ([#527](https://github.com/muruhq/muru/issues/527))
+- Added `muructl debug report`, a short summary of an installation to attach to a bug report, as text, Markdown (`--format markdown`) or JSON. It is safe to post: it holds no logs, request data, environment or secrets, and replaces application names, host names, paths and addresses with placeholders. It works with no daemon running, and against `muructl run` and `muructl serve`, where `muructl config show --effective` now lists the settings in force too. ([#540](https://github.com/muruhq/muru/issues/540))
+- Added `muructl debug bundle`, which writes one archive of a whole system for a time window (`--since`), for the people who own it to triage with: its logs and events, the configuration in force and what the workers are doing. It works with the daemon stopped, records what it could not collect in its manifest, writes to a file only its owner can read or to standard output (`--output -`), and with `--dry-run` says what it would hold. ([#541](https://github.com/muruhq/muru/issues/541))
+
+### Removed
+
+- Removed the lookup for a managed copy of uv under the daemon's state directory, which nothing installed. uv is found through `tools.uv`, `MURU_UV`, beside `muructl` or on `PATH`. ([#538](https://github.com/muruhq/muru/issues/538))
+
+### Fixed
+
+- Fixed a daemon that started while one instance of a managed HTTP server had exited starting the whole release afresh beside the instances still running, which were left with nothing supervising or stopping them. The daemon now takes over each instance that is still running and starts the others again. ([#389](https://github.com/muruhq/muru/issues/389))
+- Fixed stopping a managed HTTP server killing only the process its command started. An instance still running after `shutdown_timeout` is now killed together with every process it started, and processes left behind by an instance that exited in time are stopped as well. ([#390](https://github.com/muruhq/muru/issues/390))
+- Fixed a daemon that takes over a managed HTTP server trusting any running process that had a recorded pid, which it would later stop as if it were the instance. The record now holds the start time of each instance's process, and a pid that has passed to another process is not taken over and is never signalled. ([#391](https://github.com/muruhq/muru/issues/391))
+- Fixed log rotation by period being lost across a daemon restart: the daemon now records the period each log was last seen in, so a period that ends while it is stopped rotates the file once when it next runs, and an empty file is not rotated. ([#525](https://github.com/muruhq/muru/issues/525))
+- Fixed rotation of the edge's own log, which left the edge writing to the archive so that its later lines were lost once the archive was compressed: `edge.log` is now rotated in place. ([#529](https://github.com/muruhq/muru/issues/529))
+- Fixed commands failing with `transport error` when a socket file was left behind by a daemon or development run that had gone. A left-behind socket no longer counts as a running instance, even when its process ID has been reused by another process, and a command with nothing to connect to says that nothing is listening at that path. ([#534](https://github.com/muruhq/muru/issues/534))
+- Fixed a managed HTTP server instance that was waiting to be started again when the daemon stopped never being started by the next daemon, which, when the release was later stopped, sent the stop signal to its own process group. ([#552](https://github.com/muruhq/muru/issues/552))
+- Fixed a managed HTTP server release that failed to start one of its instances leaving the instances it had already started running. They are now stopped. ([#553](https://github.com/muruhq/muru/issues/553))
+- Fixed two instances of a managed HTTP server with `bind = 'port'` being able to be given the same port. ([#554](https://github.com/muruhq/muru/issues/554))
+- Fixed a managed HTTP server instance being started again beside processes the previous one left running, such as workers whose master was killed. They are now sent the stop signal when the instance exits and killed if they are still running when it is due to start. ([#555](https://github.com/muruhq/muru/issues/555))
+
+### Documentation
+
+- The logging and managed HTTP server guides now say that a managed server's lines are in the release's log file as the server wrote them, with no time or instance tag added, and that the lines of its instances are interleaved. ([#392](https://github.com/muruhq/muru/issues/392))
+
+
 ## 0.1.0a21 (2026-11-09)
 
 ### Added
