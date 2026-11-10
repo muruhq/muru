@@ -1673,12 +1673,12 @@ mod tests {
         .unwrap();
         assert_eq!(pids(&supervisor), [running.id()]);
 
-        // The process is the one recorded, so the stop is its to take.
-        // The supervisor reaps it, being its parent here, so there is
-        // no status left for the test to wait for.
+        // The process is the one recorded, so the stop is its to take:
+        // it is killed. The clock is paused, so the stop does not wait
+        // for it to go, which takes a moment of real time.
 
         supervisor.stop_until(Instant::now()).await;
-        assert!(!exists(running.id()));
+        wait_for("the process to go", || (!alive(running.id())).then_some(()));
         let _ = running.wait();
     }
 }
