@@ -409,8 +409,10 @@ in front of every line, for a supervisor that adds none.
 
 `--log-format json` writes one JSON object per line instead, for a log
 collector, each with its `time`, a `kind` (`access`, `app` for the
-application's output, `muru`, or `serve.stopping` and `serve.draining`
-for the lines that mark a [stop](#stopping)), and the line's fields:
+application's output, `muru`, `serve.stopping` and `serve.draining`
+for the lines that mark a [stop](#stopping), or `panic` for a panic in
+Muru itself, with its `thread`, `location` and, when `RUST_BACKTRACE`
+asks for one, a `backtrace` array), and the line's fields:
 
 ```json
 {"time":"2026-11-02T05:42:22.836Z","kind":"app","source":"muru.worker[0]","message":"worker 0 is ready"}

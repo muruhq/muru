@@ -891,6 +891,11 @@ fn main() -> anyhow::Result<()> {
 
     init::become_init();
 
+    // A panic is reported as one of Muru's lines, stamped in a log file
+    // as every other line there is (section 11.8).
+
+    muru_common::log::install_panic_hook();
+
     // The MCP library's own events stay at warnings unless MURU_LOG says
     // otherwise, and the warning it gives for each refused tool call,
     // with the error in Rust's debug form, is left to the server's own

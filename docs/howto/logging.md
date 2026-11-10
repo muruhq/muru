@@ -251,7 +251,9 @@ or `--log-dir`):
 | `daemon.log` | the daemon's output when started with `muructl daemon start` |
 
 Every line in these files starts with the full UTC time, except the
-lines of a managed HTTP server. Its instances write to the release's file
+lines of a managed HTTP server. A panic in the daemon or the edge is
+written as `muru: panic:` lines with the time in front too, one for
+each frame of its backtrace when `RUST_BACKTRACE` is set. Its instances write to the release's file
 themselves, so each line is in the file as the server wrote it: with no
 time in front, unless the server writes one of its own, and no tag naming
 the instance. The lines of a release's instances are interleaved in the
