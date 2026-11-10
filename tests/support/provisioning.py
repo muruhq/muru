@@ -10,7 +10,6 @@ import shutil
 import subprocess
 import sys
 import sysconfig
-import tempfile
 import time
 from pathlib import Path
 
@@ -159,7 +158,7 @@ def run_until_serving(
     return the process once it serves, with its log; the caller stops it
     with `stop`."""
 
-    log = Path(tempfile.mkstemp(prefix="muru-provisioning-", suffix=".log")[1])
+    log = support.temporary_log("muru-provisioning-")
     command = [str(muructl()), "run", str(directory), "--port", "auto", "--processes", "1"]
     command += [*support.dashboard_args(args)[0], *args]
 

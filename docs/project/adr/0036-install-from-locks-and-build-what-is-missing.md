@@ -123,3 +123,7 @@ Specification sections 8.1 to 8.4, 9.1, 13.1 and 13.8. Softens the
 isolation sentences of [ADR 0007](0007-uv-as-external-tool.md); external uv
 stands. Decided in issue #237 on 2026-10-31; the implementation issues are
 #124, #125 and #235. The builder without uv is parked as #236.
+
+The `muructl tools install uv` this record mentions when leaving out a
+second builder was dropped by
+[ADR 0057](0057-muru-does-not-install-uv.md). The decision here stands.

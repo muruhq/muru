@@ -3,10 +3,11 @@
 //! 10.2). Every access goes through one connection behind a mutex; the
 //! store is small and the reconciler is the only writer.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use muru_config::{ClientClass, Host as VirtualHost, Overlay, RateLimit, Route, Upstream};
 
@@ -135,13 +136,17 @@ CREATE TABLE IF NOT EXISTS command_runs (
     message TEXT NOT NULL,
     PRIMARY KEY (app, command)
 );
+CREATE TABLE IF NOT EXISTS log_periods (
+    path TEXT PRIMARY KEY,
+    period TEXT NOT NULL
+);
 ";
 
 /// How many events are kept.
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 14;
 
 /// The store.
 pub struct Store {
@@ -170,8 +175,11 @@ impl Store {
         // priority (section 7.4), added to an older table here, version
         // 10 the last run of each command (section 9.12), version 11 the
         // application's own access log choice (section 11.2), added to
-        // an older table here, and version 12 the virtual hosts in
-        // maintenance mode (section 4.12).
+        // an older table here, version 12 the virtual hosts in
+        // maintenance mode (section 4.12), version 13 the period each log
+        // file was last seen in (section 11.3), and version 14 whether
+        // applied files declare a release (section 9.1), added to an older
+        // table here.
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -186,6 +194,39 @@ impl Store {
             }
             Some(_) => {}
         }
+
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
+    }
+
+    /// Open an existing store only to read it, as a command does with no
+    /// daemon running: the schema is left as it is, so a store is only
+    /// ever migrated by the daemon that will use it, and any write fails.
+    ///
+    /// A store with no write-ahead log is opened as immutable, since
+    /// SQLite otherwise leaves `-wal` and `-shm` files beside it. One with
+    /// a log, as a daemon that crashed leaves, is read through the log, so
+    /// that nothing it holds is missed.
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        let mut log = path.as_os_str().to_owned();
+        log.push("-wal");
+
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+
+        let connection = if Path::new(&log).exists() {
+            Connection::open_with_flags(path, flags)?
+        } else {
+            let escaped = path
+                .to_string_lossy()
+                .replace('%', "%25")
+                .replace('?', "%3f")
+                .replace('#', "%23");
+
+            Connection::open_with_flags(format!("file:{escaped}?immutable=1"), flags)?
+        };
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -394,13 +435,49 @@ impl Store {
         })
     }
 
-    /// Remove a release record. The caller makes sure it is not running.
+    /// Remove a release record and its scale pins. The caller makes sure
+    /// it is not running.
     pub fn delete_release(&self, app: &str, id: &str) -> Result<(), StoreError> {
         self.with(|connection| {
+            connection.execute(
+                "DELETE FROM scale_pins WHERE app = ?1 AND release = ?2",
+                params![app, id],
+            )?;
             connection.execute(
                 "DELETE FROM releases WHERE app = ?1 AND id = ?2",
                 params![app, id],
             )?;
+            Ok(())
+        })
+    }
+
+    /// The releases of an application that applied files declare (section
+    /// 9.1), which `release prune` leaves unless forced.
+    pub fn declared_releases(&self, app: &str) -> Result<BTreeSet<String>, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT id FROM releases WHERE app = ?1 AND declared = 1")?;
+            let rows = statement.query_map([app], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<BTreeSet<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Record the releases of an application that the files of an apply
+    /// declare, in place of those an earlier apply declared.
+    pub fn set_declared_releases(&self, app: &str, ids: &[String]) -> Result<(), StoreError> {
+        self.with(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute("UPDATE releases SET declared = 0 WHERE app = ?1", [app])?;
+
+            for id in ids {
+                transaction.execute(
+                    "UPDATE releases SET declared = 1 WHERE app = ?1 AND id = ?2",
+                    params![app, id],
+                )?;
+            }
+
+            transaction.commit()?;
             Ok(())
         })
     }
@@ -410,6 +487,8 @@ impl Store {
     pub fn delete_app(&self, name: &str) -> Result<(), StoreError> {
         self.with(|connection| {
             connection.execute("DELETE FROM releases WHERE app = ?1", [name])?;
+            connection.execute("DELETE FROM rollouts WHERE app = ?1", [name])?;
+            connection.execute("DELETE FROM scale_pins WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM maintenance WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM command_runs WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM apps WHERE name = ?1", [name])?;
@@ -999,6 +1078,45 @@ impl Store {
         })
     }
 
+    /// The period each log file was last seen in (section 11.3).
+    pub fn log_periods(&self) -> Result<Vec<(String, String)>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare("SELECT path, period FROM log_periods")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Record the period of each of these log files, in one write.
+    pub fn set_log_periods(&self, periods: &[(String, String)]) -> Result<(), StoreError> {
+        self.with(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+
+            for (path, period) in periods {
+                transaction.execute(
+                    "INSERT INTO log_periods (path, period) VALUES (?1, ?2) \
+                     ON CONFLICT(path) DO UPDATE SET period = excluded.period",
+                    params![path, period],
+                )?;
+            }
+
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Forget the periods of log files that no longer exist.
+    pub fn forget_log_periods(&self, paths: &[String]) -> Result<(), StoreError> {
+        self.with(|connection| {
+            for path in paths {
+                connection.execute("DELETE FROM log_periods WHERE path = ?1", params![path])?;
+            }
+
+            Ok(())
+        })
+    }
+
     /// Events after a sequence number, oldest first, up to `limit`.
     pub fn events_after(&self, after: u64, limit: usize) -> Result<Vec<Event>, StoreError> {
         self.with(|connection| {
@@ -1053,20 +1171,41 @@ fn app_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<App> {
 /// the access log choice of version 11 to an applications table that
 /// predates them.
 fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
-    let mut statement = connection.prepare("PRAGMA table_info(apps)")?;
-    let columns: Vec<String> = statement
+    add_columns(
+        connection,
+        "apps",
+        &[
+            ("user", "TEXT"),
+            ("grp", "TEXT"),
+            ("umask", "TEXT"),
+            ("priority", "INTEGER"),
+            ("access_log", "TEXT"),
+        ],
+    )?;
+    add_columns(
+        connection,
+        "releases",
+        &[("declared", "INTEGER NOT NULL DEFAULT 0")],
+    )
+}
+
+/// Add to `table` each of `columns` an older store lacks.
+fn add_columns(
+    connection: &Connection,
+    table: &str,
+    columns: &[(&str, &str)],
+) -> Result<(), StoreError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
 
-    for (column, kind) in [
-        ("user", "TEXT"),
-        ("grp", "TEXT"),
-        ("umask", "TEXT"),
-        ("priority", "INTEGER"),
-        ("access_log", "TEXT"),
-    ] {
-        if !columns.iter().any(|name| name == column) {
-            connection.execute(&format!("ALTER TABLE apps ADD COLUMN {column} {kind}"), [])?;
+    for (column, kind) in columns {
+        if !existing.iter().any(|name| name == column) {
+            connection.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
+                [],
+            )?;
         }
     }
 
@@ -1289,14 +1428,15 @@ fn release_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Release> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
 
     use super::*;
     use crate::model::ScalingSpec;
     use muru_config::{Interface, Preload};
 
-    fn spec() -> ReleaseSpec {
+    /// A release's spec, for this crate's tests.
+    pub(crate) fn spec() -> ReleaseSpec {
         ReleaseSpec {
             limits: crate::model::ServedLimits::default(),
             source: PathBuf::from("/srv/shop"),
@@ -1360,6 +1500,66 @@ mod tests {
         );
         assert_eq!(store.app("shop").unwrap().current.as_deref(), Some("r1"));
         assert!(store.release("shop", "r9").is_err());
+    }
+
+    #[test]
+    fn a_store_opened_read_only_is_left_exactly_as_it_was() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("muru.sqlite");
+
+        // A store at an older schema, with no daemon running.
+
+        {
+            let store = Store::open(&path).unwrap();
+            store.ensure_app("shop").unwrap();
+        }
+
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch("DROP TABLE log_periods; UPDATE schema SET version = 12;")
+                .unwrap();
+        }
+
+        let before = std::fs::read(&path).unwrap();
+        let store = Store::open_read_only(&path).unwrap();
+        assert_eq!(store.apps().unwrap().len(), 1);
+        assert!(
+            store
+                .set_log_periods(&[("/a".to_owned(), "d1".to_owned())])
+                .is_err()
+        );
+        drop(store);
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let mut names: Vec<String> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["muru.sqlite"], "nothing is left beside it");
+
+        // What only a write-ahead log holds is still read.
+
+        let writer = Store::open(&path).unwrap();
+        writer.ensure_app("later").unwrap();
+        let reader = Store::open_read_only(&path).unwrap();
+        assert_eq!(reader.apps().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn log_periods_are_kept_by_path_and_can_be_forgotten() {
+        let store = Store::in_memory().unwrap();
+        let record = |path: &str, period: &str| (path.to_owned(), period.to_owned());
+
+        store
+            .set_log_periods(&[record("/a.log", "d1"), record("/b.log", "d1")])
+            .unwrap();
+        store.set_log_periods(&[record("/a.log", "d2")]).unwrap();
+        store.forget_log_periods(&["/b.log".to_owned()]).unwrap();
+        assert_eq!(store.log_periods().unwrap(), vec![record("/a.log", "d2")]);
     }
 
     #[test]

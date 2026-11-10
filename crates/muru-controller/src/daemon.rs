@@ -455,6 +455,39 @@ pub enum Command {
         /// Where the outcome goes.
         done: oneshot::Sender<Result<Release, String>>,
     },
+    /// Section 9.1: the releases a route's traffic names and the
+    /// candidates of the rollouts under way, which removal leaves.
+    ReferencedReleases {
+        /// Where the answer goes.
+        done: oneshot::Sender<BTreeSet<(String, String)>>,
+    },
+    /// Section 9.1: drop a release's record unless it has become
+    /// protected since it was chosen. The check and the removal are one
+    /// step of the command loop, so a promotion or rollback cannot slip
+    /// between them.
+    ForgetRelease {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// Where the outcome goes.
+        done: oneshot::Sender<Result<(), String>>,
+    },
+    /// Section 9.1: why an application cannot be removed now, if so.
+    AppRemovalRefused {
+        /// The application.
+        app: String,
+        /// Where the answer goes.
+        done: oneshot::Sender<Option<String>>,
+    },
+    /// Section 9.1: drain whatever an application runs and drop it and
+    /// its release records, unless it cannot be removed now.
+    RemoveApp {
+        /// The application.
+        app: String,
+        /// Where the outcome goes.
+        done: oneshot::Sender<Result<(), String>>,
+    },
     /// Section 10.10: start a recorded release held, for an apply's
     /// prepare phase, unless it runs.
     StartHeld {
@@ -496,6 +529,29 @@ pub enum Command {
         workers: bool,
         /// Where the count of what was told goes.
         done: oneshot::Sender<Reopened>,
+    },
+    /// Rotate these log files now (section 11.3), on the policy in
+    /// force. Answered with each one's archive or error, by log name, or
+    /// why none could be: rotation is external.
+    RotateLogs {
+        /// Each log's name and path.
+        logs: Vec<(String, PathBuf)>,
+        /// Where the answer goes.
+        done: oneshot::Sender<Result<Vec<RotatedLog>, String>>,
+    },
+    /// Hold log files against rotation while a command cuts them
+    /// (section 11.3). Answered with whether each file's writers cannot
+    /// reopen it, or why the files could not be held.
+    ClaimLogs {
+        /// The files, in order.
+        paths: Vec<PathBuf>,
+        /// Where the answer goes.
+        done: oneshot::Sender<Result<Vec<bool>, String>>,
+    },
+    /// Let rotation consider these log files again.
+    ReleaseLogs {
+        /// The files.
+        paths: Vec<PathBuf>,
     },
     /// Stop the daemon: detaching, with hosts and the edge left serving
     /// for the next daemon to re-adopt, or draining everything first.
@@ -627,6 +683,10 @@ struct HostRecord {
     sockets: Vec<PathBuf>,
     #[serde(default)]
     groups: Vec<GroupRecord>,
+    /// The runtime library directory the host runs with, which `muructl
+    /// cache` leaves while the host is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime: Option<PathBuf>,
 }
 
 /// A named worker group's sockets and paths, for re-adoption and the
@@ -819,6 +879,15 @@ impl Interfaces {
     }
 }
 
+/// One log rotated at a command's asking: its archive, or why not.
+#[derive(Debug, Clone)]
+pub struct RotatedLog {
+    /// The log's name.
+    pub name: String,
+    /// Its archive, relative to the log directory.
+    pub archive: Result<String, String>,
+}
+
 /// What a ReopenLogs command reached.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Reopened {
@@ -902,8 +971,10 @@ impl Backend {
         }
     }
 
-    /// Send the host a signal; a managed server's instances take none,
-    /// since the daemon writes their log lines itself.
+    /// Send the host a signal, which is how it is told to reopen its log
+    /// file. A managed server's instances take none: each writes to the
+    /// release's log file itself, on a descriptor it was started with,
+    /// and cannot be told to reopen it, so that file is rotated in place.
     fn signal(&self, signal: i32) -> bool {
         match self {
             Self::Host(host) => host.signal(signal),
@@ -1126,6 +1197,9 @@ struct Daemon {
     secrets: Vec<crate::secrets::Store>,
     /// Built-in log rotation (section 11.3), when it is on.
     rotation: Option<crate::rotation::Rotator>,
+    /// Section 11.3: the log files a command is cutting, which rotation
+    /// leaves alone.
+    claimed_logs: std::collections::HashSet<PathBuf>,
     /// Section 13.3: what SIGTERM means, and how a shutdown runs.
     shutdown: crate::shutdown::Policy,
     /// The service user (ADR 0026), when this daemon is root: whom the
@@ -1484,6 +1558,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         ),
     }
 
+    let rotation = settings
+        .rotation
+        .clone()
+        .map(|policy| restored_rotator(policy, &store));
+
     let mut daemon = Daemon {
         store,
         events,
@@ -1503,7 +1582,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         warm_ups: BTreeMap::new(),
         clock: (None, false),
         secrets: settings.secrets.clone(),
-        rotation: settings.rotation.clone().map(crate::rotation::Rotator::new),
+        rotation,
+        claimed_logs: std::collections::HashSet::new(),
         shutdown: settings.shutdown.clone(),
         service,
         debug_exec: settings.debug_exec,
@@ -2356,6 +2436,48 @@ fn write_record<T: serde::Serialize>(path: &Path, record: &T) {
     }
 }
 
+/// What the event says when a managed server's instances are taken
+/// over: the pids of those that were still there, and which were gone
+/// and are started again by the next check. In the record of the
+/// instances as adopted, one that is to be started has pid 0.
+fn adoption_message(adopted: &ServersRecord) -> String {
+    let list = |words: Vec<String>| match words.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [most @ .., last] => format!("{} and {last}", most.join(", ")),
+    };
+    let (gone, there): (Vec<_>, Vec<_>) = adopted
+        .instances
+        .iter()
+        .partition(|instance| instance.pid == 0);
+    let pids: Vec<String> = there
+        .iter()
+        .map(|instance| instance.pid.to_string())
+        .collect();
+    let indexes: Vec<String> = gone
+        .iter()
+        .map(|instance| instance.index.to_string())
+        .collect();
+
+    let taken_over = if pids.is_empty() {
+        "none of the server instances was still there".to_owned()
+    } else {
+        format!("re-adopted the server instances (pid {})", pids.join(", "))
+    };
+
+    match indexes.len() {
+        0 => taken_over,
+        1 => format!(
+            "{taken_over}; instance {} was gone and is started again",
+            list(indexes)
+        ),
+        _ => format!(
+            "{taken_over}; instances {} were gone and are started again",
+            list(indexes)
+        ),
+    }
+}
+
 /// Whether a process's command line names the path, which is how a host
 /// record is checked against the process that has its pid now.
 fn command_mentions(pid: u32, path: &Path) -> bool {
@@ -2877,7 +2999,9 @@ impl Daemon {
         if settings.rotation != rotation {
             match (settings.rotation, self.rotation.as_mut()) {
                 (Some(policy), Some(rotator)) => rotator.set_policy(policy),
-                (Some(policy), None) => self.rotation = Some(crate::rotation::Rotator::new(policy)),
+                (Some(policy), None) => {
+                    self.rotation = Some(restored_rotator(policy, &self.store));
+                }
                 (None, _) => self.rotation = None,
             }
 
@@ -4050,17 +4174,14 @@ impl Daemon {
             identity,
             &self.host_log(app, id),
             record,
-        );
+        )
+        .await;
 
         match adopted {
             Ok(servers) => {
                 let retained_until = matches!(release.state, ReleaseState::Retained)
                     .then(|| Instant::now() + RETENTION);
-                let pids: Vec<String> = record
-                    .instances
-                    .iter()
-                    .map(|instance| instance.pid.to_string())
-                    .collect();
+                let message = adoption_message(&servers.record());
                 self.running.insert(
                     (app.to_owned(), id.to_owned()),
                     Running {
@@ -4086,12 +4207,8 @@ impl Daemon {
                     },
                 );
                 self.publish_servers();
-                self.events.emit(
-                    "release.adopted",
-                    &subject,
-                    "info",
-                    &format!("re-adopted the server instances (pid {})", pids.join(", ")),
-                );
+                self.events
+                    .emit("release.adopted", &subject, "info", &message);
                 true
             }
             Err(error) => {
@@ -4192,6 +4309,18 @@ impl Daemon {
             Command::Drain { app, id, done } => {
                 let _ = done.send(self.drain_release(&app, &id).await);
             }
+            Command::ReferencedReleases { done } => {
+                let _ = done.send(self.referenced_releases());
+            }
+            Command::ForgetRelease { app, id, done } => {
+                let _ = done.send(self.forget_release(&app, &id));
+            }
+            Command::AppRemovalRefused { app, done } => {
+                let _ = done.send(self.app_removal_refused(&app));
+            }
+            Command::RemoveApp { app, done } => {
+                let _ = done.send(self.remove_app(&app).await);
+            }
             Command::StartHeld { app, id, done } => {
                 let _ = done.send(self.start_held(&app, &id).await);
             }
@@ -4219,6 +4348,17 @@ impl Daemon {
             }
             Command::ReopenLogs { workers, done } => {
                 let _ = done.send(self.reopen_logs(workers));
+            }
+            Command::RotateLogs { logs, done } => {
+                let _ = done.send(self.rotate_named_logs(logs));
+            }
+            Command::ClaimLogs { paths, done } => {
+                let _ = done.send(self.claim_logs(paths));
+            }
+            Command::ReleaseLogs { paths } => {
+                for path in paths {
+                    self.claimed_logs.remove(&path);
+                }
             }
             Command::Metrics { done } => {
                 let _ = done.send(self.metrics().await);
@@ -5138,6 +5278,7 @@ impl Daemon {
                 pid: host.pid().unwrap_or(0),
                 sockets: host.sockets.clone(),
                 groups: groups.clone(),
+                runtime: library.pythonpath.clone(),
             },
         );
         let now = Instant::now();
@@ -5319,14 +5460,19 @@ impl Daemon {
     ) -> Result<(), String> {
         let subject = format!("{app}@{id}");
         let log = self.host_log(app, id);
-        let mut servers = match Servers::start(
+        let grace = Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms);
+        let spawned = Servers::start(
             http,
             &run_dir.join("r1"),
             &release.spec.source,
             env,
             identity,
             &log,
-        ) {
+            grace,
+        )
+        .await;
+
+        let mut servers = match spawned {
             Ok(servers) => servers,
             Err(error) => {
                 let message = format!("the server could not be started: {error:#}");
@@ -5342,11 +5488,7 @@ impl Daemon {
 
         if let Err(error) = servers.wait_ready(timeout).await {
             let message = format!("{error:#}");
-            servers
-                .stop(Duration::from_millis(
-                    release.spec.timeouts.shutdown_timeout_ms,
-                ))
-                .await;
+            servers.stop(grace).await;
             self.set_state(release, ReleaseState::Failed, &message);
             self.events
                 .emit("release.failed", &subject, "error", &message);
@@ -8365,6 +8507,126 @@ impl Daemon {
             .map_err(|error| error.to_string())
     }
 
+    /// Section 9.1: drop a release's record, unless it is protected now.
+    fn forget_release(&self, app: &str, id: &str) -> Result<(), String> {
+        let record = self.store.app(app).map_err(|error| error.to_string())?;
+        let release = self
+            .store
+            .release(app, id)
+            .map_err(|error| error.to_string())?;
+        let candidate = crate::removal::Candidate {
+            id: id.to_owned(),
+            state: release.state,
+            created_unix_ms: release.created_unix_ms,
+            declared: false,
+            referenced: self
+                .referenced_releases()
+                .contains(&(app.to_owned(), id.to_owned())),
+        };
+
+        if let Some(why) = crate::removal::protection(
+            record.current.as_deref(),
+            record.previous.as_deref(),
+            &candidate,
+        ) {
+            return Err(format!("{app}@{id} cannot be removed: {}", why.describe()));
+        }
+
+        if self.running.contains_key(&(app.to_owned(), id.to_owned())) {
+            return Err(format!("{app}@{id} cannot be removed: it is still running"));
+        }
+
+        self.store
+            .delete_release(app, id)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Section 9.1: why an application cannot be removed now, if so: a
+    /// route still sends it traffic, a rollout is under way, or a release
+    /// of it is being built or waits to be started.
+    fn app_removal_refused(&self, app: &str) -> Option<String> {
+        let (routes, _) = self.effective();
+
+        for route in self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .iter()
+            .chain(&routes)
+        {
+            if route_apps(route).contains(&app) {
+                return Some(format!(
+                    "route {} {} sends traffic to {app}; remove the route first",
+                    route.host,
+                    route.key()
+                ));
+            }
+        }
+
+        if let Ok(Some(rollout)) = self.store.active_rollout(app) {
+            return Some(format!(
+                "a rollout of {app} to {} is under way; promote or abort it first",
+                rollout.candidate
+            ));
+        }
+
+        self.store
+            .releases(Some(app))
+            .unwrap_or_default()
+            .iter()
+            .find(|release| {
+                matches!(
+                    release.state,
+                    ReleaseState::Pending | ReleaseState::Building
+                )
+            })
+            .map(|release| {
+                format!(
+                    "{app}@{} is {}; wait for it to finish",
+                    release.id, release.state
+                )
+            })
+    }
+
+    /// Section 9.1: drain whatever an application runs, then drop its
+    /// release records and the application.
+    async fn remove_app(&mut self, app: &str) -> Result<(), String> {
+        if let Some(why) = self.app_removal_refused(app) {
+            return Err(format!("{app} cannot be removed: {why}"));
+        }
+
+        let releases = self
+            .store
+            .releases(Some(app))
+            .map_err(|error| error.to_string())?;
+
+        for release in &releases {
+            let key = (app.to_owned(), release.id.clone());
+
+            if self.running.contains_key(&key) || !release.state.is_final() {
+                self.drain_release(app, &release.id).await?;
+            }
+        }
+
+        if let Some(((_, id), _)) = self.running.iter().find(|((name, _), _)| name == app) {
+            return Err(format!("{app}@{id} did not stop"));
+        }
+
+        self.store
+            .delete_app(app)
+            .map_err(|error| error.to_string())?;
+        self.serving.remove(app);
+        self.maintenance.remove(app);
+
+        // The edge forgets the application with its next snapshot.
+
+        if let Err(error) = self.push_snapshot().await {
+            tracing::warn!(%error, "pushing the snapshot after removing {app} failed");
+        }
+
+        Ok(())
+    }
+
     /// A host that exited on its own fails its release; the release that
     /// serves is started again once.
     async fn check_hosts(&mut self) {
@@ -8696,6 +8958,8 @@ impl Daemon {
                         pid,
                         sockets: all,
                         groups: running.groups.clone(),
+                        runtime: read_record::<HostRecord>(&record)
+                            .and_then(|previous| previous.runtime),
                     },
                 );
 
@@ -9049,9 +9313,13 @@ impl Daemon {
             return;
         };
         let now = std::time::SystemTime::now();
+
+        // The edge reopens the access log when told, but keeps its own log
+        // open on its standard streams, so that one is rotated in place.
+
         let mut candidates = vec![
             (self.locations.access_log(), false),
-            (self.locations.logs.path.join("edge.log"), false),
+            (self.locations.logs.path.join("edge.log"), true),
         ];
 
         if self.owns_log {
@@ -9085,13 +9353,27 @@ impl Daemon {
             ));
         }
 
+        // The period each file is now in is recorded before anything is
+        // rotated, so a daemon started after a crash does not rotate a
+        // file a second time.
+
+        let due: Vec<(PathBuf, bool)> = candidates
+            .into_iter()
+            .filter(|(path, _)| {
+                !self.claimed_logs.contains(path) && path.is_file() && rotator.due(path, now)
+            })
+            .collect();
+        let changed = rotator.take_changed();
+
+        if !changed.is_empty()
+            && let Err(error) = self.store.set_log_periods(&changed)
+        {
+            tracing::warn!(%error, "recording the log files' periods failed");
+        }
+
         let mut rotated = Vec::new();
 
-        for (path, in_place) in candidates {
-            if !path.is_file() || !rotator.due(&path, now) {
-                continue;
-            }
-
+        for (path, in_place) in due {
             let outcome = if in_place {
                 rotator.rotate_in_place(&path, now)
             } else {
@@ -9106,6 +9388,11 @@ impl Daemon {
             }
         }
 
+        self.after_rotation(&rotated);
+    }
+
+    /// Have the writers reopen what was rotated, and say so.
+    fn after_rotation(&mut self, rotated: &[PathBuf]) {
         if rotated.is_empty() {
             return;
         }
@@ -9136,6 +9423,84 @@ impl Daemon {
             "info",
             &format!("rotated {}", names.join(", ")),
         );
+    }
+
+    /// Rotate named logs now, as a command asks.
+    fn rotate_named_logs(
+        &mut self,
+        logs: Vec<(String, PathBuf)>,
+    ) -> Result<Vec<RotatedLog>, String> {
+        if self.rotation.is_none() {
+            return Err(
+                "log rotation is external ([logs] rotate = 'external'): whatever \
+                 rotates the files does this, followed by muructl logs reopen"
+                    .to_owned(),
+            );
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut rotated = Vec::new();
+        let mut archives = Vec::new();
+
+        for (name, path) in logs {
+            let archive = if self.claimed_logs.contains(&path) {
+                Err("it is being cut by another command".to_owned())
+            } else {
+                let in_place = self.cannot_reopen(&path);
+                let rotator = self.rotation.as_ref().expect("checked above");
+
+                let outcome = if in_place {
+                    rotator.rotate_in_place(&path, now)
+                } else {
+                    rotator.rotate(&path, now)
+                };
+
+                outcome
+                    .map(|archive| {
+                        let relative = archive
+                            .strip_prefix(&self.locations.logs.path)
+                            .unwrap_or(&archive)
+                            .display()
+                            .to_string();
+                        archives.push(archive);
+                        relative
+                    })
+                    .map_err(|error| error.to_string())
+            };
+
+            rotated.push(RotatedLog { name, archive });
+        }
+
+        self.after_rotation(&archives);
+        Ok(rotated)
+    }
+
+    /// Whether a log's writers cannot be told to reopen it: the
+    /// instances of a managed HTTP server, and the edge for its own log.
+    fn cannot_reopen(&self, path: &Path) -> bool {
+        let edge_log = self.locations.logs.path.join("edge.log");
+
+        path == edge_log
+            || self.running.iter().any(|((app, id), running)| {
+                running.backend.servers().is_some() && self.locations.release_log(app, id) == path
+            })
+    }
+
+    /// Hold log files against rotation, saying of each whether its
+    /// writers cannot reopen it: the instances of a managed HTTP server
+    /// and the edge's own log, which it does not reopen.
+    fn claim_logs(&mut self, paths: Vec<PathBuf>) -> Result<Vec<bool>, String> {
+        if let Some(path) = paths.iter().find(|path| self.claimed_logs.contains(*path)) {
+            return Err(format!(
+                "{} is being cut by another command",
+                path.display()
+            ));
+        }
+
+        let in_place = paths.iter().map(|path| self.cannot_reopen(path)).collect();
+
+        self.claimed_logs.extend(paths);
+        Ok(in_place)
     }
 
     fn reopen_logs(&mut self, workers: bool) -> Reopened {
@@ -9250,6 +9615,29 @@ fn writes_to(path: &std::path::Path) -> bool {
     described
         && current.dev() as libc::dev_t == stat.st_dev
         && current.ino() as libc::ino_t == stat.st_ino
+}
+
+/// A rotator that carries on from the periods the state store records,
+/// less those of log files that are gone (section 11.3).
+fn restored_rotator(policy: crate::rotation::Policy, store: &Store) -> crate::rotation::Rotator {
+    let (present, gone): (Vec<_>, Vec<_>) = store
+        .log_periods()
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "reading the log files' periods failed");
+            Vec::new()
+        })
+        .into_iter()
+        .partition(|(path, _)| std::path::Path::new(path).is_file());
+
+    let gone: Vec<String> = gone.into_iter().map(|(path, _)| path).collect();
+
+    if !gone.is_empty()
+        && let Err(error) = store.forget_log_periods(&gone)
+    {
+        tracing::warn!(%error, "forgetting the periods of removed log files failed");
+    }
+
+    crate::rotation::Rotator::restored(policy, present)
 }
 
 /// Open the daemon's log file again on standard output and error: once
@@ -9582,6 +9970,37 @@ fn step_message(steps: &[RolloutStep], step: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_adoption_event_names_the_instances_kept_and_those_started_again() {
+        let adopted = |pids: &[u32]| ServersRecord {
+            instances: (0..)
+                .zip(pids)
+                .map(|(index, pid)| crate::servers::InstanceRecord {
+                    index,
+                    pid: *pid,
+                    address: String::new(),
+                    started_unix_ms: 0,
+                    quick_exits: 0,
+                    start_time: 0,
+                })
+                .collect(),
+        };
+
+        assert_eq!(
+            adoption_message(&adopted(&[41, 42])),
+            "re-adopted the server instances (pid 41, 42)"
+        );
+        assert_eq!(
+            adoption_message(&adopted(&[41, 0])),
+            "re-adopted the server instances (pid 41); instance 1 was gone and is started again"
+        );
+        assert_eq!(
+            adoption_message(&adopted(&[0, 0, 0])),
+            "none of the server instances was still there; \
+             instances 0, 1 and 2 were gone and are started again"
+        );
+    }
 
     #[test]
     fn a_group_that_may_scale_to_zero_retains_no_worker_by_default() {

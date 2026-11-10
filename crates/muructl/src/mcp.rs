@@ -496,6 +496,23 @@ fn pairs(arguments: &JsonObject, key: &str) -> Result<Vec<(String, String)>, Str
 }
 
 /// Words, all owned.
+/// The options of a tool that names logs the way `muructl logs` commands do.
+fn log_target_flags(arguments: &JsonObject) -> Vec<String> {
+    let mut flags = Vec::new();
+
+    if flag(arguments, "access") {
+        flags.push("--access".to_owned());
+    }
+
+    flags.extend(option(arguments, "host", "--host"));
+
+    if flag(arguments, "all") {
+        flags.push("--all".to_owned());
+    }
+
+    flags
+}
+
 fn words(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_owned()).collect()
 }
@@ -700,6 +717,22 @@ fn specs() -> Vec<Spec> {
                 ]
                 .concat())
             },
+        },
+        Spec {
+            name: "log_files",
+            description: "Each log file with its size, its archives and the total, and whether its release or host no longer exists.",
+            changes: false,
+            properties: json!({}),
+            required: &[],
+            command: |_| Ok(words(&["logs", "list"])),
+        },
+        Spec {
+            name: "cache",
+            description: "What the user cache and the daemon's re-creatable data take: each runtime library by version and interpreter tag, the certificates, uv's build cache, downloaded Pythons, and what uses each.",
+            changes: false,
+            properties: json!({}),
+            required: &[],
+            command: |_| Ok(words(&["cache", "list"])),
         },
         Spec {
             name: "events",
@@ -1208,6 +1241,243 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "truncate_logs",
+            description: "Cut a live log down to its newest bytes, at a line boundary; keep of 0 empties it. Refused unless yes is true; log_files shows what there is to cut.",
+            changes: true,
+            properties: json!({
+                "target": {"type": "string", "description": "One release's log, as app@release"},
+                "access": {"type": "boolean", "description": "The access log"},
+                "host": {"type": "string", "description": "The file a virtual host names for its records"},
+                "all": {"type": "boolean", "description": "Every log"},
+                "keep": {"type": "string", "description": "How much to keep, as a size such as 100MB; 0 for none"},
+                "yes": {"type": "boolean", "description": "Confirm the cut; without it the command refuses"},
+            }),
+            required: &["keep"],
+            command: |arguments| {
+                let mut command = words(&["logs", "truncate"]);
+                command.extend(text(arguments, "target"));
+                command.extend(log_target_flags(arguments));
+                command.extend(option(arguments, "keep", "--keep"));
+
+                if flag(arguments, "yes") {
+                    command.push("--yes".to_owned());
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "rotate_logs",
+            description: "Rotate logs now, on the daemon's policy: all of them with content unless one is named. Refused when rotation is external.",
+            changes: true,
+            properties: json!({
+                "target": {"type": "string", "description": "One release's log, as app@release"},
+                "access": {"type": "boolean", "description": "The access log"},
+                "host": {"type": "string", "description": "The file a virtual host names for its records"},
+                "all": {"type": "boolean", "description": "Every log"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["logs", "rotate"]);
+                command.extend(text(arguments, "target"));
+                command.extend(log_target_flags(arguments));
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "prune_logs",
+            description: "Remove log archives by keep (per log) or older_than, and with orphaned the logs and archives of what no longer exists. dry_run lists what would go; anything else is refused unless yes is true.",
+            changes: true,
+            properties: json!({
+                "keep": {"type": "integer", "description": "How many of the newest archives to keep per log"},
+                "older_than": {"type": "string", "description": "Remove archives older than this, as a duration such as 30d"},
+                "orphaned": {"type": "boolean", "description": "Also remove the logs and archives of what no longer exists"},
+                "dry_run": {"type": "boolean"},
+                "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["logs", "prune"]);
+                command.extend(option(arguments, "keep", "--keep"));
+                command.extend(option(arguments, "older_than", "--older-than"));
+
+                for (key, name) in [
+                    ("orphaned", "--orphaned"),
+                    ("dry_run", "--dry-run"),
+                    ("yes", "--yes"),
+                ] {
+                    if flag(arguments, key) {
+                        command.push(name.to_owned());
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "prune_releases",
+            description: "Remove old releases, of app or of all applications, keeping the keep newest that have not failed. Never takes the serving or rollback release, a running one or one a route or rollout uses. dry_run lists what would go; anything else is refused unless yes is true.",
+            changes: true,
+            properties: json!({
+                "app": {"type": "string", "description": "The application; every application when not given"},
+                "keep": {"type": "integer", "description": "How many of the newest releases that have not failed to keep"},
+                "force": {"type": "boolean", "description": "Also take releases applied files declare"},
+                "keep_logs": {"type": "boolean", "description": "Leave the logs of what is removed"},
+                "dry_run": {"type": "boolean"},
+                "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
+            }),
+            required: &["keep"],
+            command: |arguments| {
+                let mut command = words(&["release", "prune"]);
+                command.extend(
+                    arguments
+                        .get("app")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+                command.extend(option(arguments, "keep", "--keep"));
+
+                for (key, name) in [
+                    ("force", "--force"),
+                    ("keep_logs", "--keep-logs"),
+                    ("dry_run", "--dry-run"),
+                    ("yes", "--yes"),
+                ] {
+                    if flag(arguments, key) {
+                        command.push(name.to_owned());
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "remove_release",
+            description: "Remove one release, as app@release, with its environment, bytecode and logs. Refused for the serving or rollback release, a running one or one a route or rollout uses. dry_run says what would go; anything else is refused unless yes is true.",
+            changes: true,
+            properties: json!({
+                "release": {"type": "string", "description": "The release, as app@release"},
+                "keep_logs": {"type": "boolean", "description": "Leave its log and archives"},
+                "dry_run": {"type": "boolean"},
+                "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
+            }),
+            required: &["release"],
+            command: |arguments| {
+                let mut command = words(&["release", "remove"]);
+                command.extend(
+                    arguments
+                        .get("release")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+
+                for (key, name) in [
+                    ("keep_logs", "--keep-logs"),
+                    ("dry_run", "--dry-run"),
+                    ("yes", "--yes"),
+                ] {
+                    if flag(arguments, key) {
+                        command.push(name.to_owned());
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "remove_app",
+            description: "Remove an application: drain whatever runs and remove every release with its environment, bytecode and logs. Refused while a route sends it traffic. dry_run says what would go; anything else is refused unless yes is true.",
+            changes: true,
+            properties: json!({
+                "app": {"type": "string"},
+                "dry_run": {"type": "boolean"},
+                "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
+            }),
+            required: &["app"],
+            command: |arguments| {
+                let mut command = words(&["app", "remove"]);
+                command.extend(
+                    arguments
+                        .get("app")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+
+                for (key, name) in [("dry_run", "--dry-run"), ("yes", "--yes")] {
+                    if flag(arguments, key) {
+                        command.push(name.to_owned());
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "prune_cache",
+            description: "Remove what is stale from the cache areas: runtime libraries of other versions, or of the version or tag named, and downloaded Pythons no release uses. dry_run lists what would go; anything else is refused unless yes is true.",
+            changes: true,
+            properties: json!({
+                "area": {"type": "string", "enum": ["user", "daemon"]},
+                "version": {"type": "string"},
+                "tag": {"type": "string"},
+                "dry_run": {"type": "boolean"},
+                "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["cache", "prune"]);
+                command.extend(
+                    arguments
+                        .get("area")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+                command.extend(option(arguments, "version", "--version"));
+                command.extend(option(arguments, "tag", "--tag"));
+
+                for (key, name) in [("dry_run", "--dry-run"), ("yes", "--yes")] {
+                    if flag(arguments, key) {
+                        command.push(name.to_owned());
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "clear_cache",
+            description: "Remove everything in a cache area that is not in use, which is re-created on demand; a runtime library is fetched again, which needs the network or a wheel directory. The development certificates stay unless certs is true. dry_run lists what would go; anything else is refused unless yes is true.",
+            changes: true,
+            properties: json!({
+                "area": {"type": "string", "enum": ["user", "daemon"]},
+                "certs": {"type": "boolean", "description": "Also remove the development certificates"},
+                "dry_run": {"type": "boolean"},
+                "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
+            }),
+            required: &["area"],
+            command: |arguments| {
+                let mut command = words(&["cache", "clear"]);
+                command.extend(
+                    arguments
+                        .get("area")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+
+                for (key, name) in [
+                    ("certs", "--certs"),
+                    ("dry_run", "--dry-run"),
+                    ("yes", "--yes"),
+                ] {
+                    if flag(arguments, key) {
+                        command.push(name.to_owned());
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "reopen_logs",
             description: "Reopen every log file by name, after something outside Muru has renamed them; workers also runs each worker's on_reopen_logs hook.",
             changes: true,
@@ -1288,6 +1558,57 @@ mod tests {
             ])
         );
         assert!(command("debug", json!({"what": "exec", "target": "shop"})).is_err());
+        assert_eq!(
+            command("truncate_logs", json!({"access": true, "keep": "1MB"})),
+            Ok(vec![
+                "logs".into(),
+                "truncate".into(),
+                "--access".into(),
+                "--keep".into(),
+                "1MB".into()
+            ]),
+            "without yes the command runs with no --yes, and refuses"
+        );
+        assert_eq!(
+            command("prune_logs", json!({"keep": 2, "dry_run": true})),
+            Ok(vec![
+                "logs".into(),
+                "prune".into(),
+                "--keep".into(),
+                "2".into(),
+                "--dry-run".into()
+            ])
+        );
+
+        assert_eq!(
+            command("prune_releases", json!({"app": "shop", "keep": 2})),
+            Ok(vec![
+                "release".into(),
+                "prune".into(),
+                "shop".into(),
+                "--keep".into(),
+                "2".into()
+            ]),
+            "without yes the command runs with no --yes, and refuses"
+        );
+        assert_eq!(
+            command("clear_cache", json!({"area": "user", "dry_run": true})),
+            Ok(vec![
+                "cache".into(),
+                "clear".into(),
+                "user".into(),
+                "--dry-run".into()
+            ])
+        );
+        assert_eq!(
+            command("remove_release", json!({"release": "shop@r1", "yes": true})),
+            Ok(vec![
+                "release".into(),
+                "remove".into(),
+                "shop@r1".into(),
+                "--yes".into()
+            ])
+        );
 
         // Every environment value is for a person at a terminal, never
         // for the agent's context.

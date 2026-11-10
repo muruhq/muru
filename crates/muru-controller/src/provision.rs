@@ -35,8 +35,7 @@ impl Provisioning {
 
     /// The daemon's context from its `[tools]` table and state directory.
     pub fn for_daemon(tools: &muru_config::Tools, state_dir: &Path) -> Self {
-        let tools_dir = state_dir.join("tools");
-        let uv = Uv::find(tools.uv.as_deref().map(Path::new), Some(&tools_dir));
+        let uv = Uv::find(tools.uv.as_deref().map(Path::new));
         let offline = tools.offline.unwrap_or(false);
         let isolation = Isolation {
             python_install_dir: Some(
@@ -121,12 +120,10 @@ impl Provisioning {
 
                 text
             }
-            None => {
-                "uv was not found (tools.uv, MURU_UV, beside muructl, PATH, the managed copy); \
+            None => "uv was not found (tools.uv, MURU_UV, beside muructl, PATH); \
                      releases run on existing environments, and a Python version request cannot be \
                      resolved until uv is installed"
-                    .to_owned()
-            }
+                .to_owned(),
         }
     }
 }

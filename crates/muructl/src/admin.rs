@@ -82,6 +82,26 @@ pub struct DaemonFileArgs {
 }
 
 impl DaemonFileArgs {
+    /// The state directory an option names, if one does.
+    pub(crate) fn state_dir(&self) -> Option<&Path> {
+        self.state_dir.as_deref()
+    }
+
+    /// The log directory an option names, if one does.
+    pub(crate) fn log_dir(&self) -> Option<&Path> {
+        self.log_dir.as_deref()
+    }
+
+    /// The cache directory an option names, if one does.
+    pub(crate) fn cache_dir(&self) -> Option<&Path> {
+        self.cache_dir.as_deref()
+    }
+
+    /// The daemon's configuration file an option names, if one does.
+    pub(crate) fn config(&self) -> Option<&Path> {
+        self.config.as_deref()
+    }
+
     /// The same options, for a daemon started in the background.
     pub fn as_arguments(&self) -> Vec<String> {
         let mut arguments = Vec::new();
@@ -274,7 +294,7 @@ impl SocketArgs {
 
         let locations = self.locations.resolve();
         let daemon = locations.admin_socket();
-        let daemon_listening = daemon.exists();
+        let daemon_listening = daemon.exists() && !muru_controller::client::left_behind(&daemon);
         let runs = crate::run_admin::runs(&locations.run.path);
         let here = std::env::current_dir()
             .and_then(|directory| directory.canonicalize())
@@ -835,6 +855,22 @@ pub enum DebugCommand {
     /// its [daemon] table sets debug_exec.
     Exec(ExecArgs),
 
+    /// A short summary of the installation to attach to a bug report:
+    /// versions, how Muru runs, each release's interface, framework and
+    /// state, the serving releases' settings and recent events. Safe to
+    /// post: no log lines, request data, environment or secrets, and
+    /// application names, host names, paths and addresses replaced by
+    /// placeholders. Works with no daemon running, on its files.
+    Report(crate::diagnostics::report::ReportArgs),
+
+    /// An archive of the whole system for a time window, to triage with:
+    /// the logs and events of the window, the configuration in force, and
+    /// what the workers are doing. It holds production data and is not
+    /// for posting; it is written readable by its owner alone. Works with
+    /// no daemon running, on its files, and records what it could not
+    /// collect in its manifest.
+    Bundle(crate::diagnostics::bundle::BundleArgs),
+
     /// Open a pdb session in a worker: on the thread stopped at
     /// breakpoint(), else on a thread of its own. Each line read is a pdb
     /// command, and the end of input lets the code go on. Without
@@ -1057,6 +1093,15 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         return attach(args).await;
     }
 
+    // The diagnostic commands look at the whole installation, not into
+    // one release's workers.
+
+    let command = match command {
+        DebugCommand::Report(args) => return crate::diagnostics::report::report(args).await,
+        DebugCommand::Bundle(args) => return crate::diagnostics::bundle::bundle(args).await,
+        other => other,
+    };
+
     if let DebugCommand::Profile(profile) = &command
         && profile.format == ProfileFormat::Pstats
         && profile.output.is_none()
@@ -1126,7 +1171,9 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
                 "timeout_s": exec.timeout.as_secs_f64(),
             }),
         ),
-        DebugCommand::Attach(_) => unreachable!("attach is handled above"),
+        DebugCommand::Attach(_) | DebugCommand::Report(_) | DebugCommand::Bundle(_) => {
+            unreachable!("attach, report and bundle are handled above")
+        }
     };
 
     let target = args.target.as_deref().unwrap_or_default();
@@ -1146,7 +1193,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::Trace(_) => print_trace(&response),
         DebugCommand::Memory(_) => print_memory(&response),
         DebugCommand::Exec(_) => print_exec(&response),
-        DebugCommand::Attach(_) => {}
+        DebugCommand::Attach(_) | DebugCommand::Report(_) | DebugCommand::Bundle(_) => {}
     }
 
     Ok(())
@@ -1858,7 +1905,7 @@ fn print_json(response: &pb::DebugResponse) {
 
 /// A debug answer as JSON: the release, and each worker's answer with its
 /// result parsed.
-fn debug_json(response: &pb::DebugResponse) -> serde_json::Value {
+pub(crate) fn debug_json(response: &pb::DebugResponse) -> serde_json::Value {
     let workers: Vec<serde_json::Value> = response
         .workers
         .iter()
@@ -4361,6 +4408,33 @@ pub enum AppCommand {
         #[command(flatten)]
         output: JsonArgs,
     },
+
+    /// Remove an application: drain whatever runs and remove every
+    /// release with its environment, bytecode and logs. Refused while a
+    /// route sends it traffic. Asks first; without a terminal it needs
+    /// --yes.
+    Remove(Box<AppRemoveArgs>),
+}
+
+/// What `muructl app remove` takes.
+#[derive(Args, Clone)]
+pub struct AppRemoveArgs {
+    /// The application.
+    app: String,
+
+    /// Only say what would go.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
 }
 
 /// List applications.
@@ -4413,6 +4487,59 @@ pub async fn app_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Remove an application and all its releases.
+pub async fn app_remove(args: AppRemoveArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.socket()?).await?;
+    let request = pb::RemoveAppRequest {
+        app: args.app.clone(),
+        dry_run: true,
+    };
+
+    let plan = client
+        .remove_app(request.clone())
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if args.dry_run {
+        if !args.output.json && plan.removed.is_empty() {
+            println!("muru: {} has no releases to remove", args.app);
+            return Ok(());
+        }
+
+        show_removal_plan(&plan, true, args.output.json)?;
+        return Ok(());
+    }
+
+    for release in &plan.removed {
+        eprintln!("  {}", removal_line(release));
+    }
+
+    let question = format!(
+        "Remove application {} and its {} release{}, freeing {}?",
+        args.app,
+        plan.removed.len(),
+        if plan.removed.len() == 1 { "" } else { "s" },
+        human_size(plan.freed)
+    );
+
+    if !confirm(&question, args.yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    let answer = client
+        .remove_app(pb::RemoveAppRequest {
+            dry_run: false,
+            ..request
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    finish_removal(&answer, args.output.json)
 }
 
 /// The `muructl overlay` subcommands (section 9.10).
@@ -5149,6 +5276,18 @@ pub enum ReleaseCommand {
         output: JsonArgs,
     },
 
+    /// Remove old releases, of one application or of all: their records,
+    /// environments, bytecode and logs. Never takes the serving or rollback
+    /// release, a running one or one a route or rollout uses. Asks first;
+    /// without a terminal it needs --yes.
+    Prune(Box<ReleasePruneArgs>),
+
+    /// Remove one release: its record, environment, bytecode and logs.
+    /// Refused for the serving or rollback release, a running one or one
+    /// a route or rollout uses. Asks first; without a terminal it needs
+    /// --yes.
+    Remove(Box<ReleaseRemoveArgs>),
+
     /// Wait until a release reaches a state.
     Wait {
         /// The release, as app@release.
@@ -5170,6 +5309,66 @@ pub enum ReleaseCommand {
     },
 }
 
+/// What `muructl release prune` takes.
+#[derive(Args, Clone)]
+pub struct ReleasePruneArgs {
+    /// The application; every application when none is named.
+    app: Option<String>,
+
+    /// Keep this many of the newest releases that have not failed, beside
+    /// the serving and rollback releases.
+    #[arg(long, value_name = "N")]
+    keep: u32,
+
+    /// Also take releases that applied files declare, which the next
+    /// apply would create again.
+    #[arg(long)]
+    force: bool,
+
+    /// Leave the log and log archives of what is removed.
+    #[arg(long)]
+    keep_logs: bool,
+
+    /// Only list what would be removed.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// What `muructl release remove` takes.
+#[derive(Args, Clone)]
+pub struct ReleaseRemoveArgs {
+    /// The release, as app@release.
+    release: String,
+
+    /// Leave its log and log archives.
+    #[arg(long)]
+    keep_logs: bool,
+
+    /// Only say what would be removed.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
 /// List releases.
 pub async fn release_list(
     app: Option<String>,
@@ -5180,6 +5379,7 @@ pub async fn release_list(
     let answer = client
         .list_releases(pb::ListReleasesRequest {
             app: app.unwrap_or_default(),
+            disk: true,
         })
         .await?
         .into_inner();
@@ -5196,17 +5396,18 @@ pub async fn release_list(
     }
 
     println!(
-        "{:<24} {:<10} {:<8} {:<16} SOURCE",
-        "RELEASE", "STATE", "SERVING", "WORKERS"
+        "{:<24} {:<10} {:<8} {:<16} {:>9} SOURCE",
+        "RELEASE", "STATE", "SERVING", "WORKERS", "DISK"
     );
 
     for release in releases {
         println!(
-            "{:<24} {:<10} {:<8} {:<16} {}",
+            "{:<24} {:<10} {:<8} {:<16} {:>9} {}",
             format!("{}@{}", release.app, release.id),
             release.state,
             if release.serving { "yes" } else { "" },
             workers_column(&release),
+            human_size(release.disk_bytes),
             release.source
         );
 
@@ -5216,6 +5417,189 @@ pub async fn release_list(
     }
 
     Ok(())
+}
+
+/// Remove old releases.
+pub async fn release_prune(args: ReleasePruneArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.socket()?).await?;
+    let request = pb::PruneReleasesRequest {
+        app: args.app.clone().unwrap_or_default(),
+        keep: args.keep,
+        force: args.force,
+        keep_logs: args.keep_logs,
+        dry_run: true,
+    };
+
+    let plan = client
+        .prune_releases(request.clone())
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if !show_removal_plan(&plan, args.dry_run, args.output.json)? {
+        return Ok(());
+    }
+
+    if !confirm_removal(&plan, args.yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    let answer = client
+        .prune_releases(pb::PruneReleasesRequest {
+            dry_run: false,
+            ..request
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    finish_removal(&answer, args.output.json)
+}
+
+/// Remove one release.
+pub async fn release_remove(args: ReleaseRemoveArgs) -> anyhow::Result<()> {
+    let (app, id) = split_release(&args.release)?;
+    let mut client = client::connect(&args.socket.socket()?).await?;
+    let request = pb::RemoveReleaseRequest {
+        app: app.to_owned(),
+        release: id.to_owned(),
+        keep_logs: args.keep_logs,
+        dry_run: true,
+    };
+
+    let plan = client
+        .remove_release(request.clone())
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if !show_removal_plan(&plan, args.dry_run, args.output.json)? {
+        return Ok(());
+    }
+
+    if !confirm_removal(&plan, args.yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    let answer = client
+        .remove_release(pb::RemoveReleaseRequest {
+            dry_run: false,
+            ..request
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    finish_removal(&answer, args.output.json)
+}
+
+/// Print a removal's plan. Returns whether it goes on to the question: a
+/// dry run stops here, and so does a plan with nothing in it.
+fn show_removal_plan(
+    plan: &pb::RemoveReleasesResponse,
+    dry_run: bool,
+    json: bool,
+) -> anyhow::Result<bool> {
+    if dry_run || plan.removed.is_empty() {
+        if json {
+            print_answer(plan)?;
+            return Ok(false);
+        }
+
+        if plan.removed.is_empty() {
+            println!("muru: no releases to remove");
+        }
+
+        for release in &plan.removed {
+            println!("{}", removal_line(release));
+        }
+
+        if dry_run {
+            for release in &plan.kept {
+                println!(
+                    "{}@{} is kept ({}): {}",
+                    release.app,
+                    release.id,
+                    release.state,
+                    keep_phrase(&release.why)
+                );
+            }
+        }
+
+        if dry_run && !plan.removed.is_empty() {
+            println!("would free {}", human_size(plan.freed));
+        }
+
+        return Ok(false);
+    }
+
+    for release in &plan.removed {
+        eprintln!("  {}", removal_line(release));
+    }
+
+    Ok(true)
+}
+
+/// One release of a removal, for a person: what it is, its state, what
+/// removing it frees.
+fn removal_line(release: &pb::RemovedRelease) -> String {
+    format!(
+        "{}@{} ({}, {})",
+        release.app,
+        release.id,
+        release.state,
+        human_size(release.disk_bytes)
+    )
+}
+
+/// Why a release stays, for a person.
+fn keep_phrase(why: &str) -> &str {
+    match why {
+        "serving" => "it serves the application's traffic",
+        "rollback" => "it is the release a rollback restores",
+        "in_use" => "it is in use",
+        "referenced" => "a route's traffic or a rollout under way uses it",
+        "declared" => "applied files declare it; --force takes it",
+        "keep" => "among the newest kept",
+        "failed" => "failed, and not yet older than both the serving and rollback releases",
+        other => other,
+    }
+}
+
+/// The question before a removal.
+fn confirm_removal(plan: &pb::RemoveReleasesResponse, yes: bool) -> anyhow::Result<bool> {
+    let question = format!(
+        "Remove {} release{}, freeing {}?",
+        plan.removed.len(),
+        if plan.removed.len() == 1 { "" } else { "s" },
+        human_size(plan.freed)
+    );
+
+    confirm(&question, yes)
+}
+
+/// Report a removal and fail if any part of it did.
+fn finish_removal(answer: &pb::RemoveReleasesResponse, json: bool) -> anyhow::Result<()> {
+    if json {
+        print_answer(answer)?;
+    } else {
+        println!("muru: removed, freeing {}", human_size(answer.freed));
+    }
+
+    let failures: Vec<String> = answer
+        .removed
+        .iter()
+        .filter(|release| !release.error.is_empty())
+        .map(|release| format!("{}@{}: {}", release.app, release.id, release.error))
+        .collect();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
 }
 
 /// The WORKERS column of `release list`: what runs now, or `-` when
@@ -6150,14 +6534,14 @@ fn exit_code(report: &pb::ConfigReport, planning: bool) -> i32 {
 }
 
 /// The time now, as Unix milliseconds.
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64)
 }
 
 /// Unix milliseconds as an RFC 3339 instant in UTC.
-fn format_time(unix_ms: u64) -> String {
+pub(crate) fn format_time(unix_ms: u64) -> String {
     time::OffsetDateTime::from_unix_timestamp((unix_ms / 1000) as i64)
         .map(|time| {
             format!(
@@ -6880,6 +7264,140 @@ pub struct LogsArgs {
     socket: SocketArgs,
 }
 
+/// Which logs a command on the log files acts on.
+#[derive(Args, Clone, Default)]
+pub struct LogTargetArgs {
+    /// One release's log, as app@release.
+    #[arg(value_name = "APP@RELEASE")]
+    target: Option<String>,
+
+    /// The access log.
+    #[arg(long)]
+    access: bool,
+
+    /// The file a virtual host names for its records.
+    #[arg(long, value_name = "HOST")]
+    host: Option<String>,
+
+    /// Every log.
+    #[arg(long)]
+    all: bool,
+}
+
+impl LogTargetArgs {
+    /// The target as the admin API takes it. `required` refuses none
+    /// being named, saying what `doing` would need.
+    fn target(&self, required: bool, doing: &str) -> anyhow::Result<pb::LogTarget> {
+        let named = usize::from(self.target.is_some())
+            + usize::from(self.access)
+            + usize::from(self.host.is_some())
+            + usize::from(self.all);
+
+        if named > 1 {
+            anyhow::bail!("name one of APP@RELEASE, --access, --host HOST or --all, not several");
+        }
+
+        if named == 0 && required {
+            anyhow::bail!("name what to {doing}: APP@RELEASE, --access, --host HOST or --all");
+        }
+
+        let (app, release) = match &self.target {
+            Some(target) => {
+                let (app, release) = split_release(target)?;
+                (app.to_owned(), release.to_owned())
+            }
+            None => (String::new(), String::new()),
+        };
+
+        Ok(pb::LogTarget {
+            app,
+            release,
+            access: self.access,
+            host: self.host.clone().unwrap_or_default(),
+            all: self.all,
+        })
+    }
+}
+
+/// What `muructl logs truncate` takes.
+#[derive(Args, Clone)]
+pub struct LogsTruncateArgs {
+    #[command(flatten)]
+    target: LogTargetArgs,
+
+    /// How much of the newest content to keep, as a size such as 100MB,
+    /// cut at a line boundary; 0 empties the file.
+    #[arg(long, value_name = "SIZE", value_parser = muru_config::parse_size)]
+    keep: u64,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// With no daemon running, where its log directory and state are.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// What `muructl logs rotate` takes.
+#[derive(Args, Clone)]
+pub struct LogsRotateArgs {
+    #[command(flatten)]
+    target: LogTargetArgs,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// With no daemon running, where its log directory, state and
+    /// configuration are.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// What `muructl logs prune` takes.
+#[derive(Args, Clone)]
+pub struct LogsPruneArgs {
+    /// Keep only this many of the newest archives per log.
+    #[arg(long, value_name = "N", conflicts_with = "older_than")]
+    keep: Option<u32>,
+
+    /// Remove archives older than this, as a duration such as 30d.
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    older_than: Option<Duration>,
+
+    /// Also remove the logs and archives of releases and virtual hosts
+    /// that no longer exist.
+    #[arg(long)]
+    orphaned: bool,
+
+    /// Only list what would be removed.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// With no daemon running, where its log directory and state are.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
 /// The `muructl logs` subcommands.
 #[derive(Subcommand, Clone)]
 pub enum LogsCommand {
@@ -6892,6 +7410,33 @@ pub enum LogsCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
+    },
+
+    /// Remove log archives by count or age and, with --orphaned, the
+    /// logs and archives of releases and hosts that no longer exist.
+    /// Asks first; without a terminal it needs --yes.
+    Prune(Box<LogsPruneArgs>),
+
+    /// Rotate logs now, on the policy in force: all of them when none
+    /// is named, compressing and keeping as configured.
+    Rotate(Box<LogsRotateArgs>),
+
+    /// Cut a live log down to its newest SIZE, at a line boundary. Asks
+    /// first; without a terminal it needs --yes.
+    Truncate(Box<LogsTruncateArgs>),
+
+    /// List each log with its size, its archives and the total, and flag
+    /// logs whose release or host no longer exists.
+    List {
+        #[command(flatten)]
+        socket: SocketArgs,
+
+        /// With no daemon running, where its log directory and state are.
+        #[command(flatten)]
+        files: DaemonFileArgs,
 
         #[command(flatten)]
         output: JsonArgs,
@@ -7004,6 +7549,1103 @@ pub async fn logs_reopen(workers: bool, socket: SocketArgs, json: bool) -> anyho
         if workers { " and their workers" } else { "" }
     );
     Ok(())
+}
+
+/// How a command on the log files reaches them: through the running
+/// daemon, or with none running on the files themselves.
+enum LogsWay {
+    /// Through the daemon, so that it can tell the writers and nothing
+    /// collides with its rotation.
+    Daemon(Box<muru_proto::admin::v1::admin_client::AdminClient<tonic::transport::Channel>>),
+    /// On the files directly, with none running.
+    Files(Box<LogDirectory>),
+}
+
+/// A log directory with no daemon running.
+struct LogDirectory {
+    locations: Locations,
+    /// What the state store says exists, when there is a store.
+    existing: Option<muru_controller::log_files::Existing>,
+}
+
+/// The locations the daemon's location options resolve to.
+pub(crate) fn daemon_locations(socket: &SocketArgs, files: &DaemonFileArgs) -> Locations {
+    Locations::resolve(&Options {
+        config: files.config.clone(),
+        state_dir: files.state_dir.clone(),
+        run_dir: socket.locations.run_dir.clone(),
+        log_dir: files.log_dir.clone(),
+        cache_dir: files.cache_dir.clone(),
+        system: socket.locations.system,
+    })
+}
+
+/// Whether nothing listens where a command that names no socket would
+/// find the daemon. A socket file that is absent, or one left behind that
+/// refuses the connection, is no daemon. Anything else, such as a
+/// permission refused, is left for the connection to report.
+fn no_daemon(socket: &SocketArgs, path: &Path) -> bool {
+    socket.socket.is_none()
+        && match path.try_exists() {
+            Ok(false) => true,
+            Ok(true) => muru_controller::client::left_behind(path),
+            Err(_) => false,
+        }
+}
+
+/// Find how to reach the log files. A command that names no socket looks
+/// for the daemon alone, since only a daemon writes log files; with none
+/// listening it works on the files in the resolved log directory.
+async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result<LogsWay> {
+    let locations = daemon_locations(socket, files);
+    let path = socket
+        .socket
+        .clone()
+        .unwrap_or_else(|| locations.admin_socket());
+
+    if no_daemon(socket, &path) {
+        let store_path = locations.state_store();
+
+        let existing = if store_path.is_file() {
+            let store = muru_controller::store::Store::open_read_only(&store_path)
+                .with_context(|| format!("opening {}", store_path.display()))?;
+            Some(muru_controller::log_files::Existing::read(&store)?)
+        } else {
+            None
+        };
+
+        return Ok(LogsWay::Files(Box::new(LogDirectory {
+            locations,
+            existing,
+        })));
+    }
+
+    let mut client = client::connect(&path).await?;
+
+    if let Some(asked) = &files.log_dir {
+        let answer = client
+            .list_logs(pb::ListLogsRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner();
+        let same = asked.canonicalize().ok() == Path::new(&answer.directory).canonicalize().ok();
+
+        if !same {
+            anyhow::bail!(
+                "the daemon running at {} writes its logs to {}, not {}",
+                path.display(),
+                answer.directory,
+                asked.display()
+            );
+        }
+    }
+
+    Ok(LogsWay::Daemon(Box::new(client)))
+}
+
+/// List the log files and what they take.
+pub async fn logs_list(
+    socket: SocketArgs,
+    files: DaemonFileArgs,
+    json: bool,
+) -> anyhow::Result<()> {
+    let report = match logs_way(&socket, &files).await? {
+        LogsWay::Daemon(mut client) => client
+            .list_logs(pb::ListLogsRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => muru_controller::log_files::report(
+            &directory.locations.logs.path,
+            directory.existing.as_ref(),
+        )
+        .with_context(|| format!("reading {}", directory.locations.logs.path.display()))?,
+    };
+
+    if json {
+        return print_answer(&report);
+    }
+
+    if report.logs.is_empty() {
+        println!("no log files in {}", report.directory);
+        return Ok(());
+    }
+
+    println!(
+        "{:<40} {:>9} {:>18} {:>9}",
+        "LOG", "SIZE", "ARCHIVES", "TOTAL"
+    );
+
+    for log in &report.logs {
+        let archives = if log.archives.is_empty() {
+            "-".to_owned()
+        } else {
+            format!("{} ({})", log.archives.len(), human_size(log.archives_size))
+        };
+
+        let size = if log.present {
+            human_size(log.size)
+        } else {
+            "-".to_owned()
+        };
+
+        println!(
+            "{:<40} {size:>9} {archives:>18} {:>9}{}",
+            log.name,
+            human_size(log.total),
+            if log.orphaned { "  orphaned" } else { "" }
+        );
+    }
+
+    println!(
+        "total {}, in {}",
+        human_size(report.total),
+        report.directory
+    );
+
+    if !report.orphans_known {
+        println!(
+            "no state store was found, so logs of releases and hosts that no longer exist \
+             are not flagged"
+        );
+    }
+
+    Ok(())
+}
+
+/// Ask a yes or no question on the terminal, on standard error so that
+/// standard output stays the command's answer. `--yes` answers without
+/// asking; with no terminal to ask on, the command is refused.
+fn confirm(question: &str, yes: bool) -> anyhow::Result<bool> {
+    use std::io::{IsTerminal as _, Write as _};
+
+    if yes {
+        return Ok(true);
+    }
+
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("there is no terminal to ask {question:?}; give --yes to go ahead");
+    }
+
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Cut live logs down to their newest content.
+pub async fn logs_truncate(args: LogsTruncateArgs) -> anyhow::Result<()> {
+    let target = args.target.target(true, "truncate")?;
+    let keep = args.keep;
+    let way = logs_way(&args.socket, &args.files).await?;
+
+    // What it would free, for the question.
+
+    let plan = match &way {
+        LogsWay::Daemon(client) => client
+            .clone()
+            .truncate_logs(pb::TruncateLogsRequest {
+                target: Some(target.clone()),
+                keep,
+                dry_run: true,
+            })
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => muru_controller::log_files::plan_truncate(
+            &directory.locations.logs.path,
+            directory.existing.as_ref(),
+            &target,
+            keep,
+        )
+        .map_err(anyhow::Error::msg)?,
+    };
+
+    if plan.freed == 0 {
+        eprintln!(
+            "muru: nothing to truncate: every log named is within {}",
+            human_size(keep)
+        );
+        return if args.output.json {
+            print_answer(&plan)
+        } else {
+            Ok(())
+        };
+    }
+
+    for log in &plan.logs {
+        eprintln!(
+            "  {} from {} to {}, freeing {}",
+            log.name,
+            human_size(log.size),
+            human_size(log.kept),
+            human_size(log.freed)
+        );
+    }
+
+    let question = format!("Truncate, freeing {}?", human_size(plan.freed));
+
+    if !confirm(&question, args.yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    let answer = match way {
+        LogsWay::Daemon(mut client) => client
+            .truncate_logs(pb::TruncateLogsRequest {
+                target: Some(target),
+                keep,
+                dry_run: false,
+            })
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => muru_controller::log_files::truncate_directly(
+            &directory.locations.logs.path,
+            directory.existing.as_ref(),
+            &target,
+            keep,
+        )
+        .map_err(anyhow::Error::msg)?,
+    };
+
+    if args.output.json {
+        print_answer(&answer)?;
+    } else {
+        println!("muru: truncated, freeing {}", human_size(answer.freed));
+    }
+
+    let failures: Vec<String> = answer
+        .logs
+        .iter()
+        .filter(|log| !log.error.is_empty())
+        .map(|log| format!("{}: {}", log.name, log.error))
+        .collect();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+/// Rotate logs now.
+pub async fn logs_rotate(args: LogsRotateArgs) -> anyhow::Result<()> {
+    let target = args.target.target(false, "rotate")?;
+
+    let answer = match logs_way(&args.socket, &args.files).await? {
+        LogsWay::Daemon(mut client) => client
+            .rotate_logs(pb::RotateLogsRequest {
+                target: Some(target),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => {
+            let document = read_config(&directory.locations.config.path)?;
+            let policy = muru_controller::rotation::Policy::from_table(document.logs.as_ref())?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "log rotation is external ([logs] rotate = 'external'): whatever rotates \
+                         the files does this, followed by muructl logs reopen"
+                    )
+                })?;
+
+            muru_controller::log_files::rotate_directly(
+                &directory.locations.logs.path,
+                directory.existing.as_ref(),
+                &target,
+                &muru_controller::rotation::Rotator::new(policy),
+            )
+            .map_err(anyhow::Error::msg)?
+        }
+    };
+
+    if args.output.json {
+        print_answer(&answer)?;
+    } else if answer.logs.is_empty() {
+        println!("muru: nothing to rotate");
+    } else {
+        for log in &answer.logs {
+            if log.error.is_empty() {
+                println!("{} rotated to {}", log.name, log.archive);
+            }
+        }
+    }
+
+    let failures: Vec<String> = answer
+        .logs
+        .iter()
+        .filter(|log| !log.error.is_empty())
+        .map(|log| format!("{}: {}", log.name, log.error))
+        .collect();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+/// Remove log archives, and the logs of what no longer exists.
+pub async fn logs_prune(args: LogsPruneArgs) -> anyhow::Result<()> {
+    if args.keep.is_none() && args.older_than.is_none() && !args.orphaned {
+        anyhow::bail!("name what to prune: --keep, --older-than or --orphaned");
+    }
+
+    let way = logs_way(&args.socket, &args.files).await?;
+    let older_than_s = args.older_than.map_or(0, |limit| limit.as_secs());
+    let request = pb::PruneLogsRequest {
+        keep: args.keep,
+        older_than_s,
+        orphaned: args.orphaned,
+        dry_run: true,
+    };
+
+    // Plans and carries out a prune with no daemon running.
+
+    let directly =
+        |directory: &LogDirectory, dry_run: bool| -> anyhow::Result<pb::PruneLogsResponse> {
+            use muru_controller::log_files;
+
+            if args.orphaned && directory.existing.is_none() {
+                anyhow::bail!(
+                    "--orphaned needs the state store to tell what no longer exists; name it with \
+                 --state-dir"
+                );
+            }
+
+            let rules = log_files::PruneRules {
+                keep: args.keep,
+                older_than: (older_than_s > 0)
+                    .then(|| std::time::SystemTime::now() - Duration::from_secs(older_than_s)),
+                orphaned: args.orphaned,
+            };
+            let root = &directory.locations.logs.path;
+            let logs = log_files::list(root, directory.existing.as_ref())
+                .with_context(|| format!("reading {}", root.display()))?;
+            let mut removed = log_files::plan_prune(&logs, &rules, None);
+
+            if !dry_run {
+                log_files::carry_out_prune(root, &mut removed);
+            }
+
+            Ok(log_files::prune_answer(removed, dry_run))
+        };
+
+    let plan = match &way {
+        LogsWay::Daemon(client) => client
+            .clone()
+            .prune_logs(request)
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => directly(directory, true)?,
+    };
+
+    if args.dry_run || plan.removed.is_empty() {
+        if args.output.json {
+            return print_answer(&plan);
+        }
+
+        if plan.removed.is_empty() {
+            println!("muru: nothing to prune");
+        }
+
+        for file in &plan.removed {
+            println!("{} ({}, {})", file.name, human_size(file.size), file.why);
+        }
+
+        if args.dry_run && !plan.removed.is_empty() {
+            println!("would free {}", human_size(plan.freed));
+        }
+
+        return Ok(());
+    }
+
+    for file in &plan.removed {
+        eprintln!("  {} ({})", file.name, human_size(file.size));
+    }
+
+    let question = format!(
+        "Remove {} file{}, freeing {}?",
+        plan.removed.len(),
+        if plan.removed.len() == 1 { "" } else { "s" },
+        human_size(plan.freed)
+    );
+
+    if !confirm(&question, args.yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    let answer = match way {
+        LogsWay::Daemon(mut client) => client
+            .prune_logs(pb::PruneLogsRequest {
+                dry_run: false,
+                ..request
+            })
+            .await
+            .map_err(explain)?
+            .into_inner(),
+        LogsWay::Files(directory) => directly(&directory, false)?,
+    };
+
+    if args.output.json {
+        print_answer(&answer)?;
+    } else {
+        println!("muru: pruned, freeing {}", human_size(answer.freed));
+    }
+
+    let failures: Vec<String> = answer
+        .removed
+        .iter()
+        .filter(|file| !file.error.is_empty())
+        .map(|file| format!("{}: {}", file.name, file.error))
+        .collect();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+/// The areas `muructl cache` works on.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CacheArea {
+    /// The user cache: runtime libraries and certificates.
+    User,
+    /// The daemon's state directory: its runtime libraries, uv's build
+    /// cache and downloaded Pythons.
+    Daemon,
+}
+
+/// What `muructl cache list` takes.
+#[derive(Args, Clone)]
+pub struct CacheListArgs {
+    /// The area to list; both when none is named.
+    #[arg(value_enum)]
+    area: Option<CacheArea>,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// The daemon's and the user cache's locations.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// The `muructl cache` subcommands.
+#[derive(Subcommand)]
+pub enum CacheCommand {
+    /// Show what the user cache and the daemon's re-creatable data take,
+    /// each runtime library by version and interpreter tag, the certificates,
+    /// uv's build cache and downloaded Pythons.
+    List(Box<CacheListArgs>),
+
+    /// Remove what is stale: runtime libraries of other versions, or of
+    /// the version or tag named, and downloaded Pythons no release uses.
+    /// Asks first; without a terminal it needs --yes.
+    Prune(Box<CachePruneArgs>),
+
+    /// Remove everything in an area that is not in use. It is re-created
+    /// on demand. The development certificates are left unless named.
+    /// Asks first; without a terminal it needs --yes.
+    Clear(Box<CacheClearArgs>),
+}
+
+/// What `muructl cache prune` takes.
+#[derive(Args, Clone)]
+pub struct CachePruneArgs {
+    /// The area to prune; both when none is named.
+    #[arg(value_enum)]
+    area: Option<CacheArea>,
+
+    /// Only runtime libraries of this version, muructl's own included.
+    #[arg(long, value_name = "VERSION")]
+    version: Option<String>,
+
+    /// Only runtime libraries of this interpreter tag, muructl's own
+    /// version included.
+    #[arg(long, value_name = "TAG")]
+    tag: Option<String>,
+
+    /// Only list what would be removed.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// The daemon's and the user cache's locations.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// What `muructl cache clear` takes.
+#[derive(Args, Clone)]
+pub struct CacheClearArgs {
+    /// The area to clear.
+    #[arg(value_enum)]
+    area: CacheArea,
+
+    /// Also remove the development certificates, which a browser or the
+    /// system may trust.
+    #[arg(long)]
+    certs: bool,
+
+    /// Only list what would be removed.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    yes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// The daemon's and the user cache's locations.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// The user cache directory: --cache-dir, else what `muructl run` uses.
+fn user_cache_dir(files: &DaemonFileArgs) -> anyhow::Result<PathBuf> {
+    match &files.cache_dir {
+        Some(path) => Ok(std::path::absolute(path).unwrap_or_else(|_| path.clone())),
+        None => crate::devcert::cache_dir(),
+    }
+}
+
+/// How a cache command reaches the daemon's area: its daemon when one
+/// runs, else its files, with what the state store says the releases use.
+enum CacheWay {
+    Daemon(Box<muru_proto::admin::v1::admin_client::AdminClient<tonic::transport::Channel>>),
+    Files(Box<Locations>, Vec<muru_controller::model::Release>),
+}
+
+/// Find how to reach the daemon's area. A --state-dir that is not the
+/// running daemon's is refused rather than worked on behind its back.
+async fn cache_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result<CacheWay> {
+    let locations = daemon_locations(socket, files);
+    let path = socket
+        .socket
+        .clone()
+        .unwrap_or_else(|| locations.admin_socket());
+
+    if no_daemon(socket, &path) {
+        let store_path = locations.state_store();
+
+        let releases = if store_path.is_file() {
+            muru_controller::store::Store::open_read_only(&store_path)
+                .with_context(|| format!("opening {}", store_path.display()))?
+                .releases(None)?
+        } else {
+            Vec::new()
+        };
+
+        return Ok(CacheWay::Files(Box::new(locations), releases));
+    }
+
+    let mut client = client::connect(&path).await?;
+
+    if let Some(asked) = &files.state_dir {
+        let answer = client
+            .list_cache(pb::ListCacheRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner();
+        let same = asked.canonicalize().ok() == Path::new(&answer.directory).canonicalize().ok();
+
+        if !same {
+            anyhow::bail!(
+                "the daemon running at {} keeps its state in {}, not {}",
+                path.display(),
+                answer.directory,
+                asked.display()
+            );
+        }
+    }
+
+    Ok(CacheWay::Daemon(Box::new(client)))
+}
+
+/// What the development runs have of the user cache in use.
+fn user_cache_in_use(socket: &SocketArgs) -> muru_controller::cache::InUse {
+    let mut in_use = muru_controller::cache::InUse::default();
+
+    for run in crate::run_admin::runs(&socket.locations.resolve().run.path) {
+        for directory in run.runtime {
+            let resolved = std::fs::canonicalize(&directory).unwrap_or(directory);
+            in_use
+                .runtime
+                .insert(resolved, format!("the development run of {}", run.app));
+        }
+    }
+
+    in_use
+}
+
+/// The report on the user cache, with what development runs use marked.
+fn user_cache_report(
+    socket: &SocketArgs,
+    files: &DaemonFileArgs,
+) -> anyhow::Result<pb::ListCacheResponse> {
+    use muru_controller::cache;
+
+    let root = user_cache_dir(files)?;
+    let mut entries = cache::user_entries(&root);
+    cache::mark_in_use(
+        &mut entries,
+        &user_cache_in_use(socket),
+        &crate::provision::version(),
+    );
+
+    Ok(cache::report(&root, entries))
+}
+
+/// The report on the daemon's area, through the daemon or from its files.
+async fn daemon_cache_report(way: CacheWay) -> anyhow::Result<pb::ListCacheResponse> {
+    match way {
+        CacheWay::Daemon(mut client) => Ok(client
+            .list_cache(pb::ListCacheRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner()),
+        CacheWay::Files(locations, releases) => {
+            Ok(muru_controller::cache::state_report(&locations, &releases))
+        }
+    }
+}
+
+/// `muructl cache list`, for scripts: the two areas that were asked for.
+#[derive(serde::Serialize)]
+struct CacheReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<pb::ListCacheResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon: Option<pb::ListCacheResponse>,
+}
+
+/// List the cache areas.
+pub async fn cache_list(args: CacheListArgs) -> anyhow::Result<()> {
+    let user = if args.area == Some(CacheArea::Daemon) {
+        None
+    } else {
+        Some(user_cache_report(&args.socket, &args.files)?)
+    };
+
+    let daemon = if args.area == Some(CacheArea::User) {
+        None
+    } else {
+        Some(daemon_cache_report(cache_way(&args.socket, &args.files).await?).await?)
+    };
+
+    if args.output.json {
+        return print_answer(&CacheReport { user, daemon });
+    }
+
+    for (title, report) in [("USER CACHE", &user), ("DAEMON DATA", &daemon)] {
+        let Some(report) = report else {
+            continue;
+        };
+
+        println!("{title} in {}", report.directory);
+
+        if report.entries.is_empty() {
+            println!("  nothing");
+        }
+
+        for entry in &report.entries {
+            let used = if entry.in_use.is_empty() {
+                String::new()
+            } else {
+                format!("  in use by {}", entry.in_use)
+            };
+
+            println!("  {:<40} {:>9}{used}", entry.name, human_size(entry.size));
+        }
+
+        println!("  total {}", human_size(report.total));
+    }
+
+    Ok(())
+}
+
+/// One area's plan or result, and where it goes next.
+struct CacheRemoval {
+    title: &'static str,
+    answer: pb::RemoveCacheResponse,
+}
+
+/// A prune's plan or outcome on the user cache.
+fn user_cache_prune(
+    args: &CachePruneArgs,
+    dry_run: bool,
+) -> anyhow::Result<pb::RemoveCacheResponse> {
+    use muru_controller::cache;
+
+    let rules = cache::PruneRules {
+        own_version: crate::provision::version(),
+        version: args.version.clone(),
+        tag: args.tag.clone(),
+    };
+    let mut answer = cache::plan_prune(
+        user_cache_report(&args.socket, &args.files)?,
+        &rules,
+        dry_run,
+    );
+
+    if !dry_run {
+        cache::carry_out(&mut answer);
+    }
+
+    Ok(answer)
+}
+
+/// A prune's plan or outcome on the daemon's area.
+async fn daemon_cache_prune(
+    args: &CachePruneArgs,
+    way: &CacheWay,
+    dry_run: bool,
+) -> anyhow::Result<pb::RemoveCacheResponse> {
+    match way {
+        CacheWay::Daemon(client) => Ok((**client)
+            .clone()
+            .prune_cache(pb::PruneCacheRequest {
+                version: args.version.clone().unwrap_or_default(),
+                tag: args.tag.clone().unwrap_or_default(),
+                dry_run,
+            })
+            .await
+            .map_err(explain)?
+            .into_inner()),
+        CacheWay::Files(locations, releases) => Ok(muru_controller::cache::prune_state(
+            locations,
+            releases,
+            args.version.clone(),
+            args.tag.clone(),
+            dry_run,
+        )),
+    }
+}
+
+/// A clear's plan or outcome on the user cache.
+fn user_cache_clear(
+    args: &CacheClearArgs,
+    dry_run: bool,
+) -> anyhow::Result<pb::RemoveCacheResponse> {
+    use muru_controller::cache;
+
+    let mut answer = cache::plan_clear(
+        user_cache_report(&args.socket, &args.files)?,
+        args.certs,
+        dry_run,
+    );
+
+    if !dry_run {
+        cache::carry_out(&mut answer);
+    }
+
+    Ok(answer)
+}
+
+/// A clear's plan or outcome on the daemon's area.
+async fn daemon_cache_clear(
+    way: &CacheWay,
+    dry_run: bool,
+) -> anyhow::Result<pb::RemoveCacheResponse> {
+    match way {
+        CacheWay::Daemon(client) => Ok((**client)
+            .clone()
+            .clear_cache(pb::ClearCacheRequest { dry_run })
+            .await
+            .map_err(explain)?
+            .into_inner()),
+        CacheWay::Files(locations, releases) => Ok(muru_controller::cache::clear_state(
+            locations, releases, dry_run,
+        )),
+    }
+}
+
+/// Print one area's plan and what is left, on standard error unless this
+/// is the dry run's answer.
+fn show_cache_plan(removal: &CacheRemoval, dry_run: bool) {
+    let print = |line: String| {
+        if dry_run {
+            println!("{line}");
+        } else {
+            eprintln!("{line}");
+        }
+    };
+
+    if removal.answer.removed.is_empty() && removal.answer.left.is_empty() {
+        return;
+    }
+
+    print(format!("{} in {}", removal.title, removal.answer.directory));
+
+    for item in &removal.answer.removed {
+        print(format!("  {} ({})", item.name, human_size(item.freed)));
+    }
+
+    for item in &removal.answer.left {
+        print(format!(
+            "  {} is left: in use by {}",
+            item.name, item.in_use
+        ));
+    }
+}
+
+/// `muructl cache prune` and `clear`, for scripts: each area asked for.
+#[derive(serde::Serialize)]
+struct CacheRemovalReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<pb::RemoveCacheResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon: Option<pb::RemoveCacheResponse>,
+}
+
+/// Show the plans, ask, and return whether to go on. `notice` is what is
+/// said before the question.
+fn cache_removal_decided(
+    removals: &[CacheRemoval],
+    dry_run: bool,
+    json: bool,
+    yes: bool,
+    notice: Option<&str>,
+) -> anyhow::Result<bool> {
+    let count: usize = removals
+        .iter()
+        .map(|removal| removal.answer.removed.len())
+        .sum();
+    let freed: u64 = removals.iter().map(|removal| removal.answer.freed).sum();
+
+    if dry_run || count == 0 {
+        if !json {
+            for removal in removals {
+                show_cache_plan(removal, true);
+            }
+
+            if count == 0 {
+                println!("muru: nothing to remove");
+            } else {
+                println!("would free {}", human_size(freed));
+            }
+        }
+
+        return Ok(false);
+    }
+
+    for removal in removals {
+        show_cache_plan(removal, false);
+    }
+
+    if let Some(notice) = notice {
+        eprintln!("{notice}");
+    }
+
+    let question = format!(
+        "Remove {count} item{}, freeing {}?",
+        if count == 1 { "" } else { "s" },
+        human_size(freed)
+    );
+
+    if confirm(&question, yes)? {
+        Ok(true)
+    } else {
+        eprintln!("muru: nothing was changed");
+        Ok(false)
+    }
+}
+
+/// Report the outcome of a removal, failing if any part of it did.
+fn finish_cache_removal(removals: Vec<CacheRemoval>, json: bool) -> anyhow::Result<()> {
+    let failures: Vec<String> = removals
+        .iter()
+        .flat_map(|removal| removal.answer.removed.iter())
+        .filter(|item| !item.error.is_empty())
+        .map(|item| format!("{}: {}", item.name, item.error))
+        .collect();
+    let freed: u64 = removals.iter().map(|removal| removal.answer.freed).sum();
+
+    if json {
+        let mut report = CacheRemovalReport {
+            user: None,
+            daemon: None,
+        };
+
+        for removal in removals {
+            if removal.title == USER_AREA_TITLE {
+                report.user = Some(removal.answer);
+            } else {
+                report.daemon = Some(removal.answer);
+            }
+        }
+
+        print_answer(&report)?;
+    } else {
+        println!("muru: removed, freeing {}", human_size(freed));
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+const USER_AREA_TITLE: &str = "USER CACHE";
+const DAEMON_AREA_TITLE: &str = "DAEMON DATA";
+
+/// Print the plans as `--json` gives them, for a run that stops there.
+fn print_cache_plans(removals: Vec<CacheRemoval>) -> anyhow::Result<()> {
+    let mut report = CacheRemovalReport {
+        user: None,
+        daemon: None,
+    };
+
+    for removal in removals {
+        if removal.title == USER_AREA_TITLE {
+            report.user = Some(removal.answer);
+        } else {
+            report.daemon = Some(removal.answer);
+        }
+    }
+
+    print_answer(&report)
+}
+
+/// Remove what is stale.
+pub async fn cache_prune(args: CachePruneArgs) -> anyhow::Result<()> {
+    let way = if args.area == Some(CacheArea::User) {
+        None
+    } else {
+        Some(cache_way(&args.socket, &args.files).await?)
+    };
+
+    let mut removals = Vec::new();
+
+    if args.area != Some(CacheArea::Daemon) {
+        removals.push(CacheRemoval {
+            title: USER_AREA_TITLE,
+            answer: user_cache_prune(&args, true)?,
+        });
+    }
+
+    if let Some(way) = &way {
+        removals.push(CacheRemoval {
+            title: DAEMON_AREA_TITLE,
+            answer: daemon_cache_prune(&args, way, true).await?,
+        });
+    }
+
+    let go_on = cache_removal_decided(&removals, args.dry_run, args.output.json, args.yes, None)?;
+
+    if !go_on {
+        return if args.output.json && (args.dry_run || nothing_planned(&removals)) {
+            print_cache_plans(removals)
+        } else {
+            Ok(())
+        };
+    }
+
+    for removal in &mut removals {
+        removal.answer = if removal.title == USER_AREA_TITLE {
+            user_cache_prune(&args, false)?
+        } else {
+            let way = way.as_ref().context("the daemon's area was planned")?;
+            daemon_cache_prune(&args, way, false).await?
+        };
+    }
+
+    finish_cache_removal(removals, args.output.json)
+}
+
+/// Whether no area has anything to remove.
+fn nothing_planned(removals: &[CacheRemoval]) -> bool {
+    removals
+        .iter()
+        .all(|removal| removal.answer.removed.is_empty())
+}
+
+/// Remove everything in an area that is not in use.
+pub async fn cache_clear(args: CacheClearArgs) -> anyhow::Result<()> {
+    let way = if args.area == CacheArea::User {
+        None
+    } else {
+        Some(cache_way(&args.socket, &args.files).await?)
+    };
+
+    let plan = match &way {
+        None => CacheRemoval {
+            title: USER_AREA_TITLE,
+            answer: user_cache_clear(&args, true)?,
+        },
+        Some(way) => CacheRemoval {
+            title: DAEMON_AREA_TITLE,
+            answer: daemon_cache_clear(way, true).await?,
+        },
+    };
+
+    let mut removals = vec![plan];
+    let notice = "These are re-created on demand. A runtime library is fetched again when next                   needed, which needs the network or a wheel directory (MURU_WHEEL_DIR).";
+
+    let go_on = cache_removal_decided(
+        &removals,
+        args.dry_run,
+        args.output.json,
+        args.yes,
+        Some(notice),
+    )?;
+
+    if !go_on {
+        return if args.output.json && (args.dry_run || nothing_planned(&removals)) {
+            print_cache_plans(removals)
+        } else {
+            Ok(())
+        };
+    }
+
+    removals[0].answer = match &way {
+        None => user_cache_clear(&args, false)?,
+        Some(way) => daemon_cache_clear(way, false).await?,
+    };
+
+    finish_cache_removal(removals, args.output.json)
+}
+
+/// A byte count for a reader, in the units sizes are given in.
+pub(crate) fn human_size(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
+
+    for (scale, unit) in UNITS {
+        if bytes >= scale {
+            return format!("{:.1}{unit}", bytes as f64 / scale as f64);
+        }
+    }
+
+    format!("{bytes}B")
 }
 
 /// An access log record as the compact line a development run prints,
@@ -7183,6 +8825,7 @@ mod tests {
             project: PathBuf::from(project),
             listen: "127.0.0.1:8080".to_owned(),
             socket: PathBuf::from(socket),
+            runtime: Vec::new(),
         };
         let daemon = PathBuf::from("/user/admin.sock");
         let denied = PathBuf::from("/run/muru/admin.sock");

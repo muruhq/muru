@@ -36,6 +36,13 @@ impl Limits {
         Self::read_from(Path::new(MOUNT), &membership)
     }
 
+    /// The cgroup v2 limits of another process, by its pid, or none
+    /// where its membership cannot be read.
+    pub fn read_of(pid: u32) -> Option<Self> {
+        let membership = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        Self::read_from(Path::new(MOUNT), &membership)
+    }
+
     /// The limits of the cgroup `membership` (the text of
     /// `/proc/self/cgroup`) names under `mount`. A path the mount does not
     /// hold, as when the container shares the host's cgroup namespace, is

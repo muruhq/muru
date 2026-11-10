@@ -22,8 +22,6 @@ pub enum Found {
     Beside,
     /// `uv` on PATH.
     OnPath,
-    /// The managed copy under the tools directory.
-    Managed,
 }
 
 impl Found {
@@ -34,7 +32,6 @@ impl Found {
             Found::Variable => UV_VARIABLE,
             Found::Beside => "beside muructl",
             Found::OnPath => "PATH",
-            Found::Managed => "the managed copy",
         }
     }
 }
@@ -92,9 +89,9 @@ pub enum UvError {
 
 impl Uv {
     /// Find uv by the lookup order of section 8.4: `configured` (the
-    /// daemon's `tools.uv`), `MURU_UV`, a uv beside this executable, uv on
-    /// PATH, then the managed copy in `tools_dir`.
-    pub fn find(configured: Option<&Path>, tools_dir: Option<&Path>) -> Option<Self> {
+    /// daemon's `tools.uv`), `MURU_UV`, a uv beside this executable, then
+    /// uv on PATH.
+    pub fn find(configured: Option<&Path>) -> Option<Self> {
         if let Some(path) = configured {
             return Some(Self {
                 path: path.to_path_buf(),
@@ -121,20 +118,10 @@ impl Uv {
             });
         }
 
-        if let Some(path) = find_on_path("uv") {
-            return Some(Self {
-                path,
-                found: Found::OnPath,
-            });
-        }
-
-        tools_dir
-            .map(|dir| dir.join("uv"))
-            .filter(|path| path.is_file())
-            .map(|path| Self {
-                path,
-                found: Found::Managed,
-            })
+        find_on_path("uv").map(|path| Self {
+            path,
+            found: Found::OnPath,
+        })
     }
 
     /// `uv --version`, as a version.
@@ -316,7 +303,7 @@ pub(crate) mod tests {
     fn a_configured_path_wins_and_version_is_read() {
         let dir = tempfile::tempdir().unwrap();
         let fake = fake_uv(dir.path(), Some("/opt/python/bin/python3.13"));
-        let uv = Uv::find(Some(&fake), None).unwrap();
+        let uv = Uv::find(Some(&fake)).unwrap();
 
         assert_eq!(uv.found, Found::Configured);
         assert_eq!(uv.version().unwrap(), Version::parse("0.9.9").unwrap());
@@ -330,7 +317,7 @@ pub(crate) mod tests {
     fn a_request_the_machine_cannot_satisfy_is_none_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let fake = fake_uv(dir.path(), None);
-        let uv = Uv::find(Some(&fake), None).unwrap();
+        let uv = Uv::find(Some(&fake)).unwrap();
 
         assert_eq!(uv.python_find("3.99", &Isolation::default()).unwrap(), None);
         assert!(
@@ -338,24 +325,6 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("python find 3.99 --no-project")
         );
-    }
-
-    #[test]
-    fn the_managed_copy_is_the_last_resort() {
-        let dir = tempfile::tempdir().unwrap();
-        let tools = dir.path().join("tools");
-        std::fs::create_dir_all(&tools).unwrap();
-        fake_uv(&tools, None);
-
-        // Nothing on PATH and nothing beside the test executable, so the
-        // managed copy is what is found.
-
-        let found = {
-            let _guard = EnvGuard::set("PATH", dir.path().join("empty"));
-            Uv::find(None, Some(&tools))
-        };
-
-        assert_eq!(found.map(|uv| uv.found), Some(Found::Managed));
     }
 
     /// Set a variable for the test and restore it after.

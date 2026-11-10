@@ -41,6 +41,8 @@ Recipes for specific tasks, assuming you already know the basics. The
   sizing in a pod.
 - [Upgrading Muru](upgrading.md): a new version of muructl and the
   daemon.
+- [Disk space](disk-space.md): clearing old releases, applications and
+  caches.
 
 ## Releases and traffic
 
@@ -104,7 +106,8 @@ Recipes for specific tasks, assuming you already know the basics. The
 - [The dashboard](dashboard.md): charts, workers and actions in a
   browser.
 - [Inspecting workers](debugging.md): stacks, profiles, memory and a
-  debugger in running workers.
+  debugger in running workers, a report to attach to a bug report, and
+  a bundle of a whole system for triage.
 
 ## Coding agents
 
@@ -132,6 +135,7 @@ migrations
 containers
 kubernetes
 upgrading
+disk-space
 traffic
 rollouts
 overlays

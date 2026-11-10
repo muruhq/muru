@@ -34,7 +34,10 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Configuration | muructl config show RELEASE --effective | Merged settings with their sources | 3.3 |
 | Configuration | muructl config schema | Print the JSON Schema for configuration files | 10.3 |
 | Applications | muructl app create, list, show, delete | Manage applications | 3.1 |
-| Applications | muructl release create, list, show, delete, wait | Manage releases and wait for states | 9.1 |
+| Applications | muructl app remove APP | Drain whatever runs and remove the application and all its releases, with their environments, bytecode and logs; refused while a route sends it traffic. Asks first. Flags: --dry-run, --yes, --json | 9.1 |
+| Applications | muructl release list, show, wait | Manage releases and wait for states; list shows the disk each takes | 9.1 |
+| Applications | muructl release prune [APP] --keep N | Remove old releases, of one application or all: the N newest that have not failed stay, with the serving, rollback and running releases and those a route or rollout uses. Failed releases stay until older than both the serving and the rollback release. Asks first. Flags: --force (take releases applied files declare), --keep-logs, --dry-run, --yes, --json | 9.1 |
+| Applications | muructl release remove APP@ID | Remove one release, the protected ones of 9.1 refused; a failed release named goes at once. Asks first. Flags: --keep-logs, --dry-run, --yes, --json | 9.1 |
 | Applications | muructl deploy APP PATH or IMAGE | Create a release and apply the default strategy. Flags: --entrypoint, --interface, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --factory, --release, --no-wait, --retain, --retain-workers, --fresh (take nothing from the previous release, section 3.3), --static (a directory of the release's own files, section 4.9), --build MODE, --build-extra, --build-group (the build table for this deploy, section 8.2), --dry-run (report what the deploy would do and change nothing, section 10.4) | 9.2 |
 | Applications | muructl reload APP | New release from the current source | 9.8 |
 | Applications | muructl command list [APP[@RELEASE]] | The commands the release declares, with their inputs and each one's last run; with no application, those of the project in the current directory. Flags: --chdir, --config | 9.12 |
@@ -53,10 +56,17 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Capacity | muructl restart RELEASE or APP --worker N | Replace one worker with a fresh one, or every worker in turn with --all; --pid names it by process id, --force kills it at once, --no-wait returns before the replacement serves | 7.6 |
 | Capacity | muructl schedule add, list, remove | Scheduled capacity | 7.5 |
 | Capacity | muructl edge pools, set | Edge pools and process counts | 4.2 |
+| Operations | muructl cache list [user or daemon] | What the user cache and the daemon's re-creatable data take, by runtime library version and tag, certificates, uv's build cache and downloaded Pythons, with what uses each. Flags: --json, and with no daemon running --state-dir and --cache-dir | 13.8 |
+| Operations | muructl cache prune [user or daemon] | Remove runtime libraries of other versions, or of the version or tag named, and downloaded Pythons no release uses; what is in use is left. Asks first. Flags: --version, --tag, --dry-run, --yes, --json, --state-dir, --cache-dir | 13.8 |
+| Operations | muructl cache clear user or daemon | Remove everything in the area that is not in use. Asks first. Flags: --certs (the development certificates too), --dry-run, --yes, --json, --state-dir, --cache-dir | 13.8 |
 | Observability | muructl watch | Live view of applications, releases and workers | 10.7 |
 | Observability | muructl events | Show or follow events with filters. Flags: --follow, --after | 11.5 |
 | Observability | muructl logs RELEASE | Show or follow logs | 11.2 |
 | Observability | muructl logs reopen [--workers] | Reopen log files after external rotation | 11.3 |
+| Observability | muructl logs rotate [TARGET] | Rotate now on the policy in force: TARGET as for truncate, or every log with content except orphaned ones. Refused when rotation is external. Flags: --json, and with no daemon running --log-dir, --state-dir and --config | 11.3 |
+| Observability | muructl logs prune | Remove archives by --keep N per log or --older-than DURATION and, with --orphaned, the logs and archives of releases and hosts that no longer exist. Asks first. Flags: --yes, --dry-run, --json, and with no daemon running --log-dir and --state-dir | 11.3 |
+| Observability | muructl logs truncate TARGET --keep SIZE | Cut a live log down to its newest SIZE at a line boundary; TARGET is APP@RELEASE, --access, --host HOST or --all. Asks first. Flags: --yes, --json, and with no daemon running --log-dir and --state-dir | 11.3 |
+| Observability | muructl logs list | Each log with its size, archives and total, flagging logs whose release or host no longer exists. Flags: --json, and with no daemon running --log-dir and --state-dir | 11.3 |
 | Observability | muructl metrics | Print the node's metrics as Prometheus text | 11.1 |
 | Observability | muructl logging level RELEASE | Time-limited logger levels, or --reset | 11.4 |
 | Observability | muructl logging access MODE | Time-limited changes to which requests the access log writes, for an application and paths, the list of those in force, or --reset | 11.2 |
@@ -70,14 +80,14 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Observability | muructl debug inspect TARGET | sys.path, modules, redacted environment, settings, descriptors and threads | 11.7 |
 | Images and tools | muructl image check IMAGE | Probe an image against the contract | 8.6 |
 | Images and tools | muructl image build, dockerfile | Build an image or print the generated Dockerfile (later) | 8.6 |
-| Images and tools | muructl tools install uv | Managed copy of uv | 8.4 |
 | Images and tools | muructl runtime install --python PYTHON --target DIR | Unpack the runtime library for that interpreter's tag, the image build step | 8.3 |
 | Traffic | muructl overlay list, show, preview NAME | Overlays, triggers and effective changes | 9.10 |
 | Traffic | muructl overlay activate, end NAME [--for, --until] | Manual activation and ending | 9.10 |
 | Traffic | muructl overlay promote NAME | Fold an active overlay into the base configuration | 9.10 |
 | Traffic | muructl client-class list, test | Show classes, classify a sample request | 4.14 |
 | Traffic | muructl ratelimit list, status | Rate limits and current rejections | 4.15 |
-| Observability | muructl debug report | Redacted diagnostic bundle for bug reports | 18.6 |
+| Observability | muructl debug report | A short summary of the installation to attach to a bug report, safe to post: no log lines, request data, environment or secrets, and names, paths and addresses as placeholders. Works with no daemon running, on its files. Flags: --format (text or markdown), --json, and the daemon's location options --state-dir, --config, --run-dir and --system | 11.9, 18.6 |
+| Observability | muructl debug bundle [TARGET] | An archive of the whole system for a time window, for the people who own it to triage with; it holds production data. TARGET is app or app@release, the whole node by default. Works with no daemon running, on its files, and records what it could not collect in its manifest. Flags: --since DURATION (1h), --output FILE or - for standard output, --dry-run, --scrub (client addresses as placeholders, query strings cut), --memory and --profile DURATION (the workers' object counts and a profile, which cost the workers and are collected only when asked for), and the daemon's location options --state-dir, --log-dir, --config, --run-dir and --system | 11.9 |
 | Development | muructl serve-static DIR | Serve a directory with no configuration. Flags: --listing, --index, --fallback, --https and port options | 4.9 |
 | Daemon | muructl daemon stop --shutdown [--timeout] | Drain every release and stop everything, instead of detaching | 13.3 |
 | Configuration | muructl secret set, list, remove | Manage the file secret store; values never appear in output | 10.8 |

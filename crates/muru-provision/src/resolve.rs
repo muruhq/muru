@@ -380,7 +380,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let fake = fake_uv(dir.path(), Some(&python3.display().to_string()));
-        let uv = Uv::find(Some(&fake), None).unwrap();
+        let uv = Uv::find(Some(&fake)).unwrap();
         let isolation = Isolation::default();
         std::fs::write(dir.path().join(".python-version"), "3.13\n").unwrap();
         let resolved = resolve(&inputs(dir.path(), Some(&uv), &isolation)).unwrap();
@@ -396,7 +396,7 @@ mod tests {
 
         std::fs::create_dir_all(dir.path().join("none")).unwrap();
         let missing = fake_uv(&dir.path().join("none"), None);
-        let uv = Uv::find(Some(&missing), None).unwrap();
+        let uv = Uv::find(Some(&missing)).unwrap();
         let error = resolve(&inputs(dir.path(), Some(&uv), &isolation)).unwrap_err();
 
         assert_eq!(
@@ -453,7 +453,7 @@ mod tests {
         .unwrap();
         let text = python3.display().to_string();
         let fake = fake_uv(dir.path(), Some(&text));
-        let uv = Uv::find(Some(&fake), None).unwrap();
+        let uv = Uv::find(Some(&fake)).unwrap();
         let mut by_path = self::tests::inputs(dir.path(), Some(&uv), &isolation);
         by_path.flag = Some(&text);
         let error = resolve(&by_path).unwrap_err();
@@ -477,7 +477,7 @@ mod tests {
         std::os::unix::fs::symlink(&python3, bin.join("python")).unwrap();
         std::fs::write(dir.path().join(".python-version"), "3.13\n").unwrap();
         let fake = fake_uv(dir.path(), Some(&python3.display().to_string()));
-        let uv = Uv::find(Some(&fake), None).unwrap();
+        let uv = Uv::find(Some(&fake)).unwrap();
         let isolation = Isolation::default();
         let _guard = EnvGuard::set("VIRTUAL_ENV", "");
 

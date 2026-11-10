@@ -29,6 +29,15 @@ def wait_for(predicate: Callable[[], bool], timeout: float = 20.0) -> None:
         time.sleep(0.1)
 
 
+def serving_pid(server: support.Server) -> int | None:
+    """The pid of the worker answering /info, or None while no worker can
+    answer: a 503 is the documented reply in the gap as the only worker is
+    replaced."""
+
+    response = server.get("/info")
+    return json.loads(response.body)["pid"] if response.status == 200 else None
+
+
 def replacements(log: str) -> list[str]:
     """The worker.recycled and worker.timeout_killed lines the host logged."""
 
@@ -151,7 +160,7 @@ def test_a_request_past_the_hard_timeout_replaces_its_worker() -> None:
         thread.join(timeout=30)
         assert outcome and outcome[0] != "status 200", outcome
 
-        wait_for(lambda: json.loads(server.get("/info").body)["pid"] != stuck_pid)
+        wait_for(lambda: serving_pid(server) not in (None, stuck_pid))
         assert server.get("/sleep?seconds=0.1").status == 200
     finally:
         server.stop()
@@ -186,7 +195,7 @@ def test_an_event_loop_that_stalls_replaces_its_worker() -> None:
         assert "past the loop stall timeout of 1 s" in log
         assert "plain_asgi.py" in log, "no stack dump"
 
-        wait_for(lambda: json.loads(server.get("/info").body)["pid"] != stalled_pid, timeout=30)
+        wait_for(lambda: serving_pid(server) not in (None, stalled_pid), timeout=30)
         assert server.get("/").status == 200
     finally:
         server.stop()

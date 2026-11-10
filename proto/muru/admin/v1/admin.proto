@@ -17,6 +17,8 @@ service Admin {
   // Applications.
   rpc ListApps(ListAppsRequest) returns (ListAppsResponse);
   rpc GetApp(GetAppRequest) returns (App);
+  // Remove an application and every release it has, or say what would go.
+  rpc RemoveApp(RemoveAppRequest) returns (RemoveReleasesResponse);
 
   // Create a release from a source directory and apply the application's
   // default strategy (blue/green): start it, move traffic when it is
@@ -35,6 +37,10 @@ service Admin {
   rpc Rollback(RollbackRequest) returns (Release);
   // Drain a release: no new traffic, requests in flight finish, then stop.
   rpc DrainRelease(DrainReleaseRequest) returns (Release);
+  // Remove old releases of one application or of all, or list what would go.
+  rpc PruneReleases(PruneReleasesRequest) returns (RemoveReleasesResponse);
+  // Remove one release, or say what that would free.
+  rpc RemoveRelease(RemoveReleaseRequest) returns (RemoveReleasesResponse);
 
   // Section 9.3: shift an application's traffic to a release step by step,
   // with gates, and control the rollout; or move all of it at once.
@@ -87,6 +93,21 @@ service Admin {
   // and reopening every log file after an external rotation.
   rpc TailLogs(TailLogsRequest) returns (stream LogLine);
   rpc ReopenLogs(ReopenLogsRequest) returns (ReopenLogsResponse);
+  // The log files and their archives, what they take, and which belong to a release or host that is gone.
+  rpc ListLogs(ListLogsRequest) returns (ListLogsResponse);
+  // Cut live logs down, or say what doing so would free.
+  rpc TruncateLogs(TruncateLogsRequest) returns (TruncateLogsResponse);
+  // Rotate logs now, on the daemon's policy; refused when rotation is external.
+  rpc RotateLogs(RotateLogsRequest) returns (RotateLogsResponse);
+  // Remove log archives by count or age and, when asked, the logs of what no longer exists.
+  rpc PruneLogs(PruneLogsRequest) returns (PruneLogsResponse);
+
+  // The daemon's re-creatable data (sections 8.2, 8.3 and 13.8).
+  rpc ListCache(ListCacheRequest) returns (ListCacheResponse);
+  // Remove what is stale, or list what would go.
+  rpc PruneCache(PruneCacheRequest) returns (RemoveCacheResponse);
+  // Remove everything in the daemon's area that is not in use, or list it.
+  rpc ClearCache(ClearCacheRequest) returns (RemoveCacheResponse);
 
   // Metrics (section 11.1): the node's Prometheus text exposition.
   rpc GetMetrics(GetMetricsRequest) returns (MetricsText);
@@ -112,6 +133,10 @@ service Admin {
   // DumpStacks and SetLogLevel of appendix B are the stacks and logging
   // operations of this one call.
   rpc Debug(DebugRequest) returns (DebugResponse);
+
+  // Section 11.9: say that a diagnostic bundle is being made of this
+  // system, which is recorded as an event as the debug operations are.
+  rpc NoteBundle(NoteBundleRequest) returns (NoteBundleResponse);
 
   // Section 9.10: overlays, their state, and activating, ending,
   // previewing and promoting one.
@@ -152,6 +177,9 @@ message Status {
   string release = 17;              // a run's release, r1 and so on; empty for a daemon
   string project = 18;              // a run's project directory; empty for a daemon
   string no_host = 19;              // several applications serve with no hosts declared, and which; empty otherwise
+  string config = 20;               // the daemon's configuration file, which need not exist; empty for a run
+  string log_dir = 21;              // the daemon's log directory; empty for a run, which writes no log files
+  string cache_dir = 22;            // the daemon's cache directory; empty for a run
 }
 
 message ListWebSocketsRequest {
@@ -375,6 +403,7 @@ message EnvEntry {
 
 message ListReleasesRequest {
   string app = 1;                   // every application when empty
+  bool disk = 2;                    // also measure what each release takes on disk
 }
 
 message ListReleasesResponse {
@@ -400,6 +429,52 @@ message RollbackRequest {
 message DrainReleaseRequest {
   string app = 1;
   string release = 2;
+}
+
+message PruneReleasesRequest {
+  string app = 1;                   // every application when empty
+  uint32 keep = 2;                  // keep this many of the newest releases that have not failed
+  bool force = 3;                   // also take releases applied files declare
+  bool keep_logs = 4;               // leave the logs of what is removed
+  bool dry_run = 5;                 // only list what would go
+}
+
+message RemoveAppRequest {
+  string app = 1;
+  bool dry_run = 2;                 // only say what would go
+}
+
+message RemoveReleaseRequest {
+  string app = 1;
+  string release = 2;
+  bool keep_logs = 3;               // leave its log and archives
+  bool dry_run = 4;                 // only say what it would free
+}
+
+// A release a removal took, or would take.
+message RemovedRelease {
+  string app = 1;
+  string id = 2;
+  string state = 3;
+  uint64 created_unix_ms = 4;
+  uint64 disk_bytes = 5;            // what removing it gives back
+  string why = 6;                   // keep, failed, named or application
+  string error = 7;                 // why it could not be removed, or what was left behind
+}
+
+// A release a removal left, and why.
+message KeptRelease {
+  string app = 1;
+  string id = 2;
+  string state = 3;
+  string why = 4;                   // serving, rollback, in_use, referenced, declared, keep or failed
+}
+
+message RemoveReleasesResponse {
+  repeated RemovedRelease removed = 1;
+  repeated KeptRelease kept = 2;
+  uint64 freed = 3;                 // the bytes given back, or that would be
+  bool dry_run = 4;                 // nothing was changed
 }
 
 // Section 9.3: a canary rollout of a candidate release against the
@@ -614,6 +689,8 @@ message Release {
   string bytecode = 31;             // where bytecode goes: redirect with its directory, source (precompiled when detected), or off
   repeated ServerInstance server_instances = 32; // an http release's instances while it runs (section 9.9)
   bool host_running = 33;           // whether a host runs for it now; false for a stopped or dormant release
+  uint64 disk_bytes = 34;           // what its environment, bytecode and logs take; set when asked for
+  uint64 disk_freed_bytes = 35;     // what removing it would give back, less than disk_bytes when files are hard-linked elsewhere
 }
 
 // An instance of an http release's command.
@@ -711,6 +788,16 @@ message WorkerDebug {
   string error = 4;                 // when not ok
   string result_json = 5;           // the operation's result, when ok
 }
+
+message NoteBundleRequest {
+  string app = 1;                   // the application the bundle is limited to; the whole node when empty
+  string release = 2;               // the release it is limited to; every release when empty
+  uint64 since_unix_ms = 3;         // where its window starts
+  uint64 until_unix_ms = 4;         // where its window ends, which is when it was asked for
+  repeated string options = 5;      // what was asked for beyond the default, as scrub, memory or profile
+}
+
+message NoteBundleResponse {}
 
 message ListOverlaysRequest {}
 
@@ -972,6 +1059,139 @@ message ReopenLogsRequest {
 message ReopenLogsResponse {
   bool edge = 1;                    // the edge was told
   uint32 hosts = 2;                 // hosts told
+}
+
+message ListLogsRequest {}
+
+message LogArchive {
+  string name = 1;                  // its path relative to the log directory
+  uint64 size = 2;                  // in bytes
+  uint64 modified_unix_ms = 3;      // when it was last changed
+}
+
+message LogInfo {
+  string name = 1;                  // its path relative to the log directory
+  string kind = 2;                  // access, edge, daemon, host or release
+  string app = 3;                   // the application of a release's log
+  string release = 4;               // the release of a release's log
+  repeated string hosts = 5;        // the virtual hosts that name this file
+  uint64 size = 6;                  // in bytes, 0 when the file is gone
+  bool present = 7;                 // the file itself exists, not only archives of it
+  repeated LogArchive archives = 8; // oldest first
+  uint64 archives_size = 9;         // the bytes the archives take
+  uint64 total = 10;                // the bytes the log and its archives take
+  bool orphaned = 11;               // its release or host no longer exists
+}
+
+message ListLogsResponse {
+  string directory = 1;             // the log directory
+  repeated LogInfo logs = 2;        // by name
+  uint64 total = 3;                 // the bytes all of them take
+  bool orphans_known = 4;           // whether orphaned is meaningful: the state store was available
+}
+
+message LogTarget {
+  string app = 1;                   // with release: one release's log
+  string release = 2;
+  bool access = 3;                  // the access log
+  string host = 4;                  // the file a virtual host names
+  bool all = 5;                     // every log
+}
+
+message TruncateLogsRequest {
+  LogTarget target = 1;
+  uint64 keep = 2;                  // bytes of the newest content to keep, 0 for none
+  bool dry_run = 3;                 // say what it would free, changing nothing
+}
+
+message TruncatedLog {
+  string name = 1;                  // its path relative to the log directory
+  uint64 size = 2;                  // its size before
+  uint64 kept = 3;                  // the bytes kept
+  uint64 freed = 4;                 // the bytes freed
+  bool in_place = 5;                // cut in place, so lines written meanwhile are lost
+  uint64 late = 6;                  // the bytes writers added during the swap, carried over
+  string error = 7;                 // why this log could not be cut
+}
+
+message TruncateLogsResponse {
+  repeated TruncatedLog logs = 1;
+  uint64 freed = 2;                 // the bytes freed in all
+  bool dry_run = 3;                 // nothing was changed
+}
+
+message RotateLogsRequest {
+  LogTarget target = 1;             // every log but orphaned ones when none is named
+}
+
+message RotatedLog {
+  string name = 1;                  // its path relative to the log directory
+  uint64 size = 2;                  // the bytes rotated
+  string archive = 3;               // the archive, before compression under a daemon
+  string error = 4;                 // why this log could not be rotated
+}
+
+message RotateLogsResponse {
+  repeated RotatedLog logs = 1;     // the logs with content that were named
+}
+
+message PruneLogsRequest {
+  optional uint32 keep = 1;         // keep this many of the newest archives per log
+  uint64 older_than_s = 2;          // remove archives older than this; 0 for no limit
+  bool orphaned = 3;                // also remove the logs and archives of releases and hosts that no longer exist
+  bool dry_run = 4;                 // only list what would go
+}
+
+message PrunedFile {
+  string name = 1;                  // its path relative to the log directory
+  uint64 size = 2;                  // in bytes
+  string why = 3;                   // keep, older_than or orphaned
+  string error = 4;                 // why it could not be removed
+}
+
+message PruneLogsResponse {
+  repeated PrunedFile removed = 1;
+  uint64 freed = 2;                 // the bytes freed, or that would be
+  bool dry_run = 3;                 // nothing was changed
+}
+
+message ListCacheRequest {}
+
+// One thing a cache area holds.
+message CacheEntry {
+  string kind = 1;                  // runtime, certs, uv_cache or python
+  string name = 2;                  // its name within the area
+  string path = 3;
+  string version = 4;               // of a runtime library
+  string tag = 5;                   // of a runtime library: the interpreter tag
+  uint64 size = 6;                  // the bytes it takes
+  string in_use = 7;                // what uses it, when something does
+  uint64 freed = 8;                 // what removing it gives back
+  string error = 9;                 // why it could not be removed
+}
+
+message PruneCacheRequest {
+  string version = 1;               // only runtime libraries of this version
+  string tag = 2;                   // only runtime libraries of this interpreter tag
+  bool dry_run = 3;                 // only list what would go
+}
+
+message ClearCacheRequest {
+  bool dry_run = 1;                 // only list what would go
+}
+
+message RemoveCacheResponse {
+  string directory = 1;             // the directory the area is in
+  repeated CacheEntry removed = 2;  // what went, or would go
+  repeated CacheEntry left = 3;     // what stayed because something uses it
+  uint64 freed = 4;                 // the bytes given back, or that would be
+  bool dry_run = 5;                 // nothing was changed
+}
+
+message ListCacheResponse {
+  string directory = 1;             // the directory the area is in
+  repeated CacheEntry entries = 2;
+  uint64 total = 3;                 // the bytes the area takes
 }
 
 message GetMetricsRequest {}

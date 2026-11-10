@@ -42,7 +42,7 @@ body:
         - muructl run (development mode)
         - user daemon
         - system daemon
-        - container release
+        - muructl serve (one application in a container)
     validations:
       required: true
   - type: input
@@ -72,8 +72,7 @@ body:
     id: diagnostics
     attributes:
       label: Diagnostics
-      description: Output of `muructl debug report` (it redacts secrets), or relevant log lines and events.
-      render: text
+      description: Output of `muructl debug report --format markdown`, pasted as it is. It holds no logs or secrets, and replaces application names, host names, paths and addresses with placeholders; read it before posting. Log lines and events pasted here instead need a code fence of their own (a line of three backticks before and after).
   - type: checkboxes
     id: searched
     attributes:

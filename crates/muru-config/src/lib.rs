@@ -1420,7 +1420,7 @@ pub struct Daemon {
 #[serde(deny_unknown_fields)]
 pub struct Tools {
     /// The uv to run, in place of the lookup order (`MURU_UV`, a uv
-    /// beside muructl, uv on PATH, the managed copy).
+    /// beside muructl, uv on PATH).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uv: Option<String>,
     /// The uv versions accepted, as a specifier such as `>=0.9`; the

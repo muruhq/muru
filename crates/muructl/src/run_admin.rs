@@ -204,6 +204,8 @@ pub struct RunState {
     pub commands: muru_controller::commands::Underway,
     /// The events the run's hosts raised.
     pub events: Arc<RunEvents>,
+    /// The settings in force, each with where it came from.
+    pub settings: Arc<crate::print_config::Settings>,
 }
 
 /// What the run serves the application with, which a command of the
@@ -489,6 +491,10 @@ pub struct RunInfo {
     pub listen: String,
     /// The admin socket.
     pub socket: PathBuf,
+    /// The runtime library directories the run uses, which `muructl
+    /// cache` leaves while it runs.
+    #[serde(default)]
+    pub runtime: Vec<PathBuf>,
 }
 
 /// The run's place in the user runtime directory, removed when dropped.
@@ -509,6 +515,7 @@ impl Registration {
         listen: SocketAddr,
         app: &str,
         project: &Path,
+        library: Option<&Path>,
     ) -> anyhow::Result<Self> {
         let runs = runtime.join("runs");
         std::fs::create_dir_all(&runs).with_context(|| format!("creating {}", runs.display()))?;
@@ -534,12 +541,37 @@ impl Registration {
             project: project.to_path_buf(),
             listen: listen.to_string(),
             socket: socket.clone(),
+            runtime: library.map(Path::to_path_buf).into_iter().collect(),
         };
         std::fs::write(directory.join("run.json"), serde_json::to_vec(&info)?)?;
         Ok(Self {
             directory: Some(directory),
             socket,
         })
+    }
+
+    /// Record another runtime library directory the run uses, when a
+    /// rebuild moved it to a different interpreter. Earlier ones stay
+    /// listed, since a release may still be draining on them.
+    pub fn note_runtime(&self, library: &Path) {
+        let Some(directory) = &self.directory else {
+            return;
+        };
+        let path = directory.join("run.json");
+        let Some(mut info) = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RunInfo>(&bytes).ok())
+        else {
+            return;
+        };
+
+        if !info.runtime.iter().any(|known| known == library) {
+            info.runtime.push(library.to_path_buf());
+
+            if let Ok(bytes) = serde_json::to_vec(&info) {
+                let _ = std::fs::write(path, bytes);
+            }
+        }
     }
 
     /// The admin socket of `muructl serve` at `socket`, in its run
@@ -559,6 +591,7 @@ impl Registration {
             project: project.to_path_buf(),
             listen: listen.to_string(),
             socket: socket.to_path_buf(),
+            runtime: Vec::new(),
         };
         let registration = socket.with_file_name("serve.json");
         std::fs::write(&registration, serde_json::to_vec(&info)?)?;
@@ -588,7 +621,9 @@ impl Drop for Registration {
 }
 
 /// The development runs listening now, from the runtime directory; the
-/// leavings of a run that is gone are removed on the way.
+/// leavings of a run that is gone are removed on the way. The socket is
+/// tried because the pid of a run that is gone can come to belong to
+/// another process.
 pub fn runs(runtime: &Path) -> Vec<RunInfo> {
     let Ok(entries) = std::fs::read_dir(runtime.join("runs")) else {
         return Vec::new();
@@ -601,7 +636,11 @@ pub fn runs(runtime: &Path) -> Vec<RunInfo> {
             .and_then(|bytes| serde_json::from_slice::<RunInfo>(&bytes).ok());
 
         match info {
-            Some(info) if muru_controller::host::alive(info.pid) && info.socket.exists() => {
+            Some(info)
+                if muru_controller::host::alive(info.pid)
+                    && info.socket.exists()
+                    && !muru_controller::client::left_behind(&info.socket) =>
+            {
                 found.push(info);
             }
             _ => {
@@ -656,6 +695,14 @@ type LogStream = Pin<Box<dyn Stream<Item = Result<pb::LogLine, Status>> + Send>>
 type CommandStream = Pin<Box<dyn Stream<Item = Result<pb::CommandOutput, Status>> + Send>>;
 
 impl Service {
+    /// What a command on the log files gets from a development run.
+    fn no_log_files(&self) -> Status {
+        Status::failed_precondition(format!(
+            "a development run writes no log files: the output of {} goes to the terminal",
+            self.state.app
+        ))
+    }
+
     /// Why a command that manages the daemon's state is refused here.
     fn needs_the_daemon(&self, what: &str) -> Status {
         Status::failed_precondition(format!(
@@ -770,6 +817,9 @@ impl Admin for Service {
             release: state.release_id(),
             project: state.project.display().to_string(),
             no_host: String::new(),
+            config: String::new(),
+            log_dir: String::new(),
+            cache_dir: String::new(),
         }))
     }
 
@@ -865,6 +915,34 @@ impl Admin for Service {
              terminal",
             self.state.app
         )))
+    }
+
+    async fn truncate_logs(
+        &self,
+        _: Request<pb::TruncateLogsRequest>,
+    ) -> Result<Response<pb::TruncateLogsResponse>, Status> {
+        Err(self.no_log_files())
+    }
+
+    async fn rotate_logs(
+        &self,
+        _: Request<pb::RotateLogsRequest>,
+    ) -> Result<Response<pb::RotateLogsResponse>, Status> {
+        Err(self.no_log_files())
+    }
+
+    async fn prune_logs(
+        &self,
+        _: Request<pb::PruneLogsRequest>,
+    ) -> Result<Response<pb::PruneLogsResponse>, Status> {
+        Err(self.no_log_files())
+    }
+
+    async fn list_logs(
+        &self,
+        _: Request<pb::ListLogsRequest>,
+    ) -> Result<Response<pb::ListLogsResponse>, Status> {
+        Err(self.no_log_files())
     }
 
     async fn get_metrics(
@@ -975,6 +1053,21 @@ impl Admin for Service {
         }))
     }
 
+    /// A bundle being made of the run, which the daemon records as an
+    /// event and the run prints, as it does the debug operations.
+    async fn note_bundle(
+        &self,
+        request: Request<pb::NoteBundleRequest>,
+    ) -> Result<Response<pb::NoteBundleResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .target(&request.app, &request.release)
+            .map_err(Status::not_found)?;
+        let (_, message) = muru_controller::diagnostics::bundle_event(&request);
+        muru_common::muru_println!("debug.bundle: {message}");
+        Ok(Response::new(pb::NoteBundleResponse {}))
+    }
+
     async fn override_access_log(
         &self,
         request: Request<pb::OverrideAccessLogRequest>,
@@ -1060,6 +1153,36 @@ impl Admin for Service {
         }))
     }
 
+    /// The settings the run serves with, each with where it came from,
+    /// as the daemon gives a release's with the effective configuration
+    /// (section 3.3). A run has no desired state, so nothing else of the
+    /// configuration is answered for.
+    async fn export_config(
+        &self,
+        request: Request<pb::ExportConfigRequest>,
+    ) -> Result<Response<pb::ExportConfigResponse>, Status> {
+        let request = request.into_inner();
+        let state = &self.state;
+
+        if !request.effective {
+            return Err(self.needs_the_daemon("muructl config"));
+        }
+
+        let release = state.target(&request.app, "").map_err(Status::not_found)?;
+
+        Ok(Response::new(pb::ExportConfigResponse {
+            document: String::new(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            node: muru_controller::config::hostname(),
+            time_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as u64),
+            state_version: 0,
+            attributions: Vec::new(),
+            layers: state.settings.layers(&format!("{}@{release}", state.app)),
+        }))
+    }
+
     async fn list_events(
         &self,
         request: Request<pb::ListEventsRequest>,
@@ -1111,6 +1234,7 @@ impl Admin for Service {
     needs_the_daemon! {
         list_apps(pb::ListAppsRequest) -> pb::ListAppsResponse, "muructl app";
         get_app(pb::GetAppRequest) -> pb::App, "muructl app";
+        remove_app(pb::RemoveAppRequest) -> pb::RemoveReleasesResponse, "muructl app remove";
         deploy(pb::DeployRequest) -> pb::Release, "muructl deploy";
         plan_deploy(pb::DeployRequest) -> pb::DeployPlan, "muructl deploy";
         list_releases(pb::ListReleasesRequest) -> pb::ListReleasesResponse, "muructl release";
@@ -1118,6 +1242,11 @@ impl Admin for Service {
         wait_release(pb::WaitReleaseRequest) -> pb::Release, "muructl release wait";
         rollback(pb::RollbackRequest) -> pb::Release, "muructl rollback";
         drain_release(pb::DrainReleaseRequest) -> pb::Release, "muructl drain";
+        list_cache(pb::ListCacheRequest) -> pb::ListCacheResponse, "muructl cache";
+        prune_cache(pb::PruneCacheRequest) -> pb::RemoveCacheResponse, "muructl cache prune";
+        clear_cache(pb::ClearCacheRequest) -> pb::RemoveCacheResponse, "muructl cache clear";
+        prune_releases(pb::PruneReleasesRequest) -> pb::RemoveReleasesResponse, "muructl release prune";
+        remove_release(pb::RemoveReleaseRequest) -> pb::RemoveReleasesResponse, "muructl release remove";
         start_rollout(pb::StartRolloutRequest) -> pb::Rollout, "muructl rollout";
         get_rollout(pb::GetRolloutRequest) -> pb::Rollout, "muructl rollout";
         list_rollouts(pb::ListRolloutsRequest) -> pb::ListRolloutsResponse, "muructl rollout";
@@ -1136,7 +1265,6 @@ impl Admin for Service {
         list_upstreams(pb::ListUpstreamsRequest) -> pb::ListUpstreamsResponse, "muructl upstream";
         apply_config(pb::ApplyConfigRequest) -> pb::ConfigReport, "muructl apply";
         diff_config(pb::DiffConfigRequest) -> pb::ConfigReport, "muructl config diff";
-        export_config(pb::ExportConfigRequest) -> pb::ExportConfigResponse, "muructl config show";
         reload_config(pb::ReloadConfigRequest) -> pb::ReloadConfigResponse, "muructl daemon reload";
         upgrade_daemon(pb::UpgradeDaemonRequest) -> pb::UpgradeDaemonResponse, "muructl daemon upgrade";
         list_overlays(pb::ListOverlaysRequest) -> pb::ListOverlaysResponse, "muructl overlay";

@@ -2,7 +2,7 @@
 //! `muru.admin.v1` service over the admin Unix socket, which muructl and
 //! the dashboard's gateway speak.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use crate::daemon::{CertificateChanges, Command, Handle, RolloutAction};
 use crate::model::{
     Event, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutStep, now_unix_ms,
 };
+use crate::removal;
 
 /// Serve the API on the socket until the returned future ends.
 pub async fn serve(
@@ -64,6 +65,172 @@ struct Service {
     /// Held by the apply under way, from its plan until it ends, so that
     /// applies happen one after another (section 10.10).
     applying: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// The instant `seconds` ago, for an age limit; none for 0.
+fn older_than(seconds: u64) -> Option<std::time::SystemTime> {
+    (seconds > 0).then(|| std::time::SystemTime::now() - std::time::Duration::from_secs(seconds))
+}
+
+/// Cut the named logs to `keep` bytes each, holding them against
+/// rotation: section 11.3 has `keep` of 0 truncate in place, and any
+/// other size swap in the kept part, have the writers reopen, and add
+/// what arrived meanwhile.
+async fn truncate_logs(
+    handle: Handle,
+    directory: std::path::PathBuf,
+    existing: crate::log_files::Existing,
+    target: pb::LogTarget,
+    keep: u64,
+) -> Result<pb::TruncateLogsResponse, Status> {
+    use crate::log_files::Target;
+
+    let logs = crate::log_files::list(&directory, Some(&existing))
+        .map_err(|error| Status::internal(format!("reading the log directory: {error}")))?;
+    let selected = crate::log_files::select(&logs, &target).map_err(Status::failed_precondition)?;
+    let paths: Vec<std::path::PathBuf> = selected
+        .iter()
+        .map(|log| directory.join(&log.name))
+        .collect();
+
+    let (done_tx, done_rx) = oneshot::channel();
+    handle
+        .commands
+        .send(Command::ClaimLogs {
+            paths: paths.clone(),
+            done: done_tx,
+        })
+        .await
+        .map_err(|_| Status::unavailable(STOPPING))?;
+    let in_place = done_rx
+        .await
+        .map_err(|_| Status::unavailable(STOPPING))?
+        .map_err(Status::failed_precondition)?;
+
+    let targets: Vec<Target> = selected
+        .iter()
+        .zip(paths.iter().zip(in_place))
+        .map(|(log, (path, in_place))| Target {
+            path: path.clone(),
+            name: log.name.clone(),
+            keep,
+            in_place,
+        })
+        .collect();
+    let sizes: std::collections::HashMap<String, (u64, u64)> = selected
+        .iter()
+        .map(|log| {
+            let cut = crate::log_files::cut_point(&directory.join(&log.name), log.size, keep)
+                .unwrap_or(0);
+            (log.name.clone(), (log.size, cut))
+        })
+        .collect();
+
+    let outcome = run_truncate(&handle, targets, keep, sizes).await;
+    let _ = handle.commands.send(Command::ReleaseLogs { paths }).await;
+
+    if let Ok(answer) = &outcome {
+        let names: Vec<&str> = answer
+            .logs
+            .iter()
+            .filter(|log| log.error.is_empty() && log.freed > 0)
+            .map(|log| log.name.as_str())
+            .collect();
+
+        if !names.is_empty() {
+            handle.events.emit(
+                "logs.truncated",
+                "logs",
+                "info",
+                &format!("truncated {}", names.join(", ")),
+            );
+        }
+    }
+
+    outcome
+}
+
+/// Cut each of the targets: the steps, in order, of section 11.3.
+async fn run_truncate(
+    handle: &Handle,
+    targets: Vec<crate::log_files::Target>,
+    keep: u64,
+    sizes: std::collections::HashMap<String, (u64, u64)>,
+) -> Result<pb::TruncateLogsResponse, Status> {
+    let cut = tokio::task::spawn_blocking(move || {
+        let mut swapped = Vec::new();
+        let mut results = Vec::new();
+
+        for target in targets {
+            let (size, cut) = sizes.get(&target.name).copied().unwrap_or_default();
+            let mut result = pb::TruncatedLog {
+                name: target.name.clone(),
+                size,
+                kept: size - cut,
+                freed: cut,
+                in_place: target.in_place && keep > 0,
+                ..Default::default()
+            };
+
+            let done = if target.in_place || keep == 0 {
+                crate::log_files::cut_in_place(&target).map(|_| None)
+            } else {
+                crate::log_files::swap_in(&target)
+            };
+
+            match done {
+                Ok(Some(one)) => swapped.push(one),
+                Ok(None) => {}
+                Err(error) => {
+                    result.error = error.to_string();
+                    result.freed = 0;
+                    result.kept = size;
+                }
+            }
+
+            results.push(result);
+        }
+
+        (results, swapped)
+    })
+    .await
+    .map_err(|error| Status::internal(error.to_string()))?;
+
+    let (mut results, swapped) = cut;
+
+    if !swapped.is_empty() {
+        let (done_tx, done_rx) = oneshot::channel();
+        handle
+            .commands
+            .send(Command::ReopenLogs {
+                workers: false,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        done_rx.await.map_err(|_| Status::unavailable(STOPPING))?;
+
+        for (name, added) in crate::log_files::finish_swaps(swapped).await {
+            let Some(result) = results.iter_mut().find(|result| result.name == name) else {
+                continue;
+            };
+
+            match added {
+                Ok(bytes) => result.late = bytes,
+                Err(error) => result.error = format!("adding the lines written meanwhile: {error}"),
+            }
+        }
+    }
+
+    Ok(pb::TruncateLogsResponse {
+        freed: results
+            .iter()
+            .filter(|log| log.error.is_empty())
+            .map(|log| log.freed)
+            .sum(),
+        logs: results,
+        dry_run: false,
+    })
 }
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send>>;
@@ -128,6 +295,9 @@ impl Admin for Service {
             release: String::new(),
             project: String::new(),
             no_host: info.no_host.lock().expect("no_host poisoned").clone(),
+            config: info.locations.config.path.display().to_string(),
+            log_dir: info.locations.logs.path.display().to_string(),
+            cache_dir: info.locations.cache.path.display().to_string(),
         }))
     }
 
@@ -523,19 +693,246 @@ impl Admin for Service {
         &self,
         request: Request<pb::ListReleasesRequest>,
     ) -> Result<Response<pb::ListReleasesResponse>, Status> {
-        let app = request.into_inner().app;
-        let app = (!app.is_empty()).then_some(app);
+        let request = request.into_inner();
+        let app = (!request.app.is_empty()).then_some(request.app);
         let releases = self
             .handle
             .store
             .releases(app.as_deref())
             .map_err(internal)?;
-        Ok(Response::new(pb::ListReleasesResponse {
-            releases: releases
-                .into_iter()
-                .map(|release| release_message(release, &self.handle))
-                .collect(),
-        }))
+        let mut releases: Vec<pb::Release> = releases
+            .into_iter()
+            .map(|release| release_message(release, &self.handle))
+            .collect();
+
+        // Walking the environments is only done when asked for.
+
+        if request.disk {
+            let locations = self.handle.info.locations.clone();
+
+            releases = tokio::task::spawn_blocking(move || {
+                for release in &mut releases {
+                    let measure =
+                        removal::measure_release(&locations, &release.app, &release.id, false);
+                    let total = measure.total();
+                    release.disk_bytes = total.used;
+                    release.disk_freed_bytes = total.freed;
+                }
+
+                releases
+            })
+            .await
+            .map_err(internal)?;
+        }
+
+        Ok(Response::new(pb::ListReleasesResponse { releases }))
+    }
+
+    async fn prune_releases(
+        &self,
+        request: Request<pb::PruneReleasesRequest>,
+    ) -> Result<Response<pb::RemoveReleasesResponse>, Status> {
+        let request = request.into_inner();
+        let store = &self.handle.store;
+
+        let apps = if request.app.is_empty() {
+            store.apps().map_err(internal)?
+        } else {
+            vec![store.app(&request.app).map_err(not_found)?]
+        };
+
+        // Section 9.1: a removal waits for an apply under way, which may
+        // be about to start or promote what is chosen here.
+
+        let _applying = if request.dry_run {
+            None
+        } else {
+            Some(self.applying.clone().lock_owned().await)
+        };
+
+        let referenced = self.referenced_releases().await?;
+        let mut planned = Vec::new();
+        let mut kept = Vec::new();
+
+        for app in apps {
+            let candidates = self.candidates(&app.name, &referenced)?;
+            let decision = removal::decide_prune(
+                app.current.as_deref(),
+                app.previous.as_deref(),
+                &candidates,
+                request.keep,
+                request.force,
+            );
+
+            for (id, why) in decision.kept {
+                let state = candidates
+                    .iter()
+                    .find(|candidate| candidate.id == id)
+                    .map(|candidate| candidate.state.to_string())
+                    .unwrap_or_default();
+
+                kept.push(pb::KeptRelease {
+                    app: app.name.clone(),
+                    id,
+                    state,
+                    why: why.as_str().to_owned(),
+                });
+            }
+
+            for (id, why) in decision.removed {
+                let Some(candidate) = candidates.iter().find(|candidate| candidate.id == id) else {
+                    continue;
+                };
+
+                planned.push(Planned {
+                    app: app.name.clone(),
+                    id,
+                    state: candidate.state,
+                    created_unix_ms: candidate.created_unix_ms,
+                    why,
+                });
+            }
+        }
+
+        let mut answer = self
+            .carry_out(planned, request.keep_logs, request.dry_run)
+            .await?;
+        answer.kept = kept;
+
+        Ok(Response::new(answer))
+    }
+
+    async fn remove_app(
+        &self,
+        request: Request<pb::RemoveAppRequest>,
+    ) -> Result<Response<pb::RemoveReleasesResponse>, Status> {
+        let request = request.into_inner();
+        let store = &self.handle.store;
+        let app = store.app(&request.app).map_err(not_found)?;
+
+        let _applying = if request.dry_run {
+            None
+        } else {
+            Some(self.applying.clone().lock_owned().await)
+        };
+
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::AppRemovalRefused {
+                app: app.name.clone(),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+
+        if let Some(why) = done_rx.await.map_err(|_| Status::unavailable(STOPPING))? {
+            return Err(Status::failed_precondition(format!(
+                "{} cannot be removed: {why}",
+                app.name
+            )));
+        }
+
+        let planned: Vec<Planned> = store
+            .releases(Some(&app.name))
+            .map_err(internal)?
+            .into_iter()
+            .map(|release| Planned {
+                app: app.name.clone(),
+                id: release.id,
+                state: release.state,
+                created_unix_ms: release.created_unix_ms,
+                why: removal::Reason::Application,
+            })
+            .collect();
+        let mut answer = self.measured(&planned, false, request.dry_run).await?;
+
+        if request.dry_run {
+            return Ok(Response::new(answer));
+        }
+
+        // The daemon drains what runs and drops the records in one step;
+        // the files follow, since a release's environment can be large.
+
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::RemoveApp {
+                app: app.name.clone(),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+
+        for (item, message) in planned.iter().zip(answer.removed.iter_mut()) {
+            self.handle.events.emit(
+                "release.removed",
+                &format!("{}@{}", item.app, item.id),
+                "notice",
+                item.why.event_message(),
+            );
+            message.error = self
+                .remove_files(&item.app, &item.id, false)
+                .await
+                .join("; ");
+        }
+
+        settle_freed(&mut answer);
+        Ok(Response::new(answer))
+    }
+
+    async fn remove_release(
+        &self,
+        request: Request<pb::RemoveReleaseRequest>,
+    ) -> Result<Response<pb::RemoveReleasesResponse>, Status> {
+        let request = request.into_inner();
+        let app = self.handle.store.app(&request.app).map_err(not_found)?;
+
+        let _applying = if request.dry_run {
+            None
+        } else {
+            Some(self.applying.clone().lock_owned().await)
+        };
+
+        let referenced = self.referenced_releases().await?;
+        let candidates = self.candidates(&app.name, &referenced)?;
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.id == request.release)
+            .ok_or_else(|| {
+                Status::not_found(format!("no release {}@{}", app.name, request.release))
+            })?;
+
+        // Section 9.1: the protected releases are refused by name too. A
+        // failed release named goes without waiting for the cutoff.
+
+        if let Some(why) =
+            removal::protection(app.current.as_deref(), app.previous.as_deref(), candidate)
+        {
+            return Err(Status::failed_precondition(format!(
+                "{}@{} cannot be removed: {}",
+                app.name,
+                candidate.id,
+                why.describe()
+            )));
+        }
+
+        let planned = vec![Planned {
+            app: app.name.clone(),
+            id: candidate.id.clone(),
+            state: candidate.state,
+            created_unix_ms: candidate.created_unix_ms,
+            why: removal::Reason::Named,
+        }];
+
+        Ok(Response::new(
+            self.carry_out(planned, request.keep_logs, request.dry_run)
+                .await?,
+        ))
     }
 
     async fn get_release(
@@ -821,6 +1218,218 @@ impl Admin for Service {
         }))
     }
 
+    async fn list_logs(
+        &self,
+        _: Request<pb::ListLogsRequest>,
+    ) -> Result<Response<pb::ListLogsResponse>, Status> {
+        let existing = crate::log_files::Existing::read(&self.handle.store).map_err(internal)?;
+        let directory = self.handle.info.locations.logs.path.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            crate::log_files::report(&directory, Some(&existing))
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .map_err(|error| Status::internal(format!("reading the log directory: {error}")))?;
+
+        Ok(Response::new(report))
+    }
+
+    async fn truncate_logs(
+        &self,
+        request: Request<pb::TruncateLogsRequest>,
+    ) -> Result<Response<pb::TruncateLogsResponse>, Status> {
+        let request = request.into_inner();
+        let target = request.target.unwrap_or_default();
+        let keep = request.keep;
+        let existing = crate::log_files::Existing::read(&self.handle.store).map_err(internal)?;
+        let directory = self.handle.info.locations.logs.path.clone();
+
+        if request.dry_run {
+            let plan = tokio::task::spawn_blocking(move || {
+                crate::log_files::plan_truncate(&directory, Some(&existing), &target, keep)
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .map_err(Status::failed_precondition)?;
+
+            return Ok(Response::new(plan));
+        }
+
+        // A task of its own carries the cut to its end: a caller that
+        // goes away must not leave files held against rotation.
+
+        let handle = self.handle.clone();
+
+        tokio::spawn(truncate_logs(handle, directory, existing, target, keep))
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .map(Response::new)
+    }
+
+    async fn rotate_logs(
+        &self,
+        request: Request<pb::RotateLogsRequest>,
+    ) -> Result<Response<pb::RotateLogsResponse>, Status> {
+        let target = request.into_inner().target.unwrap_or_default();
+        let existing = crate::log_files::Existing::read(&self.handle.store).map_err(internal)?;
+        let directory = self.handle.info.locations.logs.path.clone();
+        let selected = tokio::task::spawn_blocking(move || {
+            let logs = crate::log_files::list(&directory, Some(&existing))
+                .map_err(|error| format!("reading the log directory: {error}"))?;
+
+            crate::log_files::select_for_rotation(&logs, &target).map(|selected| {
+                selected
+                    .iter()
+                    .map(|log| (log.name.clone(), log.size, directory.join(&log.name)))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .map_err(Status::failed_precondition)?;
+
+        let sizes: std::collections::HashMap<String, u64> = selected
+            .iter()
+            .map(|(name, size, _)| (name.clone(), *size))
+            .collect();
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::RotateLogs {
+                logs: selected
+                    .into_iter()
+                    .map(|(name, _, path)| (name, path))
+                    .collect(),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let rotated = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+
+        Ok(Response::new(pb::RotateLogsResponse {
+            logs: rotated
+                .into_iter()
+                .map(|log| pb::RotatedLog {
+                    size: sizes.get(&log.name).copied().unwrap_or_default(),
+                    error: log.archive.as_ref().err().cloned().unwrap_or_default(),
+                    archive: log.archive.unwrap_or_default(),
+                    name: log.name,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn prune_logs(
+        &self,
+        request: Request<pb::PruneLogsRequest>,
+    ) -> Result<Response<pb::PruneLogsResponse>, Status> {
+        let request = request.into_inner();
+        let rules = crate::log_files::PruneRules {
+            keep: request.keep,
+            older_than: older_than(request.older_than_s),
+            orphaned: request.orphaned,
+        };
+
+        if rules.keep.is_none() && rules.older_than.is_none() && !rules.orphaned {
+            return Err(Status::invalid_argument(
+                "name what to prune: --keep, --older-than or --orphaned",
+            ));
+        }
+
+        let store = self.handle.store.clone();
+        let existing = crate::log_files::Existing::read(&store).map_err(internal)?;
+        let directory = self.handle.info.locations.logs.path.clone();
+        let dry_run = request.dry_run;
+        let events = self.handle.events.clone();
+
+        // The store is read again after the listing, so a log whose
+        // release was created in between is not taken for an orphan.
+
+        let answer = tokio::task::spawn_blocking(move || -> Result<_, Status> {
+            let logs = crate::log_files::list(&directory, Some(&existing))
+                .map_err(|error| Status::internal(format!("reading the log directory: {error}")))?;
+            let latest = crate::log_files::Existing::read(&store).map_err(internal)?;
+            let mut removed = crate::log_files::plan_prune(&logs, &rules, Some(&latest));
+
+            if !dry_run {
+                crate::log_files::carry_out_prune(&directory, &mut removed);
+            }
+
+            Ok(crate::log_files::prune_answer(removed, dry_run))
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))??;
+
+        if !dry_run && !answer.removed.is_empty() {
+            events.emit(
+                "logs.pruned",
+                "logs",
+                "info",
+                &format!(
+                    "pruned {} file{}",
+                    answer.removed.len(),
+                    if answer.removed.len() == 1 { "" } else { "s" }
+                ),
+            );
+        }
+
+        Ok(Response::new(answer))
+    }
+
+    async fn list_cache(
+        &self,
+        _: Request<pb::ListCacheRequest>,
+    ) -> Result<Response<pb::ListCacheResponse>, Status> {
+        let releases = self.handle.store.releases(None).map_err(internal)?;
+        let locations = self.handle.info.locations.clone();
+
+        let answer =
+            tokio::task::spawn_blocking(move || crate::cache::state_report(&locations, &releases))
+                .await
+                .map_err(internal)?;
+
+        Ok(Response::new(answer))
+    }
+
+    async fn prune_cache(
+        &self,
+        request: Request<pb::PruneCacheRequest>,
+    ) -> Result<Response<pb::RemoveCacheResponse>, Status> {
+        let request = request.into_inner();
+        let releases = self.handle.store.releases(None).map_err(internal)?;
+        let locations = self.handle.info.locations.clone();
+        let named = |text: String| (!text.is_empty()).then_some(text);
+        let (version, tag) = (named(request.version), named(request.tag));
+
+        let answer = tokio::task::spawn_blocking(move || {
+            crate::cache::prune_state(&locations, &releases, version, tag, request.dry_run)
+        })
+        .await
+        .map_err(internal)?;
+
+        Ok(Response::new(answer))
+    }
+
+    async fn clear_cache(
+        &self,
+        request: Request<pb::ClearCacheRequest>,
+    ) -> Result<Response<pb::RemoveCacheResponse>, Status> {
+        let dry_run = request.into_inner().dry_run;
+        let releases = self.handle.store.releases(None).map_err(internal)?;
+        let locations = self.handle.info.locations.clone();
+
+        let answer = tokio::task::spawn_blocking(move || {
+            crate::cache::clear_state(&locations, &releases, dry_run)
+        })
+        .await
+        .map_err(internal)?;
+
+        Ok(Response::new(answer))
+    }
+
     async fn get_metrics(
         &self,
         _: Request<pb::GetMetricsRequest>,
@@ -1042,6 +1651,21 @@ impl Admin for Service {
                 .collect(),
             release,
         }))
+    }
+
+    /// Section 11.9: a bundle holds the system's logs and configuration
+    /// and leaves it, so making one is recorded, as the operations that
+    /// reach into a worker are. The collection itself is the command's.
+    async fn note_bundle(
+        &self,
+        request: Request<pb::NoteBundleRequest>,
+    ) -> Result<Response<pb::NoteBundleResponse>, Status> {
+        let request = request.into_inner();
+        let (subject, message) = crate::diagnostics::bundle_event(&request);
+        self.handle
+            .events
+            .emit("debug.bundle", &subject, "notice", &message);
+        Ok(Response::new(pb::NoteBundleResponse {}))
     }
 
     async fn list_overlays(
@@ -2057,11 +2681,24 @@ impl Service {
         report.applied = true;
         let mut failures = 0;
 
+        // Section 9.1: what the files declare, for release prune to leave.
+
+        for (app, ids) in &plan.declared {
+            if let Err(error) = self.handle.store.set_declared_releases(app, ids) {
+                tracing::warn!(%error, "recording what the applied files declare for {app} failed");
+            }
+        }
+
         for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
             let outcome = match &change.action {
                 Action::RemoveRelease { app, id } => {
-                    self.remove_release(app, id, "pruned: the applied files do not declare it")
-                        .await
+                    self.drain_and_remove(
+                        app,
+                        id,
+                        "pruned: the applied files do not declare it",
+                        false,
+                    )
+                    .await
                 }
                 Action::RemoveApp { app } => self
                     .handle
@@ -2293,8 +2930,10 @@ impl Service {
 
         let why = format!("the apply that added it was undone: {error}");
 
+        // Its log is left, since it may say why the apply failed.
+
         for (app, id) in prepared.releases.iter().rev() {
-            if let Err(why) = self.remove_release(app, id, &why).await {
+            if let Err(why) = self.drain_and_remove(app, id, &why, true).await {
                 tracing::warn!(%why, "removing {app}@{id} after a failed apply failed");
             }
         }
@@ -2336,9 +2975,17 @@ impl Service {
         report.errors.push(error);
     }
 
-    /// Drain a release if it runs, then drop its record, with a
-    /// `release.removed` event saying `why`.
-    async fn remove_release(&self, app: &str, id: &str, why: &str) -> Result<String, String> {
+    /// Drain a release if it runs, then drop its record and its files,
+    /// with a `release.removed` event saying `why`. This is the path of an
+    /// apply; what the protected releases of section 9.1 are does not
+    /// apply to it, since a prune there removes what the files do not name.
+    async fn drain_and_remove(
+        &self,
+        app: &str,
+        id: &str,
+        why: &str,
+        keep_logs: bool,
+    ) -> Result<String, String> {
         let running = self
             .handle
             .store
@@ -2370,23 +3017,145 @@ impl Service {
             .events
             .emit("release.removed", &format!("{app}@{id}"), "notice", why);
 
-        // Section 8.2: the environment built for the release and its
-        // bytecode go with it.
-
-        let state = &self.handle.info.locations.state.path;
-
-        for dir in [
-            crate::provision::Provisioning::environment_dir(state, app, id),
-            crate::provision::Provisioning::pycache_dir(state, app, id),
-        ] {
-            if dir.is_dir()
-                && let Err(error) = std::fs::remove_dir_all(&dir)
-            {
-                tracing::warn!(%error, "removing {} failed", dir.display());
-            }
+        for failure in self.remove_files(app, id, keep_logs).await {
+            tracing::warn!("removing a file of {app}@{id} failed: {failure}");
         }
 
         Ok(outcome.to_owned())
+    }
+
+    /// Remove a release's files off the async workers, saying what could
+    /// not be removed.
+    async fn remove_files(&self, app: &str, id: &str, keep_logs: bool) -> Vec<String> {
+        let locations = self.handle.info.locations.clone();
+        let (app, id) = (app.to_owned(), id.to_owned());
+
+        tokio::task::spawn_blocking(move || removal::remove_files(&locations, &app, &id, keep_logs))
+            .await
+            .unwrap_or_else(|error| vec![error.to_string()])
+    }
+
+    /// What the daemon's command loop says is referenced now.
+    async fn referenced_releases(&self) -> Result<BTreeSet<(String, String)>, Status> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::ReferencedReleases { done: done_tx })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+
+        done_rx.await.map_err(|_| Status::unavailable(STOPPING))
+    }
+
+    /// What deciding a removal needs to know of an application's releases.
+    fn candidates(
+        &self,
+        app: &str,
+        referenced: &BTreeSet<(String, String)>,
+    ) -> Result<Vec<removal::Candidate>, Status> {
+        let store = &self.handle.store;
+        let declared = store.declared_releases(app).map_err(internal)?;
+
+        Ok(store
+            .releases(Some(app))
+            .map_err(internal)?
+            .into_iter()
+            .map(|release| removal::Candidate {
+                declared: declared.contains(&release.id),
+                referenced: referenced.contains(&(app.to_owned(), release.id.clone())),
+                id: release.id,
+                state: release.state,
+                created_unix_ms: release.created_unix_ms,
+            })
+            .collect())
+    }
+
+    /// What the planned releases take, as the answer a removal gives
+    /// before anything has gone.
+    async fn measured(
+        &self,
+        planned: &[Planned],
+        keep_logs: bool,
+        dry_run: bool,
+    ) -> Result<pb::RemoveReleasesResponse, Status> {
+        let locations = self.handle.info.locations.clone();
+        let keys: Vec<(String, String)> = planned
+            .iter()
+            .map(|item| (item.app.clone(), item.id.clone()))
+            .collect();
+
+        let (each, together) = tokio::task::spawn_blocking(move || {
+            removal::measure_releases(&locations, &keys, keep_logs)
+        })
+        .await
+        .map_err(internal)?;
+
+        Ok(pb::RemoveReleasesResponse {
+            removed: planned
+                .iter()
+                .zip(&each)
+                .map(|(item, disk)| pb::RemovedRelease {
+                    app: item.app.clone(),
+                    id: item.id.clone(),
+                    state: item.state.to_string(),
+                    created_unix_ms: item.created_unix_ms,
+                    disk_bytes: disk.freed,
+                    why: item.why.as_str().to_owned(),
+                    error: String::new(),
+                })
+                .collect(),
+            kept: Vec::new(),
+            freed: together.freed,
+            dry_run,
+        })
+    }
+
+    /// Measure what the planned releases take and, unless this is a dry
+    /// run, remove them one at a time. The daemon checks each again as it
+    /// drops the record, so one that became protected since it was chosen
+    /// is reported and left.
+    async fn carry_out(
+        &self,
+        planned: Vec<Planned>,
+        keep_logs: bool,
+        dry_run: bool,
+    ) -> Result<pb::RemoveReleasesResponse, Status> {
+        let mut answer = self.measured(&planned, keep_logs, dry_run).await?;
+
+        if dry_run {
+            return Ok(answer);
+        }
+
+        for (item, message) in planned.iter().zip(answer.removed.iter_mut()) {
+            let (done_tx, done_rx) = oneshot::channel();
+            self.handle
+                .commands
+                .send(Command::ForgetRelease {
+                    app: item.app.clone(),
+                    id: item.id.clone(),
+                    done: done_tx,
+                })
+                .await
+                .map_err(|_| Status::unavailable(STOPPING))?;
+
+            if let Err(why) = done_rx.await.map_err(|_| Status::unavailable(STOPPING))? {
+                message.error = why;
+                continue;
+            }
+
+            self.handle.events.emit(
+                "release.removed",
+                &format!("{}@{}", item.app, item.id),
+                "notice",
+                item.why.event_message(),
+            );
+
+            let failures = self.remove_files(&item.app, &item.id, keep_logs).await;
+            message.error = failures.join("; ");
+        }
+
+        settle_freed(&mut answer);
+        Ok(answer)
     }
 
     /// Push a snapshot with the hosts and routes as they now are.
@@ -2404,6 +3173,28 @@ impl Service {
 
 /// The outcome when the daemon's command loop has gone.
 const STOPPING: &str = "the daemon is stopping";
+
+/// A release that was not removed gave nothing back, so with any left
+/// the total is what those that went gave back.
+fn settle_freed(answer: &mut pb::RemoveReleasesResponse) {
+    if answer.removed.iter().any(|item| !item.error.is_empty()) {
+        answer.freed = answer
+            .removed
+            .iter()
+            .filter(|item| item.error.is_empty())
+            .map(|item| item.disk_bytes)
+            .sum();
+    }
+}
+
+/// A release chosen for removal, before its disk use is known.
+struct Planned {
+    app: String,
+    id: String,
+    state: ReleaseState,
+    created_unix_ms: u64,
+    why: removal::Reason,
+}
 
 /// A report with one parse error and nothing else.
 fn parse_failure(error: String) -> pb::ConfigReport {
@@ -2911,6 +3702,8 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
             })
             .collect(),
         host_running: live.host,
+        disk_bytes: 0,
+        disk_freed_bytes: 0,
         retained_until_unix_ms: live.retained_until_unix_ms,
         kind: if release.spec.http.is_some() {
             "http".to_owned()

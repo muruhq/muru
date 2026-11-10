@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import signal
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -223,6 +226,54 @@ def test_a_crashed_instance_is_started_again(daemon: Daemon) -> None:
     assert daemon.releases("legacy") == [
         {"release": "legacy@r1", "state": "ready", "serving": "yes"}
     ]
+
+
+def group_gone(pgid: int) -> bool:
+    """Whether nothing is left of a process group; signal 0 sends nothing."""
+
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+
+    return False
+
+
+def test_nothing_is_left_of_an_instance_whose_processes_ignore_the_stop_signal(
+    daemon: Daemon,
+) -> None:
+    # The instance is a shell that ignores TERM and runs the server as a
+    # child, which ignores it as well, as a master with a worker would.
+
+    script = f"trap '' TERM; {shlex.quote(sys.executable)} server.py --bind {{bind}} & wait"
+    deploy_server(daemon, "legacy", "--timeout", "shutdown=1s", command=["/bin/sh", "-c", script])
+    killed = instances(daemon, "legacy@r1")[0]["pid"]
+    orphan = report(daemon)["pid"]
+    assert orphan != killed
+    assert os.getpgid(orphan) == killed
+
+    # The shell is killed, as a master might be, and its child runs on.
+    # The instance is not left to start again beside it: the child is
+    # stopped, and killed since it ignores that, and then the instance
+    # starts.
+
+    os.kill(killed, signal.SIGKILL)
+    wait_for(lambda: instances(daemon, "legacy@r1")[0]["pid"] not in (0, killed), 20)
+    wait_for(lambda: not alive(orphan))
+    wait_for(lambda: group_gone(killed))
+    assert "leaving processes behind" in daemon.muructl("events").stdout
+    wait_for(lambda: daemon.request("/").status == 200, 20)
+    leader = instances(daemon, "legacy@r1")[0]["pid"]
+    child = report(daemon)["pid"]
+    assert child not in (orphan, leader)
+    assert os.getpgid(child) == leader
+
+    # The stop signal does nothing, so the drain ends with the kill, which
+    # takes the child with the shell: nothing is left of the group.
+
+    assert "is stopped" in daemon.muructl("drain", "legacy@r1").stdout
+    wait_for(lambda: not alive(leader) and not alive(child))
+    wait_for(lambda: group_gone(leader))
 
 
 def test_gunicorn_and_uvicorn_profiles_add_their_own_flags(daemon: Daemon, tmp_path: Path) -> None:
@@ -539,4 +590,115 @@ def test_a_daemon_restart_readopts_the_instances(tmp_path: Path) -> None:
 
         second.stop(shutdown=True)
 
+    wait_for(lambda: not alive(replacement))
+
+
+def test_a_daemon_restart_adopts_the_instances_still_there_and_starts_the_rest(
+    tmp_path: Path,
+) -> None:
+    first = start_daemon(tmp_path)
+    second = None
+
+    try:
+        deploy_server(first, "legacy", "--bind", "port", "--instances", "2")
+        before = instances(first, "legacy@r1")
+        survivor, lost = before[0]["pid"], before[1]["pid"]
+
+        # The daemon detaches, and one instance exits while none is there.
+
+        assert "detached" in first.muructl("daemon", "stop").stdout
+        first.process.wait(timeout=30)
+        os.kill(lost, signal.SIGKILL)
+        wait_for(lambda: not alive(lost))
+
+        # The next daemon takes over the instance that is still there, as
+        # it was, and starts the other again at its address. The release
+        # is the one it was, not a fresh start beside the survivor.
+
+        second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+        wait_for(lambda: instances(second, "legacy@r1")[1]["pid"] not in (0, lost), 20)
+        after = instances(second, "legacy@r1")
+        assert after[0] == before[0]
+        assert after[1]["index"] == 1
+        assert after[1]["address"] == before[1]["address"]
+        replacement = after[1]["pid"]
+        assert second.releases("legacy") == [
+            {"release": "legacy@r1", "state": "ready", "serving": "yes"}
+        ]
+        events = second.muructl("events").stdout
+        assert f"re-adopted the server instances (pid {survivor})" in events
+        assert "instance 1 was gone and is started again" in events
+        assert f"instance 1 started again (pid {replacement})" in events
+
+        # Both serve.
+
+        def serving() -> set[int]:
+            responses = [second.request(f"/n/{n}") for n in range(8)]
+            return {json.loads(r.body)["pid"] for r in responses if r.status == 200}
+
+        wait_for(lambda: serving() == {survivor, replacement}, 20)
+    finally:
+        if second is None:
+            second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+
+        second.stop(shutdown=True)
+
+    # The shutdown stops them both: the survivor was not left behind.
+
+    wait_for(lambda: not alive(survivor) and not alive(replacement))
+
+
+def test_a_recorded_pid_that_another_process_has_is_not_adopted(tmp_path: Path) -> None:
+    first = start_daemon(tmp_path)
+    second = None
+    bystander = None
+
+    try:
+        deploy_server(first, "legacy", "--bind", "port")
+        pid = instances(first, "legacy@r1")[0]["pid"]
+        assert "detached" in first.muructl("daemon", "stop").stdout
+        first.process.wait(timeout=30)
+
+        # The instance exits while no daemon is there, and the record is
+        # changed to say its pid is that of a process of the test's own,
+        # as it would be had the pid been given out again. The start time
+        # recorded beside it is still the instance's, which started well
+        # before the bystander: a deploy and a daemon's stop ago.
+
+        os.kill(pid, signal.SIGKILL)
+        wait_for(lambda: not alive(pid))
+        bystander = subprocess.Popen(["/bin/sleep", "600"])
+        record = first.run_dir / "apps" / "legacy" / "r1" / "servers.toml"
+        text = record.read_text()
+        assert f"pid = {pid}\n" in text
+        assert "start_time = " in text and "start_time = 0\n" not in text
+        record.write_text(text.replace(f"pid = {pid}\n", f"pid = {bystander.pid}\n"))
+
+        # The next daemon does not take the bystander for the instance.
+        # It starts the instance again.
+
+        second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+        wait_for(lambda: instances(second, "legacy@r1")[0]["pid"] != 0, 20)
+        replacement = instances(second, "legacy@r1")[0]["pid"]
+        assert replacement not in (pid, bystander.pid)
+        events = second.muructl("events").stdout
+        assert "none of the server instances was still there" in events
+        assert f"instance 0 started again (pid {replacement})" in events
+        wait_for(lambda: second.request("/").status == 200, 20)
+        assert report(second)["pid"] == replacement
+    finally:
+        if second is None:
+            second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+
+        # The shutdown stops what the daemon runs, and the bystander was
+        # never signalled: it is still running.
+
+        second.stop(shutdown=True)
+
+        if bystander is not None:
+            untouched = bystander.poll() is None
+            bystander.kill()
+            bystander.wait()
+
+    assert untouched
     wait_for(lambda: not alive(replacement))

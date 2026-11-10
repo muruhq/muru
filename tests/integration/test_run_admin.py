@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import threading
 import urllib.request
@@ -55,6 +56,16 @@ def muructl(
         )
 
     return completed
+
+
+def leave_socket_behind(path: Path) -> None:
+    """Make the file of a socket nothing listens on, as a process killed
+    outright leaves it."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with socket.socket(socket.AF_UNIX) as listener:
+        listener.bind(str(path))
 
 
 def start(runtime: Path, port: int | None = None, **kwargs: object) -> support.Server:
@@ -274,8 +285,10 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
         )
         assert f"runs/{second.port}/admin.sock" in muructl(runtime, "status", cwd=other).stdout
 
-        # Elsewhere, with no daemon, the runs are named so one can be chosen.
+        # Elsewhere, with no daemon, the runs are named so one can be
+        # chosen. A socket file left behind by a daemon is no daemon.
 
+        leave_socket_behind(runtime / "admin.sock")
         ambiguous = muructl(runtime, "status", cwd=tmp_path, check=False)
         assert ambiguous.returncode != 0
         assert "several development runs are" in ambiguous.stderr
@@ -305,6 +318,27 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
     nothing = muructl(runtime, "status", cwd=tmp_path, check=False)
     assert "nothing is listening at" in nothing.stderr
     assert "no development run (muructl run)" in nothing.stderr
+
+    # A run that has gone, whose pid another process has since been given
+    # and whose socket file is still there, is not taken for a live one.
+    # The daemon's socket left behind above is what the command tries.
+
+    gone = runtime / "runs" / "1"
+    leave_socket_behind(gone / "admin.sock")
+    (gone / "run.json").write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "app": "gone",
+                "project": str(tmp_path),
+                "listen": "127.0.0.1:1",
+                "socket": str(gone / "admin.sock"),
+            }
+        )
+    )
+    nothing = muructl(runtime, "status", cwd=tmp_path, check=False)
+    assert f"nothing is listening at {runtime}/admin.sock" in nothing.stderr
+    assert not gone.exists()
 
 
 def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:

@@ -109,17 +109,30 @@ impl Policy {
 pub struct Rotator {
     policy: Policy,
     /// The period each file was last seen in, so a change of period
-    /// rotates it once.
+    /// rotates it once. Restored from the state store at start, so the
+    /// comparison carries across a restart of the daemon.
     periods: HashMap<PathBuf, String>,
+    /// The records changed since they were last taken for the state store.
+    changed: Vec<(String, String)>,
 }
 
 impl Rotator {
-    /// A rotator for the policy, starting now: nothing is due for the
-    /// clock until the period changes.
+    /// A rotator for the policy with no record of any file: nothing is
+    /// due for the clock until a file's period changes.
     pub fn new(policy: Policy) -> Self {
+        Self::restored(policy, Vec::new())
+    }
+
+    /// A rotator that carries on from the records the state store holds,
+    /// so a file last seen in an earlier period is due at its next check.
+    pub fn restored(policy: Policy, periods: Vec<(String, String)>) -> Self {
         Self {
             policy,
-            periods: HashMap::new(),
+            periods: periods
+                .into_iter()
+                .map(|(path, period)| (PathBuf::from(path), period))
+                .collect(),
+            changed: Vec::new(),
         }
     }
 
@@ -136,16 +149,29 @@ impl Rotator {
 
     /// Whether a file is due: it has reached the size, or the period has
     /// changed since it was last seen. A file seen for the first time
-    /// only notes its period.
+    /// only notes its period, and an empty file is never due, its period
+    /// still being noted.
     pub fn due(&mut self, path: &Path, now: SystemTime) -> bool {
         let period = period(self.policy.every, now);
         let previous = self.periods.insert(path.to_path_buf(), period.clone());
-        let by_clock = previous.is_some_and(|previous| previous != period);
-        let by_size = self.policy.size.is_some_and(|limit| {
-            std::fs::metadata(path).is_ok_and(|metadata| metadata.len() >= limit)
-        });
 
-        by_clock || by_size
+        if previous.as_ref() != Some(&period) {
+            self.changed
+                .push((path.display().to_string(), period.clone()));
+        }
+
+        let by_clock = previous.is_some_and(|previous| previous != period);
+        let length = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+        let by_size = self.policy.size.is_some_and(|limit| length >= limit);
+
+        length > 0 && (by_clock || by_size)
+    }
+
+    /// The records changed since this was last called, for the state
+    /// store. Taken before anything is rotated, so a file is not rotated
+    /// again by a daemon started after a crash.
+    pub fn take_changed(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.changed)
     }
 
     /// Rotate a file: rename it with a timestamp, compress the archive in
@@ -159,7 +185,8 @@ impl Rotator {
     }
 
     /// Rotate a file whose writers cannot reopen it (section 9.9: the
-    /// instances of a managed HTTP server): the contents are copied to
+    /// instances of a managed HTTP server, and section 11.3: the edge for
+    /// its own log): the contents are copied to
     /// the archive and the file truncated in place, which a writer with
     /// the file open in append mode carries on into. Lines written
     /// between the copy and the truncation are lost.
@@ -173,13 +200,29 @@ impl Rotator {
         self.finish(path, archive)
     }
 
+    /// Rotate a file in place and finish the archive before returning,
+    /// for a command with nothing to carry on in the background once it
+    /// exits. Returns the finished archive's path.
+    pub fn rotate_in_place_now(&self, path: &Path, now: SystemTime) -> std::io::Result<PathBuf> {
+        let archive = archive_path(path, now);
+        std::fs::copy(path, &archive)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+
+        let finished = compress(&archive, self.policy.compress)?;
+        prune(path, self.policy.keep);
+        Ok(finished)
+    }
+
     /// Compress an archive in the background and prune the old ones.
     fn finish(&self, path: &Path, archive: PathBuf) -> std::io::Result<PathBuf> {
         let policy = self.policy.clone();
         let base = path.to_path_buf();
         let renamed = archive.clone();
         tokio::task::spawn_blocking(move || {
-            if let Err(error) = compress(&renamed, policy.compress) {
+            if let Err(error) = compress(&renamed, policy.compress).map(drop) {
                 tracing::warn!(%error, path = %renamed.display(), "compressing a rotated log failed");
             }
 
@@ -189,28 +232,57 @@ impl Rotator {
     }
 }
 
-/// Where a file rotated now is archived: the file's path with a stamp.
+/// Where a file rotated now is archived: the file's path with a stamp,
+/// the next second's if this one already has an archive in any form, so
+/// that a second rotation within a second cannot replace the first.
 fn archive_path(path: &Path, now: SystemTime) -> PathBuf {
-    let mut archive = path.as_os_str().to_owned();
-    archive.push(format!(".{}", stamp(now)));
-    PathBuf::from(archive)
+    let mut moment = now;
+
+    loop {
+        let mut archive = path.as_os_str().to_owned();
+        archive.push(format!(".{}", stamp(moment)));
+        let archive = PathBuf::from(archive);
+
+        let taken = ["", ".zst", ".gz"].iter().any(|suffix| {
+            let mut name = archive.as_os_str().to_owned();
+            name.push(suffix);
+            Path::new(&name).exists()
+        });
+
+        if !taken {
+            return archive;
+        }
+
+        moment += Duration::from_secs(1);
+    }
 }
 
 /// Create the log afresh with the archive's mode and owner, so a writer
 /// that runs as another user (ADR 0026) reopens a file it may write,
 /// in a directory it may not create one in.
 fn recreate(path: &Path, archive: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
     let metadata = std::fs::metadata(archive)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
+    match_mode_and_owner(&file, path, &metadata)
+}
+
+/// Give a file the mode and owner of another, so a writer that runs as
+/// another user keeps access to it; a chown this user may not make is
+/// left, since a daemon that is not root has one user only.
+pub(crate) fn match_mode_and_owner(
+    file: &std::fs::File,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
     file.set_permissions(std::fs::Permissions::from_mode(metadata.mode() & 0o7777))?;
 
     if let Err(error) = std::os::unix::fs::chown(path, Some(metadata.uid()), Some(metadata.gid())) {
-        tracing::debug!(%error, path = %path.display(), "the recreated log keeps this user");
+        tracing::debug!(%error, path = %path.display(), "the new log keeps this user");
     }
 
     Ok(())
@@ -266,9 +338,10 @@ fn civil(days: u64) -> (u64, u64, u64) {
 }
 
 /// Compress an archive in place, replacing it with the compressed file.
-fn compress(archive: &Path, how: Compress) -> std::io::Result<()> {
+/// Returns the path it ends up at.
+fn compress(archive: &Path, how: Compress) -> std::io::Result<PathBuf> {
     let suffix = match how {
-        Compress::Off => return Ok(()),
+        Compress::Off => return Ok(archive.to_path_buf()),
         Compress::Zstd => "zst",
         Compress::Gzip => "gz",
     };
@@ -293,7 +366,8 @@ fn compress(archive: &Path, how: Compress) -> std::io::Result<()> {
         Compress::Off => {}
     }
 
-    std::fs::remove_file(archive)
+    std::fs::remove_file(archive)?;
+    Ok(target)
 }
 
 /// Keep only the newest `keep` archives of a log, by name, which sorts
@@ -392,6 +466,75 @@ mod tests {
         );
         assert!(!rotator.due(&log, now + Duration::from_secs(3601)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restart_carries_the_period_so_a_file_rotates_once() {
+        let dir = std::env::temp_dir().join(format!("muru-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("a.log");
+        let empty = dir.join("empty.log");
+        let new = dir.join("new.log");
+        std::fs::write(&log, "x").unwrap();
+        std::fs::write(&empty, "").unwrap();
+        let policy = Policy {
+            size: None,
+            every: Every::Daily,
+            keep: 2,
+            compress: Compress::Off,
+        };
+        let day_one = SystemTime::UNIX_EPOCH + Duration::from_secs(1_793_000_000);
+        let day_two = day_one + Duration::from_secs(86_400);
+
+        // A daemon sees both files, stops, and one the next day carries
+        // on from what the first recorded.
+
+        let mut first = Rotator::new(policy.clone());
+        assert!(!first.due(&log, day_one));
+        assert!(!first.due(&empty, day_one));
+        let records = first.take_changed();
+        assert_eq!(records.len(), 2);
+
+        let mut second = Rotator::restored(policy, records);
+        assert!(second.due(&log, day_two), "left over from yesterday");
+        assert!(!second.due(&empty, day_two), "nothing to rotate");
+
+        // The change is recorded, so another start the same day and a
+        // later check of this one leave the file alone.
+
+        let records = second.take_changed();
+        assert_eq!(records.len(), 2);
+        assert!(!second.due(&log, day_two + Duration::from_secs(60)));
+        assert!(second.take_changed().is_empty());
+
+        let mut third = Rotator::restored(second.policy().clone(), records);
+        assert!(!third.due(&log, day_two + Duration::from_secs(120)));
+
+        // A file with no record only notes its period, as it always has.
+
+        std::fs::write(&new, "x").unwrap();
+        assert!(!third.due(&new, day_two));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_rotation_within_a_second_gets_an_archive_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("a.log");
+        std::fs::write(&log, "one").unwrap();
+        let rotator = Rotator::new(Policy {
+            size: None,
+            every: Every::Off,
+            keep: 5,
+            compress: Compress::Off,
+        });
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_793_000_000);
+        let first = rotator.rotate_in_place_now(&log, now).unwrap();
+        std::fs::write(&log, "two").unwrap();
+        let second = rotator.rotate_in_place_now(&log, now).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        assert_eq!(std::fs::read(&second).unwrap(), b"two");
     }
 
     #[test]

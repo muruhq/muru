@@ -10,6 +10,7 @@
 mod admin;
 mod dashboard;
 mod devcert;
+mod diagnostics;
 mod edge;
 mod init;
 mod log_format;
@@ -221,13 +222,20 @@ enum Command {
         command: admin::SecretCommand,
     },
 
-    /// Look into a release's workers: status, stacks, tasks, inspect.
+    /// Look into a release's workers (status, stacks, tasks, inspect),
+    /// and collect diagnostics: a report for a bug report, a bundle of
+    /// the system for triage.
     Debug {
         #[command(subcommand)]
         command: admin::DebugCommand,
     },
 
     /// The runtime library on its own: unpack it for an image.
+    Cache {
+        #[command(subcommand)]
+        command: admin::CacheCommand,
+    },
+
     Runtime {
         #[command(subcommand)]
         command: provision::RuntimeCommand,
@@ -256,8 +264,8 @@ enum Command {
         output: admin::JsonArgs,
     },
 
-    /// Show or follow a release's output or the access log, or reopen
-    /// the log files after an external rotation.
+    /// Show or follow a release's output or the access log, list what
+    /// the log files take, or reopen them after an external rotation.
     Logs(admin::LogsArgs),
 
     /// Print the node's metrics as Prometheus text.
@@ -953,6 +961,13 @@ fn main() -> anyhow::Result<()> {
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
         Command::Debug { command } => runtime.block_on(admin::debug(command)),
+        Command::Cache { command } => runtime.block_on(async move {
+            match command {
+                admin::CacheCommand::List(args) => admin::cache_list(*args).await,
+                admin::CacheCommand::Prune(args) => admin::cache_prune(*args).await,
+                admin::CacheCommand::Clear(args) => admin::cache_clear(*args).await,
+            }
+        }),
         Command::Runtime { command } => runtime.block_on(provision::run(command)),
         Command::Secret { command } => runtime.block_on(admin::secret(command)),
         Command::Logging { command } => runtime.block_on(admin::logging(command)),
@@ -963,6 +978,7 @@ fn main() -> anyhow::Result<()> {
                 admin::AppCommand::List { socket, output } => {
                     admin::app_list(socket, output.json).await
                 }
+                admin::AppCommand::Remove(args) => admin::app_remove(*args).await,
             }
         }),
         Command::Release { command } => runtime.block_on(async move {
@@ -972,6 +988,8 @@ fn main() -> anyhow::Result<()> {
                     socket,
                     output,
                 } => admin::release_list(app, socket, output.json).await,
+                admin::ReleaseCommand::Prune(args) => admin::release_prune(*args).await,
+                admin::ReleaseCommand::Remove(args) => admin::release_remove(*args).await,
                 admin::ReleaseCommand::Show {
                     release,
                     socket,
@@ -1045,6 +1063,14 @@ fn main() -> anyhow::Result<()> {
                     socket,
                     output,
                 }) => admin::logs_reopen(workers, socket, output.json).await,
+                Some(admin::LogsCommand::List {
+                    socket,
+                    files,
+                    output,
+                }) => admin::logs_list(socket, files, output.json).await,
+                Some(admin::LogsCommand::Truncate(args)) => admin::logs_truncate(*args).await,
+                Some(admin::LogsCommand::Rotate(args)) => admin::logs_rotate(*args).await,
+                Some(admin::LogsCommand::Prune(args)) => admin::logs_prune(*args).await,
                 None => admin::logs(args).await,
             }
         }),
@@ -2394,7 +2420,7 @@ fn interpreter(
     resolved: &Resolved,
     built: bool,
 ) -> anyhow::Result<muru_provision::Resolved> {
-    let uv = muru_provision::Uv::find(None, None);
+    let uv = muru_provision::Uv::find(None);
     let isolation = muru_provision::Isolation::default();
 
     // After a build the environment just made is what runs: the flag's
@@ -2723,13 +2749,19 @@ fn interface_label(interface: &str) -> &str {
 /// Development mode: one host with forked workers behind an embedded edge,
 /// replaced by a new one when --reload sees a source change.
 async fn run(args: RunArgs) -> anyhow::Result<()> {
-    run_with(args, None).await
+    run_with(args, None, None).await
 }
 
 /// Serve as `muructl run` does, or as `muructl serve` with `serve`
 /// (section 13.9): production behaviours, one run directory, no
 /// installs, the admin port, and every line on standard output.
-async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<()> {
+/// `serve_settings` is what serve's own layers set, for the settings the
+/// admin socket answers with.
+async fn run_with(
+    args: RunArgs,
+    serve: Option<serve::Mode>,
+    serve_settings: Option<print_config::Serve>,
+) -> anyhow::Result<()> {
     let mut resolved = resolve_for(&args, serve.as_ref())?;
     muru_common::log::show_timestamps(resolved.serving.timestamps);
 
@@ -2773,6 +2805,14 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         resolved.processes = 1;
         resolved.threads = 1;
     }
+
+    // The settings in force with where each came from, which the admin
+    // socket gives a command that asks for the effective configuration.
+
+    let settings = Arc::new(match serve_settings {
+        Some(serve) => print_config::serve_settings(&resolved, serve),
+        None => print_config::run_settings(&args, &resolved),
+    });
 
     // The interpreter is found as the run would find it, so that one the
     // run could not use is refused here with the same words.
@@ -3333,7 +3373,13 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
             &label,
             &project,
         ),
-        None => run_admin::Registration::new(&runtime, edge.local_addr(), &label, &project),
+        None => run_admin::Registration::new(
+            &runtime,
+            edge.local_addr(),
+            &label,
+            &project,
+            library.pythonpath.as_deref(),
+        ),
     };
 
     let registration = match registered {
@@ -3370,6 +3416,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
             served: Arc::clone(&served),
             commands: commands.clone(),
             events: Arc::clone(&run_events),
+            settings: Arc::clone(&settings),
         });
 
         match run_admin::serve(state, admin_stop_rx).await {
@@ -3601,6 +3648,12 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
                         spec.python = python.python.clone();
                         spec.pythonpath = library.pythonpath.clone();
                         served.replace(spec.python.clone(), spec.pythonpath.clone());
+
+                        if let (Some(registration), Some(directory)) =
+                            (&registration, &library.pythonpath)
+                        {
+                            registration.note_runtime(directory);
+                        }
                     }
                     Ok(false) => {}
                     Err(error) => {

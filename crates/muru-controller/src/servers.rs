@@ -4,17 +4,17 @@
 //! reaches as an upstream named after the release.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use muru_config::{ServerBind, ServerProfile};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpStream, UnixStream};
-use tokio::process::{Child, Command};
+use tokio::time::Instant;
 
-use crate::host::{Identity, alive};
+use crate::host::Identity;
 use crate::model::HttpServerSpec;
+use crate::supervisor::{self, EventNames, InstanceSpec, Report, RestartPolicy, Supervisor};
 
 /// How long one readiness probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -22,19 +22,15 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often the instances are probed while they start.
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// The wait before a crashed instance is started again, doubled with
-/// each crash in a row up to the cap.
-const BACKOFF_FIRST: Duration = Duration::from_secs(1);
-
-/// The longest wait between a crash and the next start.
-const BACKOFF_CAP: Duration = Duration::from_secs(30);
-
-/// An instance up this long has recovered: its next crash starts the
-/// backoff over.
-const STABLE_AFTER: Duration = Duration::from_secs(60);
-
 /// How long the instances get to be ready when the release says nothing.
 pub const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The events the instances of a managed server are reported under.
+const EVENTS: EventNames = EventNames {
+    exited: "server.exited",
+    started: "server.started",
+    failed: "server.failed",
+};
 
 /// Where one instance listens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,106 +63,6 @@ impl Bind {
     }
 }
 
-/// A process this daemon started, or one it adopted from a previous
-/// daemon.
-enum Process {
-    Child(Child),
-    Adopted(u32),
-}
-
-/// One supervised instance.
-struct Instance {
-    index: u32,
-    bind: Bind,
-    process: Option<Process>,
-    /// When the process was started, for the backoff reset.
-    started: Instant,
-    /// When the process was started, Unix milliseconds; 0 for one adopted
-    /// from a record that did not say.
-    started_unix_ms: u64,
-    /// Crashes in a row, each doubling the wait before the next start.
-    crashes: u32,
-    /// When the next start is due, after a crash.
-    due: Option<Instant>,
-}
-
-impl Instance {
-    fn pid(&self) -> Option<u32> {
-        match &self.process {
-            Some(Process::Child(child)) => child.id(),
-            Some(Process::Adopted(pid)) => Some(*pid),
-            None => None,
-        }
-    }
-
-    /// Whether the process has exited, without waiting: a sentence
-    /// saying how when it has.
-    fn try_exited(&mut self) -> std::io::Result<Option<String>> {
-        match &mut self.process {
-            Some(Process::Child(child)) => Ok(child
-                .try_wait()?
-                .map(|status| format!("exited with {status}"))),
-            Some(Process::Adopted(pid)) => Ok((!alive(*pid)).then(|| "is gone".to_owned())),
-            None => Ok(None),
-        }
-    }
-
-    fn signal(&self, signal: i32) {
-        if let Some(pid) = self.pid() {
-            // SAFETY: kill(2) with a pid this daemon started or adopted.
-
-            unsafe {
-                libc::kill(pid as libc::pid_t, signal);
-            }
-        }
-    }
-
-    /// Wait for the process to exit until the deadline, then kill it.
-    async fn finish(&mut self, deadline: Instant) {
-        match &mut self.process {
-            Some(Process::Child(child)) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-
-                if tokio::time::timeout(remaining, child.wait()).await.is_err() {
-                    let _ = child.kill().await;
-                }
-            }
-            Some(Process::Adopted(pid)) => {
-                let pid = *pid;
-
-                while alive(pid) && Instant::now() < deadline {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-
-                if alive(pid) {
-                    // SAFETY: as in signal.
-
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                    }
-                }
-            }
-            None => {}
-        }
-
-        self.process = None;
-
-        if let Bind::Unix(path) = &self.bind {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-/// A change the supervisor reports, for the event stream.
-pub struct Report {
-    /// The event type.
-    pub kind: &'static str,
-    /// Its level.
-    pub level: &'static str,
-    /// What happened.
-    pub message: String,
-}
-
 /// What a previous daemon recorded about the instances, in the
 /// release's run directory.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -175,81 +71,112 @@ pub struct ServersRecord {
     pub instances: Vec<InstanceRecord>,
 }
 
-/// One instance as recorded.
+/// One instance as recorded: what the supervisor records of its process,
+/// and its address.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct InstanceRecord {
     /// The instance's index, from 0.
     pub index: u32,
-    /// Its pid.
+    /// Its pid; 0 while it waits to be started again.
     pub pid: u32,
     /// Where it listens, as an upstream names it.
     pub address: String,
     /// When its process was started, Unix milliseconds; 0 when not known.
     #[serde(default)]
     pub started_unix_ms: u64,
+    /// Its exits and failed starts in a row.
+    #[serde(default)]
+    pub quick_exits: u32,
+    /// The start time the kernel gives its process, which with the pid
+    /// names the process; 0 when not known.
+    #[serde(default)]
+    pub start_time: u64,
 }
 
-/// The instances of one managed HTTP release.
+impl InstanceRecord {
+    /// The part of the record that is the supervisor's.
+    fn process(&self) -> supervisor::InstanceRecord {
+        supervisor::InstanceRecord {
+            index: self.index,
+            pid: self.pid,
+            started_unix_ms: self.started_unix_ms,
+            quick_exits: self.quick_exits,
+            start_time: self.start_time,
+        }
+    }
+}
+
+/// The instances of one managed HTTP release: their processes, which a
+/// supervisor runs, and where each listens.
 pub struct Servers {
-    spec: HttpServerSpec,
+    readiness_path: Option<String>,
     run_dir: PathBuf,
-    cwd: PathBuf,
-    env: Vec<(String, String)>,
-    identity: Option<Identity>,
-    log: PathBuf,
-    instances: Vec<Instance>,
+    /// Each instance's address, in the supervisor's order.
+    binds: Vec<Bind>,
+    supervisor: Supervisor,
 }
 
 impl Servers {
     /// Start every instance under the run directory, each with its own
     /// address, running `spec.command` in `cwd` with `env`, as
-    /// `identity` when one is set, its output appended to `log`.
-    pub fn start(
+    /// `identity` when one is set, its output appended to `log`. When
+    /// an instance cannot be started, those started before it are
+    /// stopped, with `grace` to stop in before they are killed.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start(
         spec: &HttpServerSpec,
         run_dir: &Path,
         cwd: &Path,
         env: Vec<(String, String)>,
         identity: Option<Identity>,
         log: &Path,
+        grace: Duration,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(run_dir)
             .with_context(|| format!("creating {}", run_dir.display()))?;
-        let mut servers = Self {
-            spec: spec.clone(),
-            run_dir: run_dir.to_path_buf(),
-            cwd: cwd.to_path_buf(),
-            env,
-            identity,
-            log: log.to_path_buf(),
-            instances: Vec::new(),
+        let binds = allocate(spec.bind, run_dir, spec.instances.max(1))?;
+        let instances = (0..)
+            .zip(&binds)
+            .map(|(index, bind)| instance_spec(spec, index, bind))
+            .collect();
+        let started = Supervisor::start(
+            process_spec(spec, cwd, env, identity, log),
+            RestartPolicy::default(),
+            instances,
+            grace,
+        )
+        .await;
+
+        let supervisor = match started {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(run_dir);
+                return Err(error);
+            }
         };
 
-        for index in 0..spec.instances.max(1) {
-            let bind = servers.allocate(index)?;
-            servers.instances.push(Instance {
-                index,
-                bind,
-                process: None,
-                started: Instant::now(),
-                started_unix_ms: 0,
-                crashes: 0,
-                due: None,
-            });
-        }
-
-        for position in 0..servers.instances.len() {
-            servers.spawn(position)?;
-        }
-
-        Ok(servers)
+        Ok(Self {
+            readiness_path: spec.readiness_path.clone(),
+            run_dir: run_dir.to_path_buf(),
+            binds,
+            supervisor,
+        })
     }
 
-    /// Take over the instances a previous daemon recorded: each must
-    /// still be there. They are stopped with signals rather than waited
-    /// for, and one that exits is started again as a child of this
-    /// daemon.
+    /// Take over the instances a previous daemon recorded, each one
+    /// that is still there, with those that are not due to be started
+    /// by the next `check`. Only a record with no instances, or with an
+    /// address that cannot be read, is refused.
+    ///
+    /// An instance is there when the process with its pid has the start
+    /// time it was recorded with, which the supervisor checks. A record
+    /// with no start time for an instance, as one written before the
+    /// start time was kept, leaves only the pid, which any process may
+    /// have by now. Such an instance is taken over only if something
+    /// answers HTTP at its address as well, and is otherwise started
+    /// again, with the process that has its pid left alone.
     #[allow(clippy::too_many_arguments)]
-    pub fn adopt(
+    pub async fn adopt(
         spec: &HttpServerSpec,
         run_dir: &Path,
         cwd: &Path,
@@ -258,138 +185,82 @@ impl Servers {
         log: &Path,
         record: &ServersRecord,
     ) -> anyhow::Result<Self> {
-        let mut instances = Vec::new();
+        let mut binds = Vec::new();
 
         for instance in &record.instances {
-            anyhow::ensure!(
-                alive(instance.pid),
-                "instance {} (pid {}) is gone",
-                instance.index,
-                instance.pid
-            );
             let bind = Bind::parse(&instance.address).with_context(|| {
                 format!(
                     "instance {}: {:?} is not an address",
                     instance.index, instance.address
                 )
             })?;
-            instances.push(Instance {
-                index: instance.index,
-                bind,
-                process: Some(Process::Adopted(instance.pid)),
-                started: Instant::now(),
-                started_unix_ms: instance.started_unix_ms,
-                crashes: 0,
-                due: None,
-            });
+            binds.push(bind);
         }
 
-        anyhow::ensure!(!instances.is_empty(), "no instances were recorded");
-
-        Ok(Self {
-            spec: spec.clone(),
-            run_dir: run_dir.to_path_buf(),
-            cwd: cwd.to_path_buf(),
-            env,
-            identity,
-            log: log.to_path_buf(),
-            instances,
-        })
-    }
-
-    /// A socket path or a free loopback port for an instance.
-    fn allocate(&self, index: u32) -> anyhow::Result<Bind> {
-        match self.spec.bind {
-            ServerBind::Unix => Ok(Bind::Unix(
-                self.run_dir.join(format!("server-{index}.sock")),
-            )),
-            ServerBind::Port => {
-                let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-                    .context("finding a free loopback port")?;
-                Ok(Bind::Port(listener.local_addr()?.port()))
-            }
-        }
-    }
-
-    /// Start one instance's process.
-    fn spawn(&mut self, position: usize) -> anyhow::Result<()> {
-        let instance = &self.instances[position];
-
-        // A crashed instance leaves its socket file behind, which the
-        // next one could not bind.
-
-        if let Bind::Unix(path) = &instance.bind {
-            let _ = std::fs::remove_file(path);
-        }
-
-        let arguments = arguments_for(self.spec.profile, &self.spec.command, &instance.bind);
-        let program = Path::new(&arguments[0]);
-
-        // A relative path with a directory in it is taken from the
-        // working directory, which is what an operator writing
-        // `.venv/bin/gunicorn` means; a bare name is found on PATH.
-
-        let program = if program.is_relative() && program.components().count() > 1 {
-            self.cwd.join(program)
-        } else {
-            program.to_path_buf()
+        let instances = record
+            .instances
+            .iter()
+            .zip(&binds)
+            .map(|(instance, bind)| instance_spec(spec, instance.index, bind))
+            .collect();
+        let mut processes = supervisor::Record {
+            instances: record
+                .instances
+                .iter()
+                .map(InstanceRecord::process)
+                .collect(),
         };
 
-        // Output goes to the release's log file itself, not through this
-        // daemon, so a daemon that detaches or upgrades leaves the
-        // instance writing; the file is rotated in place (section 11.3).
+        for (process, bind) in processes.instances.iter_mut().zip(&binds) {
+            let unproven = process.pid != 0 && process.start_time == 0;
 
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log)
-            .with_context(|| format!("opening {}", self.log.display()))?;
-        let mut command = Command::new(&program);
-        command
-            .args(&arguments[1..])
-            .current_dir(&self.cwd)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log)
-            .env_clear()
-            .envs(self.env.iter().cloned())
-            .env("MURU_HTTP_BIND", instance.bind.address())
-            .env("MURU_INSTANCE", instance.index.to_string());
-
-        if let Bind::Port(port) = instance.bind {
-            command.env("PORT", port.to_string());
+            if unproven
+                && answer(bind, spec.readiness_path.as_deref(), PROBE_TIMEOUT)
+                    .await
+                    .is_none()
+            {
+                process.pid = 0;
+            }
         }
 
-        crate::host::own_session(&mut command, self.identity);
-        let child = command
-            .spawn()
-            .with_context(|| format!("starting {}", program.display()))?;
-        let instance = &mut self.instances[position];
-        instance.process = Some(Process::Child(child));
-        instance.started = Instant::now();
-        instance.started_unix_ms = crate::model::now_unix_ms();
-        instance.due = None;
-        Ok(())
+        let supervisor = Supervisor::adopt(
+            process_spec(spec, cwd, env, identity, log),
+            RestartPolicy::default(),
+            instances,
+            &processes,
+        )?;
+
+        Ok(Self {
+            readiness_path: spec.readiness_path.clone(),
+            run_dir: run_dir.to_path_buf(),
+            binds,
+            supervisor,
+        })
     }
 
     /// Wait until every instance answers its readiness probe, or one
     /// exits, or the time is up.
     pub async fn wait_ready(&mut self, timeout: Duration) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
-        let mut ready = vec![false; self.instances.len()];
-        let path = self.spec.readiness_path.clone();
+        let mut ready = vec![false; self.binds.len()];
+        let path = self.readiness_path.clone();
+        let indexes: Vec<u32> = self
+            .supervisor
+            .instances()
+            .map(supervisor::Instance::index)
+            .collect();
 
         loop {
-            for (position, instance) in self.instances.iter_mut().enumerate() {
+            for (position, bind) in self.binds.iter().enumerate() {
                 if ready[position] {
                     continue;
                 }
 
-                if let Some(how) = instance.try_exited()? {
-                    anyhow::bail!("instance {} {how} before it was ready", instance.index);
+                if let Some(exit) = self.supervisor.try_exited(position)? {
+                    anyhow::bail!("instance {} {exit} before it was ready", indexes[position]);
                 }
 
-                if probe(&instance.bind, path.as_deref(), PROBE_TIMEOUT).await {
+                if probe(bind, path.as_deref(), PROBE_TIMEOUT).await {
                     ready[position] = true;
                 }
             }
@@ -399,12 +270,11 @@ impl Servers {
             }
 
             if Instant::now() >= deadline {
-                let waiting = self
-                    .instances
+                let waiting = indexes
                     .iter()
                     .zip(&ready)
                     .find(|(_, ready)| !**ready)
-                    .map(|(instance, _)| instance.index)
+                    .map(|(index, _)| *index)
                     .unwrap_or(0);
                 anyhow::bail!(
                     "instance {waiting} was not ready within {} s{}",
@@ -422,128 +292,37 @@ impl Servers {
     /// Reap instances that exited and start again those whose wait has
     /// passed, with what happened for the event stream.
     pub fn check(&mut self) -> Vec<Report> {
-        let now = Instant::now();
-        let mut reports = Vec::new();
-
-        for position in 0..self.instances.len() {
-            let instance = &mut self.instances[position];
-
-            if let Ok(Some(how)) = instance.try_exited() {
-                instance.process = None;
-
-                if instance.started.elapsed() >= STABLE_AFTER {
-                    instance.crashes = 0;
-                }
-
-                instance.crashes += 1;
-                let wait = backoff(instance.crashes);
-                instance.due = Some(now + wait);
-                reports.push(Report {
-                    kind: "server.exited",
-                    level: "warning",
-                    message: format!(
-                        "instance {} {how}; starting it again in {}",
-                        instance.index,
-                        muru_config::format_duration(wait)
-                    ),
-                });
-            }
-
-            if instance.process.is_some() || !instance.due.is_some_and(|due| due <= now) {
-                continue;
-            }
-
-            let index = instance.index;
-
-            match self.spawn(position) {
-                Ok(()) => reports.push(Report {
-                    kind: "server.started",
-                    level: "info",
-                    message: format!(
-                        "instance {index} started again (pid {})",
-                        self.instances[position].pid().unwrap_or(0)
-                    ),
-                }),
-                Err(error) => {
-                    let instance = &mut self.instances[position];
-                    instance.crashes += 1;
-                    let wait = backoff(instance.crashes);
-                    instance.due = Some(now + wait);
-                    reports.push(Report {
-                        kind: "server.failed",
-                        level: "error",
-                        message: format!(
-                            "instance {index} could not be started: {error:#}; trying again in {}",
-                            muru_config::format_duration(wait)
-                        ),
-                    });
-                }
-            }
-        }
-
-        reports
+        self.supervisor.check()
     }
 
     /// Every instance's address, as the snapshot names them.
     pub fn addresses(&self) -> Vec<String> {
-        self.instances
-            .iter()
-            .map(|instance| instance.bind.address())
-            .collect()
+        self.binds.iter().map(Bind::address).collect()
     }
 
     /// How many instances have a process right now.
     pub fn running(&self) -> usize {
-        self.instances
-            .iter()
-            .filter(|instance| instance.process.is_some())
-            .count()
+        self.supervisor.running()
     }
 
     /// The instances as a record for the next daemon.
     pub fn record(&self) -> ServersRecord {
         ServersRecord {
             instances: self
+                .supervisor
+                .record()
                 .instances
-                .iter()
-                .map(|instance| InstanceRecord {
-                    index: instance.index,
-                    pid: instance.pid().unwrap_or(0),
-                    address: instance.bind.address(),
-                    started_unix_ms: if instance.process.is_some() {
-                        instance.started_unix_ms
-                    } else {
-                        0
-                    },
+                .into_iter()
+                .zip(&self.binds)
+                .map(|(process, bind)| InstanceRecord {
+                    index: process.index,
+                    pid: process.pid,
+                    address: bind.address(),
+                    started_unix_ms: process.started_unix_ms,
+                    quick_exits: process.quick_exits,
+                    start_time: process.start_time,
                 })
                 .collect(),
-        }
-    }
-
-    /// The signal that stops an instance gracefully: the profile's, or
-    /// the one the release names.
-    fn stop_signal(&self) -> i32 {
-        let name = self
-            .spec
-            .stop_signal
-            .as_deref()
-            .unwrap_or(match self.spec.profile {
-                ServerProfile::Gunicorn
-                | ServerProfile::Uvicorn
-                | ServerProfile::Granian
-                | ServerProfile::ModWsgiExpress
-                | ServerProfile::Uwsgi
-                | ServerProfile::Generic => "TERM",
-            });
-
-        match name {
-            "INT" => libc::SIGINT,
-            "QUIT" => libc::SIGQUIT,
-            "HUP" => libc::SIGHUP,
-            "USR1" => libc::SIGUSR1,
-            "USR2" => libc::SIGUSR2,
-            "WINCH" => libc::SIGWINCH,
-            _ => libc::SIGTERM,
         }
     }
 
@@ -551,46 +330,109 @@ impl Servers {
     /// still there after `grace`, and the sockets and run directory
     /// removed.
     pub async fn stop(self, grace: Duration) {
-        self.stop_until(Instant::now() + grace).await;
+        self.stop_until(std::time::Instant::now() + grace).await;
     }
 
     /// Stop the instances as `stop` does, killing what is still there at
     /// `kill_at`.
-    pub async fn stop_until(mut self, kill_at: Instant) {
-        let signal = self.stop_signal();
-
-        for instance in &self.instances {
-            instance.signal(signal);
-        }
-
-        let deadline = kill_at;
-
-        for instance in &mut self.instances {
-            instance.finish(deadline).await;
-        }
-
+    pub async fn stop_until(self, kill_at: std::time::Instant) {
+        self.supervisor.stop_until(Instant::from_std(kill_at)).await;
         let _ = std::fs::remove_dir_all(&self.run_dir);
     }
 
     /// Leave the instances running and forget them, for a daemon that
     /// detaches.
     pub fn release(self) {
-        for instance in self.instances {
-            if let Some(Process::Child(mut child)) = instance.process {
-                // The child must not be killed when its handle drops.
+        self.supervisor.release();
+    }
+}
 
-                let _ = child.try_wait();
-                std::mem::forget(child);
-            }
+/// A socket path or a free loopback port for each of `count` instances.
+/// A free port is one the system gives to a listener that asks for any.
+/// Every such listener is held open until the last port is known, so
+/// that no two instances of a release are given the same one.
+fn allocate(bind: ServerBind, run_dir: &Path, count: u32) -> anyhow::Result<Vec<Bind>> {
+    match bind {
+        ServerBind::Unix => Ok((0..count)
+            .map(|index| Bind::Unix(run_dir.join(format!("server-{index}.sock"))))
+            .collect()),
+        ServerBind::Port => {
+            let listeners = (0..count)
+                .map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)))
+                .collect::<std::io::Result<Vec<_>>>()
+                .context("finding a free loopback port")?;
+            listeners
+                .iter()
+                .map(|listener| Ok(Bind::Port(listener.local_addr()?.port())))
+                .collect()
         }
     }
 }
 
-/// The wait before the next start after this many crashes in a row.
-fn backoff(crashes: u32) -> Duration {
-    BACKOFF_FIRST
-        .saturating_mul(1 << crashes.saturating_sub(1).min(5))
-        .min(BACKOFF_CAP)
+/// What the supervisor needs to know of every instance of a release.
+fn process_spec(
+    spec: &HttpServerSpec,
+    cwd: &Path,
+    env: Vec<(String, String)>,
+    identity: Option<Identity>,
+    log: &Path,
+) -> supervisor::Spec {
+    supervisor::Spec {
+        cwd: cwd.to_path_buf(),
+        env,
+        identity,
+        log: log.to_path_buf(),
+        stop_signal: stop_signal(spec),
+        stop_group: false,
+        events: EVENTS,
+    }
+}
+
+/// One instance for the supervisor: the command with the instance's
+/// address filled in, the variables that tell the server where to
+/// listen, and the socket file a crashed instance leaves behind.
+fn instance_spec(spec: &HttpServerSpec, index: u32, bind: &Bind) -> InstanceSpec {
+    let mut env = vec![
+        ("MURU_HTTP_BIND".to_owned(), bind.address()),
+        ("MURU_INSTANCE".to_owned(), index.to_string()),
+    ];
+
+    let stale = match bind {
+        Bind::Unix(path) => vec![path.clone()],
+        Bind::Port(port) => {
+            env.push(("PORT".to_owned(), port.to_string()));
+            Vec::new()
+        }
+    };
+
+    InstanceSpec {
+        command: arguments_for(spec.profile, &spec.command, bind),
+        env,
+        stale,
+    }
+}
+
+/// The signal that stops an instance gracefully: the profile's, or the
+/// one the release names.
+fn stop_signal(spec: &HttpServerSpec) -> i32 {
+    let name = spec.stop_signal.as_deref().unwrap_or(match spec.profile {
+        ServerProfile::Gunicorn
+        | ServerProfile::Uvicorn
+        | ServerProfile::Granian
+        | ServerProfile::ModWsgiExpress
+        | ServerProfile::Uwsgi
+        | ServerProfile::Generic => "TERM",
+    });
+
+    match name {
+        "INT" => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "HUP" => libc::SIGHUP,
+        "USR1" => libc::SIGUSR1,
+        "USR2" => libc::SIGUSR2,
+        "WINCH" => libc::SIGWINCH,
+        _ => libc::SIGTERM,
+    }
 }
 
 /// The command with its address filled in: `{bind}` becomes the
@@ -672,6 +514,15 @@ fn arguments_for(profile: ServerProfile, command: &[String], bind: &Bind) -> Vec
 /// Whether an instance answers: with a path, a GET of it answered 2xx
 /// or 3xx; without one, any HTTP response at all.
 async fn probe(bind: &Bind, path: Option<&str>, timeout: Duration) -> bool {
+    match answer(bind, path, timeout).await {
+        Some(status) => path.is_none() || (200..400).contains(&status),
+        None => false,
+    }
+}
+
+/// The status an instance answers a GET of the path with, `/` when
+/// there is none, or nothing when no HTTP response comes in time.
+async fn answer(bind: &Bind, path: Option<&str>, timeout: Duration) -> Option<u16> {
     let request = format!(
         "GET {} HTTP/1.0\r\nHost: localhost\r\nUser-Agent: muru-readiness\r\n\r\n",
         path.unwrap_or("/")
@@ -692,10 +543,7 @@ async fn probe(bind: &Bind, path: Option<&str>, timeout: Duration) -> bool {
     })
     .await;
 
-    match answered {
-        Ok(Some(status)) => path.is_none() || (200..400).contains(&status),
-        _ => false,
-    }
+    answered.ok().flatten()
 }
 
 /// The status of the response a stream carries, from its status line.
@@ -862,20 +710,108 @@ mod tests {
     }
 
     #[test]
-    fn the_backoff_doubles_to_the_cap() {
-        assert_eq!(backoff(1), Duration::from_secs(1));
-        assert_eq!(backoff(2), Duration::from_secs(2));
-        assert_eq!(backoff(4), Duration::from_secs(8));
-        assert_eq!(backoff(9), Duration::from_secs(30));
-    }
-
-    #[test]
     fn addresses_round_trip_through_records() {
         for bind in [Bind::Unix(PathBuf::from("/run/s.sock")), Bind::Port(8001)] {
             assert_eq!(Bind::parse(&bind.address()), Some(bind));
         }
 
         assert_eq!(Bind::parse("10.0.0.1:80"), None);
+    }
+
+    #[test]
+    fn the_instances_of_a_release_get_addresses_of_their_own() {
+        let run_dir = Path::new("/run/r1");
+        let ports = allocate(ServerBind::Port, run_dir, 64).unwrap();
+        let distinct: std::collections::BTreeSet<String> =
+            ports.iter().map(Bind::address).collect();
+        assert_eq!(distinct.len(), 64);
+        assert!(
+            ports
+                .iter()
+                .all(|bind| matches!(bind, Bind::Port(port) if *port != 0))
+        );
+
+        assert_eq!(
+            allocate(ServerBind::Unix, run_dir, 2).unwrap(),
+            [
+                Bind::Unix(PathBuf::from("/run/r1/server-0.sock")),
+                Bind::Unix(PathBuf::from("/run/r1/server-1.sock")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_instance_recorded_with_no_start_time_is_adopted_only_if_its_address_answers() {
+        // The record names a process that is running, a child of the
+        // test, and has no start time for it, so the pid is all there
+        // is to say the process is the instance.
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut bystander = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .spawn()
+            .unwrap();
+        let spec = HttpServerSpec {
+            profile: ServerProfile::Generic,
+            command: command(&["/bin/sleep", "600"]),
+            bind: ServerBind::Port,
+            instances: 1,
+            readiness_path: None,
+            readiness_timeout_ms: 1000,
+            stop_signal: None,
+        };
+
+        // Something answers HTTP at one address, and nothing listens at
+        // the other.
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let answering = Bind::Port(listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await;
+            }
+        });
+        let silent = Bind::Unix(dir.path().join("nothing.sock"));
+
+        for (bind, adopted) in [(answering, true), (silent, false)] {
+            let record = ServersRecord {
+                instances: vec![InstanceRecord {
+                    index: 0,
+                    pid: bystander.id(),
+                    address: bind.address(),
+                    started_unix_ms: 0,
+                    quick_exits: 0,
+                    start_time: 0,
+                }],
+            };
+            let servers = Servers::adopt(
+                &spec,
+                dir.path(),
+                dir.path(),
+                Vec::new(),
+                None,
+                &dir.path().join("output.log"),
+                &record,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                servers.record().instances[0].pid,
+                if adopted { bystander.id() } else { 0 }
+            );
+            assert_eq!(servers.running(), usize::from(adopted));
+            servers.release();
+        }
+
+        // Neither adoption signalled the process.
+
+        assert_eq!(bystander.try_wait().unwrap(), None);
+        bystander.kill().unwrap();
+        bystander.wait().unwrap();
     }
 
     #[tokio::test]

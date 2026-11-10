@@ -188,7 +188,7 @@ pub async fn prepare(
         (BuildWhen::Auto, Some(_), Some(_)) => {
             // Used as it is, however stale, but said when it is behind.
 
-            let Some(uv) = muru_provision::Uv::find(None, None) else {
+            let Some(uv) = muru_provision::Uv::find(None) else {
                 return Ok(false);
             };
             let project = project.to_path_buf();
@@ -278,7 +278,7 @@ async fn build_environment(
     development: bool,
     reason: &str,
 ) -> anyhow::Result<bool> {
-    let Some(uv) = muru_provision::Uv::find(None, None) else {
+    let Some(uv) = muru_provision::Uv::find(None) else {
         println!(
             "muru: {reason}, but uv was not found on PATH, beside muructl or in MURU_UV, so the \
              environment was not built; install uv, or make the environment yourself"
@@ -370,7 +370,7 @@ pub async fn build(args: BuildArgs) -> anyhow::Result<()> {
         );
     }
 
-    let Some(uv) = muru_provision::Uv::find(None, None) else {
+    let Some(uv) = muru_provision::Uv::find(None) else {
         anyhow::bail!(
             "uv was not found on PATH, beside muructl or in MURU_UV, and building needs it; \
              install uv, or set MURU_UV to where it is"

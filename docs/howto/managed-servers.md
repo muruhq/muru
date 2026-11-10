@@ -36,7 +36,7 @@ readiness = { path = '/healthz', timeout = '60s' }
 | `readiness` | none | `path` is probed with a GET every 100 ms until it answers 2xx or 3xx; without it any HTTP response makes the instance ready. `timeout` (default `60s`) is how long the instances get |
 | `stop_signal` | the profile's | the signal that stops an instance gracefully: `TERM`, `INT`, `QUIT`, `HUP`, `USR1`, `USR2` or `WINCH`; required by `generic` |
 | `env` | none | environment variables and secret references, as for a workers release |
-| `timeouts.shutdown_timeout` | `5s` | how long an instance told to stop gets before it is killed |
+| `timeouts.shutdown_timeout` | `5s` | how long an instance told to stop gets before it, and every process it started, is killed |
 
 The same release is deployed from the command line with `--server` and
 the command after `--`:
@@ -88,22 +88,54 @@ instances = 2
 ## Readiness, supervision and stopping
 
 The release is `warming` until every instance answers its probe, and
-`failed` if one exits first or the timeout passes, with the instance and
-the reason in the release's message. An instance that exits later is
+`failed` if one cannot be started, one exits first or the timeout passes,
+with the instance and the reason in the release's message. A release
+that fails leaves nothing running: the instances that had started are
+stopped as a drain stops them.
+
+An instance that exits later is
 started again after a wait that doubles with each exit in a row, from one
 second up to thirty, and starts over once an instance has run for a
 minute; the exit and the restart are `server.exited` and `server.started`
-events, and a start that fails is `server.failed`. While an instance is
+events, and a start that fails is `server.failed`. An instance is never
+started beside what the one before it left running. Processes still in
+the process group of an instance that exited, such as workers whose
+master was killed, are sent the stop signal when the exit is seen, and
+the `server.exited` event says that processes were left behind. Any
+still running when the wait ends are killed, and the instance starts on
+the daemon's next check, a second later. They are also killed if the
+daemon stops or upgrades before the wait ends.
+
+While an instance is
 down its requests go to the others, or are answered 502
 `upstream_failed` when there is none, and `muru_upstream_health` reports
 each instance by address under the release's name. The instance count is
 fixed: `muructl scale` refuses a managed server.
 
 Draining stops new requests at the edge, waits for those in flight, then
-sends each instance the profile's stop signal (`TERM` for every profile
-unless `stop_signal` says otherwise) and kills one still there after
-`shutdown_timeout`. A superseded release is kept warm as a workers release
-is, with its instances running, so a rollback to it is instant.
+sends the process of each instance the profile's stop signal (`TERM` for
+every profile unless `stop_signal` says otherwise). The signal goes to
+that process alone, the one the command started, such as a gunicorn
+master, and not to the processes it started in turn.
+
+Each instance runs in a process group of its own, which holds every
+process it started, such as a master's workers. What is left of an
+instance when `shutdown_timeout` ends is killed as a group:
+
+- An instance whose process is still there is killed, and every process
+  in its group with it.
+
+- An instance whose process exited in time but left processes of its
+  group running has those sent the stop signal as well, as soon as it
+  has exited, and they are killed when `shutdown_timeout` ends, or half
+  a second after the signal if less than that was left.
+
+A process that has moved itself out of the instance's process group, by
+starting a session of its own as a daemonising server does, is not found
+and is left running.
+
+A superseded release is kept warm as a workers release is, with its
+instances running, so a rollback to it is instant.
 
 ## uWSGI
 
@@ -136,11 +168,37 @@ records each request under the application and release with `http` as
 its group and the instance's address as its mount.
 
 The instances' standard output and error go to the release's log file,
-shown by `muructl logs APP`, and the daemon rotates that file by copying
-it and truncating it in place, since the server cannot be told to reopen
-it. A daemon that stops without `--shutdown`, or upgrades itself, leaves
-the instances running and the next daemon takes them over from the
-record in the release's run directory. `muructl release list` shows a
+shown by `muructl logs APP`. Each line is in the file as the server wrote
+it: Muru puts no time in front of it and no tag naming the instance, so a
+time or a process id on a line is whatever the server's own logging puts
+there, and the lines of a release's instances are interleaved in the one
+file. The daemon rotates that file by copying it and truncating it in
+place, since the server cannot be told to reopen it.
+
+A daemon that stops without `--shutdown`, or upgrades itself, leaves
+the instances running, and the next daemon takes them over from the
+record in the release's run directory, one instance at a time. An
+instance that is still running is taken over as it is, with its pid and
+start time. An instance that exited while no daemon was running, or that
+was waiting to be started again when the daemon stopped, is started
+again within a second at the same address, and its waits carry on from
+the exits it had in a row. The release stays `ready`, and its
+`release.adopted` event names the pids taken over and the instances
+started again:
+
+```
+re-adopted the server instances (pid 48213); instance 1 was gone and is started again
+```
+
+The record holds each instance's pid together with the time the kernel
+gives for when that process started. An instance counts as still running
+only when the process that has its pid now started at the recorded time.
+A pid that has passed to another process since is not taken over, and
+that process is never signalled: the instance is started again. Where
+the record holds no start time for an instance, the instance is taken
+over only if its address also answers an HTTP request.
+
+`muructl release list` shows a
 managed server as its instance count and profile in the workers column.
 `muructl release show` lists each instance with its pid and address, and
 with `--json` as `server_instances`, each with `index`, `pid` (0 while it
