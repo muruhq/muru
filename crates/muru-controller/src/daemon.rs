@@ -4174,7 +4174,8 @@ impl Daemon {
             identity,
             &self.host_log(app, id),
             record,
-        );
+        )
+        .await;
 
         match adopted {
             Ok(servers) => {
@@ -9980,6 +9981,7 @@ mod tests {
                     address: String::new(),
                     started_unix_ms: 0,
                     quick_exits: 0,
+                    start_time: 0,
                 })
                 .collect(),
         };

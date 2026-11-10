@@ -177,6 +177,14 @@ started again:
 re-adopted the server instances (pid 48213); instance 1 was gone and is started again
 ```
 
+The record holds each instance's pid together with the time the kernel
+gives for when that process started. An instance counts as still running
+only when the process that has its pid now started at the recorded time.
+A pid that has passed to another process since is not taken over, and
+that process is never signalled: the instance is started again. Where
+the record holds no start time for an instance, the instance is taken
+over only if its address also answers an HTTP request.
+
 `muructl release list` shows a
 managed server as its instance count and profile in the workers column.
 `muructl release show` lists each instance with its pid and address, and

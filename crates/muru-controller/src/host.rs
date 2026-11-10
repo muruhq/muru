@@ -1539,6 +1539,83 @@ pub fn alive(pid: u32) -> bool {
     }
 }
 
+/// When the kernel says a process started, as a number that means
+/// nothing but is the same every time it is read for one process and
+/// differs for another process given the same pid later. None when it
+/// cannot be read: no such process, or no way to ask on this system.
+///
+/// A pid alone does not name a process across time, since pids are used
+/// again; a pid and this together do, which is how a record of a
+/// process is checked against whatever has its pid now.
+pub(crate) fn start_time(pid: u32) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+
+    read_start_time(pid)
+}
+
+/// On Linux the start time is `starttime` in `/proc/PID/stat`: clock
+/// ticks since the system booted.
+#[cfg(target_os = "linux")]
+fn read_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    start_time_in_stat(&stat)
+}
+
+/// On macOS the start time is in the process's BSD information: seconds
+/// and microseconds, combined as microseconds.
+#[cfg(target_os = "macos")]
+fn read_start_time(pid: u32) -> Option<u64> {
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+
+    // SAFETY: proc_bsdinfo is plain data for which all zeroes is a
+    // valid value.
+
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+
+    // SAFETY: proc_pidinfo writes at most `size` bytes to the buffer it
+    // is given, which is a proc_bsdinfo of that size that outlives the
+    // call.
+
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            size,
+        )
+    };
+
+    if written != size {
+        return None;
+    }
+
+    Some(
+        info.pbi_start_tvsec
+            .wrapping_mul(1_000_000)
+            .wrapping_add(info.pbi_start_tvusec),
+    )
+}
+
+/// Elsewhere there is no start time to read.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// The `starttime` field of a `/proc/PID/stat` line, its 22nd. The
+/// second field is the command's name in parentheses, which may itself
+/// hold spaces and parentheses, so the fields are counted from the last
+/// closing one: the state is the first after it and the start time the
+/// 20th.
+#[cfg(any(target_os = "linux", test))]
+fn start_time_in_stat(stat: &str) -> Option<u64> {
+    let (_, after_name) = stat.rsplit_once(')')?;
+    after_name.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// Whether a worker accepts connections on its socket. The edge connects
 /// to every worker as soon as the host is ready, so this connects too: a
 /// Unix socket file exists from bind, a moment before listen.
@@ -1675,5 +1752,53 @@ fn tagged(source: &str, message: &str) -> String {
         message.to_owned()
     } else {
         format!("{source}: {message}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_start_time_is_read_past_a_command_name_with_spaces_and_parentheses() {
+        // A line as proc(5) gives it, for a process that named itself
+        // awkwardly; field 22 is 8421.
+
+        let stat = "4242 (a ) b) c) S 1 4242 4242 0 -1 4194560 120 0 0 0 3 1 0 0 20 0 1 0 8421 \
+                    2318336 180 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0";
+        assert_eq!(start_time_in_stat(stat), Some(8421));
+        assert_eq!(start_time_in_stat("4242 (short) S 1 2 3"), None);
+        assert_eq!(start_time_in_stat("no parenthesis at all"), None);
+    }
+
+    #[test]
+    fn a_process_has_a_start_time_that_stays_the_same_and_is_its_own() {
+        // Two children of the test, started far enough apart that no
+        // clock gives them the same time.
+
+        let spawn = || {
+            std::process::Command::new("/bin/sleep")
+                .arg("600")
+                .spawn()
+                .unwrap()
+        };
+        let mut first = spawn();
+        std::thread::sleep(Duration::from_millis(50));
+        let mut second = spawn();
+
+        let started = start_time(first.id()).expect("a running process has a start time");
+        assert_eq!(start_time(first.id()), Some(started));
+        assert_ne!(start_time(second.id()), Some(started));
+        assert!(start_time(second.id()).is_some());
+
+        // A pid that names no process has none, and neither has pid 0.
+
+        for child in [&mut first, &mut second] {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+
+        assert_eq!(start_time(first.id()), None);
+        assert_eq!(start_time(0), None);
     }
 }

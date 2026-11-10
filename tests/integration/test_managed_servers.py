@@ -13,6 +13,7 @@ import json
 import os
 import shlex
 import signal
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -629,3 +630,59 @@ def test_a_daemon_restart_adopts_the_instances_still_there_and_starts_the_rest(
     # The shutdown stops them both: the survivor was not left behind.
 
     wait_for(lambda: not alive(survivor) and not alive(replacement))
+
+
+def test_a_recorded_pid_that_another_process_has_is_not_adopted(tmp_path: Path) -> None:
+    first = start_daemon(tmp_path)
+    second = None
+    bystander = None
+
+    try:
+        deploy_server(first, "legacy", "--bind", "port")
+        pid = instances(first, "legacy@r1")[0]["pid"]
+        assert "detached" in first.muructl("daemon", "stop").stdout
+        first.process.wait(timeout=30)
+
+        # The instance exits while no daemon is there, and the record is
+        # changed to say its pid is that of a process of the test's own,
+        # as it would be had the pid been given out again. The start time
+        # recorded beside it is still the instance's, which started well
+        # before the bystander: a deploy and a daemon's stop ago.
+
+        os.kill(pid, signal.SIGKILL)
+        wait_for(lambda: not alive(pid))
+        bystander = subprocess.Popen(["/bin/sleep", "600"])
+        record = first.run_dir / "apps" / "legacy" / "r1" / "servers.toml"
+        text = record.read_text()
+        assert f"pid = {pid}\n" in text
+        assert "start_time = " in text and "start_time = 0\n" not in text
+        record.write_text(text.replace(f"pid = {pid}\n", f"pid = {bystander.pid}\n"))
+
+        # The next daemon does not take the bystander for the instance.
+        # It starts the instance again.
+
+        second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+        wait_for(lambda: instances(second, "legacy@r1")[0]["pid"] != 0, 20)
+        replacement = instances(second, "legacy@r1")[0]["pid"]
+        assert replacement not in (pid, bystander.pid)
+        events = second.muructl("events").stdout
+        assert "none of the server instances was still there" in events
+        assert f"instance 0 started again (pid {replacement})" in events
+        wait_for(lambda: second.request("/").status == 200, 20)
+        assert report(second)["pid"] == replacement
+    finally:
+        if second is None:
+            second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+
+        # The shutdown stops what the daemon runs, and the bystander was
+        # never signalled: it is still running.
+
+        second.stop(shutdown=True)
+
+        if bystander is not None:
+            untouched = bystander.poll() is None
+            bystander.kill()
+            bystander.wait()
+
+    assert untouched
+    wait_for(lambda: not alive(replacement))

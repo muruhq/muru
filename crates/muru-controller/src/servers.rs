@@ -87,6 +87,10 @@ pub struct InstanceRecord {
     /// Its exits and failed starts in a row.
     #[serde(default)]
     pub quick_exits: u32,
+    /// The start time the kernel gives its process, which with the pid
+    /// names the process; 0 when not known.
+    #[serde(default)]
+    pub start_time: u64,
 }
 
 impl InstanceRecord {
@@ -97,6 +101,7 @@ impl InstanceRecord {
             pid: self.pid,
             started_unix_ms: self.started_unix_ms,
             quick_exits: self.quick_exits,
+            start_time: self.start_time,
         }
     }
 }
@@ -150,8 +155,16 @@ impl Servers {
     /// that is still there, with those that are not due to be started
     /// by the next `check`. Only a record with no instances, or with an
     /// address that cannot be read, is refused.
+    ///
+    /// An instance is there when the process with its pid has the start
+    /// time it was recorded with, which the supervisor checks. A record
+    /// with no start time for an instance, as one written before the
+    /// start time was kept, leaves only the pid, which any process may
+    /// have by now. Such an instance is taken over only if something
+    /// answers HTTP at its address as well, and is otherwise started
+    /// again, with the process that has its pid left alone.
     #[allow(clippy::too_many_arguments)]
-    pub fn adopt(
+    pub async fn adopt(
         spec: &HttpServerSpec,
         run_dir: &Path,
         cwd: &Path,
@@ -178,13 +191,26 @@ impl Servers {
             .zip(&binds)
             .map(|(instance, bind)| instance_spec(spec, instance.index, bind))
             .collect();
-        let processes = supervisor::Record {
+        let mut processes = supervisor::Record {
             instances: record
                 .instances
                 .iter()
                 .map(InstanceRecord::process)
                 .collect(),
         };
+
+        for (process, bind) in processes.instances.iter_mut().zip(&binds) {
+            let unproven = process.pid != 0 && process.start_time == 0;
+
+            if unproven
+                && answer(bind, spec.readiness_path.as_deref(), PROBE_TIMEOUT)
+                    .await
+                    .is_none()
+            {
+                process.pid = 0;
+            }
+        }
+
         let supervisor = Supervisor::adopt(
             process_spec(spec, cwd, env, identity, log),
             RestartPolicy::default(),
@@ -282,6 +308,7 @@ impl Servers {
                     address: bind.address(),
                     started_unix_ms: process.started_unix_ms,
                     quick_exits: process.quick_exits,
+                    start_time: process.start_time,
                 })
                 .collect(),
         }
@@ -465,6 +492,15 @@ fn arguments_for(profile: ServerProfile, command: &[String], bind: &Bind) -> Vec
 /// Whether an instance answers: with a path, a GET of it answered 2xx
 /// or 3xx; without one, any HTTP response at all.
 async fn probe(bind: &Bind, path: Option<&str>, timeout: Duration) -> bool {
+    match answer(bind, path, timeout).await {
+        Some(status) => path.is_none() || (200..400).contains(&status),
+        None => false,
+    }
+}
+
+/// The status an instance answers a GET of the path with, `/` when
+/// there is none, or nothing when no HTTP response comes in time.
+async fn answer(bind: &Bind, path: Option<&str>, timeout: Duration) -> Option<u16> {
     let request = format!(
         "GET {} HTTP/1.0\r\nHost: localhost\r\nUser-Agent: muru-readiness\r\n\r\n",
         path.unwrap_or("/")
@@ -485,10 +521,7 @@ async fn probe(bind: &Bind, path: Option<&str>, timeout: Duration) -> bool {
     })
     .await;
 
-    match answered {
-        Ok(Some(status)) => path.is_none() || (200..400).contains(&status),
-        _ => false,
-    }
+    answered.ok().flatten()
 }
 
 /// The status of the response a stream carries, from its status line.
@@ -661,6 +694,80 @@ mod tests {
         }
 
         assert_eq!(Bind::parse("10.0.0.1:80"), None);
+    }
+
+    #[tokio::test]
+    async fn an_instance_recorded_with_no_start_time_is_adopted_only_if_its_address_answers() {
+        // The record names a process that is running, a child of the
+        // test, and has no start time for it, so the pid is all there
+        // is to say the process is the instance.
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut bystander = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .spawn()
+            .unwrap();
+        let spec = HttpServerSpec {
+            profile: ServerProfile::Generic,
+            command: command(&["/bin/sleep", "600"]),
+            bind: ServerBind::Port,
+            instances: 1,
+            readiness_path: None,
+            readiness_timeout_ms: 1000,
+            stop_signal: None,
+        };
+
+        // Something answers HTTP at one address, and nothing listens at
+        // the other.
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let answering = Bind::Port(listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await;
+            }
+        });
+        let silent = Bind::Unix(dir.path().join("nothing.sock"));
+
+        for (bind, adopted) in [(answering, true), (silent, false)] {
+            let record = ServersRecord {
+                instances: vec![InstanceRecord {
+                    index: 0,
+                    pid: bystander.id(),
+                    address: bind.address(),
+                    started_unix_ms: 0,
+                    quick_exits: 0,
+                    start_time: 0,
+                }],
+            };
+            let servers = Servers::adopt(
+                &spec,
+                dir.path(),
+                dir.path(),
+                Vec::new(),
+                None,
+                &dir.path().join("output.log"),
+                &record,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                servers.record().instances[0].pid,
+                if adopted { bystander.id() } else { 0 }
+            );
+            assert_eq!(servers.running(), usize::from(adopted));
+            servers.release();
+        }
+
+        // Neither adoption signalled the process.
+
+        assert_eq!(bystander.try_wait().unwrap(), None);
+        bystander.kill().unwrap();
+        bystander.wait().unwrap();
     }
 
     #[tokio::test]

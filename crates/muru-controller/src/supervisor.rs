@@ -17,7 +17,7 @@ use anyhow::Context as _;
 use tokio::process::{Child, Command};
 use tokio::time::Instant;
 
-use crate::host::{Identity, alive, leads_group, signal_group, signal_process};
+use crate::host::{Identity, alive, leads_group, signal_group, signal_process, start_time};
 
 /// How often a process that is not a child of this daemon is looked at
 /// while it is waited for.
@@ -148,29 +148,58 @@ impl fmt::Display for Exit {
 /// daemon. Either way it was started in a session of its own, so its
 /// pid is also the id of its process group, which holds whatever it
 /// started that did not leave.
+///
+/// Each carries the start time the kernel gives the process, 0 when it
+/// could not be read. A pid is used again once its process has gone, so
+/// the pid of a process this daemon does not hold as a child names it
+/// only together with that time.
 enum Process {
     /// A child, with the pid it was started with: its handle forgets the
     /// pid once the child has been reaped, and the group is still looked
     /// for under it then.
-    Child { child: Child, pid: u32 },
+    Child {
+        child: Child,
+        pid: u32,
+        start_time: u64,
+    },
     /// A process a previous daemon started.
-    Adopted { pid: u32 },
+    Adopted { pid: u32, start_time: u64 },
+}
+
+/// Whether the process recorded with this pid and start time is still
+/// running: something has the pid, and it started when the recorded
+/// process did. A pid whose process has another start time, or none
+/// that can be read, has passed to another process, and the recorded
+/// one is gone. A record with no start time has only the pid to go by.
+/// Pid 0 is how a record shows an instance that had no process, and is
+/// never looked for: as a pid it would name this daemon's own group.
+fn still_running(pid: u32, started: u64) -> bool {
+    pid != 0 && alive(pid) && (started == 0 || start_time(pid) == Some(started))
 }
 
 impl Process {
     /// The pid the process was started with, and so its group's id.
     fn pid(&self) -> u32 {
         match self {
-            Self::Child { pid, .. } | Self::Adopted { pid } => *pid,
+            Self::Child { pid, .. } | Self::Adopted { pid, .. } => *pid,
         }
     }
 
-    /// The pid to signal the process itself by: none for a child that
-    /// has been reaped, whose pid may be another process's by now.
+    /// The start time the kernel gave the process; 0 when not known.
+    fn start_time(&self) -> u64 {
+        match self {
+            Self::Child { start_time, .. } | Self::Adopted { start_time, .. } => *start_time,
+        }
+    }
+
+    /// The pid to signal the process itself by. There is none for a
+    /// child that has been reaped, nor for an adopted process that is no
+    /// longer the one with its pid: the pid may be another process's by
+    /// now, which must never be signalled.
     fn own_pid(&self) -> Option<u32> {
         match self {
             Self::Child { child, .. } => child.id(),
-            Self::Adopted { pid } => Some(*pid),
+            Self::Adopted { pid, start_time } => still_running(*pid, *start_time).then_some(*pid),
         }
     }
 
@@ -178,14 +207,16 @@ impl Process {
     fn try_exited(&mut self) -> std::io::Result<Option<Exit>> {
         match self {
             Self::Child { child, .. } => Ok(child.try_wait()?.map(Exit::Status)),
-            Self::Adopted { pid } => Ok((!alive(*pid)).then_some(Exit::Gone)),
+            Self::Adopted { pid, start_time } => {
+                Ok((!still_running(*pid, *start_time)).then_some(Exit::Gone))
+            }
         }
     }
 
     /// Ask the process to stop: the signal to the process alone, or to
     /// its whole group.
     fn stop(&self, signal: i32, group: bool) {
-        if group {
+        if group && self.group_is_own() {
             signal_group(self.pid(), signal);
         } else if let Some(pid) = self.own_pid() {
             signal_process(pid, signal);
@@ -199,12 +230,12 @@ impl Process {
             Self::Child { child, .. } => tokio::time::timeout_at(deadline, child.wait())
                 .await
                 .is_ok(),
-            Self::Adopted { pid } => {
-                while alive(*pid) && Instant::now() < deadline {
+            Self::Adopted { pid, start_time } => {
+                while still_running(*pid, *start_time) && Instant::now() < deadline {
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
 
-                !alive(*pid)
+                !still_running(*pid, *start_time)
             }
         }
     }
@@ -214,13 +245,18 @@ impl Process {
     /// it, are its own.
     async fn kill(&mut self) {
         match self {
-            Self::Child { child, pid } => {
+            Self::Child { child, pid, .. } => {
                 signal_group(*pid, libc::SIGKILL);
                 let _ = child.kill().await;
             }
-            Self::Adopted { pid } => {
-                // A process this daemon did not start is checked to lead
-                // its group before the group is signalled.
+            Self::Adopted { pid, start_time } => {
+                // A process this daemon did not start is looked at once
+                // more, and checked to lead its group, before anything
+                // is signalled.
+
+                if !still_running(*pid, *start_time) {
+                    return;
+                }
 
                 if leads_group(*pid) {
                     signal_group(*pid, libc::SIGKILL);
@@ -229,10 +265,22 @@ impl Process {
                 signal_process(*pid, libc::SIGKILL);
                 let gone_by = Instant::now() + LEFTOVER_GRACE;
 
-                while alive(*pid) && Instant::now() < gone_by {
+                while still_running(*pid, *start_time) && Instant::now() < gone_by {
                     tokio::time::sleep(GROUP_POLL_INTERVAL).await;
                 }
             }
+        }
+    }
+
+    /// Whether the process group under the process's pid is the
+    /// process's own. A child's is. An adopted process's is unless
+    /// another process has its pid now, when a group under that id is
+    /// the other's: an id is not used again while anything is left of
+    /// its group.
+    fn group_is_own(&self) -> bool {
+        match self {
+            Self::Child { .. } => true,
+            Self::Adopted { pid, start_time } => !alive(*pid) || still_running(*pid, *start_time),
         }
     }
 
@@ -253,7 +301,7 @@ impl Process {
         // any member is left, so what answers under it is the
         // instance's; after a kill these are processes on their way out.
 
-        if !signal_group(group, 0) {
+        if !self.group_is_own() || !signal_group(group, 0) {
             return;
         }
 
@@ -329,6 +377,7 @@ impl Instance {
                 0
             },
             quick_exits: self.quick_exits,
+            start_time: self.process.as_ref().map_or(0, Process::start_time),
         }
     }
 }
@@ -364,6 +413,13 @@ pub struct InstanceRecord {
     /// starts carry on under the next daemon.
     #[serde(default)]
     pub quick_exits: u32,
+    /// The start time the kernel gives its process, which with the pid
+    /// names the process: a number to compare for equality and nothing
+    /// else (clock ticks since boot on Linux, microseconds on macOS).
+    /// 0 when it is not known: there is no process, it could not be
+    /// read, or the record was written before it was kept.
+    #[serde(default)]
+    pub start_time: u64,
 }
 
 /// The instances of one supervised program.
@@ -409,6 +465,14 @@ impl Supervisor {
     /// was written (pid 0), is an instance that exited: it is due at
     /// once, so the next `check` starts it, and its exits in a row are
     /// as recorded. Only a record that names no instance is refused.
+    ///
+    /// A process is there when something has the recorded pid and its
+    /// start time is the recorded one. A pid whose process started at
+    /// another time, or whose start time cannot be read, has passed to
+    /// another process: the instance is not there, and that process is
+    /// never signalled. A record with no start time for an instance has
+    /// only the pid to go by, so its user should have other grounds for
+    /// believing it, and clear the pid of one it does not believe.
     pub fn adopt(
         spec: Spec,
         policy: RestartPolicy,
@@ -433,9 +497,12 @@ impl Supervisor {
                     ..Instance::new(recorded.index, instance)
                 };
 
-                if still_there(recorded) {
+                if still_running(recorded.pid, recorded.start_time) {
                     Instance {
-                        process: Some(Process::Adopted { pid: recorded.pid }),
+                        process: Some(Process::Adopted {
+                            pid: recorded.pid,
+                            start_time: recorded.start_time,
+                        }),
                         started_unix_ms: recorded.started_unix_ms,
                         ..instance
                     }
@@ -504,7 +571,11 @@ impl Supervisor {
             .id()
             .with_context(|| format!("{} started with no pid", program.display()))?;
         let instance = &mut self.instances[position];
-        instance.process = Some(Process::Child { child, pid });
+        instance.process = Some(Process::Child {
+            child,
+            pid,
+            start_time: start_time(pid).unwrap_or(0),
+        });
         instance.started = Instant::now();
         instance.started_unix_ms = crate::model::now_unix_ms();
         instance.due = None;
@@ -643,14 +714,6 @@ impl Supervisor {
             }
         }
     }
-}
-
-/// Whether the process an instance was recorded with is still there.
-/// Pid 0 is how the record shows an instance that had no process, and
-/// is never looked for: as a pid it would name this daemon's own process
-/// group.
-fn still_there(recorded: &InstanceRecord) -> bool {
-    recorded.pid != 0 && alive(recorded.pid)
 }
 
 #[cfg(test)]
@@ -898,6 +961,14 @@ mod tests {
                 .iter()
                 .all(|instance| instance.started_unix_ms > 0)
         );
+        assert_eq!(
+            record
+                .instances
+                .iter()
+                .map(|instance| Some(instance.start_time))
+                .collect::<Vec<_>>(),
+            [start_time(started[0]), start_time(started[1])]
+        );
         assert_eq!(supervisor.running(), 2);
 
         // An instance that waits to be started has no pid and no start
@@ -914,18 +985,29 @@ mod tests {
             (
                 record.instances[1].index,
                 record.instances[1].pid,
-                record.instances[1].started_unix_ms
+                record.instances[1].started_unix_ms,
+                record.instances[1].start_time
             ),
-            (1, 0, 0)
+            (1, 0, 0, 0)
         );
         assert_eq!(supervisor.running(), 1);
 
-        // The record reads back from the form it is written in.
+        // The record reads back from the form it is written in, and so
+        // does one written before the later fields were kept.
 
         let text = toml::to_string(&record).unwrap();
         let read: Record = toml::from_str(&text).unwrap();
         assert_eq!(read.instances.len(), 2);
         assert_eq!(read.instances[0].pid, started[0]);
+        assert_eq!(read.instances[0].start_time, record.instances[0].start_time);
+        let older: Record = toml::from_str("[[instances]]\nindex = 0\npid = 7\n").unwrap();
+        assert_eq!(
+            (
+                older.instances[0].start_time,
+                older.instances[0].quick_exits
+            ),
+            (0, 0)
+        );
 
         supervisor.stop_until(Instant::now()).await;
     }
@@ -1044,6 +1126,7 @@ mod tests {
                     pid: *pid,
                     started_unix_ms: if *pid == 0 { 0 } else { 1234 },
                     quick_exits: 2,
+                    start_time: start_time(*pid).unwrap_or(0),
                 })
                 .collect(),
         }
@@ -1171,5 +1254,117 @@ mod tests {
         assert_eq!(supervisor.running(), 1);
 
         supervisor.stop_until(Instant::now()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pid_that_another_process_has_is_not_adopted_and_never_signalled() {
+        // The record names a process that is running, a child of the
+        // test, with a start time that is not that process's: the pid
+        // has passed to it since the record was written.
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut bystander = previous();
+        let mut record = recorded(&[bystander.id()]);
+        assert_ne!(record.instances[0].start_time, 0);
+        record.instances[0].start_time += 1;
+        let mut supervisor = Supervisor::adopt(
+            spec(dir.path()),
+            RestartPolicy::default(),
+            vec![instance(&["/bin/sleep", "600"])],
+            &record,
+        )
+        .unwrap();
+
+        // The instance has no process, and the first check starts one.
+
+        assert_eq!(pids(&supervisor), [0]);
+        assert_eq!(supervisor.check().len(), 1);
+        assert_ne!(pids(&supervisor), [bystander.id()]);
+
+        // Stopping the instance leaves the bystander running.
+
+        supervisor.stop_until(Instant::now()).await;
+        assert_eq!(bystander.try_wait().unwrap(), None);
+        bystander.kill().unwrap();
+        bystander.wait().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_adopted_process_whose_pid_passes_to_another_is_gone() {
+        // What the supervisor adopted is described by a pid and a start
+        // time. Here they stop matching, as when the adopted process
+        // exits and its pid is given out again within a check: the
+        // process that has the pid now is a child of the test.
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut bystander = previous();
+        let record = recorded(&[bystander.id()]);
+        let mut supervisor = Supervisor::adopt(
+            spec(dir.path()),
+            RestartPolicy::default(),
+            vec![instance(&["/bin/sleep", "600"])],
+            &record,
+        )
+        .unwrap();
+        assert_eq!(pids(&supervisor), [bystander.id()]);
+
+        let Some(Process::Adopted { start_time, .. }) = &mut supervisor.instances[0].process else {
+            panic!("the instance was adopted");
+        };
+        *start_time += 1;
+
+        // The instance is seen to be gone, and a stop while it waits
+        // signals nothing: the bystander runs on.
+
+        assert_eq!(
+            reports(&mut supervisor),
+            ["thing.exited warning: instance 0 is gone; starting it again in 4s"]
+        );
+        supervisor.stop_until(Instant::now()).await;
+        assert_eq!(bystander.try_wait().unwrap(), None);
+
+        // Nor is it signalled when the stop comes before the check has
+        // seen that the instance is gone.
+
+        let mut supervisor = Supervisor::adopt(
+            spec(dir.path()),
+            RestartPolicy::default(),
+            vec![instance(&["/bin/sleep", "600"])],
+            &record,
+        )
+        .unwrap();
+
+        if let Some(Process::Adopted { start_time, .. }) = &mut supervisor.instances[0].process {
+            *start_time += 1;
+        }
+
+        supervisor.stop_until(Instant::now()).await;
+        assert_eq!(bystander.try_wait().unwrap(), None);
+        bystander.kill().unwrap();
+        bystander.wait().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_record_with_no_start_time_is_adopted_on_the_pid_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut running = previous();
+        let mut record = recorded(&[running.id()]);
+        record.instances[0].start_time = 0;
+        let supervisor = Supervisor::adopt(
+            spec(dir.path()),
+            RestartPolicy::default(),
+            vec![instance(&["/bin/sleep", "600"])],
+            &record,
+        )
+        .unwrap();
+        assert_eq!(pids(&supervisor), [running.id()]);
+
+        // The process is the one recorded, so the stop is its to take.
+        // The supervisor reaps it, being its parent here, so there is
+        // no status left for the test to wait for.
+
+        supervisor.stop_until(Instant::now()).await;
+        assert!(!exists(running.id()));
+        let _ = running.wait();
     }
 }
