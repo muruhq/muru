@@ -12,6 +12,7 @@
 
 pub mod facts;
 pub mod stored;
+pub mod window;
 
 use muru_proto::admin::v1 as pb;
 use serde::Serialize;
