@@ -510,6 +510,14 @@ names where the daemon's state store is, which is how they know what
 still exists. `muructl serve` writes its logs to standard output, so
 these commands have nothing to do for it.
 
+When the disk holding the log directory is full, a release's host drops
+the worker lines it cannot write and goes on serving. Once it can write
+again it adds a line saying how many it dropped:
+
+```
+2026-11-02T05:42:30.101Z muru.host[4242]: dropped 120 lines of worker 0's stderr that could not be written (No space left on device)
+```
+
 `muructl logs list` shows each log, its size, its archives and the total
 it takes, and flags as `orphaned` a log whose release or virtual host no
 longer exists. `--json` prints the same for scripts:

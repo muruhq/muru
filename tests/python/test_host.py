@@ -625,3 +625,34 @@ def test_a_shutdown_with_a_budget_of_its_own_leaves_the_workers_less_time(
     assert instance.time_to_stop() == 0.0
     stop_by.write_text("not a time")
     assert instance.time_to_stop() == 7.0
+
+
+def test_output_that_cannot_be_written_is_dropped_counted_and_reported(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A full disk under the release log never stops the host: the lines
+    are dropped, and their count is reported once writing works again."""
+
+    written: list[bytes] = []
+    full = True
+
+    def sink(data: bytes) -> None:
+        if full:
+            raise OSError(28, "No space left on device")
+
+        written.append(data)
+
+    output = host.WorkerOutput(0, "stderr", -1, sink=sink)
+    output.relay(b"one\ntwo\npart")
+    output.flush()
+    assert written == [] and output.dropped == 3
+
+    full = False
+    output.relay(b"three\n")
+
+    assert len(written) == 1 and written[0].endswith(b"muru.worker[0]: three\n")
+    assert output.dropped == 0
+    assert (
+        "dropped 3 lines of worker 0's stderr that could not be written "
+        "(No space left on device)" in capsys.readouterr().err
+    )
