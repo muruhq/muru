@@ -103,7 +103,8 @@ the process group of an instance that exited, such as workers whose
 master was killed, are sent the stop signal when the exit is seen, and
 the `server.exited` event says that processes were left behind. Any
 still running when the wait ends are killed, and the instance starts on
-the daemon's next check, a second later.
+the daemon's next check, a second later. They are also killed if the
+daemon stops or upgrades before the wait ends.
 
 While an instance is
 down its requests go to the others, or are answered 502

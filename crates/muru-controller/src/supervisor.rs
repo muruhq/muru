@@ -811,7 +811,9 @@ impl Supervisor {
     }
 
     /// Leave the instances running and forget them, for a daemon that
-    /// detaches.
+    /// detaches. What an instance that exited left running is killed
+    /// here: the record has no place for it, so the next daemon would
+    /// start the instance beside it.
     pub fn release(self) {
         for instance in self.instances {
             if let Some(Process::Child { mut child, .. }) = instance.process {
@@ -819,6 +821,10 @@ impl Supervisor {
 
                 let _ = child.try_wait();
                 std::mem::forget(child);
+            }
+
+            if let Some(leftover) = instance.leftover {
+                signal_group(leftover.group, libc::SIGKILL);
             }
         }
     }
@@ -1320,6 +1326,42 @@ mod tests {
 
         supervisor.stop_until(Instant::now()).await;
         wait_for("the group to empty", || (!group_exists(pid)).then_some(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn what_an_instance_leaves_behind_does_not_outlive_a_release() {
+        // As above, and the daemon lets go of the instances while one
+        // waits to be started, with its child still running. The next
+        // daemon would know nothing of the child.
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut supervisor, pid) = start_script(
+            dir.path(),
+            spec(dir.path()),
+            "(trap '' TERM; : > ready; exec /bin/sleep 600) & wait",
+        )
+        .await;
+        kill(pid);
+        reports(&mut supervisor);
+        assert!(group_exists(pid));
+
+        // The child is killed as the instances are let go. Should it be
+        // found still running, the test kills it before failing.
+
+        supervisor.release();
+        let gone = std::time::Instant::now() + Duration::from_secs(10);
+
+        while group_exists(pid) && std::time::Instant::now() < gone {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let left = group_exists(pid);
+
+        if left {
+            signal_group(pid, libc::SIGKILL);
+        }
+
+        assert!(!left);
     }
 
     #[tokio::test]
