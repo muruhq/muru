@@ -134,9 +134,7 @@ impl Servers {
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(run_dir)
             .with_context(|| format!("creating {}", run_dir.display()))?;
-        let binds = (0..spec.instances.max(1))
-            .map(|index| allocate(spec.bind, run_dir, index))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let binds = allocate(spec.bind, run_dir, spec.instances.max(1))?;
         let instances = (0..)
             .zip(&binds)
             .map(|(index, bind)| instance_spec(spec, index, bind))
@@ -349,14 +347,24 @@ impl Servers {
     }
 }
 
-/// A socket path or a free loopback port for an instance.
-fn allocate(bind: ServerBind, run_dir: &Path, index: u32) -> anyhow::Result<Bind> {
+/// A socket path or a free loopback port for each of `count` instances.
+/// A free port is one the system gives to a listener that asks for any.
+/// Every such listener is held open until the last port is known, so
+/// that no two instances of a release are given the same one.
+fn allocate(bind: ServerBind, run_dir: &Path, count: u32) -> anyhow::Result<Vec<Bind>> {
     match bind {
-        ServerBind::Unix => Ok(Bind::Unix(run_dir.join(format!("server-{index}.sock")))),
+        ServerBind::Unix => Ok((0..count)
+            .map(|index| Bind::Unix(run_dir.join(format!("server-{index}.sock"))))
+            .collect()),
         ServerBind::Port => {
-            let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            let listeners = (0..count)
+                .map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)))
+                .collect::<std::io::Result<Vec<_>>>()
                 .context("finding a free loopback port")?;
-            Ok(Bind::Port(listener.local_addr()?.port()))
+            listeners
+                .iter()
+                .map(|listener| Ok(Bind::Port(listener.local_addr()?.port())))
+                .collect()
         }
     }
 }
@@ -708,6 +716,28 @@ mod tests {
         }
 
         assert_eq!(Bind::parse("10.0.0.1:80"), None);
+    }
+
+    #[test]
+    fn the_instances_of_a_release_get_addresses_of_their_own() {
+        let run_dir = Path::new("/run/r1");
+        let ports = allocate(ServerBind::Port, run_dir, 64).unwrap();
+        let distinct: std::collections::BTreeSet<String> =
+            ports.iter().map(Bind::address).collect();
+        assert_eq!(distinct.len(), 64);
+        assert!(
+            ports
+                .iter()
+                .all(|bind| matches!(bind, Bind::Port(port) if *port != 0))
+        );
+
+        assert_eq!(
+            allocate(ServerBind::Unix, run_dir, 2).unwrap(),
+            [
+                Bind::Unix(PathBuf::from("/run/r1/server-0.sock")),
+                Bind::Unix(PathBuf::from("/run/r1/server-1.sock")),
+            ]
+        );
     }
 
     #[tokio::test]
