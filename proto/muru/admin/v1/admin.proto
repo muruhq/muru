@@ -1081,6 +1081,7 @@ message LogInfo {
   uint64 archives_size = 9;         // the bytes the archives take
   uint64 total = 10;                // the bytes the log and its archives take
   bool orphaned = 11;               // its release or host no longer exists
+  uint64 modified_unix_ms = 12;     // when the file itself was last changed, 0 when it is gone
 }
 
 message ListLogsResponse {

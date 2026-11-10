@@ -1063,11 +1063,7 @@ fn main() -> anyhow::Result<()> {
                     socket,
                     output,
                 }) => admin::logs_reopen(workers, socket, output.json).await,
-                Some(admin::LogsCommand::List {
-                    socket,
-                    files,
-                    output,
-                }) => admin::logs_list(socket, files, output.json).await,
+                Some(admin::LogsCommand::List(args)) => admin::logs_list(*args).await,
                 Some(admin::LogsCommand::Truncate(args)) => admin::logs_truncate(*args).await,
                 Some(admin::LogsCommand::Rotate(args)) => admin::logs_rotate(*args).await,
                 Some(admin::LogsCommand::Prune(args)) => admin::logs_prune(*args).await,

@@ -7430,17 +7430,87 @@ pub enum LogsCommand {
 
     /// List each log with its size, its archives and the total, and flag
     /// logs whose release or host no longer exists.
-    List {
-        #[command(flatten)]
-        socket: SocketArgs,
+    List(Box<LogsListArgs>),
+}
 
-        /// With no daemon running, where its log directory and state are.
-        #[command(flatten)]
-        files: DaemonFileArgs,
+/// What `muructl logs list` takes.
+#[derive(Args, Clone)]
+pub struct LogsListArgs {
+    /// Only the logs of this application's releases, or of one release
+    /// as app@release.
+    #[arg(value_name = "APP[@RELEASE]", conflicts_with_all = ["access", "host"])]
+    target: Option<String>,
 
-        #[command(flatten)]
-        output: JsonArgs,
-    },
+    /// Only the access log.
+    #[arg(long, conflicts_with = "host")]
+    access: bool,
+
+    /// Only the file a virtual host names for its records.
+    #[arg(long, value_name = "HOST")]
+    host: Option<String>,
+
+    /// List each archive under its log, oldest first, with its size and
+    /// when it was last written.
+    #[arg(long)]
+    archives: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// With no daemon running, where its log directory and state are.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+impl LogsListArgs {
+    /// Whether the arguments name a log: every log when they name none.
+    fn names(&self, log: &pb::LogInfo) -> bool {
+        if let Some(target) = &self.target {
+            let (app, release) = target.split_once('@').unwrap_or((target, ""));
+
+            return log.kind == "release"
+                && log.app == app
+                && (release.is_empty() || log.release == release);
+        }
+
+        if let Some(host) = &self.host {
+            return log.hosts.contains(host);
+        }
+
+        !self.access || log.kind == "access"
+    }
+
+    /// Keep only the logs the arguments name, with the total of those
+    /// alone. Naming a log that is not there is refused.
+    fn narrow(&self, report: &mut pb::ListLogsResponse) -> anyhow::Result<()> {
+        let missing = match (&self.target, &self.host) {
+            (Some(target), _) => {
+                if target.contains('@') {
+                    split_release(target)?;
+                }
+
+                format!("no log for {target}")
+            }
+            (None, Some(host)) => format!(
+                "no log file for virtual host {host}: its records are in access.log unless it \
+                 names an access_log_file"
+            ),
+            (None, None) if self.access => "there is no access log".to_owned(),
+            (None, None) => return Ok(()),
+        };
+
+        report.logs.retain(|log| self.names(log));
+
+        if report.logs.is_empty() {
+            anyhow::bail!("{missing}, in {}", report.directory);
+        }
+
+        report.total = report.logs.iter().map(|log| log.total).sum();
+        Ok(())
+    }
 }
 
 /// Show or follow a release's output or the access log.
@@ -7644,12 +7714,8 @@ async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result
 }
 
 /// List the log files and what they take.
-pub async fn logs_list(
-    socket: SocketArgs,
-    files: DaemonFileArgs,
-    json: bool,
-) -> anyhow::Result<()> {
-    let report = match logs_way(&socket, &files).await? {
+pub async fn logs_list(args: LogsListArgs) -> anyhow::Result<()> {
+    let mut report = match logs_way(&args.socket, &args.files).await? {
         LogsWay::Daemon(mut client) => client
             .list_logs(pb::ListLogsRequest {})
             .await
@@ -7662,7 +7728,9 @@ pub async fn logs_list(
         .with_context(|| format!("reading {}", directory.locations.logs.path.display()))?,
     };
 
-    if json {
+    args.narrow(&mut report)?;
+
+    if args.output.json {
         return print_answer(&report);
     }
 
@@ -7671,6 +7739,31 @@ pub async fn logs_list(
         return Ok(());
     }
 
+    if args.archives {
+        print_archives(&report);
+    } else {
+        print_logs(&report);
+    }
+
+    println!(
+        "total {}, in {}",
+        human_size(report.total),
+        report.directory
+    );
+
+    if !report.orphans_known {
+        println!(
+            "no state store was found, so logs of releases and hosts that no longer exist \
+             are not flagged"
+        );
+    }
+
+    Ok(())
+}
+
+/// The logs as a table: each with its size, how many archives it has
+/// and what they take, and the total.
+fn print_logs(report: &pb::ListLogsResponse) {
     println!(
         "{:<40} {:>9} {:>18} {:>9}",
         "LOG", "SIZE", "ARCHIVES", "TOTAL"
@@ -7696,21 +7789,51 @@ pub async fn logs_list(
             if log.orphaned { "  orphaned" } else { "" }
         );
     }
+}
+
+/// The logs as a table with each archive on a line of its own under its
+/// log, oldest first: every file with its size and when it was last
+/// written, and each log with its total.
+fn print_archives(report: &pb::ListLogsResponse) {
+    let width = report
+        .logs
+        .iter()
+        .flat_map(|log| {
+            std::iter::once(log.name.len())
+                .chain(log.archives.iter().map(|archive| archive.name.len() + 2))
+        })
+        .max()
+        .unwrap_or(0)
+        .max(40);
 
     println!(
-        "total {}, in {}",
-        human_size(report.total),
-        report.directory
+        "{:<width$} {:>9}  {:<20} {:>9}",
+        "LOG", "SIZE", "MODIFIED", "TOTAL"
     );
 
-    if !report.orphans_known {
-        println!(
-            "no state store was found, so logs of releases and hosts that no longer exist \
-             are not flagged"
-        );
-    }
+    for log in &report.logs {
+        let (size, modified) = if log.present {
+            (human_size(log.size), format_time(log.modified_unix_ms))
+        } else {
+            ("-".to_owned(), "-".to_owned())
+        };
 
-    Ok(())
+        println!(
+            "{:<width$} {size:>9}  {modified:<20} {:>9}{}",
+            log.name,
+            human_size(log.total),
+            if log.orphaned { "  orphaned" } else { "" }
+        );
+
+        for archive in &log.archives {
+            println!(
+                "{:<width$} {:>9}  {}",
+                format!("  {}", archive.name),
+                human_size(archive.size),
+                format_time(archive.modified_unix_ms)
+            );
+        }
+    }
 }
 
 /// Ask a yes or no question on the terminal, on standard error so that
@@ -9063,5 +9186,83 @@ up 1 1700000000000
             ..applied
         };
         assert_eq!(super::exit_code(&refused, false), 1);
+    }
+}
+
+#[cfg(test)]
+mod logs_list_tests {
+    use clap::Parser;
+
+    use super::{LogsListArgs, pb};
+
+    /// The arguments as `muructl logs list` parses them.
+    #[derive(Parser)]
+    struct Command {
+        #[command(flatten)]
+        args: LogsListArgs,
+    }
+
+    fn report() -> pb::ListLogsResponse {
+        let log = |name: &str, kind: &str, app: &str, release: &str, hosts: &[&str]| pb::LogInfo {
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            app: app.to_owned(),
+            release: release.to_owned(),
+            hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+            total: 10,
+            ..pb::LogInfo::default()
+        };
+
+        pb::ListLogsResponse {
+            directory: "/logs".to_owned(),
+            logs: vec![
+                log("access.log", "access", "", "", &[]),
+                log("apps/shop/r1.log", "release", "shop", "r1", &[]),
+                log("apps/shop/r2.log", "release", "shop", "r2", &[]),
+                log("apps/shopfront/r1.log", "release", "shopfront", "r1", &[]),
+                log("intranet.log", "host", "", "", &["intranet"]),
+            ],
+            total: 50,
+            orphans_known: true,
+        }
+    }
+
+    fn narrowed(arguments: &[&str]) -> anyhow::Result<(Vec<String>, u64)> {
+        let command =
+            Command::try_parse_from(std::iter::once("list").chain(arguments.iter().copied()))?;
+        let mut report = report();
+        command.args.narrow(&mut report)?;
+
+        Ok((
+            report.logs.into_iter().map(|log| log.name).collect(),
+            report.total,
+        ))
+    }
+
+    #[test]
+    fn a_target_narrows_the_list_and_its_total() {
+        assert_eq!(narrowed(&[]).unwrap().0.len(), 5);
+        assert_eq!(
+            narrowed(&["shop"]).unwrap(),
+            (
+                vec!["apps/shop/r1.log".to_owned(), "apps/shop/r2.log".to_owned()],
+                20
+            )
+        );
+        assert_eq!(narrowed(&["shop@r2"]).unwrap().0, ["apps/shop/r2.log"]);
+        assert_eq!(narrowed(&["--access"]).unwrap().0, ["access.log"]);
+        assert_eq!(
+            narrowed(&["--host", "intranet"]).unwrap().0,
+            ["intranet.log"]
+        );
+
+        let refused = narrowed(&["shop@r9"]).unwrap_err().to_string();
+        assert_eq!(refused, "no log for shop@r9, in /logs");
+        assert!(narrowed(&["--host", "shop"]).is_err());
+        assert!(narrowed(&["shop@"]).is_err());
+        assert!(
+            narrowed(&["shop", "--access"]).is_err(),
+            "one target at a time"
+        );
     }
 }

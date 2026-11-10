@@ -499,6 +499,39 @@ edge.log                                    4.0KB                   -     4.0KB
 total 5.9GB, in /var/log/muru
 ```
 
+`--archives` lists each archive on a line of its own under its log,
+oldest first, with its size and when it was last written, in UTC. A log
+whose file is gone and only has archives shows `-` for its size and time:
+
+```console
+$ muructl logs list --archives
+LOG                                           SIZE  MODIFIED                 TOTAL
+access.log                                   5.2GB  2026-11-10T05:42:23Z     5.3GB
+  access.log.20261108-000000.zst            20.1MB  2026-11-09T00:00:01Z
+  access.log.20261109-000000.zst            20.4MB  2026-11-10T00:00:01Z
+  access.log.20261110-000000.zst            20.5MB  2026-11-10T00:00:02Z
+apps/shop/r3.log                            12.0MB  2026-11-10T05:42:23Z    12.0MB
+apps/shop/r1.log                                 -  -                        9.0MB  orphaned
+  apps/shop/r1.log.20261101-000000.zst       9.0MB  2026-11-01T00:00:01Z
+edge.log                                     4.0KB  2026-11-10T05:40:12Z     4.0KB
+total 5.9GB, in /var/log/muru
+```
+
+An application, `APP@RELEASE`, `--access` or `--host HOST` narrows the
+list to those logs, with the total of those alone: an application
+lists the logs of all its releases, and `--host HOST` the file the host
+names for its records. A target with no log is refused. The same
+targets narrow the `--json` output.
+
+```console
+$ muructl logs list shop --archives
+LOG                                           SIZE  MODIFIED                 TOTAL
+apps/shop/r3.log                            12.0MB  2026-11-10T05:42:23Z    12.0MB
+apps/shop/r1.log                                 -  -                        9.0MB  orphaned
+  apps/shop/r1.log.20261101-000000.zst       9.0MB  2026-11-01T00:00:01Z
+total 21.0MB, in /var/log/muru
+```
+
 `muructl logs truncate` cuts a live log down. It needs a target
 (`APP@RELEASE`, `--access`, `--host HOST` or `--all`) and `--keep SIZE`,
 and leaves archives alone:

@@ -99,6 +99,12 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
         text = daemon.muructl("logs", "list").stdout
         assert "apps/gone/r9.log" in text and "orphaned" in text and "total " in text
 
+        # --archives names each archive under its log, and a target
+        # narrows the list to its logs.
+
+        text = daemon.muructl("logs", "list", "gone@r9", "--archives").stdout
+        assert "\n  apps/gone/r9.log.20260101-000000 " in text and "access.log" not in text
+
         # A --log-dir that is not the daemon's is refused rather than
         # working on another directory behind its back.
 
@@ -237,6 +243,8 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
         assert report["orphans_known"] is True
         assert by_name(report)["apps/gone/r9.log"]["orphaned"] is True
         assert by_name(report)["apps/shop/r1.log"]["orphaned"] is False
+        narrowed = json.loads(direct(daemon, "logs", "list", "shop", "--json").stdout)
+        assert [log["name"] for log in narrowed["logs"]] == ["apps/shop/r1.log"]
 
         answer = json.loads(
             direct(daemon, "logs", "truncate", "--access", "--keep", "0", "--yes", "--json").stdout
