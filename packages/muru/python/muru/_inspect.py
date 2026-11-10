@@ -59,6 +59,7 @@ DECLARED = "MURU_DECLARED_ENV"
 
 _changed: dict[str, int] = {}
 _timers: dict[str, threading.Timer] = {}
+_until: dict[str, float] = {}
 _lock = threading.Lock()
 
 
@@ -92,6 +93,8 @@ def handle(
             result = tasks(loop)
         elif op == "inspect":
             result = inspect(bool(args.get("env", False)))
+        elif op == "logging" and args.get("list"):
+            result = changed_levels()
         elif op == "logging":
             result = set_level(
                 str(args.get("logger", "")),
@@ -702,6 +705,7 @@ def set_level(logger: str, level: str, duration_s: float | None, reset: bool) ->
                     timer.cancel()
 
             _changed.clear()
+            _until.clear()
             return {"reset": restored}
 
         numeric = logging.getLevelName(level.upper())
@@ -719,11 +723,14 @@ def set_level(logger: str, level: str, duration_s: float | None, reset: bool) ->
         if timer is not None:
             timer.cancel()
 
+        _until.pop(key, None)
+
         if duration_s is not None:
             timer = threading.Timer(float(duration_s), _revert, args=(key,))
             timer.daemon = True
             timer.start()
             _timers[key] = timer
+            _until[key] = time.time() + float(duration_s)
 
     return {
         "logger": logger or "root",
@@ -733,10 +740,33 @@ def set_level(logger: str, level: str, duration_s: float | None, reset: bool) ->
     }
 
 
+def changed_levels() -> dict[str, Any]:
+    """List the logger levels changed with `set_level` and in force now.
+
+    Each with its level, the level it replaced, and when it reverts on
+    its own as Unix milliseconds, None for a change that lasts until
+    reset. Nothing is changed by asking.
+    """
+
+    with _lock:
+        changed = [
+            {
+                "logger": name or "root",
+                "level": logging.getLevelName(logging.getLogger(name or None).level),
+                "previous": logging.getLevelName(previous),
+                "until_unix_ms": int(_until[name] * 1000) if name in _until else None,
+            }
+            for name, previous in sorted(_changed.items())
+        ]
+
+    return {"changed": changed}
+
+
 def _revert(key: str) -> None:
     with _lock:
         previous = _changed.pop(key, None)
         _timers.pop(key, None)
+        _until.pop(key, None)
 
         if previous is not None:
             logging.getLogger(key or None).setLevel(previous)

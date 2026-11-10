@@ -68,3 +68,33 @@ def test_values_are_shown_for_muru_the_interpreter_and_the_release_only(
 
     assert _inspect.environment(every=True)["STRIPE_ACCOUNT"] == "acct_1"
     assert _inspect.environment(every=True)["API_TOKEN"] == "***"
+
+
+def test_the_levels_changed_are_listed_until_they_revert() -> None:
+    """A listing says which loggers are changed, to what, from what and
+    until when, and changes nothing itself."""
+
+    import json
+    import logging
+    import time
+
+    before = logging.getLogger("muru_test.listed").level
+
+    try:
+        _inspect.set_level("muru_test.listed", "DEBUG", 60.0, False)
+        _inspect.set_level("muru_test.held", "ERROR", None, False)
+        answer = json.loads(
+            _inspect.handle('{"id": 1, "op": "logging", "args": {"list": true}}', [])
+        )
+        changed = {entry["logger"]: entry for entry in answer["result"]["changed"]}
+
+        assert changed["muru_test.listed"]["level"] == "DEBUG"
+        assert changed["muru_test.listed"]["previous"] == logging.getLevelName(before)
+        until = changed["muru_test.listed"]["until_unix_ms"]
+        assert time.time() * 1000 < until <= (time.time() + 61) * 1000
+        assert changed["muru_test.held"]["until_unix_ms"] is None
+        assert logging.getLogger("muru_test.listed").level == logging.DEBUG
+    finally:
+        _inspect.set_level("", "", None, True)
+
+    assert _inspect.changed_levels() == {"changed": []}

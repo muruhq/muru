@@ -511,8 +511,14 @@ def test_logging_level_changes_a_logger_for_a_period(daemon: Daemon) -> None:
     text = daemon.muructl("logging", "level", "logger", "noisy=DEBUG").stdout
     assert "noisy DEBUG (was NOTSET)" in text
     assert json.loads(daemon.get("/").body)["noisy_level"] == "DEBUG"
+
+    # With no level, each worker lists what it has changed, and until when.
+
+    listed = daemon.muructl("logging", "level", "logger").stdout
+    assert "worker 0 (pid" in listed and "noisy DEBUG (was NOTSET), until reset" in listed
     assert "reset noisy" in daemon.muructl("logging", "level", "logger", "--reset").stdout
     assert json.loads(daemon.get("/").body)["noisy_level"] == "NOTSET"
+    assert "no levels changed" in daemon.muructl("logging", "level", "logger").stdout
 
     completed = daemon.muructl("logging", "level", "logger", "noisy=LOUD", check=False)
     assert "is not a logging level" in completed.stdout + completed.stderr

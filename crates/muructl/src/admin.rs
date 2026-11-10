@@ -1070,7 +1070,9 @@ pub struct ExecArgs {
 /// The logging subcommands (section 11.4).
 #[derive(Subcommand)]
 pub enum LoggingCommand {
-    /// Set loggers' levels in a release's workers, for a period or until reset.
+    /// Set loggers' levels in a release's workers, for a period or until
+    /// reset; with no level and no --reset, list the levels changed this
+    /// way in each worker and until when.
     Level {
         /// The release as app@release, or an application for its current
         /// release; the one application of `muructl run` or `muructl
@@ -1080,7 +1082,7 @@ pub enum LoggingCommand {
 
         /// A logger and its level as NAME=LEVEL (root with an empty name,
         /// as =DEBUG). Repeatable.
-        #[arg(value_name = "NAME=LEVEL", required_unless_present_any = ["reset", "target"])]
+        #[arg(value_name = "NAME=LEVEL")]
         levels: Vec<String>,
 
         /// Revert on its own after this long, for example 10m.
@@ -1708,10 +1710,63 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
         target => target.unwrap_or_default(),
     };
 
-    anyhow::ensure!(
-        reset || !levels.is_empty(),
-        "give a logger and its level as NAME=LEVEL, or --reset"
-    );
+    // No level and no reset: what each worker has changed, and until when.
+
+    if !reset && levels.is_empty() {
+        anyhow::ensure!(
+            duration.is_none(),
+            "--for needs a logger and its level as NAME=LEVEL"
+        );
+
+        let response = ask(
+            &socket,
+            &target,
+            "logging",
+            worker,
+            serde_json::json!({"list": true}),
+        )
+        .await?;
+
+        if output.json {
+            return print_answer(&[debug_json(&response)]);
+        }
+
+        for answer in &response.workers {
+            let Some(result) = parse_result(answer) else {
+                println!(
+                    "worker {} (pid {}): {}",
+                    answer.index, answer.pid, answer.error
+                );
+                continue;
+            };
+
+            let changed = result["changed"].as_array().cloned().unwrap_or_default();
+
+            if changed.is_empty() {
+                println!(
+                    "worker {} (pid {}): no levels changed",
+                    answer.index, answer.pid
+                );
+            }
+
+            for entry in &changed {
+                let until = entry["until_unix_ms"].as_u64().map_or_else(
+                    || "until reset".to_owned(),
+                    |ms| format!("until {}", format_time(ms)),
+                );
+                println!(
+                    "worker {} (pid {}): {} {} (was {}), {until}",
+                    answer.index,
+                    answer.pid,
+                    entry["logger"].as_str().unwrap_or("root"),
+                    entry["level"].as_str().unwrap_or("?"),
+                    entry["previous"].as_str().unwrap_or("?"),
+                );
+            }
+        }
+
+        return Ok(());
+    }
 
     if reset {
         let response = ask(

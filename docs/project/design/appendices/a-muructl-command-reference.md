@@ -68,7 +68,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Observability | muructl logs truncate TARGET --keep SIZE | Cut a live log down to its newest SIZE at a line boundary; TARGET is APP@RELEASE, --access, --host HOST or --all. Asks first. Flags: --yes, --json, and with no daemon running --log-dir and --state-dir | 11.3 |
 | Observability | muructl logs list [TARGET] | Each log with its size, archives and total, flagging logs whose release or host no longer exists; TARGET is APP, APP@RELEASE, --access or --host HOST, and narrows the list to those logs. Flags: --archives (each archive under its log, with its size and modification time), --json, and with no daemon running --log-dir and --state-dir | 11.3 |
 | Observability | muructl metrics | Print the node's metrics as Prometheus text | 11.1 |
-| Observability | muructl logging level RELEASE | Time-limited logger levels, or --reset | 11.4 |
+| Observability | muructl logging level RELEASE | Time-limited logger levels, or --reset; with neither, the levels changed this way in each worker and until when | 11.4 |
 | Observability | muructl logging access MODE | Time-limited changes to which requests the access log writes, for an application and paths, the list of those in force, or --reset | 11.2 |
 | Observability | muructl debug stacks TARGET | Python stacks of every thread with the request each is serving, merged across workers. Flags: --worker | 11.7 |
 | Observability | muructl debug tasks TARGET | asyncio task tree and loop lag of ASGI workers | 11.7 |

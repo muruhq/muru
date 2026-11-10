@@ -468,6 +468,17 @@ changed this way revert when the period ends, on `--reset`, and when the
 worker is replaced, since a new worker starts from the release's
 [logging defaults](logging.md).
 
+With no level and no `--reset`, the command changes nothing and lists
+what each worker has changed, with the level it replaced and when it
+reverts:
+
+```console
+$ muructl logging level shop
+worker 0 (pid 4242): shop.payments DEBUG (was INFO), until 2026-11-02T05:52:22Z
+worker 0 (pid 4242): root DEBUG (was WARNING), until reset
+worker 1 (pid 4243): no levels changed
+```
+
 A reply is held to 256 MiB. Past that, the command says the reply was
 too large and to ask one worker with `--worker`, or a shorter `--for`
 for `profile`, or a smaller `--top` for `trace` and `memory`.
@@ -684,6 +695,7 @@ Everything is under one directory named as the file is.
 | `config/in-force.json` | What is in force outside the configuration: each rollout and where it stands, the sizes releases are pinned at, the applications and virtual hosts in maintenance mode, and each overlay's state |
 | `config/daemon.toml` | The daemon's own configuration file |
 | `config/access-log-overrides.json` | The changes `muructl logging access` has in force |
+| `config/logger-levels.json` | The logger levels `muructl logging level` has changed in each running release's workers, by `APP@RELEASE`, as the command lists them with `--json` |
 | `config/routing-snapshot.json` | The version of the routing snapshot in force, which an access log record's `snapshot` names |
 | `config/changes.jsonl` | The events of the window that changed the configuration: an apply or a reload, traffic moved, a deploy, a rollout's step, an overlay starting or ending |
 
@@ -775,9 +787,8 @@ the bundle under its name without the `.gz` or `.zst`. The manifest's
 `config/` holds the configuration as it was when the bundle was made.
 The manifest's `configuration_changed` says whether it changed during
 the window, and `config/changes.jsonl` what changed and when. Muru keeps
-only the routing snapshot in force, and no record of the levels
-`muructl logging level` changed, so the manifest lists the earlier
-snapshots and the logger levels as not collected.
+only the routing snapshot in force, so the manifest lists the earlier
+snapshots as not collected.
 
 A development run and `muructl serve` have no state store, so their
 `config/` holds `effective.toml`, with the settings in force and where
