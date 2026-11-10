@@ -38,6 +38,18 @@ const ASKED: &str = "asked for when the bundle is made";
 /// nothing runs.
 const NOTHING_RUNS: &str = "nothing is running to ask";
 
+/// How many times the workers' stacks are taken, and how long apart: one
+/// sample cannot tell a thread that is stuck from one that is busy.
+const STACK_SAMPLES: u32 = 3;
+const STACK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How many requests in flight and open WebSockets are listed.
+const LISTED: u32 = 1000;
+
+/// The states of a release in which a host runs for it, by which a plan
+/// tells what would be asked when it may not ask.
+const RUNNING_STATES: [&str; 5] = ["starting", "warming", "ready", "draining", "retained"];
+
 /// How many lines a development run or `muructl serve` is asked for:
 /// more than it keeps in memory.
 const EVERY_LINE: u32 = 1_000_000;
@@ -170,6 +182,8 @@ struct Bundle<'a, W: Write> {
     target: &'a Target,
     /// What takes client addresses and query strings out, with --scrub.
     scrubber: Option<Scrubber>,
+    /// The releases of the target with workers to ask, once known.
+    running: Option<Vec<(String, String)>>,
     /// The events of the window, once they have been read.
     events: Option<Vec<pb::Event>>,
     /// The metrics as the daemon gave them, once it has been asked.
@@ -210,6 +224,8 @@ impl<W: Write> Bundle<'_, W> {
         self.events().await?;
         let configuration_changed = self.configuration().await?;
         self.logs().await?;
+        self.live().await?;
+        self.figures().await?;
 
         // What was noted while collecting, such as a worker that did not
         // answer, is recorded as what it left out.
@@ -368,11 +384,13 @@ impl<W: Write> Bundle<'_, W> {
 
         self.archive.missing(
             &format!("{config}/routing-snapshots"),
-            "only the routing snapshot in force is kept, not those before it: the events in              changes.jsonl say what changed, and when",
+            "only the routing snapshot in force is kept, not those before it: the events in \
+             changes.jsonl say what changed, and when",
         );
         self.archive.missing(
             &format!("{config}/logger-levels.json"),
-            "the levels muructl logging level changed are held by each worker, and nothing              lists them",
+            "the levels muructl logging level changed are held by each worker, and nothing \
+             lists them",
         );
 
         // Every change the window's events record.
@@ -462,11 +480,28 @@ impl<W: Write> Bundle<'_, W> {
         let releases = self.installation.releases().await;
         let target = self.target;
 
-        let found = releases.map(|releases| {
-            let releases: Vec<ReleaseFacts> = releases
+        let releases = releases.map(|releases| {
+            releases
                 .into_iter()
                 .filter(|release| target.holds(&release.app, &release.id))
-                .collect();
+                .collect::<Vec<ReleaseFacts>>()
+        });
+
+        // Only a release with workers has anything to say of them.
+
+        if self.installation.running()
+            && let Ok(releases) = &releases
+        {
+            self.running = Some(
+                releases
+                    .iter()
+                    .filter(|release| !release.workers.is_empty())
+                    .map(|release| (release.app.clone(), release.id.clone()))
+                    .collect(),
+            );
+        }
+
+        let found = releases.map(|releases| {
             let installation = &*self.installation;
 
             let locations = installation.locations().map(|locations| {
@@ -552,6 +587,202 @@ impl<W: Write> Bundle<'_, W> {
                 Ok(())
             }
         }
+    }
+
+    /// The releases of the target whose workers are asked. When the
+    /// summary could not say, as in a plan that asks nothing, those the
+    /// state store has in a state a host runs in.
+    fn running_releases(&mut self) -> Vec<(String, String)> {
+        if let Some(running) = &self.running {
+            return running.clone();
+        }
+
+        // A development run and muructl serve have the one release.
+
+        let Ok(store) = &self.installation.store else {
+            return self
+                .installation
+                .status()
+                .filter(|status| !status.app.is_empty())
+                .map(|status| (status.app.clone(), status.release.clone()))
+                .into_iter()
+                .collect();
+        };
+
+        stored::releases(store)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|release| {
+                release.kind == "workers"
+                    && RUNNING_STATES.contains(&release.state.as_str())
+                    && self.target.holds(&release.app, &release.id)
+            })
+            .map(|release| (release.app, release.id))
+            .collect()
+    }
+
+    /// One debug operation of a release's workers as a part: each
+    /// worker's answer, as the command's own `--json` prints it.
+    async fn worker_part(
+        &mut self,
+        app: &str,
+        release: &str,
+        op: &str,
+        path: &str,
+    ) -> io::Result<()> {
+        if !self.asks(path) {
+            return Ok(());
+        }
+
+        let answered = self
+            .installation
+            .debug(app, release, op, None)
+            .await
+            .map(|answer| crate::admin::debug_json(&answer));
+        self.put_scrubbed(path, answered)
+    }
+
+    /// Add a part as JSON, with what --scrub takes out taken out of
+    /// every string in it, or record why there is none.
+    fn put_scrubbed<T: Serialize>(
+        &mut self,
+        path: &str,
+        found: Result<T, String>,
+    ) -> io::Result<()> {
+        let found = found.and_then(|found| {
+            let mut value = serde_json::to_value(found).map_err(|error| error.to_string())?;
+
+            if let Some(scrubber) = &mut self.scrubber {
+                scrubber.json(&mut value);
+            }
+
+            Ok(value)
+        });
+        self.put(path, found)
+    }
+
+    /// `live/`: what the workers are doing as the bundle is made. For
+    /// each release with workers: their status, their stacks, taken more
+    /// than once a few seconds apart, and their asyncio tasks; then the
+    /// requests in flight and the open WebSockets, from the edge.
+    async fn live(&mut self) -> io::Result<()> {
+        let live = layout::LIVE;
+
+        if !self.installation.running() {
+            self.archive.missing(live, NOTHING_RUNS);
+            return Ok(());
+        }
+
+        let releases = self.running_releases();
+        let part = |app: &str, release: &str, name: &str| format!("{live}/{app}@{release}/{name}");
+
+        // The first stacks are taken before anything else is asked of
+        // the workers, and the rest once the other parts are in.
+
+        let started = tokio::time::Instant::now();
+
+        for (app, release) in &releases {
+            self.worker_part(app, release, "stacks", &part(app, release, "stacks-1.json"))
+                .await?;
+            self.worker_part(app, release, "status", &part(app, release, "status.json"))
+                .await?;
+            self.worker_part(app, release, "tasks", &part(app, release, "tasks.json"))
+                .await?;
+        }
+
+        let path = format!("{live}/requests.json");
+
+        if self.asks(&path) {
+            let asked = match &mut self.installation.live {
+                Some(running) => {
+                    within(running.client.list_requests(pb::ListRequestsRequest {
+                        app: self.target.app.clone(),
+                        limit: LISTED,
+                    }))
+                    .await
+                }
+                None => Err(NOTHING_RUNS.to_owned()),
+            };
+
+            self.put_scrubbed(&path, asked)?;
+        }
+
+        let path = format!("{live}/websockets.json");
+
+        if self.asks(&path) {
+            let asked = match &mut self.installation.live {
+                Some(running) => {
+                    within(running.client.list_web_sockets(pb::ListWebSocketsRequest {
+                        app: self.target.app.clone(),
+                        limit: LISTED,
+                    }))
+                    .await
+                }
+                None => Err(NOTHING_RUNS.to_owned()),
+            };
+
+            self.put_scrubbed(&path, asked)?;
+        }
+
+        for sample in 2..=STACK_SAMPLES {
+            if !self.archive.is_planned() && !releases.is_empty() {
+                tokio::time::sleep_until(started + STACK_INTERVAL * (sample - 1)).await;
+            }
+
+            for (app, release) in &releases {
+                let path = part(app, release, &format!("stacks-{sample}.json"));
+                self.worker_part(app, release, "stacks", &path).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// `figures/`: the metrics as a scrape reads them, which hold the
+    /// garbage collection figures, and for a daemon each release's
+    /// scaling as `muructl scale status` diagnoses it.
+    async fn figures(&mut self) -> io::Result<()> {
+        let figures = layout::FIGURES;
+        let path = format!("{figures}/metrics.txt");
+
+        if self.asks(&path) {
+            let metrics = self.metrics().await;
+            self.put_text(&path, metrics)?;
+        }
+
+        if self.installation.runs().is_daemon() && self.installation.running() {
+            for (app, release) in self.running_releases() {
+                let path = format!("{figures}/scaling/{app}@{release}.json");
+
+                if !self.asks(&path) {
+                    continue;
+                }
+
+                let asked = match &mut self.installation.live {
+                    Some(running) => {
+                        within(
+                            running
+                                .client
+                                .get_scale_status(pb::GetScaleStatusRequest { app, release }),
+                        )
+                        .await
+                    }
+                    None => Err(NOTHING_RUNS.to_owned()),
+                };
+
+                self.put(&path, asked)?;
+            }
+        }
+
+        // The charts' history is the dashboard's own, which the daemon's
+        // gives only to a session.
+
+        self.archive.missing(
+            &format!("{figures}/history.json"),
+            "the history the dashboard's charts draw is kept in memory, and the admin socket \
+             does not offer it",
+        );
+        Ok(())
     }
 
     /// An event as a line of JSON, its sentence scrubbed when asked.
@@ -1003,6 +1234,7 @@ pub async fn bundle(args: BundleArgs) -> anyhow::Result<()> {
             window,
             target: &target,
             scrubber: args.scrub.then(Scrubber::default),
+            running: None,
             events: None,
             metrics: None,
         };
@@ -1119,6 +1351,7 @@ impl Making<'_> {
             window: self.window,
             target: self.target,
             scrubber: self.scrub.then(Scrubber::default),
+            running: None,
             events: None,
             metrics: None,
         };

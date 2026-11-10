@@ -449,18 +449,38 @@ impl Installation {
         op: &str,
         worker: Option<u32>,
     ) -> Result<pb::DebugResponse, String> {
+        self.debug_with(app, release, op, worker, serde_json::json!({}), ASK)
+            .await
+    }
+
+    /// One debug operation with its arguments, given `limit` to answer:
+    /// an operation over a period needs its period and a little more.
+    async fn debug_with(
+        &mut self,
+        app: &str,
+        release: &str,
+        op: &str,
+        worker: Option<u32>,
+        arguments: serde_json::Value,
+        limit: Duration,
+    ) -> Result<pb::DebugResponse, String> {
         let Some(live) = &mut self.live else {
-            return Err("nothing is running".to_owned());
+            return Err("nothing is running to ask".to_owned());
         };
 
-        within(live.client.debug(pb::DebugRequest {
+        let asked = live.client.debug(pb::DebugRequest {
             app: app.to_owned(),
             release: release.to_owned(),
             op: op.to_owned(),
             worker,
-            args_json: "{}".to_owned(),
-        }))
-        .await
+            args_json: arguments.to_string(),
+        });
+
+        match tokio::time::timeout(limit, asked).await {
+            Ok(Ok(response)) => Ok(response.into_inner()),
+            Ok(Err(status)) => Err(status.message().to_owned()),
+            Err(_) => Err(format!("no answer within {} seconds", limit.as_secs())),
+        }
     }
 
     /// What `debug inspect` says of one worker.

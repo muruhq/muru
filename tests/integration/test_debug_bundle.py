@@ -255,8 +255,20 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         changed = next(part for part in manifest["parts"] if part["path"] == "config/changes.jsonl")
         assert changed["note"].startswith("the configuration changed 2 times during the window")
         missing = {part["path"]: part["why"] for part in manifest["parts"] if not part["collected"]}
-        assert sorted(missing) == ["config/logger-levels.json", "config/routing-snapshots"]
-        assert "only the routing snapshot in force is kept" in missing["config/routing-snapshots"]
+        assert missing == {
+            "config/routing-snapshots": (
+                "only the routing snapshot in force is kept, not those before it: the events "
+                "in changes.jsonl say what changed, and when"
+            ),
+            "config/logger-levels.json": (
+                "the levels muructl logging level changed are held by each worker, and nothing "
+                "lists them"
+            ),
+            "figures/history.json": (
+                "the history the dashboard's charts draw is kept in memory, and the admin "
+                "socket does not offer it"
+            ),
+        }
 
         # The logs of the window, by their names in the log directory.
 
@@ -267,6 +279,25 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         noted = {part["path"]: part.get("note") for part in manifest["parts"]}
         assert noted["logs/access.log"] == "the lines of the window"
 
+        # What the workers were doing: their status, their stacks taken
+        # three times, and their tasks, each as the command's own --json
+        # gives it; the requests in flight and the open WebSockets; and
+        # the figures.
+
+        status = json.loads(found["live/shop@r1/status.json"])
+        assert status["release"] == "r1"
+        assert [worker["result"]["state"] for worker in status["workers"]] == ["ready", "ready"]
+
+        for sample in (1, 2, 3):
+            stacks = json.loads(found[f"live/shop@r1/stacks-{sample}.json"])
+            assert len(stacks["workers"]) == 2 and all(worker["ok"] for worker in stacks["workers"])
+
+        assert len(json.loads(found["live/shop@r1/tasks.json"])["workers"]) == 2
+        assert json.loads(found["live/requests.json"])["in_flight"] == 0
+        assert json.loads(found["live/websockets.json"])["open"] == 0
+        assert b"muru_requests_total" in found["figures/metrics.txt"]
+        assert json.loads(found["figures/scaling/shop@r1.json"])["groups"][0]["group"] == "default"
+
         # Every event of the window is there in full, and the making of
         # the bundle is an event of its own.
 
@@ -276,7 +307,9 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         assert "debug.bundle" in recorded
         assert "a diagnostic bundle of the whole node was made, reaching back 1h" in recorded
 
-        # A file that exists is left alone, and - is standard output.
+        # A file that exists is left alone. With - the archive goes to
+        # standard output, here of one release and a shorter window; a
+        # target that names nothing is refused.
 
         assert "exists: name another file with --output, or remove it" in refused(
             daemon, "--output", str(written)
@@ -284,6 +317,7 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         piped = muructl(
             "debug",
             "bundle",
+            "shop@r1",
             "--since",
             "10m",
             "--output",
@@ -293,16 +327,10 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         )
         assert piped.returncode == 0, piped.stderr.decode()
         assert piped.stderr.decode().startswith("muru: wrote the bundle to standard output: ")
-        window = manifest_of(members(piped.stdout))["window"]
-        assert window["until_unix_ms"] - window["since_unix_ms"] == 600_000
-
-        # A target limits the bundle, and one that names nothing is
-        # refused.
-
-        target = tmp_path / "target.tar.gz"
-        bundle(daemon, "shop@r1", "--output", str(target))
-        found = members(target.read_bytes())
-        assert manifest_of(found)["target"] == "shop@r1"
+        found = members(piped.stdout)
+        manifest = manifest_of(found)
+        assert manifest["target"] == "shop@r1"
+        assert manifest["window"]["until_unix_ms"] - manifest["window"]["since_unix_ms"] == 600_000
         assert "config/releases/shop@r1.json" in found
         assert json.loads(found["installation.json"])["releases"][0]["id"] == "r1"
         assert "a diagnostic bundle of shop@r1 was made" in daemon.muructl("events").stdout
@@ -328,7 +356,7 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
     (release,) = json.loads(found["installation.json"])["releases"]
     assert release["state"] == "stopped" and release["workers"] == []
     types = [event["type"] for event in events_of(found)]
-    assert "daemon.stopped" in types and types.count("debug.bundle") == 3
+    assert "daemon.stopped" in types and types.count("debug.bundle") == 2
 
     # What the files hold is all there, and what only the running daemon
     # knows is listed with why it is not.
@@ -337,8 +365,14 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
     assert "[app.shop" in found["config/effective.toml"].decode()
     assert 'secret = "***"' in found["config/daemon.toml"].decode()
     missing = {part["path"]: part["why"] for part in manifest["parts"] if not part["collected"]}
-    assert missing["config/access-log-overrides.json"] == "nothing is running to ask"
-    assert missing["config/routing-snapshot.json"] == "nothing is running to ask"
+
+    for path in (
+        "config/access-log-overrides.json",
+        "config/routing-snapshot.json",
+        "live",
+        "figures/metrics.txt",
+    ):
+        assert missing[path] == "nothing is running to ask", path
 
     assert {path.name: path.stat().st_mtime_ns for path in state.iterdir()} == before
     assert (state / "muru.sqlite").read_bytes() == stored
@@ -467,6 +501,10 @@ def test_bundle_of_a_development_run_and_of_a_serve(tmp_path: Path) -> None:
             "the lines of the window among those muructl run keeps in memory"
         )
 
+        assert len(json.loads(found["live/plain-wsgi@r1/stacks-3.json"])["workers"]) == 2
+        assert b"muru_requests_total" in found["figures/metrics.txt"]
+        assert not any(path.startswith("figures/scaling/") for path in found)
+
         # A run has no state store: its settings are what config show
         # --effective prints, and it has no daemon's file.
 
@@ -481,13 +519,24 @@ def test_bundle_of_a_development_run_and_of_a_serve(tmp_path: Path) -> None:
 
     serve = start_serve(tmp_path)
 
+    # The same against muructl serve, which is found in its run
+    # directory: the plan lists what would be asked of it.
+
     try:
-        piped = muructl(
-            "debug", "bundle", "--output", "-", env={"MURU_RUN_DIR": str(serve.run_dir)}
-        )
-        assert piped.returncode == 0, piped.stderr.decode()
-        found = members(piped.stdout)
-        assert manifest_of(found)["runs"] == "muructl serve"
-        assert json.loads(found["installation.json"])["releases"][0]["app"] == "plain-wsgi"
+        planned = muructl("debug", "bundle", "--dry-run", env={"MURU_RUN_DIR": str(serve.run_dir)})
+        assert planned.returncode == 0, planned.stderr.decode()
+        listed = planned.stdout.decode()
+
+        for path in (
+            "installation.json",
+            "config/effective.toml",
+            "logs/apps/plain-wsgi/r1.log",
+            "logs/access.log",
+            "live/plain-wsgi@r1/stacks-3.json",
+            "figures/metrics.txt",
+        ):
+            assert re.search(
+                rf"^  {re.escape(path)} +asked for when the bundle is made$", listed, re.M
+            ), path
     finally:
         serve.stop()

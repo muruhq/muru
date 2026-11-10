@@ -1895,7 +1895,7 @@ fn print_json(response: &pb::DebugResponse) {
 
 /// A debug answer as JSON: the release, and each worker's answer with its
 /// result parsed.
-fn debug_json(response: &pb::DebugResponse) -> serde_json::Value {
+pub(crate) fn debug_json(response: &pb::DebugResponse) -> serde_json::Value {
     let workers: Vec<serde_json::Value> = response
         .workers
         .iter()

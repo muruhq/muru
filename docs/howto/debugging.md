@@ -687,10 +687,23 @@ Everything is under one directory named as the file is.
 | `config/changes.jsonl` | The events of the window that changed the configuration: an apply or a reload, traffic moved, a deploy, a rollout's step, an overlay starting or ending |
 
 | `logs/` | The logs of the window, by their names in the log directory: `access.log`, `edge.log`, `daemon.log`, a file virtual hosts name for their records, and each release's output as `apps/APP/RELEASE.log` |
+| `live/APP@RELEASE/status.json` | Each worker's state, requests and memory, as [`muructl debug status --json`](#status) gives them |
+| `live/APP@RELEASE/stacks-1.json`, `stacks-2.json`, `stacks-3.json` | The workers' [stacks](#stacks), taken three times two seconds apart |
+| `live/APP@RELEASE/tasks.json` | The asyncio [tasks](#tasks) of the workers' event loops |
+| `live/requests.json` | The [requests in flight](#requests-in-flight), up to a thousand, as `muructl requests --list --json` gives them |
+| `live/websockets.json` | The open WebSockets, up to a thousand, as `muructl websockets --list --json` gives them |
+| `figures/metrics.txt` | The [metrics](metrics.md) as a scrape reads them, the garbage collection figures among them |
+| `figures/scaling/APP@RELEASE.json` | Each worker group's scaling, as [`muructl scale status --json`](scaling.md) gives it |
 
 With a target, the releases, events and output of other applications
 are left out, the access log's records are those of the target alone,
 and the events and logs of the node stay.
+
+The `live/` parts are of each release that has workers. One sample of
+the stacks cannot tell a thread that is stuck from one that is busy, so
+they are taken three times: a thread at the same place in all three is
+waiting there. The history the dashboard's charts draw is not in a
+bundle, and the manifest lists it as not collected.
 
 ### The logs of the window
 
@@ -722,8 +735,8 @@ out, for a bundle that has to go to someone with a narrower need:
 - A request target or a URL loses its query string, which reads as
   `?...`.
 
-Every string of an access log record and of an event is scrubbed this
-way. A line of an application's own output is free text, in which only
+Every string of an access log record, of an event and of a `live/` part
+is scrubbed this way. A line of an application's own output is free text, in which only
 what has the shape of an address, or of a target with a query, is
 found. A compressed archive is decompressed to be scrubbed, and is in
 the bundle under its name without the `.gz` or `.zst`. The manifest's
