@@ -40,4 +40,5 @@ pub mod settings;
 pub mod shutdown;
 pub mod sinks;
 pub mod store;
+pub mod supervisor;
 pub mod triggers;
