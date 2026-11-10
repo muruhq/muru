@@ -463,8 +463,13 @@ impl Supervisor {
     /// this daemon. One that is not there, because it exited while no
     /// daemon was looking or was waiting to be started when the record
     /// was written (pid 0), is an instance that exited: it is due at
-    /// once, so the next `check` starts it, and its exits in a row are
-    /// as recorded. Only a record that names no instance is refused.
+    /// once, so the next `check` starts it. Only a record that names no
+    /// instance is refused.
+    ///
+    /// The waits between starts carry on as if the daemon had not
+    /// changed: an instance's exits in a row are as recorded, and one
+    /// that is taken over has been running since its recorded start, so
+    /// a run that has lasted is still a recovery.
     ///
     /// A process is there when something has the recorded pid and its
     /// start time is the recorded one. A pid whose process started at
@@ -487,6 +492,7 @@ impl Supervisor {
             instances.len()
         );
         let now = Instant::now();
+        let now_unix_ms = crate::model::now_unix_ms();
         let instances = record
             .instances
             .iter()
@@ -498,11 +504,20 @@ impl Supervisor {
                 };
 
                 if still_running(recorded.pid, recorded.start_time) {
+                    // How long it has run, by the wall clock; a record
+                    // that does not say when it started gives none.
+
+                    let run = match recorded.started_unix_ms {
+                        0 => Duration::ZERO,
+                        started => Duration::from_millis(now_unix_ms.saturating_sub(started)),
+                    };
+
                     Instance {
                         process: Some(Process::Adopted {
                             pid: recorded.pid,
                             start_time: recorded.start_time,
                         }),
+                        started: now.checked_sub(run).unwrap_or(now),
                         started_unix_ms: recorded.started_unix_ms,
                         ..instance
                     }
@@ -1115,16 +1130,18 @@ mod tests {
         wait_for("the group to empty", || (!group_exists(pid)).then_some(()));
     }
 
-    /// A record of processes with these pids, each with two exits in a
-    /// row behind it.
+    /// A record of processes with these pids, each started a moment ago
+    /// with two exits in a row behind it.
     fn recorded(pids: &[u32]) -> Record {
+        let now = crate::model::now_unix_ms();
+
         Record {
             instances: (0..)
                 .zip(pids)
                 .map(|(index, pid)| InstanceRecord {
                     index,
                     pid: *pid,
-                    started_unix_ms: if *pid == 0 { 0 } else { 1234 },
+                    started_unix_ms: if *pid == 0 { 0 } else { now },
                     quick_exits: 2,
                     start_time: start_time(*pid).unwrap_or(0),
                 })
@@ -1175,7 +1192,10 @@ mod tests {
 
         assert_eq!(pids(&supervisor), [survivor.id(), 0, 0]);
         assert_eq!(supervisor.running(), 1);
-        assert_eq!(supervisor.record().instances[0].started_unix_ms, 1234);
+        assert_eq!(
+            supervisor.record().instances[0].started_unix_ms,
+            record.instances[0].started_unix_ms
+        );
 
         // The first check starts the two that were not there, and
         // leaves the survivor alone.
@@ -1221,6 +1241,36 @@ mod tests {
         assert_eq!(supervisor.check().len(), 2);
         assert_eq!(supervisor.running(), 3);
         assert!(!pids(&supervisor).contains(&survivor.id()));
+
+        supervisor.stop_until(Instant::now()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_adopted_instance_has_run_since_its_recorded_start() {
+        // The record is of a process started two minutes ago, with exits
+        // in a row from before that.
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut lasting = previous();
+        let mut record = recorded(&[lasting.id()]);
+        record.instances[0].started_unix_ms -= 120_000;
+        let mut supervisor = Supervisor::adopt(
+            spec(dir.path()),
+            RestartPolicy::default(),
+            vec![instance(&["/bin/sleep", "600"])],
+            &record,
+        )
+        .unwrap();
+
+        // Its run has lasted, so its exit is a first one, whatever the
+        // daemon that sees it has been running for.
+
+        lasting.kill().unwrap();
+        lasting.wait().unwrap();
+        assert_eq!(
+            reports(&mut supervisor),
+            ["thing.exited warning: instance 0 is gone; starting it again in 1s"]
+        );
 
         supervisor.stop_until(Instant::now()).await;
     }
