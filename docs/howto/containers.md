@@ -427,11 +427,13 @@ exception logged with it as one `exception` field:
 {"time":"2026-11-02T05:42:23.104Z","kind":"app","source":"muru.worker[0]","level":"ERROR","logger":"shop.views","message":"checkout failed","request_id":"01M6CY84YP8J7V9K0QN8ABV14V","exception":"Traceback (most recent call last):\n  ...\nKeyError: 'sku'","app":"shop","release":"r1","group":"default","worker":0}
 ```
 
-A traceback written to standard error rather than logged, such as one
-from an exception the application did not catch, is gathered into a
-single record too, from `Traceback (most recent call last):` to the
-exception's own line. So a log collector that splits records at newlines
-keeps each traceback whole.
+An exception the application did not catch is logged on the `muru`
+logger at `ERROR`, so it is one such record, with the request's id and
+the traceback as its `exception` field. A traceback written to standard
+error rather than logged, such as one an application prints itself, is
+gathered into a single record too, from `Traceback (most recent call
+last):` to the exception's own line. So a log collector that splits
+records at newlines keeps each traceback whole.
 
 Each JSON line also carries the pod it came from, when the Deployment
 passes it in with the Downward API, and the OpenTelemetry service and

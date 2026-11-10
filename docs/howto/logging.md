@@ -95,6 +95,26 @@ The `muru_` prefix keeps them apart from what an application passes in
 `extra`, so a middleware that logs with `extra={"request_id": ...}` keeps
 working.
 
+An exception the application does not catch, and one a hook raises, is
+logged on the `muru` logger at `ERROR` with its traceback, during a
+request with the request's id. It reaches the application's own
+handlers when it has configured some, and is written in the platform
+format when it has not:
+
+```
+muru.worker[0]: ERROR muru: the application raised an exception
+muru.worker[0]: Traceback (most recent call last):
+muru.worker[0]:   ...
+muru.worker[0]: RuntimeError: deliberate failure
+```
+
+When the application's logging would show nothing at `ERROR` on that
+logger, because it disabled the logger, set a level above `ERROR` on
+it or on the root logger, or gave it only handlers that take no
+`ERROR`, the traceback is written to standard error instead, after a
+`muru:` line saying what raised it. A filter that drops the record is
+honoured.
+
 ## The access log
 
 ```
