@@ -42,7 +42,7 @@ body:
         - muructl run (development mode)
         - user daemon
         - system daemon
-        - container release
+        - muructl serve (one application in a container)
     validations:
       required: true
   - type: input

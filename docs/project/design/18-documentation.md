@@ -85,7 +85,7 @@ Bug reports follow the same path. Questions and open-ended ideas go to GitHub Di
 
 | Template | Fields |
 | --- | --- |
-| bug_report.yml | Summary; Muru version (muructl --version); Python version and build (regular or free-threaded); operating system and architecture; how Muru runs (muructl run, user daemon, system daemon, container release); interface (WSGI or ASGI) and framework; configuration excerpt with secrets removed; steps to reproduce; expected and actual behaviour; diagnostics from muructl debug report --format markdown, in a field that shows what is pasted as Markdown; confirmation that existing issues were searched |
+| bug_report.yml | Summary; Muru version (muructl --version); Python version and build (regular or free-threaded); operating system and architecture; how Muru runs (muructl run, user daemon, system daemon, muructl serve), as muructl debug report names it; interface (WSGI or ASGI) and framework; configuration excerpt with secrets removed; steps to reproduce; expected and actual behaviour; diagnostics from muructl debug report --format markdown, in a field that shows what is pasted as Markdown; confirmation that existing issues were searched |
 | feature_request.yml | Problem or use case; desired behaviour stated as a requirement; current workaround; alternatives considered; who is affected and at what scale; related specification section if known; willingness to test |
 | documentation.yml | Page or URL; what is wrong, missing or unclear; suggested correction |
 | config.yml | Blank issues disabled. Contact links to GitHub Discussions for questions, the security advisory form, and the documentation |
