@@ -607,7 +607,13 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         });
     }
 
-    command.spawn().context("starting the daemon")?;
+    // Where this daemon's lines start in the log, which it appends to.
+
+    let written_before = std::fs::metadata(locations.daemon_log()).map_or(0, |found| found.len());
+    let mut child = command.spawn().context("starting the daemon")?;
+
+    // Until it answers, a daemon that has exited is reported at once,
+    // with what it wrote, rather than waited for.
 
     let started = Instant::now();
 
@@ -624,6 +630,14 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
             );
             return Ok(());
         }
+
+        if let Some(exited) = child.try_wait().context("waiting for the daemon")? {
+            anyhow::bail!(
+                "the daemon exited before it answered ({exited}); {}",
+                daemon_log_since(&locations.daemon_log(), written_before)
+            );
+        }
+
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -632,6 +646,42 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         locations.daemon_log().display()
     )
 }
+
+/// The lines a daemon wrote to its log from `offset` on, the last
+/// `DAEMON_LOG_LINES` of them, as the end of a message about it.
+fn daemon_log_since(path: &Path, offset: u64) -> String {
+    use std::io::{Read as _, Seek as _};
+
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path).and_then(|mut file| {
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.read_to_end(&mut bytes)
+    });
+
+    let written = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = written.lines().collect();
+
+    if read.is_err() || lines.is_empty() {
+        return format!("see {}", path.display());
+    }
+
+    let last: Vec<String> = lines[lines.len().saturating_sub(DAEMON_LOG_LINES)..]
+        .iter()
+        .map(|line| {
+            if line.is_empty() {
+                String::new()
+            } else {
+                format!("  {line}")
+            }
+        })
+        .collect();
+
+    format!("from {}:\n{}", path.display(), last.join("\n"))
+}
+
+/// How many of a daemon's last lines `daemon start` shows when it exits
+/// before answering.
+const DAEMON_LOG_LINES: usize = 20;
 
 /// How long one exchange with a daemon that is being stopped may take
 /// before it counts as not answering.

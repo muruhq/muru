@@ -311,6 +311,50 @@ def test_daemon_stop_gives_up_on_a_silent_socket(tmp_path: Path) -> None:
     assert elapsed < 20, elapsed
 
 
+def test_a_daemon_that_exits_at_start_is_reported_with_its_log(tmp_path: Path) -> None:
+    """A daemon that cannot bind its listener exits at once, and daemon
+    start says so with what it wrote, rather than waiting for it."""
+
+    muructl = support.muructl_path()
+    if muructl is None:
+        support.unavailable("muructl is not built")
+    run_dir = support.short_dir("muru-run-")
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+
+    try:
+        started = subprocess.run(
+            [
+                str(muructl),
+                "daemon",
+                "start",
+                "--listen",
+                f"127.0.0.1:{listener.getsockname()[1]}",
+                "--config",
+                str(tmp_path / "muru.toml"),
+                "--state-dir",
+                str(tmp_path / "state"),
+                "--run-dir",
+                str(run_dir),
+                "--log-dir",
+                str(tmp_path / "logs"),
+                "--cache-dir",
+                str(tmp_path / "cache"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    finally:
+        listener.close()
+
+    assert started.returncode != 0
+    assert "the daemon exited before it answered (exit status: 1)" in started.stderr
+    assert "cannot listen on" in started.stderr, started.stderr
+
+
 def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
     muructl = support.muructl_path()
     if muructl is None or not support.extension_available():

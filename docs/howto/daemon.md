@@ -604,10 +604,27 @@ on it, and its `[limits]` table sets the body size limit and timeouts.
 ## Running it
 
 `muructl daemon start` starts the daemon in the background, logging to
-`daemon.log` in the log directory, and waits until it answers. The
-daemon writes its pid to `daemon.pid` in the runtime directory and
-removes the file when it exits. `muructl
-up` does the same and is harmless when one already runs. `muructl daemon
+`daemon.log` in the log directory, and waits until it answers. A daemon
+that exits before it answers, such as one that cannot listen on its
+address, is reported at once with its exit status and the lines it
+wrote to `daemon.log`, the last twenty of them:
+
+```console
+$ muructl daemon start
+Error: the daemon exited before it answered (exit status: 1); from /var/log/muru/daemon.log:
+  muru: config: /etc/muru/muru.toml (default)
+  muru: state: /var/lib/muru (default)
+  muru: run: /run/muru (default)
+  muru: logs: /var/log/muru (default)
+  muru: cache: /var/cache/muru (default)
+  Error: cannot listen on 0.0.0.0:80
+
+  Caused by:
+      Address already in use (os error 98)
+```
+
+The daemon writes its pid to `daemon.pid` in the runtime directory and
+removes the file when it exits. `muructl up` does the same and is harmless when one already runs. `muructl daemon
 status` and `muructl status` show the daemon, its edge process, its
 listener, its admin socket, its configuration file and its state, run,
 log and cache directories:
