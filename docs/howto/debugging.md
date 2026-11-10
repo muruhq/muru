@@ -604,3 +604,119 @@ configuration file those options and the environment name, so pass
 `--config` when the daemon was started with one. A part that cannot be
 collected is listed under `NOT COLLECTED` with the reason, in place of
 its figures, and the command still succeeds.
+
+## A bundle of a system for triage
+
+`muructl debug bundle` writes one archive of a whole system for a time
+window, to triage a problem with afterwards, somewhere else. It is for
+the people who own the system: it holds real log lines, client addresses
+and configuration, and is not for posting. For a public bug report, use
+[the report](#a-report-for-a-bug-report).
+
+```
+muructl debug bundle
+muructl debug bundle --since 30m --output /mnt/scratch/shop.tar.gz
+muructl debug bundle shop@r3 --since 2d
+muructl debug bundle --dry-run
+ssh web1 muructl debug bundle --output - > web1.tar.gz
+kubectl exec deploy/shop -- muructl debug bundle --output - > shop.tar.gz
+```
+
+The archive is a `.tar.gz` that any tool opens. `--since` says how far
+back it reaches, an hour when left out. A target limits it to one
+application, or to one release as `app@release`; the whole node is the
+default.
+
+`--output` names the file, and `-` writes the archive to standard
+output, to send through `ssh` or `kubectl exec`. With no `--output` the
+file is `muru-bundle-` and the time in UTC, in the current directory.
+The file is created readable and writable by its owner alone, and a
+file that already exists is refused. Before writing, the command checks
+that the file system has room, and refuses with how much the bundle
+needs when it has not:
+
+```
+$ muructl debug bundle
+error: the bundle needs about 1.2GB, and /var/lib/muru has 310.0MB free: write it elsewhere with --output, or to standard output with --output -
+```
+
+`--dry-run` prints what the bundle would hold and about how large it
+would be, writes nothing, and asks nothing of the workers:
+
+```
+$ muructl debug bundle --dry-run
+A bundle of the whole node, reaching back 1h to 2026-11-02T04:42:22Z, would hold:
+  installation.json  asked for when the bundle is made
+  events.jsonl       48.2KB
+About 76.1KB once compressed, from 48.2KB on disk and what is asked for when it is made.
+/home/ops has 41.0GB free.
+```
+
+When it finishes, the command says where the archive is, how many parts
+it holds, each part it could not collect, and that it holds production
+data:
+
+```
+$ muructl debug bundle
+muru: wrote the bundle to muru-bundle-20261102-054222.tar.gz (3.4MB): 31 parts, 1 not collected
+  live/shop@r3/stacks-2.json: no answer within 5 seconds
+muru: it holds production data (logs, client addresses and configuration) and only its owner can read it: handle it as such
+```
+
+### What it holds
+
+Everything is under one directory named as the file is.
+
+| Path | Holds |
+| --- | --- |
+| `manifest.json` | What the bundle is of, its window, and every part: whether it was collected, its size, and why not when it was not |
+| `installation.json` | Muru's version, the platform, how Muru runs and where its directories are, and every release with its state, interface, Python version and workers' states |
+| `events.jsonl` | Every event of the window, in full, a JSON object a line |
+
+With a target, the events of other applications are left out, and those
+of the node stay.
+
+A bundle never holds secret values, the value of an environment
+variable beyond those [`muructl debug inspect`](#inspect) shows, or a
+request's or a response's body.
+
+### The manifest
+
+`manifest.json` is the last member of the archive:
+
+| Field | Meaning |
+| --- | --- |
+| `format` | The version of the layout, `1` |
+| `kind` | `bundle` |
+| `created`, `muru`, `node` | When the bundle was made, Muru's version and the machine's name |
+| `target` | What it was limited to, as `app` or `app@release`; empty for the whole node |
+| `window` | `since_unix_ms` and `until_unix_ms`, the period it covers |
+| `runs`, `running` | How Muru runs, and whether it was running |
+| `recorded` | How the making of the bundle was recorded, or why it was not |
+| `left_out` | What a bundle never holds |
+| `parts` | Every part, each with its `path` and `collected`; `bytes` for one in the archive, `why` for one that is not, and a `note` where there is something to know about it |
+
+### On a system in trouble
+
+The command reads the daemon's files where they hold what it needs (the
+state store, which it opens read-only and never changes), and asks the
+daemon only for what the daemon alone knows. It runs at a lower
+priority than what serves, compresses at the fastest setting, and
+writes the archive as a stream, so nothing is held in memory or written
+beside it.
+
+Each question it asks has a time limit of its own. A part that cannot
+be collected, because a worker hangs or the daemon does not answer, is
+listed in the manifest with the reason, and the rest is collected: a
+bundle with parts missing is a normal result, and the command succeeds.
+
+With no daemon running the bundle is made from the daemon's files, and
+the command takes the daemon's location options for that (`--state-dir`,
+`--log-dir`, `--config`, `--run-dir` and `--system`). It works against a
+development run and `muructl serve` as well, which keep no files, so
+everything is asked of them.
+
+Each bundle made of a running daemon is the event `debug.bundle`, which
+says what the bundle was of and how far back it reached. A development
+run and `muructl serve` print the same as a line of their output. A dry
+run records nothing.

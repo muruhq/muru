@@ -10,6 +10,7 @@
 //! Asking a running daemon, a development run or `muructl serve` is the
 //! command's own work, which fills the same types.
 
+pub mod archive;
 pub mod facts;
 pub mod stored;
 pub mod window;
@@ -213,6 +214,47 @@ pub fn frameworks(modules: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// The event that records a bundle being made: what it is about (the
+/// application or release the bundle is limited to, else the daemon) and
+/// its sentence, which says how far back the bundle reaches.
+pub fn bundle_event(request: &pb::NoteBundleRequest) -> (String, String) {
+    let subject = match (request.app.as_str(), request.release.as_str()) {
+        ("", _) => "daemon".to_owned(),
+        (app, "") => app.to_owned(),
+        (app, release) => format!("{app}@{release}"),
+    };
+
+    let of = if request.app.is_empty() {
+        "the whole node".to_owned()
+    } else {
+        subject.clone()
+    };
+    let reach = period(request.until_unix_ms.saturating_sub(request.since_unix_ms) / 1000);
+
+    let with = if request.options.is_empty() {
+        String::new()
+    } else {
+        format!(", with {}", request.options.join(", "))
+    };
+
+    (
+        subject,
+        format!("a diagnostic bundle of {of} was made, reaching back {reach}{with}"),
+    )
+}
+
+/// A period of whole seconds in the largest unit that divides it, as a
+/// duration is written on a command line: `1h`, `90m`, `45s`.
+pub fn period(seconds: u64) -> String {
+    for (unit, length) in [("d", 86_400), ("h", 3600), ("m", 60)] {
+        if seconds != 0 && seconds.is_multiple_of(length) {
+            return format!("{}{unit}", seconds / length);
+        }
+    }
+
+    format!("{seconds}s")
+}
+
 /// An event of the store as the admin API gives it.
 pub fn event_message(event: crate::model::Event) -> pb::Event {
     pb::Event {
@@ -252,6 +294,41 @@ mod tests {
         assert_eq!(
             Setting::parse("shop@r1: made before Muru recorded where settings come from"),
             None
+        );
+    }
+
+    #[test]
+    fn the_event_for_a_bundle_says_what_it_was_made_of() {
+        let whole = pb::NoteBundleRequest {
+            since_unix_ms: 1_000_000,
+            until_unix_ms: 1_000_000 + 3_600_000,
+            ..pb::NoteBundleRequest::default()
+        };
+        assert_eq!(
+            bundle_event(&whole),
+            (
+                "daemon".to_owned(),
+                "a diagnostic bundle of the whole node was made, reaching back 1h".to_owned()
+            )
+        );
+
+        let narrowed = pb::NoteBundleRequest {
+            app: "shop".to_owned(),
+            release: "r3".to_owned(),
+            since_unix_ms: 1_000_000,
+            until_unix_ms: 1_000_000 + 90_000,
+            options: vec!["scrub".to_owned(), "memory".to_owned()],
+        };
+        assert_eq!(period(5400), "90m");
+        assert_eq!(period(172_800), "2d");
+        assert_eq!(period(0), "0s");
+        assert_eq!(
+            bundle_event(&narrowed),
+            (
+                "shop@r3".to_owned(),
+                "a diagnostic bundle of shop@r3 was made, reaching back 90s, with scrub, memory"
+                    .to_owned()
+            )
         );
     }
 

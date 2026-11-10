@@ -50,6 +50,45 @@ fn kernel_release() -> String {
         .collect()
 }
 
+/// How many bytes an unprivileged process may still write to the file
+/// system that holds `path`, or none when the system does not say.
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+
+    // SAFETY: statvfs is plain data that all-zero bytes are a valid value
+    // of, the path is a NUL-terminated string this frame owns, and statvfs
+    // fills the structure this frame owns.
+
+    let found = unsafe {
+        let mut found: libc::statvfs = std::mem::zeroed();
+
+        if libc::statvfs(path.as_ptr(), &mut found) != 0 {
+            return None;
+        }
+
+        found
+    };
+
+    // The types of the fields differ between systems.
+
+    #[allow(clippy::unnecessary_cast)]
+    Some(found.f_bavail as u64 * found.f_frsize as u64)
+}
+
+/// Give this process's work a lower priority than anything serving, so
+/// that collecting from a system short of CPU takes nothing from it.
+/// Left as it is when the system refuses.
+pub fn lower_priority() {
+    // SAFETY: setpriority changes only this process's own scheduling
+    // priority and has no memory effects; its result is not needed.
+
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+    }
+}
+
 /// Whether this process runs in a container, as far as the usual signs
 /// tell: the files a container runtime leaves at the root, the variables
 /// Kubernetes and systemd's container managers set, or the cgroup of
@@ -87,6 +126,14 @@ mod tests {
         assert_eq!(platform.os, std::env::consts::OS);
         assert!(!platform.arch.is_empty());
         assert!(!platform.kernel.is_empty());
+    }
+
+    #[test]
+    fn a_file_system_says_what_room_it_has() {
+        let directory = tempfile::tempdir().unwrap();
+
+        assert!(free_bytes(directory.path()).is_some_and(|free| free > 0));
+        assert_eq!(free_bytes(&directory.path().join("no/such/place")), None);
     }
 
     #[test]

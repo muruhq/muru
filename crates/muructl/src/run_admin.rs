@@ -1050,6 +1050,21 @@ impl Admin for Service {
         }))
     }
 
+    /// A bundle being made of the run, which the daemon records as an
+    /// event and the run prints, as it does the debug operations.
+    async fn note_bundle(
+        &self,
+        request: Request<pb::NoteBundleRequest>,
+    ) -> Result<Response<pb::NoteBundleResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .target(&request.app, &request.release)
+            .map_err(Status::not_found)?;
+        let (_, message) = muru_controller::diagnostics::bundle_event(&request);
+        muru_common::muru_println!("debug.bundle: {message}");
+        Ok(Response::new(pb::NoteBundleResponse {}))
+    }
+
     async fn override_access_log(
         &self,
         request: Request<pb::OverrideAccessLogRequest>,

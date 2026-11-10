@@ -848,6 +848,14 @@ pub enum DebugCommand {
     /// placeholders. Works with no daemon running, on its files.
     Report(crate::diagnostics::report::ReportArgs),
 
+    /// An archive of the whole system for a time window, to triage with:
+    /// the logs and events of the window, the configuration in force, and
+    /// what the workers are doing. It holds production data and is not
+    /// for posting; it is written readable by its owner alone. Works with
+    /// no daemon running, on its files, and records what it could not
+    /// collect in its manifest.
+    Bundle(crate::diagnostics::bundle::BundleArgs),
+
     /// Open a pdb session in a worker: on the thread stopped at
     /// breakpoint(), else on a thread of its own. Each line read is a pdb
     /// command, and the end of input lets the code go on. Without
@@ -1075,6 +1083,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
 
     let command = match command {
         DebugCommand::Report(args) => return crate::diagnostics::report::report(args).await,
+        DebugCommand::Bundle(args) => return crate::diagnostics::bundle::bundle(args).await,
         other => other,
     };
 
@@ -1147,8 +1156,8 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
                 "timeout_s": exec.timeout.as_secs_f64(),
             }),
         ),
-        DebugCommand::Attach(_) | DebugCommand::Report(_) => {
-            unreachable!("attach and report are handled above")
+        DebugCommand::Attach(_) | DebugCommand::Report(_) | DebugCommand::Bundle(_) => {
+            unreachable!("attach, report and bundle are handled above")
         }
     };
 
@@ -1169,7 +1178,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::Trace(_) => print_trace(&response),
         DebugCommand::Memory(_) => print_memory(&response),
         DebugCommand::Exec(_) => print_exec(&response),
-        DebugCommand::Attach(_) | DebugCommand::Report(_) => {}
+        DebugCommand::Attach(_) | DebugCommand::Report(_) | DebugCommand::Bundle(_) => {}
     }
 
     Ok(())

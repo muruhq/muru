@@ -134,6 +134,10 @@ service Admin {
   // operations of this one call.
   rpc Debug(DebugRequest) returns (DebugResponse);
 
+  // Section 11.9: say that a diagnostic bundle is being made of this
+  // system, which is recorded as an event as the debug operations are.
+  rpc NoteBundle(NoteBundleRequest) returns (NoteBundleResponse);
+
   // Section 9.10: overlays, their state, and activating, ending,
   // previewing and promoting one.
   rpc ListOverlays(ListOverlaysRequest) returns (ListOverlaysResponse);
@@ -781,6 +785,16 @@ message WorkerDebug {
   string error = 4;                 // when not ok
   string result_json = 5;           // the operation's result, when ok
 }
+
+message NoteBundleRequest {
+  string app = 1;                   // the application the bundle is limited to; the whole node when empty
+  string release = 2;               // the release it is limited to; every release when empty
+  uint64 since_unix_ms = 3;         // where its window starts
+  uint64 until_unix_ms = 4;         // where its window ends, which is when it was asked for
+  repeated string options = 5;      // what was asked for beyond the default, as scrub, memory or profile
+}
+
+message NoteBundleResponse {}
 
 message ListOverlaysRequest {}
 

@@ -71,6 +71,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | SetLogLevel | POST /v1/apps/{app}/releases/{release}:loglevel | time-limited logger levels |
 | OverrideAccessLog | POST /v1/access-log:override | time-limited changes to which requests the access log writes, listed or reset |
 | DumpStacks | POST /v1/.../workers/{worker}:stacks | Python stacks |
+| NoteBundle | POST /v1/debug:bundle | say that a diagnostic bundle is being made, with what it is limited to and its window, which is recorded as the event debug.bundle (11.9); the collection is the command's own |
 | WatchEvents | GET /v1/events (Server-Sent Events) | event stream from a sequence number |
 | GetStatus | GET /v1/status | daemon, edges, snapshot version |
 | ReloadDaemonConfig | POST /v1/daemon:reload | re-read the daemon configuration |

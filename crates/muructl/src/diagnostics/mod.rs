@@ -1,6 +1,7 @@
-//! The diagnostic commands (design specification sections 11.7 and
+//! The diagnostic commands (design specification sections 11.9 and
 //! 18.6): `muructl debug report`, a summary of an installation that is
-//! safe to post with a bug report.
+//! safe to post with a bug report, and `muructl debug bundle`, an archive
+//! of a whole system for the people who own it.
 //!
 //! What the commands collect is shared. This module reaches an
 //! installation however it runs (a daemon, running or stopped, a
@@ -11,6 +12,7 @@
 //! own. A part that cannot be collected is noted with the reason, and
 //! collection carries on.
 
+pub mod bundle;
 pub mod markdown;
 pub mod redact;
 pub mod report;
@@ -210,6 +212,12 @@ impl Installation {
         self.runs
     }
 
+    /// Whether the daemon's state store can be read, so that what it
+    /// holds need not be asked of the daemon.
+    pub fn reads_store(&self) -> bool {
+        self.store.is_ok()
+    }
+
     /// Whether something answered on the admin socket.
     pub fn running(&self) -> bool {
         self.live.is_some()
@@ -298,6 +306,45 @@ impl Installation {
         }
 
         Ok(releases)
+    }
+
+    /// The releases the installation has, each as its application and
+    /// its id, without anything being asked of a worker.
+    pub async fn releases_known(&mut self) -> Result<Vec<(String, String)>, String> {
+        let named = |releases: Vec<ReleaseFacts>| {
+            releases
+                .into_iter()
+                .map(|release| (release.app, release.id))
+                .collect()
+        };
+
+        if !self.runs.is_daemon() {
+            return match self.status() {
+                Some(status) => Ok(vec![(status.app.clone(), status.release.clone())]),
+                None => Err(self.unreachable()),
+            };
+        }
+
+        if let Ok(releases) = self.stored_releases() {
+            return Ok(named(releases));
+        }
+
+        let Some(live) = &mut self.live else {
+            return Err(self.unreachable());
+        };
+
+        within(live.client.list_releases(pb::ListReleasesRequest {
+            app: String::new(),
+            disk: false,
+        }))
+        .await
+        .map(|answer| {
+            answer
+                .releases
+                .into_iter()
+                .map(|release| (release.app, release.id))
+                .collect()
+        })
     }
 
     /// The releases as the state store records them.

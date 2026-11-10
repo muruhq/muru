@@ -1650,6 +1650,21 @@ impl Admin for Service {
         }))
     }
 
+    /// Section 11.9: a bundle holds the system's logs and configuration
+    /// and leaves it, so making one is recorded, as the operations that
+    /// reach into a worker are. The collection itself is the command's.
+    async fn note_bundle(
+        &self,
+        request: Request<pb::NoteBundleRequest>,
+    ) -> Result<Response<pb::NoteBundleResponse>, Status> {
+        let request = request.into_inner();
+        let (subject, message) = crate::diagnostics::bundle_event(&request);
+        self.handle
+            .events
+            .emit("debug.bundle", &subject, "notice", &message);
+        Ok(Response::new(pb::NoteBundleResponse {}))
+    }
+
     async fn list_overlays(
         &self,
         _: Request<pb::ListOverlaysRequest>,
