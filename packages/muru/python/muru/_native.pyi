@@ -68,6 +68,9 @@ def serve(
 def memory_usage() -> dict[str, int] | None:
     """Return the worker's rss, pss and uss in bytes, or None where unmeasured."""
 
+def set_title(title: str, short: str) -> None:
+    """Set the process title ps shows, and on Linux the short name top shows."""
+
 def requests() -> list[dict[str, Any]]:
     """Return the requests in flight: id, method, path, elapsed ms and threads."""
 

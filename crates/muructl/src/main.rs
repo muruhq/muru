@@ -341,6 +341,10 @@ struct RelayRunArgs {
     /// What a full queue does: drop_oldest or block.
     #[arg(long, value_name = "WHAT", default_value = "drop_oldest", value_parser = muru_controller::relay::Overflow::parse)]
     on_overflow: muru_controller::relay::Overflow,
+
+    /// The release, as app@release, for the process title.
+    #[arg(long, value_name = "APP@RELEASE")]
+    release: Option<String>,
 }
 
 /// What `serve-static` takes.
@@ -984,6 +988,7 @@ fn main() -> anyhow::Result<()> {
                 log_file: args.log_file,
                 queue: args.queue,
                 overflow: args.on_overflow,
+                release: args.release,
             });
         }
         other => other,
@@ -992,7 +997,7 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let json = asks_for_json(std::env::args_os());
+    let json = asks_for_json(muru_common::title::args_os().into_iter());
 
     let result = match command {
         Command::Run(args) => runtime.block_on(run(*args)),
@@ -2989,6 +2994,16 @@ async fn run_with(
         ),
         None => app_name(&resolved.project, &resolved.entrypoint),
     };
+
+    // Section 2.1: the process says what it serves, as `muru run APP` or
+    // `muru serve APP`.
+
+    let (title, short) = match &serve {
+        Some(_) => (format!("muru serve {label}"), "muru-serve"),
+        None => (format!("muru run {label}"), "muru-run"),
+    };
+
+    muru_common::title::set(&title, short);
 
     let groups = resolved
         .groups

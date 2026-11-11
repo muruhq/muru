@@ -562,6 +562,34 @@ pub struct HostSpec {
     pub identity: Option<Identity>,
 }
 
+impl HostSpec {
+    /// The release as app@release, as the host names itself: the
+    /// application's name, else the top-level module of its entrypoint,
+    /// and the release's id, else the name of its run directory (`r1`,
+    /// `r2` in development).
+    pub fn label(&self, run_dir: &Path) -> String {
+        let name = self.name.clone().unwrap_or_else(|| {
+            let module = self.app.split(':').next().unwrap_or_default();
+            let top = module.split('.').next().unwrap_or_default();
+
+            if top.is_empty() {
+                "default".to_owned()
+            } else {
+                top.to_owned()
+            }
+        });
+
+        let release = self.release.clone().unwrap_or_else(|| {
+            run_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+
+        format!("{name}@{release}")
+    }
+}
+
 /// Whom a host runs as (section 10.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Identity {
@@ -2025,6 +2053,8 @@ pub struct RelayLaunch {
     identity: Option<Identity>,
     /// The host serves in its own process, with no socket to connect to.
     single: bool,
+    /// The release, as app@release, for the relay's process title.
+    release: String,
 }
 
 impl RelayLaunch {
@@ -2035,6 +2065,7 @@ impl RelayLaunch {
             spec.detach_to.clone(),
             spec.relay,
             spec.identity,
+            spec.label(run_dir),
         )?;
 
         Ok(Self {
@@ -2050,6 +2081,7 @@ impl RelayLaunch {
         log_file: Option<PathBuf>,
         settings: RelaySettings,
         identity: Option<Identity>,
+        release: String,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             executable: crate::daemon::running_executable()
@@ -2059,6 +2091,7 @@ impl RelayLaunch {
             settings,
             identity,
             single: false,
+            release,
         })
     }
 
@@ -2089,6 +2122,8 @@ impl RelayLaunch {
             .arg(self.settings.queue.to_string())
             .arg("--on-overflow")
             .arg(self.settings.overflow.as_str())
+            .arg("--release")
+            .arg(&self.release)
             .stdin(Stdio::null())
             .stdout(Stdio::null());
 

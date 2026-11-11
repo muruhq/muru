@@ -2146,7 +2146,8 @@ pub(crate) fn running_executable() -> anyhow::Result<PathBuf> {
 /// the one that name finds on the PATH or that path names now; what the
 /// kernel reports as the running executable may be a replaced file.
 pub fn installed_executable() -> anyhow::Result<PathBuf> {
-    let name = std::env::args_os()
+    let name = muru_common::title::args_os()
+        .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("the daemon has no command name"))?;
     let name = PathBuf::from(name);
@@ -2537,17 +2538,26 @@ fn adoption_message(adopted: &ServersRecord) -> String {
     }
 }
 
-/// Whether a process's command line names the path, which is how a host
-/// record is checked against the process that has its pid now.
-fn command_mentions(pid: u32, path: &Path) -> bool {
+/// Whether a process's command line names the path or is the title, which
+/// is how a host's or relay's record is checked against the process that
+/// has its pid now.
+fn command_mentions(pid: u32, path: &Path, title: &str) -> bool {
     let output = std::process::Command::new("ps")
         .args(["-o", "command=", "-p", &pid.to_string()])
         .output();
 
     match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout).contains(&path.display().to_string()),
+        Ok(output) => names(&String::from_utf8_lossy(&output.stdout), path, title),
         Err(_) => false,
     }
+}
+
+/// Whether a command line, as `ps` shows it, is the process a record
+/// names: it mentions `path`, as the process was started, or it is
+/// `title`, which the process set in place of its arguments (section
+/// 2.1), with whatever spaces `ps` shows for the rest of the area.
+fn names(command: &str, path: &Path, title: &str) -> bool {
+    command.contains(&path.display().to_string()) || command.trim() == title
 }
 
 /// The index of the worker a link socket belongs to, from its name:
@@ -4139,7 +4149,7 @@ impl Daemon {
             return false;
         };
 
-        if !command_mentions(record.pid, &run_dir) {
+        if !command_mentions(record.pid, &run_dir, &format!("muru host {app}@{id}")) {
             tracing::info!(
                 pid = record.pid,
                 "release {app}@{id} could not be re-adopted: no process of its host has the pid"
@@ -4178,6 +4188,7 @@ impl Daemon {
             Some(self.host_log(app, id)),
             self.relay_settings,
             identity,
+            subject.clone(),
         ) {
             Ok(launch) => launch,
             Err(error) => {
@@ -4187,7 +4198,7 @@ impl Daemon {
         };
         let relay_pid = read_record::<RelayRecord>(&host_dir.join(crate::relay::RECORD))
             .map(|record| record.pid)
-            .filter(|pid| command_mentions(*pid, &host_dir));
+            .filter(|pid| command_mentions(*pid, &host_dir, &format!("muru relay {subject}")));
         let watcher = self.relay_watcher(&subject);
         let adopted = HostProcess::adopt(
             record.pid,
@@ -10187,6 +10198,28 @@ fn step_message(steps: &[RolloutStep], step: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_names_a_process_by_its_path_or_its_title() {
+        let run_dir = Path::new("/run/muru/apps/shop/r42");
+
+        assert!(super::names(
+            "python -m muru.host --socket-dir /run/muru/apps/shop/r42/r1",
+            run_dir,
+            "muru host shop@r42"
+        ));
+        assert!(super::names(
+            "muru host shop@r42      ",
+            run_dir,
+            "muru host shop@r42"
+        ));
+        assert!(!super::names(
+            "muru host shop@r421",
+            run_dir,
+            "muru host shop@r42"
+        ));
+        assert!(!super::names("sleep 300", run_dir, "muru host shop@r42"));
+    }
 
     #[test]
     fn the_adoption_event_names_the_instances_kept_and_those_started_again() {

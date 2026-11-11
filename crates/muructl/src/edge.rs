@@ -82,6 +82,10 @@ fn parse_listener(text: &str) -> Result<(i32, bool), String> {
 
 /// Run the edge until the daemon tells it to stop or a listener fails.
 pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
+    // Section 2.1: the edge's process title.
+
+    muru_common::title::set("muru-edge", "muru-edge");
+
     // The listeners were bound by the daemon and inherited across exec.
 
     let mut inherited = Vec::new();

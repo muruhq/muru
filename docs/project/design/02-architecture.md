@@ -16,7 +16,8 @@ Muru has three layers. The edge carries traffic, the daemon decides what should 
 ```mermaid
 flowchart LR
   CL[Clients] -->|HTTP and TLS| EDGE[Edge pool]
-  OPS[muructl, dashboard, automation] -->|admin API| D
+  OPS[muructl, automation] -->|admin API| D
+  DASH[Dashboard, read-only] -.->|reads| D
   subgraph CP [Daemon]
     D[Controller and supervisor]
     ST[(State store)]
@@ -48,9 +49,12 @@ flowchart LR
 | --- | --- | --- | --- |
 | Edge (process title muru-edge) | muructl edge run, Rust, tokio, hyper, rustls | Listeners, TLS, virtual hosts, routing, load balancing, limits, buffering, static files, internal redirects, uploads, error pages | Replaced with listener handoff, no refused connections |
 | Daemon (process title murud) | muructl daemon run, Rust | Desired state, reconciler, supervision, admin API, dashboard, log collection, events, schedules | None on traffic. Hosts are re-adopted |
-| Host process | python -m muru.host, Python with the runtime library | Preload the application, fork and supervise workers, collect what they leave behind as a subreaper | Affects only its release |
-| Worker | Forked from the host | Serve requests through the WSGI, ASGI and gRPC bridges | One worker, replaced from the host |
-| muructl client | Same binary | CLI over the admin API, development mode | None |
+| Host process (process title muru host APP@RELEASE) | python -m muru.host, Python with the runtime library | Preload the application, fork and supervise workers, collect what they leave behind as a subreaper | Affects only its release |
+| Log relay (process title muru relay APP@RELEASE) | muructl relay run, Rust, beside each host | Queue the host's and workers' output and write it to the release log (section 11.3, ADR 0059) | Output pauses; the host keeps serving |
+| Worker (process title muru worker APP@RELEASE GROUP/INDEX) | Forked from the host | Serve requests through the WSGI, ASGI and gRPC bridges | One worker, replaced from the host |
+| muructl client | Same binary | CLI over the admin API, development mode (process title muru run APP, or muru serve APP in a container) | None |
+
+**Process titles.** Each process sets its title once it knows what it is, so `ps`, `top` and `htop` tell them apart without `muructl`: on Linux by rewriting the process's argument area, the span from `arg_start` to `arg_end` in `/proc/self/stat`, followed by NULs, and with `prctl(PR_SET_NAME)` for the short name (`murud`, `muru-edge`, `muru-run`, `muru-serve`, `muru-host`, `muru-relay`, `muru-worker`); on macOS by rewriting the argument area `_NSGetArgv` points into, keeping one string for each argument the process was started with, since `ps` reads that many and `pgrep` skips runs of NULs. The area is found once, before anything is written, so a worker forked from its host has the host's room, and a title too long for it is cut. The arguments are kept before the first title for whatever reads them later, such as a daemon that runs itself again for an upgrade. The host sets its title once its application is loaded, and each worker after its fork, so a replacement sets its own; with `--single` the host is its only process and keeps the host's title. A host or relay adopted again after a daemon restart is recognised by its record's pid when that process's command line names the release's run directory, as before its title, or is exactly its title (section 13.3). `muructl status --processes` shows the same processes as a tree (section 13.10).
 
 ## 2.2 Data path and control path
 

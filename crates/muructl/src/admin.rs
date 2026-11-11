@@ -541,7 +541,8 @@ pub struct DaemonRunArgs {
 /// The arguments a daemon re-executes itself with on an upgrade: its own,
 /// with --upgraded-from naming this version in place of any earlier one.
 fn upgrade_arguments() -> Vec<std::ffi::OsString> {
-    let mut arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let mut arguments: Vec<std::ffi::OsString> =
+        muru_common::title::args_os().into_iter().skip(1).collect();
 
     if let Some(at) = arguments
         .iter()
@@ -559,6 +560,10 @@ fn upgrade_arguments() -> Vec<std::ffi::OsString> {
 /// Run the daemon in the foreground.
 pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     let locations = args.locations.resolve()?;
+
+    // Section 2.1: the daemon's process title.
+
+    muru_common::title::set("murud", "murud");
 
     // The file is read the same way here and on every reload, with the
     // command line's settings laid over it.

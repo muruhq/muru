@@ -259,12 +259,17 @@ def test_detached_daemon_leaves_traffic_flowing_and_is_readopted(tmp_path: Path)
     finally:
         if second is None:
             second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+        ours = support.recorded_pids(first.run_dir)
         second.stop(shutdown=True)
+
+    # Nothing is left: nothing that names the run directory, and none of
+    # the edge, hosts and relays the records named, which carry titles.
 
     listing = subprocess.run(
         ["ps", "-ax", "-o", "command="], capture_output=True, text=True, check=False
     ).stdout
     assert not any(first.run_dir.name in line for line in listing.splitlines())
+    assert ours and not support.still_running(ours), ours
 
 
 def test_a_relative_interpreter_path_is_resolved_where_the_command_runs(
