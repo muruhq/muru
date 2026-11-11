@@ -180,10 +180,14 @@ def test_warnings_filters_are_applied_in_order_the_last_first() -> None:
 
     import warnings
 
-    saved = warnings.filters[:]
+    from muru._inspect import warnings_in_force
+
     muru_logging._refused_filters.clear()
 
-    try:
+    # pytest runs each test inside catch_warnings, whose filters a build
+    # with context-aware warnings keeps apart from warnings.filters.
+
+    with warnings.catch_warnings():
         muru_logging._filter_warnings(
             [
                 "ignore::DeprecationWarning",
@@ -191,12 +195,11 @@ def test_warnings_filters_are_applied_in_order_the_last_first() -> None:
                 "ignore::no_such_module.Warning",
             ]
         )
-        first, second = warnings.filters[0], warnings.filters[1]
+        first, second = warnings_in_force()[0], warnings_in_force()[1]
         assert first[0] == "error" and first[2] is DeprecationWarning
         assert first[1].pattern == "boom" and first[3].pattern == r"shop\.views\Z"
         assert second[0] == "ignore" and second[1] is None
         assert len(muru_logging._refused_filters) == 1
         assert "no_such_module" in muru_logging._refused_filters[0]
-    finally:
-        warnings.filters[:] = saved
-        muru_logging._refused_filters.clear()
+
+    muru_logging._refused_filters.clear()

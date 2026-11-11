@@ -899,6 +899,19 @@ def _pattern(matched: Any) -> str:
     return str(getattr(matched, "pattern", matched))
 
 
+def warnings_in_force() -> list[Any]:
+    """Return the warnings filters in force here, the first matching first.
+
+    On a build with context-aware warnings (the default on a free-threaded
+    build), a `catch_warnings` block keeps filters of its own, which
+    `warnings.filters` does not show; `warnings._get_filters` gives the
+    current context's, where it exists.
+    """
+
+    current = getattr(warnings, "_get_filters", None)
+    return list(current() if callable(current) else warnings.filters)
+
+
 def _category_name(category: Any) -> str:
     """Name a warning category as a filter names it: builtins bare."""
 
@@ -951,7 +964,7 @@ def logging_setup() -> dict[str, Any]:
                 "module": _pattern(module),
                 "lineno": lineno,
             }
-            for action, message, category, module, lineno in warnings.filters
+            for action, message, category, module, lineno in warnings_in_force()
         ],
     }
 
