@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import sysconfig
+import time
 from collections.abc import Iterator
 
 import pytest
@@ -125,6 +126,14 @@ def test_unsafe_import_falls_back_to_per_worker_imports() -> None:
         # run again in each worker, before its post_fork.
 
         for name in ("on_load", "pre_fork"):
+            # A worker's lines reach the log through its relay, a moment
+            # after the worker has written them.
+
+            deadline = time.monotonic() + 10
+
+            while len(hook_lines(server, name)) < WORKERS + 1 and time.monotonic() < deadline:
+                time.sleep(0.05)
+
             lines = hook_lines(server, name)
             assert lines[0] == {
                 "pid": str(server.host_pid()),

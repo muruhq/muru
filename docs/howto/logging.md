@@ -16,20 +16,64 @@ one access log, which `muructl logs` reads.
 
 ## Application output
 
-Everything a worker writes to standard output or standard error is relayed
-by the host with the worker's index, so output from different workers can
-be told apart:
+Everything a worker writes to standard output or standard error goes
+through the release's log relay, a small process beside its host, which
+adds the worker's index, so output from different workers can be told
+apart:
 
 ```
 muru.worker[0]: Traceback (most recent call last):
 muru.worker[1].stdout: starting import of catalogue
 ```
 
-Lines from the host itself carry `muru.host[PID]:`, and lines from muructl
-start with `muru:`. Python's `logging` goes to standard error by default
+Lines from the host itself carry `muru.host[PID]:`, lines from the relay
+`muru.relay[PID]:`, and lines from muructl start with `muru:`. A line
+longer than 64 KiB is cut there, with a marker at the end saying so.
+Python's `logging` goes to standard error by default
 and so arrives tagged; nothing needs configuring. On the terminal these
 lines have no time in front; [times on log lines](#times-on-log-lines)
 says where they do and how to ask for one.
+
+### When the output cannot keep up
+
+The relay reads each worker's output as it is written and holds it in a
+queue for that worker, up to 1 MB, while it is written out. A log file
+on a slow disk, a paused terminal or a container runtime that stops
+reading holds up the relay alone. The host goes on serving, and requests
+are not held up.
+
+When a worker's queue is full, the relay drops that queue's oldest lines
+to make room. Where they were it writes a line saying how many went:
+
+```
+2026-11-02T05:42:30.101Z muru.relay[4243]: dropped 120 lines of worker 0's output here: the log was not keeping up
+```
+
+The `muru_app_output_dropped_total` [metric](metrics.md) counts the
+lines dropped. A warning event, `output.dropping`, says when dropping
+starts, and an `output.caught_up` event says how many lines went once
+the log has caught up.
+
+Under the daemon, the `[logs]` table says what a full queue does and how
+much a queue holds, for every application:
+
+```toml
+[logs]
+on_overflow = 'drop_oldest'  # or 'block'
+output_queue = '1MB'         # at least 64KB
+```
+
+With `on_overflow = 'block'` no lines are dropped. The relay stops
+reading a worker whose queue is full, so that worker waits when it next
+writes, and only that worker. An `output.held` warning event says when
+that starts, and `output.caught_up` when it ends. The settings apply
+to a release when its host next starts. `muructl run` and `muructl
+serve` use the defaults.
+
+If a relay exits while its host is running, another is started, after
+an `output.relay_restarting` warning event, and takes over the same
+output. A worker writes on until its pipe is full, then waits for the
+new relay. Nothing else is affected.
 
 ## Python logging
 
@@ -535,8 +579,9 @@ anything else that renames the files. Every log the daemon writes
 follows the same rule: once a file is renamed away, its writer opens it
 again by name, so lines go to a new file and the renamed one is
 complete. The edge reopens the access log, the files virtual hosts name
-and its own `edge.log`, each host its release's file, and a background
-daemon its own log. Lines written between the rename and the reopen
+and its own `edge.log`, each release's log relay its release's file,
+and a background daemon its own log. Lines written between the rename
+and the reopen
 land in the renamed file, and none are lost.
 
 The daemon notices a rename by itself. Every few seconds, and once when
@@ -608,13 +653,16 @@ names where the daemon's state store is, which is how they know what
 still exists. `muructl serve` writes its logs to standard output, so
 these commands have nothing to do for it.
 
-When the disk holding the log directory is full, a release's host drops
-the worker lines it cannot write and goes on serving. Once it can write
-again it adds a line saying how many it dropped:
+When the disk holding the log directory is full, a release's log relay
+drops the lines it cannot write and the release goes on serving. Once it
+can write again it adds a line saying how many it dropped:
 
 ```
-2026-11-02T05:42:30.101Z muru.host[4242]: dropped 120 lines of worker 0's stderr that could not be written (No space left on device)
+2026-11-02T05:42:30.101Z muru.relay[4243]: dropped 120 lines that could not be written (No space left on device)
 ```
+
+The lines count towards `muru_app_output_dropped_total`, and an
+`output.failing` warning event says when writing starts to fail.
 
 `muructl logs list` shows each log, its size, its archives and the total
 it takes, and flags as `orphaned` a log whose release or virtual host no

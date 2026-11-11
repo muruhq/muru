@@ -13,17 +13,17 @@ re-executes itself with per-worker imports. With true such a finding is a
 failure, and with false every worker imports for itself and the check is
 skipped. Hooks come from the module named with --hooks.
 
-Each worker writes to pipes the host created at fork, and the host relays
-every line to its own standard error tagged with the worker's index and
-stream (section 11.2), so output from different workers can be told apart.
+Each worker writes to pipes the host created at fork. The host keeps their
+read ends and never reads them: it passes them to the release's log relay
+over a Unix socket (section 11.3, ADR 0059), and the relay tags every line
+with the worker's index and stream, so output from different workers can
+be told apart, and writes it wherever it goes.
 
 One application, a fixed number of workers restarted when they die, and
 shutdown on SIGTERM, SIGINT or when standard input closes, which is how the
-parent `muructl` signals that it has gone away. Under the daemon the host
-writes to the file named with --log-file: SIGUSR1 opens it again by name
-after an external rotation (section 11.3), and SIGUSR2 passes SIGUSR1 on
+parent `muructl` signals that it has gone away. SIGUSR2 passes SIGUSR1 on
 to every worker, whose on_reopen_logs hook handles the application's own
-files.
+files (section 11.3).
 
 Each worker reports to the host once a second over a pipe: requests in
 flight, the age of the oldest, requests served, and at intervals its
@@ -49,11 +49,11 @@ import random
 import selectors
 import signal
 import socket
-import stat
 import sys
 import threading
 import time
 import traceback
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from types import ModuleType
@@ -133,6 +133,11 @@ MAX_START_FAILURES = 3
 PRELOAD_MODES = ("auto", "true", "false")
 READ_SIZE = 65536
 
+# Section 11.3: how many exited workers' pipes are kept for a relay that
+# has not read them yet: 64 workers' worth.
+
+MAX_EXITED_PIPES = 128
+
 
 # Set in a worker, whose lines the host relays with the worker's own tag,
 # so the host prefix is for the host alone.
@@ -140,50 +145,44 @@ READ_SIZE = 65536
 _in_worker = False
 
 
-# Whether standard error is a regular file, decided once per process: a
-# worker forks from the host, and its standard error is a pipe.
+# Lines of the host's own that found its output pipe full, not yet
+# reported.
 
-_stamped: tuple[int, bool] | None = None
-
-
-def stamp() -> str:
-    """Return the time to put in front of a line, or nothing (section 11.8).
-
-    A line written to a file carries the full time, RFC 3339 in UTC with
-    milliseconds, as a daemon's release log does. A line written to a pipe
-    does not: under muructl run and muructl serve the reader adds it when
-    asked, and a worker's lines are timed by the host that relays them.
-    """
-
-    global _stamped
-
-    if _stamped is None or _stamped[0] != os.getpid():
-        try:
-            regular = stat.S_ISREG(os.fstat(2).st_mode)
-        except OSError:
-            regular = False
-
-        _stamped = (os.getpid(), regular)
-
-    if not _stamped[1]:
-        return ""
-
-    now = time.time()
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + f".{int(now * 1000) % 1000:03d}Z "
+_dropped_own = 0
 
 
 def log(message: str) -> None:
-    """Write one line to standard error, prefixed so it can be told from application output."""
+    """Write one line to standard error, prefixed so it can be told from application output.
+
+    The line goes in one write, directly to the descriptor. Under a relay
+    the host's standard error is a non-blocking pipe, since nothing in its
+    loop may wait on output: a line that finds the pipe full (no relay is
+    reading it) is dropped and counted, and the count is said in front of
+    the next line that fits.
+    """
+
+    global _dropped_own
 
     prefix = "" if _in_worker else f"muru.host[{os.getpid()}]: "
+    line = f"{prefix}{message}\n"
+
+    if _dropped_own:
+        noun = "line" if _dropped_own == 1 else "lines"
+        line = f"{prefix}dropped {_dropped_own} {noun} of the host's own output\n{line}"
 
     # The parent that reads this stream may already be gone, and a log line
     # lost then must not stop the host from stopping its workers.
 
+    flush_streams()
+
     try:
-        print(f"{stamp()}{prefix}{message}", file=sys.stderr, flush=True)
+        os.write(2, line.encode("utf-8", "replace"))
+    except BlockingIOError:
+        _dropped_own += 1
     except OSError:
         pass
+    else:
+        _dropped_own = 0
 
 
 def flush_streams() -> None:
@@ -199,23 +198,6 @@ def flush_streams() -> None:
             stream.flush()
         except (OSError, ValueError):
             pass
-
-
-def write_stderr(data: bytes) -> None:
-    """Write bytes to standard error's descriptor directly, in one write.
-
-    Whatever the host has buffered goes first, so its own lines and the
-    workers' stay in order. Bytes a failed write could not take are not
-    kept for later, as a buffered stream would keep them: an OSError
-    means they are gone.
-    """
-
-    flush_streams()
-    view = memoryview(data)
-
-    while view:
-        written = os.write(sys.stderr.fileno(), view)
-        view = view[written:]
 
 
 INTERFACES = ("auto", "wsgi", "asgi", "grpc")
@@ -537,70 +519,19 @@ class Release:
 
 
 @dataclass
-class WorkerOutput:
-    """The read end of one worker's stdout or stderr pipe, relayed line by line.
+class HeldPipe:
+    """The read end of a pipe the host holds for its relay and never reads.
 
-    `sink` takes the relayed lines; `dropped` counts those it could not
-    take since the last that it did, and `failure` says why.
+    The relay is sent a copy; the host keeps this one so that a relay
+    started later can be given it too, until a relay has read the pipe
+    to its end.
     """
 
-    index: int
-    stream: str
+    number: int
     fd: int
-    pending: bytes = b""
-    sink: Callable[[bytes], None] = write_stderr
-    dropped: int = 0
-    failure: str = ""
-
-    @property
-    def tag(self) -> str:
-        """The prefix each relayed line carries."""
-
-        suffix = "" if self.stream == "stderr" else f".{self.stream}"
-        return f"muru.worker[{self.index}]{suffix}: "
-
-    def relay(self, data: bytes) -> None:
-        """Write the complete lines in data, keeping any partial line for later."""
-
-        self.pending += data
-        *lines, self.pending = self.pending.split(b"\n")
-
-        if lines:
-            self.write(lines)
-
-    def flush(self) -> None:
-        """Write a final partial line, if any."""
-
-        if self.pending:
-            self.write([self.pending])
-            self.pending = b""
-
-    def write(self, lines: list[bytes]) -> None:
-        """Write lines with the time and the tag in one write.
-
-        A log that cannot be written (a full disk, say) never stops the
-        host: lines a write fails on are dropped and counted, and once a
-        write succeeds again the count is reported as one of the host's
-        own lines.
-        """
-
-        when = stamp()
-        text = "".join(when + self.tag + line.decode("utf-8", "replace") + "\n" for line in lines)
-
-        try:
-            self.sink(text.encode("utf-8"))
-        except OSError as error:
-            self.dropped += len(lines)
-            self.failure = error.strerror or str(error)
-            return
-
-        if self.dropped:
-            noun = "line" if self.dropped == 1 else "lines"
-            log(
-                f"dropped {self.dropped} {noun} of worker {self.index}'s {self.stream} "
-                f"that could not be written ({self.failure})"
-            )
-            self.dropped = 0
+    worker: int | None
+    stream: str
+    exited: bool = False
 
 
 @dataclass
@@ -1028,7 +959,8 @@ class Host:
         detach: bool = False,
         groups: list[Group] | None = None,
         mounts: list[Mount] | None = None,
-        log_file: str | None = None,
+        output_socket: str | None = None,
+        output_fd: int | None = None,
         control: str | None = None,
         max_requests: int | None = None,
         max_lifetime: float | None = None,
@@ -1052,7 +984,6 @@ class Host:
         self.socket_dir = socket_dir
         self.tcp_base_port = tcp_base_port
         self.detach = detach
-        self.log_file = log_file
         self.threads = threads
         self.sync_threads = sync_threads
         self.concurrency = concurrency
@@ -1102,14 +1033,42 @@ class Host:
         self.lifeline_read, self.lifeline_write = os.pipe()
         self.workers: dict[int, int] = {}
         self.stopping = False
-        self.reopen_requested = False
         self.workers_reopen_requested = False
         self.restart_after: dict[int, float] = {}
         self.spawned_at: dict[int, float] = {}
         self.start_failures: dict[int, int] = {}
         self.failed = False
         self.selector = selectors.DefaultSelector()
-        self.outputs: dict[int, WorkerOutput] = {}
+
+        # Section 11.3: the read ends of the workers' pipes and of the
+        # host's own output, by number (0 is the host's), which any relay
+        # that connects is given; the pipes of each worker, by pid; and
+        # the relay's connection, with what is waiting to go to it.
+
+        self.held: dict[int, HeldPipe] = {}
+        self.next_pipe = 1
+        self.pipes_of: dict[int, list[int]] = {}
+        self.output_listener: socket.socket | None = None
+        self.output_path = output_socket
+        self.relay: socket.socket | None = None
+        self.relay_buffer = b""
+        self.relay_outgoing: deque[tuple[bytes, int | None]] = deque()
+
+        if output_fd is not None:
+            os.set_inheritable(output_fd, False)
+            self.held[0] = HeldPipe(0, output_fd, None, "host")
+
+        if output_socket is not None:
+            self.output_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+            try:
+                os.unlink(output_socket)
+            except OSError:
+                pass
+
+            self.output_listener.bind(output_socket)
+            self.output_listener.listen(2)
+            self.output_listener.setblocking(False)
 
         # Sections 7.6 and 7.7: each worker's state from its reports, the
         # generation of each index's socket (a replacement takes the
@@ -1257,8 +1216,8 @@ class Host:
                 "they do not exist in the worker, so start them from a post_fork hook instead"
             )
 
-        # Section 11.2: the worker's stdout and stderr are pipes the host
-        # relays with the worker's index, so its lines can be told apart.
+        # Section 11.2: the worker's stdout and stderr are pipes, whose
+        # read ends go to the relay, so its lines can be told apart.
 
         out_read, out_write = os.pipe()
         err_read, err_write = os.pipe()
@@ -1300,7 +1259,7 @@ class Host:
                     err_read,
                     err_write,
                     report_read,
-                    *self.outputs,
+                    *(pipe.fd for pipe in self.held.values()),
                     *self.reports,
                     *self.controls,
                 )
@@ -1309,6 +1268,7 @@ class Host:
                 os.close(self.lifeline_write)
                 control_host.close()
                 self.close_control()
+                self.close_output()
                 status = self.worker(
                     index,
                     lifeline=self.lifeline_read,
@@ -1338,10 +1298,10 @@ class Host:
         os.close(err_write)
         os.close(report_write)
 
-        for fd, stream in ((out_read, "stdout"), (err_read, "stderr")):
-            os.set_blocking(fd, False)
-            self.outputs[fd] = WorkerOutput(index, stream, fd)
-            self.selector.register(fd, selectors.EVENT_READ)
+        self.pipes_of[pid] = [
+            self.hold(out_read, index, "stdout"),
+            self.hold(err_read, index, "stderr"),
+        ]
 
         os.set_blocking(report_read, False)
         self.reports[report_read] = pid
@@ -1817,8 +1777,8 @@ class Host:
             if first:
                 log(f"received {signal.Signals(signum).name}, stopping")
 
-        def request_reopen(_signum: int, _frame: Any) -> None:
-            self.reopen_requested = True
+        def ignore(_signum: int, _frame: Any) -> None:
+            pass
 
         def request_workers_reopen(_signum: int, _frame: Any) -> None:
             self.workers_reopen_requested = True
@@ -1826,7 +1786,11 @@ class Host:
         signal.signal(signal.SIGTERM, request_stop)
         signal.signal(signal.SIGINT, request_stop)
         signal.signal(signal.SIGCHLD, lambda _signum, _frame: None)
-        signal.signal(signal.SIGUSR1, request_reopen)
+
+        # The relay owns the release log and reopens it. A handler rather
+        # than SIG_IGN, so a worker's own handling starts from the default.
+
+        signal.signal(signal.SIGUSR1, ignore)
         signal.signal(signal.SIGUSR2, request_workers_reopen)
 
         # Section 13.3: a host under the daemon outlives it, so the daemon
@@ -1844,6 +1808,15 @@ class Host:
 
         if self.control_listener is not None:
             selector.register(self.control_listener, selectors.EVENT_READ)
+
+        # Section 11.3: nothing in this loop may wait on output, its own
+        # lines included, so its standard streams stop blocking here. With
+        # --single this loop does not run: the host is the worker, whose
+        # writes block as any worker's do.
+
+        if self.output_listener is not None:
+            selector.register(self.output_listener, selectors.EVENT_READ)
+            os.set_blocking(2, False)
 
         # Section 6.10: a subreaper, so what a worker leaves running comes
         # back to the host to be stopped and collected, rather than to init.
@@ -1884,8 +1857,6 @@ class Host:
                         self.stopping = True
                         selector.unregister(0)
                         watch_stdin = False
-                elif key.fd in self.outputs:
-                    self.read_output(key.fd)
                 elif key.fd in self.reports:
                     self.read_report(key.fd)
                 elif key.fd in self.controls:
@@ -1894,7 +1865,12 @@ class Host:
                     self.accept_supervisor()
                 elif self.supervisor is not None and key.fileobj is self.supervisor:
                     self.read_supervisor()
+                elif self.output_listener is not None and key.fileobj is self.output_listener:
+                    self.accept_relay()
+                elif self.relay is not None and key.fileobj is self.relay:
+                    self.read_relay()
 
+            self.flush_relay()
             self.reap()
             self.reopen_if_requested()
             if self.stopping:
@@ -1903,8 +1879,6 @@ class Host:
             self.tick()
 
         self.terminate_all()
-        for fd in list(self.outputs):
-            self.read_output(fd, until_closed=True)
         signal.set_wakeup_fd(-1)
         return 1 if self.failed else 0
 
@@ -1952,6 +1926,171 @@ class Host:
 
         if self.supervisor is not None:
             self.supervisor.close()
+
+    # Section 11.3: the relay's connection and the pipes it is given.
+
+    def hold(self, fd: int, worker: int, stream: str) -> int:
+        """Keep a worker pipe's read end and offer it to the relay; return its number."""
+
+        number = self.next_pipe
+        self.next_pipe += 1
+        pipe = HeldPipe(number, fd, worker, stream)
+        self.held[number] = pipe
+        self.offer(pipe)
+        return number
+
+    def offer(self, pipe: HeldPipe) -> None:
+        """Queue a pipe for the connected relay, if there is one."""
+
+        if self.relay is None:
+            return
+
+        message: dict[str, Any] = {"pipe": pipe.number, "stream": pipe.stream}
+
+        if pipe.worker is not None:
+            message["worker"] = pipe.worker
+
+        line = json.dumps(message, separators=(",", ":")).encode() + b"\n"
+        self.relay_outgoing.append((line, pipe.number))
+        self.flush_relay()
+
+    def flush_relay(self) -> None:
+        """Send what is waiting for the relay, as far as the socket takes it.
+
+        A send never blocks: what the socket cannot take now waits for
+        the next turn of the loop.
+        """
+
+        while self.relay is not None and self.relay_outgoing:
+            data, number = self.relay_outgoing[0]
+
+            # A pipe given up on since it was queued has nothing to send.
+
+            pipe = None if number is None else self.held.get(number)
+
+            if number is not None and pipe is None:
+                self.relay_outgoing.popleft()
+                continue
+
+            try:
+                if pipe is None:
+                    sent = self.relay.send(data)
+                else:
+                    sent = socket.send_fds(self.relay, [data], [pipe.fd])
+            except BlockingIOError:
+                return
+            except OSError:
+                self.drop_relay()
+                return
+
+            if sent < len(data):
+                self.relay_outgoing[0] = (data[sent:], None)
+                continue
+
+            self.relay_outgoing.popleft()
+
+    def accept_relay(self) -> None:
+        """Take a relay's connection and give it every pipe held.
+
+        A new connection replaces any earlier one.
+        """
+
+        assert self.output_listener is not None
+
+        try:
+            connection, _ = self.output_listener.accept()
+        except OSError:
+            return
+
+        self.drop_relay()
+        connection.setblocking(False)
+        self.relay = connection
+        self.relay_buffer = b""
+        self.selector.register(connection, selectors.EVENT_READ)
+
+        for pipe in list(self.held.values()):
+            self.offer(pipe)
+
+    def drop_relay(self) -> None:
+        """Close the relay's connection, if there is one."""
+
+        if self.relay is None:
+            return
+
+        try:
+            self.selector.unregister(self.relay)
+        except (KeyError, ValueError):
+            pass
+
+        self.relay.close()
+        self.relay = None
+        self.relay_outgoing.clear()
+
+    def read_relay(self) -> None:
+        """Read which pipes the relay has read to their end, and close them."""
+
+        assert self.relay is not None
+
+        try:
+            data = self.relay.recv(READ_SIZE)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+
+        if not data:
+            self.drop_relay()
+            return
+
+        self.relay_buffer += data
+
+        while b"\n" in self.relay_buffer:
+            line, _, self.relay_buffer = self.relay_buffer.partition(b"\n")
+
+            try:
+                number = json.loads(line).get("ended")
+            except (ValueError, AttributeError):
+                continue
+
+            if isinstance(number, int):
+                self.release_pipe(number)
+
+    def release_pipe(self, number: int) -> None:
+        """Close a held pipe once a relay has read it to its end."""
+
+        pipe = self.held.pop(number, None)
+
+        if pipe is not None:
+            os.close(pipe.fd)
+
+    def worker_pipes_ended(self, pid: int) -> None:
+        """Note that a worker has exited, so its pipes will end.
+
+        They stay held until a relay has read them, so a crash's traceback
+        survives a relay that is being replaced, but only so many: with no
+        relay coming, a worker that keeps failing would otherwise hold
+        descriptors without end.
+        """
+
+        for number in self.pipes_of.pop(pid, []):
+            pipe = self.held.get(number)
+
+            if pipe is not None:
+                pipe.exited = True
+
+        exited = [number for number, pipe in self.held.items() if pipe.exited]
+
+        for number in exited[: max(0, len(exited) - MAX_EXITED_PIPES)]:
+            self.release_pipe(number)
+
+    def close_output(self) -> None:
+        """Close the relay's connection and the pipes held, in a worker after fork."""
+
+        if self.output_listener is not None:
+            self.output_listener.close()
+
+        if self.relay is not None:
+            self.relay.close()
 
     def read_supervisor(self) -> None:
         """Read the supervisor's acknowledgements."""
@@ -3478,11 +3617,7 @@ class Host:
             pass
 
     def reopen_if_requested(self) -> None:
-        """Carry out what SIGUSR1 and SIGUSR2 asked for, outside the handlers."""
-
-        if self.reopen_requested:
-            self.reopen_requested = False
-            self.reopen_log()
+        """Carry out what SIGUSR2 asked for, outside the handler."""
 
         if self.workers_reopen_requested:
             self.workers_reopen_requested = False
@@ -3492,54 +3627,6 @@ class Host:
                     os.kill(pid, signal.SIGUSR1)
                 except ProcessLookupError:
                     pass
-
-    def reopen_log(self) -> None:
-        """Open the log file again by name on standard output and error.
-
-        The workers' pipes are relayed through this process's standard
-        error, so reopening it here is enough for their lines too.
-        """
-
-        if self.log_file is None:
-            return
-
-        try:
-            fd = os.open(self.log_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-        except OSError as error:
-            log(f"could not reopen {self.log_file}: {error}")
-            return
-
-        flush_streams()
-        os.dup2(fd, 1)
-        os.dup2(fd, 2)
-        os.close(fd)
-        log(f"reopened {self.log_file}")
-
-    def read_output(self, fd: int, until_closed: bool = False) -> None:
-        """Relay what a worker has written; close the pipe once it is at end of file."""
-
-        output = self.outputs[fd]
-
-        while True:
-            try:
-                data = os.read(fd, READ_SIZE)
-            except BlockingIOError:
-                if until_closed:
-                    time.sleep(0.01)
-                    continue
-
-                return
-            except OSError:
-                data = b""
-
-            if not data:
-                output.flush()
-                self.selector.unregister(fd)
-                os.close(fd)
-                del self.outputs[fd]
-                return
-
-            output.relay(data)
 
     def reap(self) -> None:
         """Collect exited workers and schedule their replacement.
@@ -3564,6 +3651,7 @@ class Host:
 
             spawned_at = self.spawned_at.pop(pid, 0.0)
             self.states.pop(pid, None)
+            self.worker_pipes_ended(pid)
             self.adopt_orphans(index, pid)
             if self.stopping:
                 continue
@@ -3962,6 +4050,17 @@ class Host:
             except OSError:
                 pass
 
+        # The relay's connection stays open until this process exits, so
+        # the relay sees the host gone only after the workers are.
+
+        if self.output_listener is not None:
+            self.output_listener.close()
+
+            try:
+                os.unlink(self.output_path or "")
+            except OSError:
+                pass
+
 
 def oom_kills(cgroup: str | None) -> int | None:
     """Read the kernel's count of the cgroup's processes killed for memory."""
@@ -4198,10 +4297,17 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="keep running when the parent goes away, for a daemon that re-adopts hosts",
     )
     parser.add_argument(
-        "--log-file",
+        "--output-socket",
         default=None,
         metavar="PATH",
-        help="the file standard output and error go to, reopened by name on SIGUSR1",
+        help="the Unix socket to listen on for the release's log relay",
+    )
+    parser.add_argument(
+        "--output-fd",
+        type=int,
+        default=None,
+        metavar="FD",
+        help="the read end of the pipe standard output and error go to, kept for the relay",
     )
     parser.add_argument(
         "--group",
@@ -4640,7 +4746,8 @@ def main(argv: list[str] | None = None) -> int:
             for group in args.group
         ],
         mounts=mounts,
-        log_file=args.log_file,
+        output_socket=args.output_socket,
+        output_fd=args.output_fd,
         control=args.control,
         max_requests=args.max_requests,
         max_lifetime=args.max_lifetime,

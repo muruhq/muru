@@ -300,6 +300,47 @@ enum Command {
         #[command(subcommand)]
         command: edge::EdgeCommand,
     },
+
+    /// Run a release's log relay (internal, started beside each host).
+    Relay {
+        #[command(subcommand)]
+        command: RelayCommand,
+    },
+}
+
+/// The relay subcommands.
+#[derive(Subcommand)]
+enum RelayCommand {
+    /// Relay a host's and its workers' output to a release log or to standard error.
+    Run(RelayRunArgs),
+}
+
+/// What a relay is started with.
+#[derive(Args)]
+struct RelayRunArgs {
+    /// The Unix socket the host listens on for its relay.
+    #[arg(long, value_name = "PATH")]
+    connect: PathBuf,
+
+    /// The Unix socket to serve the relay's reports on.
+    #[arg(long, value_name = "PATH")]
+    control: PathBuf,
+
+    /// The inherited read end of the host's own output.
+    #[arg(long, value_name = "FD")]
+    host_output_fd: Option<i32>,
+
+    /// The release log to write, reopened by name on SIGUSR1; standard error without it.
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
+
+    /// Each worker's queue, in bytes.
+    #[arg(long, value_name = "BYTES", default_value_t = muru_controller::relay::DEFAULT_QUEUE)]
+    queue: usize,
+
+    /// What a full queue does: drop_oldest or block.
+    #[arg(long, value_name = "WHAT", default_value = "drop_oldest", value_parser = muru_controller::relay::Overflow::parse)]
+    on_overflow: muru_controller::relay::Overflow,
 }
 
 /// What `serve-static` takes.
@@ -929,12 +970,31 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Section 11.3: a relay runs beside every host and brings its own
+    // small runtime, so it starts none of this one's threads.
+
+    let command = match cli.command {
+        Command::Relay {
+            command: RelayCommand::Run(args),
+        } => {
+            return muru_controller::relay::run(muru_controller::relay::RelayArgs {
+                connect: args.connect,
+                control: args.control,
+                host_output_fd: args.host_output_fd,
+                log_file: args.log_file,
+                queue: args.queue,
+                overflow: args.on_overflow,
+            });
+        }
+        other => other,
+    };
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let json = asks_for_json(std::env::args_os());
 
-    let result = match cli.command {
+    let result = match command {
         Command::Run(args) => runtime.block_on(run(*args)),
         Command::Serve(args) => runtime.block_on(serve::serve(*args)),
         Command::Probe(args) => serve::probe(args),
@@ -1098,6 +1158,7 @@ fn main() -> anyhow::Result<()> {
         Command::Edge {
             command: edge::EdgeCommand::Run(args),
         } => runtime.block_on(edge::run(*args)),
+        Command::Relay { .. } => unreachable!("a relay runs before the runtime is built"),
     };
 
     // A command asked for JSON fails in JSON too: the sentence muructl
@@ -2782,6 +2843,29 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     run_with(args, None, None).await
 }
 
+/// What hears a release's relay in a run: its counts go to the metrics
+/// and its stalls to muructl events (section 11.3). Its lines reach the
+/// terminal through the relay's own output.
+fn relay_watcher(
+    label: &str,
+    release: &str,
+    events: &Arc<run_admin::RunEvents>,
+) -> muru_controller::host::RelayWatcher {
+    let (label, release) = (label.to_owned(), release.to_owned());
+    let events = Arc::clone(events);
+
+    Arc::new(move |news| match news {
+        muru_controller::host::RelayNews::Dropped(total) => {
+            run_admin::set_output_dropped(&label, &release, total);
+        }
+        muru_controller::host::RelayNews::Event {
+            kind,
+            level,
+            message,
+        } => events.record(&kind, &format!("{label}@{release}"), &level, &message),
+    })
+}
+
 /// Serve as `muructl run` does, or as `muructl serve` with `serve`
 /// (section 13.9): production behaviours, one run directory, no
 /// installs, the admin port, and every line on standard output.
@@ -3123,6 +3207,7 @@ async fn run_with(
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
         single: args.single,
         detach_to: None,
+        relay: muru_controller::host::RelaySettings::default(),
         groups,
         mounts: resolved
             .mounts
@@ -3212,7 +3297,16 @@ async fn run_with(
         None => None,
     };
 
-    let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
+    // Section 13.1: the events the hosts raise, kept for muructl events.
+
+    let run_events = Arc::new(run_admin::RunEvents::default());
+    let mut current = HostProcess::start(
+        &spec,
+        &run_dir,
+        1,
+        &logs,
+        relay_watcher(&label, "r1", &run_events),
+    )?;
 
     if let Err(error) = current.wait_ready(START_TIMEOUT).await {
         current.stop(stop_budget).await;
@@ -3227,9 +3321,6 @@ async fn run_with(
 
     let host_link: SharedHostLink = Arc::new(std::sync::Mutex::new(HostLink::default()));
 
-    // Section 13.1: the events the hosts raise, kept for muructl events.
-
-    let run_events = Arc::new(run_admin::RunEvents::default());
     host_link
         .lock()
         .expect("host link poisoned")
@@ -3724,7 +3815,9 @@ async fn run_with(
                 loop {
                     release += 1;
 
-                    let mut next = match HostProcess::start(&spec, &run_dir, release, &logs) {
+                    let watcher = relay_watcher(&label, &format!("r{release}"), &run_events);
+
+                    let mut next = match HostProcess::start(&spec, &run_dir, release, &logs, watcher) {
                         Ok(next) => next,
                         Err(error) => {
                             muru_common::muru_println!("release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);

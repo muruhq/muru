@@ -696,6 +696,13 @@ struct HostRecord {
     runtime: Option<PathBuf>,
 }
 
+/// A release's log relay, for re-adoption (section 11.3), written beside
+/// its sockets.
+#[derive(serde::Deserialize)]
+struct RelayRecord {
+    pid: u32,
+}
+
 /// A named worker group's sockets and paths, for re-adoption and the
 /// snapshot.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -941,6 +948,15 @@ impl Backend {
         match self {
             Self::Host(host) => host.try_exited(),
             Self::Servers(_) | Self::Dormant => Ok(None),
+        }
+    }
+
+    /// Have the release's log relay open the release log again by name.
+    /// Instances write their own files. Returns whether it was told.
+    fn reopen_log(&self) -> bool {
+        match self {
+            Self::Host(host) => host.signal_relay(libc::SIGUSR1),
+            Self::Servers(_) | Self::Dormant => false,
         }
     }
 
@@ -1215,6 +1231,7 @@ struct Daemon {
     /// reopen it, the file last seen at each path, how often they are
     /// checked and when next.
     reopen_on_rename: bool,
+    relay_settings: crate::host::RelaySettings,
     renames: crate::renames::Watch,
     rename_check: Duration,
     rename_due: Instant,
@@ -1614,6 +1631,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         rotation,
         claimed_logs: std::collections::HashSet::new(),
         reopen_on_rename: settings.reopen_on_rename,
+        relay_settings: settings.relay,
         renames,
         rename_check: config.rename_check,
         rename_due: Instant::now(),
@@ -2119,6 +2137,18 @@ fn write_edge_record(run_dir: &Path, edge: &EdgeProcess) {
                 .collect(),
         },
     );
+}
+
+/// The executable to start this program again from: what is running,
+/// or the installed binary when an upgrade has replaced that file.
+pub(crate) fn running_executable() -> anyhow::Result<PathBuf> {
+    let current = std::env::current_exe().context("finding the running executable")?;
+
+    if current.is_file() {
+        return Ok(current);
+    }
+
+    installed_executable()
 }
 
 /// Section 13.4: the binary an upgrade re-executes from. The daemon was
@@ -3098,6 +3128,16 @@ impl Daemon {
             report.unchanged("[logs] reopen_on_rename");
         }
 
+        if settings.relay != self.relay_settings {
+            self.relay_settings = settings.relay;
+            report.changed(
+                "[logs] on_overflow and output_queue",
+                "each application takes the new values at its next restart or deploy",
+            );
+        } else {
+            report.unchanged("[logs] on_overflow and output_queue");
+        }
+
         // Section 13.3: what the next stop signal means.
 
         if settings.shutdown != self.shutdown {
@@ -4004,6 +4044,16 @@ impl Daemon {
                 }
             }
 
+            // Section 11.3: output the release's relay could not keep.
+
+            if let Some(host) = running.backend.host() {
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_app_output_dropped_total",
+                    &[("app", app.as_str()), ("release", id.as_str())],
+                    host.output_dropped() as f64,
+                ));
+            }
+
             // Sections 7.6 and 7.7: workers replaced and workers gone.
 
             for (name, counts) in [
@@ -4130,13 +4180,47 @@ impl Daemon {
             .filter(|group| group.optional)
             .map(|group| group.name.clone())
             .collect();
+
+        // Section 11.3: the relay is adopted with its host, or replaced
+        // if it is gone.
+
+        let subject = format!("{app}@{id}");
+
+        let identity = match self.resolve_identity(app, &subject) {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::info!(%error, "release {subject} could not be re-adopted");
+                return false;
+            }
+        };
+
+        let host_dir = run_dir.join("r1");
+        let launch = match crate::host::RelayLaunch::for_release(
+            host_dir.clone(),
+            Some(self.host_log(app, id)),
+            self.relay_settings,
+            identity,
+        ) {
+            Ok(launch) => launch,
+            Err(error) => {
+                tracing::info!(error = %format!("{error:#}"), "release {subject} could not be re-adopted");
+                return false;
+            }
+        };
+        let relay_pid = read_record::<RelayRecord>(&host_dir.join(crate::relay::RECORD))
+            .map(|record| record.pid)
+            .filter(|pid| command_mentions(*pid, &host_dir));
+        let watcher = self.relay_watcher(&subject);
         let adopted = HostProcess::adopt(
             record.pid,
             record.sockets.clone(),
             group_sockets,
             optional,
-            run_dir.join("r1"),
+            host_dir,
             1,
+            launch,
+            relay_pid,
+            watcher,
         );
 
         match adopted {
@@ -5224,6 +5308,7 @@ impl Daemon {
             tcp_base_port: None,
             single: false,
             detach_to: Some(self.host_log(app, id)),
+            relay: self.relay_settings,
             logging: self
                 .info
                 .python_logging
@@ -5292,7 +5377,9 @@ impl Daemon {
         let log = self.host_log(app, id);
         let log_start = std::fs::metadata(&log).map_or(0, |metadata| metadata.len());
 
-        let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs) {
+        let watcher = self.relay_watcher(&subject);
+
+        let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs, watcher) {
             Ok(host) => host,
             Err(error) => {
                 let message = format!("the host could not be started: {error:#}");
@@ -9533,7 +9620,7 @@ impl Daemon {
         self.edge.signal(libc::SIGUSR1);
 
         for running in self.running.values() {
-            running.backend.signal(libc::SIGUSR1);
+            running.backend.reopen_log();
         }
 
         let names: Vec<String> = rotated
@@ -9628,6 +9715,29 @@ impl Daemon {
         Ok(in_place)
     }
 
+    /// What hears a release's relay: its stalls become events under the
+    /// release, as its workers' do; counts are read from the host.
+    fn relay_watcher(&self, subject: &str) -> crate::host::RelayWatcher {
+        let events = self.events.clone();
+        let subject = subject.to_owned();
+
+        std::sync::Arc::new(move |news| {
+            if let crate::host::RelayNews::Event {
+                kind,
+                level,
+                message,
+            } = news
+            {
+                let level = if level == "warning" {
+                    "warning"
+                } else {
+                    "info"
+                };
+                events.emit(&kind, &subject, level, &message);
+            }
+        })
+    }
+
     /// Open the daemon's own log again by name, when it was started in
     /// the background and so writes one.
     fn reopen_own_log(&self) {
@@ -9641,10 +9751,10 @@ impl Daemon {
     /// Section 11.3: after something has renamed the files, every writer
     /// opens its file again by name. The daemon reopens its own when it
     /// was started in the background, the edge its access log, the files
-    /// virtual hosts name and its own log on SIGUSR1, and each host its
-    /// release log on SIGUSR1; SIGUSR2 makes a host pass SIGUSR1 on to its
-    /// workers, whose on_reopen_logs hook handles files the application
-    /// opened itself.
+    /// virtual hosts name and its own log on SIGUSR1, and each release's
+    /// log relay its release log on SIGUSR1; SIGUSR2 makes a host pass
+    /// SIGUSR1 on to its workers, whose on_reopen_logs hook handles files
+    /// the application opened itself.
     fn reopen_logs(&mut self, workers: bool) -> Reopened {
         self.reopen_logs_because(workers, "")
     }
@@ -9659,7 +9769,7 @@ impl Daemon {
         let mut hosts = 0;
 
         for running in self.running.values() {
-            if running.backend.signal(libc::SIGUSR1) {
+            if running.backend.reopen_log() {
                 hosts += 1;
             }
 

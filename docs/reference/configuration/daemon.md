@@ -653,6 +653,8 @@ The `[logs]` table of the daemon's file: how the daemon rotates the log files it
 | `compress` | string | `"zstd"` | How archives are compressed: `zstd` (the default), `gzip` or `off`. |
 | `every` | string | `"daily"` | Rotate by the clock: `off`, `hourly`, `daily` (the default) or `weekly`, at the period's start in UTC. |
 | `keep` | integer | `14` | Archives kept per log. |
+| `on_overflow` | string | `"drop_oldest"` | What happens when a worker's output queue is full: `drop_oldest` (the default) drops its oldest lines to make room, and writes a line saying how many where they were; `block` makes that worker wait on its own output until there is room. |
+| `output_queue` | string | `"1MB"` | How much of a worker's output, or the host's, may wait to be written, for example 1MB, at least 64KB. |
 | `reopen_on_rename` | boolean | `true` | Notice that something has renamed a log file away, such as logrotate, and have its writer open it again by name, checking every few seconds, so no `postrotate` command is needed. |
 | `rotate` | string | `"built-in"` | `built-in` (the default) or `external`, for logrotate. |
 | `size` | string |  | Rotate a file that reaches this size, for example 100MB. |

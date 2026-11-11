@@ -1286,6 +1286,18 @@ pub struct Logs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = true))]
     pub reopen_on_rename: Option<bool>,
+    /// What happens when a worker's output queue is full: `drop_oldest`
+    /// (the default) drops its oldest lines to make room, and writes a
+    /// line saying how many where they were; `block` makes that worker
+    /// wait on its own output until there is room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "drop_oldest"))]
+    pub on_overflow: Option<String>,
+    /// How much of a worker's output, or the host's, may wait to be
+    /// written, for example 1MB, at least 64KB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "1MB"))]
+    pub output_queue: Option<String>,
     /// Put the full UTC time in front of every line the daemon writes to
     /// standard output and standard error, as `--timestamps` does, for a
     /// supervisor that stamps nothing (section 11.8). Files always carry

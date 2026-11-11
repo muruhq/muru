@@ -438,6 +438,33 @@ pub fn count_worker_event(app: &str, release: &str, kind: &str, group: &str, rea
         .or_default() += 1;
 }
 
+/// Lines of each release's output its relay dropped, by application and
+/// release (section 11.3).
+static OUTPUT_DROPPED: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
+
+/// Note what a release's relay reports it has dropped so far.
+pub fn set_output_dropped(app: &str, release: &str, total: u64) {
+    OUTPUT_DROPPED
+        .lock()
+        .expect("output dropped poisoned")
+        .insert((app.to_owned(), release.to_owned()), total);
+}
+
+fn output_dropped_samples() -> Vec<muru_edge::metrics::Sample> {
+    OUTPUT_DROPPED
+        .lock()
+        .expect("output dropped poisoned")
+        .iter()
+        .map(|((app, release), total)| {
+            muru_edge::metrics::Sample::new(
+                "muru_app_output_dropped_total",
+                &[("app", app.as_str()), ("release", release.as_str())],
+                *total as f64,
+            )
+        })
+        .collect()
+}
+
 fn worker_event_samples() -> Vec<muru_edge::metrics::Sample> {
     WORKER_EVENTS
         .lock()
@@ -473,7 +500,8 @@ pub fn metrics_text(
         .into_iter()
         .chain(pool_samples(&routing))
         .chain(connections.samples())
-        .chain(worker_event_samples());
+        .chain(worker_event_samples())
+        .chain(output_dropped_samples());
     render(&aggregate(samples))
 }
 
