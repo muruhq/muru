@@ -7452,7 +7452,7 @@ async fn run_own(
 
     let request = muru_controller::commands::CommandRequest::from_message(request)
         .map_err(anyhow::Error::msg)?;
-    let context = crate::project_commands::own(project).await?;
+    let context = crate::project_commands::own(project, &request).await?;
     let prepared =
         crate::project_commands::prepare(&context, request).map_err(anyhow::Error::msg)?;
 

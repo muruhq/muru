@@ -300,6 +300,47 @@ enum Command {
         #[command(subcommand)]
         command: edge::EdgeCommand,
     },
+
+    /// Run a release's log relay (internal, started beside each host).
+    Relay {
+        #[command(subcommand)]
+        command: RelayCommand,
+    },
+}
+
+/// The relay subcommands.
+#[derive(Subcommand)]
+enum RelayCommand {
+    /// Relay a host's and its workers' output to a release log or to standard error.
+    Run(RelayRunArgs),
+}
+
+/// What a relay is started with.
+#[derive(Args)]
+struct RelayRunArgs {
+    /// The Unix socket the host listens on for its relay, unless it serves in its own process.
+    #[arg(long, value_name = "PATH")]
+    connect: Option<PathBuf>,
+
+    /// The Unix socket to serve the relay's reports on.
+    #[arg(long, value_name = "PATH")]
+    control: PathBuf,
+
+    /// The inherited read end of the host's own output.
+    #[arg(long, value_name = "FD")]
+    host_output_fd: Option<i32>,
+
+    /// The release log to write, reopened by name on SIGUSR1; standard error without it.
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
+
+    /// Each worker's queue, in bytes.
+    #[arg(long, value_name = "BYTES", default_value_t = muru_controller::relay::DEFAULT_QUEUE)]
+    queue: usize,
+
+    /// What a full queue does: drop_oldest or block.
+    #[arg(long, value_name = "WHAT", default_value = "drop_oldest", value_parser = muru_controller::relay::Overflow::parse)]
+    on_overflow: muru_controller::relay::Overflow,
 }
 
 /// What `serve-static` takes.
@@ -929,12 +970,31 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Section 11.3: a relay runs beside every host and brings its own
+    // small runtime, so it starts none of this one's threads.
+
+    let command = match cli.command {
+        Command::Relay {
+            command: RelayCommand::Run(args),
+        } => {
+            return muru_controller::relay::run(muru_controller::relay::RelayArgs {
+                connect: args.connect,
+                control: args.control,
+                host_output_fd: args.host_output_fd,
+                log_file: args.log_file,
+                queue: args.queue,
+                overflow: args.on_overflow,
+            });
+        }
+        other => other,
+    };
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let json = asks_for_json(std::env::args_os());
 
-    let result = match cli.command {
+    let result = match command {
         Command::Run(args) => runtime.block_on(run(*args)),
         Command::Serve(args) => runtime.block_on(serve::serve(*args)),
         Command::Probe(args) => serve::probe(args),
@@ -1098,6 +1158,7 @@ fn main() -> anyhow::Result<()> {
         Command::Edge {
             command: edge::EdgeCommand::Run(args),
         } => runtime.block_on(edge::run(*args)),
+        Command::Relay { .. } => unreachable!("a relay runs before the runtime is built"),
     };
 
     // A command asked for JSON fails in JSON too: the sentence muructl
@@ -2782,6 +2843,29 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     run_with(args, None, None).await
 }
 
+/// What hears a release's relay in a run: its counts go to the metrics
+/// and its stalls to muructl events (section 11.3). Its lines reach the
+/// terminal through the relay's own output.
+fn relay_watcher(
+    label: &str,
+    release: &str,
+    events: &Arc<run_admin::RunEvents>,
+) -> muru_controller::host::RelayWatcher {
+    let (label, release) = (label.to_owned(), release.to_owned());
+    let events = Arc::clone(events);
+
+    Arc::new(move |news| match news {
+        muru_controller::host::RelayNews::Dropped(total) => {
+            run_admin::set_output_dropped(&label, &release, total);
+        }
+        muru_controller::host::RelayNews::Event {
+            kind,
+            level,
+            message,
+        } => events.record(&kind, &format!("{label}@{release}"), &level, &message),
+    })
+}
+
 /// Serve as `muructl run` does, or as `muructl serve` with `serve`
 /// (section 13.9): production behaviours, one run directory, no
 /// installs, the admin port, and every line on standard output.
@@ -2866,6 +2950,163 @@ async fn run_with(
         muru_common::muru_println!("{note}");
     }
 
+    // Every flag and setting is checked before anything is built or
+    // provisioned, so a mistake in one is reported as itself rather than
+    // as whatever provisioning met first, such as a runtime library that
+    // cannot be fetched while offline. Certificates are sorted out here
+    // too, so a bad --tls-cert or an unwritable cache fails with nothing
+    // to clean up.
+
+    let tls = tls(&args, &resolved.serving, &resolved.project)?;
+
+    let access_log_file = resolved
+        .serving
+        .access_log_file
+        .as_ref()
+        .map(|file| resolved.project.join(file));
+    let access_log = access_log_config(
+        &resolved.serving.access_log,
+        access_log_file.as_deref(),
+        muru_edge::access::Filter {
+            slow: resolved.serving.slow,
+            exclude: resolved.serving.access_log_exclude.clone(),
+            ..muru_edge::access::Filter::default()
+        },
+    )?;
+    let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
+    let memory = memory_policy(&args.memory, resolved.memory.as_ref())?;
+    let requests_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
+    let stop_budget = requests_budget + timeouts.exit_grace;
+
+    // The application's name, as the edge labels it and muru.context()
+    // reports it, so a command the log names works as it is.
+
+    let label = match &args.name {
+        Some(name) if muru_config::valid_name(name) => name.clone(),
+        Some(name) => anyhow::bail!(
+            "{name:?} is not a valid application name: lowercase letters, digits and hyphens, up \
+             to 63 characters"
+        ),
+        None => app_name(&resolved.project, &resolved.entrypoint),
+    };
+
+    let groups = resolved
+        .groups
+        .iter()
+        .map(|(name, group)| {
+            Ok(muru_controller::host::HostGroup {
+                name: name.clone(),
+                processes: group.processes.unwrap_or(resolved.processes),
+                threads: group.threads.unwrap_or(resolved.threads),
+                sync_threads: group.sync_threads.unwrap_or(resolved.sync_threads),
+                concurrency: group.concurrency.unwrap_or(resolved.concurrency),
+                timeouts: group_timeouts(name, group.timeouts.as_ref(), &timeouts)?,
+                memory: group_memory(name, group.memory.as_ref(), &memory)?,
+                max_requests: match group.max_requests {
+                    Some(0) => {
+                        anyhow::bail!("[tool.muru.groups.{name}] max_requests must be at least 1")
+                    }
+                    Some(count) => Some(count),
+                    None => resolved.max_requests,
+                },
+                max_lifetime: match &group.max_lifetime {
+                    Some(text) => {
+                        let lifetime = muru_config::parse_duration(text).map_err(|error| {
+                            anyhow::anyhow!("[tool.muru.groups.{name}] max_lifetime: {error}")
+                        })?;
+                        anyhow::ensure!(
+                            !lifetime.is_zero(),
+                            "[tool.muru.groups.{name}] max_lifetime must be longer than nothing"
+                        );
+                        Some(lifetime)
+                    }
+                    None => resolved.max_lifetime,
+                },
+                optional: group.optional.unwrap_or(false),
+                mounts: group.mounts.clone(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let env = resolved
+        .env
+        .iter()
+        .map(|(name, value)| match value {
+            muru_config::EnvValue::Plain(text) => Ok((name.clone(), text.clone())),
+            muru_config::EnvValue::Secret(_) => Err(anyhow::anyhow!(
+                "[tool.muru.env] {name}: secrets are resolved by the daemon; a development \
+                 run cannot deliver them"
+            )),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    // The reload watch is made here, so a pattern that does not parse is
+    // refused with the other settings. Includes add to the default and
+    // excludes win over includes, so a run that watches templates alone
+    // excludes **/*.py rather than losing it by naming a pattern.
+
+    let mut include = vec![RELOAD_INCLUDE.to_owned()];
+    include.extend(resolved.serving.reload_include.iter().cloned());
+
+    let reload_watch = if resolved.serving.reload {
+        let directories = if resolved.serving.reload_dirs.is_empty() {
+            vec![resolved.project.clone()]
+        } else {
+            resolved
+                .serving
+                .reload_dirs
+                .iter()
+                .map(|directory| resolved.project.join(directory))
+                .collect()
+        };
+        let directories: Vec<PathBuf> = directories
+            .into_iter()
+            .map(|directory| directory.canonicalize().unwrap_or(directory))
+            .collect();
+
+        Some(
+            Watch::new(directories, &include, &resolved.serving.reload_exclude)?.with_files(
+                muru_provision::build::TRIGGER_FILES
+                    .iter()
+                    .map(|name| resolved.project.join(name))
+                    .collect(),
+            ),
+        )
+    } else {
+        None
+    };
+
+    // Section 4.9: the application's own directories of files, under
+    // the project, each checked to exist before anything starts.
+
+    let static_paths = static_paths(&resolved)?;
+
+    // Section 4.12: the project's error pages, with files under it.
+
+    muru_config::check_error_pages(&resolved.error_pages, true)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    if let Some(table) = &resolved.error_override {
+        muru_config::check_error_override(table)
+            .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+    }
+
+    let error_policy = Arc::new(
+        muru_edge::errors::ErrorPolicy::load(
+            &muru_controller::daemon::error_pages_message(
+                &resolved.error_pages,
+                Some(&resolved.project),
+            ),
+            resolved
+                .error_override
+                .as_ref()
+                .map(muru_controller::daemon::error_override_message)
+                .as_ref(),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?,
+    );
+
     // Section 8.2: run is build under the build mode, then serve. A
     // project with a lock and no environment is built once; an existing
     // one is used as it is, and said to be behind the lock when it is.
@@ -2929,11 +3170,6 @@ async fn run_with(
         }
     }
 
-    // Certificates are sorted out before anything is started, so a bad
-    // --tls-cert or an unwritable cache fails with nothing to clean up.
-
-    let tls = tls(&args, &resolved.serving, &resolved.project)?;
-
     let run_dir = match &serve {
         Some(mode) => {
             serve::make_run_dir(&mode.run_dir)?;
@@ -2947,37 +3183,6 @@ async fn run_with(
     if serve.is_some() {
         serve::group_writable(&run_dir, 0o770);
     }
-
-    let access_log_file = resolved
-        .serving
-        .access_log_file
-        .as_ref()
-        .map(|file| resolved.project.join(file));
-    let access_log = access_log_config(
-        &resolved.serving.access_log,
-        access_log_file.as_deref(),
-        muru_edge::access::Filter {
-            slow: resolved.serving.slow,
-            exclude: resolved.serving.access_log_exclude.clone(),
-            ..muru_edge::access::Filter::default()
-        },
-    )?;
-    let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
-    let memory = memory_policy(&args.memory, resolved.memory.as_ref())?;
-    let requests_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
-    let stop_budget = requests_budget + timeouts.exit_grace;
-
-    // The application's name, as the edge labels it and muru.context()
-    // reports it, so a command the log names works as it is.
-
-    let label = match &args.name {
-        Some(name) if muru_config::valid_name(name) => name.clone(),
-        Some(name) => anyhow::bail!(
-            "{name:?} is not a valid application name: lowercase letters, digits and hyphens, up \
-             to 63 characters"
-        ),
-        None => app_name(&resolved.project, &resolved.entrypoint),
-    };
 
     let mut spec = HostSpec {
         python: python.python.clone(),
@@ -3002,43 +3207,8 @@ async fn run_with(
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
         single: args.single,
         detach_to: None,
-        groups: resolved
-            .groups
-            .iter()
-            .map(|(name, group)| {
-                Ok(muru_controller::host::HostGroup {
-                    name: name.clone(),
-                    processes: group.processes.unwrap_or(resolved.processes),
-                    threads: group.threads.unwrap_or(resolved.threads),
-                    sync_threads: group.sync_threads.unwrap_or(resolved.sync_threads),
-                    concurrency: group.concurrency.unwrap_or(resolved.concurrency),
-                    timeouts: group_timeouts(name, group.timeouts.as_ref(), &timeouts)?,
-                    memory: group_memory(name, group.memory.as_ref(), &memory)?,
-                    max_requests: match group.max_requests {
-                        Some(0) => anyhow::bail!(
-                            "[tool.muru.groups.{name}] max_requests must be at least 1"
-                        ),
-                        Some(count) => Some(count),
-                        None => resolved.max_requests,
-                    },
-                    max_lifetime: match &group.max_lifetime {
-                        Some(text) => {
-                            let lifetime = muru_config::parse_duration(text).map_err(|error| {
-                                anyhow::anyhow!("[tool.muru.groups.{name}] max_lifetime: {error}")
-                            })?;
-                            anyhow::ensure!(
-                                !lifetime.is_zero(),
-                                "[tool.muru.groups.{name}] max_lifetime must be longer than nothing"
-                            );
-                            Some(lifetime)
-                        }
-                        None => resolved.max_lifetime,
-                    },
-                    optional: group.optional.unwrap_or(false),
-                    mounts: group.mounts.clone(),
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?,
+        relay: muru_controller::host::RelaySettings::default(),
+        groups,
         mounts: resolved
             .mounts
             .iter()
@@ -3071,17 +3241,7 @@ async fn run_with(
         memory: memory.clone(),
         memory_budget: serve.as_ref().and_then(|mode| mode.memory_budget),
         cgroup: serve.as_ref().and_then(|mode| mode.cgroup.clone()),
-        env: resolved
-            .env
-            .iter()
-            .map(|(name, value)| match value {
-                muru_config::EnvValue::Plain(text) => Ok((name.clone(), text.clone())),
-                muru_config::EnvValue::Secret(_) => Err(anyhow::anyhow!(
-                    "[tool.muru.env] {name}: secrets are resolved by the daemon; a development \
-                     run cannot deliver them"
-                )),
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?,
+        env,
         shown_env: resolved.env.keys().cloned().collect(),
         identity: None,
     };
@@ -3115,37 +3275,6 @@ async fn run_with(
         resolved.sendfile_header.as_deref().unwrap_or_default(),
     );
 
-    // Section 4.9: the application's own directories of files, under
-    // the project, each checked to exist before anything starts.
-
-    let static_paths = static_paths(&resolved)?;
-
-    // Section 4.12: the project's error pages, with files under it.
-
-    muru_config::check_error_pages(&resolved.error_pages, true)
-        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
-
-    if let Some(table) = &resolved.error_override {
-        muru_config::check_error_override(table)
-            .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
-    }
-
-    let error_policy = Arc::new(
-        muru_edge::errors::ErrorPolicy::load(
-            &muru_controller::daemon::error_pages_message(
-                &resolved.error_pages,
-                Some(&resolved.project),
-            ),
-            resolved
-                .error_override
-                .as_ref()
-                .map(muru_controller::daemon::error_override_message)
-                .as_ref(),
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?,
-    );
-
     // Section 13.9: the admin port and the probe socket answer while the
     // application loads, the startup and readiness probes failing until
     // it is served.
@@ -3168,7 +3297,16 @@ async fn run_with(
         None => None,
     };
 
-    let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
+    // Section 13.1: the events the hosts raise, kept for muructl events.
+
+    let run_events = Arc::new(run_admin::RunEvents::default());
+    let mut current = HostProcess::start(
+        &spec,
+        &run_dir,
+        1,
+        &logs,
+        relay_watcher(&label, "r1", &run_events),
+    )?;
 
     if let Err(error) = current.wait_ready(START_TIMEOUT).await {
         current.stop(stop_budget).await;
@@ -3183,9 +3321,6 @@ async fn run_with(
 
     let host_link: SharedHostLink = Arc::new(std::sync::Mutex::new(HostLink::default()));
 
-    // Section 13.1: the events the hosts raise, kept for muructl events.
-
-    let run_events = Arc::new(run_admin::RunEvents::default());
     host_link
         .lock()
         .expect("host link poisoned")
@@ -3476,36 +3611,7 @@ async fn run_with(
     let mut requires_python =
         muru_provision::interpreter::requires_python(&resolved.project).map(|set| set.to_string());
 
-    if resolved.serving.reload {
-        let directories = if resolved.serving.reload_dirs.is_empty() {
-            vec![resolved.project.clone()]
-        } else {
-            resolved
-                .serving
-                .reload_dirs
-                .iter()
-                .map(|directory| resolved.project.join(directory))
-                .collect()
-        };
-        let directories: Vec<PathBuf> = directories
-            .into_iter()
-            .map(|directory| directory.canonicalize().unwrap_or(directory))
-            .collect();
-
-        // Includes add to the default and excludes win over includes, so
-        // a run that watches templates alone excludes **/*.py rather
-        // than losing it by naming a pattern.
-
-        let mut include = vec![RELOAD_INCLUDE.to_owned()];
-        include.extend(resolved.serving.reload_include.iter().cloned());
-        let watch = Watch::new(directories, &include, &resolved.serving.reload_exclude)?
-            .with_files(
-                muru_provision::build::TRIGGER_FILES
-                    .iter()
-                    .map(|name| resolved.project.join(name))
-                    .collect(),
-            );
-
+    if let Some(watch) = reload_watch {
         let except = if resolved.serving.reload_exclude.is_empty() {
             String::new()
         } else {
@@ -3709,7 +3815,9 @@ async fn run_with(
                 loop {
                     release += 1;
 
-                    let mut next = match HostProcess::start(&spec, &run_dir, release, &logs) {
+                    let watcher = relay_watcher(&label, &format!("r{release}"), &run_events);
+
+                    let mut next = match HostProcess::start(&spec, &run_dir, release, &logs, watcher) {
                         Ok(next) => next,
                         Err(error) => {
                             muru_common::muru_println!("release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);

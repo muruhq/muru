@@ -9,6 +9,117 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a23 (2026-11-11)
+
+### Added
+
+- Added `[logs] reopen_on_rename`, true by default: the daemon notices
+  within a few seconds, and at start, that logrotate or anything else has
+  renamed one of its log files away, and has every writer open its file
+  again by name. One logrotate entry with `delaycompress`, and no
+  `postrotate` or `copytruncate`, now covers every log the daemon writes. ([#166](https://github.com/muruhq/muru/issues/166))
+- Each release now has a log relay, a small process beside its host that
+  reads the output of the host and its workers and writes it to the
+  release log, or to muructl's output under `muructl run` and `muructl
+  serve`. A log that stalls or cannot be written no longer holds up the
+  host or the requests it serves. ([#167](https://github.com/muruhq/muru/issues/167))
+- Added a `[logging.python]` table to the daemon's configuration file, which
+  sets Python logging defaults for every application, merged key by key
+  under the application's and the release's own, and a `warnings` key at
+  every layer: warnings filters in `-W` syntax, applied before the
+  application is imported. `muructl config show --effective` names the
+  layer of each logging key. ([#169](https://github.com/muruhq/muru/issues/169))
+- `muructl logging level APP` with no level and no `--reset` lists the
+  logger levels each worker has changed, with the level each replaced and
+  when it reverts, and `muructl debug bundle` now collects them in
+  `config/logger-levels.json`. ([#558](https://github.com/muruhq/muru/issues/558))
+- Added `--archives` to `muructl logs list`, which lists each archive under
+  its log with its size and when it was last written, and a target (an
+  application, `APP@RELEASE`, `--access` or `--host HOST`) that narrows the
+  list to those logs. The JSON output gives each log's `modified_unix_ms`. ([#565](https://github.com/muruhq/muru/issues/565))
+- Added `muructl logs --edge` and `muructl logs --daemon`, which show or
+  follow `edge.log` and `daemon.log` and read them from the log directory
+  when no daemon is running. `muructl daemon status` names the daemon's
+  configuration file and its log and cache directories beside the state
+  and run directories and the socket, and with no daemon running says where
+  they would be and exits with status 3. ([#566](https://github.com/muruhq/muru/issues/566))
+- `muructl logs APP[@RELEASE]` and `muructl logs --access` work with no
+  daemon running, reading the file in the log directory as `--edge` and
+  `--daemon` do. An application named alone and `--access --host HOST` read
+  the state store to find the current release and the host's records. ([#569](https://github.com/muruhq/muru/issues/569))
+- Added `muructl debug logging`, which shows the logging and warnings setup
+  each worker of a release has in force: every logger with its level,
+  effective level, handlers and where its level came from, the logging
+  module's own switches and the warnings filters. `muructl debug bundle`
+  keeps each running release's in `config/logging-setup.json`. ([#576](https://github.com/muruhq/muru/issues/576))
+
+### Changed
+
+- The edge opens `edge.log` again by name on SIGUSR1, as the other writers
+  open theirs, so built-in rotation and `muructl logs truncate` rename and
+  reopen it with no lines lost, rather than copying and truncating it in
+  place. ([#166](https://github.com/muruhq/muru/issues/166))
+- Output a release's log cannot keep up with now waits in a queue for
+  each worker, 1 MB by default and set with `[logs] output_queue`. With
+  `[logs] on_overflow = "drop_oldest"`, the default, a full queue drops
+  its oldest lines and a line says how many went where they were; with
+  `"block"` only the worker whose queue is full waits. Lines dropped are
+  counted in `muru_app_output_dropped_total`, and `output.dropping`,
+  `output.held`, `output.failing` and `output.caught_up` events report
+  each stall. ([#167](https://github.com/muruhq/muru/issues/167))
+- An exception the application does not catch, and one a hook raises, is
+  logged on the `muru` logger at `ERROR` with its traceback and the
+  request's id, so it reaches the application's own handlers and joins its
+  access log line under `--log-format json`. When the application's
+  logging would not show it, the traceback is written to standard error as
+  before. ([#290](https://github.com/muruhq/muru/issues/290))
+
+### Fixed
+
+- `muructl daemon start` reports a daemon that exits before it answers at
+  once, with its exit status and the last lines it wrote to `daemon.log`,
+  instead of waiting 30 seconds and saying it did not answer. ([#567](https://github.com/muruhq/muru/issues/567))
+- Every line Muru writes to `daemon.log` and `edge.log` starts with the
+  full UTC time: the locations the daemon prints at start, the edge's lines
+  about draining and the error a daemon exits with, which is written as one
+  line. Output to a terminal is unchanged, with no time unless
+  `--timestamps` is given. ([#568](https://github.com/muruhq/muru/issues/568))
+- A panic in muructl, the daemon or the edge is reported as `muru: panic:`
+  lines, with the full UTC time in front in `daemon.log` and `edge.log` as
+  every other line there has, and one line for each frame of its
+  backtrace when `RUST_BACKTRACE` is set. Under `--log-format json` it is a
+  single record of kind `panic`. ([#571](https://github.com/muruhq/muru/issues/571))
+- A release's host no longer stops when it cannot write a worker's output,
+  for example when the disk holding the log directory is full. It drops
+  the lines it cannot write, keeps serving, and writes a line saying how
+  many it dropped once it can write again. ([#572](https://github.com/muruhq/muru/issues/572))
+- Under `muructl run` and `muructl serve`, a terminal or container runtime
+  that stops reading muructl's output no longer holds up the threads that
+  serve requests, the admin socket and the probes: the output is written
+  by a thread of its own. ([#573](https://github.com/muruhq/muru/issues/573))
+- A development run's access log file, set with `--access-log-file`, is
+  opened again by name on `muructl logs reopen` and on SIGUSR1 to the run,
+  so it can be rotated. SIGUSR1 to a run no longer ends it, and without a
+  file `muructl logs reopen` says that no access log file is set. ([#574](https://github.com/muruhq/muru/issues/574))
+- `muructl run` checks its flags and settings before it builds the project
+  or provisions the runtime library, so a wrong value, such as an
+  `--access-log` destination or a `--reload-include` pattern that does not
+  parse, is reported as itself rather than as a runtime library that
+  cannot be fetched while offline. A bad reload pattern no longer starts
+  the application first. ([#578](https://github.com/muruhq/muru/issues/578))
+- `muructl command run` against a project with nothing serving it checks
+  the command's name and inputs before it provisions the runtime library,
+  so a mistake in them is reported as itself rather than as a runtime
+  library that cannot be fetched while offline. ([#584](https://github.com/muruhq/muru/issues/584))
+
+### Documentation
+
+- The process models page no longer says that ASGI WebSockets have a limit
+  of their own: each open WebSocket holds a place of the event loop's
+  `concurrency`, and only an ASGI mount that sets `max_connections` counts
+  its open sockets apart. ([#575](https://github.com/muruhq/muru/issues/575))
+
+
 ## 0.1.0a22 (2026-11-10)
 
 ### Added

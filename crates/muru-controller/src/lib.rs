@@ -29,6 +29,7 @@ pub mod model;
 pub mod notify;
 pub mod overlays;
 pub mod provision;
+pub mod relay;
 pub mod reload;
 pub mod removal;
 pub mod renames;

@@ -300,6 +300,11 @@ pub fn split_time(line: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// The time a full-form stamp names, as `split_time` gives it.
+pub fn parse_full(stamp: &str) -> Option<SystemTime> {
+    stamp.parse::<Timestamp>().ok().map(SystemTime::from)
+}
+
 /// Write one line to `stream`: the full time when the stream is stamped,
 /// then `tag: ` and the message, in one write so lines from several
 /// threads never interleave.

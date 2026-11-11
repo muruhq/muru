@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 import pytest
+from support import provisioning as prov
 from support import server as support
 
 PROJECT = """[tool.muru]
@@ -196,7 +197,16 @@ def test_a_command_runs_on_its_own_when_nothing_serves_the_project(
     assert ran.stderr == "to standard error\n"
 
     failed = muructl(
-        runtime, project, "command", "run", "greet", "--input", "name=x", "--input", "status=3"
+        runtime,
+        project,
+        "command",
+        "run",
+        "greet",
+        "--input",
+        "name=x",
+        "--input",
+        "status=3",
+        *python,
     )
     assert failed.returncode == 3
     assert "muru: the command exited with status 3" in failed.stderr
@@ -319,6 +329,33 @@ def test_a_command_runs_on_its_own_when_nothing_serves_the_project(
     empty = muructl(runtime, tmp_path, "command", "run", "greet")
     assert empty.returncode != 0
     assert "has no pyproject.toml or muru.toml to declare greet in" in empty.stderr
+
+
+def test_a_mistake_is_refused_before_anything_is_provisioned(
+    project: Path, runtime: Path, tmp_path: Path
+) -> None:
+    """The command runs offline, with an interpreter that has no muru and
+    no wheel to give it one, so a check made after provisioning would
+    fail on the library instead."""
+
+    python = str(prov.bare_venv(tmp_path / "venv"))
+
+    for arguments, message in [
+        (["command", "run", "nope"], "has no command named nope; it declares greet, hold"),
+        (["command", "run", "greet"], "greet needs the input name"),
+    ]:
+        refused = subprocess.run(
+            command(runtime, project, *arguments, "--python", python),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+            cwd=project,
+            stdin=subprocess.DEVNULL,
+            env={**environment(runtime), **prov.offline_env(tmp_path)},
+        )
+        assert refused.returncode != 0
+        assert message in refused.stderr, refused.stderr
 
 
 def test_a_command_runs_through_a_development_run_of_the_project(

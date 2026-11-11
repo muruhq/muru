@@ -100,7 +100,8 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | schedules (name, start and end or cron and duration, timezone, group, min_workers, max_workers, warm_up, scale_in, freeze_deploys) | application, group | none | 7.5 |
 | wsgi_multiprocess, wsgi_multithread | release | auto | 6.5 |
 | logging.python level, format, request_id, capture_warnings, loggers, warnings | global (the daemon's `[logging.python]`, read when a host starts), application, release, merged key by key with `loggers` by name and `warnings` added, the more specific layer's last | WARNING (Python default), standard, false, false, none, none | 11.4 |
-| rotate (size, every, keep, compress, naming), reopen_on_rename, on_overflow | log sinks | daily, 14, zstd, built-in; reopen_on_rename true (checked every 5 s and at start, under the daemon) | 11.3 |
+| rotate (size, every, keep, compress, naming), reopen_on_rename | log sinks | daily, 14, zstd, built-in; reopen_on_rename true (checked every 5 s and at start, under the daemon) | 11.3 |
+| on_overflow, output_queue | `[logs]` | drop_oldest, 1MB | 11.3 |
 | readiness, liveness (path, timeout, expect, required, interval, failures), checks | mount, release | none (built-in signals only) | 9.11 |
 | compression (enabled, encodings, min_size, types, level) | global, host, route | enabled, br zstd gzip, 1KB, text and JSON types, default | 4.17 |
 | decompress_requests | route | false | 4.17 |
@@ -141,7 +142,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.oom_killed, worker.recycled, worker.timeout_killed, worker.loop_stalled, worker.gil_stalled, worker.restarted, server.started, server.exited, server.failed |
 | Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired, schedule.over_budget |
 | Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened, logs.rotated, logs.truncated, logs.pruned, clock.unsynchronised, clock.synchronised |
-| Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable |
+| Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable, output.dropping, output.held, output.failing, output.caught_up, output.relay_restarting |
 | Overlays | overlay.activated, overlay.ended, overlay.skipped, overlay.would_activate, overlay.warming, overlay.promoted |
 | Clients | ratelimit.enforcing, client_class.list_reloaded |
 | Dashboard | dashboard.login_issued, dashboard.action |

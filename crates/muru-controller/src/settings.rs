@@ -61,6 +61,10 @@ pub struct NodeSettings {
     /// Whether a log file renamed away has its writer reopen it, with no
     /// signal (`[logs] reopen_on_rename`, section 11.3).
     pub reopen_on_rename: bool,
+    /// What each release's log relay queues and does when full (`[logs]
+    /// output_queue` and `on_overflow`, section 11.3), taken when a host
+    /// starts.
+    pub relay: crate::host::RelaySettings,
     /// The Python logging defaults every release starts with, under its
     /// own (`[logging.python]`, section 11.4), taken when a host starts.
     pub python_logging: muru_config::PythonLogging,
@@ -193,6 +197,7 @@ impl NodeSettings {
                 .as_ref()
                 .and_then(|logs| logs.reopen_on_rename)
                 .unwrap_or(true),
+            relay: relay_from(document)?,
             python_logging,
             access_log: access_log_from(document)?,
             timestamps: document
@@ -456,6 +461,34 @@ fn listener_limits_from(
     }
 
     Ok(all)
+}
+
+/// What each release's log relay queues and does when full, from the
+/// [logs] table.
+fn relay_from(document: &muru_config::Document) -> Result<crate::host::RelaySettings, String> {
+    let mut settings = crate::host::RelaySettings::default();
+    let Some(logs) = &document.logs else {
+        return Ok(settings);
+    };
+
+    if let Some(text) = &logs.on_overflow {
+        settings.overflow =
+            crate::relay::Overflow::parse(text).map_err(|error| format!("[logs] {error}"))?;
+    }
+
+    if let Some(text) = &logs.output_queue {
+        let bytes = muru_config::parse_size(text)
+            .map_err(|error| format!("[logs] output_queue: {error}"))?;
+
+        if bytes < crate::relay::MIN_QUEUE as u64 {
+            return Err(format!("[logs] output_queue = {text:?} is less than 64KB"));
+        }
+
+        settings.queue = usize::try_from(bytes)
+            .map_err(|_| format!("[logs] output_queue = {text:?} is too large"))?;
+    }
+
+    Ok(settings)
 }
 
 /// Which records the access log writes, from the [logs] table, with the

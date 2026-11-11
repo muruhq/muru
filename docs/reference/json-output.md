@@ -94,7 +94,7 @@ $ muructl release show shop@r9 --json
 | `muructl command list` | `app`, `release` and `commands`, each with `name`, `description`, `run` or `call`, `inputs` (`name`, `description`, `required`, `default`, `pattern`, `secret`), `timeout`, `exclusive` and its `last_run` (`release`, `started_unix_ms`, `duration_ms`, `exit_code`, `ok`, `message`), which only the daemon keeps. `release` is empty for a project's commands listed with nothing serving it |
 | `muructl command run` | As `muructl exec` prints it |
 | `muructl exec` | One object per line of output, with `release`, `line` and `stderr`, then one with `finished` true, the `exit_code`, `ok`, true when the command exited with 0 and was not stopped, and the ending as a `message`. `release` is empty for a command `muructl` runs itself |
-| `muructl logs reopen` | What reopened its files: `edge`, `hosts` |
+| `muructl logs reopen` | What reopened its files: `edge`, and `hosts`, the releases whose log relay was told to |
 | `muructl release prune` | `freed` (bytes), `dry_run`, `removed` and `kept`. `removed` holds what goes, each with `app`, `id`, `state`, `created_unix_ms`, `disk_bytes`, `why` (`keep` or `failed`) and `error` when it could not be removed or part of it was left behind. `kept` holds what stays, each with `app`, `id`, `state` and `why` (`serving`, `rollback`, `in_use`, `referenced`, `declared`, `keep` or `failed`) |
 | `muructl release remove` | As `muructl release prune` prints it, with `why` of `named` and an empty `kept` |
 | `muructl app remove` | As `muructl release prune` prints it, with `why` of `application` and an empty `kept` |

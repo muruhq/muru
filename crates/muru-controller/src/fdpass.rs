@@ -83,6 +83,59 @@ pub fn recv_fd(socket: &UnixStream) -> io::Result<OwnedFd> {
     }
 }
 
+/// Have a command's process start with `fd` open as `target`, however
+/// this process has it open.
+pub fn inherit_at(command: &mut std::process::Command, fd: RawFd, target: RawFd) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: dup2 and fcntl are async-signal-safe and the closure runs
+    // in the child between fork and exec, touching nothing else. `dup2`
+    // of a descriptor onto itself leaves its close-on-exec flag, so that
+    // case clears it instead.
+
+    unsafe {
+        command.pre_exec(move || {
+            let placed = if fd == target {
+                libc::fcntl(fd, libc::F_SETFD, 0)
+            } else {
+                libc::dup2(fd, target)
+            };
+
+            if placed < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            Ok(())
+        });
+    }
+}
+
+/// Whether anything still holds the write end of the pipe whose read end
+/// is `fd`.
+pub fn has_writers(fd: RawFd) -> bool {
+    // macOS reports a hang-up only to a poll that asks about reading.
+
+    let mut polled = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    // SAFETY: poll reads and writes the one pollfd it is given, which
+    // lives for the call, and a timeout of zero returns at once.
+
+    let ready = unsafe { libc::poll(&mut polled, 1, 0) };
+    ready >= 0 && polled.revents & libc::POLLHUP == 0
+}
+
+/// Take ownership of a descriptor this process was started with.
+pub fn take_inherited(fd: RawFd) -> OwnedFd {
+    // SAFETY: the descriptor was placed for this process at start, and
+    // nothing else in it owns it.
+
+    unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
 /// Room for one control message carrying one descriptor.
 const CONTROL_LEN: usize = 32;
 
@@ -120,5 +173,16 @@ mod tests {
         let mut text = String::new();
         copy.read_to_string(&mut text).unwrap();
         assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn a_pipe_has_writers_until_its_write_end_closes() {
+        use std::os::fd::AsRawFd as _;
+
+        let (read, write) = std::io::pipe().unwrap();
+        assert!(has_writers(read.as_raw_fd()));
+
+        drop(write);
+        assert!(!has_writers(read.as_raw_fd()));
     }
 }
