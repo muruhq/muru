@@ -152,8 +152,13 @@ jobs:
           enable-cache: true
       - run: uv sync --only-group docs
       - run: uv run sphinx-build -W --keep-going -b html docs docs/_build/html
-      # The PDF is built on Read the Docs; this checks its LaTeX source builds cleanly.
+      # Read the Docs publishes the PDF, and fails the whole build when it does
+      # not build, so the PDF is built here as it is there.
       - run: uv run sphinx-build -W --keep-going -b latex docs docs/_build/latex
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends latexmk texlive-latex-recommended texlive-latex-extra texlive-fonts-recommended tex-gyre
+      - run: make -C docs/_build/latex all-pdf LATEXMKOPTS="-interaction=nonstopmode -f"
 
   ci-ok:
     # One check for branch rules to require, so the job list and matrices can

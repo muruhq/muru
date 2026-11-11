@@ -479,10 +479,6 @@ worker 0 (pid 4242): root DEBUG (was WARNING), until reset
 worker 1 (pid 4243): no levels changed
 ```
 
-A reply is held to 256 MiB. Past that, the command says the reply was
-too large and to ask one worker with `--worker`, or a shorter `--for`
-for `profile`, or a smaller `--top` for `trace` and `memory`.
-
 ## Logging setup
 
 `muructl debug logging APP[@RELEASE]` shows the logging and warnings
@@ -546,6 +542,10 @@ profile read from outside the worker takes no thread of the worker and
 is not counted. The daemon never reaches into a worker process directly, which is what lets
 the same commands work on a release running as another user, and on
 an application in a container under `muructl serve`.
+
+A reply is held to 256 MiB. Past that, the command says the reply was
+too large and to ask one worker with `--worker`, or a shorter `--for`
+for `profile`, or a smaller `--top` for `trace` and `memory`.
 
 ## A report for a bug report
 
