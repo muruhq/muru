@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from support import provisioning as prov
 from support import server as support
 
 LINE = re.compile(
@@ -237,19 +238,35 @@ def test_errors_alone_can_go_to_a_file(tmp_path: Path) -> None:
         server.stop()
 
 
-def test_a_destination_is_not_a_value_of_access_log() -> None:
+@pytest.mark.parametrize(
+    ("flags", "refusal"),
+    [
+        (["--access-log", "terminal"], '--access-log "terminal" is not on, errors or off'),
+        (["--reload", "--reload-include", "[a"], 'invalid pattern "[a"'),
+    ],
+    ids=["access-log", "reload-include"],
+)
+def test_a_bad_flag_is_refused_before_anything_is_provisioned(
+    tmp_path: Path, flags: list[str], refusal: str
+) -> None:
+    """The run is offline, with an interpreter that has no muru and no
+    wheel to give it one, so a check made after provisioning would fail on
+    the library instead."""
+
     completed = subprocess.run(
         [
-            str(support.muructl_path()),
+            str(prov.muructl()),
             "run",
             "wsgi_conformance:application",
-            "--access-log",
-            "terminal",
+            "--python",
+            str(prov.bare_venv(tmp_path / "venv")),
+            *flags,
         ],
         cwd=support.FIXTURES,
+        env={**os.environ, **prov.offline_env(tmp_path)},
         capture_output=True,
         text=True,
         timeout=60,
     )
     assert completed.returncode != 0
-    assert '--access-log "terminal" is not on, errors or off' in completed.stderr
+    assert refusal in completed.stderr
