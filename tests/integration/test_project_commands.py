@@ -196,7 +196,16 @@ def test_a_command_runs_on_its_own_when_nothing_serves_the_project(
     assert ran.stderr == "to standard error\n"
 
     failed = muructl(
-        runtime, project, "command", "run", "greet", "--input", "name=x", "--input", "status=3"
+        runtime,
+        project,
+        "command",
+        "run",
+        "greet",
+        "--input",
+        "name=x",
+        "--input",
+        "status=3",
+        *python,
     )
     assert failed.returncode == 3
     assert "muru: the command exited with status 3" in failed.stderr
@@ -312,11 +321,11 @@ def test_a_command_runs_on_its_own_when_nothing_serves_the_project(
             "--chdir finds the project a command runs for when no application is named",
         ),
     ]:
-        refused = muructl(runtime, project, *arguments)
+        refused = muructl(runtime, project, *arguments, *python)
         assert refused.returncode != 0
         assert message in refused.stderr, refused.stderr
 
-    empty = muructl(runtime, tmp_path, "command", "run", "greet")
+    empty = muructl(runtime, tmp_path, "command", "run", "greet", *python)
     assert empty.returncode != 0
     assert "has no pyproject.toml or muru.toml to declare greet in" in empty.stderr
 

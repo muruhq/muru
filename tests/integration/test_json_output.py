@@ -27,7 +27,7 @@ def answer(daemon: Daemon, *arguments: str) -> Any:
 
 
 def test_read_commands_print_the_api_answers(daemon: Daemon) -> None:
-    deployed = answer(daemon, "deploy", "shop", str(SHOP))
+    deployed = answer(daemon, "deploy", "shop", str(SHOP), "--python", sys.executable)
     assert (deployed["app"], deployed["id"], deployed["state"]) == ("shop", "r1", "ready")
     assert deployed["serving"] is True
 
