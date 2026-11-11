@@ -9,6 +9,7 @@ import http.client
 import http.server
 import json
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -573,3 +574,95 @@ def test_the_dashboard_works_under_a_proxy_path_prefix(tmp_path: Path) -> None:
     finally:
         proxy.shutdown()
         daemon.stop()
+
+
+def test_the_processes_are_listed_as_the_daemon_supervises_them(
+    served: tuple[Daemon, int],
+) -> None:
+    """`muructl status --processes` (issue 595): the daemon, its edge, the
+    release's host with its relay and workers beneath it, titled as each
+    says; narrowed to an application; frame after frame with --watch; and
+    the dashboard's section from the same answer."""
+
+    daemon, port = served
+    assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+
+    def tree(*more: str) -> dict[str, Any]:
+        listed = daemon.muructl("status", "--processes", "--json", *more)
+        answer: dict[str, Any] = json.loads(listed.stdout)
+        return answer
+
+    def host_of(answer: dict[str, Any]) -> dict[str, Any]:
+        return next(child for child in answer["root"]["children"] if child["role"] == "host")
+
+    wait_for(lambda: len(host_of(tree())["children"]) == 3)
+    answer = tree()
+    root = answer["root"]
+    assert (answer["mode"], root["role"], root["pid"]) == ("daemon", "daemon", daemon.process.pid)
+    assert [child["role"] for child in root["children"]] == ["edge", "host"]
+    edge, host = root["children"]
+    assert edge["what"] == f"listening on 127.0.0.1:{daemon.port}"
+    assert host["what"] == "shop@r1"
+    relay, *workers = host["children"]
+    assert relay["what"] == "shop@r1 output to apps/shop/r1.log", relay
+    assert relay["os_parent_pid"] == root["pid"] and not relay["readopted"]
+    assert [(worker["group"], worker["index"]) for worker in workers] == [
+        ("default", 0),
+        ("default", 1),
+    ]
+    assert all(process["user"] and process["rss_bytes"] for process in [root, edge, host])
+
+    def title(pid: int) -> str:
+        return subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, check=False
+        ).stdout.strip()
+
+    assert title(root["pid"]) == "murud"
+    assert title(edge["pid"]) == "muru-edge"
+    assert title(host["pid"]) == "muru host shop@r1"
+    assert title(workers[0]["pid"]) == "muru worker shop@r1 default/0"
+
+    # On Linux the short name too, which top shows.
+
+    if sys.platform == "linux":
+        names = {
+            Path(f"/proc/{pid}/comm").read_text().strip()
+            for pid in (root["pid"], edge["pid"], host["pid"], relay["pid"], workers[0]["pid"])
+        }
+        assert names == {"murud", "muru-edge", "muru-host", "muru-relay", "muru-worker"}, names
+
+    # Narrowed to the application, the daemon stays and the edge goes.
+
+    narrowed = tree("--app", "shop@r1")
+    assert [child["role"] for child in narrowed["root"]["children"]] == ["host"]
+    text = daemon.muructl("status", "--processes").stdout
+    assert text.splitlines()[0].startswith("edge "), text
+    assert "USER" in text and "├─ edge" in text and "└─ host" in text, text
+
+    # --watch, not on a terminal, prints one JSON document a line.
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    socket = str(daemon.run_dir / "admin.sock")
+    watching = subprocess.Popen(
+        [str(muructl), "status", "--processes", "--watch", "200ms", "--json", "--socket", socket],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+    try:
+        assert watching.stdout is not None
+        frames = [json.loads(watching.stdout.readline()) for _ in range(2)]
+        assert frames[1]["sampled_unix_ms"] > frames[0]["sampled_unix_ms"]
+    finally:
+        watching.kill()
+        watching.wait()
+
+    # The dashboard shows the same processes.
+
+    shown = fetch_json(port, "/v1/processes")
+    assert [child["pid"] for child in host_of(shown)["children"]] == [
+        child["pid"] for child in host["children"]
+    ]
+    page = fetch(port, "/fragment/processes")[2].decode()
+    assert "<th>User</th>" in page and "shop@r1 output to apps/shop/r1.log" in page, page

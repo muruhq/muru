@@ -882,6 +882,26 @@ impl<W: Write> Bundle<'_, W> {
             self.put_scrubbed(&path, asked)?;
         }
 
+        // Section 13.10: the processes as `muructl status --processes`
+        // lists them, with the last second's figures.
+
+        let path = format!("{live}/processes.json");
+
+        if self.asks(&path) {
+            let asked = match &mut self.installation.live {
+                Some(running) => {
+                    within(running.client.list_processes(pb::ListProcessesRequest {
+                        app: self.target.app.clone(),
+                        ..pb::ListProcessesRequest::default()
+                    }))
+                    .await
+                }
+                None => Err(NOTHING_RUNS.to_owned()),
+            };
+
+            self.put_scrubbed(&path, asked)?;
+        }
+
         for sample in 2..=STACK_SAMPLES {
             if !self.archive.is_planned() && !releases.is_empty() {
                 tokio::time::sleep_until(started + STACK_INTERVAL * (sample - 1)).await;

@@ -21,7 +21,9 @@ held against its threads and ASGI requests against its event loop; an
 open WebSocket holding a slot is counted. The Workers link opens the pages the daemon's
 dashboard has for [looking into the workers](#looking-into-the-workers):
 each worker's status, stacks, tasks and memory, read through the run's
-admin socket. `--dashboard ADDRESS` moves it to another loopback address and
+admin socket. Its Processes section shows the run, its host, the log
+relay and the workers as [`muructl status
+--processes`](daemon.md#the-processes) does. `--dashboard ADDRESS` moves it to another loopback address and
 `--dashboard off` turns it off; with `--allow-public` it is off unless
 asked for. `/metrics` on the same address is the Prometheus exposition
 the [metrics guide](metrics.md) describes.
@@ -80,6 +82,14 @@ path, and open it with the trailing slash: `https://example.com/proxy/8090/`.
   threads and on their event loops (WebSockets hold one each), the
   WebSockets open, and requests waiting for a slot, with when maintenance mode began for an application
   in it, and the virtual hosts and routes when declared;
+- the processes, as [`muructl status
+  --processes`](daemon.md#the-processes) shows them: the daemon, the
+  edge, each release's host, log relay and workers, and managed server
+  instances, with their pids, users, uptime, CPU and memory, each
+  worker's requests per second, busy slots, p95 and GIL wait or loop
+  lag over the last second, and a host adopted again marked as one; a
+  worker's row links to its [worker page](#looking-into-the-workers),
+  and a host's or relay's to the logs below;
 - the [rollouts](rollouts.md) under way and the latest that ended, with
   the candidate's share and what each is doing or why it ended;
 - each running release's worker groups as the [autoscaler](scaling.md)
@@ -146,14 +156,15 @@ A token lasts twelve hours, or until the daemon restarts.
 | `/v1/requests` | recent requests, newest first |
 | `/v1/websockets` | the WebSockets open: `open`, `endpoints` counted by path pattern, and `sockets`, the longest open first |
 | `/v1/events` | recent events, newest first |
+| `/v1/processes` | the processes as `muructl status --processes --json` prints them |
 | `/v1/debug/OP?release=APP@RELEASE` | a release's workers' answers to `status`, `stacks`, `tasks` or `memory`, as `muructl debug OP --json` prints them, one worker with `&worker=N`; 409 when the release is not running |
 | `/v1/history?range=1h` | the charts' points: `[second, requests/s, errors/s, p50 ms, p95 ms, in flight, workers, WebSockets open]`, one a second for the last hour, or one a minute for the last day with `range=24h` |
 | `/v1/history/stream` | each new point as a Server-Sent Event of type `point` |
 | `/v1/events/stream` | each new event as it happens, as a rendered table row (type `event`) and as JSON (type `json`) |
 | `/metrics` | the Prometheus exposition, which needs no session |
 
-A development run serves `/v1/history`, `/v1/history/stream` and
-`/v1/websockets` too.
+A development run serves `/v1/history`, `/v1/history/stream`,
+`/v1/websockets` and `/v1/processes` too.
 The history is computed from the edge's own counters once a second (the
 daemon asks its edge for them), so rates are exact and the percentiles
 come from the request histogram; a day's points fold each minute's

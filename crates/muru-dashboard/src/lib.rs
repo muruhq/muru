@@ -13,10 +13,12 @@
 
 pub mod history;
 pub mod inspect;
+pub mod processes;
 pub mod signin;
 
 pub use history::{History, Point, Reading, Sampler};
 pub use inspect::{DebugAnswer, DebugAsk, DebugSource, WorkerAnswer};
+pub use processes::ProcessesSource;
 pub use signin::Sessions;
 
 use std::convert::Infallible;
@@ -680,6 +682,7 @@ pub async fn serve(
     metrics: MetricsSource,
     history: Arc<History>,
     debug: DebugSource,
+    processes: ProcessesSource,
 ) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
@@ -687,15 +690,17 @@ pub async fn serve(
         let metrics = Arc::clone(&metrics);
         let history = Arc::clone(&history);
         let debug = Arc::clone(&debug);
+        let processes = Arc::clone(&processes);
         tokio::spawn(async move {
             let service = service_fn(move |request| {
                 let source = Arc::clone(&source);
                 let metrics = Arc::clone(&metrics);
                 let history = Arc::clone(&history);
                 let debug = Arc::clone(&debug);
+                let processes = Arc::clone(&processes);
                 async move {
                     Ok::<_, Infallible>(
-                        respond(&request, &source, &metrics, &history, &debug).await,
+                        respond(&request, &source, &metrics, &history, &debug, &processes).await,
                     )
                 }
             });
@@ -720,6 +725,7 @@ async fn respond(
     metrics: &MetricsSource,
     history: &Arc<History>,
     debug: &DebugSource,
+    processes: &ProcessesSource,
 ) -> Response<Body> {
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served\n");
@@ -736,6 +742,10 @@ async fn respond(
     // Section 13.1: the worker pages, as the daemon's dashboard has them.
 
     if let Some(response) = inspect_paths(request, debug, "run").await {
+        return response;
+    }
+
+    if let Some(response) = processes_paths(request.uri().path(), processes, false).await {
         return response;
     }
 
@@ -862,6 +872,7 @@ fn plain_text(status: StatusCode, text: String) -> Response<Body> {
 /// the task is dropped. `history` holds the points the charts draw,
 /// `events` gives the events as they happen, for the events stream, and
 /// `debug` asks a release's workers what the inspection pages show.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_node(
     listener: TcpListener,
     source: NodeSource,
@@ -870,6 +881,7 @@ pub async fn serve_node(
     events: EventsSource,
     sessions: Arc<Sessions>,
     debug: DebugSource,
+    processes: ProcessesSource,
 ) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
@@ -879,6 +891,7 @@ pub async fn serve_node(
         let events = Arc::clone(&events);
         let sessions = Arc::clone(&sessions);
         let debug = Arc::clone(&debug);
+        let processes = Arc::clone(&processes);
         tokio::spawn(async move {
             let service = service_fn(move |request| {
                 let source = Arc::clone(&source);
@@ -887,10 +900,12 @@ pub async fn serve_node(
                 let events = Arc::clone(&events);
                 let sessions = Arc::clone(&sessions);
                 let debug = Arc::clone(&debug);
+                let processes = Arc::clone(&processes);
                 async move {
                     Ok::<_, Infallible>(
                         respond_node(
                             &request, &source, &metrics, &history, &events, &sessions, &debug,
+                            &processes,
                         )
                         .await,
                     )
@@ -907,6 +922,7 @@ pub async fn serve_node(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn respond_node(
     request: &Request<Incoming>,
     source: &NodeSource,
@@ -915,6 +931,7 @@ async fn respond_node(
     events: &EventsSource,
     sessions: &Sessions,
     debug: &DebugSource,
+    processes: &ProcessesSource,
 ) -> Response<Body> {
     // Section 10.7: the dashboard shows and never changes, so it serves
     // GET alone, signing in included.
@@ -979,6 +996,10 @@ async fn respond_node(
     }
 
     if let Some(response) = inspect_paths(request, debug, "daemon").await {
+        return response;
+    }
+
+    if let Some(response) = processes_paths(path, processes, true).await {
         return response;
     }
 
@@ -1154,6 +1175,47 @@ async fn inspect_paths(
             .render(),
         ),
     })
+}
+
+/// Sections 10.7 and 13.10: the Processes section's fragment, refreshed
+/// every two seconds, and the same answer as JSON at `/v1/processes`,
+/// both from the admin operation `muructl status --processes` reads. The
+/// user column is shown `with_user`, under the daemon.
+async fn processes_paths(
+    path: &str,
+    processes: &ProcessesSource,
+    with_user: bool,
+) -> Option<Response<Body>> {
+    if path != "/v1/processes" && path != "/fragment/processes" {
+        return None;
+    }
+
+    let answer = processes().await;
+
+    if path == "/v1/processes" {
+        return Some(match answer {
+            Ok(answer) => json(&answer),
+            Err(error) => plain_text(StatusCode::SERVICE_UNAVAILABLE, format!("{error}\n")),
+        });
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
+
+    let (rows, error) = match answer {
+        Ok(answer) => (processes::rows(&answer, now), String::new()),
+        Err(error) => (Vec::new(), error),
+    };
+
+    Some(page(
+        processes::ProcessesFragment {
+            rows: &rows,
+            with_user,
+            error: &error,
+        }
+        .render(),
+    ))
 }
 
 /// Whether a request names a live session, by a bearer token or its

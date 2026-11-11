@@ -17,6 +17,7 @@ import time
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from support import server as support
@@ -382,6 +383,56 @@ def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
 
         assert refused.value.code == 409
         assert "is not serving" in refused.value.read().decode()
+
+        # The process tree (issue 595): the run, its host with the relay
+        # and both workers beneath it, each process titled as it says.
+
+        def tree() -> dict[str, Any]:
+            listed = muructl(runtime, "status", "--processes", "--json", cwd=support.FIXTURES)
+            answer: dict[str, Any] = json.loads(listed.stdout)
+            return answer
+
+        deadline = time.monotonic() + 10
+
+        while len(tree()["root"]["children"][0]["children"]) < 3:
+            assert time.monotonic() < deadline, tree()
+            time.sleep(0.1)
+
+        answer = tree()
+        root = answer["root"]
+        assert (answer["mode"], root["role"], root["pid"]) == ("run", "run", server.process.pid)
+        [host] = root["children"]
+        assert (host["role"], host["what"]) == ("host", "plain_wsgi:application (r1)")
+        roles = [(child["role"], child["index"]) for child in host["children"]]
+        assert roles == [("relay", None), ("worker", 0), ("worker", 1)], roles
+        assert all(child["os_parent_pid"] == host["pid"] for child in host["children"][1:])
+        assert not any(child["readopted"] for child in host["children"])
+
+        titles = {
+            process["pid"]: subprocess.run(
+                ["ps", "-o", "command=", "-p", str(process["pid"])],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            for process in [root, host, *host["children"]]
+        }
+        assert titles[root["pid"]] == "muru run plain-wsgi", titles
+        assert titles[host["pid"]] == "muru host plain-wsgi@r1", titles
+        assert titles[host["children"][0]["pid"]] == "muru relay plain-wsgi@r1", titles
+        assert titles[host["children"][2]["pid"]] == "muru worker plain-wsgi@r1 default/1", titles
+
+        text = muructl(runtime, "status", "--processes", cwd=support.FIXTURES).stdout
+        assert "└─ host" in text and "├─ relay" in text and "└─ worker" in text, text
+
+        # The dashboard's Processes section reads the same answer.
+
+        shown = json.loads(read("/v1/processes"))
+        assert [child["pid"] for child in shown["root"]["children"][0]["children"]] == [
+            child["pid"] for child in host["children"]
+        ]
+        fragment = read("/fragment/processes")
+        assert 'href="worker?release=plain-wsgi@r1&#38;worker=0"' in fragment, fragment
     finally:
         server.stop()
 

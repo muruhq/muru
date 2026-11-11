@@ -239,6 +239,20 @@ type CommandStream = Pin<Box<dyn Stream<Item = Result<pb::CommandOutput, Status>
 
 #[tonic::async_trait]
 impl Admin for Service {
+    async fn list_processes(
+        &self,
+        request: Request<pb::ListProcessesRequest>,
+    ) -> Result<Response<pb::Processes>, Status> {
+        crate::daemon::processes(
+            &self.handle.commands,
+            &self.handle.info,
+            request.into_inner(),
+        )
+        .await
+        .map(Response::new)
+        .ok_or_else(|| Status::unavailable("the daemon is stopping"))
+    }
+
     async fn get_status(
         &self,
         _: Request<pb::GetStatusRequest>,

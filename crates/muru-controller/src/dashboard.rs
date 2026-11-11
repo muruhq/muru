@@ -25,8 +25,24 @@ pub async fn serve(
     history: Arc<History>,
     events: Events,
     sessions: Arc<Sessions>,
+    info: Arc<crate::daemon::Info>,
 ) -> anyhow::Result<()> {
     let debug = debug_source(commands.clone());
+
+    // Section 13.10: the Processes section reads what ListProcesses
+    // answers.
+
+    let processes_commands = commands.clone();
+    let processes: muru_dashboard::ProcessesSource = Arc::new(move || {
+        let commands = processes_commands.clone();
+        let info = Arc::clone(&info);
+        Box::pin(async move {
+            let answer = crate::daemon::processes(&commands, &info, Default::default())
+                .await
+                .ok_or_else(|| "the daemon is stopping".to_owned())?;
+            serde_json::to_value(answer).map_err(|error| error.to_string())
+        })
+    });
     let data_commands = commands.clone();
     let source: NodeSource = Arc::new(move || {
         let commands = data_commands.clone();
@@ -75,7 +91,10 @@ pub async fn serve(
         }
     });
     let live: EventsSource = Arc::new(move || rows.subscribe());
-    muru_dashboard::serve_node(listener, source, metrics, history, live, sessions, debug).await
+    muru_dashboard::serve_node(
+        listener, source, metrics, history, live, sessions, debug, processes,
+    )
+    .await
 }
 
 /// Section 11.7: ask a release's workers what the inspection pages show,

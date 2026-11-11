@@ -49,6 +49,8 @@ pub struct Inputs {
     pub access_log: Arc<AccessLog>,
     /// Recent host and worker output.
     pub logs: Logs,
+    /// What the Processes section shows (section 13.10).
+    pub processes: Arc<crate::run_admin::RunProcesses>,
 }
 
 /// Bind the dashboard and serve it in the background. Returns its address.
@@ -104,9 +106,19 @@ pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> 
             }
         }
     });
+    let run_processes = Arc::clone(&inputs.processes);
+    let processes: muru_dashboard::ProcessesSource = Arc::new(move || {
+        let run_processes = Arc::clone(&run_processes);
+        Box::pin(async move {
+            let answer = run_processes.snapshot(Default::default()).await;
+            serde_json::to_value(answer).map_err(|error| error.to_string())
+        })
+    });
     let source: Source = Arc::new(move || collect(&inputs));
     tokio::spawn(async move {
-        if let Err(error) = muru_dashboard::serve(listener, source, metrics, history, debug).await {
+        if let Err(error) =
+            muru_dashboard::serve(listener, source, metrics, history, debug, processes).await
+        {
             tracing::warn!(%error, "the dashboard stopped");
         }
     });

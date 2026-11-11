@@ -14,6 +14,10 @@ service Admin {
   // The daemon, its locations and listeners.
   rpc GetStatus(GetStatusRequest) returns (Status);
 
+  // Section 13.10: the instance's processes as Muru supervises them, with
+  // what the operating system says of each and the last second's figures.
+  rpc ListProcesses(ListProcessesRequest) returns (Processes);
+
   // Applications.
   rpc ListApps(ListAppsRequest) returns (ListAppsResponse);
   rpc GetApp(GetAppRequest) returns (App);
@@ -156,6 +160,69 @@ service Admin {
 }
 
 message GetStatusRequest {}
+
+message ListProcessesRequest {
+  string app = 1;                   // only this application's processes, or every one when empty
+  string release = 2;               // and only this release of it
+  bool all = 3;                     // also the processes Muru did not start, found from the operating system
+}
+
+message Processes {
+  string version = 1;               // the version of Muru serving
+  string hostname = 2;
+  string mode = 3;                  // daemon, run or serve
+  uint64 started_unix_ms = 4;       // when the daemon, run or serve started
+  uint64 sampled_unix_ms = 5;       // when the figures were taken
+  InstanceFigures figures = 6;      // the instance's last second
+  Process root = 7;                 // the daemon, run or serve, with the rest beneath it
+}
+
+message InstanceFigures {
+  double requests_per_second = 1;
+  double errors_per_second = 2;     // responses with a 5xx status
+  double p50_ms = 3;                // total time, over the last second
+  double p95_ms = 4;
+  uint64 in_flight = 5;
+  uint64 websockets = 6;            // open now
+  uint64 connections = 7;           // open now
+  double tls_handshakes_per_second = 8;
+  double received_bytes_per_second = 9;
+  double sent_bytes_per_second = 10;
+}
+
+message Process {
+  uint32 pid = 1;
+  uint32 os_parent_pid = 2;         // the parent the operating system records
+  string role = 3;                  // daemon, run, serve, edge, host, relay, worker, server, command or other
+  string what = 4;                  // what the process is for, as a phrase
+  string app = 5;
+  string release = 6;
+  string group = 7;                 // a worker's group
+  optional uint32 index = 8;        // a worker's index in its group, a server instance's index
+  string user = 9;                  // the user it runs as
+  optional uint64 started_unix_ms = 10;
+  optional double cpu_percent = 11; // since the last reading, or over a moment for the first
+  optional uint64 rss_bytes = 12;
+  bool readopted = 13;              // its operating system parent is not the process above it
+  Figures figures = 14;             // a worker's last second; a host's when its release has one group; the edge's
+  repeated GroupFigures groups = 15; // a host's groups, when its release has more than one
+  repeated Process children = 16;
+}
+
+message Figures {
+  optional double requests_per_second = 1;
+  optional uint32 busy = 2;         // slots holding a request
+  optional uint32 slots = 3;
+  optional uint32 queue = 4;        // requests waiting for a slot, for a group
+  optional double p95_ms = 5;       // total time
+  optional double gil_wait_p95_ms = 6;
+  optional double loop_lag_p95_ms = 7;
+}
+
+message GroupFigures {
+  string group = 1;
+  Figures figures = 2;
+}
 
 message Status {
   string version = 1;

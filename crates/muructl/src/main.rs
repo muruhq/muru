@@ -16,6 +16,7 @@ mod init;
 mod log_format;
 mod mcp;
 mod print_config;
+mod processes;
 mod project_commands;
 mod provision;
 mod pstats;
@@ -202,6 +203,9 @@ enum Command {
     Status {
         #[command(flatten)]
         socket: admin::SocketArgs,
+
+        #[command(flatten)]
+        processes: processes::ProcessArgs,
 
         #[command(flatten)]
         output: admin::JsonArgs,
@@ -1107,8 +1111,17 @@ fn main() -> anyhow::Result<()> {
         Command::Maintenance { command } => runtime.block_on(admin::maintenance(command)),
         Command::Dashboard { command } => runtime.block_on(admin::dashboard(command)),
         Command::Overlay { command } => runtime.block_on(admin::overlay(command)),
-        Command::Status { socket, output } => runtime
-            .block_on(async move { admin::show_status(&socket.socket()?, output.json).await }),
+        Command::Status {
+            socket,
+            processes,
+            output,
+        } => runtime.block_on(async move {
+            if processes.processes {
+                processes::show(&socket.socket()?, &processes, output.json).await
+            } else {
+                admin::show_status(&socket.socket()?, output.json).await
+            }
+        }),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
         Command::Config { command } => match command {
             admin::ConfigCommand::Export {
@@ -3508,6 +3521,48 @@ async fn run_with(
 
     let release_number = Arc::new(AtomicU32::new(1));
 
+    // Section 13.10: what status --processes lists, and the live figures,
+    // sampled every second from the edge's counters and the workers'
+    // reports.
+
+    let mut groups = vec![muru_edge::routing::DEFAULT_GROUP.to_owned()];
+    groups.extend(resolved.groups.keys().cloned());
+    let run_processes = run_admin::RunProcesses::new(
+        if serve.is_some() { "serve" } else { "run" },
+        label.clone(),
+        resolved.entrypoint.clone(),
+        groups,
+        std::iter::once(edge.local_addr())
+            .chain(edge.https_addr())
+            .collect(),
+        Arc::clone(&release_number),
+    );
+    run_processes.host(current.pid(), current.relay_pid());
+
+    {
+        let processes = Arc::clone(&run_processes);
+        let pools = edge.pools();
+        let access_log = edge.access_log();
+        let connections = edge.connections();
+
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
+
+            loop {
+                ticks.tick().await;
+                let routing = pools.current();
+                let samples: Vec<_> = access_log
+                    .metrics()
+                    .samples()
+                    .into_iter()
+                    .chain(muru_edge::metrics::pool_samples(&routing))
+                    .chain(connections.samples())
+                    .collect();
+                processes.observe(&samples);
+            }
+        });
+    }
+
     let dashboard = match resolved.serving.dashboard.as_deref() {
         Some("off") => None,
         Some(address) => Some(address.to_owned()),
@@ -3533,6 +3588,7 @@ async fn run_with(
                 connections: edge.connections(),
                 access_log: edge.access_log(),
                 logs: logs.clone(),
+                processes: Arc::clone(&run_processes),
             },
         )
         .await
@@ -3625,6 +3681,7 @@ async fn run_with(
             commands: commands.clone(),
             events: Arc::clone(&run_events),
             settings: Arc::clone(&settings),
+            processes: Arc::clone(&run_processes),
         });
 
         match run_admin::serve(state, admin_stop_rx).await {
@@ -3739,7 +3796,9 @@ async fn run_with(
                 // that it does before it stops the old one.
 
                 match message {
-                    muru_controller::host::HostMessage::Workers { version, sockets, groups, .. } => {
+                    muru_controller::host::HostMessage::Workers { version, sockets, groups, workers, .. } => {
+                        run_processes.workers(workers);
+
                         let release = format!("r{}", current.release);
                         let kept = pools.current().kept(&label, &release);
                         let connected = muru_edge::routing::AppPools::connect(
@@ -3782,7 +3841,12 @@ async fn run_with(
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);
                     }
-                    muru_controller::host::HostMessage::Status { .. } => {}
+                    muru_controller::host::HostMessage::Status { workers } => {
+                        // The relay may have been started again since.
+
+                        run_processes.host(current.pid(), current.relay_pid());
+                        run_processes.status(workers);
+                    }
                 }
             }
             Some(path) = changed.recv() => {
@@ -3894,6 +3958,7 @@ async fn run_with(
                                 muru_common::muru_println!("switched to release r{release}");
                                 release_number.store(release, Ordering::Relaxed);
                                 let previous = std::mem::replace(&mut current, next);
+                                run_processes.host(current.pid(), current.relay_pid());
                                 tokio::spawn(previous.stop(stop_budget));
                                 let (control, messages) = host_control(&current).await;
                                 host_link.lock().expect("host link poisoned").attach(control);

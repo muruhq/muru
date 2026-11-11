@@ -1534,6 +1534,12 @@ impl HostProcess {
         let _ = std::fs::set_permissions(&path, permissions);
     }
 
+    /// The pid of the release's log relay, while one runs.
+    pub fn relay_pid(&self) -> Option<u32> {
+        let pid = self.relay.pid();
+        (pid != 0).then_some(pid)
+    }
+
     /// Send a signal to the release's log relay: SIGUSR1 has it open the
     /// release log again by name. Returns whether it was delivered.
     pub fn signal_relay(&self, signal: i32) -> bool {

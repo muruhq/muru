@@ -28,6 +28,12 @@ The daemon's [dashboard](dashboard.md#looking-into-the-workers) shows
 the status, stacks, tasks and memory of a release's workers too, and so
 does a run's, from the Workers link on its first page.
 
+`muructl status --processes` shows which processes make up the instance
+and what each is: the run or the daemon, the edge, each release's host,
+log relay and workers, with their pids, CPU, memory and each worker's
+figures over the last second, and `--watch` keeps the view live. The
+[daemon guide](daemon.md#the-processes) describes it.
+
 ## Status
 
 Each worker's pid, group, uptime, requests served, what it holds as of
@@ -754,6 +760,7 @@ Everything is under one directory named as the file is.
 | `live/APP@RELEASE/tasks.json` | The asyncio [tasks](#tasks) of the workers' event loops |
 | `live/requests.json` | The [requests in flight](#requests-in-flight), up to a thousand, as `muructl requests --list --json` gives them |
 | `live/websockets.json` | The open WebSockets, up to a thousand, as `muructl websockets --list --json` gives them |
+| `live/processes.json` | The processes as `muructl status --processes --json` gives them, narrowed to the target's application when the bundle has one |
 | `figures/metrics.txt` | The [metrics](metrics.md) as a scrape reads them, the garbage collection figures among them |
 | `figures/scaling/APP@RELEASE.json` | Each worker group's scaling, as [`muructl scale status --json`](scaling.md) gives it |
 | `host/host.json` | The machine: the kernel, the CPUs, the load averages, the memory and how much is available, the limit on open files, the room on the file system of each of Muru's directories, and on Linux the limits of the daemon's and the edge's processes and of the container's cgroup |

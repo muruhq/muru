@@ -311,6 +311,21 @@ pub const FAMILIES: &[Family] = &[
     },
 ];
 
+/// Section 13.10: each worker's requests completed, as the edge counts
+/// them, for the live figures of `muructl status --processes`. This and
+/// the other `LIVE_` samples are of no family, so the exposition never
+/// writes them; they reach the daemon with the rest.
+pub const LIVE_WORKER_REQUESTS: &str = "live_worker_requests_total";
+
+/// Each worker's total-time histogram, likewise, with `_bucket` samples.
+pub const LIVE_WORKER_DURATION: &str = "live_worker_duration_seconds";
+
+/// Each worker's slots holding a request now.
+pub const LIVE_WORKER_BUSY: &str = "live_worker_busy";
+
+/// Each worker's slots.
+pub const LIVE_WORKER_SLOTS: &str = "live_worker_slots";
+
 /// The histogram buckets in seconds, each with the `le` label it is
 /// written with; the +Inf bucket is implied.
 const BUCKETS: [(f64, &str); 13] = [
@@ -517,6 +532,9 @@ struct Inner {
     /// Body bytes received from clients and sent to them, by
     /// application, release and listener.
     bytes: BTreeMap<(String, String, String), (u64, u64)>,
+    /// Requests each worker completed and their total times, by group
+    /// and the worker's index (section 13.10).
+    workers: BTreeMap<(DurationKey, usize), (u64, Histogram)>,
     /// Requests handed across in the worker, by group and the interface
     /// they were handed to (section 6.14).
     handoffs: BTreeMap<(DurationKey, &'static str), u64>,
@@ -615,6 +633,14 @@ impl Metrics {
             .or_default();
         bytes.0 += record.received;
         bytes.1 += record.bytes;
+
+        if let Some(index) = record.worker
+            && record.websocket.is_none()
+        {
+            let worker = inner.workers.entry((by_group.clone(), index)).or_default();
+            worker.0 += 1;
+            worker.1.observe(record.total);
+        }
 
         let durations = inner.durations.entry(by_group).or_default();
         durations.total.observe(record.total);
@@ -827,6 +853,17 @@ impl Metrics {
                 &labels,
                 *sent as f64,
             ));
+        }
+
+        for ((key, index), (count, histogram)) in &inner.workers {
+            let mut labels = key.labels();
+            labels.push(("worker".to_owned(), index.to_string()));
+            samples.push(Sample {
+                name: LIVE_WORKER_REQUESTS.to_owned(),
+                labels: labels.clone(),
+                value: *count as f64,
+            });
+            histogram.samples(LIVE_WORKER_DURATION, &labels, &mut samples);
         }
 
         for ((listener, result), count) in &inner.tls_handshakes {
@@ -1053,6 +1090,28 @@ pub fn pool_samples(routing: &Routing) -> Vec<Sample> {
                     .expect("a side is the threads or the loop");
                 entry.1 += slots;
                 entry.2 += busy;
+            }
+
+            // Section 13.10: each worker's slots, named by its place in
+            // the pool, as the access record names it, and by its socket,
+            // as its host does.
+
+            for worker in &workers {
+                let index = worker.index.to_string();
+                let socket = worker.path.display().to_string();
+                let labels = [
+                    ("app", app),
+                    ("release", release),
+                    ("group", group.as_str()),
+                    ("worker", index.as_str()),
+                    ("socket", socket.as_str()),
+                ];
+                samples.push(Sample::new(
+                    LIVE_WORKER_BUSY,
+                    &labels,
+                    worker.in_flight as f64,
+                ));
+                samples.push(Sample::new(LIVE_WORKER_SLOTS, &labels, worker.slots as f64));
             }
 
             for (side, slots, busy) in sides {
