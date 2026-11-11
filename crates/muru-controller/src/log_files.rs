@@ -109,6 +109,8 @@ pub struct LogFile {
     pub size: u64,
     /// Whether the file exists.
     pub present: bool,
+    /// When the file was last changed, the epoch when it is gone.
+    pub modified: SystemTime,
     /// Its archives, oldest first.
     pub archives: Vec<Archive>,
     /// Its release or host no longer exists.
@@ -299,6 +301,7 @@ fn add(
         hosts: classified.hosts,
         size: 0,
         present: false,
+        modified: UNIX_EPOCH,
         archives: Vec::new(),
         orphaned: classified.orphaned,
     });
@@ -313,6 +316,7 @@ fn add(
     } else {
         log.size = metadata.len();
         log.present = true;
+        log.modified = metadata.modified().unwrap_or(UNIX_EPOCH);
     }
 }
 
@@ -340,22 +344,26 @@ fn log_info(log: &LogFile) -> pb::LogInfo {
         hosts: log.hosts.clone(),
         size: log.size,
         present: log.present,
+        modified_unix_ms: unix_ms(log.modified),
         archives: log
             .archives
             .iter()
             .map(|archive| pb::LogArchive {
                 name: archive.name.clone(),
                 size: archive.size,
-                modified_unix_ms: archive
-                    .modified
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |since| since.as_millis() as u64),
+                modified_unix_ms: unix_ms(archive.modified),
             })
             .collect(),
         archives_size: log.archives_size(),
         total: log.total(),
         orphaned: log.orphaned,
     }
+}
+
+/// A time as Unix milliseconds, 0 for the epoch or before it.
+fn unix_ms(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
 }
 
 /// The logs a request names, which must exist. No target at all is

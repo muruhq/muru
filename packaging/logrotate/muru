@@ -1,15 +1,16 @@
 # External rotation for Muru log files (design specification section 11.3).
-# Set rotate = 'external' on the sinks so built-in rotation is disabled.
+# Set rotate = 'external' in the daemon's [logs] table so built-in rotation
+# is off. The daemon notices each rename and has the writer reopen the
+# file by name (reopen_on_rename), so no postrotate is needed;
+# delaycompress keeps the renamed file whole for the few seconds before
+# the reopen. A managed HTTP server's release logs need copytruncate in an
+# entry of their own.
 
-/var/log/muru/*.log {
+/var/log/muru/*.log /var/log/muru/apps/*/*.log {
     daily
     rotate 14
     missingok
     notifempty
     compress
     delaycompress
-    sharedscripts
-    postrotate
-        /usr/bin/muructl logs reopen --workers >/dev/null 2>&1 || true
-    endscript
 }

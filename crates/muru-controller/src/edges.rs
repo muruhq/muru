@@ -621,6 +621,8 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
     command
         .arg("--control")
         .arg(&spec.control)
+        .arg("--log")
+        .arg(&spec.log)
         .arg("--listener-socket")
         .arg(&spec.listener_socket)
         .arg("--spool")

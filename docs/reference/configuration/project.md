@@ -185,6 +185,7 @@ The `[logging.python]` table: what loggers without handlers of their own do, set
 | `format` | string | `standard`; `json` under `muructl serve --log-format json` | The format of the platform handler: standard, json, or a logging format string. |
 | `level` | string | `"WARNING"` | The root logger's level. `DEBUG`: Everything. `INFO`: Informational messages and above. `WARNING`: Python's default: warnings and above. `ERROR`: Errors and above. `CRITICAL`: Only critical messages. |
 | `loggers` | table of strings |  | Levels for named loggers. |
+| `warnings` | array of strings |  | Warnings filters in the syntax of Python's -W option, `action:message:category:module:lineno`, applied in order with `warnings.filterwarnings` before the application is imported, so a later one takes precedence. |
 
 (config-project-tool-muru-maintenance)=
 ## `[tool.muru.maintenance]`

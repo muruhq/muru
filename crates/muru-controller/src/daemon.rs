@@ -240,7 +240,14 @@ pub struct Config {
     /// The version this daemon ran before it re-executed itself for an
     /// upgrade, or none when it started afresh.
     pub upgraded_from: Option<String>,
+    /// How often the log files are checked for a rename, when
+    /// `reopen_on_rename` is on: `RENAME_CHECK` but in tests.
+    pub rename_check: Duration,
 }
+
+/// How often the daemon checks whether a log file was renamed away
+/// (section 11.3: reopen_on_rename).
+pub const RENAME_CHECK: Duration = Duration::from_secs(5);
 
 /// What reading the TLS hosts' certificate files again found (section
 /// 4.2).
@@ -689,6 +696,13 @@ struct HostRecord {
     runtime: Option<PathBuf>,
 }
 
+/// A release's log relay, for re-adoption (section 11.3), written beside
+/// its sockets.
+#[derive(serde::Deserialize)]
+struct RelayRecord {
+    pid: u32,
+}
+
 /// A named worker group's sockets and paths, for re-adoption and the
 /// snapshot.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -773,6 +787,10 @@ pub struct Info {
     /// The rate limits (section 4.15) and client classes (section 4.14)
     /// the daemon's file defines, which applied files may name.
     pub defined: std::sync::RwLock<crate::config::Defined>,
+    /// The Python logging defaults every host starts with under its
+    /// release's own (`[logging.python]`, section 11.4), as a reload may
+    /// change them.
+    pub python_logging: std::sync::RwLock<muru_config::PythonLogging>,
     /// WebSockets open by application and release, from the edge's
     /// metrics as last sampled.
     pub websockets: std::sync::Mutex<HashMap<(String, String), u64>>,
@@ -930,6 +948,15 @@ impl Backend {
         match self {
             Self::Host(host) => host.try_exited(),
             Self::Servers(_) | Self::Dormant => Ok(None),
+        }
+    }
+
+    /// Have the release's log relay open the release log again by name.
+    /// Instances write their own files. Returns whether it was told.
+    fn reopen_log(&self) -> bool {
+        match self {
+            Self::Host(host) => host.signal_relay(libc::SIGUSR1),
+            Self::Servers(_) | Self::Dormant => false,
         }
     }
 
@@ -1200,6 +1227,14 @@ struct Daemon {
     /// Section 11.3: the log files a command is cutting, which rotation
     /// leaves alone.
     claimed_logs: std::collections::HashSet<PathBuf>,
+    /// Section 11.3: whether a log file renamed away has its writer
+    /// reopen it, the file last seen at each path, how often they are
+    /// checked and when next.
+    reopen_on_rename: bool,
+    relay_settings: crate::host::RelaySettings,
+    renames: crate::renames::Watch,
+    rename_check: Duration,
+    rename_due: Instant,
     /// Section 13.3: what SIGTERM means, and how a shutdown runs.
     shutdown: crate::shutdown::Policy,
     /// The service user (ADR 0026), when this daemon is root: whom the
@@ -1334,7 +1369,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // connections wait in the backlog; the edge is up before any release,
     // answering 503 until one serves.
 
-    let edge_log = locations.logs.path.join("edge.log");
+    let edge_log = locations.edge_log();
 
     // Section 4.11: the upload spool is the edge's own, in the state
     // directory rather than the run directory, which may be memory.
@@ -1428,6 +1463,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             },
             ..client_rules.defined()
         }),
+        python_logging: std::sync::RwLock::new(settings.python_logging.clone()),
         interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
         live: std::sync::Mutex::new(HashMap::new()),
@@ -1563,6 +1599,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .clone()
         .map(|policy| restored_rotator(policy, &store));
 
+    // Section 11.3: the files last seen at the logs' paths, so that a
+    // rename made while the daemon was stopped is noticed at its first
+    // check.
+
+    let renames =
+        crate::renames::Watch::from_seen(store.log_files_seen().unwrap_or_else(|error| {
+            tracing::warn!(%error, "reading the log files last seen failed");
+            Vec::new()
+        }));
+
     let mut daemon = Daemon {
         store,
         events,
@@ -1584,6 +1630,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         secrets: settings.secrets.clone(),
         rotation,
         claimed_logs: std::collections::HashSet::new(),
+        reopen_on_rename: settings.reopen_on_rename,
+        relay_settings: settings.relay,
+        renames,
+        rename_check: config.rename_check,
+        rename_due: Instant::now(),
         shutdown: settings.shutdown.clone(),
         service,
         debug_exec: settings.debug_exec,
@@ -1660,6 +1711,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
 
+    // Section 11.3: a log file renamed while the daemon was stopped is
+    // noticed now, before anything else is written to it.
+
+    daemon.watch_renames();
+
     let outcome = loop {
         tokio::select! {
             _ = reopen.recv() => {
@@ -1710,6 +1766,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 daemon.expire_sticky().await;
                 daemon.expire_retained().await;
                 daemon.rotate_logs();
+                daemon.watch_renames();
                 daemon.expire_access_overrides().await;
 
                 let samples = match daemon.edge.metrics().await {
@@ -2080,6 +2137,18 @@ fn write_edge_record(run_dir: &Path, edge: &EdgeProcess) {
                 .collect(),
         },
     );
+}
+
+/// The executable to start this program again from: what is running,
+/// or the installed binary when an upgrade has replaced that file.
+pub(crate) fn running_executable() -> anyhow::Result<PathBuf> {
+    let current = std::env::current_exe().context("finding the running executable")?;
+
+    if current.is_file() {
+        return Ok(current);
+    }
+
+    installed_executable()
 }
 
 /// Section 13.4: the binary an upgrade re-executes from. The daemon was
@@ -3017,6 +3086,58 @@ impl Daemon {
             report.unchanged("[logs] rotation");
         }
 
+        // Section 11.4: the Python logging defaults are installed before
+        // an application is imported, so a running host keeps those it
+        // started with.
+
+        let python_logging = self
+            .info
+            .python_logging
+            .read()
+            .expect("python logging poisoned")
+            .clone();
+
+        if settings.python_logging != python_logging {
+            *self
+                .info
+                .python_logging
+                .write()
+                .expect("python logging poisoned") = settings.python_logging.clone();
+            report.changed(
+                "[logging.python]",
+                "each application takes the new defaults at its next restart or deploy",
+            );
+        } else {
+            report.unchanged("[logging.python]");
+        }
+
+        if settings.reopen_on_rename != self.reopen_on_rename {
+            self.reopen_on_rename = settings.reopen_on_rename;
+            self.rename_due = Instant::now();
+            self.renames.forget();
+
+            report.changed(
+                "[logs] reopen_on_rename",
+                if self.reopen_on_rename {
+                    "a log file renamed away is reopened"
+                } else {
+                    "a log file renamed away waits for muructl logs reopen"
+                },
+            );
+        } else {
+            report.unchanged("[logs] reopen_on_rename");
+        }
+
+        if settings.relay != self.relay_settings {
+            self.relay_settings = settings.relay;
+            report.changed(
+                "[logs] on_overflow and output_queue",
+                "each application takes the new values at its next restart or deploy",
+            );
+        } else {
+            report.unchanged("[logs] on_overflow and output_queue");
+        }
+
         // Section 13.3: what the next stop signal means.
 
         if settings.shutdown != self.shutdown {
@@ -3923,6 +4044,16 @@ impl Daemon {
                 }
             }
 
+            // Section 11.3: output the release's relay could not keep.
+
+            if let Some(host) = running.backend.host() {
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_app_output_dropped_total",
+                    &[("app", app.as_str()), ("release", id.as_str())],
+                    host.output_dropped() as f64,
+                ));
+            }
+
             // Sections 7.6 and 7.7: workers replaced and workers gone.
 
             for (name, counts) in [
@@ -4049,13 +4180,47 @@ impl Daemon {
             .filter(|group| group.optional)
             .map(|group| group.name.clone())
             .collect();
+
+        // Section 11.3: the relay is adopted with its host, or replaced
+        // if it is gone.
+
+        let subject = format!("{app}@{id}");
+
+        let identity = match self.resolve_identity(app, &subject) {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::info!(%error, "release {subject} could not be re-adopted");
+                return false;
+            }
+        };
+
+        let host_dir = run_dir.join("r1");
+        let launch = match crate::host::RelayLaunch::for_release(
+            host_dir.clone(),
+            Some(self.host_log(app, id)),
+            self.relay_settings,
+            identity,
+        ) {
+            Ok(launch) => launch,
+            Err(error) => {
+                tracing::info!(error = %format!("{error:#}"), "release {subject} could not be re-adopted");
+                return false;
+            }
+        };
+        let relay_pid = read_record::<RelayRecord>(&host_dir.join(crate::relay::RECORD))
+            .map(|record| record.pid)
+            .filter(|pid| command_mentions(*pid, &host_dir));
+        let watcher = self.relay_watcher(&subject);
         let adopted = HostProcess::adopt(
             record.pid,
             record.sockets.clone(),
             group_sockets,
             optional,
-            run_dir.join("r1"),
+            host_dir,
             1,
+            launch,
+            relay_pid,
+            watcher,
         );
 
         match adopted {
@@ -5143,7 +5308,13 @@ impl Daemon {
             tcp_base_port: None,
             single: false,
             detach_to: Some(self.host_log(app, id)),
-            logging: spec.logging.clone(),
+            relay: self.relay_settings,
+            logging: self
+                .info
+                .python_logging
+                .read()
+                .expect("python logging poisoned")
+                .layered(&spec.logging),
             max_requests: spec.max_requests,
             max_lifetime: spec.max_lifetime_ms.map(Duration::from_millis),
             soft_timeout: spec.timeouts.soft_timeout_ms.map(Duration::from_millis),
@@ -5206,7 +5377,9 @@ impl Daemon {
         let log = self.host_log(app, id);
         let log_start = std::fs::metadata(&log).map_or(0, |metadata| metadata.len());
 
-        let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs) {
+        let watcher = self.relay_watcher(&subject);
+
+        let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs, watcher) {
             Ok(host) => host,
             Err(error) => {
                 let message = format!("the host could not be started: {error:#}");
@@ -9253,12 +9426,6 @@ impl Daemon {
         path
     }
 
-    /// Section 11.3: after logrotate has renamed the files, every writer
-    /// opens its file again by name. The daemon reopens its own when it
-    /// was started in the background, the edge its access log on SIGUSR1,
-    /// and each host its release log on SIGUSR1; SIGUSR2 makes a host
-    /// pass SIGUSR1 on to its workers, whose on_reopen_logs hook handles
-    /// files the application opened itself.
     /// Section 10.7: one point of history a second, from the edge's
     /// counters, and the WebSockets open by release for status.
     async fn sample_history(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
@@ -9306,28 +9473,21 @@ impl Daemon {
         }
     }
 
-    /// Section 11.3: rotate the log files that are due, by size or by the
-    /// clock, then have every writer reopen its file by name.
-    fn rotate_logs(&mut self) {
-        let Some(rotator) = self.rotation.as_mut() else {
-            return;
-        };
-        let now = std::time::SystemTime::now();
-
-        // The edge reopens the access log when told, but keeps its own log
-        // open on its standard streams, so that one is rotated in place.
-
-        let mut candidates = vec![
+    /// The log files the daemon's writers keep, each with whether its
+    /// writers cannot be told to reopen it: the access log, the edge's own
+    /// log and the files virtual hosts name, which the edge reopens; the
+    /// daemon's own, when it was started in the background; and each
+    /// running release's log, which its host reopens, unless a managed
+    /// HTTP server's instances write it themselves (section 9.9).
+    fn log_writers(&self) -> Vec<(PathBuf, bool)> {
+        let mut writers = vec![
             (self.locations.access_log(), false),
-            (self.locations.logs.path.join("edge.log"), true),
+            (self.locations.edge_log(), false),
         ];
 
         if self.owns_log {
-            candidates.push((self.locations.daemon_log(), false));
+            writers.push((self.locations.daemon_log(), false));
         }
-
-        // Section 11.2: the files virtual hosts name for their own
-        // records, which the edge writes and reopens as it does its own.
 
         let mut own: Vec<String> = self
             .store
@@ -9338,20 +9498,73 @@ impl Daemon {
             .collect();
         own.sort();
         own.dedup();
-        candidates.extend(
+        writers.extend(
             own.into_iter()
                 .map(|file| (self.locations.logs.path.join(file), false)),
         );
 
-        // Section 9.9: a managed server writes its log itself and cannot
-        // be told to reopen it, so its log is rotated in place.
-
         for ((app, id), running) in &self.running {
-            candidates.push((
+            writers.push((
                 self.locations.release_log(app, id),
                 running.backend.servers().is_some(),
             ));
         }
+
+        writers
+    }
+
+    /// Section 11.3: reopen_on_rename. Every `rename_check`, see whether
+    /// a log file its writers can reopen was renamed away, and if one was,
+    /// have every writer open its file again by name, as `muructl logs
+    /// reopen` does. A file being cut by a command is left to it.
+    fn watch_renames(&mut self) {
+        let now = Instant::now();
+
+        if !self.reopen_on_rename || now < self.rename_due {
+            return;
+        }
+
+        self.rename_due = now + self.rename_check;
+        let paths: Vec<PathBuf> = self
+            .log_writers()
+            .into_iter()
+            .filter(|(path, in_place)| !in_place && !self.claimed_logs.contains(path))
+            .map(|(path, _)| path)
+            .collect();
+        let renamed = self.renames.check(&paths);
+
+        if !renamed.is_empty() {
+            let names: Vec<String> = renamed
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&self.locations.logs.path)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            self.reopen_logs_because(false, &format!("{} renamed", names.join(", ")));
+        }
+
+        if let Some(seen) = self.renames.take_changed()
+            && let Err(error) = self.store.set_log_files_seen(&seen)
+        {
+            tracing::warn!(%error, "recording the log files last seen failed");
+        }
+    }
+
+    /// Section 11.3: rotate the log files that are due, by size or by the
+    /// clock, then have every writer reopen its file by name.
+    fn rotate_logs(&mut self) {
+        if self.rotation.is_none() {
+            return;
+        }
+
+        let candidates = self.log_writers();
+        let Some(rotator) = self.rotation.as_mut() else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
 
         // The period each file is now in is recorded before anything is
         // rotated, so a daemon started after a crash does not rotate a
@@ -9397,14 +9610,17 @@ impl Daemon {
             return;
         }
 
-        if self.owns_log {
-            reopen_own_log(&self.locations.daemon_log());
-        }
+        // The writers open new files, which the rename check notes as
+        // they are rather than taking the rotation for a rename.
+
+        self.renames.forget();
+
+        self.reopen_own_log();
 
         self.edge.signal(libc::SIGUSR1);
 
         for running in self.running.values() {
-            running.backend.signal(libc::SIGUSR1);
+            running.backend.reopen_log();
         }
 
         let names: Vec<String> = rotated
@@ -9476,19 +9692,15 @@ impl Daemon {
     }
 
     /// Whether a log's writers cannot be told to reopen it: the
-    /// instances of a managed HTTP server, and the edge for its own log.
+    /// instances of a managed HTTP server.
     fn cannot_reopen(&self, path: &Path) -> bool {
-        let edge_log = self.locations.logs.path.join("edge.log");
-
-        path == edge_log
-            || self.running.iter().any(|((app, id), running)| {
-                running.backend.servers().is_some() && self.locations.release_log(app, id) == path
-            })
+        self.running.iter().any(|((app, id), running)| {
+            running.backend.servers().is_some() && self.locations.release_log(app, id) == path
+        })
     }
 
     /// Hold log files against rotation, saying of each whether its
-    /// writers cannot reopen it: the instances of a managed HTTP server
-    /// and the edge's own log, which it does not reopen.
+    /// writers cannot reopen it: the instances of a managed HTTP server.
     fn claim_logs(&mut self, paths: Vec<PathBuf>) -> Result<Vec<bool>, String> {
         if let Some(path) = paths.iter().find(|path| self.claimed_logs.contains(*path)) {
             return Err(format!(
@@ -9503,16 +9715,61 @@ impl Daemon {
         Ok(in_place)
     }
 
-    fn reopen_logs(&mut self, workers: bool) -> Reopened {
-        if self.owns_log {
-            reopen_own_log(&self.locations.daemon_log());
+    /// What hears a release's relay: its stalls become events under the
+    /// release, as its workers' do; counts are read from the host.
+    fn relay_watcher(&self, subject: &str) -> crate::host::RelayWatcher {
+        let events = self.events.clone();
+        let subject = subject.to_owned();
+
+        std::sync::Arc::new(move |news| {
+            if let crate::host::RelayNews::Event {
+                kind,
+                level,
+                message,
+            } = news
+            {
+                let level = if level == "warning" {
+                    "warning"
+                } else {
+                    "info"
+                };
+                events.emit(&kind, &subject, level, &message);
+            }
+        })
+    }
+
+    /// Open the daemon's own log again by name, when it was started in
+    /// the background and so writes one.
+    fn reopen_own_log(&self) {
+        if self.owns_log
+            && let Err(error) = crate::logs::reopen_standard_streams(&self.locations.daemon_log())
+        {
+            tracing::warn!(%error, "reopening the daemon's log failed");
         }
+    }
+
+    /// Section 11.3: after something has renamed the files, every writer
+    /// opens its file again by name. The daemon reopens its own when it
+    /// was started in the background, the edge its access log, the files
+    /// virtual hosts name and its own log on SIGUSR1, and each release's
+    /// log relay its release log on SIGUSR1; SIGUSR2 makes a host pass
+    /// SIGUSR1 on to its workers, whose on_reopen_logs hook handles files
+    /// the application opened itself.
+    fn reopen_logs(&mut self, workers: bool) -> Reopened {
+        self.reopen_logs_because(workers, "")
+    }
+
+    /// Reopen the log files as `reopen_logs` does, with why in the
+    /// event's message when it is not a command or a signal that asked.
+    fn reopen_logs_because(&mut self, workers: bool, why: &str) -> Reopened {
+        self.reopen_own_log();
+        self.renames.forget();
 
         let edge = self.edge.signal(libc::SIGUSR1);
         let mut hosts = 0;
 
         for running in self.running.values() {
-            if running.backend.signal(libc::SIGUSR1) {
+            if running.backend.reopen_log() {
                 hosts += 1;
             }
 
@@ -9522,7 +9779,12 @@ impl Daemon {
         }
 
         let message = format!(
-            "reopened the log files: {}{hosts} host{}{}",
+            "reopened the log files{}: {}{hosts} host{}{}",
+            if why.is_empty() {
+                String::new()
+            } else {
+                format!(" ({why})")
+            },
             if edge { "the edge and " } else { "" },
             if hosts == 1 { "" } else { "s" },
             if workers { " and their workers" } else { "" }
@@ -9638,29 +9900,6 @@ fn restored_rotator(policy: crate::rotation::Policy, store: &Store) -> crate::ro
     }
 
     crate::rotation::Rotator::restored(policy, present)
-}
-
-/// Open the daemon's log file again on standard output and error: once
-/// logrotate has renamed it away, the lines belong in a new file at the
-/// same path.
-fn reopen_own_log(path: &std::path::Path) {
-    use std::os::unix::io::AsRawFd as _;
-
-    let Ok(log) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
-        return;
-    };
-
-    // SAFETY: dup2 of an open file onto the standard descriptors, which
-    // stay valid; `log` closes its own descriptor when it drops.
-
-    unsafe {
-        libc::dup2(log.as_raw_fd(), 1);
-        libc::dup2(log.as_raw_fd(), 2);
-    }
 }
 
 /// Sections 7.3 and 7.4: what one worker offers before the edge has

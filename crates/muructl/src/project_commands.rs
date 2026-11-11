@@ -4,6 +4,7 @@
 //! from its file, the interpreter and runtime library the application is
 //! served with, and the environment its workers have.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -84,21 +85,27 @@ pub fn listed(
     })
 }
 
-/// What the commands of the project are called in a refusal.
-fn subject(context: &Context) -> String {
-    format!("the project in {}", context.project.display())
-}
+/// A declared command found for a request, with its inputs as given and
+/// as resolved.
+type Found = (
+    CommandSpec,
+    BTreeMap<String, String>,
+    BTreeMap<String, String>,
+);
 
-/// A command ready to start: the request checked against the project's
-/// declarations, with the interpreter, environment and directory the
-/// application is served with. A secret store is the daemon's, so an
-/// input named as an entry of one is refused.
-pub fn prepare(context: &Context, request: CommandRequest) -> Result<Prepared, String> {
-    let declared_command = match &request {
-        CommandRequest::OneOff(argv) if argv.is_empty() => {
-            return Err("no command was given".to_owned());
-        }
-        CommandRequest::OneOff(_) => None,
+/// The request checked against the project's declarations, without an
+/// interpreter or a runtime library, so a mistake in it can be refused
+/// before anything is provisioned. A secret store is the daemon's, so an
+/// input named as an entry of one is refused. Gives the declared command
+/// a request names, or none for a one-off.
+pub fn check(
+    project: &Path,
+    file: Option<&Path>,
+    request: &CommandRequest,
+) -> Result<Option<Found>, String> {
+    match request {
+        CommandRequest::OneOff(argv) if argv.is_empty() => Err("no command was given".to_owned()),
+        CommandRequest::OneOff(_) => Ok(None),
         CommandRequest::Declared {
             name,
             inputs,
@@ -111,25 +118,32 @@ pub fn prepare(context: &Context, request: CommandRequest) -> Result<Prepared, S
                 ));
             }
 
-            if context.file.is_none()
+            if file.is_none()
                 && !muru_config::PROJECT_FILES
                     .iter()
-                    .any(|name| context.project.join(name).is_file())
+                    .any(|name| project.join(name).is_file())
             {
                 return Err(format!(
                     "{} has no pyproject.toml or muru.toml to declare {name} in; to run a \
                      command of a release under the daemon, name its application first",
-                    context.project.display()
+                    project.display()
                 ));
             }
 
-            let commands = declared(&context.project, context.file.as_deref())?;
-            let command =
-                muru_controller::commands::find(&commands, name, &subject(context))?.clone();
+            let commands = declared(project, file)?;
+            let subject = format!("the project in {}", project.display());
+            let command = muru_controller::commands::find(&commands, name, &subject)?.clone();
             let values = muru_controller::commands::input_values(&command, inputs)?;
-            Some((command, inputs.clone(), values))
+            Ok(Some((command, inputs.clone(), values)))
         }
-    };
+    }
+}
+
+/// A command ready to start: the request checked against the project's
+/// declarations, with the interpreter, environment and directory the
+/// application is served with.
+pub fn prepare(context: &Context, request: CommandRequest) -> Result<Prepared, String> {
+    let declared_command = check(&context.project, context.file.as_deref(), &request)?;
 
     let env = muru_controller::commands::environment(
         context.env.clone(),
@@ -287,8 +301,10 @@ impl ProjectArgs {
 /// environment and runtime library found as `muructl serve` and `muructl
 /// run` find them. The image's runtime directory is used when a setting
 /// names it or it holds a library; otherwise the library comes from
-/// where a development run takes it.
-pub async fn own(args: &ProjectArgs) -> anyhow::Result<Context> {
+/// where a development run takes it. The request is checked first, so a
+/// mistake in it is reported as itself rather than as a runtime library
+/// that cannot be fetched.
+pub async fn own(args: &ProjectArgs, request: &CommandRequest) -> anyhow::Result<Context> {
     let settings = crate::serve::command_settings(
         args.chdir.as_deref(),
         args.config.as_deref(),
@@ -309,6 +325,19 @@ pub async fn own(args: &ProjectArgs) -> anyhow::Result<Context> {
         .canonicalize()
         .unwrap_or_else(|_| settings.project.clone());
     let table = found.map(|(_, table)| table).unwrap_or_default();
+    check(&project, settings.file.as_deref(), request).map_err(anyhow::Error::msg)?;
+
+    let env = table
+        .env
+        .iter()
+        .map(|(name, value)| match value {
+            muru_config::EnvValue::Plain(text) => Ok((name.clone(), text.clone())),
+            muru_config::EnvValue::Secret(_) => Err(anyhow::anyhow!(
+                "[tool.muru.env] {name}: secrets are resolved by the daemon; a command run for \
+                 the project cannot deliver them"
+            )),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let uv = muru_provision::Uv::find(None);
     let isolation = muru_provision::Isolation::default();
@@ -338,18 +367,6 @@ pub async fn own(args: &ProjectArgs) -> anyhow::Result<Context> {
         (None, None) => crate::provision::runtime(&python.probe).await?,
     };
 
-    let env = table
-        .env
-        .iter()
-        .map(|(name, value)| match value {
-            muru_config::EnvValue::Plain(text) => Ok((name.clone(), text.clone())),
-            muru_config::EnvValue::Secret(_) => Err(anyhow::anyhow!(
-                "[tool.muru.env] {name}: secrets are resolved by the daemon; a command run for \
-                 the project cannot deliver them"
-            )),
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
     Ok(Context {
         app: label(&project, table.entrypoint.as_deref()),
         release: String::new(),
@@ -363,8 +380,6 @@ pub async fn own(args: &ProjectArgs) -> anyhow::Result<Context> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
 
     fn context(project: &Path) -> Context {

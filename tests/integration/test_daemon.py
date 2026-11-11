@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -311,6 +312,59 @@ def test_daemon_stop_gives_up_on_a_silent_socket(tmp_path: Path) -> None:
     assert elapsed < 20, elapsed
 
 
+def test_a_daemon_that_exits_at_start_is_reported_with_its_log(tmp_path: Path) -> None:
+    """A daemon that cannot bind its listener exits at once, and daemon
+    start says so with what it wrote, rather than waiting for it."""
+
+    muructl = support.muructl_path()
+    if muructl is None:
+        support.unavailable("muructl is not built")
+    run_dir = support.short_dir("muru-run-")
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+
+    try:
+        started = subprocess.run(
+            [
+                str(muructl),
+                "daemon",
+                "start",
+                "--listen",
+                f"127.0.0.1:{listener.getsockname()[1]}",
+                "--config",
+                str(tmp_path / "muru.toml"),
+                "--state-dir",
+                str(tmp_path / "state"),
+                "--run-dir",
+                str(run_dir),
+                "--log-dir",
+                str(tmp_path / "logs"),
+                "--cache-dir",
+                str(tmp_path / "cache"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    finally:
+        listener.close()
+
+    assert started.returncode != 0
+    assert "the daemon exited before it answered (exit status: 1)" in started.stderr
+    assert "cannot listen on" in started.stderr, started.stderr
+
+    # Every line of daemon.log, the error it exited with among them,
+    # starts with the full UTC time.
+
+    lines = (tmp_path / "logs" / "daemon.log").read_text().splitlines()
+    assert lines and all(re.match(r"\d{4}-\d\d-\d\dT[\d:.]+Z muru: ", line) for line in lines), (
+        lines
+    )
+    assert "muru: error: cannot listen on" in lines[-1]
+
+
 def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
     muructl = support.muructl_path()
     if muructl is None or not support.extension_available():
@@ -318,12 +372,16 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
     run_dir = support.short_dir("muru-run-")
     port = support.free_port()
     location = [
+        "--config",
+        str(tmp_path / "muru.toml"),
         "--state-dir",
         str(tmp_path / "state"),
         "--run-dir",
         str(run_dir),
         "--log-dir",
         str(tmp_path / "logs"),
+        "--cache-dir",
+        str(tmp_path / "cache"),
     ]
 
     started = subprocess.run(
@@ -367,6 +425,8 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
             timeout=60,
         )
         assert f"http://127.0.0.1:{port}" in status.stdout
+        assert f"logs     {tmp_path / 'logs'}\n" in status.stdout
+        assert "cache    " in status.stdout and "config   " in status.stdout
     finally:
         stopped = subprocess.run(
             [str(muructl), "daemon", "stop", "--shutdown", *location],
@@ -380,6 +440,29 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
     assert "releases drained and stopped" in stopped.stdout
     assert (tmp_path / "logs" / "daemon.log").is_file()
     assert not (run_dir / "daemon.pid").exists()
+
+    # With the daemon stopped, its own log is read from the file, and its
+    # status says where its files would be.
+
+    shown = subprocess.run(
+        [str(muructl), "logs", "--daemon", *location],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert shown.returncode == 0 and shown.stdout, shown.stderr
+    status = subprocess.run(
+        [str(muructl), "daemon", "status", *location],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert status.returncode == 3, status.stdout + status.stderr
+    assert status.stdout.startswith("daemon   not running\n")
+    assert f"logs     {tmp_path / 'logs'}\n" in status.stdout
+    assert f"socket   {run_dir / 'admin.sock'}\n" in status.stdout
 
 
 def test_status_names_the_edge_process(daemon: Daemon) -> None:
@@ -540,6 +623,8 @@ def test_a_relative_or_deep_run_directory_is_refused_at_start(tmp_path: Path) ->
                 str(tmp_path / "logs"),
                 "--config",
                 str(tmp_path / "muru.toml"),
+                "--cache-dir",
+                str(tmp_path / "cache"),
             ],
             capture_output=True,
             text=True,
@@ -575,6 +660,7 @@ def test_the_daemons_file_is_named_only_where_it_is_read(daemon: Daemon, tmp_pat
         "MURU_STATE_DIR": str(tmp_path / "state"),
         "MURU_LOG_DIR": str(tmp_path / "logs"),
         "MURU_RUN_DIR": str(support.short_dir("muru-rt-")),
+        "MURU_CACHE_DIR": str(tmp_path / "cache"),
     }
     config = tmp_path / "node.toml"
     config.write_text("[[listener]]\naddress = 'not an address'\n")

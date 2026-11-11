@@ -172,7 +172,7 @@ message Status {
   string dashboard = 12;            // the dashboard's address, or empty
   string budget = 13;               // what the releases hold of the node's budget (section 7.4), or empty without one
   uint32 websockets = 14;           // WebSockets open on the edge, as last sampled
-  string kind = 15;                 // daemon, or run for a development run (section 13.1)
+  string kind = 15;                 // daemon, or run for a development run (section 13.1); stopped only in what muructl daemon status prints with no daemon running (section 13.8)
   string app = 16;                  // a run's application, as its log names it; empty for a daemon
   string release = 17;              // a run's release, r1 and so on; empty for a daemon
   string project = 18;              // a run's project directory; empty for a daemon
@@ -982,6 +982,8 @@ message TailLogsRequest {
   uint32 lines = 4;                 // how many recent lines first; 0 for none
   bool access = 5;                  // the access log instead of a release
   string host = 6;                  // with access: the file a virtual host names for its own records, when it names one
+  bool edge = 7;                    // the edge process's own log, edge.log, instead of a release
+  bool daemon = 8;                  // the daemon's own log, daemon.log, instead of a release
 }
 
 message LogLine {
@@ -1081,6 +1083,7 @@ message LogInfo {
   uint64 archives_size = 9;         // the bytes the archives take
   uint64 total = 10;                // the bytes the log and its archives take
   bool orphaned = 11;               // its release or host no longer exists
+  uint64 modified_unix_ms = 12;     // when the file itself was last changed, 0 when it is gone
 }
 
 message ListLogsResponse {

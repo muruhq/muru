@@ -41,6 +41,12 @@ def test_page_shows_workers_requests_and_logs(dashboard: tuple[support.Server, i
     server, port = dashboard
     assert server.get("/response/list").status == 200
     assert server.get("/response/raise-first").status == 500
+
+    # The traceback reaches muructl through the log relay, after the
+    # response can. muructl adds a line to the dashboard before it prints
+    # it, so once the line is in the run's output the page has it.
+
+    assert server.wait_for_log("raise-first-boom")
     status, headers, body = fetch(port, "/")
     assert status == 200
     assert headers["content-type"].startswith("text/html")

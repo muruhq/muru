@@ -50,11 +50,11 @@ def test_main_requires_arguments() -> None:
 
 
 def test_main_reports_unloadable_application(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     status = host.main(["--app", "no_such_module:application", "--socket-dir", str(tmp_path)])
     assert status == 1
-    assert "cannot load no_such_module:application" in capsys.readouterr().err
+    assert "cannot load no_such_module:application" in capfd.readouterr().err
 
 
 def test_describe_status() -> None:
@@ -250,7 +250,7 @@ def exits(monkeypatch: pytest.MonkeyPatch, *statuses: tuple[int, int]) -> None:
 
 
 def test_a_timeout_kill_is_reported_at_the_decision_and_not_again_at_the_exit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> None:
     instance, state, sent, asked = replacing_host(tmp_path, monkeypatch)
     instance.replace(state, "a request ran too long", "worker.timeout_killed", "hard_timeout")
@@ -286,7 +286,7 @@ def test_a_timeout_kill_is_reported_at_the_decision_and_not_again_at_the_exit(
     exits(monkeypatch, (4242, 0))
     instance.reap()
     assert len([message for message in sent if message.get("type") == "event"]) == 1
-    assert "worker 0 (pid 4242) exited after its drain grace" in capsys.readouterr().err
+    assert "worker 0 (pid 4242) exited after its drain grace" in capfd.readouterr().err
 
 
 def kinds(sent: list[dict[str, Any]]) -> list[object]:

@@ -3,8 +3,11 @@
 //! SIGTERM (design specification sections 6.1 and 13.1).
 
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
@@ -488,10 +491,13 @@ pub struct HostSpec {
     pub tcp_base_port: Option<u16>,
     /// Serve in the host process itself, with no fork (section 13.1).
     pub single: bool,
-    /// Keep running when this process goes away, and write output to this
-    /// file instead of pipes, so a daemon can re-adopt the host after it
-    /// restarts (section 13.3). None relays the output to this process.
+    /// Keep running when this process goes away, with the relay writing
+    /// output to this file, so a daemon can re-adopt the host after it
+    /// restarts (section 13.3). None has the relay write to this process.
     pub detach_to: Option<PathBuf>,
+    /// What the release's log relay queues and does when full (section
+    /// 11.3).
+    pub relay: RelaySettings,
     /// Named worker groups beside the default one (section 7.1).
     pub groups: Vec<HostGroup>,
     /// Named mounts beside the default one at / (section 6.7).
@@ -743,7 +749,16 @@ pub struct HostProcess {
     run_dir: PathBuf,
     /// The release number within this run, from 1.
     pub release: u32,
+    /// The tasks relaying its log relay's output to this process's
+    /// streams, which end when the relay closes it. Shared with the
+    /// supervising task, which adds one for each relay it starts.
+    relays: SharedRelays,
+    /// Its log relay and the task supervising it (section 11.3).
+    relay: RelaySupervisor,
 }
+
+/// The tasks reading what relays write to this process.
+type SharedRelays = Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
 
 /// A host this process spawned, or one it adopted from a previous daemon.
 enum Process {
@@ -752,14 +767,16 @@ enum Process {
 }
 
 impl HostProcess {
-    /// Start the host for release number `release` under the run directory.
-    /// Its output is relayed to this process's own streams and kept in
-    /// `logs` for the dashboard.
+    /// Start the host for release number `release` under the run directory,
+    /// with a log relay beside it (section 11.3). Without `detach_to` what
+    /// the relay writes comes to this process's own streams and is kept in
+    /// `logs` for the dashboard; `watcher` hears what the relay reports.
     pub fn start(
         spec: &HostSpec,
         run_dir: &Path,
         release: u32,
         logs: &Logs,
+        watcher: RelayWatcher,
     ) -> anyhow::Result<Self> {
         let run_dir = run_dir.join(format!("r{release}"));
         std::fs::create_dir_all(&run_dir)
@@ -797,26 +814,47 @@ impl HostProcess {
             .arg(spec.interface.as_str())
             .stdin(Stdio::piped());
 
+        // Section 11.3: the host's own output is a pipe made here, before
+        // either process starts. The relay inherits its read end, so even
+        // an interpreter that fails before the host's code runs is heard,
+        // and the host inherits a copy to give any later relay.
+
+        let (output_read, output_write) =
+            std::io::pipe().context("making the host's output pipe")?;
+        command
+            .stdout(
+                output_write
+                    .try_clone()
+                    .context("copying the host's output pipe")?,
+            )
+            .stderr(output_write);
+
         match &spec.detach_to {
-            Some(log) => {
-                let log = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(log)
-                    .with_context(|| format!("opening {}", log.display()))?;
-                command.stdout(log.try_clone()?).stderr(log);
-
-                own_session(&mut command, spec.identity);
-            }
+            Some(_) => own_session(&mut command, spec.identity),
             None => {
-                command.stdout(Stdio::piped()).stderr(Stdio::piped());
-
                 // Section 13.1: a Ctrl-C in the terminal reaches muructl
                 // alone, which stops the edge before it tells the host,
                 // so the host and its workers are in a group of their own.
 
                 command.process_group(0);
             }
+        }
+
+        // With --single the host's own loop never runs, so nothing would
+        // answer a relay or hold pipes for one: there are no workers, and
+        // this process keeps the read end for any later relay instead.
+
+        if !spec.single {
+            crate::fdpass::inherit_at(
+                command.as_std_mut(),
+                output_read.as_raw_fd(),
+                crate::relay::HOST_OUTPUT_FD,
+            );
+            command
+                .arg("--output-socket")
+                .arg(run_dir.join(crate::relay::OUTPUT_SOCKET))
+                .arg("--output-fd")
+                .arg(crate::relay::HOST_OUTPUT_FD.to_string());
         }
 
         if let Some(hooks) = &spec.hooks {
@@ -842,8 +880,8 @@ impl HostProcess {
             command.arg("--handoff").arg(handoff.as_str());
         }
 
-        if let Some(log) = &spec.detach_to {
-            command.arg("--detach").arg("--log-file").arg(log);
+        if spec.detach_to.is_some() {
+            command.arg("--detach");
         }
 
         for mount in &spec.mounts {
@@ -975,6 +1013,10 @@ impl HostProcess {
             command
                 .arg("--logger")
                 .arg(format!("{name}={}", level.as_str()));
+        }
+
+        for filter in &spec.logging.warnings {
+            command.arg("--warning").arg(filter);
         }
 
         let workers = spec.processes
@@ -1111,21 +1153,35 @@ impl HostProcess {
             command.env("PYTHONPATH", value);
         }
 
+        // The relay first, so that the host's first line has a reader.
+
+        let launch = RelayLaunch::new(spec, &run_dir)?;
+        let relays: SharedRelays = Arc::default();
+        let first = launch
+            .spawn(Some(output_read.as_raw_fd()), logs, &relays)
+            .context("starting the release's log relay")?;
+
         let mut child = command
             .spawn()
             .with_context(|| format!("starting the host with {}", spec.python.display()))?;
 
+        // Both ends of the pipe now belong to the two processes, but for
+        // the read end kept under --single.
+
+        drop(command);
+        let kept_output = spec.single.then(|| OwnedFd::from(output_read));
+
         // The host exits when this end of its stdin closes, whatever happens here.
 
         let stdin = child.stdin.take();
-
-        if let Some(stdout) = child.stdout.take() {
-            tokio::spawn(relay(stdout, logs.clone(), false));
-        }
-
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(relay(stderr, logs.clone(), true));
-        }
+        let relay = RelaySupervisor::start(
+            launch,
+            RelayRunning::Child(first),
+            kept_output,
+            logs,
+            &relays,
+            watcher,
+        );
 
         // Sockets are numbered across every group in the order the host
         // forks them: the default group first, then each named group.
@@ -1170,12 +1226,17 @@ impl HostProcess {
                 .collect(),
             run_dir,
             release,
+            relays,
+            relay,
         })
     }
 
     /// Take over a host a previous daemon started: it is checked to be
     /// alive and its workers to be listening, and is stopped with signals
-    /// rather than waited for, since it is not this process's child.
+    /// rather than waited for, since it is not this process's child. Its
+    /// relay is adopted with it when `relay_pid` names one still there;
+    /// otherwise a new one is started and given the host's pipes.
+    #[allow(clippy::too_many_arguments)]
     pub fn adopt(
         pid: u32,
         sockets: Vec<PathBuf>,
@@ -1183,8 +1244,20 @@ impl HostProcess {
         optional: Vec<String>,
         run_dir: PathBuf,
         release: u32,
+        launch: RelayLaunch,
+        relay_pid: Option<u32>,
+        watcher: RelayWatcher,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(alive(pid), "process {pid} is gone");
+        let relays: SharedRelays = Arc::default();
+
+        let running = match relay_pid {
+            Some(relay_pid) => RelayRunning::Adopted(relay_pid),
+            None => RelayRunning::Gone,
+        };
+
+        let relay =
+            RelaySupervisor::start(launch, running, None, &Logs::default(), &relays, watcher);
         let host = Self {
             process: Process::Adopted(pid),
             stdin: None,
@@ -1193,6 +1266,8 @@ impl HostProcess {
             optional,
             run_dir,
             release,
+            relays,
+            relay,
         };
         anyhow::ensure!(
             host.required_sockets()
@@ -1310,10 +1385,14 @@ impl HostProcess {
         }
     }
 
-    /// Resolve when the host exits.
+    /// Resolve when the host exits, once what it wrote last is written.
     pub async fn exited(&mut self) -> std::io::Result<ExitStatus> {
         match &mut self.process {
-            Process::Child(child) => child.wait().await,
+            Process::Child(child) => {
+                let status = child.wait().await;
+                relayed_to_the_end(&self.relays).await;
+                status
+            }
             Process::Adopted(pid) => {
                 let pid = *pid;
 
@@ -1396,6 +1475,12 @@ impl HostProcess {
             }
         }
 
+        // The relay writes the host's last lines and exits; then what it
+        // wrote to this process is read to the end.
+
+        self.relay.finish().await;
+        relayed_to_the_end(&self.relays).await;
+
         let _ = std::fs::remove_dir_all(&self.run_dir);
     }
 
@@ -1421,8 +1506,20 @@ impl HostProcess {
         let _ = std::fs::set_permissions(&path, permissions);
     }
 
+    /// Send a signal to the release's log relay: SIGUSR1 has it open the
+    /// release log again by name. Returns whether it was delivered.
+    pub fn signal_relay(&self, signal: i32) -> bool {
+        signal_process(self.relay.pid(), signal)
+    }
+
+    /// Lines of the release's output dropped so far, across its relays.
+    pub fn output_dropped(&self) -> u64 {
+        self.relay.dropped()
+    }
+
     /// Leave the host running and forget it, for a daemon that detaches.
     pub fn release(self) {
+        self.relay.release();
         drop(self.stdin);
 
         if let Process::Child(mut child) = self.process {
@@ -1647,8 +1744,8 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
         Stream::Stdout
     };
 
-    // Section 11.8: the time is when the line arrived here, put in front
-    // when the terminal asks for it with --timestamps. When lines are
+    // Section 11.8: the time is the relay's, put in front when the
+    // terminal asks for it with --timestamps. When lines are
     // JSON records, each source's traceback is gathered and written as
     // one record, once its exception's line is followed by something
     // else or nothing more has come for a moment.
@@ -1673,28 +1770,39 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
             Some(_) => break,
         };
 
-        gathering.retain(|source, gathered| {
-            let stale = gathered
-                .updated
-                .elapsed()
-                .is_ok_and(|age| age >= TRACEBACK_WAIT);
+        let stale: Vec<String> = gathering
+            .iter()
+            .filter(|(_, gathered)| {
+                gathered
+                    .updated
+                    .elapsed()
+                    .is_ok_and(|age| age >= TRACEBACK_WAIT)
+            })
+            .map(|(source, _)| source.clone())
+            .collect();
 
-            if stale {
-                write_traceback(out, source, gathered);
+        for source in stale {
+            if let Some(mut gathered) = gathering.remove(&source) {
+                write_traceback(out, &source, &mut gathered).await;
             }
-
-            !stale
-        });
+        }
 
         let Some(line) = line else {
             continue;
         };
 
-        let time = SystemTime::now();
+        // The log relay put the time on the line when it read it, so a
+        // delay on the way here does not move it.
+
+        let (stamp, text) = muru_common::log::split_time(&line);
+        let time = stamp
+            .and_then(muru_common::log::parse_full)
+            .unwrap_or_else(SystemTime::now);
+        let line = text.to_owned();
         logs.push(time, &line);
 
         if !muru_common::log::json() {
-            muru_common::log::relayed(out, time, &line);
+            write_relayed(out, time, &line).await;
             continue;
         }
 
@@ -1710,7 +1818,7 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
                     continue;
                 }
                 Gathered::Finished(text) => {
-                    muru_common::log::relayed(out, gathered.started, &tagged(source, &text));
+                    write_relayed(out, gathered.started, &tagged(source, &text)).await;
                     gathering.remove(source);
                 }
             }
@@ -1728,11 +1836,11 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
             continue;
         }
 
-        muru_common::log::relayed(out, time, &line);
+        write_relayed(out, time, &line).await;
     }
 
     for (source, gathered) in &mut gathering {
-        write_traceback(out, source, gathered);
+        write_traceback(out, source, gathered).await;
     }
 }
 
@@ -1749,9 +1857,545 @@ struct Gathering {
     traceback: Traceback,
 }
 
-fn write_traceback(out: Stream, source: &str, gathered: &mut Gathering) {
+async fn write_traceback(out: Stream, source: &str, gathered: &mut Gathering) {
     let text = gathered.traceback.take();
-    muru_common::log::relayed(out, gathered.started, &tagged(source, &text));
+    write_relayed(out, gathered.started, &tagged(source, &text)).await;
+}
+
+/// What the relays hand the thread that writes their lines.
+enum Relayed {
+    /// A line, newline included, for one of this process's streams.
+    Line(Stream, String),
+    /// Answered once every line handed over before it is written.
+    Flushed(tokio::sync::oneshot::Sender<()>),
+}
+
+/// How many lines may wait for the writer before a relay waits for room.
+const RELAY_QUEUE: usize = 1024;
+
+/// The most a batch of one stream's lines holds in one write.
+const RELAY_BATCH: usize = 64 * 1024;
+
+/// The thread that writes what the relays read, so that a terminal or a
+/// container runtime that stops reading holds up that thread alone,
+/// never one of the runtime's: a relay awaits room in the channel, and
+/// its host's pipe fills behind it. None when the thread could not be
+/// started, and the relays write themselves.
+fn relay_writer() -> Option<&'static mpsc::Sender<Relayed>> {
+    static WRITER: std::sync::OnceLock<Option<mpsc::Sender<Relayed>>> = std::sync::OnceLock::new();
+
+    WRITER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::channel(RELAY_QUEUE);
+
+            std::thread::Builder::new()
+                .name("muru-relay-writer".to_owned())
+                .spawn(move || write_relays(receiver))
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
+
+/// Write what the relays hand over, gathering a stream's lines that are
+/// already waiting into one write of up to `RELAY_BATCH` bytes.
+fn write_relays(mut receiver: mpsc::Receiver<Relayed>) {
+    let mut next = receiver.blocking_recv();
+
+    while let Some(relayed) = next.take() {
+        let (stream, mut batch) = match relayed {
+            Relayed::Line(stream, line) => (stream, line),
+            Relayed::Flushed(answer) => {
+                let _ = answer.send(());
+                next = receiver.blocking_recv();
+                continue;
+            }
+        };
+
+        // Gather what is already waiting for the same stream; anything
+        // else waits its turn, so the order is kept.
+
+        while batch.len() < RELAY_BATCH {
+            match receiver.try_recv() {
+                Ok(Relayed::Line(same, line)) if same == stream => batch.push_str(&line),
+                Ok(other) => {
+                    next = Some(other);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+
+        muru_common::log::write(stream, batch.as_bytes());
+
+        if next.is_none() {
+            next = receiver.blocking_recv();
+        }
+    }
+}
+
+/// Hand a relayed line to the writer, waiting while its channel is full.
+async fn write_relayed(out: Stream, time: SystemTime, text: &str) {
+    let line = muru_common::log::relayed_line(out, time, text);
+
+    match relay_writer() {
+        Some(writer) => {
+            if let Err(mpsc::error::SendError(Relayed::Line(stream, line))) =
+                writer.send(Relayed::Line(out, line)).await
+            {
+                muru_common::log::write(stream, line.as_bytes());
+            }
+        }
+        None => muru_common::log::write(out, line.as_bytes()),
+    }
+}
+
+/// How long a host's relays may take to reach the end of its output once
+/// it has exited: a process it left behind may hold its streams open.
+const RELAY_END: Duration = Duration::from_secs(2);
+
+/// Wait for a host's relays to read the last of its output, and for the
+/// writer to write it, so that a host's last lines come before whatever
+/// this process writes next.
+async fn relayed_to_the_end(relays: &SharedRelays) {
+    let taken = std::mem::take(&mut *relays.lock().expect("relays poisoned"));
+
+    for relay in taken {
+        let _ = tokio::time::timeout(RELAY_END, relay).await;
+    }
+
+    let Some(writer) = relay_writer() else {
+        return;
+    };
+
+    let (answer, written) = tokio::sync::oneshot::channel();
+
+    if writer.send(Relayed::Flushed(answer)).await.is_ok() {
+        let _ = tokio::time::timeout(RELAY_END, written).await;
+    }
+}
+
+/// What a release's log relay queues and does when full (section 11.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelaySettings {
+    /// Each queue's bound in bytes (`[logs] output_queue`).
+    pub queue: usize,
+    /// What a full queue does (`[logs] on_overflow`).
+    pub overflow: crate::relay::Overflow,
+}
+
+impl Default for RelaySettings {
+    fn default() -> Self {
+        Self {
+            queue: crate::relay::DEFAULT_QUEUE,
+            overflow: crate::relay::Overflow::default(),
+        }
+    }
+}
+
+/// What a relay reports, for whoever runs the release.
+#[derive(Debug, Clone)]
+pub enum RelayNews {
+    /// Lines of the release's output dropped so far.
+    Dropped(u64),
+    /// A stall began or ended, or a relay was started again.
+    Event {
+        /// The event's kind.
+        kind: String,
+        /// `warning` or `info`.
+        level: String,
+        /// What happened, in words.
+        message: String,
+    },
+}
+
+/// Hears what a release's relay reports.
+pub type RelayWatcher = Arc<dyn Fn(RelayNews) + Send + Sync>;
+
+/// How a release's relay is started, kept to start another the same way.
+#[derive(Debug, Clone)]
+pub struct RelayLaunch {
+    /// The executable, this program.
+    executable: PathBuf,
+    /// The directory the host's and relay's sockets are in.
+    run_dir: PathBuf,
+    /// The release log, or none to write to this process.
+    log_file: Option<PathBuf>,
+    settings: RelaySettings,
+    identity: Option<Identity>,
+    /// The host serves in its own process, with no socket to connect to.
+    single: bool,
+}
+
+impl RelayLaunch {
+    /// How to start the relay of a host started with `spec`.
+    fn new(spec: &HostSpec, run_dir: &Path) -> anyhow::Result<Self> {
+        let launch = Self::for_release(
+            run_dir.to_owned(),
+            spec.detach_to.clone(),
+            spec.relay,
+            spec.identity,
+        )?;
+
+        Ok(Self {
+            single: spec.single,
+            ..launch
+        })
+    }
+
+    /// How to start the relay of a release whose sockets are in
+    /// `run_dir`, writing `log_file` or else to this process.
+    pub fn for_release(
+        run_dir: PathBuf,
+        log_file: Option<PathBuf>,
+        settings: RelaySettings,
+        identity: Option<Identity>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            executable: crate::daemon::running_executable()
+                .context("finding the executable to start the relay from")?,
+            run_dir,
+            log_file,
+            settings,
+            identity,
+            single: false,
+        })
+    }
+
+    fn output_socket(&self) -> PathBuf {
+        self.run_dir.join(crate::relay::OUTPUT_SOCKET)
+    }
+
+    fn control_socket(&self) -> PathBuf {
+        self.run_dir.join(crate::relay::CONTROL_SOCKET)
+    }
+
+    /// Start a relay, handing it the read end of the host's output when
+    /// `host_output` gives one. Without a release log what it writes
+    /// comes to this process and is relayed on to its streams.
+    fn spawn(
+        &self,
+        host_output: Option<RawFd>,
+        logs: &Logs,
+        relays: &SharedRelays,
+    ) -> anyhow::Result<Child> {
+        let mut command = Command::new(&self.executable);
+        command
+            .arg("relay")
+            .arg("run")
+            .arg("--control")
+            .arg(self.control_socket())
+            .arg("--queue")
+            .arg(self.settings.queue.to_string())
+            .arg("--on-overflow")
+            .arg(self.settings.overflow.as_str())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+
+        if !self.single {
+            command.arg("--connect").arg(self.output_socket());
+        }
+
+        if let Some(fd) = host_output {
+            crate::fdpass::inherit_at(command.as_std_mut(), fd, crate::relay::HOST_OUTPUT_FD);
+            command
+                .arg("--host-output-fd")
+                .arg(crate::relay::HOST_OUTPUT_FD.to_string());
+        }
+
+        match &self.log_file {
+            Some(log) => {
+                // The relay's own failure to start goes where its lines go.
+
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log)
+                    .with_context(|| format!("opening {}", log.display()))?;
+                command.stderr(file).arg("--log-file").arg(log);
+                own_session(&mut command, self.identity);
+            }
+            None => {
+                command.stderr(Stdio::piped());
+                command.process_group(0);
+            }
+        }
+
+        let mut child = command.spawn().context("running muructl relay")?;
+
+        if let Some(stderr) = child.stderr.take() {
+            let reading = tokio::spawn(relay(stderr, logs.clone(), true));
+            relays.lock().expect("relays poisoned").push(reading);
+        }
+
+        if let Some(pid) = child.id() {
+            self.record(pid);
+        }
+
+        Ok(child)
+    }
+
+    /// Say which process the relay is, for a daemon that adopts it.
+    fn record(&self, pid: u32) {
+        let path = self.run_dir.join(crate::relay::RECORD);
+
+        if let Err(error) = std::fs::write(&path, format!("pid = {pid}\n")) {
+            tracing::warn!(%error, "could not record the release's log relay");
+        }
+    }
+}
+
+/// The relay a supervisor is looking after.
+enum RelayRunning {
+    /// One this process started.
+    Child(Child),
+    /// One a previous daemon started.
+    Adopted(u32),
+    /// None: one is to be started.
+    Gone,
+}
+
+impl RelayRunning {
+    fn pid(&self) -> u32 {
+        match self {
+            Self::Child(child) => child.id().unwrap_or(0),
+            Self::Adopted(pid) => *pid,
+            Self::Gone => 0,
+        }
+    }
+
+    /// Wait for the relay to exit.
+    async fn exited(&mut self) {
+        match self {
+            Self::Child(child) => {
+                let _ = child.wait().await;
+            }
+            Self::Adopted(pid) => {
+                while alive(*pid) {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+            Self::Gone => {}
+        }
+    }
+}
+
+/// The task that looks after a release's relay, and what it shares.
+struct RelaySupervisor {
+    pid: Arc<AtomicU32>,
+    dropped: Arc<AtomicU64>,
+    stopping: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// How long a stop waits for the relay to write what it holds and exit,
+/// before telling it to.
+const RELAY_DRAIN: Duration = Duration::from_secs(5);
+
+/// How long a relay told to stop gets to do so before it is killed.
+const RELAY_TERM: Duration = Duration::from_secs(3);
+
+/// A relay that lasted this long is not failing: the wait before the
+/// next is back to its shortest.
+const RELAY_STEADY: Duration = Duration::from_secs(60);
+
+/// The longest wait before starting another relay.
+const RELAY_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+impl RelaySupervisor {
+    fn start(
+        launch: RelayLaunch,
+        running: RelayRunning,
+        kept_output: Option<OwnedFd>,
+        logs: &Logs,
+        relays: &SharedRelays,
+        watcher: RelayWatcher,
+    ) -> Self {
+        let pid = Arc::new(AtomicU32::new(running.pid()));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (stopping, stop) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(supervise_relay(
+            launch,
+            running,
+            kept_output,
+            logs.clone(),
+            Arc::clone(relays),
+            watcher,
+            Arc::clone(&pid),
+            Arc::clone(&dropped),
+            stop,
+        ));
+
+        Self {
+            pid,
+            dropped,
+            stopping,
+            task,
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.pid.load(Ordering::Relaxed)
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Let the relay finish now that the host is done: it writes what it
+    /// holds and exits, and is told to if it takes too long.
+    async fn finish(mut self) {
+        let _ = self.stopping.send(true);
+
+        if tokio::time::timeout(RELAY_DRAIN, &mut self.task)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+
+        signal_process(self.pid(), libc::SIGTERM);
+
+        if tokio::time::timeout(RELAY_TERM, &mut self.task)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+
+        signal_process(self.pid(), libc::SIGKILL);
+        let _ = tokio::time::timeout(RELAY_TERM, self.task).await;
+    }
+
+    /// Leave the relay running, for a daemon that detaches.
+    fn release(self) {
+        self.task.abort();
+    }
+}
+
+/// Look after a release's relay: read what it reports while it runs,
+/// start another when it exits and the host still listens for one, and
+/// end when told the host is done and the relay has gone.
+#[allow(clippy::too_many_arguments)]
+async fn supervise_relay(
+    launch: RelayLaunch,
+    mut running: RelayRunning,
+    kept_output: Option<OwnedFd>,
+    logs: Logs,
+    relays: SharedRelays,
+    watcher: RelayWatcher,
+    pid: Arc<AtomicU32>,
+    dropped: Arc<AtomicU64>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut wait = Duration::from_secs(1);
+
+    // What relays that have gone had dropped, and what the one running
+    // has, so the total never goes back.
+
+    let mut carried = 0u64;
+
+    loop {
+        let started = Instant::now();
+        let current = Arc::new(AtomicU64::new(0));
+        let reports = tokio::spawn(read_relay_reports(
+            launch.control_socket(),
+            carried,
+            Arc::clone(&current),
+            Arc::clone(&dropped),
+            Arc::clone(&watcher),
+        ));
+
+        running.exited().await;
+
+        // Whatever it said last is all it will say.
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reports.abort();
+        carried += current.load(Ordering::Relaxed);
+        dropped.store(carried, Ordering::Relaxed);
+        pid.store(0, Ordering::Relaxed);
+
+        // A relay ends when the host does; only one that left a host
+        // still there is started again. A host that serves in its own
+        // process does not listen: it is there while its output pipe has
+        // a writer.
+
+        let host_there = match &kept_output {
+            Some(output) => crate::fdpass::has_writers(output.as_raw_fd()),
+            None => listening(&launch.output_socket()),
+        };
+
+        if *stop.borrow() || !host_there {
+            return;
+        }
+
+        if started.elapsed() >= RELAY_STEADY {
+            wait = Duration::from_secs(1);
+        }
+
+        watcher(RelayNews::Event {
+            kind: "output.relay_restarting".to_owned(),
+            level: "warning".to_owned(),
+            message: format!(
+                "the release's log relay exited and will be started again in {} s",
+                wait.as_secs()
+            ),
+        });
+
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            _ = stop.changed() => return,
+        }
+
+        wait = (wait * 2).min(RELAY_BACKOFF_MAX);
+
+        let output = kept_output.as_ref().map(AsRawFd::as_raw_fd);
+
+        match launch.spawn(output, &logs, &relays) {
+            Ok(child) => {
+                pid.store(child.id().unwrap_or(0), Ordering::Relaxed);
+                running = RelayRunning::Child(child);
+            }
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "could not start the log relay again");
+                running = RelayRunning::Gone;
+            }
+        }
+    }
+}
+
+/// Read a relay's reports, trying for a moment while it starts, keeping
+/// `current` as what it has dropped and `total` with `carried` added.
+async fn read_relay_reports(
+    socket: PathBuf,
+    carried: u64,
+    current: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    watcher: RelayWatcher,
+) {
+    for _ in 0..100 {
+        let result = crate::relay::watch_reports(&socket, |report| match report {
+            crate::relay::Report::Status(status) => {
+                current.store(status.dropped, Ordering::Relaxed);
+                let sum = carried + status.dropped;
+                total.store(sum, Ordering::Relaxed);
+                watcher(RelayNews::Dropped(sum));
+            }
+            crate::relay::Report::Event(event) => watcher(RelayNews::Event {
+                kind: event.kind,
+                level: event.level,
+                message: event.message,
+            }),
+        })
+        .await;
+
+        if result.is_ok() {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// A message with its source in front, as the host writes it.

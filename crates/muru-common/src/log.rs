@@ -300,6 +300,11 @@ pub fn split_time(line: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// The time a full-form stamp names, as `split_time` gives it.
+pub fn parse_full(stamp: &str) -> Option<SystemTime> {
+    stamp.parse::<Timestamp>().ok().map(SystemTime::from)
+}
+
 /// Write one line to `stream`: the full time when the stream is stamped,
 /// then `tag: ` and the message, in one write so lines from several
 /// threads never interleave.
@@ -340,6 +345,12 @@ pub fn line_of_kind(stream: Stream, kind: &str, tag: &str, message: fmt::Argumen
 /// worker's relayed output, with the time in front when the stream is
 /// stamped. `time` is when the line arrived.
 pub fn relayed(stream: Stream, time: SystemTime, text: &str) {
+    write(stream, relayed_line(stream, time, text).as_bytes());
+}
+
+/// A relayed line as `relayed` writes it, newline included, for a caller
+/// that writes it itself.
+pub fn relayed_line(stream: Stream, time: SystemTime, text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 32);
 
     if json() {
@@ -353,8 +364,7 @@ pub fn relayed(stream: Stream, time: SystemTime, text: &str) {
 
         out.push_str(&app_record(time, source, message));
         out.push('\n');
-        write(stream, out.as_bytes());
-        return;
+        return out;
     }
 
     if stamped(stream) {
@@ -364,7 +374,7 @@ pub fn relayed(stream: Stream, time: SystemTime, text: &str) {
 
     out.push_str(text);
     out.push('\n');
-    write(stream, out.as_bytes());
+    out
 }
 
 /// The JSON record of a line of the application's output. A line that
@@ -495,6 +505,194 @@ pub fn write(stream: Stream, bytes: &[u8]) {
     };
 }
 
+/// Whether no panic has been reported yet, for the note about
+/// `RUST_BACKTRACE`, which the standard library's own hook gives only for
+/// the first.
+static FIRST_PANIC: AtomicBool = AtomicBool::new(true);
+
+/// Report panics as Muru's own lines on standard error, through the same
+/// helper as every other line: stamped where those are, a single record
+/// where lines are JSON. What a panic does next, unwinding or aborting, and
+/// the exit status it leads to are unchanged; only the report is.
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        let location = info
+            .location()
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
+            .unwrap_or_else(|| "an unknown location".to_owned());
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "Box<dyn Any>".to_owned());
+
+        // A backtrace is taken when RUST_BACKTRACE asks for one, as the
+        // standard library's hook takes it, whatever RUST_LIB_BACKTRACE
+        // says; `full` keeps the frames the short form leaves out.
+
+        let asked = std::env::var("RUST_BACKTRACE").ok();
+        let backtrace = asked.as_deref().filter(|value| *value != "0").map(|value| {
+            let captured = std::backtrace::Backtrace::force_capture();
+
+            if value == "full" {
+                format!("{captured:#}")
+            } else {
+                format!("{captured}")
+            }
+        });
+
+        let full_backtrace = asked.as_deref() == Some("full");
+        let report = Panic {
+            thread: thread.name().unwrap_or("<unnamed>"),
+            location: &location,
+            message: &message,
+            frames: backtrace.as_deref().map(|backtrace| {
+                let frames = frames(backtrace);
+
+                if full_backtrace {
+                    frames
+                } else {
+                    short(frames)
+                }
+            }),
+            note: backtrace.is_none() && FIRST_PANIC.swap(false, Ordering::Relaxed),
+        };
+
+        let text = report.render(json(), stamped(Stream::Stderr).then(SystemTime::now));
+        write(Stream::Stderr, text.as_bytes());
+    }));
+}
+
+/// The frames of a backtrace as the standard library prints it, one
+/// string each: a frame's `N: symbol` line with its `at FILE:LINE` lines
+/// after it, on one line.
+fn frames(backtrace: &str) -> Vec<String> {
+    let mut frames: Vec<String> = Vec::new();
+
+    for line in backtrace
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let numbered = line
+            .split_once(": ")
+            .is_some_and(|(number, _)| number.chars().all(|c| c.is_ascii_digit()));
+
+        match frames.last_mut() {
+            Some(frame) if !numbered => {
+                frame.push(' ');
+                frame.push_str(line);
+            }
+            _ => frames.push(line.to_owned()),
+        }
+    }
+
+    frames
+}
+
+/// The frames the standard library's hook shows in its short form:
+/// those between the panic machinery and the start of the thread, which
+/// mark themselves with `__rust_end_short_backtrace` and
+/// `__rust_begin_short_backtrace`, numbered again from 0. Without the
+/// markers every frame is kept.
+fn short(frames: Vec<String>) -> Vec<String> {
+    let start = frames
+        .iter()
+        .position(|frame| frame.contains("__rust_end_short_backtrace"))
+        .map_or(0, |end| end + 1);
+    let stop = frames[start..]
+        .iter()
+        .position(|frame| frame.contains("__rust_begin_short_backtrace"))
+        .map_or(frames.len(), |begin| start + begin);
+
+    frames[start..stop]
+        .iter()
+        .enumerate()
+        .map(|(number, frame)| {
+            let rest = frame
+                .split_once(": ")
+                .map_or(frame.as_str(), |(_, rest)| rest);
+            format!("{number}: {rest}")
+        })
+        .collect()
+}
+
+/// A panic's report, before it is written.
+struct Panic<'a> {
+    thread: &'a str,
+    location: &'a str,
+    message: &'a str,
+    /// The backtrace's frames, when one was asked for.
+    frames: Option<Vec<String>>,
+    /// Whether to say how to ask for a backtrace.
+    note: bool,
+}
+
+/// How to ask for a backtrace, as the standard library's hook says it.
+const BACKTRACE_NOTE: &str =
+    "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace";
+
+impl Panic<'_> {
+    /// The report as it is written: one JSON record, or one Muru line for
+    /// the panic and one for each frame or the note, each with the time in
+    /// front when `stamped` gives one. A message of several lines keeps
+    /// its first on the panic's line and gives each further one a line of
+    /// its own, so every line starts the same way.
+    fn render(&self, json: bool, stamped: Option<SystemTime>) -> String {
+        if json {
+            let mut record = format!(
+                "{{\"time\":\"{}\",\"kind\":\"panic\",\"message\":{},\"thread\":{},\"location\":{}",
+                full(SystemTime::now()),
+                json_string(self.message),
+                json_string(self.thread),
+                json_string(self.location)
+            );
+
+            if let Some(frames) = &self.frames {
+                let frames: Vec<String> = frames.iter().map(|frame| json_string(frame)).collect();
+                record.push_str(&format!(",\"backtrace\":[{}]", frames.join(",")));
+            } else if self.note {
+                record.push_str(&format!(",\"note\":{}", json_string(BACKTRACE_NOTE)));
+            }
+
+            record.push_str(identity());
+            record.push_str("}\n");
+            return record;
+        }
+
+        let mut lines = self.message.lines();
+        let first = lines.next().unwrap_or_default();
+        let mut text = vec![format!(
+            "thread '{}' panicked at {}: {first}",
+            self.thread, self.location
+        )];
+        text.extend(lines.map(str::to_owned));
+
+        if let Some(frames) = &self.frames {
+            text.extend(frames.iter().map(|frame| format!("  {frame}")));
+        } else if self.note {
+            text.push(BACKTRACE_NOTE.to_owned());
+        }
+
+        let time = stamped
+            .map(|time| format!("{} ", full(time)))
+            .unwrap_or_default();
+
+        text.iter()
+            .map(|line| format!("{time}muru: panic: {line}\n"))
+            .collect()
+    }
+}
+
 /// Print one of Muru's own lines to standard output, as `println!` does,
 /// with `muru: ` in front and the time when the stream is stamped.
 #[macro_export]
@@ -518,6 +716,100 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn a_panic_is_one_line_with_the_note_or_a_line_a_frame() {
+        let time = UNIX_EPOCH + Duration::from_millis(1_793_597_342_836);
+        let mut report = Panic {
+            thread: "main",
+            location: "src/main.rs:10:5",
+            message: "boom\nsecond",
+            frames: None,
+            note: true,
+        };
+
+        assert_eq!(
+            report.render(false, Some(time)),
+            "2026-11-02T05:29:02.836Z muru: panic: thread 'main' panicked at src/main.rs:10:5: boom\n\
+             2026-11-02T05:29:02.836Z muru: panic: second\n\
+             2026-11-02T05:29:02.836Z muru: panic: note: run with `RUST_BACKTRACE=1` environment \
+             variable to display a backtrace\n"
+        );
+
+        report.message = "boom";
+        report.frames = Some(frames(
+            "   0: muru::main\n             at ./src/main.rs:10:5\n   1: std::rt::lang_start\n",
+        ));
+        assert_eq!(
+            report.render(false, None),
+            "muru: panic: thread 'main' panicked at src/main.rs:10:5: boom\n\
+             muru: panic:   0: muru::main at ./src/main.rs:10:5\n\
+             muru: panic:   1: std::rt::lang_start\n"
+        );
+
+        let trimmed = short(frames(
+            "   0: trace\n   1: __rust_end_short_backtrace\n   2: app::f\n   3: \
+             __rust_begin_short_backtrace\n   4: main\n",
+        ));
+        assert_eq!(trimmed, ["0: app::f"]);
+
+        let record: serde_json::Value =
+            serde_json::from_str(report.render(true, None).trim_end()).unwrap();
+        assert_eq!(record["kind"], "panic");
+        assert_eq!(record["message"], "boom");
+        assert_eq!(record["location"], "src/main.rs:10:5");
+        assert_eq!(record["backtrace"][1], "1: std::rt::lang_start");
+    }
+
+    /// Set in the copy of the test binary that panics.
+    const PANIC_CHILD: &str = "MURU_TEST_PANIC_CHILD";
+
+    #[test]
+    fn a_panic_with_standard_error_on_a_file_is_reported_stamped() {
+        if std::env::var_os(PANIC_CHILD).is_some() {
+            install_panic_hook();
+            panic!("on purpose");
+        }
+
+        // The test binary runs this test again with standard error on a
+        // regular file, where it panics.
+
+        let path = std::env::temp_dir().join(format!("muru-panic-{}.log", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "log::tests::a_panic_with_standard_error_on_a_file_is_reported_stamped",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PANIC_CHILD, "1")
+            .env_remove("RUST_BACKTRACE")
+            .stdout(std::process::Stdio::null())
+            .stderr(file)
+            .status()
+            .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!status.success(), "the child's test panicked");
+
+        let reported: Vec<&str> = written
+            .lines()
+            .filter(|line| line.contains(" muru: panic: "))
+            .collect();
+        assert_eq!(reported.len(), 2, "{written}");
+        assert!(
+            reported.iter().all(|line| split_time(line).0.is_some()),
+            "{written}"
+        );
+        assert!(
+            reported[0].contains("panicked at crates/muru-common/src/log.rs:"),
+            "{written}"
+        );
+        assert!(reported[0].ends_with(": on purpose"), "{written}");
+        assert!(reported[1].ends_with("to display a backtrace"), "{written}");
+    }
 
     #[test]
     fn the_full_form_is_rfc_3339_in_utc_with_milliseconds() {

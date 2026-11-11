@@ -71,13 +71,13 @@ def test_missing_module_raises_import_error() -> None:
         Hooks.load("no_such_hooks_module")
 
 
-def test_call_logged_reports_and_continues(capsys: pytest.CaptureFixture[str]) -> None:
+def test_call_logged_reports_and_continues(caplog: pytest.LogCaptureFixture) -> None:
     def on_drain(context: Context) -> None:
         raise RuntimeError("drain-boom")
 
     hooks = Hooks({"on_drain": on_drain})
     assert hooks.call_logged("on_drain", Context()) is False
-    captured = capsys.readouterr().err
-    assert "the on_drain hook failed" in captured
-    assert "drain-boom" in captured
+    (record,) = [record for record in caplog.records if record.name == "muru"]
+    assert record.levelname == "ERROR" and record.getMessage() == "the on_drain hook failed"
+    assert record.exc_info is not None and "drain-boom" in str(record.exc_info[1])
     assert hooks.call_logged("on_exit", Context()) is True

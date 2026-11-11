@@ -1283,6 +1283,14 @@ impl AccessLog {
         }
     }
 
+    /// The file lines are appended to, when they go to one.
+    pub fn file(&self) -> Option<&std::path::Path> {
+        match &self.destination {
+            Destination::File(path) => Some(path),
+            _ => None,
+        }
+    }
+
     /// Open the file again by name, for section 11.3: after an external
     /// rotation has renamed the file, lines go to a new one at the path.
     /// Nothing happens when lines do not go to a file.

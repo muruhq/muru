@@ -7,6 +7,80 @@ WebSocket this way: it hands the upgrade to an ASGI application, which
 accepts the socket on the worker's event loop, and the view's thread
 goes back to the pool.
 
+The diagram follows such a request through one worker, and through the
+counts the edge keeps of what the worker is running:
+
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 400}}}%%
+flowchart TB
+  C(["Client"])
+
+  subgraph EDGE["Edge"]
+    direction LR
+    TC["<b>Thread count</b><br/>bound: threads, default 4<br/>WSGI requests while their code runs"]
+    LC["<b>Loop count</b><br/>bound: concurrency, default 1000,<br/>or a mount's own<br/>ASGI requests on the loop,<br/>and each open WebSocket"]
+    MC["<b>WebSockets of an ASGI mount</b><br/>bound: max_connections on the mount<br/>for a socket routed to the mount by path:<br/>once accepted, it gives its loop place<br/>back and holds one of these instead"]
+    TC ~~~ LC ~~~ MC
+  end
+
+  subgraph WORKER["Worker process, one Python interpreter"]
+    direction LR
+
+    subgraph POOL["WSGI threads"]
+      direction TB
+      T1["thread 1: Flask or Django view<br/>bridge = environ['muru.wsgi_to_asgi']"]
+      T2["thread 2"]
+      T3["thread 3"]
+      T4["thread 4"]
+    end
+
+    subgraph LOOPT["muru-loop thread"]
+      LOOP["asyncio event loop<br/>one per worker, started by<br/>handoff = #quot;asgi#quot;<br/>each ASGI request is a task<br/>an idle WebSocket costs no thread"]
+    end
+
+    subgraph SYNC["muru-sync pool"]
+      S["sync_threads, default 8<br/>WebSocket Handler callbacks<br/>and asyncio.to_thread"]
+    end
+  end
+
+  C -->|"① request or WebSocket<br/>upgrade to the WSGI app"| TC
+  TC -->|"② runs on an idle thread"| T1
+  T1 ==>|"③ return<br/>bridge.handoff(app):<br/>the view returns at once,<br/>its thread is free"| LOOP
+  T1 -.->|"④ DETACH: the edge<br/>moves the request<br/>to the loop count"| LC
+  LOOP -->|"⑤ on_connect, on_receive,<br/>on_disconnect, in order"| S
+  LOOP -.->|"reverse: asgi_to_wsgi<br/>.handoff(wsgi_app)<br/>waits for a free thread;<br/>DETACH moves it back<br/>to the thread count"| T4
+
+  classDef edge fill:#e8f0fe,stroke:#4a6fa5,color:#1a2a40
+  classDef wsgi fill:#fff4e0,stroke:#c08a2e,color:#3d2a08
+  classDef loop fill:#e6f6ec,stroke:#3f8f5a,color:#10301c
+  classDef sync fill:#f1ebfa,stroke:#7a5ca8,color:#2a1a40
+  class TC,LC,MC edge
+  class T1,T2,T3,T4 wsgi
+  class LOOP loop
+  class S sync
+```
+
+1. The request reaches the WSGI application like any other, counted
+   against the worker's `threads`.
+
+2. It runs on one of the worker's application threads.
+
+3. The view calls `bridge.handoff(app)`, which returns at once: the
+   request goes on as a task on the worker's event loop, on its
+   `muru-loop` thread, and the view's thread is free for the next
+   request.
+
+4. The worker tells the edge, which counts the request against the
+   event loop's `concurrency` from then on.
+
+5. With the [WebSocket adapter](#websockets-as-callbacks), the socket's
+   calls run in order on the event loop's pool for synchronous code,
+   sized by `sync_threads`.
+
+A request goes the other way, from ASGI to WSGI, with
+[`asgi_to_wsgi.handoff()`](#from-asgi-to-wsgi): it waits for a free
+application thread, and the edge counts it against `threads` again.
+
 ## Enabling it
 
 Handing requests off is enabled in the configuration, for the release's
@@ -245,7 +319,11 @@ worker's threads, or the threads of the mount's own, for a handoff to
 WSGI, and its event loop for a handoff to ASGI. Its place on the side it
 came from is free for another request at once. When the side it moves
 to is full, the request goes ahead anyway and takes the next place that
-frees there. The access log marks a request handed across with
+frees there. A WebSocket handed to ASGI holds its place among the event
+loop's `concurrency` for as long as it is open. A mount's
+`max_connections`, which counts open WebSockets apart from requests,
+applies only to a socket routed to an ASGI mount by its path. The
+access log marks a request handed across with
 `handoff=asgi` or `handoff=wsgi`, and `muru_handoffs_total` counts them
 in the [metrics](metrics.md). A [mount](mounts.md) is the better tool
 when the choice can be made by path.

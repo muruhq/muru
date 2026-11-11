@@ -511,11 +511,34 @@ def test_logging_level_changes_a_logger_for_a_period(daemon: Daemon) -> None:
     text = daemon.muructl("logging", "level", "logger", "noisy=DEBUG").stdout
     assert "noisy DEBUG (was NOTSET)" in text
     assert json.loads(daemon.get("/").body)["noisy_level"] == "DEBUG"
+
+    # With no level, each worker lists what it has changed, and until when.
+
+    listed = daemon.muructl("logging", "level", "logger").stdout
+    assert "worker 0 (pid" in listed and "noisy DEBUG (was NOTSET), until reset" in listed
     assert "reset noisy" in daemon.muructl("logging", "level", "logger", "--reset").stdout
     assert json.loads(daemon.get("/").body)["noisy_level"] == "NOTSET"
+    assert "no levels changed" in daemon.muructl("logging", "level", "logger").stdout
 
     completed = daemon.muructl("logging", "level", "logger", "noisy=LOUD", check=False)
     assert "is not a logging level" in completed.stdout + completed.stderr
+
+    # The setup in force: the application's own logger with its handler,
+    # a temporary change named as one, and the warnings filters.
+
+    daemon.muructl("logging", "level", "logger", "noisy=DEBUG")
+    shown = daemon.muructl("debug", "logging", "logger").stdout
+    assert "worker 0 (pid" in shown, shown
+    assert "tagged: level INFO (set by the application or a library)" in shown, shown
+    assert "does not propagate" in shown and "to stderr" in shown, shown
+    assert "noisy: level DEBUG (muructl logging level)" in shown, shown
+    assert "warnings filters, the first matching wins:" in shown, shown
+
+    (answer,) = json.loads(daemon.muructl("debug", "logging", "logger", "--json").stdout)["workers"]
+    loggers = {logger["name"]: logger for logger in answer["result"]["loggers"]}
+    assert loggers["tagged"]["handlers"][0]["format"].startswith("tagged %(muru_request_id)s")
+    assert loggers["root"]["level_from"] == "python"
+    daemon.muructl("logging", "level", "logger", "--reset")
 
 
 def test_debug_refuses_what_it_cannot_reach(daemon: Daemon) -> None:

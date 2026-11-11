@@ -468,9 +468,64 @@ changed this way revert when the period ends, on `--reset`, and when the
 worker is replaced, since a new worker starts from the release's
 [logging defaults](logging.md).
 
-A reply is held to 256 MiB. Past that, the command says the reply was
-too large and to ask one worker with `--worker`, or a shorter `--for`
-for `profile`, or a smaller `--top` for `trace` and `memory`.
+With no level and no `--reset`, the command changes nothing and lists
+what each worker has changed, with the level it replaced and when it
+reverts:
+
+```console
+$ muructl logging level shop
+worker 0 (pid 4242): shop.payments DEBUG (was INFO), until 2026-11-02T05:52:22Z
+worker 0 (pid 4242): root DEBUG (was WARNING), until reset
+worker 1 (pid 4243): no levels changed
+```
+
+## Logging setup
+
+`muructl debug logging APP[@RELEASE]` shows the logging and warnings
+setup each worker has in force, after the application and its
+libraries have configured what they will. It changes nothing.
+
+```console
+$ muructl debug logging shop
+worker 0 (pid 4242), the same in worker 1 (pid 4243):
+  logging.disable off, warnings captured no
+  last resort: StreamHandler, level NOTSET, to stderr, format "%(levelname)s %(name)s: %(message)s"
+  loggers:
+    root: level INFO (Muru's defaults), effective INFO
+    shop.payments: level DEBUG (muructl logging level), effective DEBUG
+    shop.audit: level INFO (set by the application or a library), effective INFO, does not propagate
+      handler FileHandler, level NOTSET, to /srv/shop/audit.log, format "%(asctime)s %(message)s"
+    urllib3: level WARNING (Muru's defaults), effective WARNING
+    and 41 loggers with nothing of their own (--all lists them)
+  warnings filters, the first matching wins:
+    ignore::DeprecationWarning::0
+    default::DeprecationWarning:__main__:0
+```
+
+Each logger has the level set on it and its effective level, whether it
+passes records up to its parent, whether it is disabled, and its
+handlers. A handler is shown with its class, level, where it writes (a
+standard stream, a file, a socket address, syslog or a mail server),
+its format and its filters, and nothing else from its settings, so a
+mail handler's credentials are never shown; a URL's user information
+is masked. Where a level came from is said as far as can be known:
+
+| Shown | Meaning |
+| --- | --- |
+| Muru's defaults | the level the release's [logging settings](logging.md#python-logging) set, still as set |
+| `muructl logging level` | a temporary change from `muructl logging level`, still as set |
+| changed since Muru set it | one of those, changed since by the application or a library |
+| Python's default | the root logger at WARNING, as Python starts it |
+| set by the application or a library | a level Muru did not set |
+
+Only the root and the loggers with a level, a handler or a flag of their
+own are listed; `--all` lists every logger. When the workers' setups
+match, one is shown and the others are named as the same; when they
+differ, each setup is shown with the workers that have it. `--worker N`
+asks one worker and `--json` gives everything, per worker. The command
+works against a development run and `muructl serve` as against the
+daemon, and `muructl debug bundle` keeps each running release's in
+`config/logging-setup.json`.
 
 ## How it reaches the worker
 
@@ -487,6 +542,10 @@ profile read from outside the worker takes no thread of the worker and
 is not counted. The daemon never reaches into a worker process directly, which is what lets
 the same commands work on a release running as another user, and on
 an application in a container under `muructl serve`.
+
+A reply is held to 256 MiB. Past that, the command says the reply was
+too large and to ask one worker with `--worker`, or a shorter `--for`
+for `profile`, or a smaller `--top` for `trace` and `memory`.
 
 ## A report for a bug report
 
@@ -684,6 +743,8 @@ Everything is under one directory named as the file is.
 | `config/in-force.json` | What is in force outside the configuration: each rollout and where it stands, the sizes releases are pinned at, the applications and virtual hosts in maintenance mode, and each overlay's state |
 | `config/daemon.toml` | The daemon's own configuration file |
 | `config/access-log-overrides.json` | The changes `muructl logging access` has in force |
+| `config/logging-setup.json` | The logging and warnings setup each running release's workers have in force, by `APP@RELEASE`, as [`muructl debug logging`](#logging-setup) gives it with `--json` |
+| `config/logger-levels.json` | The logger levels `muructl logging level` has changed in each running release's workers, by `APP@RELEASE`, as the command lists them with `--json` |
 | `config/routing-snapshot.json` | The version of the routing snapshot in force, which an access log record's `snapshot` names |
 | `config/changes.jsonl` | The events of the window that changed the configuration: an apply or a reload, traffic moved, a deploy, a rollout's step, an overlay starting or ending |
 
@@ -775,9 +836,8 @@ the bundle under its name without the `.gz` or `.zst`. The manifest's
 `config/` holds the configuration as it was when the bundle was made.
 The manifest's `configuration_changed` says whether it changed during
 the window, and `config/changes.jsonl` what changed and when. Muru keeps
-only the routing snapshot in force, and no record of the levels
-`muructl logging level` changed, so the manifest lists the earlier
-snapshots and the logger levels as not collected.
+only the routing snapshot in force, so the manifest lists the earlier
+snapshots as not collected.
 
 A development run and `muructl serve` have no state store, so their
 `config/` holds `effective.toml`, with the settings in force and where

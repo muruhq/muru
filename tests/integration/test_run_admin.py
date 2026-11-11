@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
+import sys
 import threading
+import time
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
@@ -144,6 +147,8 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
         ).stdout
         assert "42" in ran
         assert server.wait_for_log("muru: debug.exec: ran code in worker 0")
+        setup = muructl(runtime, "debug", "logging", cwd=support.FIXTURES).stdout
+        assert "the same in worker 1" in setup and "root: level" in setup, setup
 
         # The edge's figures: metrics, the access log and the WebSockets.
 
@@ -250,7 +255,7 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
             refused.stderr
         )
         refused = muructl(runtime, "logs", "reopen", cwd=support.FIXTURES, check=False)
-        assert "writes no log files" in refused.stderr
+        assert "no access log file is set (--access-log-file)" in refused.stderr, refused.stderr
 
         # Another application, or a release that is not serving, is not
         # found.
@@ -435,3 +440,110 @@ def in_background(
     thread = threading.Thread(target=lambda: answers.append(call()))
     thread.start()
     return thread, answers
+
+
+SPEWING_APP = """
+import sys
+import threading
+import time
+
+
+def spew():
+    for _ in range(20000):
+        sys.stderr.write("x" * 99 + "\\n")
+
+
+def application(environ, start_response):
+    if environ["PATH_INFO"] == "/spew":
+        threading.Thread(target=spew, daemon=True).start()
+
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    return [b"ok"]
+"""
+
+
+def test_a_stalled_terminal_leaves_the_run_answering(runtime: Path, tmp_path: Path) -> None:
+    """Output the terminal does not read holds up the thread that writes
+    it, not muructl's runtime: with one runtime thread, the run still
+    answers its admin socket while its standard error is full."""
+
+    muructl_path = support.muructl_path()
+    if muructl_path is None or not support.extension_available():
+        support.unavailable("muructl or the extension is not built")
+    (tmp_path / "spewing.py").write_text(SPEWING_APP)
+    port = support.free_port()
+
+    # Its output goes to a pipe nothing reads, as a terminal paused with
+    # Ctrl-S or a pager that is not paged.
+
+    process = subprocess.Popen(
+        [
+            str(muructl_path),
+            "run",
+            "spewing:application",
+            "--chdir",
+            str(tmp_path),
+            "--bind",
+            f"127.0.0.1:{port}",
+            "--python",
+            sys.executable,
+            "--processes",
+            "1",
+            "--no-reload",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "MURU_RUN_DIR": str(runtime), "TOKIO_WORKER_THREADS": "1"},
+    )
+
+    try:
+        support.wait_for_port(port, process)
+        assert urllib.request.urlopen(f"http://127.0.0.1:{port}/spew", timeout=30).read() == b"ok"
+
+        # About 2 MB of output fills every pipe on the way; the admin
+        # socket still answers.
+
+        time.sleep(2)
+        status = muructl(runtime, "status", cwd=tmp_path)
+        assert "spewing" in status.stdout, status.stdout + status.stderr
+    finally:
+        process.kill()
+        process.communicate(timeout=30)
+
+
+def test_a_runs_access_log_file_is_reopened_after_a_rename(runtime: Path, tmp_path: Path) -> None:
+    """muructl logs reopen and SIGUSR1 make a run open its access log
+    file again by name, so the lines after a rename go to a new file."""
+
+    log = tmp_path / "access.log"
+    server = start(runtime, args=["--access-log-file", str(log)])
+
+    def wait_for(predicate: Callable[[], bool], what: str) -> None:
+        deadline = time.monotonic() + 10
+
+        while not predicate():
+            assert time.monotonic() < deadline, f"timed out waiting for {what}"
+            time.sleep(0.05)
+
+    def written(path: Path, target: str) -> bool:
+        return path.is_file() and target in path.read_text()
+
+    try:
+        assert server.get("/before").status in (200, 404)
+        wait_for(lambda: written(log, "/before"), "the first line")
+
+        log.rename(tmp_path / "access.log.1")
+        reopened = muructl(runtime, "logs", "reopen", cwd=support.FIXTURES).stdout
+        assert reopened.strip() == "muru: reopened the log files: the edge", reopened
+        assert server.get("/after-reopen").status in (200, 404)
+        wait_for(lambda: written(log, "/after-reopen"), "a line in the new file")
+
+        log.rename(tmp_path / "access.log.2")
+        server.mark_log()
+        os.kill(server.process.pid, signal.SIGUSR1)
+        assert server.wait_for_log("reopened the access log", timeout=10)
+        assert server.get("/after-signal").status in (200, 404)
+        wait_for(lambda: written(log, "/after-signal"), "a line after SIGUSR1")
+        assert "/after-signal" not in (tmp_path / "access.log.2").read_text()
+    finally:
+        server.stop()

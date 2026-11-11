@@ -438,6 +438,33 @@ pub fn count_worker_event(app: &str, release: &str, kind: &str, group: &str, rea
         .or_default() += 1;
 }
 
+/// Lines of each release's output its relay dropped, by application and
+/// release (section 11.3).
+static OUTPUT_DROPPED: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
+
+/// Note what a release's relay reports it has dropped so far.
+pub fn set_output_dropped(app: &str, release: &str, total: u64) {
+    OUTPUT_DROPPED
+        .lock()
+        .expect("output dropped poisoned")
+        .insert((app.to_owned(), release.to_owned()), total);
+}
+
+fn output_dropped_samples() -> Vec<muru_edge::metrics::Sample> {
+    OUTPUT_DROPPED
+        .lock()
+        .expect("output dropped poisoned")
+        .iter()
+        .map(|((app, release), total)| {
+            muru_edge::metrics::Sample::new(
+                "muru_app_output_dropped_total",
+                &[("app", app.as_str()), ("release", release.as_str())],
+                *total as f64,
+            )
+        })
+        .collect()
+}
+
 fn worker_event_samples() -> Vec<muru_edge::metrics::Sample> {
     WORKER_EVENTS
         .lock()
@@ -473,7 +500,8 @@ pub fn metrics_text(
         .into_iter()
         .chain(pool_samples(&routing))
         .chain(connections.samples())
-        .chain(worker_event_samples());
+        .chain(worker_event_samples())
+        .chain(output_dropped_samples());
     render(&aggregate(samples))
 }
 
@@ -694,6 +722,22 @@ type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send>>
 type LogStream = Pin<Box<dyn Stream<Item = Result<pb::LogLine, Status>> + Send>>;
 type CommandStream = Pin<Box<dyn Stream<Item = Result<pb::CommandOutput, Status>> + Send>>;
 
+/// Open a run's access log file again by name, saying so: the writer
+/// thread does it after the lines queued before, which this waits for off
+/// the runtime. Nothing happens when the access log goes to no file.
+pub async fn reopen_access_log(access_log: Arc<AccessLog>) -> std::io::Result<()> {
+    let Some(path) = access_log.file().map(Path::to_path_buf) else {
+        return Ok(());
+    };
+
+    tokio::task::spawn_blocking(move || access_log.reopen())
+        .await
+        .map_err(std::io::Error::other)??;
+
+    muru_common::muru_eprintln!("reopened the access log {}", path.display());
+    Ok(())
+}
+
 impl Service {
     /// What a command on the log files gets from a development run.
     fn no_log_files(&self) -> Status {
@@ -831,6 +875,13 @@ impl Admin for Service {
         let state = &self.state;
         let lines = request.lines as usize;
 
+        if request.edge || request.daemon {
+            return Err(Status::failed_precondition(
+                "the edge's and the daemon's own logs are the daemon's: a development run and \
+                 muructl serve write no log files",
+            ));
+        }
+
         // The lines are read after subscribing, so none is missed between
         // the two; the ring and the stream are both in memory, since a
         // run writes no log files (section 13.8).
@@ -906,15 +957,36 @@ impl Admin for Service {
         }))
     }
 
+    /// Section 11.3: a run's only file is the access log, when
+    /// --access-log-file names one, which is opened again by name as the
+    /// edge process does it, off the runtime.
     async fn reopen_logs(
         &self,
-        _: Request<pb::ReopenLogsRequest>,
+        request: Request<pb::ReopenLogsRequest>,
     ) -> Result<Response<pb::ReopenLogsResponse>, Status> {
-        Err(Status::failed_precondition(format!(
-            "a development run writes no log files to reopen: the output of {} goes to the \
-             terminal",
-            self.state.app
-        )))
+        let Some(path) = self.state.access_log.file().map(Path::to_path_buf) else {
+            return Err(Status::failed_precondition(format!(
+                "a development run sends the output of {} to the terminal, and no access log \
+                 file is set (--access-log-file), so there is nothing to reopen",
+                self.state.app
+            )));
+        };
+
+        if request.into_inner().workers {
+            return Err(Status::failed_precondition(
+                "--workers is for a daemon's releases: under a development run, send SIGUSR1 \
+                 to a worker to run its on_reopen_logs hook",
+            ));
+        }
+
+        reopen_access_log(Arc::clone(&self.state.access_log))
+            .await
+            .map_err(|error| Status::internal(format!("reopening {}: {error}", path.display())))?;
+
+        Ok(Response::new(pb::ReopenLogsResponse {
+            edge: true,
+            hosts: 0,
+        }))
     }
 
     async fn truncate_logs(

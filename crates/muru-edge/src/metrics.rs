@@ -115,6 +115,11 @@ pub const FAMILIES: &[Family] = &[
         help: "Access log lines dropped because the writer had fallen behind; the requests are still counted.",
     },
     Family {
+        name: "muru_app_output_dropped_total",
+        kind: Kind::Counter,
+        help: "Lines of an application's output dropped because its log did not keep up or could not be written.",
+    },
+    Family {
         name: "muru_requests_in_flight",
         kind: Kind::Gauge,
         help: "Requests the edge has taken and not yet answered; a WebSocket counts until its handshake is answered.",

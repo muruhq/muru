@@ -516,6 +516,14 @@ pub fn plan(
         );
     }
 
+    if document.logging.is_some() {
+        plan.warnings.push(
+            "the node-wide [logging] table belongs in the daemon configuration file and was not \
+             applied; an application's or a release's own logging table is"
+                .to_owned(),
+        );
+    }
+
     if document.overlay_webhook.is_some() {
         plan.warnings.push(
             "the [overlay_webhook] table belongs in the daemon configuration file and was not applied"
@@ -3237,6 +3245,130 @@ fn group_prefixes(paths: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The keys a Python logging table sets, as `config show --effective`
+/// names them (`logging.python.level`, `logging.python.loggers.NAME`,
+/// `logging.python.warnings.N`), in the order of `PythonLogging::layered`,
+/// each with whether `over` sets it rather than `under`. Warnings are
+/// numbered across both, `under`'s first.
+pub fn logging_keys(
+    under: &muru_config::PythonLogging,
+    over: &muru_config::PythonLogging,
+) -> Vec<(String, bool)> {
+    let mut keys = Vec::new();
+
+    for (key, under_sets, over_sets) in [
+        ("level", under.level.is_some(), over.level.is_some()),
+        ("format", under.format.is_some(), over.format.is_some()),
+        (
+            "capture_warnings",
+            under.capture_warnings.is_some(),
+            over.capture_warnings.is_some(),
+        ),
+    ] {
+        if under_sets || over_sets {
+            keys.push((format!("logging.python.{key}"), over_sets));
+        }
+    }
+
+    let names: BTreeSet<&String> = under.loggers.keys().chain(over.loggers.keys()).collect();
+
+    for name in names {
+        keys.push((
+            format!("logging.python.loggers.{name}"),
+            over.loggers.contains_key(name),
+        ));
+    }
+
+    let warnings = under
+        .warnings
+        .iter()
+        .map(|_| false)
+        .chain(over.warnings.iter().map(|_| true));
+
+    for (index, from_over) in warnings.enumerate() {
+        keys.push((format!("logging.python.warnings.{index}"), from_over));
+    }
+
+    keys
+}
+
+/// A Python logging key's value as `config show --effective` writes it,
+/// for a key `logging_keys` names.
+fn logging_value(logging: &muru_config::PythonLogging, key: &str) -> String {
+    let key = key.strip_prefix("logging.python.").unwrap_or(key);
+
+    match key {
+        "level" => logging.level.map(|level| level.as_str().to_owned()),
+        "format" => logging.format.clone(),
+        "capture_warnings" => logging.capture_warnings.map(|on| on.to_string()),
+        _ => key
+            .strip_prefix("loggers.")
+            .and_then(|name| logging.loggers.get(name))
+            .map(|level| level.as_str().to_owned())
+            .or_else(|| {
+                key.strip_prefix("warnings.")
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .and_then(|index| logging.warnings.get(index).cloned())
+            }),
+    }
+    .unwrap_or_default()
+}
+
+/// A key `logging_keys` names over the daemon's table as the release
+/// recorded it: a warning is numbered among the release's own, past the
+/// daemon's `before`.
+fn own_logging_key(key: &str, before: usize) -> String {
+    key.strip_prefix("logging.python.warnings.")
+        .and_then(|index| index.parse::<usize>().ok())
+        .map_or_else(
+            || key.to_owned(),
+            |index| format!("logging.python.warnings.{}", index.saturating_sub(before)),
+        )
+}
+
+/// Section 11.4: the Python logging defaults each release of an exported
+/// document starts its host with, the daemon's `[logging.python]` under
+/// the release's own, a line a key with the layer it comes from, for
+/// `config show --effective`.
+pub fn logging_layers(
+    store: &Store,
+    document: &Document,
+    daemon: &muru_config::PythonLogging,
+) -> Result<Vec<String>, StoreError> {
+    let mut lines = Vec::new();
+
+    for (app, table) in &document.app {
+        for id in table.release.keys() {
+            let spec = store.release(app, id)?.spec;
+
+            if spec.http.is_some() {
+                continue;
+            }
+
+            let merged = daemon.layered(&spec.logging);
+
+            for (key, from_release) in logging_keys(daemon, &spec.logging) {
+                let layer = if from_release {
+                    let own = own_logging_key(&key, daemon.warnings.len());
+                    spec.layers
+                        .0
+                        .get(&own)
+                        .map_or("not recorded", String::as_str)
+                } else {
+                    "daemon configuration"
+                };
+
+                lines.push(format!(
+                    "{app}@{id}: {key} = {} ({layer})",
+                    logging_value(&merged, &key)
+                ));
+            }
+        }
+    }
+
+    Ok(lines)
+}
+
 /// Section 3.3: the layer a release setting came from, the first of
 /// the request, the source's [tool.muru] table and the previous release
 /// that gives it, else the default.
@@ -3851,6 +3983,33 @@ pub fn resolve_spec(
     let mut layers = resolve_layers(request, &table, previous, tables.declared, &source);
     layers.0.extend(env_layers);
 
+    // Section 11.4: Python logging defaults, the source's table with a
+    // declared release's laid over it key by key, each key's layer
+    // recorded. The daemon's own defaults go under both when the host
+    // starts.
+
+    let source_logging = table
+        .logging
+        .as_ref()
+        .and_then(|logging| logging.python.clone())
+        .unwrap_or_default();
+    let release_logging = logging
+        .and_then(|logging| logging.python.clone())
+        .unwrap_or_default();
+    let python_logging = source_logging.layered(&release_logging);
+    python_logging
+        .check()
+        .map_err(|error| format!("logging.python {error}"))?;
+
+    for (key, from_release) in logging_keys(&source_logging, &release_logging) {
+        let layer = if from_release {
+            "the release table"
+        } else {
+            "[tool.muru]"
+        };
+        layers.0.insert(key, layer.to_owned());
+    }
+
     // Section 9.12: commands from the declaration, else the source's own
     // table.
 
@@ -3920,10 +4079,7 @@ pub fn resolve_spec(
         cgi_local_redirect,
         sendfile_roots,
         sendfile_header,
-        logging: logging
-            .or(table.logging.as_ref())
-            .and_then(|logging| logging.python.clone())
-            .unwrap_or_default(),
+        logging: python_logging,
         max_requests: request
             .max_requests
             .or(table.max_requests)

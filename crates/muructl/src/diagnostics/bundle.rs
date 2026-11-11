@@ -461,17 +461,77 @@ impl<W: Write> Bundle<'_, W> {
             self.put(&path, version)?;
         }
 
+        // The logger levels muructl logging level has changed, which each
+        // worker holds, as each release's workers list them.
+
+        let path = format!("{config}/logger-levels.json");
+
+        if self.asks(&path) {
+            let levels = if self.installation.live.is_some() {
+                let mut levels = serde_json::Map::new();
+
+                for (app, release) in self.running_releases() {
+                    let answered = self
+                        .installation
+                        .debug_with(
+                            &app,
+                            &release,
+                            "logging",
+                            None,
+                            serde_json::json!({"list": true}),
+                            ASK,
+                        )
+                        .await
+                        .map_or_else(
+                            |why| serde_json::json!({"error": why}),
+                            |answer| crate::admin::debug_json(&answer),
+                        );
+                    levels.insert(format!("{app}@{release}"), answered);
+                }
+
+                Ok(serde_json::Value::Object(levels))
+            } else {
+                Err(NOTHING_RUNS.to_owned())
+            };
+
+            self.put(&path, levels)?;
+        }
+
+        // The logging and warnings setup each running release's workers
+        // have in force, as muructl debug logging --json gives it.
+
+        let path = format!("{config}/logging-setup.json");
+
+        if self.asks(&path) {
+            let setups = if self.installation.live.is_some() {
+                let mut setups = serde_json::Map::new();
+
+                for (app, release) in self.running_releases() {
+                    let answered = self
+                        .installation
+                        .debug(&app, &release, "logging_setup", None)
+                        .await
+                        .map_or_else(
+                            |why| serde_json::json!({"error": why}),
+                            |answer| crate::admin::debug_json(&answer),
+                        );
+                    setups.insert(format!("{app}@{release}"), answered);
+                }
+
+                Ok(serde_json::Value::Object(setups))
+            } else {
+                Err(NOTHING_RUNS.to_owned())
+            };
+
+            self.put(&path, setups)?;
+        }
+
         // What Muru keeps no record of.
 
         self.archive.missing(
             &format!("{config}/routing-snapshots"),
             "only the routing snapshot in force is kept, not those before it: the events in \
              changes.jsonl say what changed, and when",
-        );
-        self.archive.missing(
-            &format!("{config}/logger-levels.json"),
-            "the levels muructl logging level changed are held by each worker, and nothing \
-             lists them",
         );
 
         // Every change the window's events record.
@@ -1368,7 +1428,7 @@ impl<W: Write> Bundle<'_, W> {
                     follow: false,
                     lines: EVERY_LINE,
                     access: records,
-                    host: String::new(),
+                    ..pb::TailLogsRequest::default()
                 })
                 .await
                 .map_err(|status| status.message().to_owned())?

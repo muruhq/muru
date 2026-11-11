@@ -417,12 +417,21 @@ def test_json_lines_carry_their_kind_time_and_pod(tmp_path: Path) -> None:
     host = next(record for record in records if record["kind"] == "app")
     assert host["source"].startswith("muru.host["), host
 
-    # The traceback is one record, from its first line to the exception's.
+    # The exception the application did not catch is logged on the muru
+    # logger at ERROR, as one record with its traceback and the id of the
+    # request, which joins it to that request's access line.
 
-    traceback = next(record for record in records if "Traceback" in record.get("message", ""))
-    assert traceback["source"] == "muru.worker[0]", traceback
-    assert traceback["message"].startswith("Traceback (most recent call last):\n")
-    assert traceback["message"].endswith("RuntimeError: deliberate failure")
+    failed = next(record for record in records if record.get("logger") == "muru")
+    assert failed["source"] == "muru.worker[0]", failed
+    assert (failed["level"], failed["message"]) == ("ERROR", "the application raised an exception")
+    assert failed["exception"].startswith("Traceback (most recent call last):\n")
+    assert failed["exception"].endswith("RuntimeError: deliberate failure")
+    access = next(
+        record
+        for record in records
+        if record["kind"] == "access" and record.get("target") == "/error"
+    )
+    assert failed["request_id"] == access["request_id"], (failed, access)
 
 
 def test_python_records_in_json_are_the_records_themselves(tmp_path: Path) -> None:
