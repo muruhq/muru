@@ -22,7 +22,7 @@ Prometheus metrics are served by the daemon on the admin listener (/metrics on t
 | Workers | muru_worker_requests_total and muru_worker_requests_in_flight as each worker last reported, muru_worker_sync_threads_busy and muru_worker_sync_threads for a worker with an event loop (the busy threads and the size of each pool synchronous code runs on, by pool: loop, anyio or asgiref, section 6.6), muru_worker_cpu_seconds_total, muru_worker_memory_bytes by kind (uss, pss, rss), muru_gil_wait_seconds, muru_loop_lag_seconds and muru_handoff_queue_wait_seconds histograms, muru_worker_recycles_total by reason, muru_worker_exits_total by reason |
 | Garbage collection | muru_gc_collections_total, muru_gc_seconds_total and muru_gc_collected_objects_total by generation, muru_gc_pause_seconds histogram by generation and by whether requests were in flight |
 | Scaling | muru_scaling_decisions_total, muru_workers_desired, muru_workers_ready, muru_churn_reaps_total |
-| Edge | muru_connections_open, muru_connections_refused_total, muru_tls_handshakes_total by result, muru_snapshot_version, muru_upstream_health |
+| Edge | muru_connections_open, muru_connections_refused_total, muru_tls_handshakes_total by result, muru_request_bytes_total and muru_response_bytes_total (body bytes received from clients and sent to them, by application, release and listener, a WebSocket's when it closes), muru_snapshot_version, muru_upstream_health |
 | Bodies and uploads | muru_upload_spool_bytes |
 | Clients | muru_requests_total by client_class, muru_rate_limited_total by limit, client class and action |
 
