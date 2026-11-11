@@ -537,8 +537,19 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         executable: std::env::current_exe().context("finding the muructl executable")?,
         upgrade_arguments: upgrade_arguments(),
         upgraded_from: args.upgraded_from.clone(),
+        rename_check: rename_check(),
     })
     .await
+}
+
+/// How often the daemon checks for a renamed log file: every five
+/// seconds, or as `MURU_RENAME_CHECK_MS` says, which the tests set so
+/// that they need not wait.
+fn rename_check() -> Duration {
+    std::env::var("MURU_RENAME_CHECK_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map_or(muru_controller::daemon::RENAME_CHECK, Duration::from_millis)
 }
 
 /// Start the daemon in the background: a detached `muructl daemon run`

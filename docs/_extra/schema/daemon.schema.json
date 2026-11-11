@@ -1399,6 +1399,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "reopen_on_rename": {
+          "default": true,
+          "description": "Notice that something has renamed a log file away, such as logrotate, and have its writer open it again by name, checking every few seconds, so no `postrotate` command is needed.",
+          "type": "boolean"
+        },
         "rotate": {
           "default": "built-in",
           "description": "`built-in` (the default) or `external`, for logrotate.",

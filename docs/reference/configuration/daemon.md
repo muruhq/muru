@@ -649,6 +649,7 @@ The `[logs]` table of the daemon's file: how the daemon rotates the log files it
 | `compress` | string | `"zstd"` | How archives are compressed: `zstd` (the default), `gzip` or `off`. |
 | `every` | string | `"daily"` | Rotate by the clock: `off`, `hourly`, `daily` (the default) or `weekly`, at the period's start in UTC. |
 | `keep` | integer | `14` | Archives kept per log. |
+| `reopen_on_rename` | boolean | `true` | Notice that something has renamed a log file away, such as logrotate, and have its writer open it again by name, checking every few seconds, so no `postrotate` command is needed. |
 | `rotate` | string | `"built-in"` | `built-in` (the default) or `external`, for logrotate. |
 | `size` | string |  | Rotate a file that reaches this size, for example 100MB. |
 | `slow` | string | `"1s"` | How slow a request is to be written under `access_log = "errors"`. |

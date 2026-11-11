@@ -818,9 +818,10 @@ file again, checks it whole, and applies what changed:
   resolves its secrets from;
 
 - the `[logs]` table: the daemon rotates on the new policy from its
-  next check, and a period that changed rotates each file once; the
-  access log's `access_log`, `access_log_exclude` and `slow` go to the
-  edge at once, for the requests completed from then on;
+  next check, and a period that changed rotates each file once;
+  `reopen_on_rename` turns the check for renamed files on or off at
+  once; the access log's `access_log`, `access_log_exclude` and `slow`
+  go to the edge at once, for the requests completed from then on;
 
 - the `[shutdown]` table, for the next stop signal or `muructl daemon
   stop --shutdown`;

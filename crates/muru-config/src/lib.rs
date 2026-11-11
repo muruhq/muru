@@ -1280,6 +1280,12 @@ pub struct Logs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "zstd"))]
     pub compress: Option<String>,
+    /// Notice that something has renamed a log file away, such as
+    /// logrotate, and have its writer open it again by name, checking
+    /// every few seconds, so no `postrotate` command is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
+    pub reopen_on_rename: Option<bool>,
     /// Put the full UTC time in front of every line the daemon writes to
     /// standard output and standard error, as `--timestamps` does, for a
     /// supervisor that stamps nothing (section 11.8). Files always carry

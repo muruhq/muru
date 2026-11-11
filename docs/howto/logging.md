@@ -474,6 +474,7 @@ every = 'daily'          # off, hourly, daily or weekly, at the period's start i
 size = '100MB'           # also rotate a file that reaches this
 keep = 14                # archives kept per log
 compress = 'zstd'        # zstd, gzip or off
+reopen_on_rename = true  # reopen a file something else renamed away
 ```
 
 The table is read when the daemon starts and again on `muructl daemon
@@ -483,13 +484,24 @@ does. The [daemon guide](daemon.md#reloading-the-configuration) lists
 what else a reload applies.
 
 `rotate = 'external'` turns the built-in rotation off for logrotate, or
-anything else that renames the files and then runs `muructl logs reopen`,
-which makes every writer open its file again by name, so lines go to the
-new file and the renamed one is complete. Sending SIGUSR1 to the daemon
-does the same. `muructl logs reopen --workers` also runs the
-`on_reopen_logs` hook in every worker, for log files the application
-opened itself, which is where a `logging` file handler is reopened. A
-logrotate entry for a user-mode daemon:
+anything else that renames the files. Every log the daemon writes
+follows the same rule: once a file is renamed away, its writer opens it
+again by name, so lines go to a new file and the renamed one is
+complete. The edge reopens the access log, the files virtual hosts name
+and its own `edge.log`, each host its release's file, and a background
+daemon its own log. Lines written between the rename and the reopen
+land in the renamed file, and none are lost.
+
+The daemon notices a rename by itself. Every few seconds, and once when
+it starts, it checks that each path still leads to the file it saw
+there, and when one does not, it has every writer reopen its file, as
+`muructl logs reopen` does, with a `logs.reopened` event naming what was
+renamed. `reopen_on_rename = false` in `[logs]` turns the check off, and
+then a rename needs `muructl logs reopen`, or SIGUSR1 to the daemon,
+after it.
+
+One logrotate entry covers every log, with no `postrotate` and no
+`copytruncate`. A user-mode daemon's:
 
 ```
 /home/app/.local/state/muru/logs/*.log /home/app/.local/state/muru/logs/apps/*/*.log {
@@ -499,6 +511,26 @@ logrotate entry for a user-mode daemon:
     delaycompress
     missingok
     notifempty
+}
+```
+
+`delaycompress` is required. The writers reopen their files a few
+seconds after the rename, and without it logrotate compresses the
+renamed file at once and deletes it, so the lines written in those
+seconds are lost. A `postrotate` that runs `muructl logs reopen` makes
+the reopen immediate, and then `delaycompress` can go.
+
+Log files the application opens itself are not Muru's to know. Their
+logrotate entry runs `muructl logs reopen --workers` in its
+`postrotate`, which runs the `on_reopen_logs` hook in every worker,
+where a `logging` file handler is reopened:
+
+```
+/srv/shop/logs/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
     sharedscripts
     postrotate
         muructl logs reopen --workers
@@ -506,18 +538,15 @@ logrotate entry for a user-mode daemon:
 }
 ```
 
-Each process reopens its own file: the edge the access log, the files
-virtual hosts name and its own `edge.log`, each host its release's file (SIGUSR1 to the host does that alone, SIGUSR2 passes SIGUSR1
-on to its workers for the hook), and a background daemon its own log.
-Lines written between the rename and the reopen land in the renamed file,
-and none are lost. In development mode only the access log can go to a
-file, and SIGUSR1 to a worker runs the hook.
+In development mode only the access log can go to a file, and SIGUSR1
+to a worker runs the hook.
 
 The instances of a [managed HTTP server](managed-servers.md) write to
 their release's file themselves and cannot be told to reopen it, so the
 built-in rotation copies that file to its archive and truncates it in
 place, and lines written while it is copied are lost. With `rotate =
-'external'`, give those files logrotate's `copytruncate`.
+'external'`, those files are the one exception: give them a logrotate
+entry of their own with `copytruncate`.
 
 ## Reclaiming disk space
 

@@ -58,6 +58,9 @@ pub struct NodeSettings {
     pub secrets: Vec<crate::secrets::Store>,
     /// Log rotation (section 11.3), or none for external rotation.
     pub rotation: Option<crate::rotation::Policy>,
+    /// Whether a log file renamed away has its writer reopen it, with no
+    /// signal (`[logs] reopen_on_rename`, section 11.3).
+    pub reopen_on_rename: bool,
     /// Which records the access log writes (`[logs]` access_log,
     /// access_log_exclude and slow, section 11.2), for every snapshot.
     pub access_log: muru_edge::access::Filter,
@@ -174,6 +177,11 @@ impl NodeSettings {
             overlay_webhook,
             secrets,
             rotation,
+            reopen_on_rename: document
+                .logs
+                .as_ref()
+                .and_then(|logs| logs.reopen_on_rename)
+                .unwrap_or(true),
             access_log: access_log_from(document)?,
             timestamps: document
                 .logs

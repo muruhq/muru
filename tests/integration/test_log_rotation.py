@@ -202,6 +202,7 @@ def test_the_edge_reopens_its_own_log_after_it_is_rotated(tmp_path: Path) -> Non
     daemon = start_daemon(
         tmp_path,
         config_extra="[logs]\nsize = '100B'\nkeep = 20\ncompress = 'off'\nevery = 'off'\n",
+        env={"MURU_RENAME_CHECK_MS": "200"},
     )
     logs = tmp_path / "logs"
 
@@ -234,12 +235,23 @@ def test_the_edge_reopens_its_own_log_after_it_is_rotated(tmp_path: Path) -> Non
         wait_for(rotated, "an edge log archive", describe=state)
         wait_for(reopened, "the edge to reopen edge.log", describe=state)
         assert edge_log.stat().st_ino != first
+
+        # The rotation's own renames are not taken for someone else's, so
+        # the check for renamed files, every 200 ms here, reopens nothing.
+
+        assert "renamed)" not in daemon.muructl("events").stdout
     finally:
         daemon.stop()
 
 
-def test_external_rotation_leaves_the_files_alone(tmp_path: Path) -> None:
-    daemon = start_daemon(tmp_path, config_extra="[logs]\nrotate = 'external'\nsize = '1KB'\n")
+def test_external_rotation_leaves_the_files_alone_and_a_rename_is_reopened(
+    tmp_path: Path,
+) -> None:
+    daemon = start_daemon(
+        tmp_path,
+        config_extra="[logs]\nrotate = 'external'\nsize = '1KB'\n",
+        env={"MURU_RENAME_CHECK_MS": "200"},
+    )
     logs = tmp_path / "logs"
 
     try:
@@ -257,6 +269,27 @@ def test_external_rotation_leaves_the_files_alone(tmp_path: Path) -> None:
 
         refused = daemon.muructl("logs", "rotate", "--access", check=False)
         assert refused.returncode != 0 and "rotation is external" in refused.stderr
+
+        # A rename with no signal, as logrotate makes one with no
+        # postrotate: each writer opens its file again by name.
+
+        renamed = [logs / "access.log", logs / "edge.log", logs / "apps" / "shop" / "r1.log"]
+
+        for path in renamed:
+            path.rename(path.with_name(path.name + ".1"))
+
+        def written_again() -> bool:
+            daemon.get("/after-the-rename")
+            return all(path.is_file() and path.stat().st_size > 0 for path in renamed)
+
+        wait_for(
+            written_again, "every renamed log to be written again", describe=lambda: listing(logs)
+        )
+        assert "/after-the-rename" in (logs / "access.log").read_text()
+        events = daemon.muructl("events").stdout
+        assert (
+            "reopened the log files (access.log, edge.log, apps/shop/r1.log renamed)" in events
+        ), events
     finally:
         daemon.stop()
 

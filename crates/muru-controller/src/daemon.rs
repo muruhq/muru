@@ -240,7 +240,14 @@ pub struct Config {
     /// The version this daemon ran before it re-executed itself for an
     /// upgrade, or none when it started afresh.
     pub upgraded_from: Option<String>,
+    /// How often the log files are checked for a rename, when
+    /// `reopen_on_rename` is on: `RENAME_CHECK` but in tests.
+    pub rename_check: Duration,
 }
+
+/// How often the daemon checks whether a log file was renamed away
+/// (section 11.3: reopen_on_rename).
+pub const RENAME_CHECK: Duration = Duration::from_secs(5);
 
 /// What reading the TLS hosts' certificate files again found (section
 /// 4.2).
@@ -1200,6 +1207,13 @@ struct Daemon {
     /// Section 11.3: the log files a command is cutting, which rotation
     /// leaves alone.
     claimed_logs: std::collections::HashSet<PathBuf>,
+    /// Section 11.3: whether a log file renamed away has its writer
+    /// reopen it, the file last seen at each path, how often they are
+    /// checked and when next.
+    reopen_on_rename: bool,
+    renames: crate::renames::Watch,
+    rename_check: Duration,
+    rename_due: Instant,
     /// Section 13.3: what SIGTERM means, and how a shutdown runs.
     shutdown: crate::shutdown::Policy,
     /// The service user (ADR 0026), when this daemon is root: whom the
@@ -1563,6 +1577,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .clone()
         .map(|policy| restored_rotator(policy, &store));
 
+    // Section 11.3: the files last seen at the logs' paths, so that a
+    // rename made while the daemon was stopped is noticed at its first
+    // check.
+
+    let renames =
+        crate::renames::Watch::from_seen(store.log_files_seen().unwrap_or_else(|error| {
+            tracing::warn!(%error, "reading the log files last seen failed");
+            Vec::new()
+        }));
+
     let mut daemon = Daemon {
         store,
         events,
@@ -1584,6 +1608,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         secrets: settings.secrets.clone(),
         rotation,
         claimed_logs: std::collections::HashSet::new(),
+        reopen_on_rename: settings.reopen_on_rename,
+        renames,
+        rename_check: config.rename_check,
+        rename_due: Instant::now(),
         shutdown: settings.shutdown.clone(),
         service,
         debug_exec: settings.debug_exec,
@@ -1660,6 +1688,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
 
+    // Section 11.3: a log file renamed while the daemon was stopped is
+    // noticed now, before anything else is written to it.
+
+    daemon.watch_renames();
+
     let outcome = loop {
         tokio::select! {
             _ = reopen.recv() => {
@@ -1710,6 +1743,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 daemon.expire_sticky().await;
                 daemon.expire_retained().await;
                 daemon.rotate_logs();
+                daemon.watch_renames();
                 daemon.expire_access_overrides().await;
 
                 let samples = match daemon.edge.metrics().await {
@@ -3015,6 +3049,23 @@ impl Daemon {
             );
         } else {
             report.unchanged("[logs] rotation");
+        }
+
+        if settings.reopen_on_rename != self.reopen_on_rename {
+            self.reopen_on_rename = settings.reopen_on_rename;
+            self.rename_due = Instant::now();
+            self.renames.forget();
+
+            report.changed(
+                "[logs] reopen_on_rename",
+                if self.reopen_on_rename {
+                    "a log file renamed away is reopened"
+                } else {
+                    "a log file renamed away waits for muructl logs reopen"
+                },
+            );
+        } else {
+            report.unchanged("[logs] reopen_on_rename");
         }
 
         // Section 13.3: what the next stop signal means.
@@ -9300,27 +9351,21 @@ impl Daemon {
         }
     }
 
-    /// Section 11.3: rotate the log files that are due, by size or by the
-    /// clock, then have every writer reopen its file by name.
-    fn rotate_logs(&mut self) {
-        let Some(rotator) = self.rotation.as_mut() else {
-            return;
-        };
-        let now = std::time::SystemTime::now();
-
-        // The edge reopens the access log and its own log when told.
-
-        let mut candidates = vec![
+    /// The log files the daemon's writers keep, each with whether its
+    /// writers cannot be told to reopen it: the access log, the edge's own
+    /// log and the files virtual hosts name, which the edge reopens; the
+    /// daemon's own, when it was started in the background; and each
+    /// running release's log, which its host reopens, unless a managed
+    /// HTTP server's instances write it themselves (section 9.9).
+    fn log_writers(&self) -> Vec<(PathBuf, bool)> {
+        let mut writers = vec![
             (self.locations.access_log(), false),
             (self.locations.edge_log(), false),
         ];
 
         if self.owns_log {
-            candidates.push((self.locations.daemon_log(), false));
+            writers.push((self.locations.daemon_log(), false));
         }
-
-        // Section 11.2: the files virtual hosts name for their own
-        // records, which the edge writes and reopens as it does its own.
 
         let mut own: Vec<String> = self
             .store
@@ -9331,20 +9376,73 @@ impl Daemon {
             .collect();
         own.sort();
         own.dedup();
-        candidates.extend(
+        writers.extend(
             own.into_iter()
                 .map(|file| (self.locations.logs.path.join(file), false)),
         );
 
-        // Section 9.9: a managed server writes its log itself and cannot
-        // be told to reopen it, so its log is rotated in place.
-
         for ((app, id), running) in &self.running {
-            candidates.push((
+            writers.push((
                 self.locations.release_log(app, id),
                 running.backend.servers().is_some(),
             ));
         }
+
+        writers
+    }
+
+    /// Section 11.3: reopen_on_rename. Every `rename_check`, see whether
+    /// a log file its writers can reopen was renamed away, and if one was,
+    /// have every writer open its file again by name, as `muructl logs
+    /// reopen` does. A file being cut by a command is left to it.
+    fn watch_renames(&mut self) {
+        let now = Instant::now();
+
+        if !self.reopen_on_rename || now < self.rename_due {
+            return;
+        }
+
+        self.rename_due = now + self.rename_check;
+        let paths: Vec<PathBuf> = self
+            .log_writers()
+            .into_iter()
+            .filter(|(path, in_place)| !in_place && !self.claimed_logs.contains(path))
+            .map(|(path, _)| path)
+            .collect();
+        let renamed = self.renames.check(&paths);
+
+        if !renamed.is_empty() {
+            let names: Vec<String> = renamed
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&self.locations.logs.path)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            self.reopen_logs_because(false, &format!("{} renamed", names.join(", ")));
+        }
+
+        if let Some(seen) = self.renames.take_changed()
+            && let Err(error) = self.store.set_log_files_seen(&seen)
+        {
+            tracing::warn!(%error, "recording the log files last seen failed");
+        }
+    }
+
+    /// Section 11.3: rotate the log files that are due, by size or by the
+    /// clock, then have every writer reopen its file by name.
+    fn rotate_logs(&mut self) {
+        if self.rotation.is_none() {
+            return;
+        }
+
+        let candidates = self.log_writers();
+        let Some(rotator) = self.rotation.as_mut() else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
 
         // The period each file is now in is recorded before anything is
         // rotated, so a daemon started after a crash does not rotate a
@@ -9389,6 +9487,11 @@ impl Daemon {
         if rotated.is_empty() {
             return;
         }
+
+        // The writers open new files, which the rename check notes as
+        // they are rather than taking the rotation for a rename.
+
+        self.renames.forget();
 
         self.reopen_own_log();
 
@@ -9508,7 +9611,14 @@ impl Daemon {
     /// workers, whose on_reopen_logs hook handles files the application
     /// opened itself.
     fn reopen_logs(&mut self, workers: bool) -> Reopened {
+        self.reopen_logs_because(workers, "")
+    }
+
+    /// Reopen the log files as `reopen_logs` does, with why in the
+    /// event's message when it is not a command or a signal that asked.
+    fn reopen_logs_because(&mut self, workers: bool, why: &str) -> Reopened {
         self.reopen_own_log();
+        self.renames.forget();
 
         let edge = self.edge.signal(libc::SIGUSR1);
         let mut hosts = 0;
@@ -9524,7 +9634,12 @@ impl Daemon {
         }
 
         let message = format!(
-            "reopened the log files: {}{hosts} host{}{}",
+            "reopened the log files{}: {}{hosts} host{}{}",
+            if why.is_empty() {
+                String::new()
+            } else {
+                format!(" ({why})")
+            },
             if edge { "the edge and " } else { "" },
             if hosts == 1 { "" } else { "s" },
             if workers { " and their workers" } else { "" }

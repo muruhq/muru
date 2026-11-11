@@ -100,7 +100,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | schedules (name, start and end or cron and duration, timezone, group, min_workers, max_workers, warm_up, scale_in, freeze_deploys) | application, group | none | 7.5 |
 | wsgi_multiprocess, wsgi_multithread | release | auto | 6.5 |
 | logging.python level, format, request_id, capture_warnings, loggers | global, application, release | WARNING (Python default), standard, false, false, none | 11.4 |
-| rotate (size, every, keep, compress, naming), reopen_on_rename, on_overflow | log sinks | daily, 14, zstd, built-in | 11.3 |
+| rotate (size, every, keep, compress, naming), reopen_on_rename, on_overflow | log sinks | daily, 14, zstd, built-in; reopen_on_rename true (checked every 5 s and at start, under the daemon) | 11.3 |
 | readiness, liveness (path, timeout, expect, required, interval, failures), checks | mount, release | none (built-in signals only) | 9.11 |
 | compression (enabled, encodings, min_size, types, level) | global, host, route | enabled, br zstd gzip, 1KB, text and JSON types, default | 4.17 |
 | decompress_requests | route | false | 4.17 |
