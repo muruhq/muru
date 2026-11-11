@@ -416,258 +416,6 @@ def post_form(
         connection.close()
 
 
-def test_a_signed_in_session_turns_maintenance_on_from_the_page(tmp_path: Path) -> None:
-    port = support.free_port()
-    daemon = start_daemon(
-        tmp_path,
-        arguments=["--dashboard", f"127.0.0.1:{port}"],
-        config_extra="[dashboard]\nactions = true\n",
-    )
-    origin = {"Origin": f"http://127.0.0.1:{port}"}
-
-    try:
-        assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
-        refused = post_form(port, "/actions/maintenance", {"app": "shop", "state": "on"}, origin)
-        assert refused[0] == 403 and b"not signed in" in refused[1]
-
-        # A login link from the admin socket signs a browser in, once, back
-        # to the page wherever it is served, with a cookie for that path.
-
-        link = daemon.muructl("dashboard", "login", "--actions").stdout.strip()
-        assert link.startswith(f"http://127.0.0.1:{port}/login?code=")
-        path = link.removeprefix(f"http://127.0.0.1:{port}")
-        status, headers, _ = fetch(port, path)
-        assert status == 303 and headers["location"] == "./"
-        cookie = headers["set-cookie"].split(";")[0]
-        assert "HttpOnly" in headers["set-cookie"] and "SameSite=Strict" in headers["set-cookie"]
-        assert "Path=" not in headers["set-cookie"]
-        assert fetch(port, path)[0] == 403
-
-        page = fetch_with(port, "/", {"Cookie": cookie})
-        assert "Maintenance on" in page
-        token = re.search(r'name="csrf" value="([0-9a-f]+)"', page)
-        assert token is not None
-        assert 'action="actions/maintenance"' in page
-        form = {"csrf": token.group(1), "app": "shop", "state": "on"}
-
-        # The session's token and the page's own origin are both needed.
-
-        signed = {"Cookie": cookie}
-        assert (
-            post_form(
-                port, "/actions/maintenance", {**form, "csrf": "0" * 64}, {**signed, **origin}
-            )[0]
-            == 403
-        )
-        assert (
-            post_form(port, "/actions/maintenance", form, {**signed, "Origin": "http://evil.test"})[
-                0
-            ]
-            == 403
-        )
-        assert post_form(port, "/actions/maintenance", form, signed)[0] == 403
-        cross = {**signed, **origin, "Sec-Fetch-Site": "cross-site"}
-        assert post_form(port, "/actions/maintenance", form, cross)[0] == 403
-
-        status, headers = post_form_headers(
-            port, "/actions/maintenance", form, {**signed, **origin}
-        )
-        assert status == 303 and headers["location"] == "../"
-        assert daemon.request("/").status == 503
-        assert "Maintenance off" in fetch_with(port, "/", {"Cookie": cookie})
-        events = daemon.muructl("events").stdout
-        assert (
-            "dashboard.action" in events and "maintenance on for shop from the dashboard" in events
-        )
-
-        # A browser's Sec-Fetch-Site vouches for the page whatever Host and
-        # Origin a proxy in front leaves.
-
-        proxied = {**signed, "Origin": "https://jupyter.test", "Sec-Fetch-Site": "same-origin"}
-        off = {**form, "state": "off"}
-        assert post_form(port, "/actions/maintenance", off, proxied)[0] == 303
-        assert daemon.request("/").status == 200
-
-        # A script's token that may act needs no form token.
-
-        bearer = daemon.muructl("dashboard", "login", "--actions", "--token").stdout.strip()
-        scripted = {"Authorization": f"Bearer {bearer}"}
-        assert (
-            post_form(port, "/actions/maintenance", {"app": "shop", "state": "on"}, scripted)[0]
-            == 303
-        )
-        assert daemon.request("/").status == 503
-        post_form(port, "/actions/maintenance", {"app": "shop", "state": "off"}, scripted)
-    finally:
-        daemon.stop()
-
-
-def test_a_session_that_may_act_promotes_rolls_back_scales_restarts_and_drains(
-    tmp_path: Path,
-) -> None:
-    port = support.free_port()
-    daemon = start_daemon(
-        tmp_path,
-        arguments=["--dashboard", f"127.0.0.1:{port}"],
-        config_extra="[dashboard]\nactions = true\n",
-    )
-
-    try:
-        assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
-        daemon.muructl("deploy", "shop", str(SHOP), "--python", sys.executable, "--hold")
-        bearer = daemon.muructl("dashboard", "login", "--actions", "--token").stdout.strip()
-        acting = {"Authorization": f"Bearer {bearer}"}
-        TOKENS[port] = bearer
-
-        def post(name: str, fields: dict[str, str]) -> tuple[int, dict[str, str]]:
-            return post_form_headers(port, f"/actions/{name}", fields, acting)
-
-        def current() -> str:
-            return str(fetch_json(port, "/v1/apps")[0]["current"])
-
-        # The page offers what each release allows: the held release can be
-        # promoted or drained, the serving one drained, and nothing rolled
-        # back until there is a previous release.
-
-        page = fetch_with(port, "/", acting)
-        assert page.count('action="actions/promote"') == 1
-        assert page.count('action="actions/drain"') == 2
-        assert 'action="actions/rollback"' not in page
-        assert page.count('action="actions/scale"') == 2 and "<button>Unpin</button>" not in page
-
-        # The section is swapped in afresh every two seconds, so what is
-        # typed into a form is kept across the swap.
-
-        assert 'id="pin-shop-r1-default" hx-preserve="true"' in page
-
-        status, headers = post("promote", {"app": "shop", "release": "r2"})
-        assert status == 303 and headers["location"] == "../"
-        assert current() == "r2"
-        assert "Roll back to r1" in fetch_with(port, "/", acting)
-        assert post("promote", {"app": "shop", "release": "r2"})[0] == 409
-
-        status, _ = post("rollback", {"app": "shop"})
-        assert status == 303
-        assert current() == "r1"
-
-        # A pin shows in the scaling table with a button to lift it.
-
-        status, _ = post(
-            "scale", {"app": "shop", "release": "r1", "group": "default", "processes": "3"}
-        )
-        assert status == 303
-        scaling = {
-            row["group"]: row
-            for row in fetch_json(port, "/v1/scaling")
-            if row["release"] == "shop@r1"
-        }
-        assert scaling["default"]["pinned"] is True
-        assert "<button>Unpin</button>" in fetch_with(port, "/", acting)
-        status, _ = post(
-            "scale", {"app": "shop", "release": "r1", "group": "default", "unpin": "on"}
-        )
-        assert status == 303
-        scaling = {
-            row["group"]: row
-            for row in fetch_json(port, "/v1/scaling")
-            if row["release"] == "shop@r1"
-        }
-        assert scaling["default"]["pinned"] is False
-
-        # Restarting a worker from its page comes back to that page.
-
-        def pids() -> dict[int, int]:
-            answer = fetch_json(port, "/v1/debug/status?release=shop@r1")
-            return {
-                int(worker["index"]): int(worker["pid"])
-                for worker in answer["workers"]
-                if worker["ok"] and worker["result"]["state"] == "ready"
-            }
-
-        # The lifted pin takes the third worker away first.
-
-        wait_for(
-            lambda: (
-                len(fetch_json(port, "/v1/debug/status?release=shop@r1")["workers"]) == 2
-                and len(pids()) == 2
-            ),
-            timeout=30,
-        )
-        before = pids()
-        assert len(before) == 2, before
-        chosen, other = sorted(before)
-        page = fetch_with(port, "/workers?release=shop@r1", acting)
-        assert (
-            'action="actions/restart"' in page
-            and 'name="back" value="workers?release=shop@r1"' in page
-        )
-        assert f'id="force-{chosen}" hx-preserve="true"' in page
-        page = fetch_with(port, f"/worker?release=shop@r1&worker={chosen}", acting)
-        assert f'name="back" value="worker?release=shop@r1&#38;worker={chosen}"' in page
-        status, headers = post(
-            "restart",
-            {
-                "app": "shop",
-                "release": "r1",
-                "worker": str(chosen),
-                "back": "workers?release=shop@r1",
-            },
-        )
-        assert status == 303 and headers["location"] == "../workers?release=shop@r1"
-        wait_for(lambda: pids().get(chosen) not in (None, before[chosen]), timeout=30)
-        assert pids()[other] == before[other]
-        status, _ = post("restart", {"app": "shop", "release": "r1", "worker": "9"})
-        assert status == 409
-
-        status, _ = post("drain", {"app": "shop", "release": "r2"})
-        assert status == 303
-        releases = {
-            release["id"]: release for release in fetch_json(port, "/v1/apps/shop/releases")
-        }
-        assert releases["r2"]["state"] == "stopped" and current() == "r1"
-
-        # What is not an action, or not a whole one.
-
-        status, _ = post("deploy", {"app": "shop"})
-        assert status == 400
-        status, _ = post("drain", {"app": "shop"})
-        assert status == 400
-
-        events = daemon.muructl("events").stdout
-
-        for what in (
-            "promoted shop@r2 from the dashboard",
-            "rolled shop back to r1 from the dashboard",
-            "pinned default to 3 workers from the dashboard",
-            "unpinned default from the dashboard",
-            f"restarted worker {chosen} from the dashboard",
-            "drained shop@r2 from the dashboard",
-        ):
-            assert what in events, what
-    finally:
-        TOKENS.pop(port, None)
-        daemon.stop()
-
-
-def post_form_headers(
-    port: int, path: str, fields: dict[str, str], headers: dict[str, str]
-) -> tuple[int, dict[str, str]]:
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-
-    try:
-        connection.request(
-            "POST",
-            path,
-            body=urllib.parse.urlencode(fields),
-            headers={"Content-Type": "application/x-www-form-urlencoded", **headers},
-        )
-        response = connection.getresponse()
-        response.read()
-        return response.status, {k.lower(): v for k, v in response.getheaders()}
-    finally:
-        connection.close()
-
-
 def fetch_with(port: int, path: str, headers: dict[str, str]) -> str:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
 
@@ -704,23 +452,23 @@ def test_everything_but_the_metrics_and_assets_needs_a_session(
     assert fetch(port, "/metrics", signed=False)[0] == 200
     assert fetch(port, "/static/htmx.min.js", signed=False)[0] == 200
 
-    # A session from a plain login may look, and not act.
+    # A session may look, and nothing on the dashboard changes anything:
+    # the pages have no forms, and a POST to a path that once took an
+    # action is refused as every POST is (issue 547).
 
     assert fetch(port, "/v1/apps")[0] == 200
     assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
-    assert "Maintenance on" not in fetch(port, "/")[2].decode()
+    assert "<form" not in fetch(port, "/")[2].decode()
+    assert "<form" not in fetch(port, "/workers?release=shop@r1")[2].decode()
     refused = post_form(
         port,
         "/actions/maintenance",
         {"app": "shop", "state": "on"},
         {"Authorization": f"Bearer {TOKENS[port]}"},
     )
-    assert refused[0] == 403 and b"may only look" in refused[1]
+    assert refused[0] == 405 and b"only GET is served" in refused[1]
+    assert daemon.request("/").status == 200
 
-    # Actions need the daemon's file to allow them.
-
-    refused_login = daemon.muructl("dashboard", "login", "--actions", check=False)
-    assert refused_login.returncode != 0 and "actions are off" in refused_login.stderr
     assert fetch(port, "/login?code=anything", signed=False)[0] == 403
 
     # A link for a dashboard reached at another address.
@@ -771,7 +519,6 @@ class PrefixProxyHandler(http.server.BaseHTTPRequestHandler):
             connection.close()
 
     do_GET = forward
-    do_POST = forward
 
 
 def test_the_dashboard_works_under_a_proxy_path_prefix(tmp_path: Path) -> None:
@@ -779,7 +526,6 @@ def test_the_dashboard_works_under_a_proxy_path_prefix(tmp_path: Path) -> None:
     daemon = start_daemon(
         tmp_path,
         arguments=["--dashboard", f"127.0.0.1:{port}"],
-        config_extra="[dashboard]\nactions = true\n",
     )
     proxy = PrefixProxy(port)
     threading.Thread(target=proxy.serve_forever, daemon=True).start()
@@ -798,7 +544,7 @@ def test_the_dashboard_works_under_a_proxy_path_prefix(tmp_path: Path) -> None:
 
         # Signing in through the proxy lands on the page under the prefix.
 
-        link = daemon.muructl("dashboard", "login", "--actions", "--url", base).stdout.strip()
+        link = daemon.muructl("dashboard", "login", "--url", base).stdout.strip()
         assert link.startswith(base + "login?code=")
         status, headers, _ = through(link)
         assert status == 303
@@ -824,73 +570,6 @@ def test_the_dashboard_works_under_a_proxy_path_prefix(tmp_path: Path) -> None:
 
         history = urllib.parse.urljoin(page_url, "v1/history?range=1h")
         assert json.loads(through(history, cookie)[2])["range"] == "1h"
-
-        # An action posted from the page comes back to it.
-
-        token = re.search(r'name="csrf" value="([0-9a-f]+)"', page)
-        action = re.search(r'<form method="post" action="([^"]+)"', page)
-        assert token is not None and action is not None
-        action_url = urllib.parse.urljoin(page_url, action.group(1))
-        connection = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
-
-        try:
-            connection.request(
-                "POST",
-                urllib.parse.urlsplit(action_url).path,
-                body=urllib.parse.urlencode({"csrf": token.group(1), "app": "shop", "state": "on"}),
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Origin": f"http://127.0.0.1:{proxy_port}",
-                    "Sec-Fetch-Site": "same-origin",
-                    **cookie,
-                },
-            )
-            response = connection.getresponse()
-            response.read()
-            assert response.status == 303
-            assert urllib.parse.urljoin(action_url, response.getheader("Location", "")) == base
-        finally:
-            connection.close()
-
-        assert daemon.request("/").status == 503
     finally:
         proxy.shutdown()
-        daemon.stop()
-
-
-def test_the_actions_switch_is_reloaded_and_stops_earlier_sessions(tmp_path: Path) -> None:
-    """`[dashboard] actions` is re-read by a reload; a session issued while
-    it was on is refused when it acts after it goes off, and acts again
-    once it is back on."""
-
-    port = support.free_port()
-    daemon = start_daemon(
-        tmp_path,
-        arguments=["--dashboard", f"127.0.0.1:{port}"],
-        config_extra="[dashboard]\nactions = true\n",
-    )
-
-    try:
-        assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
-        bearer = daemon.muructl("dashboard", "login", "--actions", "--token").stdout.strip()
-        scripted = {"Authorization": f"Bearer {bearer}"}
-        on = {"app": "shop", "state": "on"}
-        off = {"app": "shop", "state": "off"}
-        config = tmp_path / "muru.toml"
-        text = config.read_text()
-        config.write_text(text.replace("actions = true", "actions = false"))
-        reloaded = daemon.muructl("daemon", "reload").stdout
-        assert "changed [dashboard] actions (off)" in reloaded, reloaded
-        status, body = post_form(port, "/actions/maintenance", on, scripted)
-        assert status == 409 and b"actions are off" in body, (status, body)
-        assert daemon.request("/").status == 200
-        refused = daemon.muructl("dashboard", "login", "--actions", check=False)
-        assert refused.returncode != 0 and "actions are off" in refused.stderr
-
-        config.write_text(text)
-        assert "changed [dashboard] actions (on)" in daemon.muructl("daemon", "reload").stdout
-        assert post_form(port, "/actions/maintenance", on, scripted)[0] == 303
-        assert daemon.request("/").status == 503
-        post_form(port, "/actions/maintenance", off, scripted)
-    finally:
         daemon.stop()

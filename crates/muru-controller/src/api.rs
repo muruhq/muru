@@ -350,30 +350,14 @@ impl Admin for Service {
             ));
         };
 
-        if request.actions
-            && !info
-                .dashboard_actions
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(Status::failed_precondition(
-                "the dashboard's actions are off; set actions = true in the [dashboard] table",
-            ));
-        }
-
-        let what = if request.actions {
-            "that may act"
-        } else {
-            "that may look"
-        };
-
         if request.token {
-            let token = sessions.issue_token(request.actions);
+            let token = sessions.issue_token();
             self.handle.events.emit(
                 "dashboard.login_issued",
                 "dashboard",
                 "notice",
                 &format!(
-                    "a dashboard token {what} was issued over the admin socket, session {}",
+                    "a dashboard token was issued over the admin socket, session {}",
                     &token[..8]
                 ),
             );
@@ -383,16 +367,16 @@ impl Admin for Service {
             }));
         }
 
-        let code = sessions.issue_code(request.actions);
+        let code = sessions.issue_code();
         self.handle.events.emit(
             "dashboard.login_issued",
             "dashboard",
             "notice",
-            &format!("a dashboard login link {what} was issued over the admin socket"),
+            "a dashboard login link was issued over the admin socket",
         );
         Ok(Response::new(pb::DashboardLoginLink {
             url: format!("http://{address}/login?code={code}"),
-            expires_in_s: muru_dashboard::actions::CODE_LIFETIME.as_secs(),
+            expires_in_s: muru_dashboard::signin::CODE_LIFETIME.as_secs(),
             code,
             token: String::new(),
         }))

@@ -634,13 +634,8 @@
     },
     "Dashboard": {
       "additionalProperties": false,
-      "description": "The `[dashboard]` table: where the daemon serves its dashboard and JSON gateway, and whether it takes actions.",
+      "description": "The `[dashboard]` table: where the daemon serves its dashboard and JSON gateway, which show and never change.",
       "properties": {
-        "actions": {
-          "default": false,
-          "description": "Whether a person signed in with `muructl dashboard login` may act from the dashboard; read-only when false.",
-          "type": "boolean"
-        },
         "listen": {
           "description": "The loopback address the dashboard is served on, such as 127.0.0.1:8090; not served when omitted.",
           "type": "string"

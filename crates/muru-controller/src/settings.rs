@@ -48,8 +48,6 @@ pub struct NodeSettings {
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard and JSON gateway are served, or nowhere.
     pub dashboard: Option<SocketAddr>,
-    /// Whether a dashboard session may be given the actions.
-    pub dashboard_actions: bool,
     /// The webhooks events are delivered to (section 11.5).
     pub sinks: Vec<crate::sinks::Webhook>,
     /// The overlays' signed webhook (section 9.10), or none.
@@ -184,10 +182,6 @@ impl NodeSettings {
             listener_proxies: listener_proxies_from(document)?,
             metrics: metrics_from(document, overrides.metrics)?,
             dashboard: dashboard_from(document, overrides.dashboard)?,
-            dashboard_actions: document
-                .dashboard
-                .as_ref()
-                .is_some_and(|dashboard| dashboard.actions),
             sinks: sinks_from(document)?,
             overlay_webhook,
             secrets,
@@ -650,7 +644,6 @@ mod tests {
         assert!(settings.sinks.is_empty());
         assert!(settings.secrets.is_empty());
         assert!(settings.metrics.is_none());
-        assert!(!settings.dashboard_actions);
         assert_eq!(settings.client_rules.directory, PathBuf::from("/etc/muru"));
     }
 
@@ -659,7 +652,7 @@ mod tests {
         let settings = settings(
             "[[listener]]\naddress = '0.0.0.0:80'\n[[listener]]\naddress = '0.0.0.0:443'\ntls = true\n\
              [limits]\nmax_body_size = '1MB'\nqueue_timeout = '2s'\n\
-             [dashboard]\nlisten = '127.0.0.1:8090'\nactions = true\n",
+             [dashboard]\nlisten = '127.0.0.1:8090'\n",
         )
         .unwrap();
         assert_eq!(settings.listeners.len(), 2);
@@ -667,7 +660,10 @@ mod tests {
         assert_eq!(settings.limits.max_body_size, 1024 * 1024);
         assert_eq!(settings.limits.queue_timeout.as_secs(), 2);
         assert_eq!(settings.dashboard, Some("127.0.0.1:8090".parse().unwrap()));
-        assert!(settings.dashboard_actions);
+
+        // The dashboard has no actions to switch on (issue 547).
+
+        assert!(muru_config::Document::parse("[dashboard]\nactions = true\n").is_err());
     }
 
     #[test]

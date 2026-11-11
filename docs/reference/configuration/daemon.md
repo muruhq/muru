@@ -402,11 +402,10 @@ The `[daemon.budget]` table: what the releases on the node may hold between them
 (config-daemon-dashboard)=
 ## `[dashboard]`
 
-The `[dashboard]` table: where the daemon serves its dashboard and JSON gateway, and whether it takes actions.
+The `[dashboard]` table: where the daemon serves its dashboard and JSON gateway, which show and never change.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `actions` | boolean | `false` | Whether a person signed in with `muructl dashboard login` may act from the dashboard; read-only when false. |
 | `listen` | string |  | The loopback address the dashboard is served on, such as 127.0.0.1:8090; not served when omitted. |
 
 (config-daemon-error-override)=

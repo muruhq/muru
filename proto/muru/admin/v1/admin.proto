@@ -66,7 +66,7 @@ service Admin {
   rpc OverrideAccessLog(OverrideAccessLogRequest) returns (AccessLogOverrides);
 
   // Section 10.7: a single-use link that signs a browser in to the
-  // dashboard's actions, when the daemon's configuration enables them.
+  // dashboard, which shows and never changes.
   rpc DashboardLogin(DashboardLoginRequest) returns (DashboardLoginLink);
 
   // Events, from a sequence number.
@@ -560,7 +560,8 @@ message SetScaleRequest {
 }
 
 message DashboardLoginRequest {
-  bool actions = 1;                 // a session that may act, which the [dashboard] table must allow
+  reserved 1;                       // was actions: the dashboard has none (ADR 0060)
+  reserved "actions";
   bool token = 2;                   // a session at once, as a bearer token for scripts, in place of a link
 }
 

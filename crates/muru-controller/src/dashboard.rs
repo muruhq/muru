@@ -7,9 +7,8 @@
 use std::sync::Arc;
 
 use muru_dashboard::{
-    Action, Actions, DebugAnswer, DebugAsk, DebugSource, EndpointRow, EventRow, EventsSource,
-    History, NodeMetricsSource, NodeSource, Reading, Sessions, SocketRow, WebSocketsView,
-    WorkerAnswer,
+    DebugAnswer, DebugAsk, DebugSource, EndpointRow, EventRow, EventsSource, History,
+    NodeMetricsSource, NodeSource, Reading, Sessions, SocketRow, WebSocketsView, WorkerAnswer,
 };
 use muru_proto::edge::v1 as pb;
 use tokio::net::TcpListener;
@@ -17,25 +16,16 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::daemon::Command;
 use crate::events::Events;
-use crate::store::Store;
 
 /// Serve the dashboard on the listener until accepting fails, for the
-/// sessions given, which also take the actions when they may; `store`
-/// is read for what an action must check first, and `allowed` is the
-/// daemon's `[dashboard] actions` switch as it stands after any reload.
+/// sessions given. It shows and never changes anything.
 pub async fn serve(
     listener: TcpListener,
     commands: mpsc::Sender<Command>,
     history: Arc<History>,
     events: Events,
     sessions: Arc<Sessions>,
-    store: Arc<Store>,
-    allowed: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
-    let actions = Actions {
-        sessions,
-        sink: action_sink(commands.clone(), events.clone(), store, allowed),
-    };
     let debug = debug_source(commands.clone());
     let data_commands = commands.clone();
     let source: NodeSource = Arc::new(move || {
@@ -85,7 +75,7 @@ pub async fn serve(
         }
     });
     let live: EventsSource = Arc::new(move || rows.subscribe());
-    muru_dashboard::serve_node(listener, source, metrics, history, live, actions, debug).await
+    muru_dashboard::serve_node(listener, source, metrics, history, live, sessions, debug).await
 }
 
 /// Section 11.7: ask a release's workers what the inspection pages show,
@@ -145,195 +135,6 @@ fn debug_source(commands: mpsc::Sender<Command>) -> DebugSource {
                     .collect(),
             })
         })
-    })
-}
-
-/// Section 10.7: carry out a dashboard action as the admin API would,
-/// recording who asked as a `dashboard.action` event.
-fn action_sink(
-    commands: mpsc::Sender<Command>,
-    events: Events,
-    store: Arc<Store>,
-    allowed: Arc<std::sync::atomic::AtomicBool>,
-) -> muru_dashboard::ActionSink {
-    Arc::new(move |action, session| {
-        let commands = commands.clone();
-        let events = events.clone();
-        let store = Arc::clone(&store);
-        let allowed = Arc::clone(&allowed);
-        Box::pin(async move {
-            // The switch is read as it stands now, so a session issued
-            // while actions were on stops acting once they are off.
-
-            if !allowed.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(
-                    "the dashboard's actions are off; set actions = true in the \
-                            [dashboard] table and reload"
-                        .to_owned(),
-                );
-            }
-
-            let what = carry_out(&commands, &store, action).await?;
-            let (subject, what) = what;
-            let what = format!("{what} from the dashboard, session {session}");
-            events.emit("dashboard.action", &subject, "notice", &what);
-            Ok(what)
-        })
-    })
-}
-
-/// Carry an action out through the reconciler, and say what was done
-/// and to what.
-async fn carry_out(
-    commands: &mpsc::Sender<Command>,
-    store: &Store,
-    action: Action,
-) -> Result<(String, String), String> {
-    const STOPPING: &str = "the daemon is stopping";
-
-    // A sent command answered by the reconciler, or why it could not be.
-
-    macro_rules! ask {
-        ($command:expr, $done_rx:expr) => {{
-            commands
-                .send($command)
-                .await
-                .map_err(|_| STOPPING.to_owned())?;
-            $done_rx.await.map_err(|_| STOPPING.to_owned())??
-        }};
-    }
-
-    Ok(match action {
-        Action::Maintenance { app, on } => {
-            let (done, done_rx) = oneshot::channel();
-            ask!(
-                Command::SetMaintenance {
-                    app: app.clone(),
-                    on,
-                    done,
-                },
-                done_rx
-            );
-            let what = format!("maintenance {} for {app}", if on { "on" } else { "off" });
-            (app, what)
-        }
-        Action::Promote { app, release } => {
-            // Section 9.6: a frozen application's deploys are refused, as
-            // the admin API refuses them, with no override from a page.
-
-            let overlays = store.overlays().map_err(|error| error.to_string())?;
-            let states = store.overlay_states().map_err(|error| error.to_string())?;
-            let frozen = crate::overlays::freezes(&crate::overlays::ordered(&overlays, &states));
-
-            if let Some(by) = frozen.get(&app) {
-                return Err(format!(
-                    "deploys of {app} are frozen by overlay {}; muructl promote --override-freeze promotes anyway",
-                    by.join(", ")
-                ));
-            }
-
-            let (done, done_rx) = oneshot::channel();
-            ask!(
-                Command::PromoteRelease {
-                    app: app.clone(),
-                    id: release.clone(),
-                    retain: crate::daemon::Retention::default(),
-                    done,
-                },
-                done_rx
-            );
-            (
-                format!("{app}@{release}"),
-                format!("promoted {app}@{release}"),
-            )
-        }
-        Action::Rollback { app } => {
-            let (done, done_rx) = oneshot::channel();
-            let release = ask!(
-                Command::Rollback {
-                    app: app.clone(),
-                    done,
-                },
-                done_rx
-            );
-            let what = format!("rolled {app} back to {}", release.id);
-            (app, what)
-        }
-        Action::Drain { app, release } => {
-            let (done, done_rx) = oneshot::channel();
-            ask!(
-                Command::Drain {
-                    app: app.clone(),
-                    id: release.clone(),
-                    done,
-                },
-                done_rx
-            );
-            (
-                format!("{app}@{release}"),
-                format!("drained {app}@{release}"),
-            )
-        }
-        Action::Scale {
-            app,
-            release,
-            group,
-            processes,
-        } => {
-            let (done, done_rx) = oneshot::channel();
-            ask!(
-                Command::SetScale {
-                    app: app.clone(),
-                    id: release.clone(),
-                    group: group.clone(),
-                    processes,
-                    unpin: processes.is_none(),
-                    done,
-                },
-                done_rx
-            );
-
-            let what = match processes {
-                Some(count) => format!("pinned {group} to {count} workers"),
-                None => format!("unpinned {group}"),
-            };
-
-            (format!("{app}@{release}"), what)
-        }
-        Action::Restart {
-            app,
-            release,
-            worker,
-            force,
-        } => {
-            let (done, done_rx) = oneshot::channel();
-            let replies = ask!(
-                Command::Debug {
-                    app: app.clone(),
-                    id: release.clone(),
-                    op: "restart".to_owned(),
-                    worker: Some(worker),
-                    args: serde_json::json!({ "force": force }),
-                    done,
-                },
-                done_rx
-            );
-
-            // The host answers with the worker, or with why it could not
-            // be replaced.
-
-            match replies.first() {
-                Some(reply) if reply.ok => {}
-                Some(reply) => return Err(reply.error.clone()),
-                None => return Err(format!("{app}@{release} has no worker {worker}")),
-            }
-
-            let how = if force { ", killed at once" } else { "" };
-            (
-                format!("{app}@{release}"),
-                format!("restarted worker {worker}{how}"),
-            )
-        }
     })
 }
 

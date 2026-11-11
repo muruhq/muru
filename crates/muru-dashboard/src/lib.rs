@@ -11,13 +11,13 @@
 //! every second for the charts; this crate knows nothing about how the
 //! figures are collected.
 
-pub mod actions;
 pub mod history;
 pub mod inspect;
+pub mod signin;
 
-pub use actions::{Action, ActionSink, Sessions};
 pub use history::{History, Point, Reading, Sampler};
 pub use inspect::{DebugAnswer, DebugAsk, DebugSource, WorkerAnswer};
+pub use signin::Sessions;
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -275,17 +275,6 @@ pub type NodeSource = Arc<dyn Fn() -> BoxFuture<Option<NodeData>> + Send + Sync>
 /// Produces the Prometheus text exposition for the daemon's `/metrics`,
 /// or none when the daemon is stopping.
 pub type NodeMetricsSource = Arc<dyn Fn() -> BoxFuture<Option<String>> + Send + Sync>;
-
-/// Signing in to the daemon's dashboard and acting from it (section
-/// 10.7): the sessions signed in, and what carries an action out for one
-/// that may act.
-#[derive(Clone)]
-pub struct Actions {
-    /// Login codes and sessions, shared with the admin API.
-    pub sessions: Arc<Sessions>,
-    /// Carries an action out.
-    pub sink: ActionSink,
-}
 
 /// Everything the daemon's dashboard shows.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -598,15 +587,12 @@ struct LogsFragment<'a> {
 #[template(path = "node.html")]
 struct NodePage<'a> {
     data: &'a NodeData,
-    /// The signed-in session's form token, when actions are on.
-    csrf: Option<&'a str>,
 }
 
 #[derive(Template)]
 #[template(path = "node_overview.html")]
 struct NodeOverviewFragment<'a> {
     data: &'a NodeData,
-    csrf: Option<&'a str>,
 }
 
 #[derive(Template)]
@@ -638,12 +624,8 @@ struct NodeEventRow<'a> {
 struct WorkersPage<'a> {
     /// app@release.
     release: &'a str,
-    /// The signed-in session's form token, when actions are on.
-    csrf: Option<&'a str>,
     /// What the page the dashboard opens on is called: daemon, or run.
     home: &'a str,
-    /// The page a restart comes back to, relative to the dashboard.
-    back: &'a str,
     status: &'a [inspect::StatusRow],
     /// Why the workers could not be asked, or empty.
     error: &'a str,
@@ -653,12 +635,8 @@ struct WorkersPage<'a> {
 #[template(path = "worker.html")]
 struct WorkerPage<'a> {
     release: &'a str,
-    /// The signed-in session's form token, when actions are on.
-    csrf: Option<&'a str>,
     /// What the page the dashboard opens on is called: daemon, or run.
     home: &'a str,
-    /// The page a restart comes back to, relative to the dashboard.
-    back: &'a str,
     worker: u32,
     status: &'a [inspect::StatusRow],
     error: &'a str,
@@ -668,10 +646,6 @@ struct WorkerPage<'a> {
 #[template(path = "workers_status.html")]
 struct WorkersStatusFragment<'a> {
     release: &'a str,
-    /// The signed-in session's form token, when actions are on.
-    csrf: Option<&'a str>,
-    /// The page a restart comes back to, relative to the dashboard.
-    back: &'a str,
     status: &'a [inspect::StatusRow],
     error: &'a str,
 }
@@ -759,10 +733,9 @@ async fn respond(
         return response;
     }
 
-    // Section 13.1: the worker pages, as the daemon's dashboard has them,
-    // with no actions since a run has no sign-in.
+    // Section 13.1: the worker pages, as the daemon's dashboard has them.
 
-    if let Some(response) = inspect_paths(request, debug, None, "run").await {
+    if let Some(response) = inspect_paths(request, debug, "run").await {
         return response;
     }
 
@@ -860,7 +833,7 @@ fn page(rendered: Result<String, askama::Error>) -> Response<Body> {
 
     headers.insert(
         CONTENT_SECURITY_POLICY,
-        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'self'"
+        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; form-action 'none'; frame-ancestors 'self'"
             .parse()
             .expect("static"),
     );
@@ -895,7 +868,7 @@ pub async fn serve_node(
     metrics: NodeMetricsSource,
     history: Arc<History>,
     events: EventsSource,
-    actions: Actions,
+    sessions: Arc<Sessions>,
     debug: DebugSource,
 ) -> anyhow::Result<()> {
     loop {
@@ -904,7 +877,7 @@ pub async fn serve_node(
         let metrics = Arc::clone(&metrics);
         let history = Arc::clone(&history);
         let events = Arc::clone(&events);
-        let actions = actions.clone();
+        let sessions = Arc::clone(&sessions);
         let debug = Arc::clone(&debug);
         tokio::spawn(async move {
             let service = service_fn(move |request| {
@@ -912,12 +885,12 @@ pub async fn serve_node(
                 let metrics = Arc::clone(&metrics);
                 let history = Arc::clone(&history);
                 let events = Arc::clone(&events);
-                let actions = actions.clone();
+                let sessions = Arc::clone(&sessions);
                 let debug = Arc::clone(&debug);
                 async move {
                     Ok::<_, Infallible>(
                         respond_node(
-                            request, &source, &metrics, &history, &events, actions, &debug,
+                            &request, &source, &metrics, &history, &events, &sessions, &debug,
                         )
                         .await,
                     )
@@ -935,33 +908,25 @@ pub async fn serve_node(
 }
 
 async fn respond_node(
-    request: Request<Incoming>,
+    request: &Request<Incoming>,
     source: &NodeSource,
     metrics: &NodeMetricsSource,
     history: &Arc<History>,
     events: &EventsSource,
-    actions: Actions,
+    sessions: &Sessions,
     debug: &DebugSource,
 ) -> Response<Body> {
-    // Section 10.7: signing in, and the actions for a session that may
-    // act.
-
-    if request.method() == Method::POST
-        && let Some(name) = request.uri().path().strip_prefix("/actions/")
-    {
-        let name = name.to_owned();
-        return act(request, &name, &actions).await;
-    }
+    // Section 10.7: the dashboard shows and never changes, so it serves
+    // GET alone, signing in included.
 
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served\n");
     }
 
-    let request = &request;
     let path = request.uri().path();
 
     if path == "/login" {
-        return login(request, &actions);
+        return login(request, sessions);
     }
 
     // The metrics are for Prometheus, which cannot sign in, and the
@@ -978,10 +943,9 @@ async fn respond_node(
         return response;
     }
 
-    let Some((session, _)) = signed_in(request, &actions) else {
+    if !signed_in(request, sessions) {
         return sign_in_first(path);
-    };
-    let csrf = session.actions.then_some(session.csrf);
+    }
 
     if let Some(response) = history_paths(request, history) {
         return response;
@@ -1014,7 +978,7 @@ async fn respond_node(
         }));
     }
 
-    if let Some(response) = inspect_paths(request, debug, csrf.as_deref(), "daemon").await {
+    if let Some(response) = inspect_paths(request, debug, "daemon").await {
         return response;
     }
 
@@ -1023,20 +987,8 @@ async fn respond_node(
     };
 
     match path {
-        "/" => page(
-            NodePage {
-                data: &data,
-                csrf: csrf.as_deref(),
-            }
-            .render(),
-        ),
-        "/fragment/node/overview" => page(
-            NodeOverviewFragment {
-                data: &data,
-                csrf: csrf.as_deref(),
-            }
-            .render(),
-        ),
+        "/" => page(NodePage { data: &data }.render()),
+        "/fragment/node/overview" => page(NodeOverviewFragment { data: &data }.render()),
         "/fragment/node/requests" => page(NodeRequestsFragment { data: &data }.render()),
         "/fragment/node/events" => page(NodeEventsFragment { data: &data }.render()),
         "/fragment/node/logs" => page(NodeLogsFragment { data: &data }.render()),
@@ -1078,7 +1030,6 @@ async fn respond_node(
 async fn inspect_paths(
     request: &Request<Incoming>,
     debug: &DebugSource,
-    csrf: Option<&str>,
     home: &str,
 ) -> Option<Response<Body>> {
     use inspect::{failures, memory_views, merge_stacks, status_rows, tasks_views};
@@ -1100,7 +1051,7 @@ async fn inspect_paths(
     // The release as app@release, and one worker for the worker page,
     // or when asked for.
 
-    let query = actions::form_fields(request.uri().query().unwrap_or_default().as_bytes());
+    let query = signin::query_fields(request.uri().query().unwrap_or_default());
     let release = query.get("release").cloned().unwrap_or_default();
 
     let Some((app, id)) = release
@@ -1152,18 +1103,11 @@ async fn inspect_paths(
         Err(error) => (DebugAnswer::default(), error),
     };
 
-    let back = match worker {
-        Some(index) => format!("worker?release={release}&worker={index}"),
-        None => format!("workers?release={release}"),
-    };
-
     Some(match (kind, op) {
         ("/workers", _) => page(
             WorkersPage {
                 release: &release,
-                csrf,
                 home,
-                back: &back,
                 status: &status_rows(&answer),
                 error: &error,
             }
@@ -1172,9 +1116,7 @@ async fn inspect_paths(
         ("/worker", _) => page(
             WorkerPage {
                 release: &release,
-                csrf,
                 home,
-                back: &back,
                 worker: worker.unwrap_or_default(),
                 status: &status_rows(&answer),
                 error: &error,
@@ -1184,8 +1126,6 @@ async fn inspect_paths(
         (_, "status") => page(
             WorkersStatusFragment {
                 release: &release,
-                csrf,
-                back: &back,
                 status: &status_rows(&answer),
                 error: &error,
             }
@@ -1216,9 +1156,9 @@ async fn inspect_paths(
     })
 }
 
-/// The live session a request names, by a bearer token or its cookie,
-/// and whether it came as a bearer token.
-fn signed_in(request: &Request<Incoming>, actions: &Actions) -> Option<(actions::Session, bool)> {
+/// Whether a request names a live session, by a bearer token or its
+/// cookie.
+fn signed_in(request: &Request<Incoming>, sessions: &Sessions) -> bool {
     let bearer = request
         .headers()
         .get(http::header::AUTHORIZATION)
@@ -1226,10 +1166,7 @@ fn signed_in(request: &Request<Incoming>, actions: &Actions) -> Option<(actions:
         .and_then(|value| value.strip_prefix("Bearer "));
 
     if let Some(token) = bearer {
-        return actions
-            .sessions
-            .session(token.trim())
-            .map(|session| (session, true));
+        return sessions.live(token.trim());
     }
 
     request
@@ -1239,9 +1176,7 @@ fn signed_in(request: &Request<Incoming>, actions: &Actions) -> Option<(actions:
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(name, _)| *name == actions::SESSION_COOKIE)
-        .and_then(|(_, id)| actions.sessions.session(id.trim()))
-        .map(|session| (session, false))
+        .any(|(name, id)| name == signin::SESSION_COOKIE && sessions.live(id.trim()))
 }
 
 /// What a request without a session gets: a page saying how to sign in
@@ -1276,15 +1211,14 @@ code { font-size: 0.95em; }
 <body>
 <main>
 <h1>Sign in to the Muru dashboard</h1>
-<p>Run <code>muructl dashboard login</code> where the daemon runs, and open the link it prints within five minutes.
-Add <code>--actions</code> for a session that may act, such as turning maintenance mode on and off.</p>
+<p>Run <code>muructl dashboard login</code> where the daemon runs, and open the link it prints within five minutes.</p>
 </main>
 </body>
 </html>
 ";
 
 /// Redeem a login link: a session cookie and back to the page.
-fn login(request: &Request<Incoming>, actions: &Actions) -> Response<Body> {
+fn login(request: &Request<Incoming>, sessions: &Sessions) -> Response<Body> {
     let code = request
         .uri()
         .query()
@@ -1293,7 +1227,7 @@ fn login(request: &Request<Incoming>, actions: &Actions) -> Response<Body> {
         .find_map(|pair| pair.strip_prefix("code="))
         .unwrap_or_default();
 
-    let Some((id, _)) = actions.sessions.redeem(code) else {
+    let Some(id) = sessions.redeem(code) else {
         return plain(
             StatusCode::FORBIDDEN,
             "this login link is unknown, used or expired; muructl dashboard login gives another\n",
@@ -1310,7 +1244,7 @@ fn login(request: &Request<Incoming>, actions: &Actions) -> Response<Body> {
 
     if let Ok(cookie) = format!(
         "{}={id}; Max-Age=43200; HttpOnly; SameSite=Strict",
-        actions::SESSION_COOKIE
+        signin::SESSION_COOKIE
     )
     .parse()
     {
@@ -1318,107 +1252,6 @@ fn login(request: &Request<Incoming>, actions: &Actions) -> Response<Body> {
     }
 
     response
-}
-
-/// Carry out an action for a live session that may act: a form posted by
-/// a page of the dashboard's own origin with the session's token, or a
-/// script's request with its bearer token. `name` is the action's, from
-/// the path.
-async fn act(request: Request<Incoming>, name: &str, actions: &Actions) -> Response<Body> {
-    let Some((session, bearer)) = signed_in(&request, actions) else {
-        return plain(
-            StatusCode::FORBIDDEN,
-            "not signed in; muructl dashboard login --actions gives a link\n",
-        );
-    };
-
-    if !session.actions {
-        return plain(
-            StatusCode::FORBIDDEN,
-            "this session may only look; muructl dashboard login --actions gives one that may act\n",
-        );
-    }
-
-    // A browser sends the cookie whoever's page posts, so a form must come
-    // from the dashboard's own origin and carry the session's token; a
-    // bearer token is never sent by a browser on its own.
-
-    if !bearer && !same_origin(&request) {
-        return plain(
-            StatusCode::FORBIDDEN,
-            "an action must come from the dashboard's own page\n",
-        );
-    }
-
-    let body = match http_body_util::Limited::new(request.into_body(), 4096)
-        .collect()
-        .await
-    {
-        Ok(body) => body.to_bytes(),
-        Err(_) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "the form is too large\n"),
-    };
-    let fields = actions::form_fields(&body);
-
-    if !bearer && !actions::same_token(fields.get("csrf").map_or("", String::as_str), &session.csrf)
-    {
-        return plain(
-            StatusCode::FORBIDDEN,
-            "the form's token is not this session's\n",
-        );
-    }
-
-    let action = match Action::from_form(name, &fields) {
-        Ok(action) => action,
-        Err(error) => return plain_text(StatusCode::BAD_REQUEST, format!("{error}\n")),
-    };
-
-    match (actions.sink)(action, session.label).await {
-        Ok(_) => {
-            // Back to the page the form was on, which is one level up from
-            // the action's own path, under whatever prefix it is served: a
-            // worker page names itself in `back`, a relative path of the
-            // dashboard's own.
-
-            let back = fields
-                .get("back")
-                .filter(|back| back.starts_with("workers?") || back.starts_with("worker?"))
-                .map_or_else(|| "../".to_owned(), |back| format!("../{back}"));
-            let mut response = plain(StatusCode::SEE_OTHER, "done\n");
-
-            if let Ok(location) = back.parse() {
-                response
-                    .headers_mut()
-                    .insert(http::header::LOCATION, location);
-            }
-
-            response
-        }
-        Err(error) => plain_text(StatusCode::CONFLICT, format!("{error}\n")),
-    }
-}
-
-/// Whether a form was posted by a page of the dashboard's own origin. The
-/// browser's Sec-Fetch-Site says so whatever proxy is in front, since it
-/// compares the page with the URL the browser asked for; without it, the
-/// Origin must be the Host the request names.
-fn same_origin(request: &Request<Incoming>) -> bool {
-    let header = |name: &str| {
-        request
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-    };
-
-    if let Some(site) = header("sec-fetch-site") {
-        return site == "same-origin";
-    }
-
-    match (header("origin"), header("host")) {
-        (Some(origin), Some(host)) => {
-            origin == format!("http://{host}") || origin == format!("https://{host}")
-        }
-        _ => false,
-    }
 }
 
 /// A Server-Sent Events response from a stream of messages.

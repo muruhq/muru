@@ -780,10 +780,6 @@ pub struct Info {
     /// The dashboard's login codes and sessions, when it is served
     /// (section 10.7).
     pub dashboard_sessions: Option<Arc<muru_dashboard::Sessions>>,
-    /// Whether a dashboard session may be given the actions, which
-    /// `muructl dashboard login --actions` asks for, and whether a session
-    /// that has them may act: `[dashboard] actions`, re-read on reload.
-    pub dashboard_actions: Arc<std::sync::atomic::AtomicBool>,
     /// The rate limits (section 4.15) and client classes (section 4.14)
     /// the daemon's file defines, which applied files may name.
     pub defined: std::sync::RwLock<crate::config::Defined>,
@@ -1326,9 +1322,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let metrics = settings.metrics;
     let dashboard = settings.dashboard;
     let dashboard_sessions = dashboard.is_some().then(muru_dashboard::Sessions::new);
-    let dashboard_actions = Arc::new(std::sync::atomic::AtomicBool::new(
-        settings.dashboard_actions,
-    ));
     let sinks = std::mem::take(&mut settings.sinks);
     let locations = config.locations;
 
@@ -1455,7 +1448,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         metrics,
         dashboard,
         dashboard_sessions: dashboard_sessions.clone(),
-        dashboard_actions: Arc::clone(&dashboard_actions),
         defined: std::sync::RwLock::new(crate::config::Defined {
             budget: crate::budget::View {
                 budget: settings.budget,
@@ -1514,8 +1506,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 Arc::clone(&history),
                 events.clone(),
                 dashboard_sessions.unwrap_or_else(muru_dashboard::Sessions::new),
-                Arc::clone(&handle.store),
-                Arc::clone(&dashboard_actions),
             )))
         }
         None => None,
@@ -2989,7 +2979,7 @@ impl Daemon {
         self.client_rules = settings.client_rules;
         self.clients = clients;
 
-        // Section 7.4: the budget, and the dashboard's actions switch.
+        // Section 7.4: the budget.
 
         if settings.budget != self.budget {
             self.budget = settings.budget;
@@ -3013,18 +3003,6 @@ impl Daemon {
             report.changed("[daemon] pass_env", "for releases started from now on");
         } else {
             report.unchanged("[daemon] pass_env");
-        }
-
-        let actions = settings.dashboard_actions;
-        let actions_were = self
-            .info
-            .dashboard_actions
-            .swap(actions, std::sync::atomic::Ordering::Relaxed);
-
-        if actions_were != actions {
-            report.changed("[dashboard] actions", if actions { "on" } else { "off" });
-        } else {
-            report.unchanged("[dashboard] actions");
         }
 
         // Section 11.5: sinks start, stop and restart on their cursors.

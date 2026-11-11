@@ -50,7 +50,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Traffic | muructl drain RELEASE | Drain a release | 9.5 |
 | Traffic | muructl rollback APP | Restore the previous traffic policy | 9.6 |
 | Traffic | muructl maintenance on, off APP | Maintenance page at the edge | 4.12 |
-| Operations | muructl dashboard login | A single-use link signing a browser in to the dashboard's actions | 10.7 |
+| Operations | muructl dashboard login | A single-use link signing a browser in to the dashboard, or with --token a bearer token for scripts | 10.7 |
 | Capacity | muructl scale RELEASE or APP | Processes, threads, bounds, temporary floors with --until | 7.4, 7.5 |
 | Capacity | muructl scale status RELEASE | Signals, decisions, churn counters | 7.3 |
 | Capacity | muructl restart RELEASE or APP --worker N | Replace one worker with a fresh one, or every worker in turn with --all; --pid names it by process id, --force kills it at once, --no-wait returns before the replacement serves | 7.6 |

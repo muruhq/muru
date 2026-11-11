@@ -5274,11 +5274,6 @@ pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
 pub enum DashboardCommand {
     /// Print a single-use link that signs a browser in to the dashboard.
     Login {
-        /// A session that may act from the dashboard as well as look, which
-        /// the [dashboard] table's `actions = true` allows.
-        #[arg(long)]
-        actions: bool,
-
         /// Print a token for scripts to send as `Authorization: Bearer`,
         /// good for twelve hours, instead of a link.
         #[arg(long)]
@@ -5301,7 +5296,6 @@ pub enum DashboardCommand {
 /// Run a dashboard subcommand.
 pub async fn dashboard(command: DashboardCommand) -> anyhow::Result<()> {
     let DashboardCommand::Login {
-        actions,
         token,
         url,
         socket,
@@ -5309,7 +5303,7 @@ pub async fn dashboard(command: DashboardCommand) -> anyhow::Result<()> {
     } = command;
     let mut client = client::connect(&socket.socket()?).await?;
     let link = client
-        .dashboard_login(pb::DashboardLoginRequest { actions, token })
+        .dashboard_login(pb::DashboardLoginRequest { token })
         .await
         .map_err(explain)?
         .into_inner();
