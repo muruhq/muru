@@ -727,10 +727,21 @@ a terminal; SIGTERM or an interrupt detaches it the same way, and
 daemon to exit. The [systemd
 guide](systemd.md) has the unit and what it does. Commands find the
 daemon through its admin socket: `--socket` or `MURU_SOCKET`, else a
-development run started from the current directory, else the daemon's
-socket in the runtime directory, else the one development run listening;
-with several runs and no daemon the command names them, so one can be
-chosen with `--socket`. `muructl status` says which was found. A run
+development run whose project is the current directory, else one started
+from the current directory, else the daemon's socket in the runtime
+directory, else the one development run listening; with several runs and
+no daemon the command names them, so one can be chosen with `--socket`.
+`muructl status` says which was found. When the daemon answers while a
+development run is listening, the command says so on standard error and
+names the run, its project directory and its socket:
+
+```console
+$ muructl logs --access --lines 1
+muru: using the daemon; the development run of shop on http://127.0.0.1:8080 is also listening: run the command from /home/me/shop, or pass --socket /run/user/1000/muru/runs/8080/admin.sock, to reach it
+```
+
+`muructl run` prints the directories its commands are reached from when
+it starts. A run
 directory you may not enter is passed over like one that is not there;
 when nothing else is found, the command says permission was denied on
 its socket.

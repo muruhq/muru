@@ -171,8 +171,9 @@ pub struct JsonArgs {
 #[derive(Args, Clone, Default)]
 pub struct SocketArgs {
     /// The admin socket (default: MURU_SOCKET, else a development run
-    /// started from the current directory, else the user daemon's socket
-    /// in the runtime directory, else the one development run listening).
+    /// whose project is the current directory or that was started from
+    /// it, else the user daemon's socket in the runtime directory, else
+    /// the one development run listening).
     #[arg(long, global = true, value_name = "PATH", env = "MURU_SOCKET")]
     socket: Option<PathBuf>,
 
@@ -300,7 +301,33 @@ impl SocketArgs {
             .and_then(|directory| directory.canonicalize())
             .ok();
 
-        discovered(&runs, here.as_deref(), daemon, daemon_listening, denied)
+        let discovery = discovered(&runs, here.as_deref(), daemon, daemon_listening, denied)?;
+
+        // A command may look for its socket more than once; the note that
+        // the daemon was chosen over a run is said once.
+
+        static NOTED: std::sync::Once = std::sync::Once::new();
+
+        if let Some(note) = &discovery.note {
+            NOTED.call_once(|| muru_common::muru_eprintln!("{note}"));
+        }
+
+        Ok(discovery.socket)
+    }
+}
+
+/// Where discovery led: the socket, and what to tell the user about the
+/// choice when a development run listens that was passed over for the
+/// daemon.
+#[derive(Debug)]
+struct Discovery {
+    socket: PathBuf,
+    note: Option<String>,
+}
+
+impl Discovery {
+    fn quiet(socket: PathBuf) -> Self {
+        Self { socket, note: None }
     }
 }
 
@@ -314,31 +341,69 @@ fn may_not_enter(path: &Path) -> bool {
 }
 
 /// The rest of discovery (design specification section 13.8), once there
-/// is no usable serve: a development run from the current project, the
-/// daemon's socket when it listens, then the one run listening. With
-/// nothing there, the socket of a run directory this user may not enter
-/// when there is one, so the permission error is reported, or the daemon's.
+/// is no usable serve: a development run whose project is the current
+/// directory, then one started from it, the daemon's socket when it
+/// listens, then the one run listening. With nothing there, the socket
+/// of a run directory this user may not enter when there is one, so the
+/// permission error is reported, or the daemon's. When the daemon is
+/// chosen while runs listen, the note names them and how to reach them.
 fn discovered(
     runs: &[crate::run_admin::RunInfo],
     here: Option<&Path>,
     daemon: PathBuf,
     daemon_listening: bool,
     denied: Option<PathBuf>,
-) -> anyhow::Result<PathBuf> {
-    if let Some(run) = runs
+) -> anyhow::Result<Discovery> {
+    let project = runs
         .iter()
-        .find(|run| here.is_some_and(|here| run.project == here))
-    {
-        return Ok(run.socket.clone());
+        .find(|run| here.is_some_and(|here| run.project == here));
+
+    let started = || {
+        runs.iter()
+            .find(|run| here.is_some() && run.started_from.as_deref() == here)
+    };
+
+    if let Some(run) = project.or_else(started) {
+        return Ok(Discovery::quiet(run.socket.clone()));
     }
 
     if daemon_listening {
-        return Ok(daemon);
+        let note = match runs {
+            [] => None,
+            [run] => Some(format!(
+                "using the daemon; the development run of {} on http://{} is also \
+                 listening: run the command from {}, or pass --socket {}, to reach it",
+                run.app,
+                run.listen,
+                run.project.display(),
+                run.socket.display()
+            )),
+            several => Some(format!(
+                "using the daemon; development runs are also listening: {}; run the \
+                 command from a run's project directory, or pass --socket, to reach one",
+                several
+                    .iter()
+                    .map(|run| format!(
+                        "{} on http://{} from {} (--socket {})",
+                        run.app,
+                        run.listen,
+                        run.project.display(),
+                        run.socket.display()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )),
+        };
+
+        return Ok(Discovery {
+            socket: daemon,
+            note,
+        });
     }
 
     match runs {
-        [] => Ok(denied.unwrap_or(daemon)),
-        [run] => Ok(run.socket.clone()),
+        [] => Ok(Discovery::quiet(denied.unwrap_or(daemon))),
+        [run] => Ok(Discovery::quiet(run.socket.clone())),
         several => anyhow::bail!(
             "no daemon is running and several development runs are: {}; name one with \
              --socket, or run the command from its project directory",
@@ -9492,6 +9557,7 @@ mod tests {
             pid: 1,
             app: "app".to_owned(),
             project: PathBuf::from(project),
+            started_from: None,
             listen: "127.0.0.1:8080".to_owned(),
             socket: PathBuf::from(socket),
             runtime: Vec::new(),
@@ -9507,6 +9573,7 @@ mod tests {
                 denied.map(Path::to_path_buf),
             )
             .expect("found")
+            .socket
         };
         let mine = [run("/user/runs/8080/admin.sock", "/mine")];
 
@@ -9522,6 +9589,69 @@ mod tests {
 
         assert_eq!(found(&[], None, false, Some(&denied)), denied);
         assert_eq!(found(&[], None, false, None), daemon);
+    }
+
+    #[test]
+    fn discovery_finds_a_run_from_where_it_was_started_and_says_when_the_daemon_wins() {
+        use std::path::{Path, PathBuf};
+
+        use crate::run_admin::RunInfo;
+
+        let shop = RunInfo {
+            pid: 1,
+            app: "shop".to_owned(),
+            project: PathBuf::from("/work/shop"),
+            started_from: Some(PathBuf::from("/work")),
+            listen: "127.0.0.1:18380".to_owned(),
+            socket: PathBuf::from("/user/runs/18380/admin.sock"),
+            runtime: Vec::new(),
+        };
+        let other = RunInfo {
+            app: "api".to_owned(),
+            project: PathBuf::from("/work"),
+            started_from: Some(PathBuf::from("/elsewhere")),
+            listen: "127.0.0.1:18381".to_owned(),
+            socket: PathBuf::from("/user/runs/18381/admin.sock"),
+            ..shop.clone()
+        };
+        let daemon = PathBuf::from("/user/admin.sock");
+        let found = |runs: &[RunInfo], here: &str| {
+            super::discovered(runs, Some(Path::new(here)), daemon.clone(), true, None)
+                .expect("found")
+        };
+
+        // The directory a run was started from reaches it ahead of the
+        // daemon, quietly; a run whose project is that directory wins over it.
+
+        let started = found(std::slice::from_ref(&shop), "/work");
+        assert_eq!(started.socket, shop.socket);
+        assert!(started.note.is_none());
+
+        let both = [shop.clone(), other.clone()];
+        assert_eq!(found(&both, "/work").socket, other.socket);
+
+        // Elsewhere the daemon answers, and the note names the run passed
+        // over and how to reach it.
+
+        let elsewhere = found(std::slice::from_ref(&shop), "/tmp");
+        assert_eq!(elsewhere.socket, daemon);
+        let note = elsewhere.note.expect("a note");
+        assert!(note.starts_with("using the daemon;"), "{note}");
+        assert!(note.contains("shop on http://127.0.0.1:18380"), "{note}");
+        assert!(
+            note.contains("--socket /user/runs/18380/admin.sock"),
+            "{note}"
+        );
+
+        let several = found(&both, "/tmp").note.expect("a note");
+        assert!(
+            several.contains("development runs are also listening"),
+            "{several}"
+        );
+        assert!(
+            several.contains("api on http://127.0.0.1:18381"),
+            "{several}"
+        );
     }
 
     #[test]

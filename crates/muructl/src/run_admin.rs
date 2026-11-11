@@ -515,6 +515,10 @@ pub struct RunInfo {
     pub app: String,
     /// The project directory.
     pub project: PathBuf,
+    /// The directory `muructl run` was started from, which reaches the
+    /// run as its project directory does.
+    #[serde(default)]
+    pub started_from: Option<PathBuf>,
     /// The address the application is served on.
     pub listen: String,
     /// The admin socket.
@@ -567,6 +571,9 @@ impl Registration {
             pid: std::process::id(),
             app: app.to_owned(),
             project: project.to_path_buf(),
+            started_from: std::env::current_dir()
+                .and_then(|directory| directory.canonicalize())
+                .ok(),
             listen: listen.to_string(),
             socket: socket.clone(),
             runtime: library.map(Path::to_path_buf).into_iter().collect(),
@@ -617,6 +624,7 @@ impl Registration {
             pid: std::process::id(),
             app: app.to_owned(),
             project: project.to_path_buf(),
+            started_from: None,
             listen: listen.to_string(),
             socket: socket.to_path_buf(),
             runtime: Vec::new(),

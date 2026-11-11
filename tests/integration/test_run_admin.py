@@ -290,6 +290,15 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
         )
         assert f"runs/{second.port}/admin.sock" in muructl(runtime, "status", cwd=other).stdout
 
+        # The directory a run was started from reaches it too, and the run
+        # says so at start (issue 592). Both were started from here.
+
+        here = Path.cwd().resolve()
+        assert (
+            f"muructl commands run from {other.resolve()} or {here} reach this run" in second.log()
+        )
+        assert f"{runtime}/runs/" in muructl(runtime, "status", cwd=here).stdout
+
         # Elsewhere, with no daemon, the runs are named so one can be
         # chosen. A socket file left behind by a daemon is no daemon.
 

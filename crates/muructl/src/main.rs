@@ -3561,6 +3561,20 @@ async fn run_with(
         ),
     };
 
+    // Section 13.8: commands run from the project directory, or from
+    // where this run was started, reach it.
+
+    let reached = serve.is_none().then(|| {
+        let here = std::env::current_dir()
+            .and_then(|directory| directory.canonicalize())
+            .ok();
+
+        match here {
+            Some(here) if here != project => format!("{} or {}", project.display(), here.display()),
+            _ => project.display().to_string(),
+        }
+    });
+
     let registration = match registered {
         Ok(registration) => Some(registration),
         Err(error) => {
@@ -3601,6 +3615,13 @@ async fn run_with(
         match run_admin::serve(state, admin_stop_rx).await {
             Ok(serving) => {
                 muru_common::muru_println!("admin socket {}", registration.socket.display());
+
+                if let Some(reached) = &reached {
+                    muru_common::muru_println!(
+                        "muructl commands run from {reached} reach this run"
+                    );
+                }
+
                 admin_serving = Some(tokio::spawn(serving));
             }
             Err(error) => muru_common::muru_println!("no admin socket: {error:#}"),
