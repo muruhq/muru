@@ -1082,7 +1082,11 @@ pub fn run(
 
     if handed_off {
         if let Err(error) = &result {
-            report(py, error);
+            report(
+                py,
+                error,
+                "the application raised an exception after a handoff",
+            );
 
             if let Some(channel) = handoff.slot.channel() {
                 channel.fail_handoff(py, describe(py, error));
@@ -1094,10 +1098,6 @@ pub fn run(
 
     if let Err(error) = result {
         let broken_pipe = error.is_instance_of::<PyBrokenPipeError>(py);
-
-        if !broken_pipe {
-            report(py, &error);
-        }
 
         // Section 7.6: the timeout exception, raised in this thread by
         // the watchdog, is a 504 rather than a 500.
@@ -1120,6 +1120,20 @@ pub fn run(
                 "app_error",
             ),
         };
+
+        // The host's line for the timeout's event says the request ran
+        // past it (issue 368), so the traceback's line says only that the
+        // application was interrupted.
+
+        if !broken_pipe {
+            let what = if timed_out.is_some() {
+                "the application was interrupted"
+            } else {
+                "the application raised an exception"
+            };
+
+            report(py, &error, what);
+        }
 
         let start_response = start_response.get();
 
@@ -1216,7 +1230,7 @@ fn run_app<'py>(
         if let Ok(close) = result.getattr(intern!(py, "close"))
             && let Err(error) = close.call0()
         {
-            report(py, &error);
+            report(py, &error, "the response's close() raised an exception");
         }
 
         return Ok(());
@@ -1239,16 +1253,11 @@ fn run_app<'py>(
     if let Ok(close) = result.getattr(intern!(py, "close"))
         && let Err(error) = close.call0()
     {
-        report(py, &error);
+        report(py, &error, "the response's close() raised an exception");
     }
     outcome
 }
 
-/// Print an exception with its traceback to stderr, the worker's log.
-///
-/// `PyErr::print` is not used because it exits the process for SystemExit,
-/// and an application raising SystemExit is a failed request, not a reason
-/// to stop serving.
 /// Format an exception with its traceback, as the traceback module does.
 pub(crate) fn describe(py: Python<'_>, error: &PyErr) -> String {
     let formatted = py
@@ -1262,13 +1271,27 @@ pub(crate) fn describe(py: Python<'_>, error: &PyErr) -> String {
     }
 }
 
-pub(crate) fn report(py: Python<'_>, error: &PyErr) {
-    let printed = py
-        .import(intern!(py, "traceback"))
-        .and_then(|module| module.call_method1(intern!(py, "print_exception"), (error.value(py),)));
+/// Report an exception the application or a hook did not catch, saying
+/// `what` raised it: through `muru.logging`, on the `muru` logger at ERROR
+/// with the request's id (section 11.4), or with its traceback printed
+/// when that cannot be had.
+///
+/// `PyErr::print` is not used because it exits the process for SystemExit,
+/// and an application raising SystemExit is a failed request, not a reason
+/// to stop serving.
+pub(crate) fn report(py: Python<'_>, error: &PyErr, what: &str) {
+    let logged = py
+        .import(intern!(py, "muru.logging"))
+        .and_then(|module| module.call_method1(intern!(py, "_report"), (error.value(py), what)));
 
-    if printed.is_err() {
-        eprintln!("muru: application error: {error}");
+    if logged.is_err() {
+        let printed = py.import(intern!(py, "traceback")).and_then(|module| {
+            module.call_method1(intern!(py, "print_exception"), (error.value(py),))
+        });
+
+        if printed.is_err() {
+            eprintln!("muru: {what}: {error}");
+        }
     }
 
     let _ = py

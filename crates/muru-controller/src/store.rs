@@ -140,13 +140,18 @@ CREATE TABLE IF NOT EXISTS log_periods (
     path TEXT PRIMARY KEY,
     period TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS log_files_seen (
+    path TEXT PRIMARY KEY,
+    device INTEGER NOT NULL,
+    inode INTEGER NOT NULL
+);
 ";
 
 /// How many events are kept.
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// The store.
 pub struct Store {
@@ -179,7 +184,8 @@ impl Store {
         // maintenance mode (section 4.12), version 13 the period each log
         // file was last seen in (section 11.3), and version 14 whether
         // applied files declare a release (section 9.1), added to an older
-        // table here.
+        // table here, and version 15 the file last seen at each log's path
+        // (section 11.3).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -1113,6 +1119,42 @@ impl Store {
                 connection.execute("DELETE FROM log_periods WHERE path = ?1", params![path])?;
             }
 
+            Ok(())
+        })
+    }
+
+    /// The file last seen at each log's path, as its device and inode
+    /// (section 11.3: reopen_on_rename).
+    pub fn log_files_seen(&self) -> Result<Vec<(String, u64, u64)>, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT path, device, inode FROM log_files_seen")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Replace the files last seen at the logs' paths, in one write.
+    pub fn set_log_files_seen(&self, seen: &[(String, u64, u64)]) -> Result<(), StoreError> {
+        self.with(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute("DELETE FROM log_files_seen", [])?;
+
+            for (path, device, inode) in seen {
+                transaction.execute(
+                    "INSERT INTO log_files_seen (path, device, inode) VALUES (?1, ?2, ?3)",
+                    params![path, *device as i64, *inode as i64],
+                )?;
+            }
+
+            transaction.commit()?;
             Ok(())
         })
     }

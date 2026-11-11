@@ -58,6 +58,12 @@ pub struct NodeSettings {
     pub secrets: Vec<crate::secrets::Store>,
     /// Log rotation (section 11.3), or none for external rotation.
     pub rotation: Option<crate::rotation::Policy>,
+    /// Whether a log file renamed away has its writer reopen it, with no
+    /// signal (`[logs] reopen_on_rename`, section 11.3).
+    pub reopen_on_rename: bool,
+    /// The Python logging defaults every release starts with, under its
+    /// own (`[logging.python]`, section 11.4), taken when a host starts.
+    pub python_logging: muru_config::PythonLogging,
     /// Which records the access log writes (`[logs]` access_log,
     /// access_log_exclude and slow, section 11.2), for every snapshot.
     pub access_log: muru_edge::access::Filter,
@@ -146,6 +152,14 @@ impl NodeSettings {
             .map_err(|error| format!("{error:#}"))?;
         let rotation = crate::rotation::Policy::from_table(document.logs.as_ref())
             .map_err(|error| format!("{error:#}"))?;
+        let python_logging = document
+            .logging
+            .as_ref()
+            .and_then(|logging| logging.python.clone())
+            .unwrap_or_default();
+        python_logging
+            .check()
+            .map_err(|error| format!("[logging.python] {error}"))?;
         let shutdown = crate::shutdown::Policy::from_table(
             document.shutdown.as_ref(),
             crate::shutdown::is_main_process(),
@@ -174,6 +188,12 @@ impl NodeSettings {
             overlay_webhook,
             secrets,
             rotation,
+            reopen_on_rename: document
+                .logs
+                .as_ref()
+                .and_then(|logs| logs.reopen_on_rename)
+                .unwrap_or(true),
+            python_logging,
             access_log: access_log_from(document)?,
             timestamps: document
                 .logs

@@ -198,10 +198,11 @@ def test_logs_are_rotated_by_size_compressed_and_pruned(tmp_path: Path) -> None:
         daemon.stop()
 
 
-def test_the_edge_goes_on_writing_its_own_log_after_it_is_rotated(tmp_path: Path) -> None:
+def test_the_edge_reopens_its_own_log_after_it_is_rotated(tmp_path: Path) -> None:
     daemon = start_daemon(
         tmp_path,
         config_extra="[logs]\nsize = '100B'\nkeep = 20\ncompress = 'off'\nevery = 'off'\n",
+        env={"MURU_RENAME_CHECK_MS": "200"},
     )
     logs = tmp_path / "logs"
 
@@ -216,26 +217,41 @@ def test_the_edge_goes_on_writing_its_own_log_after_it_is_rotated(tmp_path: Path
         traffic()
         return len(archives(logs, "edge.log")) >= 1
 
-    def written_again() -> bool:
+    edge_log = logs / "edge.log"
+
+    def reopened() -> bool:
         traffic()
-        return (logs / "edge.log").stat().st_size > 0
+        return f"edge reopened {edge_log}" in edge_log.read_text()
 
     try:
         assert daemon.deploy("shop", SHOP, "--processes", "1") == (
             "muru: release shop@r1 is ready and serving"
         )
+        first = edge_log.stat().st_ino
 
-        # The edge says when it reopens the access log. Those lines belong
-        # in edge.log, which it keeps open across its own rotation.
+        # edge.log is renamed like the other logs, and the edge opens it
+        # again by name: the line saying so is the first in the new file.
 
         wait_for(rotated, "an edge log archive", describe=state)
-        wait_for(written_again, "the edge to write to edge.log again", describe=state)
+        wait_for(reopened, "the edge to reopen edge.log", describe=state)
+        assert edge_log.stat().st_ino != first
+
+        # The rotation's own renames are not taken for someone else's, so
+        # the check for renamed files, every 200 ms here, reopens nothing.
+
+        assert "renamed)" not in daemon.muructl("events").stdout
     finally:
         daemon.stop()
 
 
-def test_external_rotation_leaves_the_files_alone(tmp_path: Path) -> None:
-    daemon = start_daemon(tmp_path, config_extra="[logs]\nrotate = 'external'\nsize = '1KB'\n")
+def test_external_rotation_leaves_the_files_alone_and_a_rename_is_reopened(
+    tmp_path: Path,
+) -> None:
+    daemon = start_daemon(
+        tmp_path,
+        config_extra="[logs]\nrotate = 'external'\nsize = '1KB'\n",
+        env={"MURU_RENAME_CHECK_MS": "200"},
+    )
     logs = tmp_path / "logs"
 
     try:
@@ -253,6 +269,27 @@ def test_external_rotation_leaves_the_files_alone(tmp_path: Path) -> None:
 
         refused = daemon.muructl("logs", "rotate", "--access", check=False)
         assert refused.returncode != 0 and "rotation is external" in refused.stderr
+
+        # A rename with no signal, as logrotate makes one with no
+        # postrotate: each writer opens its file again by name.
+
+        renamed = [logs / "access.log", logs / "edge.log", logs / "apps" / "shop" / "r1.log"]
+
+        for path in renamed:
+            path.rename(path.with_name(path.name + ".1"))
+
+        def written_again() -> bool:
+            daemon.get("/after-the-rename")
+            return all(path.is_file() and path.stat().st_size > 0 for path in renamed)
+
+        wait_for(
+            written_again, "every renamed log to be written again", describe=lambda: listing(logs)
+        )
+        assert "/after-the-rename" in (logs / "access.log").read_text()
+        events = daemon.muructl("events").stdout
+        assert (
+            "reopened the log files (access.log, edge.log, apps/shop/r1.log renamed)" in events
+        ), events
     finally:
         daemon.stop()
 

@@ -256,6 +256,7 @@ mod tests {
             hosts: Vec::new(),
             size: 10,
             present: true,
+            modified: SystemTime::now(),
             archives: Vec::new(),
             orphaned: false,
         };

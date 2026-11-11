@@ -710,6 +710,13 @@
           },
           "description": "Levels for named loggers.",
           "type": "object"
+        },
+        "warnings": {
+          "description": "Warnings filters in the syntax of Python's -W option, `action:message:category:module:lineno`, applied in order with `warnings.filterwarnings` before the application is imported, so a later one takes precedence.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"

@@ -31,6 +31,7 @@ pub mod overlays;
 pub mod provision;
 pub mod reload;
 pub mod removal;
+pub mod renames;
 pub mod render;
 pub mod rollouts;
 pub mod rotation;

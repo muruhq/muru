@@ -116,3 +116,90 @@ def test_install_replaces_last_resort_and_sets_levels() -> None:
         root.setLevel(root_level)
         root.handlers[:] = handlers
         logging.getLogger("noisy").setLevel(logging.NOTSET)
+
+
+def test_an_unhandled_exception_is_logged_with_the_request_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An exception the application did not catch goes to the muru logger
+    at ERROR, with its traceback and the request it failed."""
+
+    from muru import _context
+
+    token = _context._request_id.set("01TESTREQUEST")
+
+    try:
+        try:
+            raise KeyError("sku")
+        except KeyError as error:
+            muru_logging._report(error, "the application raised an exception")
+    finally:
+        _context._request_id.reset(token)
+
+    (record,) = [record for record in caplog.records if record.name == "muru"]
+    assert record.levelname == "ERROR"
+    assert record.getMessage() == "the application raised an exception"
+    assert record.exc_info is not None and isinstance(record.exc_info[1], KeyError)
+    assert record.muru_request_id == "01TESTREQUEST"  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("silenced", ["disabled", "level", "null handler"])
+def test_an_exception_logging_would_not_show_is_written_to_stderr(
+    silenced: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the application's configuration would show nothing at ERROR on
+    the muru logger, the traceback is written to standard error instead."""
+
+    logger = logging.getLogger("muru")
+    level = logger.level
+
+    if silenced == "disabled":
+        monkeypatch.setattr(logger, "disabled", True)
+    elif silenced == "level":
+        logger.setLevel(logging.CRITICAL)
+    else:
+        monkeypatch.setattr(logger, "handlers", [logging.NullHandler()])
+        monkeypatch.setattr(logger, "propagate", False)
+
+    try:
+        raise KeyError("sku")
+    except KeyError as error:
+        muru_logging._report(error, "the application raised an exception")
+    finally:
+        logger.setLevel(level)
+
+    written = capsys.readouterr().err
+    assert written.startswith("muru: the application raised an exception\nTraceback")
+    assert "KeyError: 'sku'" in written
+
+
+def test_warnings_filters_are_applied_in_order_the_last_first() -> None:
+    """Filters in -W syntax go in with filterwarnings, so the last given
+    takes precedence; one whose category cannot be imported is noted and
+    left out."""
+
+    import warnings
+
+    from muru._inspect import warnings_in_force
+
+    muru_logging._refused_filters.clear()
+
+    # pytest runs each test inside catch_warnings, whose filters a build
+    # with context-aware warnings keeps apart from warnings.filters.
+
+    with warnings.catch_warnings():
+        muru_logging._filter_warnings(
+            [
+                "ignore::DeprecationWarning",
+                "error:boom:DeprecationWarning:shop.views",
+                "ignore::no_such_module.Warning",
+            ]
+        )
+        first, second = warnings_in_force()[0], warnings_in_force()[1]
+        assert first[0] == "error" and first[2] is DeprecationWarning
+        assert first[1].pattern == "boom" and first[3].pattern == r"shop\.views\Z"
+        assert second[0] == "ignore" and second[1] is None
+        assert len(muru_logging._refused_filters) == 1
+        assert "no_such_module" in muru_logging._refused_filters[0]
+
+    muru_logging._refused_filters.clear()

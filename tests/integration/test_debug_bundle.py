@@ -264,6 +264,14 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         assert "[overlay_webhook]" in daemon_file and 'secret = "***"' in daemon_file
         assert json.loads(found["config/access-log-overrides.json"]) == []
         assert json.loads(found["config/routing-snapshot.json"])["version"] >= 1
+        setups = json.loads(found["config/logging-setup.json"])
+        assert len(setups["shop@r1"]["workers"]) == 2
+        assert setups["shop@r1"]["workers"][0]["result"]["loggers"][0]["name"] == "root"
+        levels = json.loads(found["config/logger-levels.json"])
+        assert [worker["result"] for worker in levels["shop@r1"]["workers"]] == [
+            {"changed": []},
+            {"changed": []},
+        ]
 
         for secret in (b"abc123", b"s3cret", b"hunter2", b"hunter3"):
             holding = [path for path, content in found.items() if secret in content]
@@ -283,10 +291,6 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
             "config/routing-snapshots": (
                 "only the routing snapshot in force is kept, not those before it: the events "
                 "in changes.jsonl say what changed, and when"
-            ),
-            "config/logger-levels.json": (
-                "the levels muructl logging level changed are held by each worker, and nothing "
-                "lists them"
             ),
             "figures/history.json": (
                 "the history the dashboard's charts draw is kept in memory, and the admin "

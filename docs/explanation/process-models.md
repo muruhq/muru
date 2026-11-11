@@ -60,8 +60,11 @@ values and do not.
 
 An ASGI worker runs a single event loop thread, started after the fork, on
 which every connection's coroutine runs. The configured concurrency is how
-many requests the worker accepts at once, and WebSockets have a separate
-limit because they live longer.
+many requests the worker accepts at once, and each open WebSocket holds
+one of those places for as long as it is open. An ASGI mount can set
+`max_connections` to count its open WebSockets apart from its requests,
+so that held sockets do not take the places of requests: see
+[the limits of an ASGI mount's own](../howto/mounts.md#limits-of-an-asgi-mounts-own).
 
 Synchronous code called through `asyncio.to_thread`, or through a
 framework's own way of running `def` views, runs on threads apart from

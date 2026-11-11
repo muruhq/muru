@@ -198,7 +198,7 @@ enum Command {
         command: admin::DashboardCommand,
     },
 
-    /// Show the daemon's status.
+    /// Show the status of the daemon or the development run.
     Status {
         #[command(flatten)]
         socket: admin::SocketArgs,
@@ -891,6 +891,11 @@ fn main() -> anyhow::Result<()> {
 
     init::become_init();
 
+    // A panic is reported as one of Muru's lines, stamped in a log file
+    // as every other line there is (section 11.8).
+
+    muru_common::log::install_panic_hook();
+
     // The MCP library's own events stay at warnings unless MURU_LOG says
     // otherwise, and the warning it gives for each refused tool call,
     // with the error in Rust's debug form, is left to the server's own
@@ -936,6 +941,14 @@ fn main() -> anyhow::Result<()> {
         Command::Build(args) => runtime.block_on(provision::build(*args)),
         Command::Check(args) => runtime.block_on(check(*args)),
         Command::ServeStatic(args) => runtime.block_on(serve_static(*args)),
+        Command::Daemon {
+            command:
+                admin::DaemonCommand::Status {
+                    socket,
+                    files,
+                    output,
+                },
+        } => exit_with(runtime, admin::daemon_status(socket, files, output.json)),
         Command::Daemon { command } => runtime.block_on(async move {
             match command {
                 admin::DaemonCommand::Run(args) => admin::daemon_run(args).await,
@@ -954,8 +967,8 @@ fn main() -> anyhow::Result<()> {
                     socket,
                     files,
                 } => admin::daemon_upgrade(socket, files, timeout).await,
-                admin::DaemonCommand::Status { socket, output, .. } => {
-                    admin::daemon_status(socket, output.json).await
+                admin::DaemonCommand::Status { .. } => {
+                    unreachable!("daemon status is matched on its own")
                 }
             }
         }),
@@ -1029,9 +1042,8 @@ fn main() -> anyhow::Result<()> {
         Command::Maintenance { command } => runtime.block_on(admin::maintenance(command)),
         Command::Dashboard { command } => runtime.block_on(admin::dashboard(command)),
         Command::Overlay { command } => runtime.block_on(admin::overlay(command)),
-        Command::Status { socket, output } => {
-            runtime.block_on(admin::daemon_status(socket, output.json))
-        }
+        Command::Status { socket, output } => runtime
+            .block_on(async move { admin::show_status(&socket.socket()?, output.json).await }),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
         Command::Config { command } => match command {
             admin::ConfigCommand::Export {
@@ -1063,11 +1075,7 @@ fn main() -> anyhow::Result<()> {
                     socket,
                     output,
                 }) => admin::logs_reopen(workers, socket, output.json).await,
-                Some(admin::LogsCommand::List {
-                    socket,
-                    files,
-                    output,
-                }) => admin::logs_list(socket, files, output.json).await,
+                Some(admin::LogsCommand::List(args)) => admin::logs_list(*args).await,
                 Some(admin::LogsCommand::Truncate(args)) => admin::logs_truncate(*args).await,
                 Some(admin::LogsCommand::Rotate(args)) => admin::logs_rotate(*args).await,
                 Some(admin::LogsCommand::Prune(args)) => admin::logs_prune(*args).await,
@@ -1094,11 +1102,22 @@ fn main() -> anyhow::Result<()> {
 
     // A command asked for JSON fails in JSON too: the sentence muructl
     // would print, on standard output, with the same exit status.
+    // Section 11.8: where Muru's lines carry the time (a file such as
+    // daemon.log, or --timestamps) or are JSON records, the error is one
+    // of them, a single line, rather than the multi-line form printed
+    // for a terminal.
 
     match result {
         Err(error) if json => {
             let failure = serde_json::json!({ "error": format!("{error:#}") });
             println!("{}", serde_json::to_string_pretty(&failure)?);
+            std::process::exit(1)
+        }
+        Err(error)
+            if muru_common::log::json()
+                || muru_common::log::stamped(muru_common::log::Stream::Stderr) =>
+        {
+            muru_common::muru_eprintln!("error: {error:#}");
             std::process::exit(1)
         }
         other => other,
@@ -2016,7 +2035,18 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         static_dirs,
         error_pages: table.error_pages,
         error_override: table.error_override,
-        logging: table.logging,
+        logging: match table.logging {
+            Some(logging) => {
+                if let Some(python) = &logging.python {
+                    python
+                        .check()
+                        .map_err(|error| anyhow::anyhow!("[tool.muru.logging.python] {error}"))?;
+                }
+
+                Some(logging)
+            }
+            None => None,
+        },
         max_requests,
         max_lifetime: match (args.max_lifetime, &table.max_lifetime) {
             (Some(lifetime), _) => Some(lifetime),
@@ -3217,6 +3247,20 @@ async fn run_with(
         }
     };
     let written = edge.access_log();
+
+    // Section 11.3: SIGUSR1 opens the access log file again by name, as
+    // the edge process does, after something has renamed it; without a
+    // file it does nothing, rather than end the run.
+
+    let reopened = edge.access_log();
+    let mut reopen = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    tokio::spawn(async move {
+        while reopen.recv().await.is_some() {
+            if let Err(error) = run_admin::reopen_access_log(Arc::clone(&reopened)).await {
+                muru_common::muru_eprintln!("could not reopen the access log: {error}");
+            }
+        }
+    });
 
     let addresses = match edge.https_addr() {
         Some(https) if resolved.serving.https_only => {

@@ -10,11 +10,10 @@ on_load and pre_fork run in each worker before its post_fork.
 from __future__ import annotations
 
 import importlib
-import sys
-import traceback
 from collections.abc import Callable
 from typing import Any
 
+from muru import logging as muru_logging
 from muru._context import Context
 
 __all__ = ["HOOKS", "Hooks"]
@@ -82,10 +81,8 @@ class Hooks:
 
         try:
             self.call(hook, context)
-        except BaseException:
-            print(f"muru: the {hook} hook failed", file=sys.stderr)
-            traceback.print_exc()
-            sys.stderr.flush()
+        except BaseException as error:
+            muru_logging._report(error, f"the {hook} hook failed")
             return False
 
         return True

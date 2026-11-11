@@ -604,12 +604,51 @@ on it, and its `[limits]` table sets the body size limit and timeouts.
 ## Running it
 
 `muructl daemon start` starts the daemon in the background, logging to
-`daemon.log` in the log directory, and waits until it answers. The
-daemon writes its pid to `daemon.pid` in the runtime directory and
-removes the file when it exits. `muructl
-up` does the same and is harmless when one already runs. `muructl daemon
+`daemon.log` in the log directory, and waits until it answers. A daemon
+that exits before it answers, such as one that cannot listen on its
+address, is reported at once with its exit status and the lines it
+wrote to `daemon.log`, the last twenty of them:
+
+```console
+$ muructl daemon start
+Error: the daemon exited before it answered (exit status: 1); from /var/log/muru/daemon.log:
+  2026-11-02T05:40:11.204Z muru: config: /etc/muru/muru.toml (default)
+  2026-11-02T05:40:11.204Z muru: state: /var/lib/muru (default)
+  2026-11-02T05:40:11.204Z muru: run: /run/muru (default)
+  2026-11-02T05:40:11.204Z muru: logs: /var/log/muru (default)
+  2026-11-02T05:40:11.204Z muru: cache: /var/cache/muru (default)
+  2026-11-02T05:40:11.209Z muru: error: cannot listen on 0.0.0.0:80: Address already in use (os error 98)
+```
+
+The daemon writes its pid to `daemon.pid` in the runtime directory and
+removes the file when it exits. `muructl up` does the same and is harmless when one already runs. `muructl daemon
 status` and `muructl status` show the daemon, its edge process, its
-listener and its locations. `--metrics ADDRESS`, or a `[metrics]` table
+listener, its admin socket, its configuration file and its state, run,
+log and cache directories:
+
+```console
+$ muructl daemon status
+daemon   pid 4242 version 1.0.0
+edge     pid 4250
+serving  http://0.0.0.0:80
+socket   /run/muru/admin.sock
+config   /etc/muru/muru.toml
+state    /var/lib/muru
+run      /run/muru
+logs     /var/log/muru
+cache    /var/cache/muru
+apps     2 (3 releases)
+websockets 0 open
+```
+
+With no daemon running, `muructl daemon status` says so, names where a
+daemon started with the same location options and environment would
+keep the same files, and exits with status 3. That is where to look
+for `daemon.log` when a daemon did not start, and `muructl logs
+--daemon` reads it. `muructl status` with nothing running says that
+nothing is listening.
+
+`--metrics ADDRESS`, or a `[metrics]` table
 in the configuration file, serves Prometheus metrics on an internal
 address; the [metrics guide](metrics.md) lists them. `--dashboard
 ADDRESS`, or a `[dashboard]` table, serves the [dashboard and JSON
@@ -778,10 +817,14 @@ file again, checks it whole, and applies what changed:
 - the `[secrets.store.NAME]` tables, which the next release to start
   resolves its secrets from;
 
+- the `[logging.python]` table: each application takes the new Python
+  logging defaults at its next restart or deploy, since a running host
+  keeps those it started with;
 - the `[logs]` table: the daemon rotates on the new policy from its
-  next check, and a period that changed rotates each file once; the
-  access log's `access_log`, `access_log_exclude` and `slow` go to the
-  edge at once, for the requests completed from then on;
+  next check, and a period that changed rotates each file once;
+  `reopen_on_rename` turns the check for renamed files on or off at
+  once; the access log's `access_log`, `access_log_exclude` and `slow`
+  go to the edge at once, for the requests completed from then on;
 
 - the `[shutdown]` table, for the next stop signal or `muructl daemon
   stop --shutdown`;

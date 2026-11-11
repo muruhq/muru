@@ -186,6 +186,38 @@ def log(message: str) -> None:
         pass
 
 
+def flush_streams() -> None:
+    """Flush standard output and standard error, as before a fork or an exec.
+
+    A line that could not be written (a full disk, say) stays in the
+    stream's buffer, and the error its flush raises again must not stop
+    the host.
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+
+
+def write_stderr(data: bytes) -> None:
+    """Write bytes to standard error's descriptor directly, in one write.
+
+    Whatever the host has buffered goes first, so its own lines and the
+    workers' stay in order. Bytes a failed write could not take are not
+    kept for later, as a buffered stream would keep them: an OSError
+    means they are gone.
+    """
+
+    flush_streams()
+    view = memoryview(data)
+
+    while view:
+        written = os.write(sys.stderr.fileno(), view)
+        view = view[written:]
+
+
 INTERFACES = ("auto", "wsgi", "asgi", "grpc")
 HANDOFFS = ("asgi", "wsgi")
 
@@ -506,12 +538,19 @@ class Release:
 
 @dataclass
 class WorkerOutput:
-    """The read end of one worker's stdout or stderr pipe, relayed line by line."""
+    """The read end of one worker's stdout or stderr pipe, relayed line by line.
+
+    `sink` takes the relayed lines; `dropped` counts those it could not
+    take since the last that it did, and `failure` says why.
+    """
 
     index: int
     stream: str
     fd: int
     pending: bytes = b""
+    sink: Callable[[bytes], None] = write_stderr
+    dropped: int = 0
+    failure: str = ""
 
     @property
     def tag(self) -> str:
@@ -525,20 +564,43 @@ class WorkerOutput:
 
         self.pending += data
         *lines, self.pending = self.pending.split(b"\n")
-        when = stamp()
 
-        for line in lines:
-            sys.stderr.write(when + self.tag + line.decode("utf-8", "replace") + "\n")
-
-        sys.stderr.flush()
+        if lines:
+            self.write(lines)
 
     def flush(self) -> None:
         """Write a final partial line, if any."""
 
         if self.pending:
-            sys.stderr.write(stamp() + self.tag + self.pending.decode("utf-8", "replace") + "\n")
-            sys.stderr.flush()
+            self.write([self.pending])
             self.pending = b""
+
+    def write(self, lines: list[bytes]) -> None:
+        """Write lines with the time and the tag in one write.
+
+        A log that cannot be written (a full disk, say) never stops the
+        host: lines a write fails on are dropped and counted, and once a
+        write succeeds again the count is reported as one of the host's
+        own lines.
+        """
+
+        when = stamp()
+        text = "".join(when + self.tag + line.decode("utf-8", "replace") + "\n" for line in lines)
+
+        try:
+            self.sink(text.encode("utf-8"))
+        except OSError as error:
+            self.dropped += len(lines)
+            self.failure = error.strerror or str(error)
+            return
+
+        if self.dropped:
+            noun = "line" if self.dropped == 1 else "lines"
+            log(
+                f"dropped {self.dropped} {noun} of worker {self.index}'s {self.stream} "
+                f"that could not be written ({self.failure})"
+            )
+            self.dropped = 0
 
 
 @dataclass
@@ -1216,8 +1278,7 @@ class Host:
         # Anything the host has buffered would otherwise be written twice,
         # once by each process.
 
-        sys.stdout.flush()
-        sys.stderr.flush()
+        flush_streams()
         pid = os.fork()
 
         if pid == 0:
@@ -3448,8 +3509,7 @@ class Host:
             log(f"could not reopen {self.log_file}: {error}")
             return
 
-        sys.stdout.flush()
-        sys.stderr.flush()
+        flush_streams()
         os.dup2(fd, 1)
         os.dup2(fd, 2)
         os.close(fd)
@@ -4239,6 +4299,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="a named logger's level",
     )
     parser.add_argument(
+        "--warning",
+        action="append",
+        default=[],
+        metavar="FILTER",
+        help="a warnings filter in -W syntax, applied in order",
+    )
+    parser.add_argument(
         "--control",
         default=None,
         metavar="PATH",
@@ -4454,7 +4521,16 @@ def main(argv: list[str] | None = None) -> int:
     # Section 11.4: the logging defaults are in place before anything of
     # the application is imported, and the workers inherit them.
 
-    muru_logging._install(args.log_level, args.log_format, args.capture_warnings, dict(args.logger))
+    muru_logging._install(
+        args.log_level,
+        args.log_format,
+        args.capture_warnings,
+        dict(args.logger),
+        args.warning,
+    )
+
+    for refused in muru_logging._refused_filters:
+        log(f"warnings filter {refused} was not applied")
 
     # Section 6.2 step 1: no collections during preload.
 
@@ -4512,7 +4588,7 @@ def main(argv: list[str] | None = None) -> int:
                 "preload: falling back to per-worker imports, which costs slower worker "
                 "replacement and no shared memory; set preload to false to silence this"
             )
-            sys.stderr.flush()
+            flush_streams()
             os.execv(
                 sys.executable,
                 [

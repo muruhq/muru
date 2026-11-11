@@ -1046,10 +1046,15 @@ impl Admin for Service {
         let request = request.into_inner();
         let locations = &self.handle.info.locations;
 
-        // The access log is one file; a release's output is its host's
-        // file, the current release's when none is named.
+        // The access log, the edge's and the daemon's are one file each;
+        // a release's output is its host's file, the current release's
+        // when none is named.
 
-        let (app, release, path) = if request.access {
+        let (app, release, path) = if request.edge {
+            (String::new(), String::new(), locations.edge_log())
+        } else if request.daemon {
+            (String::new(), String::new(), locations.daemon_log())
+        } else if request.access {
             // Section 11.2: a virtual host may name a file of its own.
 
             let own = if request.host.is_empty() {
@@ -1100,10 +1105,7 @@ impl Admin for Service {
         };
 
         if !request.follow && !path.exists() {
-            return Err(Status::not_found(format!(
-                "no log file at {}",
-                path.display()
-            )));
+            return Err(Status::not_found(crate::logs::missing(&path)));
         }
 
         let lines = crate::logs::tail(path, request.lines as usize, request.follow);
@@ -2404,6 +2406,17 @@ impl Admin for Service {
                 .expect("limits poisoned")
                 .clone();
             layers.extend(config::served_layers(&self.handle.store, &document).map_err(internal)?);
+            let python_logging = self
+                .handle
+                .info
+                .python_logging
+                .read()
+                .expect("python logging poisoned")
+                .clone();
+            layers.extend(
+                config::logging_layers(&self.handle.store, &document, &python_logging)
+                    .map_err(internal)?,
+            );
             layers.extend(config::route_layers(&self.handle.store, &document, &limits));
             (attributions, layers)
         } else {

@@ -1399,6 +1399,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "reopen_on_rename": {
+          "default": true,
+          "description": "Notice that something has renamed a log file away, such as logrotate, and have its writer open it again by name, checking every few seconds, so no `postrotate` command is needed.",
+          "type": "boolean"
+        },
         "rotate": {
           "default": "built-in",
           "description": "`built-in` (the default) or `external`, for logrotate.",
@@ -1858,6 +1863,13 @@
           },
           "description": "Levels for named loggers.",
           "type": "object"
+        },
+        "warnings": {
+          "description": "Warnings filters in the syntax of Python's -W option, `action:message:category:module:lineno`, applied in order with `warnings.filterwarnings` before the application is imported, so a later one takes precedence.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -3232,6 +3244,10 @@
         "$ref": "#/$defs/Listener"
       },
       "type": "array"
+    },
+    "logging": {
+      "$ref": "#/$defs/Logging",
+      "description": "Python logging defaults for every release, under each application's and release's own, from the daemon's own file. Read when a host starts."
     },
     "logs": {
       "$ref": "#/$defs/Logs",

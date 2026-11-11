@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
-import sys
 import time
 import traceback
 from collections.abc import (
@@ -31,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple, NoReturn, TypeVar
 
 from muru import _asgi
+from muru import logging as muru_logging
 
 try:
     import grpc
@@ -288,9 +288,7 @@ class Call:
         if isinstance(error, Aborted):
             return
 
-        detail = "".join(traceback.format_exception(error))
-        sys.stderr.write(f"muru: the gRPC handler for {self.path} raised:\n{detail}")
-        sys.stderr.flush()
+        muru_logging._report(error, f"the gRPC handler for {self.path} raised an exception")
 
         if self.code is None or self.code is grpc.StatusCode.OK:
             self.code = grpc.StatusCode.UNKNOWN

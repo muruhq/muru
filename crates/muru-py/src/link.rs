@@ -106,18 +106,19 @@ impl Lifecycle {
         if let Some(hook) = hook {
             Python::attach(|py| {
                 if let Err(error) = hook.call1(py, (left.as_secs_f64(),)) {
-                    wsgi::report(py, &error);
+                    wsgi::report(py, &error, "the on_exit hook failed");
                 }
             });
         }
     }
 
-    /// Call a hook with the interpreter attached, reporting any exception.
-    fn call(hook: Option<&Py<PyAny>>) {
+    /// Call the hook `name` with the interpreter attached, reporting any
+    /// exception.
+    fn call(hook: Option<&Py<PyAny>>, name: &str) {
         if let Some(hook) = hook {
             Python::attach(|py| {
                 if let Err(error) = hook.call0(py) {
-                    wsgi::report(py, &error);
+                    wsgi::report(py, &error, &format!("the {name} hook failed"));
                 }
             });
         }
@@ -234,8 +235,8 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
                 }
                 asked = signals.next() => match asked {
                     Asked::Stop => break,
-                    Asked::ReopenLogs => Lifecycle::call(reopen_logs),
-                    Asked::Reclaim => Lifecycle::call(reclaim),
+                    Asked::ReopenLogs => Lifecycle::call(reopen_logs, "on_reopen_logs"),
+                    Asked::Reclaim => Lifecycle::call(reclaim, "on_reclaim"),
                 },
                 () = lifeline.gone() => {
                     eprintln!("muru: the host is gone, stopping");
@@ -267,7 +268,7 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
             .checked_sub(exit_grace)
             .unwrap_or_else(Instant::now)
     };
-    Lifecycle::call(lifecycle.on_drain.as_ref());
+    Lifecycle::call(lifecycle.on_drain.as_ref(), "on_drain");
 
     // Requests already running finish on their threads, or on the event
     // loop, while the runtime still carries their responses. No new one

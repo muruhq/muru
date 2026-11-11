@@ -99,6 +99,16 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
         text = daemon.muructl("logs", "list").stdout
         assert "apps/gone/r9.log" in text and "orphaned" in text and "total " in text
 
+        # --archives names each archive under its log, and a target
+        # narrows the list to its logs.
+
+        # The edge's own log, through the daemon.
+
+        daemon.muructl("logs", "--edge", "--lines", "1")
+
+        text = daemon.muructl("logs", "list", "gone@r9", "--archives").stdout
+        assert "\n  apps/gone/r9.log.20260101-000000 " in text and "access.log" not in text
+
         # A --log-dir that is not the daemon's is refused rather than
         # working on another directory behind its back.
 
@@ -237,6 +247,23 @@ def test_logs_commands_through_a_daemon_and_without_one(tmp_path: Path) -> None:
         assert report["orphans_known"] is True
         assert by_name(report)["apps/gone/r9.log"]["orphaned"] is True
         assert by_name(report)["apps/shop/r1.log"]["orphaned"] is False
+        narrowed = json.loads(direct(daemon, "logs", "list", "shop", "--json").stdout)
+        assert [log["name"] for log in narrowed["logs"]] == ["apps/shop/r1.log"]
+
+        # The edge's own log, from its file.
+
+        with (logs / "edge.log").open("a") as edge_log:
+            edge_log.write("2026-11-10T05:40:12.001Z muru.edge: the last line\n")
+
+        shown = direct(daemon, "logs", "--edge", "--lines", "1", "--no-timestamps").stdout
+        assert shown == "muru.edge: the last line\n"
+
+        # A release's output and the access log, from their files, the
+        # application's current release from the store.
+
+        shown = direct(daemon, "logs", "shop", "--lines", "1", "--json").stdout
+        assert json.loads(shown)["release"] == "r1"
+        assert "time" in json.loads(direct(daemon, "logs", "--access", "--json", "-n", "1").stdout)
 
         answer = json.loads(
             direct(daemon, "logs", "truncate", "--access", "--keep", "0", "--yes", "--json").stdout

@@ -20,11 +20,16 @@ overwrite an attribute the record already has.
 
 from __future__ import annotations
 
+import builtins
 import datetime
+import importlib
 import json
 import logging
 import os
+import re
 import sys
+import traceback
+import warnings
 from collections.abc import Callable
 from typing import Any
 
@@ -131,6 +136,63 @@ def _tagging(factory: Callable[..., logging.LogRecord]) -> Callable[..., logging
     return tagged
 
 
+def _shown(logger: logging.Logger, level: int) -> bool:
+    """Say whether a record at `level` on `logger` would reach a handler that writes it.
+
+    As ``Logger.callHandlers`` decides: the logger must be enabled for the
+    level, and some handler on the way up its hierarchy, other than a
+    ``NullHandler``, must take the level; with no handler at all the
+    last-resort handler does. A filter is not consulted, so a record a
+    filter drops counts as shown.
+    """
+
+    if logger.disabled or not logger.isEnabledFor(level):
+        return False
+
+    current: logging.Logger | None = logger
+    found = False
+
+    while current is not None:
+        for handler in current.handlers:
+            found = True
+
+            if not isinstance(handler, logging.NullHandler) and level >= handler.level:
+                return True
+
+        if not current.propagate:
+            break
+
+        current = current.parent
+
+    resort = logging.lastResort
+    return not found and resort is not None and level >= resort.level
+
+
+def _report(error: BaseException, message: str) -> None:
+    """Report an exception the application or a hook did not catch.
+
+    It is logged on the ``muru`` logger at ERROR with its traceback, so it
+    reaches the application's own handlers when it has configured some,
+    Muru's format when it has not, and carries the request's id. When the
+    application's configuration would show nothing at ERROR there (the
+    logger disabled by a ``dictConfig``, a level above ERROR, or only
+    handlers that take no ERROR), the traceback is written to standard
+    error instead, so it is never lost to a logging setting.
+    """
+
+    logger = logging.getLogger("muru")
+
+    if _shown(logger, logging.ERROR):
+        logger.error(message, exc_info=(type(error), error, error.__traceback__))
+        return
+
+    try:
+        sys.stderr.write(f"muru: {message}\n" + "".join(traceback.format_exception(error)))
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
+
 def default_config() -> dict[str, Any]:
     """Return the platform defaults as a ``logging.config.dictConfig`` dictionary.
 
@@ -162,11 +224,71 @@ def default_config() -> dict[str, Any]:
     }
 
 
+_installed: dict[str, int] = {}
+"""The levels `_install` set, by logger name, the root's under "", so a
+later look can tell Muru's defaults from what changed them since."""
+
+_refused_filters: list[str] = []
+"""The warnings filters `_install` could not apply, each with why."""
+
+
+def _filter_warnings(filters: list[str]) -> None:
+    """Apply warnings filters in the syntax of Python's -W option, in order.
+
+    Each is ``action:message:category:module:lineno``, read as -W reads
+    it: the message and module match literally, from the start, and a
+    later filter takes precedence. A filter whose category cannot be
+    imported is not applied and is noted in ``_refused_filters``; the
+    rest of its syntax was checked when the configuration was read.
+    """
+
+    actions = ("default", "always", "all", "ignore", "module", "once", "error")
+
+    for text in filters:
+        fields = [field.strip() for field in text.split(":")]
+        action, message, category_name, module, lineno = (fields + [""] * 5)[:5]
+        action = next((known for known in actions if known.startswith(action)), "default")
+        action = "always" if action == "all" else action
+
+        try:
+            category = _warning_category(category_name)
+        except (ImportError, AttributeError, TypeError) as error:
+            _refused_filters.append(f"{text!r} ({error})")
+            continue
+
+        warnings.filterwarnings(
+            action,  # type: ignore[arg-type]
+            re.escape(message),
+            category,
+            re.escape(module) + r"\Z" if module else "",
+            int(lineno or 0),
+        )
+
+
+def _warning_category(name: str) -> type[Warning]:
+    """Return the warning category a filter names: a builtin or a dotted path."""
+
+    if not name:
+        return Warning
+
+    if "." in name:
+        module, _, attribute = name.rpartition(".")
+        found = getattr(importlib.import_module(module), attribute)
+    else:
+        found = getattr(builtins, name)
+
+    if not (isinstance(found, type) and issubclass(found, Warning)):
+        raise TypeError(f"{name} is not a Warning subclass")
+
+    return found
+
+
 def _install(
     level: str | None,
     format: str | None,
     capture_warnings: bool,
     loggers: dict[str, str],
+    warnings_filters: list[str] | None = None,
 ) -> None:
     """Apply the release's logging settings before the application is imported.
 
@@ -188,9 +310,13 @@ def _install(
 
     if level:
         logging.getLogger().setLevel(level)
+        _installed[""] = logging.getLogger().level
 
     for name, named_level in loggers.items():
         logging.getLogger(name).setLevel(named_level)
+        _installed[name] = logging.getLogger(name).level
+
+    _filter_warnings(warnings_filters or [])
 
     if capture_warnings:
         logging.captureWarnings(True)

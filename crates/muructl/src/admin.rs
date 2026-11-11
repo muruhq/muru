@@ -417,7 +417,8 @@ pub enum DaemonCommand {
         files: DaemonFileArgs,
     },
 
-    /// Show the daemon's status.
+    /// Show the daemon's status, or where its files would be when none
+    /// is running, exiting 3 then.
     Status {
         #[command(flatten)]
         socket: SocketArgs,
@@ -525,12 +526,9 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         ("logs", &locations.logs),
         ("cache", &locations.cache),
     ] {
-        println!(
-            "muru: {name}: {} ({})",
-            location.path.display(),
-            location.rule
-        );
+        muru_common::muru_println!("{name}: {} ({})", location.path.display(), location.rule);
     }
+
     muru_controller::daemon::run(muru_controller::daemon::Config {
         locations,
         settings,
@@ -539,8 +537,19 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         executable: std::env::current_exe().context("finding the muructl executable")?,
         upgrade_arguments: upgrade_arguments(),
         upgraded_from: args.upgraded_from.clone(),
+        rename_check: rename_check(),
     })
     .await
+}
+
+/// How often the daemon checks for a renamed log file: every five
+/// seconds, or as `MURU_RENAME_CHECK_MS` says, which the tests set so
+/// that they need not wait.
+fn rename_check() -> Duration {
+    std::env::var("MURU_RENAME_CHECK_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map_or(muru_controller::daemon::RENAME_CHECK, Duration::from_millis)
 }
 
 /// Start the daemon in the background: a detached `muructl daemon run`
@@ -606,7 +615,13 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         });
     }
 
-    command.spawn().context("starting the daemon")?;
+    // Where this daemon's lines start in the log, which it appends to.
+
+    let written_before = std::fs::metadata(locations.daemon_log()).map_or(0, |found| found.len());
+    let mut child = command.spawn().context("starting the daemon")?;
+
+    // Until it answers, a daemon that has exited is reported at once,
+    // with what it wrote, rather than waited for.
 
     let started = Instant::now();
 
@@ -623,6 +638,14 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
             );
             return Ok(());
         }
+
+        if let Some(exited) = child.try_wait().context("waiting for the daemon")? {
+            anyhow::bail!(
+                "the daemon exited before it answered ({exited}); {}",
+                daemon_log_since(&locations.daemon_log(), written_before)
+            );
+        }
+
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -631,6 +654,42 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         locations.daemon_log().display()
     )
 }
+
+/// The lines a daemon wrote to its log from `offset` on, the last
+/// `DAEMON_LOG_LINES` of them, as the end of a message about it.
+fn daemon_log_since(path: &Path, offset: u64) -> String {
+    use std::io::{Read as _, Seek as _};
+
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path).and_then(|mut file| {
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.read_to_end(&mut bytes)
+    });
+
+    let written = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = written.lines().collect();
+
+    if read.is_err() || lines.is_empty() {
+        return format!("see {}", path.display());
+    }
+
+    let last: Vec<String> = lines[lines.len().saturating_sub(DAEMON_LOG_LINES)..]
+        .iter()
+        .map(|line| {
+            if line.is_empty() {
+                String::new()
+            } else {
+                format!("  {line}")
+            }
+        })
+        .collect();
+
+    format!("from {}:\n{}", path.display(), last.join("\n"))
+}
+
+/// How many of a daemon's last lines `daemon start` shows when it exits
+/// before answering.
+const DAEMON_LOG_LINES: usize = 20;
 
 /// How long one exchange with a daemon that is being stopped may take
 /// before it counts as not answering.
@@ -835,6 +894,13 @@ pub enum DebugCommand {
     /// masked either way.
     Inspect(InspectArgs),
 
+    /// The logging and warnings setup each worker has in force: its
+    /// loggers with their levels, effective levels, handlers and where
+    /// each level came from, the logging module's switches, and the
+    /// warnings filters. Only the loggers with something set unless
+    /// --all is given. Reads only.
+    Logging(LoggingSetupArgs),
+
     /// Sample every thread's stack for a period, merged across the
     /// workers, as collapsed stacks for a flame graph or as pstats; with
     /// --requests or --path, only the requests chosen.
@@ -891,6 +957,18 @@ pub struct InspectArgs {
     /// release's.
     #[arg(long)]
     env: bool,
+}
+
+/// `muructl debug logging`.
+#[derive(Args)]
+pub struct LoggingSetupArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// List every logger that exists, not only those with a level, a
+    /// handler or a flag of their own.
+    #[arg(long)]
+    all: bool,
 }
 
 /// `muructl debug attach`.
@@ -1022,7 +1100,9 @@ pub struct ExecArgs {
 /// The logging subcommands (section 11.4).
 #[derive(Subcommand)]
 pub enum LoggingCommand {
-    /// Set loggers' levels in a release's workers, for a period or until reset.
+    /// Set loggers' levels in a release's workers, for a period or until
+    /// reset; with no level and no --reset, list the levels changed this
+    /// way in each worker and until when.
     Level {
         /// The release as app@release, or an application for its current
         /// release; the one application of `muructl run` or `muructl
@@ -1032,7 +1112,7 @@ pub enum LoggingCommand {
 
         /// A logger and its level as NAME=LEVEL (root with an empty name,
         /// as =DEBUG). Repeatable.
-        #[arg(value_name = "NAME=LEVEL", required_unless_present_any = ["reset", "target"])]
+        #[arg(value_name = "NAME=LEVEL")]
         levels: Vec<String>,
 
         /// Revert on its own after this long, for example 10m.
@@ -1123,6 +1203,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
             &inspect.common,
             serde_json::json!({"env": inspect.env}),
         ),
+        DebugCommand::Logging(setup) => ("logging_setup", &setup.common, serde_json::json!({})),
         DebugCommand::Profile(profile) => (
             "profile",
             &profile.common,
@@ -1189,6 +1270,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::Stacks(_) => print_stacks(&response),
         DebugCommand::Tasks(_) => print_tasks(&response),
         DebugCommand::Inspect(_) => print_inspect(&response),
+        DebugCommand::Logging(setup) => print_logging_setup(&response, setup.all),
         DebugCommand::Profile(profile) => write_profile(&response, profile)?,
         DebugCommand::Trace(_) => print_trace(&response),
         DebugCommand::Memory(_) => print_memory(&response),
@@ -1660,10 +1742,63 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
         target => target.unwrap_or_default(),
     };
 
-    anyhow::ensure!(
-        reset || !levels.is_empty(),
-        "give a logger and its level as NAME=LEVEL, or --reset"
-    );
+    // No level and no reset: what each worker has changed, and until when.
+
+    if !reset && levels.is_empty() {
+        anyhow::ensure!(
+            duration.is_none(),
+            "--for needs a logger and its level as NAME=LEVEL"
+        );
+
+        let response = ask(
+            &socket,
+            &target,
+            "logging",
+            worker,
+            serde_json::json!({"list": true}),
+        )
+        .await?;
+
+        if output.json {
+            return print_answer(&[debug_json(&response)]);
+        }
+
+        for answer in &response.workers {
+            let Some(result) = parse_result(answer) else {
+                println!(
+                    "worker {} (pid {}): {}",
+                    answer.index, answer.pid, answer.error
+                );
+                continue;
+            };
+
+            let changed = result["changed"].as_array().cloned().unwrap_or_default();
+
+            if changed.is_empty() {
+                println!(
+                    "worker {} (pid {}): no levels changed",
+                    answer.index, answer.pid
+                );
+            }
+
+            for entry in &changed {
+                let until = entry["until_unix_ms"].as_u64().map_or_else(
+                    || "until reset".to_owned(),
+                    |ms| format!("until {}", format_time(ms)),
+                );
+                println!(
+                    "worker {} (pid {}): {} {} (was {}), {until}",
+                    answer.index,
+                    answer.pid,
+                    entry["logger"].as_str().unwrap_or("root"),
+                    entry["level"].as_str().unwrap_or("?"),
+                    entry["previous"].as_str().unwrap_or("?"),
+                );
+            }
+        }
+
+        return Ok(());
+    }
 
     if reset {
         let response = ask(
@@ -2109,6 +2244,168 @@ fn print_tasks(response: &pb::DebugResponse) {
         }
 
         println!();
+    }
+}
+
+/// The logging setup as `debug logging` prints it. Workers that answer
+/// the same are shown once, with the others named as matching; when they
+/// differ, each is shown.
+fn print_logging_setup(response: &pb::DebugResponse, all: bool) {
+    let mut shown: Vec<(serde_json::Value, Vec<String>)> = Vec::new();
+
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            println!(
+                "worker {} (pid {}): {}",
+                answer.index, answer.pid, answer.error
+            );
+            continue;
+        };
+
+        let who = format!("worker {} (pid {})", answer.index, answer.pid);
+
+        match shown.iter_mut().find(|(setup, _)| *setup == result) {
+            Some((_, workers)) => workers.push(who),
+            None => shown.push((result, vec![who])),
+        }
+    }
+
+    if shown.len() > 1 {
+        println!("the workers differ: each setup is shown with the workers that have it");
+    }
+
+    for (setup, workers) in &shown {
+        match workers.as_slice() {
+            [one] => println!("{one}:"),
+            [first, rest @ ..] => println!("{first}, the same in {}:", rest.join(", ")),
+            [] => continue,
+        }
+
+        print_one_logging_setup(setup, all);
+    }
+}
+
+/// Where a logger's level came from, as `debug logging` says it.
+fn level_from(origin: &serde_json::Value) -> &'static str {
+    match origin.as_str() {
+        Some("muru") => " (Muru's defaults)",
+        Some("temporary") => " (muructl logging level)",
+        Some("changed since") => " (changed since Muru set it)",
+        Some("application") => " (set by the application or a library)",
+        Some("python") => " (Python's default)",
+        _ => "",
+    }
+}
+
+/// A handler as one line of `debug logging`.
+fn handler_line(handler: &serde_json::Value) -> String {
+    let mut line = format!(
+        "{}, level {}",
+        handler["class"].as_str().unwrap_or("?"),
+        handler["level"].as_str().unwrap_or("?")
+    );
+
+    if let Some(destination) = handler["destination"].as_str() {
+        line.push_str(&format!(", to {destination}"));
+    }
+
+    if let Some(format) = handler["format"].as_str() {
+        line.push_str(&format!(", format {format:?}"));
+    }
+
+    let filters: Vec<&str> = handler["filters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+
+    if !filters.is_empty() {
+        line.push_str(&format!(", filters {}", filters.join(", ")));
+    }
+
+    line
+}
+
+fn print_one_logging_setup(setup: &serde_json::Value, all: bool) {
+    println!(
+        "  logging.disable {}, warnings captured {}",
+        setup["disable"].as_str().unwrap_or("off"),
+        if setup["capture_warnings"].as_bool() == Some(true) {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+
+    if setup["last_resort"].is_object() {
+        println!("  last resort: {}", handler_line(&setup["last_resort"]));
+    }
+
+    println!("  loggers:");
+    let mut hidden = 0;
+
+    for logger in setup["loggers"].as_array().into_iter().flatten() {
+        let name = logger["name"].as_str().unwrap_or("?");
+        let level = logger["level"].as_str().unwrap_or("NOTSET");
+        let handlers = logger["handlers"].as_array().cloned().unwrap_or_default();
+        let propagates = logger["propagate"].as_bool() != Some(false);
+        let disabled = logger["disabled"].as_bool() == Some(true);
+        let interesting =
+            name == "root" || level != "NOTSET" || !handlers.is_empty() || !propagates || disabled;
+
+        if !all && !interesting {
+            hidden += 1;
+            continue;
+        }
+
+        let mut line = format!(
+            "    {name}: level {level}{}, effective {}",
+            level_from(&logger["level_from"]),
+            logger["effective"].as_str().unwrap_or("?")
+        );
+
+        if !propagates {
+            line.push_str(", does not propagate");
+        }
+
+        if disabled {
+            line.push_str(", disabled");
+        }
+
+        println!("{line}");
+
+        for handler in &handlers {
+            println!("      handler {}", handler_line(handler));
+        }
+    }
+
+    if hidden > 0 {
+        println!(
+            "    and {} with nothing of their own (--all lists them)",
+            counted(hidden, "logger", "loggers")
+        );
+    }
+
+    let filters = setup["warnings_filters"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    println!("  warnings filters, the first matching wins:");
+
+    if filters.is_empty() {
+        println!("    none");
+    }
+
+    for filter in &filters {
+        println!(
+            "    {}:{}:{}:{}:{}",
+            filter["action"].as_str().unwrap_or("?"),
+            filter["message"].as_str().unwrap_or(""),
+            filter["category"].as_str().unwrap_or(""),
+            filter["module"].as_str().unwrap_or(""),
+            filter["lineno"].as_u64().unwrap_or(0)
+        );
     }
 }
 
@@ -2587,9 +2884,51 @@ pub async fn daemon_reload(socket: SocketArgs, json: bool) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Show the daemon's status.
-pub async fn daemon_status(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+/// The exit status of `muructl daemon status` when no daemon is
+/// running, as for an init script's status.
+const NOT_RUNNING: i32 = 3;
+
+/// Show the daemon's status, exiting 3 when none is running. With none
+/// running and no socket named, it says where a daemon started with the
+/// same options and environment would keep its files.
+pub async fn daemon_status(
+    socket: SocketArgs,
+    files: DaemonFileArgs,
+    json: bool,
+) -> anyhow::Result<i32> {
+    let path = socket.socket()?;
+    let locations = daemon_locations(&socket, &files);
+
+    if path == locations.admin_socket() && no_daemon(&socket, &path) {
+        let status = pb::Status {
+            kind: "stopped".to_owned(),
+            socket: path.display().to_string(),
+            config: locations.config.path.display().to_string(),
+            state_dir: locations.state.path.display().to_string(),
+            run_dir: locations.run.path.display().to_string(),
+            log_dir: locations.logs.path.display().to_string(),
+            cache_dir: locations.cache.path.display().to_string(),
+            ..pb::Status::default()
+        };
+
+        if json {
+            print_answer(&status)?;
+        } else {
+            println!("daemon   not running");
+            print_daemon_files(&status);
+        }
+
+        return Ok(NOT_RUNNING);
+    }
+
+    show_status(&path, json).await?;
+    Ok(0)
+}
+
+/// Show the status of what answers at an admin socket: a daemon or a
+/// development run.
+pub async fn show_status(path: &Path, json: bool) -> anyhow::Result<()> {
+    let mut client = client::connect(path).await?;
     let status = client
         .get_status(pb::GetStatusRequest {})
         .await?
@@ -2622,7 +2961,6 @@ pub async fn daemon_status(socket: SocketArgs, json: bool) -> anyhow::Result<()>
     println!("daemon   pid {} version {}", status.pid, status.version);
     println!("edge     pid {}", status.edge_pid);
     println!("serving  {}", status.listeners.join(", "));
-    println!("socket   {}", status.socket);
 
     if !status.metrics.is_empty() {
         println!("metrics  http://{}/metrics", status.metrics);
@@ -2632,8 +2970,7 @@ pub async fn daemon_status(socket: SocketArgs, json: bool) -> anyhow::Result<()>
         println!("dashboard http://{}/", status.dashboard);
     }
 
-    println!("state    {}", status.state_dir);
-    println!("run      {}", status.run_dir);
+    print_daemon_files(&status);
     println!(
         "apps     {} ({} releases)",
         status.app_count, status.release_count
@@ -2652,6 +2989,17 @@ pub async fn daemon_status(socket: SocketArgs, json: bool) -> anyhow::Result<()>
     }
 
     Ok(())
+}
+
+/// The daemon's socket, configuration file and directories, as `daemon
+/// status` prints them.
+fn print_daemon_files(status: &pb::Status) {
+    println!("socket   {}", status.socket);
+    println!("config   {}", status.config);
+    println!("state    {}", status.state_dir);
+    println!("run      {}", status.run_dir);
+    println!("logs     {}", status.log_dir);
+    println!("cache    {}", status.cache_dir);
 }
 
 /// Make sure a daemon runs: start one when none answers.
@@ -7220,8 +7568,9 @@ async fn relay(
     }
 }
 
-/// What `muructl logs` takes: a release's output, or the access log,
-/// shown or followed; or `logs reopen` after an external rotation.
+/// What `muructl logs` takes: a release's output, the access log, or
+/// the edge's or the daemon's own log, shown or followed; or a
+/// subcommand on the log files.
 #[derive(Args, Clone)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct LogsArgs {
@@ -7230,8 +7579,9 @@ pub struct LogsArgs {
 
     /// The application, or app@release; the current release when only
     /// the application is named. A development run's application when
-    /// left out; the daemon needs it, unless --access is given.
-    #[arg(value_name = "APP[@RELEASE]")]
+    /// left out; the daemon needs it, unless --access, --edge or
+    /// --daemon is given.
+    #[arg(value_name = "APP[@RELEASE]", conflicts_with_all = ["edge", "daemon"])]
     target: Option<String>,
 
     /// Keep printing lines as they are written.
@@ -7243,8 +7593,17 @@ pub struct LogsArgs {
     lines: u32,
 
     /// The access log the edge writes, instead of a release's output.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["edge", "daemon"])]
     access: bool,
+
+    /// The daemon's edge process's own output, edge.log.
+    #[arg(long, conflicts_with = "daemon")]
+    edge: bool,
+
+    /// The daemon's own output, daemon.log, which a daemon started with
+    /// muructl daemon start writes.
+    #[arg(long)]
+    daemon: bool,
 
     /// With --access, the records of one virtual host: from the file it
     /// names for them, or else those in the access log that name it.
@@ -7262,6 +7621,11 @@ pub struct LogsArgs {
 
     #[command(flatten)]
     socket: SocketArgs,
+
+    /// With no daemon running, where its log directory and state are:
+    /// the files are read from there.
+    #[command(flatten)]
+    files: DaemonFileArgs,
 }
 
 /// Which logs a command on the log files acts on.
@@ -7430,80 +7794,110 @@ pub enum LogsCommand {
 
     /// List each log with its size, its archives and the total, and flag
     /// logs whose release or host no longer exists.
-    List {
-        #[command(flatten)]
-        socket: SocketArgs,
-
-        /// With no daemon running, where its log directory and state are.
-        #[command(flatten)]
-        files: DaemonFileArgs,
-
-        #[command(flatten)]
-        output: JsonArgs,
-    },
+    List(Box<LogsListArgs>),
 }
 
-/// Show or follow a release's output or the access log.
-pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
-    let (app, release) = match &args.target {
-        Some(target) if target.contains('@') => {
-            let (app, release) = split_release(target)?;
-            (app.to_owned(), release.to_owned())
+/// What `muructl logs list` takes.
+#[derive(Args, Clone)]
+pub struct LogsListArgs {
+    /// Only the logs of this application's releases, or of one release
+    /// as app@release.
+    #[arg(value_name = "APP[@RELEASE]", conflicts_with_all = ["access", "host"])]
+    target: Option<String>,
+
+    /// Only the access log.
+    #[arg(long, conflicts_with = "host")]
+    access: bool,
+
+    /// Only the file a virtual host names for its records.
+    #[arg(long, value_name = "HOST")]
+    host: Option<String>,
+
+    /// List each archive under its log, oldest first, with its size and
+    /// when it was last written.
+    #[arg(long)]
+    archives: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    /// With no daemon running, where its log directory and state are.
+    #[command(flatten)]
+    files: DaemonFileArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+impl LogsListArgs {
+    /// Whether the arguments name a log: every log when they name none.
+    fn names(&self, log: &pb::LogInfo) -> bool {
+        if let Some(target) = &self.target {
+            let (app, release) = target.split_once('@').unwrap_or((target, ""));
+
+            return log.kind == "release"
+                && log.app == app
+                && (release.is_empty() || log.release == release);
         }
-        Some(app) => (app.clone(), String::new()),
-        None => (String::new(), String::new()),
-    };
 
-    let mut client = client::connect(&args.socket.socket()?).await?;
-
-    // Section 11.2: a virtual host's records are in the file it names
-    // for them, or else among the access log's, where each JSON record
-    // names its virtual host.
-
-    let mut own_file = false;
-
-    if let Some(name) = &args.host {
-        let hosts = client
-            .list_hosts(pb::ListHostsRequest {})
-            .await
-            .map_err(explain)?
-            .into_inner()
-            .hosts;
-        let host = hosts
-            .iter()
-            .find(|host| host.name == *name)
-            .ok_or_else(|| anyhow::anyhow!("no virtual host named {name}"))?;
-        own_file = !host.access_log_file.is_empty();
-
-        if !own_file && host.access_log_format == "combined" {
-            anyhow::bail!(
-                "host {name} writes its records to access.log in the combined format, which \
-                 does not name the host; give the host an access_log_file to keep them apart"
-            );
+        if let Some(host) = &self.host {
+            return log.hosts.contains(host);
         }
+
+        !self.access || log.kind == "access"
     }
 
-    let named = args.host.as_deref().filter(|_| !own_file);
-    let mut stream = client
-        .tail_logs(pb::TailLogsRequest {
-            app,
-            release,
-            follow: args.follow,
-            lines: args.lines,
-            access: args.access,
-            host: args.host.clone().filter(|_| own_file).unwrap_or_default(),
-        })
-        .await
-        .map_err(explain)?
-        .into_inner();
+    /// Keep only the logs the arguments name, with the total of those
+    /// alone. Naming a log that is not there is refused.
+    fn narrow(&self, report: &mut pb::ListLogsResponse) -> anyhow::Result<()> {
+        let missing = match (&self.target, &self.host) {
+            (Some(target), _) => {
+                if target.contains('@') {
+                    split_release(target)?;
+                }
 
-    // Access log records are kept as JSON lines already; a release's
-    // output becomes JSON lines of the admin API's log lines.
+                format!("no log for {target}")
+            }
+            (None, Some(host)) => format!(
+                "no log file for virtual host {host}: its records are in access.log unless it \
+                 names an access_log_file"
+            ),
+            (None, None) if self.access => "there is no access log".to_owned(),
+            (None, None) => return Ok(()),
+        };
 
-    while let Some(line) = stream.next().await {
-        let line = line.map_err(explain)?;
+        report.logs.retain(|log| self.names(log));
 
-        if let Some(name) = named {
+        if report.logs.is_empty() {
+            anyhow::bail!("{missing}, in {}", report.directory);
+        }
+
+        report.total = report.logs.iter().map(|log| log.total).sum();
+        Ok(())
+    }
+}
+
+/// The lines `muructl logs` prints, from the daemon or from a file.
+type LogLines = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = anyhow::Result<pb::LogLine>>>>;
+
+/// Show or follow a release's output, the access log, or the edge's or
+/// the daemon's own log: through whatever answers at the admin socket,
+/// else, with no daemon running, from the file in the log directory.
+pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
+    let (mut lines, named) = if args.edge || args.daemon {
+        (own_log_lines(&args).await?, None)
+    } else {
+        log_lines(&args).await?
+    };
+
+    // Access log records are kept as JSON lines already; any other line
+    // becomes a JSON line of the admin API's log line. `named` is a host
+    // whose records are picked out of access.log by its name.
+
+    while let Some(line) = lines.next().await {
+        let line = line?;
+
+        if let Some(name) = &named {
             let of_host = serde_json::from_str::<serde_json::Value>(&line.line)
                 .ok()
                 .and_then(|record| Some(record.get("virtual_host")?.as_str()? == name))
@@ -7528,6 +7922,220 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether a virtual host's records are in a file of its own, which it
+/// names, rather than among access.log's. A host whose records go to
+/// access.log in the combined format cannot be picked out of it.
+fn host_has_own_file(name: &str, access_log_file: &str, format: &str) -> anyhow::Result<bool> {
+    let own_file = !access_log_file.is_empty();
+
+    if !own_file && format == "combined" {
+        anyhow::bail!(
+            "host {name} writes its records to access.log in the combined format, which does \
+             not name the host; give the host an access_log_file to keep them apart"
+        );
+    }
+
+    Ok(own_file)
+}
+
+/// A release's output or the access log, with the host whose records are
+/// to be picked out of it. With no daemon listening and no socket named,
+/// they come from the files.
+async fn log_lines(args: &LogsArgs) -> anyhow::Result<(LogLines, Option<String>)> {
+    let path = args.socket.socket()?;
+    let locations = daemon_locations(&args.socket, &args.files);
+
+    if path == locations.admin_socket() && no_daemon(&args.socket, &path) {
+        return file_log_lines(args, &locations);
+    }
+
+    let (app, release) = match &args.target {
+        Some(target) if target.contains('@') => {
+            let (app, release) = split_release(target)?;
+            (app.to_owned(), release.to_owned())
+        }
+        Some(app) => (app.clone(), String::new()),
+        None => (String::new(), String::new()),
+    };
+
+    let mut client = client::connect(&path).await?;
+
+    // Section 11.2: a virtual host's records are in the file it names
+    // for them, or else among the access log's, where each JSON record
+    // names its virtual host.
+
+    let mut own_file = false;
+
+    if let Some(name) = &args.host {
+        let hosts = client
+            .list_hosts(pb::ListHostsRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner()
+            .hosts;
+        let host = hosts
+            .iter()
+            .find(|host| host.name == *name)
+            .ok_or_else(|| anyhow::anyhow!("no virtual host named {name}"))?;
+        own_file = host_has_own_file(name, &host.access_log_file, &host.access_log_format)?;
+    }
+
+    let stream = client
+        .tail_logs(pb::TailLogsRequest {
+            app,
+            release,
+            follow: args.follow,
+            lines: args.lines,
+            access: args.access,
+            host: args.host.clone().filter(|_| own_file).unwrap_or_default(),
+            ..pb::TailLogsRequest::default()
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    let named = args.host.clone().filter(|_| !own_file);
+    Ok((Box::pin(stream.map(|line| line.map_err(explain))), named))
+}
+
+/// A release's output or the access log read from its file, with no
+/// daemon running. A release named in full and the access log need only
+/// the log directory; an application's current release and a virtual
+/// host's file are found in the state store, opened read-only.
+fn file_log_lines(
+    args: &LogsArgs,
+    locations: &Locations,
+) -> anyhow::Result<(LogLines, Option<String>)> {
+    let store = |needed_for: &str| -> anyhow::Result<muru_controller::store::Store> {
+        let path = locations.state_store();
+
+        if !path.is_file() {
+            anyhow::bail!(
+                "no daemon is running, and {needed_for} needs its state store, which is not at \
+                 {}; name it with --state-dir",
+                path.display()
+            );
+        }
+
+        muru_controller::store::Store::open_read_only(&path)
+            .with_context(|| format!("opening {}", path.display()))
+    };
+
+    let (app, release, path, named) = if args.access {
+        match &args.host {
+            None => (String::new(), String::new(), locations.access_log(), None),
+            Some(name) => {
+                let hosts = store("finding a virtual host's records")?
+                    .hosts()
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let (_, host) = hosts
+                    .iter()
+                    .find(|(host, _)| host == name)
+                    .ok_or_else(|| anyhow::anyhow!("no virtual host named {name}"))?;
+                let file = host.access_log_file.clone().unwrap_or_default();
+                let format = host.access_log_format.clone().unwrap_or_default();
+
+                if host_has_own_file(name, &file, &format)? {
+                    (
+                        String::new(),
+                        String::new(),
+                        locations.logs.path.join(file),
+                        None,
+                    )
+                } else {
+                    (
+                        String::new(),
+                        String::new(),
+                        locations.access_log(),
+                        Some(name.clone()),
+                    )
+                }
+            }
+        }
+    } else {
+        let Some(target) = &args.target else {
+            anyhow::bail!("name an application, or give --access, --edge or --daemon");
+        };
+
+        let (app, release) = match target.split_once('@') {
+            Some(_) => {
+                let (app, release) = split_release(target)?;
+                (app.to_owned(), release.to_owned())
+            }
+            None => {
+                let found = store("finding an application's current release")?
+                    .app(target)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let current = found
+                    .current
+                    .ok_or_else(|| anyhow::anyhow!("{target} has no current release"))?;
+                (target.clone(), current)
+            }
+        };
+
+        let path = locations.release_log(&app, &release);
+        (app, release, path, None)
+    };
+
+    if !args.follow && !path.exists() {
+        anyhow::bail!(muru_controller::logs::missing(&path));
+    }
+
+    let lines = muru_controller::logs::tail(path, args.lines as usize, args.follow);
+    let stream = lines.map(move |line| {
+        Ok(pb::LogLine {
+            app: app.clone(),
+            release: release.clone(),
+            line,
+        })
+    });
+
+    Ok((Box::pin(stream), named))
+}
+
+/// The edge's or the daemon's own log: through the daemon when one is
+/// running, else from the file in the log directory, which is where a
+/// daemon that failed to start says why.
+async fn own_log_lines(args: &LogsArgs) -> anyhow::Result<LogLines> {
+    match logs_way(&args.socket, &args.files).await? {
+        LogsWay::Daemon(mut client) => {
+            let stream = client
+                .tail_logs(pb::TailLogsRequest {
+                    follow: args.follow,
+                    lines: args.lines,
+                    edge: args.edge,
+                    daemon: args.daemon,
+                    ..pb::TailLogsRequest::default()
+                })
+                .await
+                .map_err(explain)?
+                .into_inner();
+
+            Ok(Box::pin(stream.map(|line| line.map_err(explain))))
+        }
+        LogsWay::Files(directory) => {
+            let path = if args.edge {
+                directory.locations.edge_log()
+            } else {
+                directory.locations.daemon_log()
+            };
+
+            if !args.follow && !path.exists() {
+                anyhow::bail!(muru_controller::logs::missing(&path));
+            }
+
+            let lines = muru_controller::logs::tail(path, args.lines as usize, args.follow);
+
+            Ok(Box::pin(lines.map(|line| {
+                Ok(pb::LogLine {
+                    line,
+                    ..pb::LogLine::default()
+                })
+            })))
+        }
+    }
+}
+
 /// Reopen every log file after an external rotation.
 pub async fn logs_reopen(workers: bool, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
@@ -7539,6 +8147,14 @@ pub async fn logs_reopen(workers: bool, socket: SocketArgs, json: bool) -> anyho
 
     if json {
         return print_answer(&reopened);
+    }
+
+    // With no host to reopen, as a development run or a daemon with no
+    // release running, the edge alone is named.
+
+    if reopened.edge && reopened.hosts == 0 {
+        println!("muru: reopened the log files: the edge");
+        return Ok(());
     }
 
     println!(
@@ -7644,12 +8260,8 @@ async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result
 }
 
 /// List the log files and what they take.
-pub async fn logs_list(
-    socket: SocketArgs,
-    files: DaemonFileArgs,
-    json: bool,
-) -> anyhow::Result<()> {
-    let report = match logs_way(&socket, &files).await? {
+pub async fn logs_list(args: LogsListArgs) -> anyhow::Result<()> {
+    let mut report = match logs_way(&args.socket, &args.files).await? {
         LogsWay::Daemon(mut client) => client
             .list_logs(pb::ListLogsRequest {})
             .await
@@ -7662,7 +8274,9 @@ pub async fn logs_list(
         .with_context(|| format!("reading {}", directory.locations.logs.path.display()))?,
     };
 
-    if json {
+    args.narrow(&mut report)?;
+
+    if args.output.json {
         return print_answer(&report);
     }
 
@@ -7671,6 +8285,31 @@ pub async fn logs_list(
         return Ok(());
     }
 
+    if args.archives {
+        print_archives(&report);
+    } else {
+        print_logs(&report);
+    }
+
+    println!(
+        "total {}, in {}",
+        human_size(report.total),
+        report.directory
+    );
+
+    if !report.orphans_known {
+        println!(
+            "no state store was found, so logs of releases and hosts that no longer exist \
+             are not flagged"
+        );
+    }
+
+    Ok(())
+}
+
+/// The logs as a table: each with its size, how many archives it has
+/// and what they take, and the total.
+fn print_logs(report: &pb::ListLogsResponse) {
     println!(
         "{:<40} {:>9} {:>18} {:>9}",
         "LOG", "SIZE", "ARCHIVES", "TOTAL"
@@ -7696,21 +8335,51 @@ pub async fn logs_list(
             if log.orphaned { "  orphaned" } else { "" }
         );
     }
+}
+
+/// The logs as a table with each archive on a line of its own under its
+/// log, oldest first: every file with its size and when it was last
+/// written, and each log with its total.
+fn print_archives(report: &pb::ListLogsResponse) {
+    let width = report
+        .logs
+        .iter()
+        .flat_map(|log| {
+            std::iter::once(log.name.len())
+                .chain(log.archives.iter().map(|archive| archive.name.len() + 2))
+        })
+        .max()
+        .unwrap_or(0)
+        .max(40);
 
     println!(
-        "total {}, in {}",
-        human_size(report.total),
-        report.directory
+        "{:<width$} {:>9}  {:<20} {:>9}",
+        "LOG", "SIZE", "MODIFIED", "TOTAL"
     );
 
-    if !report.orphans_known {
-        println!(
-            "no state store was found, so logs of releases and hosts that no longer exist \
-             are not flagged"
-        );
-    }
+    for log in &report.logs {
+        let (size, modified) = if log.present {
+            (human_size(log.size), format_time(log.modified_unix_ms))
+        } else {
+            ("-".to_owned(), "-".to_owned())
+        };
 
-    Ok(())
+        println!(
+            "{:<width$} {size:>9}  {modified:<20} {:>9}{}",
+            log.name,
+            human_size(log.total),
+            if log.orphaned { "  orphaned" } else { "" }
+        );
+
+        for archive in &log.archives {
+            println!(
+                "{:<width$} {:>9}  {}",
+                format!("  {}", archive.name),
+                human_size(archive.size),
+                format_time(archive.modified_unix_ms)
+            );
+        }
+    }
 }
 
 /// Ask a yes or no question on the terminal, on standard error so that
@@ -9063,5 +9732,83 @@ up 1 1700000000000
             ..applied
         };
         assert_eq!(super::exit_code(&refused, false), 1);
+    }
+}
+
+#[cfg(test)]
+mod logs_list_tests {
+    use clap::Parser;
+
+    use super::{LogsListArgs, pb};
+
+    /// The arguments as `muructl logs list` parses them.
+    #[derive(Parser)]
+    struct Command {
+        #[command(flatten)]
+        args: LogsListArgs,
+    }
+
+    fn report() -> pb::ListLogsResponse {
+        let log = |name: &str, kind: &str, app: &str, release: &str, hosts: &[&str]| pb::LogInfo {
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            app: app.to_owned(),
+            release: release.to_owned(),
+            hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+            total: 10,
+            ..pb::LogInfo::default()
+        };
+
+        pb::ListLogsResponse {
+            directory: "/logs".to_owned(),
+            logs: vec![
+                log("access.log", "access", "", "", &[]),
+                log("apps/shop/r1.log", "release", "shop", "r1", &[]),
+                log("apps/shop/r2.log", "release", "shop", "r2", &[]),
+                log("apps/shopfront/r1.log", "release", "shopfront", "r1", &[]),
+                log("intranet.log", "host", "", "", &["intranet"]),
+            ],
+            total: 50,
+            orphans_known: true,
+        }
+    }
+
+    fn narrowed(arguments: &[&str]) -> anyhow::Result<(Vec<String>, u64)> {
+        let command =
+            Command::try_parse_from(std::iter::once("list").chain(arguments.iter().copied()))?;
+        let mut report = report();
+        command.args.narrow(&mut report)?;
+
+        Ok((
+            report.logs.into_iter().map(|log| log.name).collect(),
+            report.total,
+        ))
+    }
+
+    #[test]
+    fn a_target_narrows_the_list_and_its_total() {
+        assert_eq!(narrowed(&[]).unwrap().0.len(), 5);
+        assert_eq!(
+            narrowed(&["shop"]).unwrap(),
+            (
+                vec!["apps/shop/r1.log".to_owned(), "apps/shop/r2.log".to_owned()],
+                20
+            )
+        );
+        assert_eq!(narrowed(&["shop@r2"]).unwrap().0, ["apps/shop/r2.log"]);
+        assert_eq!(narrowed(&["--access"]).unwrap().0, ["access.log"]);
+        assert_eq!(
+            narrowed(&["--host", "intranet"]).unwrap().0,
+            ["intranet.log"]
+        );
+
+        let refused = narrowed(&["shop@r9"]).unwrap_err().to_string();
+        assert_eq!(refused, "no log for shop@r9, in /logs");
+        assert!(narrowed(&["--host", "shop"]).is_err());
+        assert!(narrowed(&["shop@"]).is_err());
+        assert!(
+            narrowed(&["shop", "--access"]).is_err(),
+            "one target at a time"
+        );
     }
 }

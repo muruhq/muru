@@ -19,6 +19,7 @@ from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
+from muru import logging as muru_logging
 from muru._context import _request_id
 
 __all__ = [
@@ -548,8 +549,7 @@ async def _serve(app: ASGIApp, scope: MutableMapping[str, Any], channel: Any) ->
         # timeout, and the traceback shows where it waited.
 
         detail = "".join(traceback.format_exception(error))
-        sys.stderr.write(detail)
-        sys.stderr.flush()
+        muru_logging._report(error, "the application raised an exception")
         channel.fail(detail)
     else:
         channel.finish()

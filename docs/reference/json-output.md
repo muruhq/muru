@@ -52,7 +52,7 @@ $ muructl release show shop@r9 --json
 | Command | Prints |
 | --- | --- |
 | `muructl status` | The daemon's or run's status: `version`, `pid`, `listeners`, `app_count`, `release_count`, `edge_pid`, `no_host` (the applications serving with no hosts declared to choose between them, empty otherwise) and the rest |
-| `muructl daemon status` | The same as `muructl status` |
+| `muructl daemon status` | The same as `muructl status`, with `config`, `state_dir`, `run_dir`, `log_dir`, `cache_dir` and `socket`. With no daemon running, `kind` is `stopped` and those six say where a daemon started with the same options would keep them, the rest being empty or 0, and the command exits with status 3 |
 | `muructl daemon reload` | What was reloaded: `message` |
 | `muructl app list` | `{"apps": [...]}`, each with `name`, `current_release`, `previous_release`, `user`, `maintenance` and the rest |
 | `muructl release list` | `{"releases": [...]}`, each a release as `release show` prints it |
@@ -90,7 +90,7 @@ $ muructl release show shop@r9 --json
 | `muructl mcp skill status` | How the project's copy of the skill compares: `path`, `state` (`current`, `missing`, `out_of_date`, `edited` or `edited_out_of_date`), `edited`, `version` and `installed_version` |
 | `muructl secret list` | `{"store": ..., "keys": [...]}`; values are never shown |
 | `muructl events` | `{"events": [...]}`, each with `sequence`, `time_unix_ms`, `type`, `subject`, `level`, `message`; with `--follow`, one event per line |
-| `muructl logs` | One line per log line: a release's output as `{"app", "release", "line"}`, the access log (`--access`) as the records it keeps |
+| `muructl logs` | One line per log line: a release's output as `{"app", "release", "line"}`, the access log (`--access`) as the records it keeps, the edge's and the daemon's own logs (`--edge`, `--daemon`) as `{"app", "release", "line"}` with `app` and `release` empty |
 | `muructl command list` | `app`, `release` and `commands`, each with `name`, `description`, `run` or `call`, `inputs` (`name`, `description`, `required`, `default`, `pattern`, `secret`), `timeout`, `exclusive` and its `last_run` (`release`, `started_unix_ms`, `duration_ms`, `exit_code`, `ok`, `message`), which only the daemon keeps. `release` is empty for a project's commands listed with nothing serving it |
 | `muructl command run` | As `muructl exec` prints it |
 | `muructl exec` | One object per line of output, with `release`, `line` and `stderr`, then one with `finished` true, the `exit_code`, `ok`, true when the command exited with 0 and was not stopped, and the ending as a `message`. `release` is empty for a command `muructl` runs itself |
@@ -104,16 +104,17 @@ $ muructl release show shop@r9 --json
 | `muructl logs prune` | `freed` (bytes), `dry_run` and `removed`, each with `name`, `size`, `why` (`keep`, `older_than` or `orphaned`) and `error` when it could not be removed |
 | `muructl logs rotate` | `logs`, each with `name`, `size`, `archive` (relative to the log directory, before compression through a daemon) and `error` when that log could not be rotated |
 | `muructl logs truncate` | `freed`, `dry_run` and `logs`, each with `name`, `size`, `kept`, `freed`, `in_place` (the log was cut in place, so lines written while it was copied are lost), `late` (the bytes writers added during the swap, carried over) and `error` when that log could not be cut |
-| `muructl logs list` | `directory`, `total`, `orphans_known` (whether the state store was available to tell) and `logs`, each with `name`, relative to the directory, `kind` (`access`, `edge`, `daemon`, `host` or `release`), `app`, `release`, `hosts`, `size`, `present`, `archives_size`, `total`, `orphaned`, and `archives`, oldest first, each with `name`, `size` and `modified_unix_ms` |
+| `muructl logs list` | `directory`, `total`, `orphans_known` (whether the state store was available to tell) and `logs`, each with `name`, relative to the directory, `kind` (`access`, `edge`, `daemon`, `host` or `release`), `app`, `release`, `hosts`, `size`, `present`, `modified_unix_ms` (when the file itself was last written, 0 when it is gone), `archives_size`, `total`, `orphaned`, and `archives`, oldest first, each with `name`, `size` and `modified_unix_ms`. A target narrows `logs`, and `total` is then of those logs alone |
 | `muructl metrics` | `{"samples": [...]}`, each with `name`, `type` (as its family declares, else `untyped`), `labels` and `value`; a value JSON cannot hold (`NaN`, `+Inf`) is kept as text |
 | `muructl websockets` | `open`, `endpoints` by application and pattern, and with `--list` each open `sockets` entry |
 | `muructl requests` | `in_flight`, `groups` (one per worker group: `app`, `release`, `group`, `queued` and `queued_oldest_ms`, `threads` (whether the group's workers run requests on threads), `threads_busy`, `threads_of` and `threads_oldest_ms`, `event_loop`, `event_loop_busy` and `event_loop_oldest_ms`), and with `--list` each `requests` entry: `request_id`, `client`, `app`, `release`, `group`, `method`, `target`, `state` (`queued` or `running`), `kind`, `worker` (-1 with none), `started_unix_ms` and `age_ms` |
-| `muructl logging level` | One debug answer for each logger set, as an array |
+| `muructl logging level` | One debug answer for each logger set, as an array; with `--reset`, or with no level to list what is in force, an array of one. A listing's `result` is `changed`, each with `logger`, `level`, `previous` and `until_unix_ms` (null until a reset) |
 | `muructl logging access` | `overrides`, the changes in force after the command, the newest last, each with `mode`, `app`, `paths` and `until_unix_ms`, and `reset`, how many `--reset` put back |
 | `muructl debug status` | The debug answer: `{"release": ..., "workers": [...]}`, each worker with `index`, `pid`, `ok`, `error` and its `result`: `group`, `generation`, `socket`, `state` (`starting`, `ready`, `debugging`, `replacing` or `retiring`), `ready`, `routed`, `debugging`, `uptime_s`, `requests`, `threads` and `loop` (each `busy`, `of` and `oldest_ms`, present for the sides the worker has), `stale` (the sides are from the worker's last report, since it did not answer within a second) and its memory figures |
 | `muructl debug stacks` | The debug answer |
 | `muructl debug tasks` | The debug answer |
 | `muructl debug inspect` | The debug answer |
+| `muructl debug logging` | The debug answer, each worker's `result` with `loggers` (the root first, then every logger by name, each with `name`, `level`, `effective`, `propagate`, `disabled`, `level_from` (`muru`, `temporary`, `changed since`, `python`, `application`, or null for a logger with no level of its own) and `handlers`), `disable` (the `logging.disable` level, or null), `last_resort` (a handler, or null), `capture_warnings` and `warnings_filters`, in order, each with `action`, `message`, `category`, `module` and `lineno`. A handler has `class`, `level`, `destination` (a stream, a file path, a socket address, syslog or a mail server, any URL's user information masked, or null), `format` (the format string, or the formatter's class) and `filters` |
 | `muructl debug memory` | The debug answer |
 | `muructl debug profile` | The debug answer, with the samples rather than a written profile |
 | `muructl debug trace` | The debug answer |
