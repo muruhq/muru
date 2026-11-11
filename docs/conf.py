@@ -76,4 +76,13 @@ copybutton_prompt_is_regexp = True
 
 latex_documents = [("index", "muru.tex", "Muru", author, "manual")]
 latex_show_urls = "footnote"
-latex_elements = {"papersize": "a4paper"}
+
+# Diagrams number their steps with the circled digits ① to ⑳, which pdflatex
+# has no glyphs for: each is drawn as its number in a circle.
+
+CIRCLED_DIGITS = "\n".join(
+    rf"\DeclareUnicodeCharacter{{{0x2460 + n - 1:04X}}}{{\textcircled{{\scriptsize {n}}}}}"
+    for n in range(1, 21)
+)
+
+latex_elements = {"papersize": "a4paper", "preamble": CIRCLED_DIGITS}
