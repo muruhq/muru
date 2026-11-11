@@ -1334,7 +1334,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // connections wait in the backlog; the edge is up before any release,
     // answering 503 until one serves.
 
-    let edge_log = locations.logs.path.join("edge.log");
+    let edge_log = locations.edge_log();
 
     // Section 4.11: the upload spool is the edge's own, in the state
     // directory rather than the run directory, which may be memory.
@@ -9253,12 +9253,6 @@ impl Daemon {
         path
     }
 
-    /// Section 11.3: after logrotate has renamed the files, every writer
-    /// opens its file again by name. The daemon reopens its own when it
-    /// was started in the background, the edge its access log on SIGUSR1,
-    /// and each host its release log on SIGUSR1; SIGUSR2 makes a host
-    /// pass SIGUSR1 on to its workers, whose on_reopen_logs hook handles
-    /// files the application opened itself.
     /// Section 10.7: one point of history a second, from the edge's
     /// counters, and the WebSockets open by release for status.
     async fn sample_history(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
@@ -9314,12 +9308,11 @@ impl Daemon {
         };
         let now = std::time::SystemTime::now();
 
-        // The edge reopens the access log when told, but keeps its own log
-        // open on its standard streams, so that one is rotated in place.
+        // The edge reopens the access log and its own log when told.
 
         let mut candidates = vec![
             (self.locations.access_log(), false),
-            (self.locations.logs.path.join("edge.log"), true),
+            (self.locations.edge_log(), false),
         ];
 
         if self.owns_log {
@@ -9397,9 +9390,7 @@ impl Daemon {
             return;
         }
 
-        if self.owns_log {
-            reopen_own_log(&self.locations.daemon_log());
-        }
+        self.reopen_own_log();
 
         self.edge.signal(libc::SIGUSR1);
 
@@ -9476,19 +9467,15 @@ impl Daemon {
     }
 
     /// Whether a log's writers cannot be told to reopen it: the
-    /// instances of a managed HTTP server, and the edge for its own log.
+    /// instances of a managed HTTP server.
     fn cannot_reopen(&self, path: &Path) -> bool {
-        let edge_log = self.locations.logs.path.join("edge.log");
-
-        path == edge_log
-            || self.running.iter().any(|((app, id), running)| {
-                running.backend.servers().is_some() && self.locations.release_log(app, id) == path
-            })
+        self.running.iter().any(|((app, id), running)| {
+            running.backend.servers().is_some() && self.locations.release_log(app, id) == path
+        })
     }
 
     /// Hold log files against rotation, saying of each whether its
-    /// writers cannot reopen it: the instances of a managed HTTP server
-    /// and the edge's own log, which it does not reopen.
+    /// writers cannot reopen it: the instances of a managed HTTP server.
     fn claim_logs(&mut self, paths: Vec<PathBuf>) -> Result<Vec<bool>, String> {
         if let Some(path) = paths.iter().find(|path| self.claimed_logs.contains(*path)) {
             return Err(format!(
@@ -9503,10 +9490,25 @@ impl Daemon {
         Ok(in_place)
     }
 
-    fn reopen_logs(&mut self, workers: bool) -> Reopened {
-        if self.owns_log {
-            reopen_own_log(&self.locations.daemon_log());
+    /// Open the daemon's own log again by name, when it was started in
+    /// the background and so writes one.
+    fn reopen_own_log(&self) {
+        if self.owns_log
+            && let Err(error) = crate::logs::reopen_standard_streams(&self.locations.daemon_log())
+        {
+            tracing::warn!(%error, "reopening the daemon's log failed");
         }
+    }
+
+    /// Section 11.3: after something has renamed the files, every writer
+    /// opens its file again by name. The daemon reopens its own when it
+    /// was started in the background, the edge its access log, the files
+    /// virtual hosts name and its own log on SIGUSR1, and each host its
+    /// release log on SIGUSR1; SIGUSR2 makes a host pass SIGUSR1 on to its
+    /// workers, whose on_reopen_logs hook handles files the application
+    /// opened itself.
+    fn reopen_logs(&mut self, workers: bool) -> Reopened {
+        self.reopen_own_log();
 
         let edge = self.edge.signal(libc::SIGUSR1);
         let mut hosts = 0;
@@ -9638,29 +9640,6 @@ fn restored_rotator(policy: crate::rotation::Policy, store: &Store) -> crate::ro
     }
 
     crate::rotation::Rotator::restored(policy, present)
-}
-
-/// Open the daemon's log file again on standard output and error: once
-/// logrotate has renamed it away, the lines belong in a new file at the
-/// same path.
-fn reopen_own_log(path: &std::path::Path) {
-    use std::os::unix::io::AsRawFd as _;
-
-    let Ok(log) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
-        return;
-    };
-
-    // SAFETY: dup2 of an open file onto the standard descriptors, which
-    // stay valid; `log` closes its own descriptor when it drops.
-
-    unsafe {
-        libc::dup2(log.as_raw_fd(), 1);
-        libc::dup2(log.as_raw_fd(), 2);
-    }
 }
 
 /// Sections 7.3 and 7.4: what one worker offers before the edge has

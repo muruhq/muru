@@ -40,6 +40,11 @@ pub struct EdgeRunArgs {
     #[arg(long, value_name = "PATH", default_value = "off")]
     access_log: String,
 
+    /// The file the edge's standard output and error are, which SIGUSR1
+    /// opens again by this path.
+    #[arg(long, value_name = "PATH")]
+    log: Option<PathBuf>,
+
     /// A worker socket to serve from the start, before any snapshot.
     #[arg(long = "worker-socket", value_name = "PATH")]
     worker_sockets: Vec<PathBuf>,
@@ -196,11 +201,12 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             .map_err(anyhow::Error::from)
     });
 
-    // Section 11.3: SIGUSR1 reopens the access log after logrotate has
-    // renamed it.
+    // Section 11.3: SIGUSR1 reopens the access log and the edge's own
+    // log by name, after something has renamed them.
 
     let access_log = edge.access_log();
     let written = edge.access_log();
+    let own_log = args.log.clone();
     let mut reopen = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
     tokio::spawn(async move {
         while reopen.recv().await.is_some() {
@@ -216,6 +222,19 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
                 }
                 Err(error) => {
                     muru_common::muru_eprintln!("edge could not reopen the access log: {error}")
+                }
+            }
+
+            // Its own log is reopened onto its standard streams, after
+            // the line above, which goes to the file being replaced.
+
+            if let Some(path) = &own_log {
+                match muru_controller::logs::reopen_standard_streams(path) {
+                    Ok(()) => muru_common::muru_eprintln!("edge reopened {}", path.display()),
+                    Err(error) => muru_common::muru_eprintln!(
+                        "edge could not reopen {}: {error}",
+                        path.display()
+                    ),
                 }
             }
         }

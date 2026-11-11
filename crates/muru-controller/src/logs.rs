@@ -72,6 +72,34 @@ const TAIL_BYTES: u64 = 256 * 1024;
 /// How often a followed file is checked for new lines.
 const POLL: Duration = Duration::from_millis(200);
 
+/// Open a log file again on this process's standard output and error,
+/// by its path, appending: once something has renamed it away, the lines
+/// belong in a new file there. Whatever standard output has buffered is
+/// written first, to the file it was meant for. The daemon does this for
+/// `daemon.log` and the edge for `edge.log` (section 11.3).
+pub fn reopen_standard_streams(path: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::io::AsRawFd as _;
+
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let _ = std::io::stdout().flush();
+
+    // SAFETY: dup2 of an open file onto the standard descriptors, which
+    // stay valid; `log` closes its own descriptor when it drops.
+
+    let replaced =
+        unsafe { libc::dup2(log.as_raw_fd(), 1) >= 0 && libc::dup2(log.as_raw_fd(), 2) >= 0 };
+
+    if replaced {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// What to say when a log file asked for is not there. The daemon's own
 /// log is written only by a daemon started in the background.
 pub fn missing(path: &Path) -> String {

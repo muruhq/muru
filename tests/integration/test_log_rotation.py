@@ -198,7 +198,7 @@ def test_logs_are_rotated_by_size_compressed_and_pruned(tmp_path: Path) -> None:
         daemon.stop()
 
 
-def test_the_edge_goes_on_writing_its_own_log_after_it_is_rotated(tmp_path: Path) -> None:
+def test_the_edge_reopens_its_own_log_after_it_is_rotated(tmp_path: Path) -> None:
     daemon = start_daemon(
         tmp_path,
         config_extra="[logs]\nsize = '100B'\nkeep = 20\ncompress = 'off'\nevery = 'off'\n",
@@ -216,20 +216,24 @@ def test_the_edge_goes_on_writing_its_own_log_after_it_is_rotated(tmp_path: Path
         traffic()
         return len(archives(logs, "edge.log")) >= 1
 
-    def written_again() -> bool:
+    edge_log = logs / "edge.log"
+
+    def reopened() -> bool:
         traffic()
-        return (logs / "edge.log").stat().st_size > 0
+        return f"edge reopened {edge_log}" in edge_log.read_text()
 
     try:
         assert daemon.deploy("shop", SHOP, "--processes", "1") == (
             "muru: release shop@r1 is ready and serving"
         )
+        first = edge_log.stat().st_ino
 
-        # The edge says when it reopens the access log. Those lines belong
-        # in edge.log, which it keeps open across its own rotation.
+        # edge.log is renamed like the other logs, and the edge opens it
+        # again by name: the line saying so is the first in the new file.
 
         wait_for(rotated, "an edge log archive", describe=state)
-        wait_for(written_again, "the edge to write to edge.log again", describe=state)
+        wait_for(reopened, "the edge to reopen edge.log", describe=state)
+        assert edge_log.stat().st_ino != first
     finally:
         daemon.stop()
 

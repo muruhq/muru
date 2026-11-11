@@ -506,8 +506,8 @@ logrotate entry for a user-mode daemon:
 }
 ```
 
-Each process reopens its own file: the edge the access log, each host its
-release's file (SIGUSR1 to the host does that alone, SIGUSR2 passes SIGUSR1
+Each process reopens its own file: the edge the access log, the files
+virtual hosts name and its own `edge.log`, each host its release's file (SIGUSR1 to the host does that alone, SIGUSR2 passes SIGUSR1
 on to its workers for the hook), and a background daemon its own log.
 Lines written between the rename and the reopen land in the renamed file,
 and none are lost. In development mode only the access log can go to a
@@ -516,9 +516,8 @@ file, and SIGUSR1 to a worker runs the hook.
 The instances of a [managed HTTP server](managed-servers.md) write to
 their release's file themselves and cannot be told to reopen it, so the
 built-in rotation copies that file to its archive and truncates it in
-place, and lines written while it is copied are lost. The edge keeps its
-own log, `edge.log`, open in the same way, so it is rotated in place too.
-With `rotate = 'external'`, give those files logrotate's `copytruncate`.
+place, and lines written while it is copied are lost. With `rotate =
+'external'`, give those files logrotate's `copytruncate`.
 
 ## Reclaiming disk space
 
@@ -609,10 +608,10 @@ and without a terminal the command refuses unless given `--yes`.
   slightly out of order.
 
 The instances of a managed HTTP server cannot be told to reopen a file,
-and neither can the edge for its own log, `edge.log`, so those two are
-cut in place: the kept part is written aside, the file truncated and
-the kept part put back, and lines written while it is copied are lost.
-The same applies to every log when no daemon is running.
+so their release's log is cut in place: the kept part is written aside,
+the file truncated and the kept part put back, and lines written while
+it is copied are lost. The same applies to every log when no daemon is
+running.
 
 `muructl logs rotate` rotates now, with the compression and `keep` of the
 policy in force, for when there is disk to spare and the history is
@@ -624,9 +623,9 @@ those flagged `orphaned`. A log with no content is left alone. It writes a
 With `rotate = 'external'`, `muructl logs rotate` refuses, since something
 else owns the rotation of those files.
 
-As with truncating, the instances of a managed HTTP server and the edge
-for its own log are rotated in place, and so is every log when no daemon
-is running: lines written while the file is copied are lost.
+As with truncating, the log of a managed HTTP server's instances is
+rotated in place, and so is every log when no daemon is running: lines
+written while the file is copied are lost.
 
 `muructl logs prune` removes archives, by `--keep N` (the newest N of each
 log) or `--older-than DURATION`, and with `--orphaned` the logs and
