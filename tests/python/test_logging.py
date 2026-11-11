@@ -171,3 +171,32 @@ def test_an_exception_logging_would_not_show_is_written_to_stderr(
     written = capsys.readouterr().err
     assert written.startswith("muru: the application raised an exception\nTraceback")
     assert "KeyError: 'sku'" in written
+
+
+def test_warnings_filters_are_applied_in_order_the_last_first() -> None:
+    """Filters in -W syntax go in with filterwarnings, so the last given
+    takes precedence; one whose category cannot be imported is noted and
+    left out."""
+
+    import warnings
+
+    saved = warnings.filters[:]
+    muru_logging._refused_filters.clear()
+
+    try:
+        muru_logging._filter_warnings(
+            [
+                "ignore::DeprecationWarning",
+                "error:boom:DeprecationWarning:shop.views",
+                "ignore::no_such_module.Warning",
+            ]
+        )
+        first, second = warnings.filters[0], warnings.filters[1]
+        assert first[0] == "error" and first[2] is DeprecationWarning
+        assert first[1].pattern == "boom" and first[3].pattern == r"shop\.views\Z"
+        assert second[0] == "ignore" and second[1] is None
+        assert len(muru_logging._refused_filters) == 1
+        assert "no_such_module" in muru_logging._refused_filters[0]
+    finally:
+        warnings.filters[:] = saved
+        muru_logging._refused_filters.clear()

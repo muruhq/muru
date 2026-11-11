@@ -4299,6 +4299,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="a named logger's level",
     )
     parser.add_argument(
+        "--warning",
+        action="append",
+        default=[],
+        metavar="FILTER",
+        help="a warnings filter in -W syntax, applied in order",
+    )
+    parser.add_argument(
         "--control",
         default=None,
         metavar="PATH",
@@ -4514,7 +4521,16 @@ def main(argv: list[str] | None = None) -> int:
     # Section 11.4: the logging defaults are in place before anything of
     # the application is imported, and the workers inherit them.
 
-    muru_logging._install(args.log_level, args.log_format, args.capture_warnings, dict(args.logger))
+    muru_logging._install(
+        args.log_level,
+        args.log_format,
+        args.capture_warnings,
+        dict(args.logger),
+        args.warning,
+    )
+
+    for refused in muru_logging._refused_filters:
+        log(f"warnings filter {refused} was not applied")
 
     # Section 6.2 step 1: no collections during preload.
 

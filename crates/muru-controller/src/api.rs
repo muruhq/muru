@@ -2406,6 +2406,17 @@ impl Admin for Service {
                 .expect("limits poisoned")
                 .clone();
             layers.extend(config::served_layers(&self.handle.store, &document).map_err(internal)?);
+            let python_logging = self
+                .handle
+                .info
+                .python_logging
+                .read()
+                .expect("python logging poisoned")
+                .clone();
+            layers.extend(
+                config::logging_layers(&self.handle.store, &document, &python_logging)
+                    .map_err(internal)?,
+            );
             layers.extend(config::route_layers(&self.handle.store, &document, &limits));
             (attributions, layers)
         } else {

@@ -41,8 +41,8 @@ in the platform format. Nothing else is touched: `basicConfig` and
 last-resort handler is used only where no handler exists.
 
 The settings come from a `[tool.muru.logging.python]` table in
-pyproject.toml or muru.toml, or from the `logging.python` table of a
-declared release, which wins:
+pyproject.toml or muru.toml, and from the `logging.python` table of a
+declared release:
 
 ```toml
 [tool.muru.logging.python]
@@ -50,6 +50,7 @@ level = "INFO"
 format = "json"
 capture_warnings = true
 loggers = { urllib3 = "WARNING" }
+warnings = ["ignore::DeprecationWarning"]
 ```
 
 | Key | Default | Effect |
@@ -58,6 +59,47 @@ loggers = { urllib3 = "WARNING" }
 | `format` | `standard` | `standard` writes `LEVEL logger: message`, with no time since Muru adds one where the output wants it; `json` writes one object per record with the time, level, logger, message, application, release, group and worker, the request id during a request, and the exception when there is one; anything else is a `logging` format string |
 | `capture_warnings` | `false` | route `warnings.warn` through the `py.warnings` logger |
 | `loggers` | none | levels for named loggers |
+| `warnings` | none | warnings filters in the syntax of Python's `-W` option, `action:message:category:module:lineno`, applied in order, so a later one takes precedence |
+
+Under the daemon, a `[logging.python]` table in the daemon's own
+configuration file sets the same keys for every application:
+
+```toml
+[logging.python]
+format = "json"
+loggers = { urllib3 = "WARNING" }
+warnings = ["ignore::DeprecationWarning"]
+```
+
+The tables merge key by key. A key an application's table sets wins over
+the daemon's, and a key a declared release's table sets wins over both.
+`loggers` merge by logger name, so the daemon's `urllib3` and an
+application's `myapp` both apply, and where two tables name the same
+logger the more specific one's level is used. `warnings` add up: the
+daemon's filters come first, then the application's, then the
+release's, so the more specific ones take precedence.
+
+The daemon's table is read when a host starts. After `muructl daemon
+reload`, each application takes the new defaults at its next restart or
+deploy. `muructl config show --effective` lists each key in force for
+each release with where it comes from: `daemon configuration`,
+`[tool.muru]` or `the release table`:
+
+```console
+$ muructl config show shop --effective
+...
+#   shop@r3: logging.python.format = json (daemon configuration)
+#   shop@r3: logging.python.level = INFO ([tool.muru])
+#   shop@r3: logging.python.loggers.urllib3 = WARNING (daemon configuration)
+#   shop@r3: logging.python.warnings.0 = ignore::DeprecationWarning (daemon configuration)
+```
+
+A filter whose syntax is wrong is refused when the configuration is
+read. A filter naming a category that cannot be imported is left out
+when the host starts, with a host line saying so. An application that
+calls `warnings.simplefilter` or `filterwarnings` itself still has the
+last word. `muructl run` and `muructl serve` take the application's
+table alone.
 
 A worker's records arrive tagged like the rest of its output, so a
 standard record reads `muru.worker[0]: WARNING demo: warned`. The host

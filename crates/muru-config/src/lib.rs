@@ -1630,6 +1630,104 @@ pub struct PythonLogging {
     /// Levels for named loggers.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub loggers: BTreeMap<String, LogLevel>,
+    /// Warnings filters in the syntax of Python's -W option,
+    /// `action:message:category:module:lineno`, applied in order with
+    /// `warnings.filterwarnings` before the application is imported, so a
+    /// later one takes precedence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+impl PythonLogging {
+    /// This table with `over`, a more specific layer's, laid over it key
+    /// by key (sections 3.3 and 11.4): a key `over` sets wins, `loggers`
+    /// merge by name with `over`'s level winning, and `warnings` add up,
+    /// `over`'s after this table's so that they take precedence.
+    pub fn layered(&self, over: &PythonLogging) -> PythonLogging {
+        let mut loggers = self.loggers.clone();
+        loggers.extend(
+            over.loggers
+                .iter()
+                .map(|(name, level)| (name.clone(), *level)),
+        );
+
+        PythonLogging {
+            level: over.level.or(self.level),
+            format: over.format.clone().or_else(|| self.format.clone()),
+            capture_warnings: over.capture_warnings.or(self.capture_warnings),
+            loggers,
+            warnings: self
+                .warnings
+                .iter()
+                .chain(&over.warnings)
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Check the table's warnings filters, naming the first that is not
+    /// one.
+    pub fn check(&self) -> Result<(), String> {
+        for filter in &self.warnings {
+            check_warnings_filter(filter)
+                .map_err(|why| format!("warnings: {filter:?} is not a warnings filter: {why}"))?;
+        }
+
+        Ok(())
+    }
+}
+
+/// The actions a warnings filter may take, as Python's -W option accepts
+/// them, a unique prefix of one included.
+const WARNING_ACTIONS: [&str; 7] = [
+    "default", "always", "all", "ignore", "module", "once", "error",
+];
+
+/// Check a warnings filter in the syntax of Python's -W option:
+/// `action:message:category:module:lineno`, every field after the action
+/// optional. The category is checked to be a name, which the host imports
+/// when it applies the filter.
+pub fn check_warnings_filter(filter: &str) -> Result<(), String> {
+    let fields: Vec<&str> = filter.split(':').map(str::trim).collect();
+
+    if fields.len() > 5 {
+        return Err("it has more than five fields".to_owned());
+    }
+
+    let action = fields[0];
+
+    if !action.is_empty()
+        && !WARNING_ACTIONS
+            .iter()
+            .any(|known| known.starts_with(action))
+    {
+        return Err(format!(
+            "{action:?} is not an action: default, always, ignore, module, once or error"
+        ));
+    }
+
+    if let Some(category) = fields.get(2).filter(|category| !category.is_empty()) {
+        let named = category.split('.').all(|part| {
+            part.chars()
+                .next()
+                .is_some_and(|first| first.is_alphabetic() || first == '_')
+                && part.chars().all(|c| c.is_alphanumeric() || c == '_')
+        });
+
+        if !named {
+            return Err(format!(
+                "{category:?} is not the name of a warning category"
+            ));
+        }
+    }
+
+    if let Some(line) = fields.get(4).filter(|line| !line.is_empty())
+        && line.parse::<u32>().is_err()
+    {
+        return Err(format!("{line:?} is not a line number"));
+    }
+
+    Ok(())
 }
 
 /// The `[logging]` table: how Python logging is set up in the workers.
@@ -4712,6 +4810,11 @@ pub struct Document {
     /// Log rotation and the access log (sections 11.2 and 11.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logs: Option<Logs>,
+    /// Python logging defaults for every release, under each
+    /// application's and release's own (section 11.4), from the daemon's
+    /// own file. Read when a host starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logging: Option<Logging>,
     /// What SIGTERM means to the daemon, and how a shutdown runs (section
     /// 13.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6986,5 +7089,81 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         let error = load_project(&dir).unwrap_err().to_string();
         assert!(!error.contains("daemon's format"), "{error}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod python_logging_tests {
+    use super::{LogLevel, PythonLogging, check_warnings_filter};
+
+    #[test]
+    fn a_warnings_filter_is_checked_as_python_reads_minus_w() {
+        for filter in [
+            "ignore",
+            "i::DeprecationWarning",
+            "ignore:.*pkg_resources:UserWarning",
+            "error::mypkg.MyWarning:mypkg.module:12",
+            "default:::",
+        ] {
+            assert!(check_warnings_filter(filter).is_ok(), "{filter}");
+        }
+
+        for (filter, why) in [
+            ("shout", "is not an action"),
+            (
+                "ignore::Not A Name",
+                "is not the name of a warning category",
+            ),
+            ("ignore::Warning:mod:twelve", "is not a line number"),
+            ("ignore:a:b:c:1:extra", "more than five fields"),
+        ] {
+            let refused = check_warnings_filter(filter).unwrap_err();
+            assert!(refused.contains(why), "{filter}: {refused}");
+        }
+    }
+
+    #[test]
+    fn a_more_specific_table_is_laid_over_key_by_key() {
+        let daemon = PythonLogging {
+            level: Some(LogLevel::Info),
+            format: Some("json".to_owned()),
+            loggers: [
+                ("urllib3".to_owned(), LogLevel::Warning),
+                ("shared".to_owned(), LogLevel::Error),
+            ]
+            .into(),
+            warnings: vec!["ignore::DeprecationWarning".to_owned()],
+            ..PythonLogging::default()
+        };
+        let app = PythonLogging {
+            level: Some(LogLevel::Debug),
+            loggers: [
+                ("myapp".to_owned(), LogLevel::Debug),
+                ("shared".to_owned(), LogLevel::Info),
+            ]
+            .into(),
+            warnings: vec!["error::DeprecationWarning:myapp".to_owned()],
+            ..PythonLogging::default()
+        };
+        let merged = daemon.layered(&app);
+
+        assert_eq!(merged.level, Some(LogLevel::Debug));
+        assert_eq!(merged.format.as_deref(), Some("json"));
+        assert_eq!(merged.loggers["urllib3"], LogLevel::Warning);
+        assert_eq!(merged.loggers["myapp"], LogLevel::Debug);
+        assert_eq!(
+            merged.loggers["shared"],
+            LogLevel::Info,
+            "the more specific layer wins"
+        );
+        assert_eq!(
+            merged.warnings,
+            [
+                "ignore::DeprecationWarning",
+                "error::DeprecationWarning:myapp"
+            ],
+            "the more specific layer's filters come last"
+        );
+        assert!(merged.check().is_ok());
     }
 }

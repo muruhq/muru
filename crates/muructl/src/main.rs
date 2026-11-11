@@ -2035,7 +2035,18 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         static_dirs,
         error_pages: table.error_pages,
         error_override: table.error_override,
-        logging: table.logging,
+        logging: match table.logging {
+            Some(logging) => {
+                if let Some(python) = &logging.python {
+                    python
+                        .check()
+                        .map_err(|error| anyhow::anyhow!("[tool.muru.logging.python] {error}"))?;
+                }
+
+                Some(logging)
+            }
+            None => None,
+        },
         max_requests,
         max_lifetime: match (args.max_lifetime, &table.max_lifetime) {
             (Some(lifetime), _) => Some(lifetime),

@@ -780,6 +780,10 @@ pub struct Info {
     /// The rate limits (section 4.15) and client classes (section 4.14)
     /// the daemon's file defines, which applied files may name.
     pub defined: std::sync::RwLock<crate::config::Defined>,
+    /// The Python logging defaults every host starts with under its
+    /// release's own (`[logging.python]`, section 11.4), as a reload may
+    /// change them.
+    pub python_logging: std::sync::RwLock<muru_config::PythonLogging>,
     /// WebSockets open by application and release, from the edge's
     /// metrics as last sampled.
     pub websockets: std::sync::Mutex<HashMap<(String, String), u64>>,
@@ -1442,6 +1446,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             },
             ..client_rules.defined()
         }),
+        python_logging: std::sync::RwLock::new(settings.python_logging.clone()),
         interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
         live: std::sync::Mutex::new(HashMap::new()),
@@ -3049,6 +3054,31 @@ impl Daemon {
             );
         } else {
             report.unchanged("[logs] rotation");
+        }
+
+        // Section 11.4: the Python logging defaults are installed before
+        // an application is imported, so a running host keeps those it
+        // started with.
+
+        let python_logging = self
+            .info
+            .python_logging
+            .read()
+            .expect("python logging poisoned")
+            .clone();
+
+        if settings.python_logging != python_logging {
+            *self
+                .info
+                .python_logging
+                .write()
+                .expect("python logging poisoned") = settings.python_logging.clone();
+            report.changed(
+                "[logging.python]",
+                "each application takes the new defaults at its next restart or deploy",
+            );
+        } else {
+            report.unchanged("[logging.python]");
         }
 
         if settings.reopen_on_rename != self.reopen_on_rename {
@@ -5194,7 +5224,12 @@ impl Daemon {
             tcp_base_port: None,
             single: false,
             detach_to: Some(self.host_log(app, id)),
-            logging: spec.logging.clone(),
+            logging: self
+                .info
+                .python_logging
+                .read()
+                .expect("python logging poisoned")
+                .layered(&spec.logging),
             max_requests: spec.max_requests,
             max_lifetime: spec.max_lifetime_ms.map(Duration::from_millis),
             soft_timeout: spec.timeouts.soft_timeout_ms.map(Duration::from_millis),

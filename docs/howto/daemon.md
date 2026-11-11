@@ -817,6 +817,9 @@ file again, checks it whole, and applies what changed:
 - the `[secrets.store.NAME]` tables, which the next release to start
   resolves its secrets from;
 
+- the `[logging.python]` table: each application takes the new Python
+  logging defaults at its next restart or deploy, since a running host
+  keeps those it started with;
 - the `[logs]` table: the daemon rotates on the new policy from its
   next check, and a period that changed rotates each file once;
   `reopen_on_rename` turns the check for renamed files on or off at

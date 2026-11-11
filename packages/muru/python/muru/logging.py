@@ -20,12 +20,16 @@ overwrite an attribute the record already has.
 
 from __future__ import annotations
 
+import builtins
 import datetime
+import importlib
 import json
 import logging
 import os
+import re
 import sys
 import traceback
+import warnings
 from collections.abc import Callable
 from typing import Any
 
@@ -220,11 +224,67 @@ def default_config() -> dict[str, Any]:
     }
 
 
+_refused_filters: list[str] = []
+"""The warnings filters `_install` could not apply, each with why."""
+
+
+def _filter_warnings(filters: list[str]) -> None:
+    """Apply warnings filters in the syntax of Python's -W option, in order.
+
+    Each is ``action:message:category:module:lineno``, read as -W reads
+    it: the message and module match literally, from the start, and a
+    later filter takes precedence. A filter whose category cannot be
+    imported is not applied and is noted in ``_refused_filters``; the
+    rest of its syntax was checked when the configuration was read.
+    """
+
+    actions = ("default", "always", "all", "ignore", "module", "once", "error")
+
+    for text in filters:
+        fields = [field.strip() for field in text.split(":")]
+        action, message, category_name, module, lineno = (fields + [""] * 5)[:5]
+        action = next((known for known in actions if known.startswith(action)), "default")
+        action = "always" if action == "all" else action
+
+        try:
+            category = _warning_category(category_name)
+        except (ImportError, AttributeError, TypeError) as error:
+            _refused_filters.append(f"{text!r} ({error})")
+            continue
+
+        warnings.filterwarnings(
+            action,  # type: ignore[arg-type]
+            re.escape(message),
+            category,
+            re.escape(module) + r"\Z" if module else "",
+            int(lineno or 0),
+        )
+
+
+def _warning_category(name: str) -> type[Warning]:
+    """Return the warning category a filter names: a builtin or a dotted path."""
+
+    if not name:
+        return Warning
+
+    if "." in name:
+        module, _, attribute = name.rpartition(".")
+        found = getattr(importlib.import_module(module), attribute)
+    else:
+        found = getattr(builtins, name)
+
+    if not (isinstance(found, type) and issubclass(found, Warning)):
+        raise TypeError(f"{name} is not a Warning subclass")
+
+    return found
+
+
 def _install(
     level: str | None,
     format: str | None,
     capture_warnings: bool,
     loggers: dict[str, str],
+    warnings_filters: list[str] | None = None,
 ) -> None:
     """Apply the release's logging settings before the application is imported.
 
@@ -249,6 +309,8 @@ def _install(
 
     for name, named_level in loggers.items():
         logging.getLogger(name).setLevel(named_level)
+
+    _filter_warnings(warnings_filters or [])
 
     if capture_warnings:
         logging.captureWarnings(True)

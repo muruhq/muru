@@ -22,6 +22,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `host` | table of tables, {ref}`[host.NAME] <config-daemon-host-name>` |  | Virtual hosts by name. |
 | `limits` | table, {ref}`[limits] <config-daemon-limits>` |  | Limits in force everywhere. |
 | `listener` | array of tables, {ref}`[[listener]] <config-daemon-listener>` |  | Listeners. |
+| `logging` | table, {ref}`[logging] <config-daemon-logging>` |  | Python logging defaults for every release, under each application's and release's own, from the daemon's own file. Read when a host starts. |
 | `logs` | table, {ref}`[logs] <config-daemon-logs>` |  | Log rotation and the access log. |
 | `metrics` | table, {ref}`[metrics] <config-daemon-metrics>` |  | The metrics listener. |
 | `overlay` | table of tables, {ref}`[overlay.NAME] <config-daemon-overlay-name>` |  | Overlays by name: partial configuration laid over the routes and applications while active. |
@@ -81,7 +82,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `instances` | integer | `1` | How many instances of the command an `http` release runs. |
 | `interface` | string | `"auto"` | The interface, when declared rather than detected. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `kind` | string | `"workers"` | What the release runs: `workers` from an entrypoint, the default, or `http`, an HTTP server started from `command`. `workers`: Muru's own workers, from an entrypoint. `http`: An HTTP server Muru starts and supervises, from a command. |
-| `logging` | table, {ref}`[app.NAME.release.ID.logging] <config-daemon-app-name-release-id-logging>` |  | How Python logging is set up in the workers. |
+| `logging` | table, {ref}`[logging] <config-daemon-logging>` |  | How Python logging is set up in the workers. |
 | `maintenance` | table, {ref}`[host.NAME.maintenance] <config-daemon-host-name-maintenance>` |  | What maintenance mode lets through. |
 | `max_body_size` | string | the host's, else `max_body_size` in `[limits]` | The largest body of a request the release serves, for example 50MB, which the edge enforces. |
 | `max_lifetime` | string |  | How long a worker lives before it is replaced, for example 1h, with jitter; off when absent. |
@@ -197,27 +198,6 @@ The requests a worker group takes for its paths: every list given must name the 
 | `client_class` | array of strings |  | Client classes. |
 | `host` | array of strings |  | Hosts: a virtual host's name or a name it answers to, or under `muructl run` the name the request carries. |
 | `method` | array of strings |  | Methods, compared in upper case. |
-
-(config-daemon-app-name-release-id-logging)=
-## `[app.NAME.release.ID.logging]`
-
-The `[logging]` table: how Python logging is set up in the workers.
-
-| Key | Type | Default | Description |
-| --- | --- | --- | --- |
-| `python` | table, {ref}`[app.NAME.release.ID.logging.python] <config-daemon-app-name-release-id-logging-python>` |  | Python logging defaults. |
-
-(config-daemon-app-name-release-id-logging-python)=
-## `[app.NAME.release.ID.logging.python]`
-
-The `[logging.python]` table: what loggers without handlers of their own do, set before the application is imported.
-
-| Key | Type | Default | Description |
-| --- | --- | --- | --- |
-| `capture_warnings` | boolean | `false` | Whether warnings.warn goes through the py.warnings logger. |
-| `format` | string | `standard`; `json` under `muructl serve --log-format json` | The format of the platform handler: standard, json, or a logging format string. |
-| `level` | string | `"WARNING"` | The root logger's level. `DEBUG`: Everything. `INFO`: Informational messages and above. `WARNING`: Python's default: warnings and above. `ERROR`: Errors and above. `CRITICAL`: Only critical messages. |
-| `loggers` | table of strings |  | Levels for named loggers. |
 
 (config-daemon-app-name-release-id-memory)=
 ## `[app.NAME.release.ID.memory]`
@@ -635,6 +615,30 @@ A listener's `limits` table: the keys of `[limits]` that bound a connection and 
 | `max_header_bytes` | string | `max_header_bytes` in `[limits]` | Largest request head, for example 64KB. |
 | `max_headers` | integer | `max_headers` in `[limits]` | Most headers in a request. |
 | `max_requests_per_connection` | integer | `max_requests_per_connection` in `[limits]` | Requests served on one connection before it is closed; 0 for no limit. |
+
+(config-daemon-logging)=
+## `[logging]`
+
+The `[logging]` table: how Python logging is set up in the workers.
+
+The same keys apply at `[app.NAME.release.ID.logging]`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `python` | table, {ref}`[logging.python] <config-daemon-logging-python>` |  | Python logging defaults. |
+
+(config-daemon-logging-python)=
+## `[logging.python]`
+
+The `[logging.python]` table: what loggers without handlers of their own do, set before the application is imported.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `capture_warnings` | boolean | `false` | Whether warnings.warn goes through the py.warnings logger. |
+| `format` | string | `standard`; `json` under `muructl serve --log-format json` | The format of the platform handler: standard, json, or a logging format string. |
+| `level` | string | `"WARNING"` | The root logger's level. `DEBUG`: Everything. `INFO`: Informational messages and above. `WARNING`: Python's default: warnings and above. `ERROR`: Errors and above. `CRITICAL`: Only critical messages. |
+| `loggers` | table of strings |  | Levels for named loggers. |
+| `warnings` | array of strings |  | Warnings filters in the syntax of Python's -W option, `action:message:category:module:lineno`, applied in order with `warnings.filterwarnings` before the application is imported, so a later one takes precedence. |
 
 (config-daemon-logs)=
 ## `[logs]`

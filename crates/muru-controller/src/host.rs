@@ -980,6 +980,10 @@ impl HostProcess {
                 .arg(format!("{name}={}", level.as_str()));
         }
 
+        for filter in &spec.logging.warnings {
+            command.arg("--warning").arg(filter);
+        }
+
         let workers = spec.processes
             + spec
                 .groups
