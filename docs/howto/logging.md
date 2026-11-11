@@ -585,8 +585,11 @@ where a `logging` file handler is reopened:
 }
 ```
 
-In development mode only the access log can go to a file, and SIGUSR1
-to a worker runs the hook.
+In development mode only the access log can go to a file, with
+`--access-log-file`. `muructl logs reopen` against the run, or SIGUSR1
+to its `muructl` process, opens that file again by name, and the run
+does not notice a rename by itself. SIGUSR1 to a worker runs its
+`on_reopen_logs` hook.
 
 The instances of a [managed HTTP server](managed-servers.md) write to
 their release's file themselves and cannot be told to reopen it, so the

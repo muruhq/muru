@@ -694,6 +694,22 @@ type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send>>
 type LogStream = Pin<Box<dyn Stream<Item = Result<pb::LogLine, Status>> + Send>>;
 type CommandStream = Pin<Box<dyn Stream<Item = Result<pb::CommandOutput, Status>> + Send>>;
 
+/// Open a run's access log file again by name, saying so: the writer
+/// thread does it after the lines queued before, which this waits for off
+/// the runtime. Nothing happens when the access log goes to no file.
+pub async fn reopen_access_log(access_log: Arc<AccessLog>) -> std::io::Result<()> {
+    let Some(path) = access_log.file().map(Path::to_path_buf) else {
+        return Ok(());
+    };
+
+    tokio::task::spawn_blocking(move || access_log.reopen())
+        .await
+        .map_err(std::io::Error::other)??;
+
+    muru_common::muru_eprintln!("reopened the access log {}", path.display());
+    Ok(())
+}
+
 impl Service {
     /// What a command on the log files gets from a development run.
     fn no_log_files(&self) -> Status {
@@ -913,15 +929,36 @@ impl Admin for Service {
         }))
     }
 
+    /// Section 11.3: a run's only file is the access log, when
+    /// --access-log-file names one, which is opened again by name as the
+    /// edge process does it, off the runtime.
     async fn reopen_logs(
         &self,
-        _: Request<pb::ReopenLogsRequest>,
+        request: Request<pb::ReopenLogsRequest>,
     ) -> Result<Response<pb::ReopenLogsResponse>, Status> {
-        Err(Status::failed_precondition(format!(
-            "a development run writes no log files to reopen: the output of {} goes to the \
-             terminal",
-            self.state.app
-        )))
+        let Some(path) = self.state.access_log.file().map(Path::to_path_buf) else {
+            return Err(Status::failed_precondition(format!(
+                "a development run sends the output of {} to the terminal, and no access log \
+                 file is set (--access-log-file), so there is nothing to reopen",
+                self.state.app
+            )));
+        };
+
+        if request.into_inner().workers {
+            return Err(Status::failed_precondition(
+                "--workers is for a daemon's releases: under a development run, send SIGUSR1 \
+                 to a worker to run its on_reopen_logs hook",
+            ));
+        }
+
+        reopen_access_log(Arc::clone(&self.state.access_log))
+            .await
+            .map_err(|error| Status::internal(format!("reopening {}: {error}", path.display())))?;
+
+        Ok(Response::new(pb::ReopenLogsResponse {
+            edge: true,
+            hosts: 0,
+        }))
     }
 
     async fn truncate_logs(

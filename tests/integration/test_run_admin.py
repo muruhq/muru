@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -254,7 +255,7 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
             refused.stderr
         )
         refused = muructl(runtime, "logs", "reopen", cwd=support.FIXTURES, check=False)
-        assert "writes no log files" in refused.stderr
+        assert "no access log file is set (--access-log-file)" in refused.stderr, refused.stderr
 
         # Another application, or a release that is not serving, is not
         # found.
@@ -508,3 +509,41 @@ def test_a_stalled_terminal_leaves_the_run_answering(runtime: Path, tmp_path: Pa
     finally:
         process.kill()
         process.communicate(timeout=30)
+
+
+def test_a_runs_access_log_file_is_reopened_after_a_rename(runtime: Path, tmp_path: Path) -> None:
+    """muructl logs reopen and SIGUSR1 make a run open its access log
+    file again by name, so the lines after a rename go to a new file."""
+
+    log = tmp_path / "access.log"
+    server = start(runtime, args=["--access-log-file", str(log)])
+
+    def wait_for(predicate: Callable[[], bool], what: str) -> None:
+        deadline = time.monotonic() + 10
+
+        while not predicate():
+            assert time.monotonic() < deadline, f"timed out waiting for {what}"
+            time.sleep(0.05)
+
+    def written(path: Path, target: str) -> bool:
+        return path.is_file() and target in path.read_text()
+
+    try:
+        assert server.get("/before").status in (200, 404)
+        wait_for(lambda: written(log, "/before"), "the first line")
+
+        log.rename(tmp_path / "access.log.1")
+        reopened = muructl(runtime, "logs", "reopen", cwd=support.FIXTURES).stdout
+        assert reopened.strip() == "muru: reopened the log files: the edge", reopened
+        assert server.get("/after-reopen").status in (200, 404)
+        wait_for(lambda: written(log, "/after-reopen"), "a line in the new file")
+
+        log.rename(tmp_path / "access.log.2")
+        server.mark_log()
+        os.kill(server.process.pid, signal.SIGUSR1)
+        assert server.wait_for_log("reopened the access log", timeout=10)
+        assert server.get("/after-signal").status in (200, 404)
+        wait_for(lambda: written(log, "/after-signal"), "a line after SIGUSR1")
+        assert "/after-signal" not in (tmp_path / "access.log.2").read_text()
+    finally:
+        server.stop()

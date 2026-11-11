@@ -3248,6 +3248,20 @@ async fn run_with(
     };
     let written = edge.access_log();
 
+    // Section 11.3: SIGUSR1 opens the access log file again by name, as
+    // the edge process does, after something has renamed it; without a
+    // file it does nothing, rather than end the run.
+
+    let reopened = edge.access_log();
+    let mut reopen = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    tokio::spawn(async move {
+        while reopen.recv().await.is_some() {
+            if let Err(error) = run_admin::reopen_access_log(Arc::clone(&reopened)).await {
+                muru_common::muru_eprintln!("could not reopen the access log: {error}");
+            }
+        }
+    });
+
     let addresses = match edge.https_addr() {
         Some(https) if resolved.serving.https_only => {
             format!(

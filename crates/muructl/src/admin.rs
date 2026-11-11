@@ -8149,6 +8149,14 @@ pub async fn logs_reopen(workers: bool, socket: SocketArgs, json: bool) -> anyho
         return print_answer(&reopened);
     }
 
+    // With no host to reopen, as a development run or a daemon with no
+    // release running, the edge alone is named.
+
+    if reopened.edge && reopened.hosts == 0 {
+        println!("muru: reopened the log files: the edge");
+        return Ok(());
+    }
+
     println!(
         "muru: reopened the log files: {}{} host{}{}",
         if reopened.edge { "the edge and " } else { "" },
