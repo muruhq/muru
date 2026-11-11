@@ -67,12 +67,27 @@ def wheel_tag() -> str:
 
 def build_wheel(directory: Path, wheel_version: str) -> Path:
     """A muru wheel for this interpreter in `directory/wheels`, made from
-    the development checkout's package (with its built extension) and a
-    minimal dist-info, so no network and no maturin are needed."""
+    the development checkout's Python sources, the extension this
+    interpreter imports, and a minimal dist-info, so no network and no
+    maturin are needed.
+
+    The extension comes from the running interpreter's installed muru, not
+    the checkout, which holds only the builds `maturin develop` made: a
+    free-threaded pass that installed its own build from a wheel has none
+    of its own there."""
+
+    from muru import _native
 
     staging = directory / "staging"
     package = staging / "muru"
-    shutil.copytree(PYTHON_SOURCES, package, ignore=shutil.ignore_patterns("__pycache__"))
+
+    shutil.copytree(
+        PYTHON_SOURCES,
+        package,
+        ignore=shutil.ignore_patterns("__pycache__", "_native.*.so", "_native.*.pyd"),
+    )
+
+    shutil.copy(_native.__file__, package / Path(_native.__file__).name)
     dist_info = staging / f"muru-{wheel_version}.dist-info"
     dist_info.mkdir()
     (dist_info / "METADATA").write_text(
