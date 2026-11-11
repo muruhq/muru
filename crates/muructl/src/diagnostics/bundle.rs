@@ -497,6 +497,35 @@ impl<W: Write> Bundle<'_, W> {
             self.put(&path, levels)?;
         }
 
+        // The logging and warnings setup each running release's workers
+        // have in force, as muructl debug logging --json gives it.
+
+        let path = format!("{config}/logging-setup.json");
+
+        if self.asks(&path) {
+            let setups = if self.installation.live.is_some() {
+                let mut setups = serde_json::Map::new();
+
+                for (app, release) in self.running_releases() {
+                    let answered = self
+                        .installation
+                        .debug(&app, &release, "logging_setup", None)
+                        .await
+                        .map_or_else(
+                            |why| serde_json::json!({"error": why}),
+                            |answer| crate::admin::debug_json(&answer),
+                        );
+                    setups.insert(format!("{app}@{release}"), answered);
+                }
+
+                Ok(serde_json::Value::Object(setups))
+            } else {
+                Err(NOTHING_RUNS.to_owned())
+            };
+
+            self.put(&path, setups)?;
+        }
+
         // What Muru keeps no record of.
 
         self.archive.missing(

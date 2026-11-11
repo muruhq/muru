@@ -224,6 +224,10 @@ def default_config() -> dict[str, Any]:
     }
 
 
+_installed: dict[str, int] = {}
+"""The levels `_install` set, by logger name, the root's under "", so a
+later look can tell Muru's defaults from what changed them since."""
+
 _refused_filters: list[str] = []
 """The warnings filters `_install` could not apply, each with why."""
 
@@ -306,9 +310,11 @@ def _install(
 
     if level:
         logging.getLogger().setLevel(level)
+        _installed[""] = logging.getLogger().level
 
     for name, named_level in loggers.items():
         logging.getLogger(name).setLevel(named_level)
+        _installed[name] = logging.getLogger(name).level
 
     _filter_warnings(warnings_filters or [])
 

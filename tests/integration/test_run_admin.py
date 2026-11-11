@@ -146,6 +146,8 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
         ).stdout
         assert "42" in ran
         assert server.wait_for_log("muru: debug.exec: ran code in worker 0")
+        setup = muructl(runtime, "debug", "logging", cwd=support.FIXTURES).stdout
+        assert "the same in worker 1" in setup and "root: level" in setup, setup
 
         # The edge's figures: metrics, the access log and the WebSockets.
 

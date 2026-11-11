@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 from collections import Counter, defaultdict
 from concurrent.futures import Future
 from typing import Any
@@ -60,6 +61,7 @@ DECLARED = "MURU_DECLARED_ENV"
 _changed: dict[str, int] = {}
 _timers: dict[str, threading.Timer] = {}
 _until: dict[str, float] = {}
+_set_to: dict[str, int] = {}
 _lock = threading.Lock()
 
 
@@ -95,6 +97,8 @@ def handle(
             result = inspect(bool(args.get("env", False)))
         elif op == "logging" and args.get("list"):
             result = changed_levels()
+        elif op == "logging_setup":
+            result = logging_setup()
         elif op == "logging":
             result = set_level(
                 str(args.get("logger", "")),
@@ -706,6 +710,7 @@ def set_level(logger: str, level: str, duration_s: float | None, reset: bool) ->
 
             _changed.clear()
             _until.clear()
+            _set_to.clear()
             return {"reset": restored}
 
         numeric = logging.getLevelName(level.upper())
@@ -718,6 +723,7 @@ def set_level(logger: str, level: str, duration_s: float | None, reset: bool) ->
         previous = _changed.get(key, target.level)
         _changed.setdefault(key, target.level)
         target.setLevel(numeric)
+        _set_to[key] = numeric
         timer = _timers.pop(key, None)
 
         if timer is not None:
@@ -762,11 +768,200 @@ def changed_levels() -> dict[str, Any]:
     return {"changed": changed}
 
 
+# A URL's user information, which a handler's settings may carry.
+
+_USERINFO = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@")
+
+
+def _masked(text: str) -> str:
+    """Return text with the user information of any URL in it masked."""
+
+    return _USERINFO.sub(r"\g<scheme>***@", text)
+
+
+def _class_name(thing: object) -> str:
+    kind = type(thing)
+    return (
+        kind.__qualname__
+        if kind.__module__ in ("logging", "builtins")
+        else (f"{kind.__module__}.{kind.__qualname__}")
+    )
+
+
+def _destination(handler: logging.Handler) -> str | None:
+    """Say where a handler writes, from the fields that name a place only."""
+
+    import logging.handlers as handlers
+
+    if isinstance(handler, logging.FileHandler):
+        return handler.baseFilename
+
+    if isinstance(handler, handlers.SysLogHandler):
+        return f"syslog {handler.address}"
+
+    if isinstance(handler, handlers.SMTPHandler):
+        return (
+            f"mail via {handler.mailhost}:{handler.mailport or 25} to {', '.join(handler.toaddrs)}"
+        )
+
+    if isinstance(handler, handlers.HTTPHandler):
+        return _masked(f"http://{handler.host}{handler.url}")
+
+    if isinstance(handler, (handlers.SocketHandler)):
+        return f"{handler.host}:{handler.port}" if handler.port is not None else str(handler.host)
+
+    if isinstance(handler, handlers.QueueHandler):
+        return "a queue"
+
+    if isinstance(handler, logging.StreamHandler):
+        stream = handler.stream
+
+        for standard, candidates in (
+            ("stderr", (sys.stderr, sys.__stderr__)),
+            ("stdout", (sys.stdout, sys.__stdout__)),
+        ):
+            if any(stream is candidate for candidate in candidates):
+                return standard
+
+        try:
+            return {1: "stdout", 2: "stderr"}.get(stream.fileno(), f"descriptor {stream.fileno()}")
+        except (AttributeError, OSError, ValueError):
+            named = getattr(stream, "name", None)
+            return _masked(named) if isinstance(named, str) else _class_name(stream)
+
+    return None
+
+
+def _handler(handler: logging.Handler) -> dict[str, Any]:
+    """Describe a handler with only the fields that hold no secret."""
+
+    formatter = handler.formatter
+    fmt = getattr(formatter, "_fmt", None) if formatter is not None else None
+
+    return {
+        "class": _class_name(handler),
+        "level": logging.getLevelName(handler.level),
+        "destination": _destination(handler),
+        "format": fmt if isinstance(fmt, str) else (_class_name(formatter) if formatter else None),
+        "filters": [
+            f"Filter({item.name!r})"
+            if isinstance(item, logging.Filter) and item.name
+            else _class_name(item)
+            for item in handler.filters
+        ],
+    }
+
+
+def _level_origin(name: str, logger: logging.Logger) -> str | None:
+    """Say where a logger's level came from, as far as Muru can tell."""
+
+    from muru import logging as muru_logging
+
+    if name in _set_to:
+        if logger.level == _set_to[name]:
+            return "temporary"
+
+        return "changed since"
+
+    if name in muru_logging._installed:
+        if logger.level == muru_logging._installed[name]:
+            return "muru"
+
+        return "changed since"
+
+    if logger.level == logging.NOTSET:
+        return None
+
+    if not name and logger.level == logging.WARNING:
+        return "python"
+
+    return "application"
+
+
+def _logger(name: str, logger: logging.Logger) -> dict[str, Any]:
+    return {
+        "name": name or "root",
+        "level": logging.getLevelName(logger.level),
+        "effective": logging.getLevelName(logger.getEffectiveLevel()),
+        "propagate": logger.propagate,
+        "disabled": logger.disabled,
+        "level_from": _level_origin(name, logger),
+        "handlers": [_handler(handler) for handler in logger.handlers],
+    }
+
+
+def _pattern(matched: Any) -> str:
+    """Return a filter's message or module pattern as text, empty for none."""
+
+    if matched is None:
+        return ""
+
+    return str(getattr(matched, "pattern", matched))
+
+
+def _category_name(category: Any) -> str:
+    """Name a warning category as a filter names it: builtins bare."""
+
+    if isinstance(category, tuple):
+        return ", ".join(_category_name(each) for each in category)
+
+    module = getattr(category, "__module__", "")
+    name = getattr(category, "__qualname__", str(category))
+    return name if module == "builtins" else f"{module}.{name}"
+
+
+def logging_setup() -> dict[str, Any]:
+    """Describe the logging and warnings setup in force in this process.
+
+    Every logger that exists, the root first, with its level, effective
+    level, propagation, disabled flag, handlers and where its level came
+    from: Muru's defaults (`muru`), a `muructl logging level` change
+    (`temporary`), changed since either (`changed since`), Python's own
+    default for the root (`python`), or set by the application or a
+    library (`application`). Then the logging module's
+    own switches and the warnings filters, in order. It reads the state
+    only, and reports of each handler only where it writes, its level,
+    format and filters, with any URL's user information masked.
+    """
+
+    with _lock:
+        root = logging.getLogger()
+        loggers = [_logger("", root)]
+        existing = dict(logging.Logger.manager.loggerDict)
+
+        for name in sorted(existing):
+            found = existing[name]
+
+            if isinstance(found, logging.Logger):
+                loggers.append(_logger(name, found))
+
+    resort = logging.lastResort
+    disabled = logging.root.manager.disable
+
+    return {
+        "loggers": loggers,
+        "disable": logging.getLevelName(disabled) if disabled else None,
+        "last_resort": _handler(resort) if resort is not None else None,
+        "capture_warnings": getattr(logging, "_warnings_showwarning", None) is not None,
+        "warnings_filters": [
+            {
+                "action": action,
+                "message": _pattern(message),
+                "category": _category_name(category),
+                "module": _pattern(module),
+                "lineno": lineno,
+            }
+            for action, message, category, module, lineno in warnings.filters
+        ],
+    }
+
+
 def _revert(key: str) -> None:
     with _lock:
         previous = _changed.pop(key, None)
         _timers.pop(key, None)
         _until.pop(key, None)
+        _set_to.pop(key, None)
 
         if previous is not None:
             logging.getLogger(key or None).setLevel(previous)

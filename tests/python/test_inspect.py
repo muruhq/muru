@@ -98,3 +98,59 @@ def test_the_levels_changed_are_listed_until_they_revert() -> None:
         _inspect.set_level("", "", None, True)
 
     assert _inspect.changed_levels() == {"changed": []}
+
+
+def test_the_logging_setup_names_where_levels_came_from_and_hides_credentials() -> None:
+    """The setup lists each logger with where its level came from, and of
+    a handler only where it writes, never its credentials."""
+
+    import json
+    import logging
+    import logging.handlers
+
+    from muru import logging as muru_logging
+
+    installed = logging.getLogger("muru_test.installed")
+    changed = logging.getLogger("muru_test.changed")
+    mailed = logging.getLogger("muru_test.mailed")
+    saved = dict(muru_logging._installed)
+    mail = logging.handlers.SMTPHandler(
+        ("smtp.example.com", 587),
+        "app@example.com",
+        ["ops@example.com"],
+        "boom",
+        credentials=("user", "hunter2"),
+    )
+    web = logging.handlers.HTTPHandler("logs.example.com", "/in?token=abc")
+    web.host = "user:s3cret@logs.example.com"
+
+    try:
+        installed.setLevel(logging.INFO)
+        changed.setLevel(logging.INFO)
+        muru_logging._installed.update(
+            {"muru_test.installed": logging.INFO, "muru_test.changed": logging.INFO}
+        )
+        changed.setLevel(logging.ERROR)
+        _inspect.set_level("muru_test.mailed", "DEBUG", None, False)
+        mailed.addHandler(mail)
+        mailed.addHandler(web)
+
+        answer = json.loads(_inspect.handle('{"id": 1, "op": "logging_setup"}', []))
+        setup = answer["result"]
+        found = {logger["name"]: logger for logger in setup["loggers"]}
+
+        assert setup["loggers"][0]["name"] == "root"
+        assert found["muru_test.installed"]["level_from"] == "muru"
+        assert found["muru_test.changed"]["level_from"] == "changed since"
+        assert found["muru_test.mailed"]["level_from"] == "temporary"
+        handlers = found["muru_test.mailed"]["handlers"]
+        assert handlers[0]["destination"] == "mail via smtp.example.com:587 to ops@example.com"
+        assert "***@logs.example.com" in handlers[1]["destination"]
+        assert "hunter2" not in json.dumps(setup) and "s3cret" not in json.dumps(setup)
+        assert isinstance(setup["warnings_filters"], list)
+    finally:
+        _inspect.set_level("", "", None, True)
+        mailed.removeHandler(mail)
+        mailed.removeHandler(web)
+        muru_logging._installed.clear()
+        muru_logging._installed.update(saved)

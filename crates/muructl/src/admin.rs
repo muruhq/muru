@@ -894,6 +894,13 @@ pub enum DebugCommand {
     /// masked either way.
     Inspect(InspectArgs),
 
+    /// The logging and warnings setup each worker has in force: its
+    /// loggers with their levels, effective levels, handlers and where
+    /// each level came from, the logging module's switches, and the
+    /// warnings filters. Only the loggers with something set unless
+    /// --all is given. Reads only.
+    Logging(LoggingSetupArgs),
+
     /// Sample every thread's stack for a period, merged across the
     /// workers, as collapsed stacks for a flame graph or as pstats; with
     /// --requests or --path, only the requests chosen.
@@ -950,6 +957,18 @@ pub struct InspectArgs {
     /// release's.
     #[arg(long)]
     env: bool,
+}
+
+/// `muructl debug logging`.
+#[derive(Args)]
+pub struct LoggingSetupArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// List every logger that exists, not only those with a level, a
+    /// handler or a flag of their own.
+    #[arg(long)]
+    all: bool,
 }
 
 /// `muructl debug attach`.
@@ -1184,6 +1203,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
             &inspect.common,
             serde_json::json!({"env": inspect.env}),
         ),
+        DebugCommand::Logging(setup) => ("logging_setup", &setup.common, serde_json::json!({})),
         DebugCommand::Profile(profile) => (
             "profile",
             &profile.common,
@@ -1250,6 +1270,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::Stacks(_) => print_stacks(&response),
         DebugCommand::Tasks(_) => print_tasks(&response),
         DebugCommand::Inspect(_) => print_inspect(&response),
+        DebugCommand::Logging(setup) => print_logging_setup(&response, setup.all),
         DebugCommand::Profile(profile) => write_profile(&response, profile)?,
         DebugCommand::Trace(_) => print_trace(&response),
         DebugCommand::Memory(_) => print_memory(&response),
@@ -2223,6 +2244,168 @@ fn print_tasks(response: &pb::DebugResponse) {
         }
 
         println!();
+    }
+}
+
+/// The logging setup as `debug logging` prints it. Workers that answer
+/// the same are shown once, with the others named as matching; when they
+/// differ, each is shown.
+fn print_logging_setup(response: &pb::DebugResponse, all: bool) {
+    let mut shown: Vec<(serde_json::Value, Vec<String>)> = Vec::new();
+
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            println!(
+                "worker {} (pid {}): {}",
+                answer.index, answer.pid, answer.error
+            );
+            continue;
+        };
+
+        let who = format!("worker {} (pid {})", answer.index, answer.pid);
+
+        match shown.iter_mut().find(|(setup, _)| *setup == result) {
+            Some((_, workers)) => workers.push(who),
+            None => shown.push((result, vec![who])),
+        }
+    }
+
+    if shown.len() > 1 {
+        println!("the workers differ: each setup is shown with the workers that have it");
+    }
+
+    for (setup, workers) in &shown {
+        match workers.as_slice() {
+            [one] => println!("{one}:"),
+            [first, rest @ ..] => println!("{first}, the same in {}:", rest.join(", ")),
+            [] => continue,
+        }
+
+        print_one_logging_setup(setup, all);
+    }
+}
+
+/// Where a logger's level came from, as `debug logging` says it.
+fn level_from(origin: &serde_json::Value) -> &'static str {
+    match origin.as_str() {
+        Some("muru") => " (Muru's defaults)",
+        Some("temporary") => " (muructl logging level)",
+        Some("changed since") => " (changed since Muru set it)",
+        Some("application") => " (set by the application or a library)",
+        Some("python") => " (Python's default)",
+        _ => "",
+    }
+}
+
+/// A handler as one line of `debug logging`.
+fn handler_line(handler: &serde_json::Value) -> String {
+    let mut line = format!(
+        "{}, level {}",
+        handler["class"].as_str().unwrap_or("?"),
+        handler["level"].as_str().unwrap_or("?")
+    );
+
+    if let Some(destination) = handler["destination"].as_str() {
+        line.push_str(&format!(", to {destination}"));
+    }
+
+    if let Some(format) = handler["format"].as_str() {
+        line.push_str(&format!(", format {format:?}"));
+    }
+
+    let filters: Vec<&str> = handler["filters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+
+    if !filters.is_empty() {
+        line.push_str(&format!(", filters {}", filters.join(", ")));
+    }
+
+    line
+}
+
+fn print_one_logging_setup(setup: &serde_json::Value, all: bool) {
+    println!(
+        "  logging.disable {}, warnings captured {}",
+        setup["disable"].as_str().unwrap_or("off"),
+        if setup["capture_warnings"].as_bool() == Some(true) {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+
+    if setup["last_resort"].is_object() {
+        println!("  last resort: {}", handler_line(&setup["last_resort"]));
+    }
+
+    println!("  loggers:");
+    let mut hidden = 0;
+
+    for logger in setup["loggers"].as_array().into_iter().flatten() {
+        let name = logger["name"].as_str().unwrap_or("?");
+        let level = logger["level"].as_str().unwrap_or("NOTSET");
+        let handlers = logger["handlers"].as_array().cloned().unwrap_or_default();
+        let propagates = logger["propagate"].as_bool() != Some(false);
+        let disabled = logger["disabled"].as_bool() == Some(true);
+        let interesting =
+            name == "root" || level != "NOTSET" || !handlers.is_empty() || !propagates || disabled;
+
+        if !all && !interesting {
+            hidden += 1;
+            continue;
+        }
+
+        let mut line = format!(
+            "    {name}: level {level}{}, effective {}",
+            level_from(&logger["level_from"]),
+            logger["effective"].as_str().unwrap_or("?")
+        );
+
+        if !propagates {
+            line.push_str(", does not propagate");
+        }
+
+        if disabled {
+            line.push_str(", disabled");
+        }
+
+        println!("{line}");
+
+        for handler in &handlers {
+            println!("      handler {}", handler_line(handler));
+        }
+    }
+
+    if hidden > 0 {
+        println!(
+            "    and {} with nothing of their own (--all lists them)",
+            counted(hidden, "logger", "loggers")
+        );
+    }
+
+    let filters = setup["warnings_filters"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    println!("  warnings filters, the first matching wins:");
+
+    if filters.is_empty() {
+        println!("    none");
+    }
+
+    for filter in &filters {
+        println!(
+            "    {}:{}:{}:{}:{}",
+            filter["action"].as_str().unwrap_or("?"),
+            filter["message"].as_str().unwrap_or(""),
+            filter["category"].as_str().unwrap_or(""),
+            filter["module"].as_str().unwrap_or(""),
+            filter["lineno"].as_u64().unwrap_or(0)
+        );
     }
 }
 

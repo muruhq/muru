@@ -114,6 +114,7 @@ $ muructl release show shop@r9 --json
 | `muructl debug stacks` | The debug answer |
 | `muructl debug tasks` | The debug answer |
 | `muructl debug inspect` | The debug answer |
+| `muructl debug logging` | The debug answer, each worker's `result` with `loggers` (the root first, then every logger by name, each with `name`, `level`, `effective`, `propagate`, `disabled`, `level_from` (`muru`, `temporary`, `changed since`, `python`, `application`, or null for a logger with no level of its own) and `handlers`), `disable` (the `logging.disable` level, or null), `last_resort` (a handler, or null), `capture_warnings` and `warnings_filters`, in order, each with `action`, `message`, `category`, `module` and `lineno`. A handler has `class`, `level`, `destination` (a stream, a file path, a socket address, syslog or a mail server, any URL's user information masked, or null), `format` (the format string, or the formatter's class) and `filters` |
 | `muructl debug memory` | The debug answer |
 | `muructl debug profile` | The debug answer, with the samples rather than a written profile |
 | `muructl debug trace` | The debug answer |

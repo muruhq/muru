@@ -101,6 +101,11 @@ calls `warnings.simplefilter` or `filterwarnings` itself still has the
 last word. `muructl run` and `muructl serve` take the application's
 table alone.
 
+[`muructl debug logging`](debugging.md#logging-setup) shows what a
+release's workers have in force once the application has configured
+logging and warnings itself: each logger's level and where it came
+from, the handlers and the warnings filters.
+
 A worker's records arrive tagged like the rest of its output, so a
 standard record reads `muru.worker[0]: WARNING demo: warned`. The host
 sets `MURU_LOG_LEVEL` and `MURU_LOG_FORMAT` to what was chosen, and
