@@ -110,6 +110,24 @@ pub fn inherit_at(command: &mut std::process::Command, fd: RawFd, target: RawFd)
     }
 }
 
+/// Whether anything still holds the write end of the pipe whose read end
+/// is `fd`.
+pub fn has_writers(fd: RawFd) -> bool {
+    // macOS reports a hang-up only to a poll that asks about reading.
+
+    let mut polled = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    // SAFETY: poll reads and writes the one pollfd it is given, which
+    // lives for the call, and a timeout of zero returns at once.
+
+    let ready = unsafe { libc::poll(&mut polled, 1, 0) };
+    ready >= 0 && polled.revents & libc::POLLHUP == 0
+}
+
 /// Take ownership of a descriptor this process was started with.
 pub fn take_inherited(fd: RawFd) -> OwnedFd {
     // SAFETY: the descriptor was placed for this process at start, and
@@ -155,5 +173,16 @@ mod tests {
         let mut text = String::new();
         copy.read_to_string(&mut text).unwrap();
         assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn a_pipe_has_writers_until_its_write_end_closes() {
+        use std::os::fd::AsRawFd as _;
+
+        let (read, write) = std::io::pipe().unwrap();
+        assert!(has_writers(read.as_raw_fd()));
+
+        drop(write);
+        assert!(!has_writers(read.as_raw_fd()));
     }
 }

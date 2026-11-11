@@ -35,6 +35,14 @@ def application(environ, start_response):
 """
 
 
+ECHO = """\
+def application(environ, start_response):
+    print("echo", environ["PATH_INFO"], flush=True)
+    start_response("200 OK", [("Content-Length", "2")])
+    return [b"ok"]
+"""
+
+
 def wait_for(predicate: Callable[[], bool], timeout: float = 20.0) -> None:
     deadline = time.monotonic() + timeout
 
@@ -88,6 +96,30 @@ def test_a_relay_is_replaced_adopted_and_drains_at_stop(tmp_path: Path) -> None:
 
     log = tmp_path / "logs" / "apps" / "shop" / "r1.log"
     assert "received SIGTERM, stopping" in log.read_text()
+
+
+def test_a_relay_is_replaced_under_single(tmp_path: Path) -> None:
+    """A host serving in its own process has nothing to answer a relay
+    with, so the replacement has to be given its output by muructl."""
+
+    (tmp_path / "echo.py").write_text(ECHO)
+    server = support.start(
+        "echo:application", workers=None, threads=None, chdir=tmp_path, args=["--single"]
+    )
+
+    try:
+        assert server.get("/first").status == 200
+        assert server.wait_for_log("echo /first"), server.log()
+        record = Path(os.environ["TMPDIR"]) / f"muru-{server.process.pid}" / "r1" / "relay.toml"
+        first = int(record.read_text().split("=")[1])
+
+        os.kill(first, signal.SIGKILL)
+        wait_for(lambda: int(record.read_text().split("=")[1]) != first)
+
+        assert server.get("/second").status == 200
+        assert server.wait_for_log("echo /second", timeout=20.0), server.log()
+    finally:
+        server.stop()
 
 
 def test_a_stalled_destination_holds_up_no_request(tmp_path: Path) -> None:

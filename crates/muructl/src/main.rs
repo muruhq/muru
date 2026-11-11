@@ -318,9 +318,9 @@ enum RelayCommand {
 /// What a relay is started with.
 #[derive(Args)]
 struct RelayRunArgs {
-    /// The Unix socket the host listens on for its relay.
+    /// The Unix socket the host listens on for its relay, unless it serves in its own process.
     #[arg(long, value_name = "PATH")]
-    connect: PathBuf,
+    connect: Option<PathBuf>,
 
     /// The Unix socket to serve the relay's reports on.
     #[arg(long, value_name = "PATH")]

@@ -3,7 +3,7 @@
 //! SIGTERM (design specification sections 6.1 and 13.1).
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd as _, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -828,11 +828,6 @@ impl HostProcess {
                     .context("copying the host's output pipe")?,
             )
             .stderr(output_write);
-        crate::fdpass::inherit_at(
-            command.as_std_mut(),
-            output_read.as_raw_fd(),
-            crate::relay::HOST_OUTPUT_FD,
-        );
 
         match &spec.detach_to {
             Some(_) => own_session(&mut command, spec.identity),
@@ -845,12 +840,22 @@ impl HostProcess {
             }
         }
 
-        let output_socket = run_dir.join(crate::relay::OUTPUT_SOCKET);
-        command
-            .arg("--output-socket")
-            .arg(&output_socket)
-            .arg("--output-fd")
-            .arg(crate::relay::HOST_OUTPUT_FD.to_string());
+        // With --single the host's own loop never runs, so nothing would
+        // answer a relay or hold pipes for one: there are no workers, and
+        // this process keeps the read end for any later relay instead.
+
+        if !spec.single {
+            crate::fdpass::inherit_at(
+                command.as_std_mut(),
+                output_read.as_raw_fd(),
+                crate::relay::HOST_OUTPUT_FD,
+            );
+            command
+                .arg("--output-socket")
+                .arg(run_dir.join(crate::relay::OUTPUT_SOCKET))
+                .arg("--output-fd")
+                .arg(crate::relay::HOST_OUTPUT_FD.to_string());
+        }
 
         if let Some(hooks) = &spec.hooks {
             command.arg("--hooks").arg(hooks);
@@ -1160,16 +1165,23 @@ impl HostProcess {
             .spawn()
             .with_context(|| format!("starting the host with {}", spec.python.display()))?;
 
-        // Both ends of the pipe now belong to the two processes.
+        // Both ends of the pipe now belong to the two processes, but for
+        // the read end kept under --single.
 
         drop(command);
-        drop(output_read);
+        let kept_output = spec.single.then(|| OwnedFd::from(output_read));
 
         // The host exits when this end of its stdin closes, whatever happens here.
 
         let stdin = child.stdin.take();
-        let relay =
-            RelaySupervisor::start(launch, RelayRunning::Child(first), logs, &relays, watcher);
+        let relay = RelaySupervisor::start(
+            launch,
+            RelayRunning::Child(first),
+            kept_output,
+            logs,
+            &relays,
+            watcher,
+        );
 
         // Sockets are numbered across every group in the order the host
         // forks them: the default group first, then each named group.
@@ -1244,7 +1256,8 @@ impl HostProcess {
             None => RelayRunning::Gone,
         };
 
-        let relay = RelaySupervisor::start(launch, running, &Logs::default(), &relays, watcher);
+        let relay =
+            RelaySupervisor::start(launch, running, None, &Logs::default(), &relays, watcher);
         let host = Self {
             process: Process::Adopted(pid),
             stdin: None,
@@ -2010,17 +2023,24 @@ pub struct RelayLaunch {
     log_file: Option<PathBuf>,
     settings: RelaySettings,
     identity: Option<Identity>,
+    /// The host serves in its own process, with no socket to connect to.
+    single: bool,
 }
 
 impl RelayLaunch {
     /// How to start the relay of a host started with `spec`.
     fn new(spec: &HostSpec, run_dir: &Path) -> anyhow::Result<Self> {
-        Self::for_release(
+        let launch = Self::for_release(
             run_dir.to_owned(),
             spec.detach_to.clone(),
             spec.relay,
             spec.identity,
-        )
+        )?;
+
+        Ok(Self {
+            single: spec.single,
+            ..launch
+        })
     }
 
     /// How to start the relay of a release whose sockets are in
@@ -2038,6 +2058,7 @@ impl RelayLaunch {
             log_file,
             settings,
             identity,
+            single: false,
         })
     }
 
@@ -2062,8 +2083,6 @@ impl RelayLaunch {
         command
             .arg("relay")
             .arg("run")
-            .arg("--connect")
-            .arg(self.output_socket())
             .arg("--control")
             .arg(self.control_socket())
             .arg("--queue")
@@ -2072,6 +2091,10 @@ impl RelayLaunch {
             .arg(self.settings.overflow.as_str())
             .stdin(Stdio::null())
             .stdout(Stdio::null());
+
+        if !self.single {
+            command.arg("--connect").arg(self.output_socket());
+        }
 
         if let Some(fd) = host_output {
             crate::fdpass::inherit_at(command.as_std_mut(), fd, crate::relay::HOST_OUTPUT_FD);
@@ -2183,6 +2206,7 @@ impl RelaySupervisor {
     fn start(
         launch: RelayLaunch,
         running: RelayRunning,
+        kept_output: Option<OwnedFd>,
         logs: &Logs,
         relays: &SharedRelays,
         watcher: RelayWatcher,
@@ -2193,6 +2217,7 @@ impl RelaySupervisor {
         let task = tokio::spawn(supervise_relay(
             launch,
             running,
+            kept_output,
             logs.clone(),
             Arc::clone(relays),
             watcher,
@@ -2255,6 +2280,7 @@ impl RelaySupervisor {
 async fn supervise_relay(
     launch: RelayLaunch,
     mut running: RelayRunning,
+    kept_output: Option<OwnedFd>,
     logs: Logs,
     relays: SharedRelays,
     watcher: RelayWatcher,
@@ -2291,9 +2317,16 @@ async fn supervise_relay(
         pid.store(0, Ordering::Relaxed);
 
         // A relay ends when the host does; only one that left a host
-        // still listening is started again.
+        // still there is started again. A host that serves in its own
+        // process does not listen: it is there while its output pipe has
+        // a writer.
 
-        if *stop.borrow() || !listening(&launch.output_socket()) {
+        let host_there = match &kept_output {
+            Some(output) => crate::fdpass::has_writers(output.as_raw_fd()),
+            None => listening(&launch.output_socket()),
+        };
+
+        if *stop.borrow() || !host_there {
             return;
         }
 
@@ -2317,7 +2350,9 @@ async fn supervise_relay(
 
         wait = (wait * 2).min(RELAY_BACKOFF_MAX);
 
-        match launch.spawn(None, &logs, &relays) {
+        let output = kept_output.as_ref().map(AsRawFd::as_raw_fd);
+
+        match launch.spawn(output, &logs, &relays) {
             Ok(child) => {
                 pid.store(child.id().unwrap_or(0), Ordering::Relaxed);
                 running = RelayRunning::Child(child);

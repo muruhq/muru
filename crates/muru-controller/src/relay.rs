@@ -116,8 +116,9 @@ impl Overflow {
 /// What a relay is started with.
 #[derive(Debug, Clone)]
 pub struct RelayArgs {
-    /// The host's output socket, to connect to.
-    pub connect: PathBuf,
+    /// The host's output socket, to connect to; none when the host serves
+    /// in its own process (`--single`) and has only its own output.
+    pub connect: Option<PathBuf>,
     /// The control socket to serve.
     pub control: PathBuf,
     /// The read end of the host's own output, when inherited.
@@ -886,8 +887,10 @@ async fn read_loop(args: RelayArgs, shared: Arc<Shared>) -> anyhow::Result<bool>
                 continue;
             }
 
-            if Instant::now() >= next_attempt {
-                match UnixStream::connect(&args.connect).await {
+            if let Some(path) = &args.connect
+                && Instant::now() >= next_attempt
+            {
+                match UnixStream::connect(path).await {
                     Ok(stream) => {
                         connection = Some(Connection::new(stream));
                         connected_once = true;
@@ -905,7 +908,7 @@ async fn read_loop(args: RelayArgs, shared: Arc<Shared>) -> anyhow::Result<bool>
 
         let tick = if host_gone_at.is_some() {
             Duration::from_millis(100)
-        } else if connection.is_none() {
+        } else if connection.is_none() && args.connect.is_some() {
             wait.max(Duration::from_millis(5))
         } else {
             Duration::from_secs(1)
@@ -1488,7 +1491,7 @@ mod tests {
         let listener = UnixListener::bind(&output).unwrap();
 
         let args = RelayArgs {
-            connect: output.clone(),
+            connect: Some(output.clone()),
             control: dir.path().join(CONTROL_SOCKET),
             host_output_fd: None,
             log_file: Some(log.clone()),
