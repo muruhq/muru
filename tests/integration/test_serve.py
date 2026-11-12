@@ -555,7 +555,12 @@ inputs.name = { default = 'pod' }
 
         serve.wait_for("command.finished: greet")
         records = [json.loads(line) for line in serve.stdout]
-        assert any(record["message"] == "[command greet] hello pod" for record in records)
+        assert any(
+            record["kind"] == "command"
+            and record["command"] == "greet"
+            and record["message"] == "hello pod"
+            for record in records
+        ), records
         assert any(
             record["kind"] == "muru" and record["message"].startswith("command.started: greet")
             for record in records

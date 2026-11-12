@@ -377,6 +377,26 @@ pub fn relayed_line(stream: Stream, time: SystemTime, text: &str) -> String {
     out
 }
 
+/// Write a line a declared command or `muructl exec` printed under a run
+/// or `muructl serve`, as `[command NAME] line` with the time in front
+/// when the stream is stamped, or in JSON as a record of kind `command`
+/// with the command's name. `time` is when the line arrived.
+pub fn command_line(stream: Stream, time: SystemTime, command: &str, line: &str) {
+    if json() {
+        let record = format!(
+            "{{\"time\":\"{}\",\"kind\":\"command\",\"command\":{},\"message\":{}{}}}\n",
+            full(time),
+            json_string(command),
+            json_string(line),
+            identity()
+        );
+        write(stream, record.as_bytes());
+        return;
+    }
+
+    relayed(stream, time, &format!("[command {command}] {line}"));
+}
+
 /// The JSON record of a line of the application's output. A line that
 /// is itself a JSON object, such as a record of Python logging's json
 /// format, is the record, with Muru's fields added: its own `time` is

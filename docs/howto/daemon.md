@@ -533,7 +533,8 @@ the dev group, without building sdists, with bytecode compiled and the
 project's extras and groups, into the state directory under
 `envs/APP/RELEASE`, as the release's user. The release is in the
 `building` state meanwhile, uv's lines go to the release log tagged
-`[build]`, and a failed build fails the release with uv's last line. A
+`[build]`, each with the full UTC time in front as every line of the
+file has, and a failed build fails the release with uv's last line. A
 source with its own `.venv` is used as it is, as before.
 
 ```

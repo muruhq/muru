@@ -5,12 +5,15 @@ build mode and a failed build."""
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 import pytest
 from support import provisioning as prov
 from support.daemon import Daemon, start_daemon
+
+TIMED = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z ")
 
 
 @pytest.fixture
@@ -56,9 +59,26 @@ def test_a_source_with_a_lock_and_no_venv_is_built_before_it_starts(
         < events.index("release.ready")
     )
 
-    log = (tmp_path / "daemon" / "logs" / "apps" / "hello" / "r1.log").read_text()
+    log_file = tmp_path / "daemon" / "logs" / "apps" / "hello" / "r1.log"
+    log = log_file.read_text()
     assert "[build] uv sync --frozen --python " in log
     assert "--no-dev --no-build --compile-bytecode" in log
+
+    # Every line of the release's log has the full time in front, the
+    # build's and a command's as well as the relay's (issue 605), and
+    # muructl logs shows each with it.
+
+    daemon.muructl("exec", "hello", "--", "python", "-c", "print('from a command')")
+    log = log_file.read_text()
+    assert "[command exec] from a command" in log
+    assert "[command exec] exited with status 0" in log
+    untimed = [line for line in log.splitlines() if not TIMED.match(line)]
+    assert not untimed, untimed
+
+    shown = daemon.muructl("logs", "hello@r1", "--lines", "1000").stdout.splitlines()
+    assert any("[build] uv sync" in line for line in shown), shown
+    untimed = [line for line in shown if not TIMED.match(line)]
+    assert not untimed, untimed
 
 
 def test_the_wheel_directory_may_come_from_the_environment(tmp_path: Path) -> None:

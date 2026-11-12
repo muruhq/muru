@@ -4895,12 +4895,18 @@ impl Daemon {
             }
 
             crate::host::own_session_std(&mut command, identity);
-            let _ = writeln!(log, "[build] {}", build.describe());
 
+            // Every line of the release's log has the full time in front,
+            // as the relay puts on the host's and the workers' lines.
+
+            let mut write = |line: &str| {
+                let time = muru_common::log::full(std::time::SystemTime::now());
+                let _ = writeln!(log, "{time} [build] {line}");
+            };
+
+            write(&build.describe());
             build
-                .run_command(command, &mut |line| {
-                    let _ = writeln!(log, "[build] {line}");
-                })
+                .run_command(command, &mut write)
                 .map_err(|error| error.to_string())
         })
         .await
