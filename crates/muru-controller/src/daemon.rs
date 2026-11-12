@@ -9723,11 +9723,11 @@ impl Daemon {
             None => return (String::new(), String::new()),
         };
 
+        // The time is UTC, with the zone, as `release list` and the
+        // events give it (issue 618).
+
         let phrase = if word == "retained" && running.retained_until_unix_ms > 0 {
-            let until =
-                std::time::UNIX_EPOCH + Duration::from_millis(running.retained_until_unix_ms);
-            let clock = muru_common::log::clock(until);
-            format!("retained until {}", &clock[..5])
+            format!("retained until {}", clock(running.retained_until_unix_ms))
         } else {
             word.to_owned()
         };
@@ -10162,13 +10162,13 @@ fn unix_ms_of(instant: Option<Instant>) -> u64 {
     })
 }
 
-/// A Unix time as HH:MM:SS, UTC.
 /// A time in milliseconds since the epoch in the full form of section
 /// 11.8, for the dashboard to show as the viewer's local clock.
 pub(crate) fn full_time(unix_ms: u64) -> String {
     muru_common::log::full(std::time::UNIX_EPOCH + Duration::from_millis(unix_ms))
 }
 
+/// A Unix time as HH:MM:SS, UTC.
 pub(crate) fn clock_hms(unix_ms: u64) -> String {
     let seconds = (unix_ms / 1000) % 86_400;
     format!(
@@ -10179,6 +10179,8 @@ pub(crate) fn clock_hms(unix_ms: u64) -> String {
     )
 }
 
+/// A Unix time as HH:MM with the zone, UTC: how `release list` and the
+/// process view give a retained release's deadline.
 fn clock(unix_ms: u64) -> String {
     let seconds = (unix_ms / 1000) % 86_400;
     format!("{:02}:{:02} UTC", seconds / 3600, (seconds % 3600) / 60)
@@ -10609,6 +10611,15 @@ mod tests {
             retained_by_default(&crate::model::ScalingSpec::default()),
             1
         );
+    }
+
+    /// The process view and `release list` give a retained release's
+    /// deadline the same way, in UTC with the zone (issue 618).
+    #[test]
+    fn a_deadline_is_given_in_utc_with_the_zone() {
+        let at = (7 * 3600 + 40 * 60) * 1000 + 59_999;
+
+        assert_eq!(clock(at), "07:40 UTC");
     }
 
     #[test]

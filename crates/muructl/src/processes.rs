@@ -844,7 +844,7 @@ mod tests {
             "shop",
             "r41",
             &["default", "crawlers"],
-            ("retained", "retained until 07:40"),
+            ("retained", "retained until 07:40 UTC"),
         );
         example.add(kept, 4242, "shop", 5 * 3600 + 13 * 60, 0.0, 91.0);
         example.add(relay, 4242, "shop", 5 * 3600 + 13 * 60, 0.0, 7.0);

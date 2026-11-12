@@ -666,7 +666,7 @@ PID    ROLE           WHAT                                   USER      UP     CP
 4330   ├─ host        api@r7 serving                         api     1d4h    0.0%    88.0MB     203    6/64       0    12 ms     48 ms
 4331   │  ├─ relay    api@r7 output to apps/api/r7.log       api     1d4h    0.0%     7.0MB
 4340   │  └─ worker   group default, worker 0                api     1d4h    4.2%   131.0MB     203    6/64            12 ms     48 ms
-4290   ├─ host        shop@r41 retained until 07:40          shop   5h13m    0.0%    91.0MB
+4290   ├─ host        shop@r41 retained until 07:40 UTC      shop   5h13m    0.0%    91.0MB
 4291   │  ├─ relay    shop@r41 output to apps/shop/r41.log   shop   5h13m    0.0%     7.0MB
        │  ├─ group    crawlers
 4293   │  ├─ worker   group crawlers, worker 0               shop   5h13m    0.0%   118.0MB
@@ -705,7 +705,7 @@ its name, so an idle instance shows which release serves:
 | `canary 10%` | is a rollout's candidate, taking that share of the traffic |
 | `held` | is ready and takes no traffic, as a deploy with `--hold` leaves it |
 | `draining` | is off the route, finishing the requests it has |
-| `retained until 07:40` | is kept warm for a rollback until then, in local time |
+| `retained until 07:40 UTC` | is kept warm for a rollback until then, given in UTC as `release list` gives it |
 
 A release still starting shows its state, `starting` or `warming`.
 `--json` gives the same as each host's `state`.
