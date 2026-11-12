@@ -29,6 +29,7 @@ message Hello {
   repeated GrpcMethod grpc_methods = 8; // the gRPC methods its mounts registered (section 6.13)
   repeated MountPool mount_pools = 9; // every named mount: the side it runs on, and its own slots or connections when it has them (section 6.7)
   repeated string websocket_mounts = 10; // the named mounts that accept websocket scopes (section 6.14)
+  uint32 worker = 11;               // its index within its group, which the edge names it by in the access log and its reports
 }
 
 // A named mount (section 6.7): the side it runs on, whose count its

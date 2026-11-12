@@ -1093,6 +1093,7 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
         grpc_methods: shared.grpc_methods.clone(),
         mount_pools: shared.mount_pools(),
         websocket_mounts: shared.websocket_mounts(),
+        worker: shared.worker,
     };
 
     if frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into())

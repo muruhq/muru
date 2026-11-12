@@ -54,7 +54,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Operations | muructl dashboard login | A single-use link signing a browser in to the dashboard, or with --token a bearer token for scripts | 10.7 |
 | Capacity | muructl scale RELEASE or APP | Processes, threads, bounds, temporary floors with --until | 7.4, 7.5 |
 | Capacity | muructl scale status RELEASE | Signals, decisions, churn counters | 7.3 |
-| Capacity | muructl restart RELEASE or APP --worker N | Replace one worker with a fresh one, or every worker in turn with --all; --pid names it by process id, --force kills it at once, --no-wait returns before the replacement serves | 7.6 |
+| Capacity | muructl restart RELEASE or APP --worker [GROUP/]N | Replace one worker with a fresh one, or every worker in turn with --all; --pid names it by process id, --force kills it at once, --no-wait returns before the replacement serves | 7.6 |
 | Capacity | muructl schedule add, list, remove | Scheduled capacity | 7.5 |
 | Capacity | muructl edge pools, set | Edge pools and process counts | 4.2 |
 | Operations | muructl cache list [user or daemon] | What the user cache and the daemon's re-creatable data take, by runtime library version and tag, certificates, uv's build cache and downloaded Pythons, with what uses each. Flags: --json, and with no daemon running --state-dir and --cache-dir | 13.8 |
@@ -77,8 +77,8 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Observability | muructl debug profile TARGET --for | Sampling profile written as collapsed stacks or pstats. Flags: --worker, --requests, --path, --format | 11.7 |
 | Observability | muructl debug trace TARGET --for | In-process sys.monitoring trace. Flags: --worker, --requests, --path, --force | 11.7 |
 | Observability | muructl debug memory TARGET | Resident size, gc counts and object counts; --trace --for for allocation sites, --diff for a snapshot comparison | 11.7 |
-| Observability | muructl debug attach TARGET --worker N | pdb in a worker over the admin API; --dap for debuggers speaking the Debug Adapter Protocol | 11.7 |
-| Observability | muructl debug exec TARGET --worker N -- CODE | Run a snippet in a worker (admin, audited, off in production by default) | 11.7 |
+| Observability | muructl debug attach TARGET --worker [GROUP/]N | pdb in a worker over the admin API; --dap for debuggers speaking the Debug Adapter Protocol | 11.7 |
+| Observability | muructl debug exec TARGET --worker [GROUP/]N -- CODE | Run a snippet in a worker (admin, audited, off in production by default) | 11.7 |
 | Observability | muructl debug inspect TARGET | sys.path, modules, redacted environment, settings, descriptors and threads | 11.7 |
 | Images and tools | muructl image check IMAGE | Probe an image against the contract | 8.6 |
 | Images and tools | muructl image build, dockerfile | Build an image or print the generated Dockerfile (later) | 8.6 |

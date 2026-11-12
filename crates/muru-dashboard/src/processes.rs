@@ -94,10 +94,16 @@ fn flatten(
     let role = text(process, "role");
     let app = text(process, "app");
     let release = text(process, "release");
-    let index = number(process, "index").map(|index| index as u64);
+    let index = number(process, "index").map(|index| index as u32);
+
+    // A worker's page names it by its index within its group, after the
+    // group's name outside the default group.
 
     let link = match role.as_str() {
-        "worker" => index.map(|index| format!("worker?release={app}@{release}&worker={index}")),
+        "worker" => index.map(|index| {
+            let worker = muru_common::worker::WorkerName::new(&text(process, "group"), index);
+            format!("worker?release={app}@{release}&worker={worker}")
+        }),
         "host" | "relay" => Some("#logs".to_owned()),
         _ => None,
     };
@@ -285,6 +291,10 @@ mod tests {
         assert_eq!(
             (rows[3].rate.as_str(), rows[3].busy.as_str()),
             ("12", "1/4")
+        );
+        assert_eq!(
+            rows[5].link.as_deref(),
+            Some("worker?release=shop@r1&worker=crawlers/0")
         );
         assert_eq!(rows[5].tree, "   └─ ");
     }

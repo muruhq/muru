@@ -1622,7 +1622,9 @@ impl Admin for Service {
                 app: request.app.clone(),
                 id: release.clone(),
                 op: request.op.clone(),
-                worker: request.worker,
+                worker: request
+                    .worker
+                    .map(|index| muru_common::worker::WorkerName::new(&request.group, index)),
                 args,
                 done: done_tx,
             })
@@ -1643,6 +1645,7 @@ impl Admin for Service {
                 .into_iter()
                 .map(|reply| pb::WorkerDebug {
                     index: reply.index,
+                    group: reply.group,
                     pid: reply.pid,
                     ok: reply.ok,
                     error: reply.error,

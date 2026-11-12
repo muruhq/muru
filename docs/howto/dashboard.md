@@ -129,8 +129,8 @@ page takes it only on request, and it is recorded as a `debug.memory`
 event as the command is.
 
 A page is at `workers?release=APP@RELEASE` and `worker?release=APP@RELEASE&worker=N`
-under the dashboard's address; a release that is not running says so
-in place of its workers.
+under the dashboard's address, `worker=GROUP/N` for a worker of a named
+group; a release that is not running says so in place of its workers.
 
 ### JSON for scripts
 
@@ -157,7 +157,7 @@ A token lasts twelve hours, or until the daemon restarts.
 | `/v1/websockets` | the WebSockets open: `open`, `endpoints` counted by path pattern, and `sockets`, the longest open first |
 | `/v1/events` | recent events, newest first |
 | `/v1/processes` | the processes as `muructl status --processes --json` prints them |
-| `/v1/debug/OP?release=APP@RELEASE` | a release's workers' answers to `status`, `stacks`, `tasks` or `memory`, as `muructl debug OP --json` prints them, one worker with `&worker=N`; 409 when the release is not running |
+| `/v1/debug/OP?release=APP@RELEASE` | a release's workers' answers to `status`, `stacks`, `tasks` or `memory`, as `muructl debug OP --json` prints them, one worker with `&worker=N` or `&worker=GROUP/N`; 409 when the release is not running |
 | `/v1/history?range=1h` | the charts' points: `[second, requests/s, errors/s, p50 ms, p95 ms, in flight, workers, WebSockets open]`, one a second for the last hour, or one a minute for the last day with `range=24h` |
 | `/v1/history/stream` | each new point as a Server-Sent Event of type `point` |
 | `/v1/events/stream` | each new event as it happens, as a rendered table row (type `event`) and as JSON (type `json`) |
@@ -192,7 +192,7 @@ dashboard shows:
 | Roll back to the previous release | `muructl rollback APP` |
 | Take a release out of traffic and stop it | `muructl drain APP@RELEASE` |
 | Pin a worker group's count, or let the autoscaler decide again | `muructl scale APP@RELEASE --group GROUP --processes N`, or `--unpin` |
-| Replace a worker | `muructl restart APP@RELEASE --worker N`, with `--force` to kill it at once |
+| Replace a worker | `muructl restart APP@RELEASE --worker N` (or `GROUP/N`), with `--force` to kill it at once |
 
 Every link or token `muructl dashboard login` issues is recorded as a
 `dashboard.login_issued` event.

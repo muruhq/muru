@@ -17,7 +17,7 @@ pub struct DebugAsk {
     /// The operation: status, stacks, tasks or memory.
     pub op: String,
     /// One worker, or every worker.
-    pub worker: Option<u32>,
+    pub worker: Option<muru_common::worker::WorkerName>,
 }
 
 /// A release's workers' answers to one operation.
@@ -32,8 +32,10 @@ pub struct DebugAnswer {
 /// One worker's answer, as `muructl debug --json` prints it.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct WorkerAnswer {
-    /// The worker's index.
+    /// The worker's index within its group.
     pub index: u32,
+    /// Its group.
+    pub group: String,
     /// Its pid.
     pub pid: u32,
     /// Whether it answered.
@@ -44,6 +46,14 @@ pub struct WorkerAnswer {
     pub result: Option<serde_json::Value>,
 }
 
+impl WorkerAnswer {
+    /// The worker's name: its index within its group, after the group's
+    /// name and a slash outside the default group.
+    pub fn name(&self) -> String {
+        muru_common::worker::WorkerName::new(&self.group, self.index).to_string()
+    }
+}
+
 /// Asks a release's workers something, or says why it could not.
 pub type DebugSource =
     Arc<dyn Fn(DebugAsk) -> crate::BoxFuture<Result<DebugAnswer, String>> + Send + Sync>;
@@ -51,8 +61,9 @@ pub type DebugSource =
 /// A worker that did not answer.
 #[derive(Debug, Clone, Default)]
 pub struct WorkerFailure {
-    /// The worker's index.
-    pub index: u32,
+    /// The worker's name: its index within its group, after the group's
+    /// name and a slash outside the default group.
+    pub worker: String,
     /// Its pid.
     pub pid: u32,
     /// Why.
@@ -62,8 +73,9 @@ pub struct WorkerFailure {
 /// One worker's row of `debug status` (section 11.7).
 #[derive(Debug, Clone, Default)]
 pub struct StatusRow {
-    /// The worker's index.
-    pub index: u32,
+    /// The worker's name: its index within its group, after the group's
+    /// name and a slash outside the default group.
+    pub worker: String,
     /// Its pid.
     pub pid: u32,
     /// Its group.
@@ -185,8 +197,8 @@ pub struct StackView {
     pub name: String,
     /// `worker 1`, or `3 workers (0, 1, 2)`.
     pub where_: String,
-    /// The workers it came from.
-    pub workers: Vec<u32>,
+    /// The workers it came from, by name.
+    pub workers: Vec<String>,
     /// The request the thread is serving, when it is.
     pub request: Option<ServingView>,
     /// Its frames, outermost first.
@@ -222,8 +234,9 @@ pub struct FrameView {
 /// One worker's answer to `debug tasks`.
 #[derive(Debug, Clone, Default)]
 pub struct TasksView {
-    /// The worker's index.
-    pub index: u32,
+    /// The worker's name: its index within its group, after the group's
+    /// name and a slash outside the default group.
+    pub worker: String,
     /// Its pid.
     pub pid: u32,
     /// The event loop's lag, formatted, when it has one.
@@ -252,8 +265,9 @@ pub struct TaskView {
 /// One worker's answer to `debug memory`.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryView {
-    /// The worker's index.
-    pub index: u32,
+    /// The worker's name: its index within its group, after the group's
+    /// name and a slash outside the default group.
+    pub worker: String,
     /// Its pid.
     pub pid: u32,
     /// Resident size, formatted.
@@ -306,7 +320,7 @@ pub fn status_rows(answer: &DebugAnswer) -> Vec<StatusRow> {
         .map(|worker| {
             let Some(result) = &worker.result else {
                 return StatusRow {
-                    index: worker.index,
+                    worker: worker.name(),
                     pid: worker.pid,
                     error: worker.error.clone().unwrap_or_default(),
                     ..StatusRow::default()
@@ -321,7 +335,7 @@ pub fn status_rows(answer: &DebugAnswer) -> Vec<StatusRow> {
             let stale = result["stale"].as_bool() == Some(true);
 
             StatusRow {
-                index: worker.index,
+                worker: worker.name(),
                 pid: worker.pid,
                 group: result["group"].as_str().unwrap_or("default").to_owned(),
                 uptime: uptime_text(result["uptime_s"].as_f64().unwrap_or(0.0) as u64),
@@ -347,7 +361,7 @@ pub fn failures(answer: &DebugAnswer) -> Vec<WorkerFailure> {
         .iter()
         .filter(|worker| worker.result.is_none())
         .map(|worker| WorkerFailure {
-            index: worker.index,
+            worker: worker.name(),
             pid: worker.pid,
             error: worker.error.clone().unwrap_or_default(),
         })
@@ -412,11 +426,11 @@ pub fn merge_stacks(answer: &DebugAnswer) -> Vec<StackView> {
             });
 
             match same {
-                Some(entry) => entry.workers.push(worker.index),
+                Some(entry) => entry.workers.push(worker.name()),
                 None => merged.push(StackView {
                     name,
                     where_: String::new(),
-                    workers: vec![worker.index],
+                    workers: vec![worker.name()],
                     request,
                     frames,
                 }),
@@ -431,12 +445,7 @@ pub fn merge_stacks(answer: &DebugAnswer) -> Vec<StackView> {
             format!(
                 "{} workers ({})",
                 stack.workers.len(),
-                stack
-                    .workers
-                    .iter()
-                    .map(|index| index.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                stack.workers.join(", ")
             )
         };
     }
@@ -459,7 +468,7 @@ pub fn tasks_views(answer: &DebugAnswer) -> Vec<TasksView> {
         .map(|worker| {
             let Some(result) = &worker.result else {
                 return TasksView {
-                    index: worker.index,
+                    worker: worker.name(),
                     pid: worker.pid,
                     error: worker.error.clone().unwrap_or_default(),
                     ..TasksView::default()
@@ -491,7 +500,7 @@ pub fn tasks_views(answer: &DebugAnswer) -> Vec<TasksView> {
                 .collect();
 
             TasksView {
-                index: worker.index,
+                worker: worker.name(),
                 pid: worker.pid,
                 lag: result["lag_ms"].as_f64().map(|lag| format!("{lag:.1} ms")),
                 note: result["note"]
@@ -513,7 +522,7 @@ pub fn memory_views(answer: &DebugAnswer) -> Vec<MemoryView> {
         .map(|worker| {
             let Some(result) = &worker.result else {
                 return MemoryView {
-                    index: worker.index,
+                    worker: worker.name(),
                     pid: worker.pid,
                     error: worker.error.clone().unwrap_or_default(),
                     ..MemoryView::default()
@@ -536,7 +545,7 @@ pub fn memory_views(answer: &DebugAnswer) -> Vec<MemoryView> {
                 .collect();
 
             MemoryView {
-                index: worker.index,
+                worker: worker.name(),
                 pid: worker.pid,
                 rss: size("rss"),
                 pss: size("pss"),
@@ -573,6 +582,7 @@ mod tests {
     fn answered(index: u32, result: serde_json::Value) -> WorkerAnswer {
         WorkerAnswer {
             index,
+            group: "default".to_owned(),
             pid: 100 + index,
             ok: true,
             error: None,
@@ -608,7 +618,8 @@ mod tests {
                     ]}),
                 ),
                 WorkerAnswer {
-                    index: 2,
+                    index: 0,
+                    group: "crawlers".to_owned(),
                     pid: 102,
                     ok: false,
                     error: Some("did not answer".to_owned()),
@@ -629,7 +640,7 @@ mod tests {
 
         let failed = failures(&answer);
         assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].index, 2);
+        assert_eq!(failed[0].worker, "crawlers/0");
         assert_eq!(failed[0].error, "did not answer");
     }
 

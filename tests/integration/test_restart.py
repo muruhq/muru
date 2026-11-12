@@ -85,7 +85,7 @@ def test_a_worker_is_named_by_pid_and_a_missing_one_is_refused(daemon: Daemon) -
 
     refused = daemon.muructl("restart", "shop", "--worker", "7", check=False)
     assert refused.returncode != 0
-    assert "shop@r1 has no serving worker with index 7" in refused.stderr, refused.stderr
+    assert "shop@r1 has no serving worker 7" in refused.stderr, refused.stderr
 
 
 def test_force_recovers_a_frozen_worker(daemon: Daemon) -> None:

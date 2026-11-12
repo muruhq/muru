@@ -79,6 +79,10 @@ pub(crate) struct Conn {
 
 struct WorkerSlots {
     path: PathBuf,
+    /// Its index within its group, from HELLO: what the access log, the
+    /// requests in flight and the metrics name it by, rather than its
+    /// place in the pool, which shifts while a worker is out of routing.
+    number: usize,
     /// What the worker called itself in HELLO (wsgi or asgi), informational.
     worker_type: String,
     /// Whether its default mount accepts websocket scopes (section 5.6).
@@ -168,6 +172,7 @@ impl WorkerSlots {
 
         Self {
             path,
+            number: usize::try_from(hello.worker).unwrap_or(usize::MAX),
             default_async,
             threads,
             event_loop,
@@ -475,7 +480,7 @@ impl Drop for Slot {
 /// and its own count of the busy ones.
 #[derive(Debug, Clone)]
 pub struct WorkerStatus {
-    /// The worker's index.
+    /// The worker's index within its group, as it said in HELLO.
     pub index: usize,
     /// Its link socket.
     pub path: PathBuf,
@@ -615,7 +620,11 @@ impl Drop for Waiting<'_> {
 pub(crate) struct Lease {
     pub(crate) conn: Conn,
     pub(crate) permit: Slot,
+    /// The worker's place in the pool, which the connection goes back to.
     pub(crate) worker: usize,
+    /// The worker's index within its group, which the request is
+    /// recorded against.
+    pub(crate) number: usize,
     /// Section 6.7: the slot is a shared one the request's mount borrows,
     /// which the request head tells the worker.
     pub(crate) borrowed: bool,
@@ -718,9 +727,8 @@ impl LinkPool {
     pub fn workers(&self) -> Vec<WorkerStatus> {
         self.workers
             .iter()
-            .enumerate()
-            .map(|(index, worker)| WorkerStatus {
-                index,
+            .map(|worker| WorkerStatus {
+                index: worker.number,
                 path: worker.path.clone(),
                 worker_type: worker.worker_type.clone(),
                 slots: worker.slots(false) + worker.slots(true),
@@ -865,6 +873,7 @@ impl LinkPool {
                 conn,
                 permit,
                 worker: best,
+                number: worker.number,
                 borrowed,
                 on_loop: worker.on_loop(mount),
                 websockets: worker.accepts_websockets(mount),
@@ -1948,6 +1957,7 @@ async fn handle_inner(
             conn,
             permit,
             worker,
+            number,
             borrowed,
             on_loop,
             websockets,
@@ -1960,9 +1970,9 @@ async fn handle_inner(
         }
 
         let Conn { reader, mut writer } = conn;
-        recording.record.worker = Some(worker);
+        recording.record.worker = Some(number);
         recording.record.retried = retried;
-        recording.in_flight.dispatched(worker, on_loop);
+        recording.in_flight.dispatched(number, on_loop);
 
         // Section 5.6: a worker that takes websocket scopes gets the
         // upgrade as one, with no body; any other worker sees an ordinary

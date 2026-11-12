@@ -18,12 +18,14 @@ one access log, which `muructl logs` reads.
 
 Everything a worker writes to standard output or standard error goes
 through the release's log relay, a small process beside its host, which
-adds the worker's index, so output from different workers can be told
-apart:
+adds the worker's index within its group, with the group's name in
+front for a worker of a named group, so output from different workers
+can be told apart:
 
 ```
 muru.worker[0]: Traceback (most recent call last):
 muru.worker[1].stdout: starting import of catalogue
+muru.worker[reports/0]: report for 2026-11-02 written
 ```
 
 Lines from the host itself carry `muru.host[PID]:`, lines from the relay

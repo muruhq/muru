@@ -607,7 +607,7 @@ pub enum Command {
         /// The operation: status, stacks, tasks, inspect or logging.
         op: String,
         /// One worker, or every worker.
-        worker: Option<u32>,
+        worker: Option<muru_common::worker::WorkerName>,
         /// The operation's arguments.
         args: serde_json::Value,
         /// Answered with each worker's reply, or why none could be asked.
@@ -2594,17 +2594,6 @@ fn command_mentions(pid: u32, path: &Path, title: &str) -> bool {
 /// 2.1), with whatever spaces `ps` shows for the rest of the area.
 fn names(command: &str, path: &Path, title: &str) -> bool {
     command.contains(&path.display().to_string()) || command.trim() == title
-}
-
-/// The index of the worker a link socket belongs to, from its name:
-/// `worker-N.sock`, or `worker-GROUP-N.sock` in a worker group.
-fn worker_index(socket: &str) -> Option<u32> {
-    let name = std::path::Path::new(socket).file_stem()?.to_str()?;
-    name.strip_prefix("worker-")?
-        .rsplit('-')
-        .next()?
-        .parse()
-        .ok()
 }
 
 impl Daemon {
@@ -4609,11 +4598,12 @@ impl Daemon {
                     return;
                 }
 
+                let whom = worker.as_ref().map_or_else(
+                    || "every worker".to_owned(),
+                    |worker| format!("worker {worker}"),
+                );
+
                 if op == "attach" {
-                    let whom = worker.map_or_else(
-                        || "every worker".to_owned(),
-                        |index| format!("worker {index}"),
-                    );
                     self.events.emit(
                         "debug.attached",
                         &format!("{app}@{id}"),
@@ -4624,10 +4614,6 @@ impl Daemon {
 
                 if matches!(op.as_str(), "profile" | "trace" | "memory" | "exec") {
                     let subject = format!("{app}@{id}");
-                    let whom = worker.map_or_else(
-                        || "every worker".to_owned(),
-                        |index| format!("worker {index}"),
-                    );
 
                     let detail = if op == "exec" {
                         let code: String = args
@@ -4659,7 +4645,7 @@ impl Daemon {
                 match control {
                     Some(control) => {
                         self.last_request += 1;
-                        control.request(self.last_request, &op, worker, &args);
+                        control.request(self.last_request, &op, worker.as_ref(), &args);
                         self.asked.insert(self.last_request, done);
                     }
                     None => {
@@ -6247,23 +6233,34 @@ impl Daemon {
     fn replace_unreachable(&mut self, applied: pb::Applied) {
         for worker in applied.unreachable {
             let subject = format!("{}@{}", worker.app, worker.release);
-            let index = worker_index(&worker.socket);
-            let whom = index.map_or_else(
-                || format!("the worker at {}", worker.socket),
-                |index| format!("worker {index}"),
-            );
-            let control = self
+            let running = self
                 .running
-                .get(&(worker.app.clone(), worker.release.clone()))
-                .and_then(|running| running.control.as_ref());
+                .get(&(worker.app.clone(), worker.release.clone()));
 
-            let action = match (index, control) {
-                (Some(index), Some(control)) => {
+            // The host announced which worker listens on each socket.
+
+            let name = running.and_then(|running| {
+                running
+                    .workers
+                    .iter()
+                    .find(|announced| announced.socket == worker.socket)
+                    .map(|announced| {
+                        muru_common::worker::WorkerName::new(&announced.group, announced.index)
+                    })
+            });
+            let whom = name.as_ref().map_or_else(
+                || format!("the worker at {}", worker.socket),
+                |name| format!("worker {name}"),
+            );
+            let control = running.and_then(|running| running.control.as_ref());
+
+            let action = match (&name, control) {
+                (Some(name), Some(control)) => {
                     self.last_request += 1;
                     control.request(
                         self.last_request,
                         "restart",
-                        Some(index),
+                        Some(name),
                         &serde_json::json!({ "force": true }),
                     );
                     "; it is being replaced"

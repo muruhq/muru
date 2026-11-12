@@ -277,7 +277,7 @@ message OpenWebSocket {
   string group = 6;
   string mount = 7;
   string path = 8;
-  int32 worker = 9;                 // -1 when not known
+  int32 worker = 9;                 // its index within its group; -1 when not known
   uint64 opened_unix_ms = 10;
   uint64 received = 11;             // messages from the client
   uint64 sent = 12;                 // messages to the client
@@ -326,7 +326,7 @@ message InFlightRequest {
   string target = 7;                // the path with its query string
   string state = 8;                 // queued or running
   string kind = 9;                  // wsgi, wsgi streaming, asgi, asgi streaming, grpc, handoff or upstream; - while queued
-  int32 worker = 10;                // -1 when none has it
+  int32 worker = 10;                // its index within its group; -1 when none has it
   uint64 started_unix_ms = 11;
   uint64 age_ms = 12;
 }
@@ -799,7 +799,7 @@ message ReleaseGroup {
 }
 
 message Worker {
-  uint32 index = 1;
+  uint32 index = 1;                 // its index within its group
   uint32 pid = 2;
   string socket = 3;
   string group = 4;                 // its worker group, default when none is named
@@ -839,8 +839,9 @@ message DebugRequest {
   string app = 1;
   string release = 2;               // the application's current release when empty
   string op = 3;                    // status, stacks, tasks, inspect, logging, restart or the other debug operations
-  optional uint32 worker = 4;       // one worker, else every worker
+  optional uint32 worker = 4;       // one worker, by its index within its group, else every worker
   string args_json = 5;             // the operation's arguments as a JSON object
+  string group = 6;                 // the group of the worker asked for; the default group when empty
 }
 
 message DebugResponse {
@@ -850,11 +851,12 @@ message DebugResponse {
 
 // One worker's answer.
 message WorkerDebug {
-  uint32 index = 1;
+  uint32 index = 1;                 // its index within its group
   uint32 pid = 2;
   bool ok = 3;
   string error = 4;                 // when not ok
   string result_json = 5;           // the operation's result, when ok
+  string group = 6;                 // its worker group
 }
 
 message NoteBundleRequest {

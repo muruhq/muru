@@ -639,7 +639,8 @@ struct WorkerPage<'a> {
     release: &'a str,
     /// What the page the dashboard opens on is called: daemon, or run.
     home: &'a str,
-    worker: u32,
+    /// The worker's name, as worker= gives it.
+    worker: &'a str,
     status: &'a [inspect::StatusRow],
     error: &'a str,
 }
@@ -1085,20 +1086,23 @@ async fn inspect_paths(
         ));
     };
 
+    // A worker is named by its index within its group, with the group's
+    // name and a slash in front outside the default group.
+
     let worker = match query.get("worker") {
-        Some(text) => match text.parse::<u32>() {
-            Ok(index) => Some(index),
+        Some(text) => match muru_common::worker::WorkerName::parse(text) {
+            Ok(name) => Some(name),
             Err(_) => {
                 return Some(plain(
                     StatusCode::BAD_REQUEST,
-                    "worker=N names a worker by its index\n",
+                    "worker=N or worker=GROUP/N names a worker\n",
                 ));
             }
         },
         None if kind == "/worker" => {
             return Some(plain(
                 StatusCode::BAD_REQUEST,
-                "worker=N names a worker by its index\n",
+                "worker=N or worker=GROUP/N names a worker\n",
             ));
         }
         None => None,
@@ -1108,7 +1112,7 @@ async fn inspect_paths(
         app: app.to_owned(),
         release: id.to_owned(),
         op: op.to_owned(),
-        worker,
+        worker: worker.clone(),
     })
     .await;
 
@@ -1138,7 +1142,7 @@ async fn inspect_paths(
             WorkerPage {
                 release: &release,
                 home,
-                worker: worker.unwrap_or_default(),
+                worker: &worker.map(|worker| worker.to_string()).unwrap_or_default(),
                 status: &status_rows(&answer),
                 error: &error,
             }

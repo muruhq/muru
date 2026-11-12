@@ -42,6 +42,8 @@ def serve(
     exit_grace_ms: int = 2000,
     gil_stall_timeout_ms: int | None = None,
     handoff: bool = False,
+    sync_threads: int = 0,
+    worker: int = 0,
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 

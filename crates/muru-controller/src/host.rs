@@ -70,7 +70,7 @@ pub enum HostMessage {
 /// One worker a host runs, as it last announced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostWorker {
-    /// The worker's index within the host.
+    /// The worker's index within its group.
     pub index: u32,
     /// Its pid.
     pub pid: u32,
@@ -85,8 +85,10 @@ pub struct HostWorker {
 /// One worker's answer to a request (section 11.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerReply {
-    /// The worker's index.
+    /// The worker's index within its group.
     pub index: u32,
+    /// Its group.
+    pub group: String,
     /// Its pid.
     pub pid: u32,
     /// Whether it answered.
@@ -100,7 +102,7 @@ pub struct WorkerReply {
 /// What one worker last reported to its host (sections 7.6 and 7.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerStatus {
-    /// The worker's index within the host.
+    /// The worker's index within its group.
     pub index: u32,
     /// Its pid.
     pub pid: u32,
@@ -288,6 +290,7 @@ impl HostMessage {
                             .iter()
                             .map(|worker| WorkerReply {
                                 index: worker["index"].as_u64().unwrap_or(0) as u32,
+                                group: worker["group"].as_str().unwrap_or("default").to_owned(),
                                 pid: worker["pid"].as_u64().unwrap_or(0) as u32,
                                 ok: worker["ok"].as_bool().unwrap_or(false),
                                 error: worker["error"].as_str().unwrap_or_default().to_owned(),
@@ -416,14 +419,22 @@ impl HostControl {
             .send(format!("{{\"type\":\"applied\",\"version\":{version}}}\n"));
     }
 
-    /// Ask the host's workers something (section 11.7); the answer comes
-    /// back as a Response message carrying the same id.
-    pub fn request(&self, id: u64, op: &str, worker: Option<u32>, args: &serde_json::Value) {
+    /// Ask the host's workers something (section 11.7), one of them when
+    /// `worker` names it; the answer comes back as a Response message
+    /// carrying the same id.
+    pub fn request(
+        &self,
+        id: u64,
+        op: &str,
+        worker: Option<&muru_common::worker::WorkerName>,
+        args: &serde_json::Value,
+    ) {
         let message = serde_json::json!({
             "type": "request",
             "id": id,
             "op": op,
-            "worker": worker,
+            "worker": worker.map(|worker| worker.index),
+            "group": worker.map(|worker| worker.group.as_str()),
             "args": args,
         });
         let _ = self.outgoing.send(format!("{message}\n"));
