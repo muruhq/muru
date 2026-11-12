@@ -298,10 +298,10 @@ fn environment_table() -> *mut *mut *mut libc::c_char {
         static mut environ: *mut *mut libc::c_char;
     }
 
-    // SAFETY: taking the address of the C runtime's `environ` reads
-    // nothing.
+    // Taking the address of the C runtime's `environ` reads nothing, so
+    // it needs no `unsafe`.
 
-    unsafe { &raw mut environ }
+    &raw mut environ
 }
 
 /// Where the C runtime keeps `environ`.
