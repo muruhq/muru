@@ -83,7 +83,11 @@ def start(
     env: dict[str, str] | None = None,
     app: str | None = "plain_wsgi:application",
     wait: bool = True,
+    short: bool = False,
 ) -> Serve:
+    """Start muructl serve; `short` starts it as `muructl serve` alone, as a
+    container's command line does, with every setting in its variable."""
+
     muructl = support.muructl_path()
     if muructl is None:
         support.unavailable("muructl is not built (cargo build -p muructl)")
@@ -112,12 +116,26 @@ def start(
     if "--run-dir" in args:
         run_dir = Path(args[args.index("--run-dir") + 1])
 
+    command = [str(muructl), "serve", *([app] if app is not None else []), *options, *args]
+    variables = {**os.environ, **(env or {})}
+
+    if short:
+        command = ["muructl", "serve"]
+        variables.update(
+            {
+                f"MURU_SERVE_{flag[2:].replace('-', '_').upper()}": value
+                for flag, value in defaults.items()
+            }
+        )
+        variables["MURU_SERVE_ENTRYPOINT"] = app or ""
+
     process = subprocess.Popen(
-        [str(muructl), "serve", *([app] if app is not None else []), *options, *args],
+        command,
+        executable=str(muructl),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env={**os.environ, **(env or {})},
+        env=variables,
     )
     serve = Serve(process, port, admin_port, run_dir)
 
@@ -147,6 +165,30 @@ def start(
                 time.sleep(0.05)
 
     return serve
+
+
+def test_started_with_a_short_command_line_its_title_names_the_application(
+    tmp_path: Path,
+) -> None:
+    """Started as `muructl serve` alone, the process's title runs on past its
+    arguments, over the environment, which its workers still have (issue
+    606)."""
+
+    serve = start(tmp_path, short=True, env={"MURU_TEST_KEPT": "kept"})
+
+    try:
+        title = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(serve.process.pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        assert title == "muru serve plain-wsgi", title
+
+        status, body = serve.get("/env?name=MURU_TEST_KEPT")
+        assert status == 200 and json.loads(body)["value"] == "kept", body
+    finally:
+        serve.stop()
 
 
 def test_serves_with_probes_and_metrics_on_the_admin_port(tmp_path: Path) -> None:

@@ -732,6 +732,13 @@ apart:
 | Its log relay | `muru relay APP@RELEASE` |
 | A worker | `muru worker APP@RELEASE GROUP/INDEX` |
 
+A title longer than the command line the process was started with,
+such as `muru serve shop` for a process started as `muructl serve`,
+takes the room of the environment strings that follow it, which the
+process keeps a copy of, so the environment it and the processes it
+starts see is unchanged, while `/proc/PID/environ` shows the title in
+its place.
+
 On Linux the short name `top` shows by default, and `/proc/PID/comm`
 holds, is `murud`, `muru-edge`, `muru-run`, `muru-serve`, `muru-host`,
 `muru-relay` or `muru-worker`.

@@ -966,6 +966,11 @@ fn main() -> anyhow::Result<()> {
 
     init::become_init();
 
+    // Section 2.1: room for the process's title beyond its arguments,
+    // taken while nothing but this thread runs (issue 606).
+
+    muru_common::title::reserve();
+
     // A panic is reported as one of Muru's lines, stamped in a log file
     // as every other line there is (section 11.8).
 
