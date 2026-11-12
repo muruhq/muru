@@ -21,6 +21,7 @@ import tomllib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 from support import server as support
@@ -187,6 +188,56 @@ def test_started_with_a_short_command_line_its_title_names_the_application(
 
         status, body = serve.get("/env?name=MURU_TEST_KEPT")
         assert status == 200 and json.loads(body)["value"] == "kept", body
+    finally:
+        serve.stop()
+
+
+def test_a_named_group_and_a_mount_are_served_and_ready_counts_the_group(
+    tmp_path: Path,
+) -> None:
+    """A project's named group and mount work under serve: a request for the
+    mount's path reaches the group's worker, /status lists both groups, and
+    /readyz counts each required group's workers, so the reports group with
+    one process holds it back at --min-ready 2 (issue 620)."""
+
+    mounted = support.ROOT / "tests" / "fixtures" / "projects" / "mounted"
+    serve = start(
+        tmp_path,
+        "--chdir",
+        str(mounted),
+        "--processes",
+        "2",
+        "--min-ready",
+        "2",
+        "--admin-status",
+        app=str(mounted),
+        wait=False,
+    )
+
+    try:
+        support.wait_for_port(serve.port, serve.process)
+
+        def groups() -> dict[str, Any]:
+            status, body = serve.admin("/status")
+            return json.loads(body).get("groups", {}) if status == 200 else {}
+
+        deadline = time.monotonic() + 30
+
+        while {name: group["ready"] for name, group in groups().items()} != {
+            "default": 2,
+            "reports": 1,
+        }:
+            assert time.monotonic() < deadline, (groups(), serve.output())
+            time.sleep(0.05)
+
+        status, body = serve.get("/reports/daily")
+        assert status == 200, body
+        answered = json.loads(body)
+        assert (answered["mount"], answered["group"]) == ("reports", "reports"), answered
+        assert json.loads(serve.get("/")[1])["group"] == "default"
+
+        status, reason = serve.admin("/readyz")
+        assert status == 503 and "group reports has 1 of 2 workers ready" in reason, reason
     finally:
         serve.stop()
 

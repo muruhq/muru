@@ -279,7 +279,7 @@ setting over it.
 | `--listen ADDRESS` | `0.0.0.0:8080` | where the application is served |
 | `--admin-listen ADDRESS` | `0.0.0.0:9090` | where the probes and metrics are served, or `off` |
 | `--admin-status` | off | serve `/status` on the admin port too |
-| `--min-ready N` | 1 | the workers ready in every mount for `/readyz` to pass |
+| `--min-ready N` | 1 | the workers ready in each required [group](#worker-groups-and-mounts) for `/readyz` to pass |
 | `--processes N` | `auto`, from the container's CPU limit | worker processes; see [sizing](#sizing-from-the-containers-limits) |
 | `--threads N` | 4 | threads per WSGI worker |
 | `--python PATH` | as above | the interpreter |
@@ -355,6 +355,36 @@ resize) takes effect when the container restarts. On macOS, and in a
 container with no limits, the worker count is the number of CPUs and no
 memory limit is derived.
 
+## Worker groups and mounts
+
+A project's [worker groups](worker-groups.md) and [mounts](mounts.md)
+work under `muructl serve` as they do under `muructl run` and the
+daemon, from the `groups` and `mounts` tables of its `[tool.muru]`
+table, or of the file `--config` names:
+
+```toml
+[mounts.reports]
+path = "/reports"
+entrypoint = "shop.reports:application"
+
+[groups.reports]
+paths = ["/reports/*"]
+mounts = ["reports"]
+processes = 1
+```
+
+`--processes`, or the count worked out from the [container's
+limits](#sizing-from-the-containers-limits), sizes the default group. A
+named group's own `processes`, `threads`, `sync_threads` and
+`concurrency` size its workers, and a group that leaves one out takes
+the release's.
+
+`/readyz` counts each group: every group needs `--min-ready` workers
+ready, except a group marked `optional = true`, which never holds
+readiness back. While a group is short, `/readyz` answers 503 and says
+which, for example `group reports has 1 of 2 workers ready`. `/status`,
+with `--admin-status`, lists each group with its workers ready.
+
 ## Probes and metrics
 
 The admin port answers the questions a container platform asks, apart
@@ -364,7 +394,7 @@ reaches it and a busy application never delays it:
 | Path | Answers 200 when | Use it for |
 | --- | --- | --- |
 | `/livez` | the edge responds and the host is alive; a pod whose workers are all busy is alive | a liveness probe |
-| `/readyz` | at least `--min-ready` workers are ready in every mount, and the container is not stopping | a readiness probe |
+| `/readyz` | at least `--min-ready` workers are ready in each worker group that is not optional, and the container is not stopping | a readiness probe |
 | `/startupz` | the application has loaded and the first workers are ready | a startup probe |
 | `/metrics` | always, with the [metrics](metrics.md) in Prometheus text format | scraping |
 | `/status` | with `--admin-status`: the release, its workers and groups, and the settings worked out, as JSON | looking at a running container |
