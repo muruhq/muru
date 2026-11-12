@@ -43,10 +43,10 @@ BREAKPOINT_TIMEOUT = 60.0
 MAX_SESSION = 3600.0
 IDLE_LIMIT = 600.0
 
-# What breakpoint() needs from the worker: its index and the descriptor
-# its events go out on.
+# What breakpoint() needs from the worker: its name, as --worker takes
+# it, and the descriptor its events go out on.
 
-_worker = {"index": 0, "report": -1}
+_worker: dict[str, Any] = {"name": "0", "report": -1}
 _ids = itertools.count(1)
 _lock = threading.Lock()
 _sessions: dict[int, Session | Relay] = {}
@@ -57,10 +57,14 @@ _waiting: list[Waiting] = []
 _adapter: dict[str, tuple[str, int]] = {}
 
 
-def install(index: int, report: int | None) -> None:
-    """Make breakpoint() wait for an attach in this worker, unless PYTHONBREAKPOINT is set."""
+def install(name: str, report: int | None) -> None:
+    """Make breakpoint() wait for an attach in this worker, unless PYTHONBREAKPOINT is set.
 
-    _worker["index"] = index
+    `name` is the worker's as `--worker` takes it: its index within its
+    group, after the group's name and a slash outside the default group.
+    """
+
+    _worker["name"] = name
     _worker["report"] = -1 if report is None else report
 
     if not os.environ.get("PYTHONBREAKPOINT"):
@@ -316,7 +320,7 @@ def breakpoint_hook(*args: Any, timeout: float = BREAKPOINT_TIMEOUT, **kwargs: A
         _waiting.append(waiting)
 
     _native.suspend_timeouts()
-    index = _worker["index"]
+    name = _worker["name"]
 
     # The line names the command that works as it is: the application
     # as the daemon or the run names it, and this worker.
@@ -327,7 +331,7 @@ def breakpoint_hook(*args: Any, timeout: float = BREAKPOINT_TIMEOUT, **kwargs: A
         "debug.breakpoint",
         "warning",
         f"breakpoint() at {waiting.where} waits {timeout:g} s for muructl debug attach "
-        f"{context().app} --worker {index}",
+        f"{context().app} --worker {name}",
     )
 
     # Waiting in a coroutine holds the event loop, so the wait beats for

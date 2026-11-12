@@ -934,11 +934,42 @@ enum Link {
 /// every crate's warnings, the MCP library's chatter left out.
 const DEFAULT_LOG: &str = "info,rmcp=warn";
 
+/// Whether a command goes on when the reader of its output has gone: one
+/// that serves, or starts and looks after other processes, stops in its
+/// own way. Every other command only prints, and ends when its reader
+/// goes, as SIGPIPE ends other command-line tools.
+fn outlives_its_reader(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Run(_)
+            | Command::Serve(_)
+            | Command::ServeStatic(_)
+            | Command::Exec(_)
+            | Command::Mcp { .. }
+            | Command::Edge { .. }
+            | Command::Relay { .. }
+            | Command::Daemon {
+                command: admin::DaemonCommand::Run(_),
+            }
+            | Command::Commands {
+                command: admin::CommandCommand::Run(_),
+            }
+            | Command::Debug {
+                command: admin::DebugCommand::Attach(_),
+            }
+    )
+}
+
 fn main() -> anyhow::Result<()> {
     // Section 6.10: as a container's PID 1, muructl forks first and the
     // parent stays as the init; everything below is the child.
 
     init::become_init();
+
+    // Section 2.1: room for the process's title beyond its arguments,
+    // taken while nothing but this thread runs (issue 606).
+
+    muru_common::title::reserve();
 
     // A panic is reported as one of Muru's lines, stamped in a log file
     // as every other line there is (section 11.8).
@@ -997,6 +1028,13 @@ fn main() -> anyhow::Result<()> {
         }
         other => other,
     };
+
+    // A command that only prints ends when its reader goes, as other
+    // command-line tools do (issue 608).
+
+    if !outlives_its_reader(&command) {
+        muru_common::log::end_when_reader_goes(init::end_by_sigpipe);
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3796,8 +3834,8 @@ async fn run_with(
                 // that it does before it stops the old one.
 
                 match message {
-                    muru_controller::host::HostMessage::Workers { version, sockets, groups, workers, .. } => {
-                        run_processes.workers(workers);
+                    muru_controller::host::HostMessage::Workers { version, sockets, groups, workers, interfaces, .. } => {
+                        run_processes.workers(workers, &interfaces);
 
                         let release = format!("r{}", current.release);
                         let kept = pools.current().kept(&label, &release);
@@ -4164,8 +4202,38 @@ fn describe(paths: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory as _;
+    use clap::Parser as _;
 
     use super::Cli;
+
+    #[test]
+    fn only_the_commands_that_serve_or_supervise_outlive_their_reader() {
+        let keeps = |line: &str| {
+            let cli = Cli::try_parse_from(line.split_whitespace()).expect(line);
+            super::outlives_its_reader(&cli.command)
+        };
+
+        for line in [
+            "muructl run",
+            "muructl serve",
+            "muructl daemon run",
+            "muructl exec shop -- true",
+            "muructl command run migrate",
+            "muructl debug attach shop --worker 0",
+        ] {
+            assert!(keeps(line), "{line} goes on without its reader");
+        }
+
+        for line in [
+            "muructl events",
+            "muructl logs shop --follow",
+            "muructl status --processes --watch",
+            "muructl release list",
+            "muructl daemon status",
+        ] {
+            assert!(!keeps(line), "{line} ends when its reader goes");
+        }
+    }
 
     #[test]
     fn an_application_is_named_after_its_project_else_its_module() {

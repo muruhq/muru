@@ -72,8 +72,10 @@ running keeps the old worker and stops trying.
 `muructl restart` replaces one worker of a release the way a recycle
 does, for a fault the policies do not see: a broken connection pool,
 bad state left in the process, or a request that hangs with the hard
-timeout off. The worker is named by the index `muructl debug status`
-and the access log's `worker=` field show, or by its process id:
+timeout off. The worker is named by its index within its group, as
+`muructl debug status`, `muructl status --processes` and the access
+log's `worker=` field show it, with the group's name in front for a
+worker of a named group (`--worker reports/1`), or by its process id:
 
 ```
 muructl restart shop --worker 1

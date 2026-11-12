@@ -419,6 +419,12 @@ pub struct Known {
     pub socket: Option<String>,
     /// For a host: its release's groups, when it has more than one.
     pub groups: Vec<String>,
+    /// For a host and its workers: what the release's default mount runs
+    /// as, `wsgi`, `asgi` or `grpc`, once the host has said.
+    pub interface: String,
+    /// For a host: its release's part in routing, `serving`, `canary`,
+    /// `held`, `draining` or `retained`, or its state while it starts.
+    pub state: String,
 }
 
 /// The addresses listened on, as a phrase: `:80, :443` for every
@@ -435,6 +441,44 @@ pub fn addresses(listeners: &[(std::net::SocketAddr, bool)]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// What the daemon is, as its row says: whose daemon, `user` or `system`,
+/// and its state directory, with the home directory as `~`, the same
+/// identity its process title gives.
+pub fn daemon_phrase(mode: &str, state: &std::path::Path) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+
+    let shown = match home
+        .as_deref()
+        .and_then(|home| state.strip_prefix(home).ok())
+    {
+        Some(below) if !below.as_os_str().is_empty() => format!("~/{}", below.display()),
+        _ => state.display().to_string(),
+    };
+
+    format!("{mode} daemon, state {shown}")
+}
+
+/// What a host is, as its row says: its release, then the release's part
+/// in routing, `serving`, `canary 10%`, `held`, `draining` or `retained
+/// until 07:40`, when there is one to say.
+pub fn host_phrase(subject: &str, state: &str) -> String {
+    if state.is_empty() {
+        subject.to_owned()
+    } else {
+        format!("{subject} {state}")
+    }
+}
+
+/// What a release's default mount runs as, from what its host announced
+/// of each mount, the default under the empty name; empty before it has.
+pub fn default_interface(announced: &[(String, String)]) -> String {
+    announced
+        .iter()
+        .find(|(mount, _)| mount.is_empty())
+        .map(|(_, interface)| interface.clone())
+        .unwrap_or_default()
 }
 
 /// What a worker is, as a phrase: its group, when `with_group`, and its
@@ -540,6 +584,24 @@ pub async fn snapshot(
     }
 }
 
+/// The tree `snapshot` answers with, from known processes and readings
+/// given rather than taken: what the operating system says of each, its
+/// CPU and the live figures. The guides' examples are built with it.
+pub fn tree_from(
+    known: &[Known],
+    os: &HashMap<u32, OsProcess>,
+    cpu: &HashMap<u32, f64>,
+    figures: &Figures,
+) -> Option<pb::Process> {
+    let others = Others {
+        table: &[],
+        left_out: &HashSet::new(),
+        narrow: false,
+    };
+
+    tree(known, os, cpu, &others, figures)
+}
+
 /// The known processes the request keeps: with an application named, the
 /// root and that application's processes, of the release named if one
 /// is.
@@ -617,6 +679,8 @@ fn tree(
         node.release.clone_from(&process.release);
         node.group.clone_from(&process.group);
         node.index = process.index;
+        node.interface.clone_from(&process.interface);
+        node.state.clone_from(&process.state);
 
         let expected = if process.spawned_by == 0 {
             process.parent
@@ -866,6 +930,11 @@ struct LiveState {
     /// Each worker's last GIL wait and loop lag p95 over a second in
     /// which there were any, by pid.
     signal_p95: HashMap<u32, (Option<f64>, Option<f64>)>,
+    /// Each worker group's likewise, by application, release and group.
+    group_p95: HashMap<GroupKey, (Option<f64>, Option<f64>)>,
+    /// Each worker's socket by its key, as the last reading's gauges gave
+    /// them.
+    sockets: HashMap<WorkerKey, String>,
     figures: Figures,
 }
 
@@ -890,9 +959,24 @@ impl Live {
         let mut figures = Figures::default();
         gauges(samples, &mut figures);
 
+        // Each worker is named by its socket, which its place in the pool
+        // maps to. A worker that has just left the pool, scaled in or with
+        // its release taken off the route, has no gauge any more, but its
+        // counters still give the last second's requests, so the map of
+        // the reading before stands for it, and its row adds up with its
+        // group's for that second (issue 604).
+
+        let current: HashMap<WorkerKey, String> = samples
+            .iter()
+            .filter(|sample| sample.name == muru_edge::metrics::LIVE_WORKER_SLOTS)
+            .map(|sample| (worker_key(sample), label(sample, "socket").to_owned()))
+            .collect();
+        let mut sockets = std::mem::replace(&mut state.sockets, current.clone());
+        sockets.extend(current);
+
         if let Some((then, before)) = previous {
             let elapsed = now.duration_since(then).as_secs_f64().max(0.001);
-            rates(&totals, &before, elapsed, samples, &mut figures);
+            rates(&totals, &before, elapsed, &sockets, &mut figures);
         }
 
         signals(&mut state, reports, &mut figures);
@@ -1026,7 +1110,7 @@ fn rates(
     totals: &Totals,
     before: &Totals,
     elapsed: f64,
-    samples: &[Sample],
+    sockets: &HashMap<WorkerKey, String>,
     figures: &mut Figures,
 ) {
     let per_second =
@@ -1041,15 +1125,6 @@ fn rates(
     let deltas = differences(&totals.buckets, &before.buckets);
     instance.p50_ms = milliseconds(&deltas, 0.5).unwrap_or(0.0);
     instance.p95_ms = milliseconds(&deltas, 0.95).unwrap_or(0.0);
-
-    // Each worker is named by its socket, which its place in the pool
-    // maps to.
-
-    let sockets: HashMap<(String, String, String, String), String> = samples
-        .iter()
-        .filter(|sample| sample.name == muru_edge::metrics::LIVE_WORKER_SLOTS)
-        .map(|sample| (worker_key(sample), label(sample, "socket").to_owned()))
-        .collect();
 
     let mut groups: HashMap<GroupKey, (f64, Buckets)> = HashMap::new();
 
@@ -1144,10 +1219,12 @@ fn signals(
 
     let mut alive = HashSet::new();
     let mut groups: HashMap<GroupKey, (Vec<u64>, Vec<u64>)> = HashMap::new();
+    let mut reporting: HashSet<GroupKey> = HashSet::new();
 
     for (app, release, workers) in reports {
         for worker in workers {
             alive.insert(worker.pid);
+            reporting.insert((app.clone(), release.clone(), worker.group.clone()));
             let previous = state.signals.get(&worker.pid).cloned();
             let gil = difference(&worker.gil_wait, previous.as_ref().map(|(gil, _)| gil));
             let lag = difference(&worker.loop_lag, previous.as_ref().map(|(_, lag)| lag));
@@ -1173,6 +1250,15 @@ fn signals(
                 kept.1 = lag_p95;
             }
 
+            figures.signals.insert(worker.pid, *kept);
+
+            // A group's figure is its workers' together, each from its
+            // second report on, as a worker's own is.
+
+            if previous.is_none() {
+                continue;
+            }
+
             let group = groups
                 .entry((app.clone(), release.clone(), worker.group.clone()))
                 .or_default();
@@ -1186,18 +1272,33 @@ fn signals(
                     *into += count;
                 }
             }
-
-            figures.signals.insert(worker.pid, *kept);
         }
     }
 
     state.signals.retain(|pid, _| alive.contains(pid));
     state.signal_p95.retain(|pid, _| alive.contains(pid));
+    state.group_p95.retain(|key, _| reporting.contains(key));
 
-    for (key, (gil, lag)) in groups {
+    // A group with nothing observed since keeps the last figure it had,
+    // as a worker does, so a second between two reports does not empty
+    // its row.
+
+    for key in reporting {
+        let kept = state.group_p95.entry(key.clone()).or_default();
+
+        if let Some((gil, lag)) = groups.get(&key) {
+            if let Some(gil) = milliseconds(&as_buckets(gil), 0.95) {
+                kept.0 = Some(gil);
+            }
+
+            if let Some(lag) = milliseconds(&as_buckets(lag), 0.95) {
+                kept.1 = Some(lag);
+            }
+        }
+
         let group = figures.groups.entry(key).or_default();
-        group.gil_wait_p95_ms = milliseconds(&as_buckets(&gil), 0.95);
-        group.loop_lag_p95_ms = milliseconds(&as_buckets(&lag), 0.95);
+        group.gil_wait_p95_ms = kept.0;
+        group.loop_lag_p95_ms = kept.1;
     }
 }
 
@@ -1230,7 +1331,7 @@ mod tests {
             Known {
                 pid: 10,
                 role: "daemon",
-                what: "muructl daemon run".to_owned(),
+                what: daemon_phrase("user", std::path::Path::new("/srv/muru/state")),
                 ..Known::default()
             },
             Known {
@@ -1404,6 +1505,91 @@ mod tests {
         let group = &figures.groups[&("shop".to_owned(), "r1".to_owned(), "default".to_owned())];
         assert_eq!(group.queue, Some(3));
         assert_eq!((group.busy, group.slots), (Some(2), Some(4)));
+    }
+
+    #[test]
+    fn a_worker_that_has_just_left_the_pool_keeps_its_last_second() {
+        let live = Live::default();
+        let worker = [
+            ("app", "shop"),
+            ("release", "r1"),
+            ("group", "default"),
+            ("worker", "0"),
+        ];
+        let slots = [
+            ("app", "shop"),
+            ("release", "r1"),
+            ("group", "default"),
+            ("worker", "0"),
+            ("socket", "/run/w0.sock"),
+        ];
+        let requests =
+            |count: f64| sample(muru_edge::metrics::LIVE_WORKER_REQUESTS, &worker, count);
+
+        live.observe(
+            &[
+                requests(10.0),
+                sample(muru_edge::metrics::LIVE_WORKER_SLOTS, &slots, 4.0),
+            ],
+            &[],
+        );
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Taken off the route: no gauge any more, but the requests of the
+        // second it served still count, for it as for its group.
+
+        live.observe(&[requests(20.0)], &[]);
+        let figures = live.figures();
+        let rate = figures.workers["/run/w0.sock"].requests_per_second;
+        let group = &figures.groups[&("shop".to_owned(), "r1".to_owned(), "default".to_owned())];
+        assert!(rate.is_some_and(|rate| rate > 0.0), "{rate:?}");
+        assert_eq!(rate, group.requests_per_second);
+
+        // A second later it is gone from the map.
+
+        std::thread::sleep(Duration::from_millis(100));
+        live.observe(&[requests(20.0)], &[]);
+        assert!(!live.figures().workers.contains_key("/run/w0.sock"));
+    }
+
+    #[test]
+    fn a_group_keeps_its_last_loop_lag_through_a_second_with_no_report() {
+        let live = Live::default();
+        let bounds = muru_proto::worker::v1::SIGNAL_BOUNDS_US.len() + 1;
+        let report = |late: u64| {
+            // Cumulative counts, as a histogram's buckets are: `late`
+            // beats in the last bounded bucket, and so in +Inf too.
+
+            let mut loop_lag = vec![0; bounds];
+            loop_lag[bounds - 2] = late;
+            loop_lag[bounds - 1] = late;
+
+            vec![(
+                "shop".to_owned(),
+                "r1".to_owned(),
+                vec![WorkerStatus {
+                    pid: 41,
+                    group: "default".to_owned(),
+                    loop_lag,
+                    ..WorkerStatus::default()
+                }],
+            )]
+        };
+        let group = |live: &Live| {
+            live.figures().groups[&("shop".to_owned(), "r1".to_owned(), "default".to_owned())]
+                .loop_lag_p95_ms
+        };
+
+        live.observe(&[], &report(0));
+        live.observe(&[], &report(5));
+        let lag = group(&live);
+        assert!(lag.is_some_and(|ms| ms > 0.0), "{lag:?}");
+
+        // The worker has sent nothing new: the same counts again.
+
+        live.observe(&[], &report(5));
+        assert_eq!(group(&live), lag);
+        assert_eq!(live.figures().signals[&41].1, lag);
     }
 
     #[test]

@@ -5,7 +5,7 @@
   <tr><th>Worker</th><th class="num">PID</th><th>Group</th><th class="num">Up</th><th class="num">Requests</th>{% if shape.threads %}<th class="num">Threads</th><th class="num">Thread oldest</th>{% endif %}{% if shape.event_loop %}<th class="num">Loop</th><th class="num">Loop oldest</th>{% endif %}{% if shape.sync %}<th class="num">Sync</th><th class="num">Sync oldest</th>{% endif %}<th class="num">RSS</th><th class="num">USS</th><th>Routed</th><th>State</th></tr>
   {% for row in status %}
   <tr>
-    <td><a href="worker?release={{ release }}&worker={{ row.index }}">{{ row.index }}</a></td>
+    <td><a href="worker?release={{ release }}&worker={{ row.worker }}">{{ row.worker }}</a></td>
     <td class="num">{{ row.pid }}</td>
     {% if row.error.is_empty() %}
     <td>{{ row.group }}</td>

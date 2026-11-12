@@ -207,15 +207,14 @@ pub struct Printed {
 impl Record for Printed {
     fn output(&self, label: &str, line: &str, stderr: bool) {
         let time = SystemTime::now();
-        let text = format!("[command {label}] {line}");
-        self.logs.push(time, &text);
+        self.logs.push(time, &format!("[command {label}] {line}"));
 
         let stream = if stderr {
             muru_common::log::Stream::Stderr
         } else {
             muru_common::log::Stream::Stdout
         };
-        muru_common::log::relayed(stream, time, &text);
+        muru_common::log::command_line(stream, time, label, line);
     }
 
     fn event(&self, kind: &str, _subject: &str, _level: &'static str, message: &str) {

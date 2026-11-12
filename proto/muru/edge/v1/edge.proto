@@ -39,6 +39,17 @@ service EdgeControl {
   // Section 7.4: the groups scaled to zero that requests are waiting
   // for, as they wait, for the daemon to wake.
   rpc WatchWakes(WatchWakesRequest) returns (stream Wake);
+  // Section 11.3: open the access log, the files virtual hosts name and
+  // the edge's own log again by name, as SIGUSR1 does, answering once
+  // they are open, so a rotation's postrotate knows the renamed files are
+  // complete.
+  rpc ReopenLogs(ReopenLogsRequest) returns (LogsReopened);
+}
+
+message ReopenLogsRequest {}
+
+message LogsReopened {
+  string error = 1;                     // what could not be reopened, and why; empty when everything was
 }
 
 message Snapshot {

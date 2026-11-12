@@ -167,6 +167,24 @@ fn exit_code(status: libc::c_int) -> i32 {
 #[cfg(not(target_os = "linux"))]
 pub fn become_init() {}
 
+/// End the process as SIGPIPE ends a command-line tool whose reader has
+/// gone, with status 141 and nothing written. SIGPIPE stays ignored until
+/// then, as the Rust runtime leaves it, so a write to a socket whose peer
+/// has gone, the admin socket among them, is an error the command reports
+/// rather than the end of it; only a write to standard output or error
+/// that meets a closed reader comes here (issue 608).
+pub fn end_by_sigpipe() -> ! {
+    // SAFETY: signal(2) with a valid signal and the default action, and
+    // raise(3) of it, have no memory-safety preconditions; the default
+    // action ends the process, and _exit(2) is reached only if it did not.
+
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        libc::raise(libc::SIGPIPE);
+        libc::_exit(128 + libc::SIGPIPE)
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::exit_code;

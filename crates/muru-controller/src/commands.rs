@@ -1094,7 +1094,8 @@ async fn supervise(
                 };
 
                 if let Some(log) = log.as_mut() {
-                    let _ = writeln!(log, "[command {}] {line}", prepared.label);
+                    let time = muru_common::log::full(std::time::SystemTime::now());
+                    let _ = writeln!(log, "{time} [command {}] {line}", prepared.label);
                 }
 
                 record.output(&prepared.label, &line, stderr);
@@ -1197,7 +1198,12 @@ async fn supervise(
     let ending = ending(child.wait().await, stopped, took);
 
     if let Some(log) = log.as_mut() {
-        let _ = writeln!(log, "[command {}] {}", prepared.label, ending.message);
+        let time = muru_common::log::full(std::time::SystemTime::now());
+        let _ = writeln!(
+            log,
+            "{time} [command {}] {}",
+            prepared.label, ending.message
+        );
     }
 
     record.output(&prepared.label, &ending.message, false);

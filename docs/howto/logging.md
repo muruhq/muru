@@ -18,12 +18,14 @@ one access log, which `muructl logs` reads.
 
 Everything a worker writes to standard output or standard error goes
 through the release's log relay, a small process beside its host, which
-adds the worker's index, so output from different workers can be told
-apart:
+adds the worker's index within its group, with the group's name in
+front for a worker of a named group, so output from different workers
+can be told apart:
 
 ```
 muru.worker[0]: Traceback (most recent call last):
 muru.worker[1].stdout: starting import of catalogue
+muru.worker[reports/0]: report for 2026-11-02 written
 ```
 
 Lines from the host itself carry `muru.host[PID]:`, lines from the relay
@@ -610,12 +612,18 @@ One logrotate entry covers every log, with no `postrotate` and no
 seconds after the rename, and without it logrotate compresses the
 renamed file at once and deletes it, so the lines written in those
 seconds are lost. A `postrotate` that runs `muructl logs reopen` makes
-the reopen immediate, and then `delaycompress` can go.
+the reopen immediate, and then `delaycompress` can go: the command
+returns once the edge and every release's log relay have opened their
+files again, so the renamed files are complete when logrotate
+compresses them. A writer that has not answered within five seconds no
+longer holds the command up.
 
 Log files the application opens itself are not Muru's to know. Their
 logrotate entry runs `muructl logs reopen --workers` in its
 `postrotate`, which runs the `on_reopen_logs` hook in every worker,
-where a `logging` file handler is reopened:
+where a `logging` file handler is reopened. A release's workers run the
+hook once its release log has been opened again, so what the hook
+prints goes to the new file:
 
 ```
 /srv/shop/logs/*.log {

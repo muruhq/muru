@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::{Args, Subcommand};
+use muru_common::worker::WorkerName;
 use muru_controller::client;
 use muru_controller::locations::{Locations, Options};
 use muru_proto::admin::v1 as pb;
@@ -561,9 +562,10 @@ fn upgrade_arguments() -> Vec<std::ffi::OsString> {
 pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     let locations = args.locations.resolve()?;
 
-    // Section 2.1: the daemon's process title.
+    // Section 2.1: the daemon's process title, which names whose daemon
+    // it is, as its edge's does.
 
-    muru_common::title::set("murud", "murud");
+    muru_common::title::set(&format!("muru daemon {}", locations.scope()), "muru-daemon");
 
     // The file is read the same way here and on every reload, with the
     // command line's settings laid over it.
@@ -930,9 +932,10 @@ pub struct DebugArgs {
     #[arg(value_name = "APP[@RELEASE]")]
     target: Option<String>,
 
-    /// One worker, by index, instead of every worker of the release.
-    #[arg(long, value_name = "N")]
-    worker: Option<u32>,
+    /// One worker instead of every worker of the release: its index
+    /// within its group, as GROUP/N outside the default group.
+    #[arg(long, value_name = "[GROUP/]N")]
+    worker: Option<WorkerName>,
 
     /// Print each worker's answer as JSON instead of text.
     #[arg(long)]
@@ -1193,9 +1196,10 @@ pub enum LoggingCommand {
         #[arg(long)]
         reset: bool,
 
-        /// One worker, by index, instead of every worker of the release.
-        #[arg(long, value_name = "N")]
-        worker: Option<u32>,
+        /// One worker instead of every worker of the release: its index
+        /// within its group, as GROUP/N outside the default group.
+        #[arg(long, value_name = "[GROUP/]N")]
+        worker: Option<WorkerName>,
 
         #[command(flatten)]
         socket: SocketArgs,
@@ -1328,7 +1332,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
     };
 
     let target = args.target.as_deref().unwrap_or_default();
-    let response = ask(&args.socket, target, op, args.worker, request).await?;
+    let response = ask(&args.socket, target, op, args.worker.as_ref(), request).await?;
 
     if args.json {
         print_json(&response);
@@ -1363,8 +1367,8 @@ async fn attach(attach_args: &AttachArgs) -> anyhow::Result<()> {
 
     let args = &attach_args.common;
 
-    let worker = match args.worker {
-        Some(worker) => worker,
+    let worker = match &args.worker {
+        Some(worker) => worker.clone(),
         None => {
             let response = ask(
                 &args.socket,
@@ -1384,10 +1388,11 @@ async fn attach(attach_args: &AttachArgs) -> anyhow::Result<()> {
 
             waiting
                 .or(response.workers.first())
-                .map_or(0, |answer| answer.index)
+                .map_or_else(|| WorkerName::new("", 0), answered_name)
         }
     };
 
+    let worker = &worker;
     let exchange = |op: &'static str, request: serde_json::Value| async move {
         let target = args.target.as_deref().unwrap_or_default();
         let response = ask(&args.socket, target, op, Some(worker), request).await?;
@@ -1457,7 +1462,7 @@ async fn attach(attach_args: &AttachArgs) -> anyhow::Result<()> {
 /// the worker, what the IDE sent going with each request and what the
 /// adapter sent coming back with its answer, base64, and the session
 /// polled while the IDE is quiet. The IDE closing its connection ends it.
-async fn relay_dap<F, R>(listen: SocketAddr, worker: u32, exchange: F) -> anyhow::Result<()>
+async fn relay_dap<F, R>(listen: SocketAddr, worker: &WorkerName, exchange: F) -> anyhow::Result<()>
 where
     F: Fn(&'static str, serde_json::Value) -> R,
     R: std::future::Future<Output = anyhow::Result<serde_json::Value>>,
@@ -1540,7 +1545,9 @@ fn write_profile(response: &pb::DebugResponse, profile: &ProfileArgs) -> anyhow:
         let Some(result) = parse_result(answer) else {
             eprintln!(
                 "worker {} (pid {}): {}",
-                answer.index, answer.pid, answer.error
+                answered_name(answer),
+                answer.pid,
+                answer.error
             );
             continue;
         };
@@ -1578,7 +1585,9 @@ fn write_profile(response: &pb::DebugResponse, profile: &ProfileArgs) -> anyhow:
         Some(path) => {
             std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?
         }
-        None => std::io::stdout().write_all(&bytes)?,
+        None => std::io::stdout()
+            .write_all(&bytes)
+            .inspect_err(muru_common::log::reader_gone)?,
     }
 
     let total: u64 = leaves.values().sum();
@@ -1621,12 +1630,14 @@ fn print_trace(response: &pb::DebugResponse) {
         let Some(result) = parse_result(answer) else {
             println!(
                 "worker {} (pid {}): {}\n",
-                answer.index, answer.pid, answer.error
+                answered_name(answer),
+                answer.pid,
+                answer.error
             );
             continue;
         };
 
-        println!("worker {} (pid {})", answer.index, answer.pid);
+        println!("worker {} (pid {})", answered_name(answer), answer.pid);
         println!("  {:>10}  {:>8}  function", "total ms", "calls");
 
         for function in result["functions"].as_array().into_iter().flatten() {
@@ -1647,12 +1658,14 @@ fn print_memory(response: &pb::DebugResponse) {
         let Some(result) = parse_result(answer) else {
             println!(
                 "worker {} (pid {}): {}\n",
-                answer.index, answer.pid, answer.error
+                answered_name(answer),
+                answer.pid,
+                answer.error
             );
             continue;
         };
 
-        println!("worker {} (pid {})", answer.index, answer.pid);
+        println!("worker {} (pid {})", answered_name(answer), answer.pid);
 
         if let Some(memory) = result["memory"].as_object() {
             let size = |name: &str| {
@@ -1753,12 +1766,14 @@ fn print_exec(response: &pb::DebugResponse) {
         let Some(result) = parse_result(answer) else {
             println!(
                 "worker {} (pid {}): {}",
-                answer.index, answer.pid, answer.error
+                answered_name(answer),
+                answer.pid,
+                answer.error
             );
             continue;
         };
 
-        println!("worker {} (pid {}):", answer.index, answer.pid);
+        println!("worker {} (pid {}):", answered_name(answer), answer.pid);
         print!("{}", result["output"].as_str().unwrap_or_default());
 
         if let Some(value) = result["value"].as_str() {
@@ -1824,7 +1839,7 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
             &socket,
             &target,
             "logging",
-            worker,
+            worker.as_ref(),
             serde_json::json!({"list": true}),
         )
         .await?;
@@ -1837,7 +1852,9 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
             let Some(result) = parse_result(answer) else {
                 println!(
                     "worker {} (pid {}): {}",
-                    answer.index, answer.pid, answer.error
+                    answered_name(answer),
+                    answer.pid,
+                    answer.error
                 );
                 continue;
             };
@@ -1847,7 +1864,8 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
             if changed.is_empty() {
                 println!(
                     "worker {} (pid {}): no levels changed",
-                    answer.index, answer.pid
+                    answered_name(answer),
+                    answer.pid
                 );
             }
 
@@ -1858,7 +1876,7 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
                 );
                 println!(
                     "worker {} (pid {}): {} {} (was {}), {until}",
-                    answer.index,
+                    answered_name(answer),
                     answer.pid,
                     entry["logger"].as_str().unwrap_or("root"),
                     entry["level"].as_str().unwrap_or("?"),
@@ -1875,7 +1893,7 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
             &socket,
             &target,
             "logging",
-            worker,
+            worker.as_ref(),
             serde_json::json!({"reset": true}),
         )
         .await?;
@@ -1888,7 +1906,7 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
             match parse_result(answer) {
                 Some(result) => println!(
                     "worker {} (pid {}): reset {}",
-                    answer.index,
+                    answered_name(answer),
                     answer.pid,
                     result["reset"]
                         .as_array()
@@ -1904,7 +1922,9 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
                 ),
                 None => println!(
                     "worker {} (pid {}): {}",
-                    answer.index, answer.pid, answer.error
+                    answered_name(answer),
+                    answer.pid,
+                    answer.error
                 ),
             }
         }
@@ -1925,7 +1945,7 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
             "level": level,
             "duration_s": duration.map(|duration| duration.as_secs_f64()),
         });
-        let response = ask(&socket, &target, "logging", worker, args).await?;
+        let response = ask(&socket, &target, "logging", worker.as_ref(), args).await?;
 
         if output.json {
             answers.push(debug_json(&response));
@@ -1936,7 +1956,7 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
             match parse_result(answer) {
                 Some(result) => println!(
                     "worker {} (pid {}): {} {} (was {}){}",
-                    answer.index,
+                    answered_name(answer),
                     answer.pid,
                     result["logger"].as_str().unwrap_or("root"),
                     result["level"].as_str().unwrap_or(level),
@@ -1947,7 +1967,9 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
                 ),
                 None => println!(
                     "worker {} (pid {}): {}",
-                    answer.index, answer.pid, answer.error
+                    answered_name(answer),
+                    answer.pid,
+                    answer.error
                 ),
             }
         }
@@ -2036,7 +2058,7 @@ async fn ask(
     socket: &SocketArgs,
     target: &str,
     op: &str,
-    worker: Option<u32>,
+    worker: Option<&WorkerName>,
     args: serde_json::Value,
 ) -> anyhow::Result<pb::DebugResponse> {
     let (app, release) = match target.split_once('@') {
@@ -2051,7 +2073,10 @@ async fn ask(
             app: app.to_owned(),
             release: release.to_owned(),
             op: op.to_owned(),
-            worker,
+            worker: worker.map(|worker| worker.index),
+            group: worker
+                .map(|worker| worker.group.clone())
+                .unwrap_or_default(),
             args_json: args.to_string(),
         })
         .await
@@ -2108,6 +2133,12 @@ fn print_json(response: &pb::DebugResponse) {
     );
 }
 
+/// A worker's name, from its answer: its index within its group, after
+/// the group's name and a slash outside the default group.
+pub(crate) fn answered_name(answer: &pb::WorkerDebug) -> WorkerName {
+    WorkerName::new(&answer.group, answer.index)
+}
+
 /// A debug answer as JSON: the release, and each worker's answer with its
 /// result parsed.
 pub(crate) fn debug_json(response: &pb::DebugResponse) -> serde_json::Value {
@@ -2117,6 +2148,7 @@ pub(crate) fn debug_json(response: &pb::DebugResponse) -> serde_json::Value {
         .map(|answer| {
             serde_json::json!({
                 "index": answer.index,
+                "group": answered_name(answer).group,
                 "pid": answer.pid,
                 "ok": answer.ok,
                 "error": (!answer.error.is_empty()).then_some(answer.error.as_str()),
@@ -2162,13 +2194,13 @@ fn print_status(response: &pb::DebugResponse) {
 
     for row in &rows {
         if !row.error.is_empty() {
-            println!("{:<7} {:<8} {}", row.index, row.pid, row.error);
+            println!("{:<7} {:<8} {}", row.worker, row.pid, row.error);
             continue;
         }
 
         let mut line = format!(
             "{:<7} {:<8} {:<10} {:<8} {:<10}",
-            row.index, row.pid, row.group, row.uptime, row.requests
+            row.worker, row.pid, row.group, row.uptime, row.requests
         );
 
         if sides.threads {
@@ -2210,7 +2242,9 @@ fn print_stacks(response: &pb::DebugResponse) {
         if !answer.ok {
             println!(
                 "worker {} (pid {}): {}\n",
-                answer.index, answer.pid, answer.error
+                answered_name(answer),
+                answer.pid,
+                answer.error
             );
         }
     }
@@ -2249,6 +2283,7 @@ fn debug_answer(response: &pb::DebugResponse) -> muru_dashboard::DebugAnswer {
             .iter()
             .map(|answer| muru_dashboard::WorkerAnswer {
                 index: answer.index,
+                group: answered_name(answer).group,
                 pid: answer.pid,
                 ok: answer.ok,
                 error: (!answer.error.is_empty()).then(|| answer.error.clone()),
@@ -2263,7 +2298,9 @@ fn print_tasks(response: &pb::DebugResponse) {
         let Some(result) = parse_result(answer) else {
             println!(
                 "worker {} (pid {}): {}",
-                answer.index, answer.pid, answer.error
+                answered_name(answer),
+                answer.pid,
+                answer.error
             );
             continue;
         };
@@ -2271,12 +2308,13 @@ fn print_tasks(response: &pb::DebugResponse) {
         match result["lag_ms"].as_f64() {
             Some(lag) => println!(
                 "worker {} (pid {}): loop lag {lag:.1} ms",
-                answer.index, answer.pid
+                answered_name(answer),
+                answer.pid
             ),
             None => {
                 println!(
                     "worker {} (pid {}): {}",
-                    answer.index,
+                    answered_name(answer),
                     answer.pid,
                     result["note"].as_str().unwrap_or("no event loop")
                 );
@@ -2327,12 +2365,14 @@ fn print_logging_setup(response: &pb::DebugResponse, all: bool) {
         let Some(result) = parse_result(answer) else {
             println!(
                 "worker {} (pid {}): {}",
-                answer.index, answer.pid, answer.error
+                answered_name(answer),
+                answer.pid,
+                answer.error
             );
             continue;
         };
 
-        let who = format!("worker {} (pid {})", answer.index, answer.pid);
+        let who = format!("worker {} (pid {})", answered_name(answer), answer.pid);
 
         match shown.iter_mut().find(|(setup, _)| *setup == result) {
             Some((_, workers)) => workers.push(who),
@@ -2484,7 +2524,9 @@ fn print_inspect(response: &pb::DebugResponse) {
         let Some(result) = parse_result(answer) else {
             println!(
                 "worker {} (pid {}): {}",
-                answer.index, answer.pid, answer.error
+                answered_name(answer),
+                answer.pid,
+                answer.error
             );
             continue;
         };
@@ -2497,7 +2539,7 @@ fn print_inspect(response: &pb::DebugResponse) {
         let process_model = settings["process_model"].as_str().unwrap_or("?");
         println!(
             "worker {} (pid {}): python {} at {}, {} in {} (group {}, {}{})",
-            answer.index,
+            answered_name(answer),
             answer.pid,
             result["python"].as_str().unwrap_or("?"),
             result["executable"].as_str().unwrap_or("?"),
@@ -4092,10 +4134,11 @@ pub struct RestartArgs {
     #[arg(value_name = "APP[@RELEASE]")]
     target: Option<String>,
 
-    /// The worker to restart, by the index `debug status` and the access
-    /// log show.
-    #[arg(long, value_name = "N", conflicts_with_all = ["pid", "all"])]
-    worker: Option<u32>,
+    /// The worker to restart, as `debug status` and the access log name
+    /// it: its index within its group, as GROUP/N outside the default
+    /// group.
+    #[arg(long, value_name = "[GROUP/]N", conflicts_with_all = ["pid", "all"])]
+    worker: Option<WorkerName>,
 
     /// The worker to restart, by process id.
     #[arg(long, value_name = "PID", conflicts_with = "all")]
@@ -4145,7 +4188,7 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
         serde_json::json!({}),
     )
     .await?;
-    let serving: Vec<(u32, u32, String)> = status
+    let serving: Vec<(WorkerName, u32, String)> = status
         .workers
         .iter()
         .filter_map(|answer| {
@@ -4154,7 +4197,7 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
                 && result["replaced"].as_bool() != Some(true);
             serving.then(|| {
                 (
-                    answer.index,
+                    answered_name(answer),
                     answer.pid,
                     result["group"].as_str().unwrap_or("default").to_owned(),
                 )
@@ -4174,25 +4217,28 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
         None => status.release.clone(),
     };
 
-    let chosen: Vec<(u32, u32)> = if args.all {
+    let chosen: Vec<(WorkerName, u32)> = if args.all {
         serving
             .iter()
             .filter(|(_, _, group)| args.group.as_ref().is_none_or(|wanted| wanted == group))
-            .map(|(index, pid, _)| (*index, *pid))
+            .map(|(name, pid, _)| (name.clone(), *pid))
             .collect()
     } else if let Some(pid) = args.pid {
         serving
             .iter()
             .find(|(_, candidate, _)| *candidate == pid)
-            .map(|(index, pid, _)| vec![(*index, *pid)])
+            .map(|(name, pid, _)| vec![(name.clone(), *pid)])
             .ok_or_else(|| anyhow::anyhow!("{release} has no serving worker with pid {pid}"))?
     } else {
-        let wanted = args.worker.expect("clap requires --worker, --pid or --all");
+        let wanted = args
+            .worker
+            .as_ref()
+            .expect("clap requires --worker, --pid or --all");
         serving
             .iter()
-            .find(|(index, _, _)| *index == wanted)
-            .map(|(index, pid, _)| vec![(*index, *pid)])
-            .ok_or_else(|| anyhow::anyhow!("{release} has no serving worker with index {wanted}"))?
+            .find(|(name, _, _)| name == wanted)
+            .map(|(name, pid, _)| vec![(name.clone(), *pid)])
+            .ok_or_else(|| anyhow::anyhow!("{release} has no serving worker {wanted}"))?
     };
 
     if chosen.is_empty() {
@@ -4209,19 +4255,19 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
 
     let mut replaced = Vec::new();
 
-    for (index, pid) in chosen {
+    for (name, pid) in chosen {
         let response = ask(
             &args.socket,
             args.target.as_deref().unwrap_or_default(),
             "restart",
-            Some(index),
+            Some(&name),
             serde_json::json!({ "force": args.force }),
         )
         .await?;
         let answer = &response.workers[0];
 
         if !answer.ok {
-            anyhow::bail!("worker {index} (pid {pid}): {}", answer.error);
+            anyhow::bail!("worker {name} (pid {pid}): {}", answer.error);
         }
 
         let new_pid = parse_result(answer)
@@ -4230,26 +4276,25 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
         let how = if args.force { ", killed at once" } else { "" };
 
         if !args.output.json {
-            println!("muru: worker {index} (pid {pid}) is being replaced by pid {new_pid}{how}");
+            println!("muru: worker {name} (pid {pid}) is being replaced by pid {new_pid}{how}");
         }
 
         let served_by = match args.no_wait {
             true => None,
-            false => Some(wait_restarted(&args, index, pid).await?),
+            false => Some(wait_restarted(&args, &name, pid).await?),
         };
 
         match (args.output.json, served_by) {
             (true, _) => replaced.push(serde_json::json!({
-                "index": index,
+                "index": name.index,
+                "group": name.group,
                 "pid": pid,
                 "new_pid": new_pid,
                 "forced": args.force,
                 "served_by": served_by,
             })),
             (false, Some(served_by)) => {
-                println!(
-                    "muru: worker {index} is served by pid {served_by}; pid {pid} has stopped"
-                );
+                println!("muru: worker {name} is served by pid {served_by}; pid {pid} has stopped");
             }
             (false, None) => {}
         }
@@ -4264,7 +4309,11 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
 
 /// Wait until the worker at `index` is one other than `old_pid`, ready,
 /// with the old one gone, and return the pid that serves.
-async fn wait_restarted(args: &RestartArgs, index: u32, old_pid: u32) -> anyhow::Result<u32> {
+async fn wait_restarted(
+    args: &RestartArgs,
+    name: &WorkerName,
+    old_pid: u32,
+) -> anyhow::Result<u32> {
     let deadline = Instant::now() + RESTART_WAIT;
 
     loop {
@@ -4273,7 +4322,7 @@ async fn wait_restarted(args: &RestartArgs, index: u32, old_pid: u32) -> anyhow:
             &args.socket,
             args.target.as_deref().unwrap_or_default(),
             "status",
-            Some(index),
+            Some(name),
             serde_json::json!({}),
         )
         .await;
@@ -4296,7 +4345,7 @@ async fn wait_restarted(args: &RestartArgs, index: u32, old_pid: u32) -> anyhow:
 
         anyhow::ensure!(
             Instant::now() < deadline,
-            "worker {index} was not replaced within {} seconds; muructl debug status shows where it is",
+            "worker {name} was not replaced within {} seconds; muructl debug status shows where it is",
             RESTART_WAIT.as_secs()
         );
     }

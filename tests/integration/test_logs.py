@@ -195,10 +195,44 @@ def test_logs_reopen_after_an_external_rotation(daemon: Daemon) -> None:
     wait_for(lambda: "/before" in access_log.read_text())
 
     # logrotate's way: rename, then ask every writer to reopen by name.
+    # The relay is held stopped across the reopen, as a busy machine can
+    # leave it: the command waits for it, so that when it returns the
+    # renamed files are complete (issue 609), and the workers' hooks wait
+    # for it too, so what they write goes to the new file (issue 598).
 
+    tree = json.loads(daemon.muructl("status", "--processes", "--json").stdout)
+    host = next(child for child in tree["root"]["children"] if child["role"] == "host")
+    relay = next(child["pid"] for child in host["children"] if child["role"] == "relay")
     os.rename(release_log, release_log.with_suffix(".log.1"))
     os.rename(access_log, access_log.with_suffix(".log.1"))
-    reopened = daemon.muructl("logs", "reopen", "--workers").stdout.strip()
+    muructl = support.muructl_path()
+    assert muructl is not None
+    os.kill(relay, signal.SIGSTOP)
+
+    try:
+        reopening = subprocess.Popen(
+            [
+                str(muructl),
+                "logs",
+                "reopen",
+                "--workers",
+                "--socket",
+                str(daemon.run_dir / "admin.sock"),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+
+        # The event comes once every writer has been told.
+
+        wait_for(lambda: "logs.reopened" in daemon.events())
+        assert reopening.poll() is None, "the command waits for the relay to reopen its file"
+    finally:
+        os.kill(relay, signal.SIGCONT)
+
+    reopened = reopening.communicate(timeout=30)[0].strip()
+    assert release_log.exists(), "the relay reopened the release log before the command returned"
+    assert access_log.exists(), "the edge reopened the access log before the command returned"
     assert reopened == "muru: reopened the log files: the edge and 1 host and their workers"
     assert daemon.request("/after").status == 200
     wait_for(lambda: release_log.exists() and "served /after" in release_log.read_text())

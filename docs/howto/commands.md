@@ -220,8 +220,16 @@ it to end and exits with 1, saying why.
 ## What is recorded
 
 The command's output is added to the release's log, each line prefixed
-with `[command NAME]` (`[command exec]` for a one-off command), so
-`muructl logs shop` shows it among the workers' output. Each run is also
+with the full UTC time and `[command NAME]` (`[command exec]` for a
+one-off command), so `muructl logs shop` shows it among the workers'
+output, in time with them, and the line saying how it exited follows:
+
+```
+2026-11-02T10:02:16.204Z [command migrate] applied 0002_quantity.sql
+2026-11-02T10:02:16.221Z [command migrate] exited with status 0 after 20ms
+```
+
+Each run is also
 in the events, with its inputs, a secret's as `***`:
 
 ```console
@@ -272,6 +280,8 @@ Where the command runs depends on what is running:
   prefixed `[command NAME]`, so the terminal, the container's log and
   `muructl logs` show it, and its start and end are printed as
   `command.started`, `command.finished` and `command.failed` lines.
+  Under `muructl serve --log-format json` each line is a record of kind
+  `command`, with the command's name in its `command` field.
   `MURU_RELEASE` names the release that serves, `r1` and so on.
 - **By `muructl` itself.** When nothing serves the project, `muructl`
   starts the command and waits for it. Nothing else needs to be running,

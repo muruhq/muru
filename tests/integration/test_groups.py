@@ -185,6 +185,38 @@ def test_groups_under_the_daemon_from_the_table_and_the_file(
         shown.split()
     )
 
+    # A worker of a named group goes by its index within the group, after
+    # the group's name outside the default group: in the process tree, the
+    # access log, the release log's tags, debug status and --worker (issue
+    # 602).
+
+    def processes(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        yield node
+
+        for child in node["children"]:
+            yield from processes(child)
+
+    tree = json.loads(daemon.muructl("status", "--processes", "--json").stdout)
+    named = sorted(
+        (process["group"], process["index"])
+        for process in processes(tree["root"])
+        if process["role"] == "worker" and process["group"] in ("default", "reports")
+    )
+    assert named == [("default", 0), ("reports", 0), ("reports", 1)], named
+
+    asked = daemon.muructl("debug", "status", "grouped", "--worker", "reports/1", "--json")
+    answers = json.loads(asked.stdout)["workers"]
+    assert [(answer["group"], answer["index"]) for answer in answers] == [("reports", 1)]
+    restarted = daemon.muructl("restart", "grouped", "--worker", "reports/1").stdout
+    assert "muru: worker reports/1 (pid " in restarted, restarted
+
+    assert daemon.request("/reports/x").status == 200
+    access = (daemon.base / "logs" / "access.log").read_text().splitlines()
+    served = [json.loads(line) for line in access if "/reports/x" in line][-1]
+    assert served["group"] == "reports" and served["worker"] in (0, 1), served
+    log = (daemon.base / "logs" / "apps" / "grouped" / "r1.log").read_text()
+    assert "worker.restarted: worker reports/1 (pid" in log, log
+
     # A declared release's groups replace the table's, and resolve their
     # sizes from the release where silent; the export writes them whole.
 
