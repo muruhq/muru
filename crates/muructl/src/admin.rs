@@ -1584,7 +1584,9 @@ fn write_profile(response: &pb::DebugResponse, profile: &ProfileArgs) -> anyhow:
         Some(path) => {
             std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?
         }
-        None => std::io::stdout().write_all(&bytes)?,
+        None => std::io::stdout()
+            .write_all(&bytes)
+            .inspect_err(muru_common::log::reader_gone)?,
     }
 
     let total: u64 = leaves.values().sum();

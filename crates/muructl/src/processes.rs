@@ -91,23 +91,23 @@ pub async fn show(socket: &Path, args: &ProcessArgs, json: bool) -> anyhow::Resu
             .map_err(|status| anyhow::anyhow!("{}", status.message()))?
             .into_inner();
 
-        let mut out = std::io::stdout().lock();
-
-        if json {
-            writeln!(out, "{}", serde_json::to_string(&answer)?)?;
+        let frame = if json {
+            format!("{}\n", serde_json::to_string(&answer)?)
         } else if redraw {
             // Home and clear, then the frame: drawn in place.
 
-            write!(out, "\x1b[H\x1b[2J{}", render(&answer, Some(every)))?;
+            format!("\x1b[H\x1b[2J{}", render(&answer, Some(every)))
         } else {
-            if !first {
-                writeln!(out)?;
-            }
+            let gap = if first { "" } else { "\n" };
+            format!("{gap}{}", render(&answer, Some(every)))
+        };
 
-            write!(out, "{}", render(&answer, Some(every)))?;
-        }
+        // A reader that has gone ends the watch, as it ends `head`.
 
-        out.flush()?;
+        let mut out = std::io::stdout().lock();
+        out.write_all(frame.as_bytes())
+            .and_then(|()| out.flush())
+            .inspect_err(muru_common::log::reader_gone)?;
         first = false;
     }
 }
