@@ -987,11 +987,15 @@ impl Backend {
         }
     }
 
-    /// Have the release's log relay open the release log again by name.
-    /// Instances write their own files. Returns whether it was told.
-    fn reopen_log(&self) -> bool {
+    /// Have the release's log relay open the release log again by name,
+    /// and with `workers` the host's workers run their on_reopen_logs
+    /// hook once it has. A managed server's instances write to the
+    /// release's log file themselves, on a descriptor they were started
+    /// with, and cannot be told to reopen it, so that file is rotated in
+    /// place. Returns whether the relay was told.
+    fn reopen_log(&self, workers: bool) -> bool {
         match self {
-            Self::Host(host) => host.signal_relay(libc::SIGUSR1),
+            Self::Host(host) => host.reopen_log(workers),
             Self::Servers(_) | Self::Dormant => false,
         }
     }
@@ -1031,17 +1035,6 @@ impl Backend {
             Self::Host(host) => host.release(),
             Self::Servers(servers) => servers.release(),
             Self::Dormant => {}
-        }
-    }
-
-    /// Send the host a signal, which is how it is told to reopen its log
-    /// file. A managed server's instances take none: each writes to the
-    /// release's log file itself, on a descriptor it was started with,
-    /// and cannot be told to reopen it, so that file is rotated in place.
-    fn signal(&self, signal: i32) -> bool {
-        match self {
-            Self::Host(host) => host.signal(signal),
-            Self::Servers(_) | Self::Dormant => false,
         }
     }
 
@@ -9797,7 +9790,7 @@ impl Daemon {
         self.edge.signal(libc::SIGUSR1);
 
         for running in self.running.values() {
-            running.backend.reopen_log();
+            running.backend.reopen_log(false);
         }
 
         let names: Vec<String> = rotated
@@ -9945,13 +9938,12 @@ impl Daemon {
         let edge = self.edge.signal(libc::SIGUSR1);
         let mut hosts = 0;
 
-        for running in self.running.values() {
-            if running.backend.reopen_log() {
-                hosts += 1;
-            }
+        // A host's workers are told once its relay has reopened the
+        // release log, so what their hooks write goes to the new file.
 
-            if workers {
-                running.backend.signal(libc::SIGUSR2);
+        for running in self.running.values() {
+            if running.backend.reopen_log(workers) {
+                hosts += 1;
             }
         }
 

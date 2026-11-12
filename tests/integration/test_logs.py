@@ -195,10 +195,22 @@ def test_logs_reopen_after_an_external_rotation(daemon: Daemon) -> None:
     wait_for(lambda: "/before" in access_log.read_text())
 
     # logrotate's way: rename, then ask every writer to reopen by name.
+    # The relay is held stopped across the reopen, as a busy machine can
+    # leave it, and the workers' hooks must still wait for it to reopen
+    # the release log (issue 598).
 
+    tree = json.loads(daemon.muructl("status", "--processes", "--json").stdout)
+    host = next(child for child in tree["root"]["children"] if child["role"] == "host")
+    relay = next(child["pid"] for child in host["children"] if child["role"] == "relay")
     os.rename(release_log, release_log.with_suffix(".log.1"))
     os.rename(access_log, access_log.with_suffix(".log.1"))
-    reopened = daemon.muructl("logs", "reopen", "--workers").stdout.strip()
+    os.kill(relay, signal.SIGSTOP)
+
+    try:
+        reopened = daemon.muructl("logs", "reopen", "--workers").stdout.strip()
+    finally:
+        os.kill(relay, signal.SIGCONT)
+
     assert reopened == "muru: reopened the log files: the edge and 1 host and their workers"
     assert daemon.request("/after").status == 200
     wait_for(lambda: release_log.exists() and "served /after" in release_log.read_text())

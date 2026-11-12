@@ -615,7 +615,9 @@ the reopen immediate, and then `delaycompress` can go.
 Log files the application opens itself are not Muru's to know. Their
 logrotate entry runs `muructl logs reopen --workers` in its
 `postrotate`, which runs the `on_reopen_logs` hook in every worker,
-where a `logging` file handler is reopened:
+where a `logging` file handler is reopened. A release's workers run the
+hook once its release log has been opened again, so what the hook
+prints goes to the new file:
 
 ```
 /srv/shop/logs/*.log {

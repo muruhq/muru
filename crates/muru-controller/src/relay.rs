@@ -222,6 +222,9 @@ pub enum Report {
     Status(Status),
     /// A stall began or ended.
     Event(Event),
+    /// The release log was opened again by name, as SIGUSR1 asked: what
+    /// the relay takes from here on goes to the file now at its path.
+    Reopened,
 }
 
 /// The state the readers and the writer share.
@@ -245,6 +248,9 @@ struct Shared {
     state: Mutex<State>,
     ready: Condvar,
     reopen: AtomicBool,
+    /// How many times the writer has acted on SIGUSR1, for the control
+    /// socket to report each one.
+    reopens: watch::Sender<u64>,
     status: watch::Sender<Status>,
     events: broadcast::Sender<Event>,
     tag: String,
@@ -267,6 +273,7 @@ impl Shared {
             }),
             ready: Condvar::new(),
             reopen: AtomicBool::new(false),
+            reopens: watch::channel(0).0,
             status: watch::channel(Status::default()).0,
             events: broadcast::channel(16).0,
             tag: format!("muru.relay[{}]: ", std::process::id()),
@@ -767,6 +774,7 @@ fn write_loop(shared: &Shared, mut destination: Destination) {
 
         if reopen {
             destination.reopen(shared);
+            shared.reopens.send_modify(|count| *count += 1);
         }
     }
 }
@@ -1229,7 +1237,8 @@ fn serve_control(path: &Path, shared: &Arc<Shared>) -> anyhow::Result<()> {
         while let Ok((stream, _)) = listener.accept().await {
             let status = shared.status.subscribe();
             let events = shared.events.subscribe();
-            tokio::spawn(report_to(stream, status, events));
+            let reopens = shared.reopens.subscribe();
+            tokio::spawn(report_to(stream, status, events, reopens));
         }
     });
 
@@ -1241,6 +1250,7 @@ async fn report_to(
     mut stream: UnixStream,
     mut status: watch::Receiver<Status>,
     mut events: broadcast::Receiver<Event>,
+    mut reopens: watch::Receiver<u64>,
 ) {
     let mut last_sent = Instant::now() - Duration::from_secs(1);
     status.mark_changed();
@@ -1273,6 +1283,11 @@ async fn report_to(
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => return,
             },
+            changed = reopens.changed() => {
+                if changed.is_err() || send(&mut stream, &Report::Reopened).await.is_err() {
+                    return;
+                }
+            }
         }
     }
 }
