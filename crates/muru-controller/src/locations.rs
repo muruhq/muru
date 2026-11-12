@@ -198,6 +198,30 @@ impl Locations {
         }
     }
 
+    /// Whose daemon this is, as its process title, its edge's and its row
+    /// in `muructl status --processes` name it (section 2.1): `user` or
+    /// `system`, or the state directory when it is not the default for
+    /// the mode, so that daemons kept apart by `--state-dir` are told
+    /// apart.
+    pub fn scope(&self) -> String {
+        let home = env::var_os("HOME").map(PathBuf::from);
+        let default = std::path::absolute(default_state(self.mode, home.as_deref()));
+
+        if default.is_ok_and(|default| default == self.state.path) {
+            self.mode_word().to_owned()
+        } else {
+            self.state.path.display().to_string()
+        }
+    }
+
+    /// `user` or `system`, for the mode.
+    pub fn mode_word(&self) -> &'static str {
+        match self.mode {
+            Mode::System => "system",
+            Mode::User => "user",
+        }
+    }
+
     /// The admin socket inside the runtime directory.
     pub fn admin_socket(&self) -> PathBuf {
         self.run.path.join("admin.sock")

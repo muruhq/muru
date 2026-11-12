@@ -462,7 +462,7 @@ mod tests {
             root: Some(process(
                 4242,
                 "daemon",
-                "muructl daemon run",
+                "system daemon, state /var/lib/muru",
                 vec![process(4250, "edge", "listening on :80", vec![]), host],
             )),
             ..pb::Processes::default()
@@ -673,7 +673,14 @@ mod tests {
     }
 
     /// A release's host and its log relay, as the daemon knows them.
-    fn host(pid: u32, daemon: u32, app: &str, release: &str, groups: &[&str]) -> [Known; 2] {
+    fn host(
+        pid: u32,
+        daemon: u32,
+        app: &str,
+        release: &str,
+        groups: &[&str],
+        (state, phrase): (&str, &str),
+    ) -> [Known; 2] {
         let subject = format!("{app}@{release}");
 
         [
@@ -681,7 +688,13 @@ mod tests {
                 app: app.to_owned(),
                 release: release.to_owned(),
                 groups: groups.iter().map(|group| (*group).to_owned()).collect(),
-                ..known(pid, daemon, "host", &subject)
+                state: state.to_owned(),
+                ..known(
+                    pid,
+                    daemon,
+                    "host",
+                    &muru_controller::processes::host_phrase(&subject, phrase),
+                )
             },
             Known {
                 app: app.to_owned(),
@@ -698,7 +711,8 @@ mod tests {
     }
 
     /// The daemon guide's example: a daemon with two applications in
-    /// worker processes, one with a named group, and a managed server.
+    /// worker processes, one with a named group and a release kept warm
+    /// after a deploy, and a managed server.
     fn daemon_example() -> pb::Processes {
         let mut example = Example::default();
         let day = 86_400;
@@ -708,7 +722,12 @@ mod tests {
         ];
 
         example.add(
-            known(4242, 0, "daemon", "muructl daemon run"),
+            known(
+                4242,
+                0,
+                "daemon",
+                &muru_controller::processes::daemon_phrase("system", Path::new("/var/lib/muru")),
+            ),
             1,
             "muru",
             3 * day + 2 * 3600,
@@ -732,7 +751,14 @@ mod tests {
             61.0,
         );
 
-        let [shop, relay] = host(4301, 4242, "shop", "r42", &["default", "crawlers"]);
+        let [shop, relay] = host(
+            4301,
+            4242,
+            "shop",
+            "r42",
+            &["default", "crawlers"],
+            ("serving", "serving"),
+        );
         example.add(shop, 4242, "shop", 5 * 3600 + 12 * 60, 0.0, 92.0);
         example.add(relay, 4242, "shop", 5 * 3600 + 12 * 60, 0.1, 7.0);
         example.add(
@@ -809,7 +835,44 @@ mod tests {
             (Some(0.4), None),
         );
 
-        let [api, relay] = host(4330, 4242, "api", "r7", &["default"]);
+        // The release the last deploy replaced, kept warm with one worker
+        // in each group for a rollback.
+
+        let [kept, relay] = host(
+            4290,
+            4242,
+            "shop",
+            "r41",
+            &["default", "crawlers"],
+            ("retained", "retained until 07:40"),
+        );
+        example.add(kept, 4242, "shop", 5 * 3600 + 13 * 60, 0.0, 91.0);
+        example.add(relay, 4242, "shop", 5 * 3600 + 13 * 60, 0.0, 7.0);
+        example.add(
+            worker(4292, 4290, "shop", "r41", "default", 0, true),
+            4290,
+            "shop",
+            5 * 3600 + 13 * 60,
+            0.0,
+            131.0,
+        );
+        example.add(
+            worker(4293, 4290, "shop", "r41", "crawlers", 0, true),
+            4290,
+            "shop",
+            5 * 3600 + 13 * 60,
+            0.0,
+            118.0,
+        );
+
+        let [api, relay] = host(
+            4330,
+            4242,
+            "api",
+            "r7",
+            &["default"],
+            ("serving", "serving"),
+        );
         example.add(api, 4242, "api", day + 4 * 3600, 0.0, 88.0);
         example.add(relay, 4242, "api", day + 4 * 3600, 0.0, 7.0);
         example.add(

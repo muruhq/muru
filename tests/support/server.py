@@ -135,7 +135,7 @@ def recorded_pids(directory: Path) -> set[int]:
                 check=False,
             ).stdout.strip()
 
-            if command.startswith(("muru-edge", "muru host ", "muru relay ")):
+            if command.startswith(("muru edge ", "muru host ", "muru relay ")):
                 pids.add(pid)
 
     return pids

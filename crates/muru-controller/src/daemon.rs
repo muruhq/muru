@@ -1420,6 +1420,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             config.access_log.clone(),
             spool.clone(),
             service,
+            locations.scope(),
         )
         .await
         .map_err(|error| tracing::info!(%error, "no edge to re-adopt"))
@@ -1454,6 +1455,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 access_log: config.access_log,
                 spool,
                 identity: service,
+                scope: locations.scope(),
             })
             .await?
         }
@@ -9525,7 +9527,10 @@ impl Daemon {
         let mut known = vec![Known {
             pid: daemon,
             role: "daemon",
-            what: "muructl daemon run".to_owned(),
+            what: crate::processes::daemon_phrase(
+                self.locations.mode_word(),
+                &self.locations.state.path,
+            ),
             ..Known::default()
         }];
 
@@ -9540,6 +9545,17 @@ impl Daemon {
             });
         }
 
+        // Section 13.10: a host's row says what its release does with
+        // traffic, so an idle instance still shows which one serves.
+
+        let rollouts: Vec<Rollout> = self
+            .store
+            .rollouts(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rollout| rollout.state.is_active())
+            .collect();
+
         for ((app, id), running) in &self.running {
             let subject = format!("{app}@{id}");
 
@@ -9548,6 +9564,8 @@ impl Daemon {
                     let Some(host_pid) = host.pid() else {
                         continue;
                     };
+
+                    let (state, phrase) = self.routing_state(app, id, running, &rollouts);
 
                     let mut groups: Vec<String> = running
                         .groups
@@ -9570,11 +9588,12 @@ impl Daemon {
                         pid: host_pid,
                         parent: daemon,
                         role: "host",
-                        what: subject.clone(),
+                        what: crate::processes::host_phrase(&subject, &phrase),
                         app: app.clone(),
                         release: id.clone(),
                         groups,
                         interface: interface.clone(),
+                        state,
                         ..Known::default()
                     });
 
@@ -9653,6 +9672,62 @@ impl Daemon {
         }
 
         known
+    }
+
+    /// A running release's part in routing, as a word for the answer and
+    /// a phrase for its host's row: a rollout's candidate is `canary`
+    /// with its share, the application's current release `serving`, one
+    /// draining or retained says so, with when a retained one stops in
+    /// local time, and a ready one that takes no traffic is `held`; one
+    /// still starting says its state.
+    fn routing_state(
+        &self,
+        app: &str,
+        id: &str,
+        running: &Running,
+        rollouts: &[Rollout],
+    ) -> (String, String) {
+        if let Some(rollout) = rollouts
+            .iter()
+            .find(|rollout| rollout.app == app && rollout.candidate == id)
+        {
+            return (
+                "canary".to_owned(),
+                format!("canary {}%", rollout.percent().min(100)),
+            );
+        }
+
+        let current = self
+            .store
+            .app(app)
+            .ok()
+            .and_then(|record| record.current)
+            .is_some_and(|current| current == id);
+        let state = self
+            .store
+            .release(app, id)
+            .map(|release| release.state)
+            .ok();
+
+        let word = match state {
+            Some(ReleaseState::Draining) => "draining",
+            Some(ReleaseState::Retained) => "retained",
+            _ if current => "serving",
+            Some(ReleaseState::Ready) => "held",
+            Some(other) => return (other.to_string(), other.to_string()),
+            None => return (String::new(), String::new()),
+        };
+
+        let phrase = if word == "retained" && running.retained_until_unix_ms > 0 {
+            let until =
+                std::time::UNIX_EPOCH + Duration::from_millis(running.retained_until_unix_ms);
+            let clock = muru_common::log::clock(until);
+            format!("retained until {}", &clock[..5])
+        } else {
+            word.to_owned()
+        };
+
+        (word.to_owned(), phrase)
     }
 
     /// The log files the daemon's writers keep, each with whether its

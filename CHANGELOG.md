@@ -13,7 +13,7 @@ breaking changes, which are listed under each release.
 
 ### Added
 
-- Every process of Muru sets a title, so `ps`, `top` and `htop` tell them apart: `murud` for the daemon, `muru-edge` for the edge, `muru run APP` or `muru serve APP`, `muru host APP@RELEASE`, `muru relay APP@RELEASE` and `muru worker APP@RELEASE GROUP/INDEX`.
+- Every process of Muru sets a title, so `ps`, `top` and `htop` tell them apart: `muru daemon SCOPE` for the daemon, `muru edge SCOPE` for the edge, `muru run APP` or `muru serve APP`, `muru host APP@RELEASE`, `muru relay APP@RELEASE` and `muru worker APP@RELEASE GROUP/INDEX`.
 
   The edge counts body bytes received from clients and sent to them, as `muru_request_bytes_total` and `muru_response_bytes_total` by application, release and listener.
 

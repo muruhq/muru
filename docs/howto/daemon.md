@@ -661,12 +661,18 @@ $ muructl status --processes
 edge  1,284 req/s  3.0 err/s  p50 4.0 ms  p95 38 ms  in flight 41  ws 212  conns 1,903  tls 12/s  in 2.1MB/s  out 46.4MB/s
 
 PID    ROLE           WHAT                                   USER      UP     CPU       RSS   REQ/S    BUSY   QUEUE      P95   GIL/LAG
-4242   daemon         muructl daemon run                     muru    3d2h    0.3%    38.0MB
+4242   daemon         system daemon, state /var/lib/muru     muru    3d2h    0.3%    38.0MB
 4250   ├─ edge        listening on :80, :443                 muru    3d2h    2.1%    61.0MB   1,284
-4330   ├─ host        api@r7                                 api     1d4h    0.0%    88.0MB     203    6/64       0    12 ms     48 ms
+4330   ├─ host        api@r7 serving                         api     1d4h    0.0%    88.0MB     203    6/64       0    12 ms     48 ms
 4331   │  ├─ relay    api@r7 output to apps/api/r7.log       api     1d4h    0.0%     7.0MB
 4340   │  └─ worker   group default, worker 0                api     1d4h    4.2%   131.0MB     203    6/64            12 ms     48 ms
-4301   ├─ host        shop@r42                               shop   5h12m    0.0%    92.0MB
+4290   ├─ host        shop@r41 retained until 07:40          shop   5h13m    0.0%    91.0MB
+4291   │  ├─ relay    shop@r41 output to apps/shop/r41.log   shop   5h13m    0.0%     7.0MB
+       │  ├─ group    crawlers
+4293   │  ├─ worker   group crawlers, worker 0               shop   5h13m    0.0%   118.0MB
+       │  ├─ group    default
+4292   │  └─ worker   group default, worker 0                shop   5h13m    0.0%   131.0MB
+4301   ├─ host        shop@r42 serving                       shop   5h12m    0.0%    92.0MB
 4302   │  ├─ relay    shop@r42 output to apps/shop/r42.log   shop   5h12m    0.1%     7.0MB
        │  ├─ group    crawlers                                                                   61     4/8       0   120 ms    0.4 ms
 4320   │  ├─ worker   group crawlers, worker 0               shop   5h12m    1.0%   120.0MB      61     4/8           120 ms    0.4 ms
@@ -688,6 +694,21 @@ instance) and `command` (a `muructl command run` or `muructl exec`
 while it runs). The tree is the one Muru supervises: a host adopted
 again after the daemon restarted has the init process as its parent
 in `ps`, which its row says.
+
+The daemon's row says whose daemon it is, `user` or `system`, and its
+state directory. A host's row gives its release's part in routing after
+its name, so an idle instance shows which release serves:
+
+| Shown | The release |
+| --- | --- |
+| `serving` | is the one its application's traffic goes to |
+| `canary 10%` | is a rollout's candidate, taking that share of the traffic |
+| `held` | is ready and takes no traffic, as a deploy with `--hold` leaves it |
+| `draining` | is off the route, finishing the requests it has |
+| `retained until 07:40` | is kept warm for a rollback until then, in local time |
+
+A release still starting shows its state, `starting` or `warming`.
+`--json` gives the same as each host's `state`.
 
 For a worker the figures are its requests per second, its slots holding
 a request of all its slots, the 95th percentile total time and, under
@@ -725,12 +746,18 @@ apart:
 
 | Process | Title |
 | --- | --- |
-| The daemon | `murud` |
-| The edge | `muru-edge` |
+| The daemon | `muru daemon user`, `muru daemon system`, or `muru daemon DIR` |
+| The edge | `muru edge user`, `muru edge system`, or `muru edge DIR` |
 | A development run, or `muructl serve` | `muru run APP`, `muru serve APP` |
 | A release's host | `muru host APP@RELEASE` |
 | Its log relay | `muru relay APP@RELEASE` |
 | A worker | `muru worker APP@RELEASE GROUP/INDEX` |
+
+The daemon's and the edge's titles name the daemon as its row does:
+`user` or `system`, or its state directory when that is not the default
+for its scope, as with `--state-dir`, so two daemons of one user are
+told apart. An edge left running while its daemon restarts has the
+init process as its parent, and its title still says whose it is.
 
 A title longer than the command line the process was started with,
 such as `muru serve shop` for a process started as `muructl serve`,
@@ -740,7 +767,7 @@ starts see is unchanged, while `/proc/PID/environ` shows the title in
 its place.
 
 On Linux the short name `top` shows by default, and `/proc/PID/comm`
-holds, is `murud`, `muru-edge`, `muru-run`, `muru-serve`, `muru-host`,
+holds, is `muru-daemon`, `muru-edge`, `muru-run`, `muru-serve`, `muru-host`,
 `muru-relay` or `muru-worker`.
 
 `--metrics ADDRESS`, or a `[metrics]` table

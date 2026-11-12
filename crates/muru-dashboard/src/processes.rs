@@ -271,7 +271,7 @@ mod tests {
     fn a_worker_links_to_its_page_and_a_readopted_host_says_so() {
         let answer = serde_json::json!({
             "root": {
-                "pid": 10, "role": "daemon", "what": "muructl daemon run",
+                "pid": 10, "role": "daemon", "what": "user daemon, state ~/.local/state/muru",
                 "children": [{
                     "pid": 20, "role": "host", "what": "shop@r1", "app": "shop", "release": "r1",
                     "readopted": true, "os_parent_pid": 1,

@@ -354,6 +354,7 @@ impl RunProcesses {
                 release: release.clone(),
                 groups: self.groups.clone(),
                 interface: seen.interface.clone(),
+                state: "serving".to_owned(),
                 ..Known::default()
             });
 

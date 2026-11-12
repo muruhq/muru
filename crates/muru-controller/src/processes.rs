@@ -422,6 +422,9 @@ pub struct Known {
     /// For a host and its workers: what the release's default mount runs
     /// as, `wsgi`, `asgi` or `grpc`, once the host has said.
     pub interface: String,
+    /// For a host: its release's part in routing, `serving`, `canary`,
+    /// `held`, `draining` or `retained`, or its state while it starts.
+    pub state: String,
 }
 
 /// The addresses listened on, as a phrase: `:80, :443` for every
@@ -438,6 +441,34 @@ pub fn addresses(listeners: &[(std::net::SocketAddr, bool)]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// What the daemon is, as its row says: whose daemon, `user` or `system`,
+/// and its state directory, with the home directory as `~`, the same
+/// identity its process title gives.
+pub fn daemon_phrase(mode: &str, state: &std::path::Path) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+
+    let shown = match home
+        .as_deref()
+        .and_then(|home| state.strip_prefix(home).ok())
+    {
+        Some(below) if !below.as_os_str().is_empty() => format!("~/{}", below.display()),
+        _ => state.display().to_string(),
+    };
+
+    format!("{mode} daemon, state {shown}")
+}
+
+/// What a host is, as its row says: its release, then the release's part
+/// in routing, `serving`, `canary 10%`, `held`, `draining` or `retained
+/// until 07:40`, when there is one to say.
+pub fn host_phrase(subject: &str, state: &str) -> String {
+    if state.is_empty() {
+        subject.to_owned()
+    } else {
+        format!("{subject} {state}")
+    }
 }
 
 /// What a release's default mount runs as, from what its host announced
@@ -649,6 +680,7 @@ fn tree(
         node.group.clone_from(&process.group);
         node.index = process.index;
         node.interface.clone_from(&process.interface);
+        node.state.clone_from(&process.state);
 
         let expected = if process.spawned_by == 0 {
             process.parent
@@ -900,6 +932,9 @@ struct LiveState {
     signal_p95: HashMap<u32, (Option<f64>, Option<f64>)>,
     /// Each worker group's likewise, by application, release and group.
     group_p95: HashMap<GroupKey, (Option<f64>, Option<f64>)>,
+    /// Each worker's socket by its key, as the last reading's gauges gave
+    /// them.
+    sockets: HashMap<WorkerKey, String>,
     figures: Figures,
 }
 
@@ -924,9 +959,24 @@ impl Live {
         let mut figures = Figures::default();
         gauges(samples, &mut figures);
 
+        // Each worker is named by its socket, which its place in the pool
+        // maps to. A worker that has just left the pool, scaled in or with
+        // its release taken off the route, has no gauge any more, but its
+        // counters still give the last second's requests, so the map of
+        // the reading before stands for it, and its row adds up with its
+        // group's for that second (issue 604).
+
+        let current: HashMap<WorkerKey, String> = samples
+            .iter()
+            .filter(|sample| sample.name == muru_edge::metrics::LIVE_WORKER_SLOTS)
+            .map(|sample| (worker_key(sample), label(sample, "socket").to_owned()))
+            .collect();
+        let mut sockets = std::mem::replace(&mut state.sockets, current.clone());
+        sockets.extend(current);
+
         if let Some((then, before)) = previous {
             let elapsed = now.duration_since(then).as_secs_f64().max(0.001);
-            rates(&totals, &before, elapsed, samples, &mut figures);
+            rates(&totals, &before, elapsed, &sockets, &mut figures);
         }
 
         signals(&mut state, reports, &mut figures);
@@ -1060,7 +1110,7 @@ fn rates(
     totals: &Totals,
     before: &Totals,
     elapsed: f64,
-    samples: &[Sample],
+    sockets: &HashMap<WorkerKey, String>,
     figures: &mut Figures,
 ) {
     let per_second =
@@ -1075,15 +1125,6 @@ fn rates(
     let deltas = differences(&totals.buckets, &before.buckets);
     instance.p50_ms = milliseconds(&deltas, 0.5).unwrap_or(0.0);
     instance.p95_ms = milliseconds(&deltas, 0.95).unwrap_or(0.0);
-
-    // Each worker is named by its socket, which its place in the pool
-    // maps to.
-
-    let sockets: HashMap<(String, String, String, String), String> = samples
-        .iter()
-        .filter(|sample| sample.name == muru_edge::metrics::LIVE_WORKER_SLOTS)
-        .map(|sample| (worker_key(sample), label(sample, "socket").to_owned()))
-        .collect();
 
     let mut groups: HashMap<GroupKey, (f64, Buckets)> = HashMap::new();
 
@@ -1290,7 +1331,7 @@ mod tests {
             Known {
                 pid: 10,
                 role: "daemon",
-                what: "muructl daemon run".to_owned(),
+                what: daemon_phrase("user", std::path::Path::new("/srv/muru/state")),
                 ..Known::default()
             },
             Known {
@@ -1464,6 +1505,51 @@ mod tests {
         let group = &figures.groups[&("shop".to_owned(), "r1".to_owned(), "default".to_owned())];
         assert_eq!(group.queue, Some(3));
         assert_eq!((group.busy, group.slots), (Some(2), Some(4)));
+    }
+
+    #[test]
+    fn a_worker_that_has_just_left_the_pool_keeps_its_last_second() {
+        let live = Live::default();
+        let worker = [
+            ("app", "shop"),
+            ("release", "r1"),
+            ("group", "default"),
+            ("worker", "0"),
+        ];
+        let slots = [
+            ("app", "shop"),
+            ("release", "r1"),
+            ("group", "default"),
+            ("worker", "0"),
+            ("socket", "/run/w0.sock"),
+        ];
+        let requests =
+            |count: f64| sample(muru_edge::metrics::LIVE_WORKER_REQUESTS, &worker, count);
+
+        live.observe(
+            &[
+                requests(10.0),
+                sample(muru_edge::metrics::LIVE_WORKER_SLOTS, &slots, 4.0),
+            ],
+            &[],
+        );
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Taken off the route: no gauge any more, but the requests of the
+        // second it served still count, for it as for its group.
+
+        live.observe(&[requests(20.0)], &[]);
+        let figures = live.figures();
+        let rate = figures.workers["/run/w0.sock"].requests_per_second;
+        let group = &figures.groups[&("shop".to_owned(), "r1".to_owned(), "default".to_owned())];
+        assert!(rate.is_some_and(|rate| rate > 0.0), "{rate:?}");
+        assert_eq!(rate, group.requests_per_second);
+
+        // A second later it is gone from the map.
+
+        std::thread::sleep(Duration::from_millis(100));
+        live.observe(&[requests(20.0)], &[]);
+        assert!(!live.figures().workers.contains_key("/run/w0.sock"));
     }
 
     #[test]

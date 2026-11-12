@@ -562,9 +562,10 @@ fn upgrade_arguments() -> Vec<std::ffi::OsString> {
 pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     let locations = args.locations.resolve()?;
 
-    // Section 2.1: the daemon's process title.
+    // Section 2.1: the daemon's process title, which names whose daemon
+    // it is, as its edge's does.
 
-    muru_common::title::set("murud", "murud");
+    muru_common::title::set(&format!("muru daemon {}", locations.scope()), "muru-daemon");
 
     // The file is read the same way here and on every reload, with the
     // command line's settings laid over it.

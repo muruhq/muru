@@ -63,6 +63,11 @@ pub struct EdgeRunArgs {
     /// a daemon that restarted without it.
     #[arg(long, value_name = "PATH")]
     listener_socket: Option<PathBuf>,
+
+    /// Whose daemon the edge serves, for its process title: user, system,
+    /// or the daemon's state directory.
+    #[arg(long, value_name = "SCOPE", default_value = "")]
+    scope: String,
 }
 
 /// Parse FD or FD:tls.
@@ -84,7 +89,8 @@ fn parse_listener(text: &str) -> Result<(i32, bool), String> {
 pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     // Section 2.1: the edge's process title.
 
-    muru_common::title::set("muru-edge", "muru-edge");
+    let title = format!("muru edge {}", args.scope);
+    muru_common::title::set(title.trim_end(), "muru-edge");
 
     // The listeners were bound by the daemon and inherited across exec.
 

@@ -52,6 +52,9 @@ pub struct EdgeSpec {
     /// Whom the edge runs as, when the daemon is root (ADR 0026): the
     /// service user, never root.
     pub identity: Option<crate::host::Identity>,
+    /// Whose daemon the edge serves, for its process title: `user`,
+    /// `system`, or the daemon's state directory (section 2.1).
+    pub scope: String,
 }
 
 /// The edge process and what it was last told.
@@ -129,6 +132,7 @@ impl EdgeProcess {
         access_log: Option<PathBuf>,
         spool: PathBuf,
         identity: Option<crate::host::Identity>,
+        scope: String,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(crate::host::alive(pid), "the edge process {pid} is gone");
         let mut client = connect(&control).await?;
@@ -171,6 +175,7 @@ impl EdgeProcess {
                 access_log,
                 spool,
                 identity,
+                scope,
             },
             process: Process::Adopted(pid),
             snapshot: pb::Snapshot {
@@ -626,7 +631,9 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         .arg("--listener-socket")
         .arg(&spec.listener_socket)
         .arg("--spool")
-        .arg(&spec.spool);
+        .arg(&spec.spool)
+        .arg("--scope")
+        .arg(&spec.scope);
 
     // Section 4.15: the rate limits' buckets, in the edges' directory,
     // which every generation of the edge maps, so a replacement draws
