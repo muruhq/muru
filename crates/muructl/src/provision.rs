@@ -296,15 +296,16 @@ async fn build_environment(
         source_builds: false,
         compile_bytecode: false,
     };
-    println!("muru: {reason}, building .venv with {}", build.describe());
+    build_line(&format!(
+        "{reason}, building .venv with {}",
+        build.describe()
+    ));
     let isolation = muru_provision::Isolation::default();
     let _ = development;
 
-    tokio::task::spawn_blocking(move || {
-        build.run(&uv, &isolation, &mut |line| println!("muru: {line}"))
-    })
-    .await?
-    .map_err(|error| anyhow::anyhow!("the environment build failed: {error}"))?;
+    tokio::task::spawn_blocking(move || build.run(&uv, &isolation, &mut build_line))
+        .await?
+        .map_err(|error| anyhow::anyhow!("the environment build failed: {error}"))?;
 
     Ok(true)
 }
@@ -393,18 +394,16 @@ pub async fn build(args: BuildArgs) -> anyhow::Result<()> {
         compile_bytecode: settings.compile_bytecode.unwrap_or(true),
     };
     let environment = args.target.clone().unwrap_or_else(|| project.join(".venv"));
-    println!(
-        "muru: building {} with {}",
+    build_line(&format!(
+        "building {} with {}",
         environment.display(),
         build.describe()
-    );
+    ));
     let isolation = muru_provision::Isolation::default();
 
-    tokio::task::spawn_blocking(move || {
-        build.run(&uv, &isolation, &mut |line| println!("muru: {line}"))
-    })
-    .await?
-    .map_err(|error| anyhow::anyhow!("the environment build failed: {error}"))?;
+    tokio::task::spawn_blocking(move || build.run(&uv, &isolation, &mut build_line))
+        .await?
+        .map_err(|error| anyhow::anyhow!("the environment build failed: {error}"))?;
 
     // What was built, probed, and the runtime library for it.
 
@@ -452,4 +451,16 @@ pub async fn build(args: BuildArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Write a line of a build, or what the build is, as one of Muru's own
+/// lines: with the time where the output wants one, and in JSON as a
+/// record of kind `build`.
+fn build_line(line: &str) {
+    muru_common::log::line_of_kind(
+        muru_common::log::Stream::Stdout,
+        "build",
+        "muru",
+        format_args!("{line}"),
+    );
 }

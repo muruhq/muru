@@ -302,10 +302,13 @@ impl Installation {
 
         for release in &mut releases {
             if release.serving && !release.workers.is_empty() {
-                let worker = release.workers[0].index;
+                let worker = muru_common::worker::WorkerName::new(
+                    &release.workers[0].group,
+                    release.workers[0].index,
+                );
 
                 match self
-                    .inspect(&release.app.clone(), &release.id.clone(), worker)
+                    .inspect(&release.app.clone(), &release.id.clone(), &worker)
                     .await
                 {
                     Ok(inspected) => release.frameworks = frameworks(&inspected["modules"]),
@@ -415,11 +418,15 @@ impl Installation {
             release.state = "ready".to_owned();
         }
 
-        let Some(worker) = release.workers.first().map(|worker| worker.index) else {
+        let Some(worker) = release
+            .workers
+            .first()
+            .map(|worker| muru_common::worker::WorkerName::new(&worker.group, worker.index))
+        else {
             return Ok(vec![release]);
         };
 
-        match self.inspect(&status.app, &status.release, worker).await {
+        match self.inspect(&status.app, &status.release, &worker).await {
             Ok(inspected) => {
                 let settings = &inspected["settings"];
                 release.frameworks = frameworks(&inspected["modules"]);
@@ -452,7 +459,7 @@ impl Installation {
         app: &str,
         release: &str,
         op: &str,
-        worker: Option<u32>,
+        worker: Option<&muru_common::worker::WorkerName>,
     ) -> Result<pb::DebugResponse, String> {
         self.debug_with(app, release, op, worker, serde_json::json!({}), ASK)
             .await
@@ -465,7 +472,7 @@ impl Installation {
         app: &str,
         release: &str,
         op: &str,
-        worker: Option<u32>,
+        worker: Option<&muru_common::worker::WorkerName>,
         arguments: serde_json::Value,
         limit: Duration,
     ) -> Result<pb::DebugResponse, String> {
@@ -477,7 +484,10 @@ impl Installation {
             app: app.to_owned(),
             release: release.to_owned(),
             op: op.to_owned(),
-            worker,
+            worker: worker.map(|worker| worker.index),
+            group: worker
+                .map(|worker| worker.group.clone())
+                .unwrap_or_default(),
             args_json: arguments.to_string(),
         });
 
@@ -493,7 +503,7 @@ impl Installation {
         &mut self,
         app: &str,
         release: &str,
-        worker: u32,
+        worker: &muru_common::worker::WorkerName,
     ) -> Result<serde_json::Value, String> {
         let answer = self.debug(app, release, "inspect", Some(worker)).await?;
         let Some(answer) = answer.workers.first() else {

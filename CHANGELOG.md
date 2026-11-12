@@ -9,11 +9,33 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a25 (2026-11-12)
+
+### Changed
+
+- A worker is numbered within its group everywhere it is shown: `muructl status --processes` and its JSON, `/v1/processes` and the dashboard's worker pages, the answers of `muructl debug` and `muructl restart`, the host's log lines and events, the tags of the release log (`muru.worker[reports/1]`), the access log and the metrics, matching its process title and its socket's name. `--worker` and the dashboard's `worker=` take `N` for a worker of the default group and `GROUP/N` for one of a named group, and the debug and restart answers carry the worker's `group` beside its `index`. ([#602](https://github.com/muruhq/muru/issues/602))
+- The daemon's process title is `muru daemon SCOPE` and the edge's `muru edge SCOPE`, with `muru-daemon` and `muru-edge` as their short names, SCOPE being `user` or `system`, or the daemon's state directory when it is not the default, as with `--state-dir`. In `muructl status --processes` the daemon's row says the same, as `user daemon, state ~/.local/state/muru`, and a host's row gives its release's part in routing after its name: `serving`, `canary 10%`, `held`, `draining` or `retained until 07:40`, which `--json`, `/v1/processes` and the dashboard's Processes section carry as the host's `state`. ([#604](https://github.com/muruhq/muru/issues/604))
+
+### Fixed
+
+- `muructl logs reopen --workers` runs a release's `on_reopen_logs` hooks only once its release log has been opened again, so what the hooks print goes to the new file rather than the renamed one. ([#598](https://github.com/muruhq/muru/issues/598))
+- In the second after traffic moves, a worker that has just left the pool, scaled in or with its release taken off the route, keeps its last second's requests per second and p95 in `muructl status --processes`, so its row adds up with its host's. ([#604](https://github.com/muruhq/muru/issues/604))
+- The `[build]` and `[command NAME]` lines the daemon writes into a release's log carry the full UTC time, as every other line of the file does, so `muructl debug bundle --since` keeps them and they sort with the lines around them. Under `muructl run` and `muructl serve`, a build's lines follow the same rules for times as Muru's other lines, and with `--log-format json` a build's lines and a command's are records of kind `build` and `command`, the latter with the command's name. ([#605](https://github.com/muruhq/muru/issues/605))
+- A process started with a short command line, as `muructl serve` is in a container, now shows its whole title, such as `muru serve shop` rather than `muru serve sh`: a title longer than the command line takes the room of the environment strings that follow it, which the process keeps a copy of. A title that still does not fit is cut at a space rather than in the middle of a name. ([#606](https://github.com/muruhq/muru/issues/606))
+- `muructl status --processes` and the dashboard's Processes section show an ASGI worker's event loop lag under GIL/LAG, and a WSGI worker's GIL wait, rather than the GIL wait whenever there is one; `--json` and `/v1/processes` keep both and carry each host's and worker's `interface`. A host's and a group's GIL/LAG keep their last figure through a second with no new report from their workers, as a worker's does, rather than going empty. ([#607](https://github.com/muruhq/muru/issues/607))
+- A `muructl` command that only prints, `--follow` and `--watch` included, ends quietly with status 141 when the reader of its output closes, as `head` and `grep -q` do, rather than panicking with "Broken pipe" and status 101. ([#608](https://github.com/muruhq/muru/issues/608))
+- `muructl logs reopen` returns once the edge and every release's log relay have opened their files again, rather than as soon as they were told, so a logrotate `postrotate` that runs it can compress the renamed files at once without losing lines. ([#609](https://github.com/muruhq/muru/issues/609))
+
+### Documentation
+
+- The examples of `muructl status --processes` in the daemon guide and the architecture page are now what the command prints, with its column alignment and its ordering of applications and groups. ([#601](https://github.com/muruhq/muru/issues/601))
+
+
 ## 0.1.0a24 (2026-11-12)
 
 ### Added
 
-- Every process of Muru sets a title, so `ps`, `top` and `htop` tell them apart: `murud` for the daemon, `muru-edge` for the edge, `muru run APP` or `muru serve APP`, `muru host APP@RELEASE`, `muru relay APP@RELEASE` and `muru worker APP@RELEASE GROUP/INDEX`.
+- Every process of Muru sets a title, so `ps`, `top` and `htop` tell them apart: `muru daemon SCOPE` for the daemon, `muru edge SCOPE` for the edge, `muru run APP` or `muru serve APP`, `muru host APP@RELEASE`, `muru relay APP@RELEASE` and `muru worker APP@RELEASE GROUP/INDEX`.
 
   The edge counts body bytes received from clients and sent to them, as `muru_request_bytes_total` and `muru_response_bytes_total` by application, release and listener.
 

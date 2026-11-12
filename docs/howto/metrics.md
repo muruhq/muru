@@ -92,7 +92,8 @@ own: the time requests wait for a worker is the `queue` phase of
 `muru_request_duration_seconds`, a worker's CPU as a share of a core is
 `rate(muru_worker_cpu_seconds_total[5m])`, and requests refused for the
 size of their body are `muru_requests_total` with the `body_too_large`
-reason. The worker families carry each worker by its index, so a worker
+reason. The worker families carry each worker by its group and its
+index within the group, so a worker
 replaced under [recycling](recycling.md) starts its counters and
 histograms again, as `rate()` and `increase()` expect of a restarted
 target.

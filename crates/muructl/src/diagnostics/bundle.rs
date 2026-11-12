@@ -1212,6 +1212,7 @@ impl<W: Write> Bundle<'_, W> {
                 release: release.clone(),
                 op: "profile".to_owned(),
                 worker: None,
+                group: String::new(),
                 args_json: serde_json::json!({
                     "duration_s": period.as_secs_f64(),
                     "interval_ms": 10.0,
@@ -1506,7 +1507,13 @@ fn collapsed(answer: &pb::DebugResponse) -> Result<(String, String), String> {
                     *stacks.entry(stack.clone()).or_default() += count.as_u64().unwrap_or(0);
                 }
             }
-            _ => refused = Some(format!("worker {}: {}", worker.index, worker.error)),
+            _ => {
+                refused = Some(format!(
+                    "worker {}: {}",
+                    crate::admin::answered_name(worker),
+                    worker.error
+                ));
+            }
         }
     }
 
@@ -2123,6 +2130,7 @@ mod tests {
     fn the_workers_profiles_are_merged_heaviest_first() {
         let worker = |index: u32, ok: bool, result: &str| pb::WorkerDebug {
             index,
+            group: "default".to_owned(),
             pid: 100 + index,
             ok,
             error: if ok {

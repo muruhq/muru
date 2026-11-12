@@ -348,8 +348,8 @@ pub(crate) async fn handle(
         }
     };
 
-    recording.record.worker = Some(lease.worker);
-    recording.in_flight.grpc(lease.worker, lease.on_loop);
+    recording.record.worker = Some(lease.number);
+    recording.in_flight.grpc(lease.number, lease.on_loop);
     let dispatched = Instant::now();
     let mut reader = lease.conn.reader;
     let mut writer = lease.conn.writer;

@@ -3,8 +3,15 @@
 `muructl debug` looks into the workers of a release through the daemon,
 the host and the worker's control connection, so nothing listens anywhere
 new. Each command takes a release as `app@release`, or an application for
-its current release, and asks every worker unless `--worker N` names one;
+its current release, and asks every worker unless `--worker` names one;
 `--json` prints each worker's answer as JSON.
+
+A worker is named by its index within its group: `--worker 1` is worker
+1 of the default group, and a worker of a named group takes the group's
+name in front, as `--worker reports/1`. The same name is in the
+worker's process title, in `muructl status --processes`, in the access
+log's `worker` and `group` fields and in the tags of its lines in the
+release's log, `muru.worker[1]` and `muru.worker[reports/1]`.
 
 A development run serves the same commands: `muructl run` has an admin
 socket of its own, which a command run from the project directory finds

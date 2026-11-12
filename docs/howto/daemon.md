@@ -533,7 +533,8 @@ the dev group, without building sdists, with bytecode compiled and the
 project's extras and groups, into the state directory under
 `envs/APP/RELEASE`, as the release's user. The release is in the
 `building` state meanwhile, uv's lines go to the release log tagged
-`[build]`, and a failed build fails the release with uv's last line. A
+`[build]`, each with the full UTC time in front as every line of the
+file has, and a failed build fails the release with uv's last line. A
 source with its own `.venv` is used as it is, as before.
 
 ```
@@ -657,22 +658,28 @@ figures over the last second:
 
 ```console
 $ muructl status --processes
-edge  1,284 req/s  3 err/s  p50 4.0 ms  p95 38 ms  in flight 41  ws 212  conns 1,903  tls 12/s  in 2.1MB/s  out 46.4MB/s
+edge  1,284 req/s  3.0 err/s  p50 4.0 ms  p95 38 ms  in flight 41  ws 212  conns 1,903  tls 12/s  in 2.1MB/s  out 46.4MB/s
 
-PID    ROLE           WHAT                                  USER   UP     CPU     RSS      REQ/S   BUSY   QUEUE   P95     GIL/LAG
-4242   daemon         muructl daemon run                    muru   3d2h   0.3%    38.0MB
-4250   ├─ edge        listening on :80, :443                muru   3d2h   2.1%    61.0MB   1,284
-4301   ├─ host        shop@r42 (re-adopted, OS parent 1)    shop   5h12m  0.0%    92.0MB
-4302   │  ├─ relay    shop@r42 output to apps/shop/r42.log  shop   5h12m  0.1%    7.0MB
-       │  ├─ group    default                                                              1,020  27/32  3       41 ms   2.1 ms
-4310   │  ├─ worker   group default, worker 0               shop   5h12m  12.3%   140.0MB  512     14/16          40 ms   2.0 ms
-4311   │  ├─ worker   group default, worker 1               shop   2h03m  11.8%   138.0MB  508     13/16          42 ms   2.2 ms
-       │  ├─ group    crawlers                                                             61     4/8    0       120 ms  0.4 ms
-4320   │  └─ worker   group crawlers, worker 0              shop   5h12m  1.0%    120.0MB  61      4/8            120 ms  0.4 ms
-4330   ├─ host        api@r7                                api    1d4h   0.0%    88.0MB   203     6/64   0       12 ms   1.1 ms
-4331   │  ├─ relay    api@r7 output to apps/api/r7.log      api    1d4h   0.0%    7.0MB
-4340   │  └─ worker   group default, worker 0               api    1d4h   4.2%    131.0MB  203     6/64           12 ms   1.1 ms
-4401   └─ server      blog@r3 instance 0: gunicorn          blog   1d     0.8%    74.0MB
+PID    ROLE           WHAT                                   USER      UP     CPU       RSS   REQ/S    BUSY   QUEUE      P95   GIL/LAG
+4242   daemon         system daemon, state /var/lib/muru     muru    3d2h    0.3%    38.0MB
+4250   ├─ edge        listening on :80, :443                 muru    3d2h    2.1%    61.0MB   1,284
+4330   ├─ host        api@r7 serving                         api     1d4h    0.0%    88.0MB     203    6/64       0    12 ms     48 ms
+4331   │  ├─ relay    api@r7 output to apps/api/r7.log       api     1d4h    0.0%     7.0MB
+4340   │  └─ worker   group default, worker 0                api     1d4h    4.2%   131.0MB     203    6/64            12 ms     48 ms
+4290   ├─ host        shop@r41 retained until 07:40          shop   5h13m    0.0%    91.0MB
+4291   │  ├─ relay    shop@r41 output to apps/shop/r41.log   shop   5h13m    0.0%     7.0MB
+       │  ├─ group    crawlers
+4293   │  ├─ worker   group crawlers, worker 0               shop   5h13m    0.0%   118.0MB
+       │  ├─ group    default
+4292   │  └─ worker   group default, worker 0                shop   5h13m    0.0%   131.0MB
+4301   ├─ host        shop@r42 serving                       shop   5h12m    0.0%    92.0MB
+4302   │  ├─ relay    shop@r42 output to apps/shop/r42.log   shop   5h12m    0.1%     7.0MB
+       │  ├─ group    crawlers                                                                   61     4/8       0   120 ms    0.4 ms
+4320   │  ├─ worker   group crawlers, worker 0               shop   5h12m    1.0%   120.0MB      61     4/8           120 ms    0.4 ms
+       │  ├─ group    default                                                                 1,020   27/32       3    41 ms    2.1 ms
+4310   │  ├─ worker   group default, worker 0                shop   5h12m   12.3%   140.0MB     512   14/16            40 ms    2.0 ms
+4311   │  └─ worker   group default, worker 1                shop   2h03m   11.8%   138.0MB     508   13/16            42 ms    2.2 ms
+4401   └─ server      blog@r3 instance 0: gunicorn           blog    1d0h    0.8%    74.0MB
 ```
 
 The first line is the instance's last second: requests and 5xx
@@ -688,12 +695,32 @@ while it runs). The tree is the one Muru supervises: a host adopted
 again after the daemon restarted has the init process as its parent
 in `ps`, which its row says.
 
+The daemon's row says whose daemon it is, `user` or `system`, and its
+state directory. A host's row gives its release's part in routing after
+its name, so an idle instance shows which release serves:
+
+| Shown | The release |
+| --- | --- |
+| `serving` | is the one its application's traffic goes to |
+| `canary 10%` | is a rollout's candidate, taking that share of the traffic |
+| `held` | is ready and takes no traffic, as a deploy with `--hold` leaves it |
+| `draining` | is off the route, finishing the requests it has |
+| `retained until 07:40` | is kept warm for a rollback until then, in local time |
+
+A release still starting shows its state, `starting` or `warming`.
+`--json` gives the same as each host's `state`.
+
 For a worker the figures are its requests per second, its slots holding
 a request of all its slots, the 95th percentile total time and, under
-GIL/LAG, its threads' GIL wait or its event loop's lag at the 95th
-percentile. Requests wait for a slot in their worker group, so QUEUE is
-a group's: a release with several groups has a row for each, and the
-host's row has the figures of a release with one.
+GIL/LAG, the 95th percentile of what holds its requests up: its event
+loop's lag when the release's default mount is ASGI, and its threads'
+wait for the GIL when it is WSGI. On a build of Python without the GIL
+a WSGI worker has no GIL wait, and the column is empty. Requests wait
+for a slot in their worker group, so QUEUE is a group's: a release with
+several groups has a row for each, and the host's row has the figures
+of a release with one, its GIL/LAG the workers' together. `--json`
+gives both figures, `gil_wait_p95_ms` and `loop_lag_p95_ms`, and the
+`interface` that chooses between them.
 
 - `--app APP[@RELEASE]` shows the daemon and one application's
   processes, or one release's.
@@ -719,15 +746,28 @@ apart:
 
 | Process | Title |
 | --- | --- |
-| The daemon | `murud` |
-| The edge | `muru-edge` |
+| The daemon | `muru daemon user`, `muru daemon system`, or `muru daemon DIR` |
+| The edge | `muru edge user`, `muru edge system`, or `muru edge DIR` |
 | A development run, or `muructl serve` | `muru run APP`, `muru serve APP` |
 | A release's host | `muru host APP@RELEASE` |
 | Its log relay | `muru relay APP@RELEASE` |
 | A worker | `muru worker APP@RELEASE GROUP/INDEX` |
 
+The daemon's and the edge's titles name the daemon as its row does:
+`user` or `system`, or its state directory when that is not the default
+for its scope, as with `--state-dir`, so two daemons of one user are
+told apart. An edge left running while its daemon restarts has the
+init process as its parent, and its title still says whose it is.
+
+A title longer than the command line the process was started with,
+such as `muru serve shop` for a process started as `muructl serve`,
+takes the room of the environment strings that follow it, which the
+process keeps a copy of, so the environment it and the processes it
+starts see is unchanged, while `/proc/PID/environ` shows the title in
+its place.
+
 On Linux the short name `top` shows by default, and `/proc/PID/comm`
-holds, is `murud`, `muru-edge`, `muru-run`, `muru-serve`, `muru-host`,
+holds, is `muru-daemon`, `muru-edge`, `muru-run`, `muru-serve`, `muru-host`,
 `muru-relay` or `muru-worker`.
 
 `--metrics ADDRESS`, or a `[metrics]` table

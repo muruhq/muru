@@ -70,7 +70,7 @@ pub enum HostMessage {
 /// One worker a host runs, as it last announced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostWorker {
-    /// The worker's index within the host.
+    /// The worker's index within its group.
     pub index: u32,
     /// Its pid.
     pub pid: u32,
@@ -85,8 +85,10 @@ pub struct HostWorker {
 /// One worker's answer to a request (section 11.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerReply {
-    /// The worker's index.
+    /// The worker's index within its group.
     pub index: u32,
+    /// Its group.
+    pub group: String,
     /// Its pid.
     pub pid: u32,
     /// Whether it answered.
@@ -98,9 +100,9 @@ pub struct WorkerReply {
 }
 
 /// What one worker last reported to its host (sections 7.6 and 7.7).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkerStatus {
-    /// The worker's index within the host.
+    /// The worker's index within its group.
     pub index: u32,
     /// Its pid.
     pub pid: u32,
@@ -288,6 +290,7 @@ impl HostMessage {
                             .iter()
                             .map(|worker| WorkerReply {
                                 index: worker["index"].as_u64().unwrap_or(0) as u32,
+                                group: worker["group"].as_str().unwrap_or("default").to_owned(),
                                 pid: worker["pid"].as_u64().unwrap_or(0) as u32,
                                 ok: worker["ok"].as_bool().unwrap_or(false),
                                 error: worker["error"].as_str().unwrap_or_default().to_owned(),
@@ -416,14 +419,22 @@ impl HostControl {
             .send(format!("{{\"type\":\"applied\",\"version\":{version}}}\n"));
     }
 
-    /// Ask the host's workers something (section 11.7); the answer comes
-    /// back as a Response message carrying the same id.
-    pub fn request(&self, id: u64, op: &str, worker: Option<u32>, args: &serde_json::Value) {
+    /// Ask the host's workers something (section 11.7), one of them when
+    /// `worker` names it; the answer comes back as a Response message
+    /// carrying the same id.
+    pub fn request(
+        &self,
+        id: u64,
+        op: &str,
+        worker: Option<&muru_common::worker::WorkerName>,
+        args: &serde_json::Value,
+    ) {
         let message = serde_json::json!({
             "type": "request",
             "id": id,
             "op": op,
-            "worker": worker,
+            "worker": worker.map(|worker| worker.index),
+            "group": worker.map(|worker| worker.group.as_str()),
             "args": args,
         });
         let _ = self.outgoing.send(format!("{message}\n"));
@@ -1540,10 +1551,33 @@ impl HostProcess {
         (pid != 0).then_some(pid)
     }
 
-    /// Send a signal to the release's log relay: SIGUSR1 has it open the
-    /// release log again by name. Returns whether it was delivered.
-    pub fn signal_relay(&self, signal: i32) -> bool {
-        signal_process(self.relay.pid(), signal)
+    /// Have the release's log relay open the release log again by name,
+    /// with SIGUSR1. When it was told, gives what changes once it reports
+    /// that it has, for a caller that waits for the file to be reopened.
+    ///
+    /// With `workers`, the host is then told, with SIGUSR2, to have its
+    /// workers run their on_reopen_logs hook, once the relay reports that
+    /// it has reopened the file, so what the hooks write goes to the new
+    /// one. A relay that does not report within `RELAY_REOPEN_WAIT`, or
+    /// that was not running, does not hold the workers back.
+    pub fn reopen_log(&self, workers: bool) -> Option<tokio::sync::watch::Receiver<u64>> {
+        let answer = self.relay.reopens.subscribe();
+        let mut reopened = self.relay.reopens.subscribe();
+        let told = signal_process(self.relay.pid(), libc::SIGUSR1);
+
+        if workers {
+            let host = self.pid().unwrap_or(0);
+
+            tokio::spawn(async move {
+                if told {
+                    let _ = tokio::time::timeout(RELAY_REOPEN_WAIT, reopened.changed()).await;
+                }
+
+                signal_process(host, libc::SIGUSR2);
+            });
+        }
+
+        told.then_some(answer)
     }
 
     /// Lines of the release's output dropped so far, across its relays.
@@ -2225,6 +2259,8 @@ impl RelayRunning {
 struct RelaySupervisor {
     pid: Arc<AtomicU32>,
     dropped: Arc<AtomicU64>,
+    /// Counts the reopens the relay has reported.
+    reopens: Arc<tokio::sync::watch::Sender<u64>>,
     stopping: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -2235,6 +2271,10 @@ const RELAY_DRAIN: Duration = Duration::from_secs(5);
 
 /// How long a relay told to stop gets to do so before it is killed.
 const RELAY_TERM: Duration = Duration::from_secs(3);
+
+/// How long a reopen with the workers waits for the relay to report that
+/// it has reopened the release log before the workers are told anyway.
+const RELAY_REOPEN_WAIT: Duration = Duration::from_secs(5);
 
 /// A relay that lasted this long is not failing: the wait before the
 /// next is back to its shortest.
@@ -2254,6 +2294,7 @@ impl RelaySupervisor {
     ) -> Self {
         let pid = Arc::new(AtomicU32::new(running.pid()));
         let dropped = Arc::new(AtomicU64::new(0));
+        let reopens = Arc::new(tokio::sync::watch::channel(0).0);
         let (stopping, stop) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(supervise_relay(
             launch,
@@ -2264,12 +2305,14 @@ impl RelaySupervisor {
             watcher,
             Arc::clone(&pid),
             Arc::clone(&dropped),
+            Arc::clone(&reopens),
             stop,
         ));
 
         Self {
             pid,
             dropped,
+            reopens,
             stopping,
             task,
         }
@@ -2327,6 +2370,7 @@ async fn supervise_relay(
     watcher: RelayWatcher,
     pid: Arc<AtomicU32>,
     dropped: Arc<AtomicU64>,
+    reopens: Arc<tokio::sync::watch::Sender<u64>>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut wait = Duration::from_secs(1);
@@ -2344,6 +2388,7 @@ async fn supervise_relay(
             carried,
             Arc::clone(&current),
             Arc::clone(&dropped),
+            Arc::clone(&reopens),
             Arc::clone(&watcher),
         ));
 
@@ -2407,12 +2452,14 @@ async fn supervise_relay(
 }
 
 /// Read a relay's reports, trying for a moment while it starts, keeping
-/// `current` as what it has dropped and `total` with `carried` added.
+/// `current` as what it has dropped and `total` with `carried` added,
+/// and counting its reopens in `reopens`.
 async fn read_relay_reports(
     socket: PathBuf,
     carried: u64,
     current: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
+    reopens: Arc<tokio::sync::watch::Sender<u64>>,
     watcher: RelayWatcher,
 ) {
     for _ in 0..100 {
@@ -2428,6 +2475,7 @@ async fn read_relay_reports(
                 level: event.level,
                 message: event.message,
             }),
+            crate::relay::Report::Reopened => reopens.send_modify(|count| *count += 1),
         })
         .await;
 

@@ -135,17 +135,19 @@ pub struct RelayArgs {
 }
 
 /// Where a line came from, which is also its queue. The relay's own
-/// lines sort first, then the host's, then the workers' by index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// lines sort first, then the host's, then the workers' by name: a
+/// worker's index within its group, after the group's name and a slash
+/// outside the default group, as the host offers it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Source {
     Relay,
     Host,
-    Worker(u32),
+    Worker(Arc<str>),
 }
 
 impl Source {
     /// The words a gap line uses for what was dropped.
-    fn whose(self) -> String {
+    fn whose(&self) -> String {
         match self {
             Self::Relay => "the relay's own output".to_owned(),
             Self::Host => "the host's output".to_owned(),
@@ -222,6 +224,9 @@ pub enum Report {
     Status(Status),
     /// A stall began or ended.
     Event(Event),
+    /// The release log was opened again by name, as SIGUSR1 asked: what
+    /// the relay takes from here on goes to the file now at its path.
+    Reopened,
 }
 
 /// The state the readers and the writer share.
@@ -245,6 +250,9 @@ struct Shared {
     state: Mutex<State>,
     ready: Condvar,
     reopen: AtomicBool,
+    /// How many times the writer has acted on SIGUSR1, for the control
+    /// socket to report each one.
+    reopens: watch::Sender<u64>,
     status: watch::Sender<Status>,
     events: broadcast::Sender<Event>,
     tag: String,
@@ -267,6 +275,7 @@ impl Shared {
             }),
             ready: Condvar::new(),
             reopen: AtomicBool::new(false),
+            reopens: watch::channel(0).0,
             status: watch::channel(Status::default()).0,
             events: broadcast::channel(16).0,
             tag: format!("muru.relay[{}]: ", std::process::id()),
@@ -280,13 +289,13 @@ impl Shared {
     }
 
     /// The notifier a reader of `source` waits on for room.
-    fn room(&self, source: Source) -> Arc<Notify> {
-        Arc::clone(&self.lock().queues.entry(source).or_default().room)
+    fn room(&self, source: &Source) -> Arc<Notify> {
+        Arc::clone(&self.lock().queues.entry(source.clone()).or_default().room)
     }
 
     /// Whether `source`'s queue has room for more, under `block`; a
     /// queue that has none starts a stall when none is in progress.
-    fn has_room(&self, source: Source) -> bool {
+    fn has_room(&self, source: &Source) -> bool {
         let mut state = self.lock();
 
         if state.overflow != Overflow::Block {
@@ -296,7 +305,7 @@ impl Shared {
         let limit = state.limit;
         let full = state
             .queues
-            .get(&source)
+            .get(source)
             .is_some_and(|queue| queue.bytes >= limit);
 
         if full && state.stall.is_none() {
@@ -334,7 +343,7 @@ impl Shared {
         let limit = state.limit;
         let overflow = state.overflow;
         let size = bytes.len();
-        let queue = state.queues.entry(source).or_default();
+        let queue = state.queues.entry(source.clone()).or_default();
         let mut dropped = 0u64;
         let mut carried = 0u64;
         let mut freed = 0usize;
@@ -653,13 +662,13 @@ fn turn_order(state: &State) -> Vec<Source> {
         .queues
         .iter()
         .filter(|(_, queue)| !queue.entries.is_empty())
-        .map(|(source, _)| *source)
+        .map(|(source, _)| source.clone())
         .collect();
 
-    let start = match state.cursor {
+    let start = match &state.cursor {
         Some(cursor) => waiting
             .iter()
-            .position(|source| *source > cursor)
+            .position(|source| source > cursor)
             .unwrap_or(0),
         None => 0,
     };
@@ -667,7 +676,7 @@ fn turn_order(state: &State) -> Vec<Source> {
     waiting[start..]
         .iter()
         .chain(&waiting[..start])
-        .copied()
+        .cloned()
         .collect()
 }
 
@@ -767,6 +776,7 @@ fn write_loop(shared: &Shared, mut destination: Destination) {
 
         if reopen {
             destination.reopen(shared);
+            shared.reopens.send_modify(|count| *count += 1);
         }
     }
 }
@@ -833,8 +843,9 @@ struct Ended {
 #[derive(Debug, serde::Deserialize)]
 struct Offered {
     pipe: u64,
+    /// The worker's name, for a worker's pipe.
     #[serde(default)]
-    worker: Option<u32>,
+    worker: Option<String>,
     stream: String,
 }
 
@@ -943,7 +954,7 @@ async fn read_loop(args: RelayArgs, shared: Arc<Shared>) -> anyhow::Result<bool>
                     }
 
                     let source = match offer.worker {
-                        Some(index) => Source::Worker(index),
+                        Some(name) => Source::Worker(name.into()),
                         None => Source::Host,
                     };
 
@@ -1045,7 +1056,7 @@ fn spawn_pipe(
 ) -> std::io::Result<()> {
     let receiver = tokio::net::unix::pipe::Receiver::from_owned_fd(fd)?;
 
-    let tag = match (source, stream.as_deref()) {
+    let tag = match (&source, stream.as_deref()) {
         (Source::Worker(index), Some("stderr") | None) => format!("muru.worker[{index}]: "),
         (Source::Worker(index), Some(stream)) => format!("muru.worker[{index}].{stream}: "),
         _ => String::new(),
@@ -1073,7 +1084,7 @@ async fn read_pipe(
     source: Source,
     tag: &str,
 ) {
-    let room = shared.room(source);
+    let room = shared.room(&source);
     let mut buffer = vec![0u8; READ_SIZE];
     let mut lines = Lines::new(tag);
 
@@ -1084,7 +1095,7 @@ async fn read_pipe(
         loop {
             let notified = room.notified();
 
-            if shared.has_room(source) {
+            if shared.has_room(&source) {
                 break;
             }
 
@@ -1097,7 +1108,7 @@ async fn read_pipe(
         };
 
         for (bytes, count) in lines.feed(&buffer[..count], SystemTime::now()) {
-            shared.push(source, bytes, count);
+            shared.push(source.clone(), bytes, count);
         }
     }
 
@@ -1229,7 +1240,8 @@ fn serve_control(path: &Path, shared: &Arc<Shared>) -> anyhow::Result<()> {
         while let Ok((stream, _)) = listener.accept().await {
             let status = shared.status.subscribe();
             let events = shared.events.subscribe();
-            tokio::spawn(report_to(stream, status, events));
+            let reopens = shared.reopens.subscribe();
+            tokio::spawn(report_to(stream, status, events, reopens));
         }
     });
 
@@ -1241,6 +1253,7 @@ async fn report_to(
     mut stream: UnixStream,
     mut status: watch::Receiver<Status>,
     mut events: broadcast::Receiver<Event>,
+    mut reopens: watch::Receiver<u64>,
 ) {
     let mut last_sent = Instant::now() - Duration::from_secs(1);
     status.mark_changed();
@@ -1273,6 +1286,11 @@ async fn report_to(
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => return,
             },
+            changed = reopens.changed() => {
+                if changed.is_err() || send(&mut stream, &Report::Reopened).await.is_err() {
+                    return;
+                }
+            }
         }
     }
 }
@@ -1376,11 +1394,11 @@ mod tests {
 
         for _ in 0..80 {
             let (bytes, lines) = entry(&line);
-            shared.push(Source::Worker(3), bytes, lines);
+            shared.push(Source::Worker("3".into()), bytes, lines);
         }
 
         let (bytes, lines) = entry("last\n");
-        shared.push(Source::Worker(3), bytes, lines);
+        shared.push(Source::Worker("3".into()), bytes, lines);
         assert_eq!(shared.lock().dropped, 17);
 
         let out = drain(&shared);
@@ -1405,11 +1423,11 @@ mod tests {
 
         for _ in 0..200 {
             let (bytes, lines) = entry(&line);
-            shared.push(Source::Worker(0), bytes, lines);
+            shared.push(Source::Worker("0".into()), bytes, lines);
         }
 
         let (bytes, lines) = entry("quiet\n");
-        shared.push(Source::Worker(1), bytes, lines);
+        shared.push(Source::Worker("1".into()), bytes, lines);
 
         let (first, _) = shared.take().unwrap();
         let first = String::from_utf8_lossy(&first);
@@ -1425,15 +1443,15 @@ mod tests {
 
         for _ in 0..64 {
             let (bytes, lines) = entry(&line);
-            shared.push(Source::Worker(0), bytes, lines);
+            shared.push(Source::Worker("0".into()), bytes, lines);
         }
 
-        assert!(!shared.has_room(Source::Worker(0)));
-        assert!(shared.has_room(Source::Worker(1)));
+        assert!(!shared.has_room(&Source::Worker("0".into())));
+        assert!(shared.has_room(&Source::Worker("1".into())));
         assert_eq!(shared.lock().dropped, 0);
 
         let _ = shared.take().unwrap();
-        assert!(shared.has_room(Source::Worker(0)));
+        assert!(shared.has_room(&Source::Worker("0".into())));
     }
 
     #[test]
@@ -1444,7 +1462,7 @@ mod tests {
 
         for _ in 0..200 {
             let (bytes, lines) = entry(&line);
-            shared.push(Source::Worker(0), bytes, lines);
+            shared.push(Source::Worker("0".into()), bytes, lines);
         }
 
         loop {
@@ -1518,7 +1536,7 @@ mod tests {
 
         muru_proto::descriptors::write_with_fd(
             &mut write_half,
-            b"{\"pipe\":7,\"worker\":2,\"stream\":\"stderr\"}\n",
+            b"{\"pipe\":7,\"worker\":\"crawlers/0\",\"stream\":\"stderr\"}\n",
             std::os::fd::AsFd::as_fd(&read),
         )
         .await
@@ -1544,6 +1562,9 @@ mod tests {
             .unwrap();
 
         let written = std::fs::read_to_string(&log).unwrap();
-        assert!(written.ends_with(" muru.worker[2]: hello\n"), "{written}");
+        assert!(
+            written.ends_with(" muru.worker[crawlers/0]: hello\n"),
+            "{written}"
+        );
     }
 }

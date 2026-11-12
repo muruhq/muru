@@ -91,23 +91,23 @@ pub async fn show(socket: &Path, args: &ProcessArgs, json: bool) -> anyhow::Resu
             .map_err(|status| anyhow::anyhow!("{}", status.message()))?
             .into_inner();
 
-        let mut out = std::io::stdout().lock();
-
-        if json {
-            writeln!(out, "{}", serde_json::to_string(&answer)?)?;
+        let frame = if json {
+            format!("{}\n", serde_json::to_string(&answer)?)
         } else if redraw {
             // Home and clear, then the frame: drawn in place.
 
-            write!(out, "\x1b[H\x1b[2J{}", render(&answer, Some(every)))?;
+            format!("\x1b[H\x1b[2J{}", render(&answer, Some(every)))
         } else {
-            if !first {
-                writeln!(out)?;
-            }
+            let gap = if first { "" } else { "\n" };
+            format!("{gap}{}", render(&answer, Some(every)))
+        };
 
-            write!(out, "{}", render(&answer, Some(every)))?;
-        }
+        // A reader that has gone ends the watch, as it ends `head`.
 
-        out.flush()?;
+        let mut out = std::io::stdout().lock();
+        out.write_all(frame.as_bytes())
+            .and_then(|()| out.flush())
+            .inspect_err(muru_common::log::reader_gone)?;
         first = false;
     }
 }
@@ -122,6 +122,8 @@ struct Row {
     cpu: String,
     rss: String,
     figures: Option<pb::Figures>,
+    /// What the release's default mount runs as, which chooses GIL/LAG.
+    interface: String,
 }
 
 /// The view as text: with `every`, a line naming the instance, the time
@@ -130,6 +132,13 @@ pub fn render(answer: &pb::Processes, every: Option<Duration>) -> String {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64);
+
+    render_at(answer, every, now)
+}
+
+/// The view as `render` draws it, with `now`, in Unix milliseconds, as
+/// the time the uptimes are counted to.
+fn render_at(answer: &pb::Processes, every: Option<Duration>, now: u64) -> String {
     let mut text = String::new();
 
     if let Some(every) = every {
@@ -197,7 +206,7 @@ pub fn render(answer: &pb::Processes, every: Option<Duration>) -> String {
             cells.extend([row.up.clone(), row.cpu.clone(), row.rss.clone()]);
 
             if with_figures {
-                cells.extend(figure_cells(row.figures.as_ref()));
+                cells.extend(figure_cells(row.figures.as_ref(), &row.interface));
             }
 
             cells
@@ -278,6 +287,7 @@ fn flatten(
             .map(crate::admin::human_size)
             .unwrap_or_default(),
         figures: process.figures,
+        interface: process.interface.clone(),
     });
 
     let below = if root {
@@ -312,6 +322,7 @@ fn flatten(
                 cpu: String::new(),
                 rss: String::new(),
                 figures: group.figures,
+                interface: process.interface.clone(),
             });
             shown_group.clone_from(&child.group);
         }
@@ -322,8 +333,10 @@ fn flatten(
 }
 
 /// The figure columns: requests per second, busy slots of the slots,
-/// requests waiting, p95 total time, and GIL wait or loop lag p95.
-fn figure_cells(figures: Option<&pb::Figures>) -> Vec<String> {
+/// requests waiting, p95 total time, and under GIL/LAG the p95 of the
+/// event loop's lag for a release whose default mount is ASGI and of the
+/// GIL wait for any other, either when the host has not said which.
+fn figure_cells(figures: Option<&pb::Figures>, interface: &str) -> Vec<String> {
     let Some(figures) = figures else {
         return vec![String::new(); 5];
     };
@@ -333,11 +346,13 @@ fn figure_cells(figures: Option<&pb::Figures>) -> Vec<String> {
         _ => String::new(),
     };
 
-    let wait = figures
-        .gil_wait_p95_ms
-        .or(figures.loop_lag_p95_ms)
-        .map(|ms| format!("{} ms", milliseconds(ms)))
-        .unwrap_or_default();
+    let wait = match interface {
+        "asgi" => figures.loop_lag_p95_ms,
+        "" => figures.gil_wait_p95_ms.or(figures.loop_lag_p95_ms),
+        _ => figures.gil_wait_p95_ms,
+    }
+    .map(|ms| format!("{} ms", milliseconds(ms)))
+    .unwrap_or_default();
 
     vec![
         figures.requests_per_second.map(rate).unwrap_or_default(),
@@ -447,7 +462,7 @@ mod tests {
             root: Some(process(
                 4242,
                 "daemon",
-                "muructl daemon run",
+                "system daemon, state /var/lib/muru",
                 vec![process(4250, "edge", "listening on :80", vec![]), host],
             )),
             ..pb::Processes::default()
@@ -476,6 +491,573 @@ mod tests {
             lines[5].contains("1.2 ms") || lines[5].contains("1.3 ms"),
             "{text}"
         );
+    }
+
+    // The guides' examples of `muructl status --processes` are what the
+    // command prints for an instance built here as the daemon and a run
+    // build their answers, so they cannot drift from it (issue 601).
+
+    use std::collections::HashMap;
+
+    use muru_controller::processes::{Figures, Known, OsProcess, tree_from, worker_phrase};
+
+    /// When the examples are taken, Unix milliseconds.
+    const NOW: u64 = 1_800_000_000_000;
+
+    /// An instance for an example: what is known of each process, what
+    /// the operating system says of it, and the live figures.
+    #[derive(Default)]
+    struct Example {
+        known: Vec<Known>,
+        os: HashMap<u32, OsProcess>,
+        cpu: HashMap<u32, f64>,
+        users: HashMap<u32, &'static str>,
+        figures: Figures,
+    }
+
+    impl Example {
+        /// A process, with its operating system parent, its user, how long
+        /// it has been up, its CPU percentage and its resident memory.
+        fn add(
+            &mut self,
+            known: Known,
+            os_parent: u32,
+            user: &'static str,
+            up_s: u64,
+            cpu: f64,
+            rss_mb: f64,
+        ) {
+            let pid = known.pid;
+            self.os.insert(
+                pid,
+                OsProcess {
+                    pid,
+                    parent: os_parent,
+                    started_unix_ms: Some(NOW - up_s * 1000),
+                    rss: Some((rss_mb * 1024.0 * 1024.0) as u64),
+                    name: if known.role == "server" {
+                        "/srv/blog/.venv/bin/gunicorn --workers 2 blog:app".to_owned()
+                    } else {
+                        String::new()
+                    },
+                    ..OsProcess::default()
+                },
+            );
+            self.cpu.insert(pid, cpu);
+            self.users.insert(pid, user);
+            self.known.push(known);
+        }
+
+        /// A worker's figures over the last second, with its GIL wait and
+        /// its loop's lag.
+        #[allow(clippy::too_many_arguments)]
+        fn worker(
+            &mut self,
+            pid: u32,
+            socket: &str,
+            rate: f64,
+            busy: u32,
+            slots: u32,
+            p95: f64,
+            wait: (Option<f64>, Option<f64>),
+        ) {
+            self.figures.workers.insert(
+                socket.to_owned(),
+                pb::Figures {
+                    requests_per_second: Some(rate),
+                    busy: Some(busy),
+                    slots: Some(slots),
+                    p95_ms: Some(p95),
+                    ..pb::Figures::default()
+                },
+            );
+            self.figures.signals.insert(pid, wait);
+        }
+
+        /// A worker group's figures over the last second.
+        #[allow(clippy::too_many_arguments)]
+        fn group(
+            &mut self,
+            app: &str,
+            release: &str,
+            group: &str,
+            rate: f64,
+            busy: u32,
+            slots: u32,
+            queue: u32,
+            p95: f64,
+            wait: (Option<f64>, Option<f64>),
+        ) {
+            self.figures.groups.insert(
+                (app.to_owned(), release.to_owned(), group.to_owned()),
+                pb::Figures {
+                    requests_per_second: Some(rate),
+                    busy: Some(busy),
+                    slots: Some(slots),
+                    queue: Some(queue),
+                    p95_ms: Some(p95),
+                    gil_wait_p95_ms: wait.0,
+                    loop_lag_p95_ms: wait.1,
+                },
+            );
+        }
+
+        /// Say what an application's default mount runs as, on its host
+        /// and workers, as the host announces it.
+        fn interface(&mut self, app: &str, interface: &str) {
+            for known in &mut self.known {
+                if known.app == app && matches!(known.role, "host" | "worker") {
+                    known.interface = interface.to_owned();
+                }
+            }
+        }
+
+        /// The answer to ListProcesses for the instance.
+        fn answer(self, mode: &str) -> pb::Processes {
+            let mut root = tree_from(&self.known, &self.os, &self.cpu, &self.figures);
+
+            fn name_users(node: &mut pb::Process, users: &HashMap<u32, &'static str>) {
+                node.user = users.get(&node.pid).copied().unwrap_or_default().to_owned();
+
+                for child in &mut node.children {
+                    name_users(child, users);
+                }
+            }
+
+            if let Some(root) = &mut root {
+                name_users(root, &self.users);
+            }
+
+            pb::Processes {
+                mode: mode.to_owned(),
+                root,
+                figures: Some(self.figures.instance),
+                ..pb::Processes::default()
+            }
+        }
+    }
+
+    fn known(pid: u32, parent: u32, role: &'static str, what: &str) -> Known {
+        Known {
+            pid,
+            parent,
+            role,
+            what: what.to_owned(),
+            ..Known::default()
+        }
+    }
+
+    /// A worker of a release, as the daemon or a run knows it.
+    fn worker(
+        pid: u32,
+        host: u32,
+        app: &str,
+        release: &str,
+        group: &str,
+        index: u32,
+        with_group: bool,
+    ) -> Known {
+        Known {
+            app: app.to_owned(),
+            release: release.to_owned(),
+            group: group.to_owned(),
+            index: Some(index),
+            socket: Some(format!("{app}/{release}/{group}-{index}.sock")),
+            ..known(
+                pid,
+                host,
+                "worker",
+                &worker_phrase(group, index, "ready", with_group),
+            )
+        }
+    }
+
+    /// A release's host and its log relay, as the daemon knows them.
+    fn host(
+        pid: u32,
+        daemon: u32,
+        app: &str,
+        release: &str,
+        groups: &[&str],
+        (state, phrase): (&str, &str),
+    ) -> [Known; 2] {
+        let subject = format!("{app}@{release}");
+
+        [
+            Known {
+                app: app.to_owned(),
+                release: release.to_owned(),
+                groups: groups.iter().map(|group| (*group).to_owned()).collect(),
+                state: state.to_owned(),
+                ..known(
+                    pid,
+                    daemon,
+                    "host",
+                    &muru_controller::processes::host_phrase(&subject, phrase),
+                )
+            },
+            Known {
+                app: app.to_owned(),
+                release: release.to_owned(),
+                spawned_by: daemon,
+                ..known(
+                    pid + 1,
+                    pid,
+                    "relay",
+                    &format!("{subject} output to apps/{app}/{release}.log"),
+                )
+            },
+        ]
+    }
+
+    /// The daemon guide's example: a daemon with two applications in
+    /// worker processes, one with a named group and a release kept warm
+    /// after a deploy, and a managed server.
+    fn daemon_example() -> pb::Processes {
+        let mut example = Example::default();
+        let day = 86_400;
+        let listening = [
+            ("0.0.0.0:80".parse().expect("an address"), false),
+            ("0.0.0.0:443".parse().expect("an address"), true),
+        ];
+
+        example.add(
+            known(
+                4242,
+                0,
+                "daemon",
+                &muru_controller::processes::daemon_phrase("system", Path::new("/var/lib/muru")),
+            ),
+            1,
+            "muru",
+            3 * day + 2 * 3600,
+            0.3,
+            38.0,
+        );
+        example.add(
+            known(
+                4250,
+                4242,
+                "edge",
+                &format!(
+                    "listening on {}",
+                    muru_controller::processes::addresses(&listening)
+                ),
+            ),
+            4242,
+            "muru",
+            3 * day + 2 * 3600,
+            2.1,
+            61.0,
+        );
+
+        let [shop, relay] = host(
+            4301,
+            4242,
+            "shop",
+            "r42",
+            &["default", "crawlers"],
+            ("serving", "serving"),
+        );
+        example.add(shop, 4242, "shop", 5 * 3600 + 12 * 60, 0.0, 92.0);
+        example.add(relay, 4242, "shop", 5 * 3600 + 12 * 60, 0.1, 7.0);
+        example.add(
+            worker(4310, 4301, "shop", "r42", "default", 0, true),
+            4301,
+            "shop",
+            5 * 3600 + 12 * 60,
+            12.3,
+            140.0,
+        );
+        example.add(
+            worker(4311, 4301, "shop", "r42", "default", 1, true),
+            4301,
+            "shop",
+            2 * 3600 + 3 * 60,
+            11.8,
+            138.0,
+        );
+        example.add(
+            worker(4320, 4301, "shop", "r42", "crawlers", 0, true),
+            4301,
+            "shop",
+            5 * 3600 + 12 * 60,
+            1.0,
+            120.0,
+        );
+        example.worker(
+            4310,
+            "shop/r42/default-0.sock",
+            512.0,
+            14,
+            16,
+            40.2,
+            (Some(2.0), None),
+        );
+        example.worker(
+            4311,
+            "shop/r42/default-1.sock",
+            508.0,
+            13,
+            16,
+            42.0,
+            (Some(2.2), None),
+        );
+        example.worker(
+            4320,
+            "shop/r42/crawlers-0.sock",
+            61.0,
+            4,
+            8,
+            120.0,
+            (Some(0.4), None),
+        );
+        example.group(
+            "shop",
+            "r42",
+            "default",
+            1020.0,
+            27,
+            32,
+            3,
+            41.0,
+            (Some(2.1), None),
+        );
+        example.group(
+            "shop",
+            "r42",
+            "crawlers",
+            61.0,
+            4,
+            8,
+            0,
+            120.0,
+            (Some(0.4), None),
+        );
+
+        // The release the last deploy replaced, kept warm with one worker
+        // in each group for a rollback.
+
+        let [kept, relay] = host(
+            4290,
+            4242,
+            "shop",
+            "r41",
+            &["default", "crawlers"],
+            ("retained", "retained until 07:40"),
+        );
+        example.add(kept, 4242, "shop", 5 * 3600 + 13 * 60, 0.0, 91.0);
+        example.add(relay, 4242, "shop", 5 * 3600 + 13 * 60, 0.0, 7.0);
+        example.add(
+            worker(4292, 4290, "shop", "r41", "default", 0, true),
+            4290,
+            "shop",
+            5 * 3600 + 13 * 60,
+            0.0,
+            131.0,
+        );
+        example.add(
+            worker(4293, 4290, "shop", "r41", "crawlers", 0, true),
+            4290,
+            "shop",
+            5 * 3600 + 13 * 60,
+            0.0,
+            118.0,
+        );
+
+        let [api, relay] = host(
+            4330,
+            4242,
+            "api",
+            "r7",
+            &["default"],
+            ("serving", "serving"),
+        );
+        example.add(api, 4242, "api", day + 4 * 3600, 0.0, 88.0);
+        example.add(relay, 4242, "api", day + 4 * 3600, 0.0, 7.0);
+        example.add(
+            worker(4340, 4330, "api", "r7", "default", 0, true),
+            4330,
+            "api",
+            day + 4 * 3600,
+            4.2,
+            131.0,
+        );
+        example.worker(
+            4340,
+            "api/r7/default-0.sock",
+            203.0,
+            6,
+            64,
+            12.0,
+            (Some(0.1), Some(48.0)),
+        );
+        example.group(
+            "api",
+            "r7",
+            "default",
+            203.0,
+            6,
+            64,
+            0,
+            12.0,
+            (Some(0.1), Some(48.0)),
+        );
+        example.interface("api", "asgi");
+        example.interface("shop", "wsgi");
+
+        example.add(
+            Known {
+                app: "blog".to_owned(),
+                release: "r3".to_owned(),
+                index: Some(0),
+                ..known(4401, 4242, "server", "blog@r3 instance 0")
+            },
+            4242,
+            "blog",
+            day,
+            0.8,
+            74.0,
+        );
+
+        example.figures.instance = pb::InstanceFigures {
+            requests_per_second: 1284.0,
+            errors_per_second: 3.0,
+            p50_ms: 4.0,
+            p95_ms: 38.0,
+            in_flight: 41,
+            websockets: 212,
+            connections: 1903,
+            tls_handshakes_per_second: 12.0,
+            received_bytes_per_second: 2.1 * 1024.0 * 1024.0,
+            sent_bytes_per_second: 46.4 * 1024.0 * 1024.0,
+        };
+
+        example.answer("daemon")
+    }
+
+    /// The architecture page's example: a development run of one
+    /// application with two workers.
+    fn run_example() -> pb::Processes {
+        let mut example = Example::default();
+
+        example.add(
+            known(4100, 0, "run", "controller and edge, :8080"),
+            4000,
+            "you",
+            12 * 60,
+            1.1,
+            24.0,
+        );
+        example.add(
+            Known {
+                app: "app".to_owned(),
+                release: "r1".to_owned(),
+                ..known(4105, 4100, "host", "app:application (r1)")
+            },
+            4100,
+            "you",
+            12 * 60,
+            0.0,
+            71.0,
+        );
+        example.add(
+            Known {
+                app: "app".to_owned(),
+                release: "r1".to_owned(),
+                spawned_by: 4100,
+                ..known(4106, 4105, "relay", "output to muructl")
+            },
+            4100,
+            "you",
+            12 * 60,
+            0.0,
+            7.0,
+        );
+        example.add(
+            worker(4107, 4105, "app", "r1", "default", 0, false),
+            4105,
+            "you",
+            12 * 60,
+            3.0,
+            96.0,
+        );
+        example.add(
+            worker(4108, 4105, "app", "r1", "default", 1, false),
+            4105,
+            "you",
+            12 * 60,
+            2.8,
+            95.0,
+        );
+        example.worker(
+            4107,
+            "app/r1/default-0.sock",
+            0.3,
+            0,
+            4,
+            9.4,
+            (Some(0.1), None),
+        );
+        example.worker(
+            4108,
+            "app/r1/default-1.sock",
+            0.2,
+            0,
+            4,
+            8.8,
+            (Some(0.1), None),
+        );
+        example.group("app", "r1", "default", 0.5, 0, 8, 0, 9.4, (Some(0.1), None));
+        example.interface("app", "wsgi");
+        example.figures.instance = pb::InstanceFigures {
+            requests_per_second: 0.5,
+            p50_ms: 3.1,
+            p95_ms: 9.4,
+            connections: 1,
+            sent_bytes_per_second: 118.0,
+            ..pb::InstanceFigures::default()
+        };
+
+        example.answer("run")
+    }
+
+    /// The example in a page: the block that follows the command line.
+    fn shown(page: &str) -> String {
+        let marker = "```console\n$ muructl status --processes\n";
+        let start = page.find(marker).expect("the page has the example") + marker.len();
+        let end = start + page[start..].find("```").expect("the example ends");
+        page[start..end].to_owned()
+    }
+
+    /// With `MURU_WRITE_EXAMPLES=1` the test writes what the command
+    /// prints into the pages instead, for a change to the view.
+    #[test]
+    fn the_guides_examples_are_what_the_command_prints() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let pages = [
+            ("docs/howto/daemon.md", daemon_example()),
+            ("docs/explanation/architecture.md", run_example()),
+        ];
+        let write = std::env::var_os("MURU_WRITE_EXAMPLES").is_some();
+
+        for (name, answer) in pages {
+            let path = root.join(name);
+            let page = std::fs::read_to_string(&path).expect("the page");
+            let printed = render_at(&answer, None, NOW);
+            let example = shown(&page);
+
+            if write {
+                std::fs::write(&path, page.replacen(&example, &printed, 1)).expect("the page");
+                continue;
+            }
+
+            assert_eq!(
+                example, printed,
+                "{name}: the example is not what the command prints; \
+                 MURU_WRITE_EXAMPLES=1 writes it"
+            );
+        }
     }
 
     #[test]

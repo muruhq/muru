@@ -143,6 +143,7 @@ fn debug_source(commands: mpsc::Sender<Command>) -> DebugSource {
                     .into_iter()
                     .map(|reply| WorkerAnswer {
                         index: reply.index,
+                        group: reply.group,
                         pid: reply.pid,
                         ok: reply.ok,
                         error: (!reply.error.is_empty()).then_some(reply.error),

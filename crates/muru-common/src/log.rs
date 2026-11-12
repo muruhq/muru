@@ -377,6 +377,26 @@ pub fn relayed_line(stream: Stream, time: SystemTime, text: &str) -> String {
     out
 }
 
+/// Write a line a declared command or `muructl exec` printed under a run
+/// or `muructl serve`, as `[command NAME] line` with the time in front
+/// when the stream is stamped, or in JSON as a record of kind `command`
+/// with the command's name. `time` is when the line arrived.
+pub fn command_line(stream: Stream, time: SystemTime, command: &str, line: &str) {
+    if json() {
+        let record = format!(
+            "{{\"time\":\"{}\",\"kind\":\"command\",\"command\":{},\"message\":{}{}}}\n",
+            full(time),
+            json_string(command),
+            json_string(line),
+            identity()
+        );
+        write(stream, record.as_bytes());
+        return;
+    }
+
+    relayed(stream, time, &format!("[command {command}] {line}"));
+}
+
 /// The JSON record of a line of the application's output. A line that
 /// is itself a JSON object, such as a record of Python logging's json
 /// format, is the record, with Muru's fields added: its own `time` is
@@ -497,12 +517,42 @@ impl Traceback {
 /// when every line goes there, in one write.
 pub fn write(stream: Stream, bytes: &[u8]) {
     // A stream that cannot be written to (a closed terminal, a full disk)
-    // never stops the process that logs to it.
+    // never stops the process that logs to it, unless the process is a
+    // command that only prints and its reader has gone.
 
-    let _ = match route(stream) {
+    let written = match route(stream) {
         Stream::Stdout => io::stdout().lock().write_all(bytes),
         Stream::Stderr => io::stderr().lock().write_all(bytes),
     };
+
+    if let Err(error) = &written {
+        reader_gone(error);
+    }
+}
+
+/// What ends the process when the reader of what it prints has gone, for
+/// a command that only prints (issue 608); unset, a failed write is left
+/// to whoever made it.
+static READER_GONE: OnceLock<fn() -> !> = OnceLock::new();
+
+/// End the process with `end` from now on when a write to its standard
+/// output or error finds that the reader has closed, as `head` and `grep
+/// -q` close it. A command that serves, writes to sockets or looks after
+/// other processes does not call it.
+pub fn end_when_reader_goes(end: fn() -> !) {
+    let _ = READER_GONE.set(end);
+}
+
+/// End the process when `error` is a write to a pipe whose reader has
+/// gone and [`end_when_reader_goes`] asked for that; do nothing otherwise.
+/// For a write to standard output or error only: a socket's broken pipe
+/// is an error to report.
+pub fn reader_gone(error: &io::Error) {
+    if error.kind() == io::ErrorKind::BrokenPipe
+        && let Some(end) = READER_GONE.get()
+    {
+        end();
+    }
 }
 
 /// Whether no panic has been reported yet, for the note about
@@ -516,6 +566,21 @@ static FIRST_PANIC: AtomicBool = AtomicBool::new(true);
 /// the exit status it leads to are unchanged; only the report is.
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
+        // `println!` and its kin panic when the reader of standard output
+        // or error has gone, which for a command that only prints is the
+        // end of its output rather than a fault.
+
+        let printing = info
+            .payload()
+            .downcast_ref::<String>()
+            .is_some_and(|message| {
+                message.starts_with("failed printing to std") && message.contains("Broken pipe")
+            });
+
+        if printing && let Some(end) = READER_GONE.get() {
+            end();
+        }
+
         let thread = std::thread::current();
         let location = info
             .location()

@@ -801,7 +801,7 @@ fn specs() -> Vec<Spec> {
             properties: json!({
                 "what": {"type": "string", "enum": ["status", "stacks", "tasks", "memory", "inspect"]},
                 "target": {"type": "string", "description": "app, or app@release"},
-                "worker": {"type": "integer", "description": "One worker, by index"},
+                "worker": {"type": "string", "description": "One worker: its index within its group, as GROUP/N outside the default group"},
             }),
             required: &["what", "target"],
             command: |arguments| {
@@ -1098,11 +1098,11 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "restart",
-            description: "Replace a release's worker (by index) with a fresh one, gracefully or at once with force; or every worker in turn with all.",
+            description: "Replace a release's worker (by its index within its group, as GROUP/N outside the default group) with a fresh one, gracefully or at once with force; or every worker in turn with all.",
             changes: true,
             properties: json!({
                 "target": {"type": "string", "description": "app, or app@release"},
-                "worker": {"type": "integer"},
+                "worker": {"type": "string", "description": "Its index within its group, as GROUP/N outside the default group"},
                 "all": {"type": "boolean"},
                 "force": {"type": "boolean"},
             }),

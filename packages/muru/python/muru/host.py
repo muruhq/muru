@@ -54,7 +54,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any
@@ -1181,6 +1181,56 @@ class Host:
 
         return self.placement[index][0]
 
+    # A worker is numbered across the host here, which keys its socket's
+    # generation, its routing and its replacements. People name it by its
+    # group and its index within the group instead, as its title and its
+    # socket's name do, so every message and line that leaves the host
+    # uses that.
+
+    def worker_name(self, index: int) -> str:
+        """Return a worker's name as people use it.
+
+        It is the worker's index within its group, with the group's name
+        and a slash in front outside the default group: `0`, `crawlers/0`.
+        """
+
+        group, within = self.placement[index]
+        return str(within) if group.name == "default" else f"{group.name}/{within}"
+
+    def worker_fields(self, index: int) -> dict[str, Any]:
+        """Return a worker's group and its index within it, for a message."""
+
+        group, within = self.placement[index]
+        return {"index": within, "group": group.name}
+
+    def wanted_worker(self, message: dict[str, Any]) -> tuple[int | None, str]:
+        """Return the worker a request names, by its index here, and its name.
+
+        The request names it by `group` (the default group when absent)
+        and `worker`, its index within the group. None is every worker;
+        a name no worker has gives -1, which matches none.
+        """
+
+        within = message.get("worker")
+
+        if within is None:
+            return None, ""
+
+        group = str(message.get("group") or "default")
+        asked = str(within) if group == "default" else f"{group}/{within}"
+
+        for index, (placed, at) in enumerate(self.placement):
+            if placed.name == group and at == within:
+                return index, asked
+
+        return -1, asked
+
+    def public_answers(self, answers: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return workers' answers in the host's order, each named by group and index within it."""
+
+        ordered = sorted(answers, key=lambda answer: int(answer["index"]))
+        return [{**answer, **self.worker_fields(int(answer["index"]))} for answer in ordered]
+
     @property
     def policies(self) -> bool:
         """Whether any timeout or recycling policy is on."""
@@ -1224,7 +1274,8 @@ class Host:
 
         if threads > 1:
             log(
-                f"forking worker {index} while {threads - 1} other threads are running; "
+                f"forking worker {self.worker_name(index)} "
+                f"while {threads - 1} other threads are running; "
                 "they do not exist in the worker, so start them from a post_fork hook instead"
             )
 
@@ -1352,7 +1403,9 @@ class Host:
         if not replacing:
             self.routed[index] = path
 
-        self.emit("worker.started", "info", f"worker {index} started as pid {pid}")
+        self.emit(
+            "worker.started", "info", f"worker {self.worker_name(index)} started as pid {pid}"
+        )
         return pid
 
     def worker(
@@ -1398,7 +1451,7 @@ class Host:
             collected = gc.collect()
             trimmed = malloc_trim()
             log(
-                f"worker {index} reclaimed memory: collected {collected} objects"
+                f"worker {self.worker_name(index)} reclaimed memory: collected {collected} objects"
                 + (", trimmed the heap" if trimmed else "")
             )
 
@@ -1451,7 +1504,10 @@ class Host:
                 hooks = release.load()
                 for mount in mounts:
                     mount.release.load()
-                log(f"worker {index} imported {release.spec} in {elapsed_ms(started)} ms")
+                log(
+                    f"worker {self.worker_name(index)} "
+                    f"imported {release.spec} in {elapsed_ms(started)} ms"
+                )
                 hooks.call("on_load", context)
                 hooks.call("pre_fork", context)
 
@@ -1465,7 +1521,10 @@ class Host:
             set_context(context)
 
             if not known and release.resolved is not None:
-                log(f"worker {index} serves {release.spec} as {interface_name(release.resolved)}")
+                log(
+                    f"worker {self.worker_name(index)} "
+                    f"serves {release.spec} as {interface_name(release.resolved)}"
+                )
 
             # Section 6.7: each mount's application is realised like the
             # release's own; section 6.6: one event loop per worker when
@@ -1494,7 +1553,7 @@ class Host:
             for name, _, mounted, _ in realised:
                 if name not in known_mounts and mounted.resolved is not None:
                     log(
-                        f"worker {index} serves mount {name}: {mounted.spec} as "
+                        f"worker {self.worker_name(index)} serves mount {name}: {mounted.spec} as "
                         f"{interface_name(mounted.resolved)}"
                     )
 
@@ -1648,7 +1707,10 @@ class Host:
             _asgi.start_registered(loop)
             hooks.call("on_ready", context)
         except Exception as error:
-            log(f"worker {index} failed to start: {error.__class__.__name__}: {error}")
+            log(
+                f"worker {self.worker_name(index)} "
+                f"failed to start: {error.__class__.__name__}: {error}"
+            )
             traceback.print_exc()
             run_exit_callbacks()
             if loop is not None:
@@ -1736,7 +1798,7 @@ class Host:
 
         from muru import _debug
 
-        _debug.install(index, report)
+        _debug.install(self.worker_name(index), report)
 
         try:
             _native.serve(
@@ -1764,11 +1826,12 @@ class Host:
                 ),
                 grpc_methods=grpc_methods,
                 handoff=self.handoff is not None,
+                worker=within,
                 **asgi_arguments,
                 **timeout_arguments,
             )
         except Exception as error:
-            log(f"worker {index} failed: {error}")
+            log(f"worker {self.worker_name(index)} failed: {error}")
             run_exit_callbacks()
             return 1
 
@@ -1966,7 +2029,7 @@ class Host:
         message: dict[str, Any] = {"pipe": pipe.number, "stream": pipe.stream}
 
         if pipe.worker is not None:
-            message["worker"] = pipe.worker
+            message["worker"] = self.worker_name(pipe.worker)
 
         line = json.dumps(message, separators=(",", ":")).encode() + b"\n"
         self.relay_outgoing.append((line, pipe.number))
@@ -2182,9 +2245,8 @@ class Host:
             "interfaces": self.interfaces(),
             "workers": [
                 {
-                    "index": state.index,
+                    **self.worker_fields(state.index),
                     "pid": state.pid,
-                    "group": self.placement[state.index][0].name,
                     "socket": state.path,
                     "state": self.worker_state(state),
                 }
@@ -2289,7 +2351,7 @@ class Host:
 
         request_id = int(message.get("id", 0))
         op = str(message.get("op", ""))
-        wanted = message.get("worker")
+        wanted, asked = self.wanted_worker(message)
         args = message.get("args") or {}
         targets = {
             state.pid: state.index
@@ -2302,7 +2364,7 @@ class Host:
             return
 
         if op == "restart":
-            self.restart_worker(request_id, wanted, args)
+            self.restart_worker(request_id, wanted, asked, args)
             return
 
         if op == "status":
@@ -2311,7 +2373,12 @@ class Host:
 
         if not targets:
             self.send_to_supervisor(
-                {"type": "response", "id": request_id, "workers": [], "error": "no such worker"}
+                {
+                    "type": "response",
+                    "id": request_id,
+                    "workers": [],
+                    "error": f"no worker {asked}" if asked else "no such worker",
+                }
             )
             return
 
@@ -2393,8 +2460,13 @@ class Host:
     # Section 7.6: a worker replaced because the operator asked, through
     # the path the policies use; with force, killed at once.
 
-    def restart_worker(self, request_id: int, wanted: Any, args: dict[str, Any]) -> None:
-        """Replace one worker on request, gracefully or at once with force."""
+    def restart_worker(
+        self, request_id: int, wanted: int | None, asked: str, args: dict[str, Any]
+    ) -> None:
+        """Replace one worker on request, gracefully or at once with force.
+
+        `wanted` is the worker by its index here, `asked` its name.
+        """
 
         force = bool(args.get("force"))
         state = next(
@@ -2410,16 +2482,16 @@ class Host:
         if wanted is None:
             error = "a worker index is needed"
         elif state is None:
-            error = f"no worker {wanted}"
+            error = f"no worker {asked}"
         elif not state.ready:
-            error = f"worker {wanted} is still starting"
+            error = f"worker {asked} is still starting"
         elif wanted in self.replacing:
-            error = f"worker {wanted} is already being replaced"
+            error = f"worker {asked} is already being replaced"
         elif state.debug_sessions and not force:
-            error = f"worker {wanted} is being debugged; --force ends the session"
+            error = f"worker {asked} is being debugged; --force ends the session"
         elif self.start_failures.get(wanted, 0) >= MAX_START_FAILURES:
             error = (
-                f"a replacement for worker {wanted} failed to start {MAX_START_FAILURES} "
+                f"a replacement for worker {asked} failed to start {MAX_START_FAILURES} "
                 "times and is not tried again"
             )
         elif self.control_listener is None:
@@ -2455,7 +2527,7 @@ class Host:
                 "id": request_id,
                 "workers": [
                     {
-                        "index": state.index,
+                        **self.worker_fields(state.index),
                         "pid": state.pid,
                         "ok": True,
                         "result": {
@@ -2527,7 +2599,7 @@ class Host:
         self.routed[state.index] = None
         retirement.announced = self.announce()
         retirement.announced_at = time.monotonic()
-        log(f"worker {state.index} (pid {state.pid}) leaves routing: scaled in")
+        log(f"worker {self.worker_name(state.index)} (pid {state.pid}) leaves routing: scaled in")
 
     def answer_status(self, request_id: int, wanted: int | None) -> None:
         """Answer `debug status` with each worker's state and what it holds.
@@ -2576,7 +2648,7 @@ class Host:
         sides = state.sides if live is None else live
 
         return {
-            "index": state.index,
+            **self.worker_fields(state.index),
             "pid": state.pid,
             "ok": True,
             "result": {
@@ -2715,7 +2787,7 @@ class Host:
             {
                 "type": "response",
                 "id": pending.id,
-                "workers": sorted(pending.answers.values(), key=lambda answer: answer["index"]),
+                "workers": self.public_answers(pending.answers.values()),
             }
         )
 
@@ -2734,10 +2806,16 @@ class Host:
 
         if state.debug_sessions:
             self.routed[state.index] = None
-            log(f"worker {state.index} (pid {state.pid}) leaves routing while it is debugged")
+            log(
+                f"worker {self.worker_name(state.index)} (pid {state.pid}) "
+                "leaves routing while it is debugged"
+            )
         else:
             self.routed[state.index] = state.path
-            log(f"worker {state.index} (pid {state.pid}) serves again: no debugger is attached")
+            log(
+                f"worker {self.worker_name(state.index)} (pid {state.pid}) "
+                "serves again: no debugger is attached"
+            )
 
         self.announce()
 
@@ -2780,7 +2858,8 @@ class Host:
                 self.emit(
                     str(report["event"]),
                     str(report.get("level", "warning")),
-                    f"worker {state.index} (pid {state.pid}): {report.get('message', '')}",
+                    f"worker {self.worker_name(state.index)} "
+                    f"(pid {state.pid}): {report.get('message', '')}",
                 )
 
                 if report["event"] == "debug.detached":
@@ -2982,7 +3061,8 @@ class Host:
             self.emit(
                 "memory.leak_suspected",
                 "warning",
-                f"worker {index} was recycled for memory {len(recent)} times in the last hour",
+                f"worker {self.worker_name(index)} "
+                f"was recycled for memory {len(recent)} times in the last hour",
             )
 
     def send_status(self) -> None:
@@ -2993,9 +3073,8 @@ class Host:
                 "type": "status",
                 "workers": [
                     {
-                        "index": state.index,
+                        **self.worker_fields(state.index),
                         "pid": state.pid,
-                        "group": self.placement[state.index][0].name,
                         "requests": state.requests,
                         "in_flight": state.in_flight,
                         "oldest_ms": state.oldest_ms,
@@ -3012,7 +3091,11 @@ class Host:
     def worker_ready(self, state: WorkerState) -> None:
         """Note that a worker listens; a replacement enters routing and is announced."""
 
-        self.emit("worker.ready", "info", f"worker {state.index} (pid {state.pid}) is ready")
+        self.emit(
+            "worker.ready",
+            "info",
+            f"worker {self.worker_name(state.index)} (pid {state.pid}) is ready",
+        )
         self.start_failures[state.index] = 0
         replacement = self.replacing.get(state.index)
 
@@ -3084,7 +3167,7 @@ class Host:
             self.emit(
                 "request.past_deadline",
                 "warning",
-                f"worker {state.index} (pid {state.pid}): request {request_id} "
+                f"worker {self.worker_name(state.index)} (pid {state.pid}): request {request_id} "
                 f"{request.method} {request.path} is past its deadline, "
                 f"{request.age_ms / 1000:.1f} s after the worker took it; the client was "
                 "answered 504 and the request goes on in the worker",
@@ -3204,7 +3287,8 @@ class Host:
             ):
                 replacement.stalled = True
                 log(
-                    f"worker {state.index} (pid {state.pid}) {reason} while being "
+                    f"worker {self.worker_name(state.index)} (pid {state.pid}) "
+                    f"{reason} while being "
                     "replaced; nothing it holds can finish"
                 )
                 self.abandon_requests(state, abandon)
@@ -3236,7 +3320,7 @@ class Host:
         replacement = Replacement(index, state.pid, reason, kind, cause)
         self.replacing[index] = replacement
         hard = hard or kind == "worker.timeout_killed"
-        log(f"worker {index} (pid {state.pid}) {reason}; replacing it")
+        log(f"worker {self.worker_name(index)} (pid {state.pid}) {reason}; replacing it")
 
         if "limit" in reason:
             self.note_memory_recycle(index)
@@ -3270,7 +3354,8 @@ class Host:
 
         if short is not None:
             log(
-                f"worker {index} (pid {state.pid}) stops before its replacement starts: "
+                f"worker {self.worker_name(index)} (pid {state.pid}) "
+                "stops before its replacement starts: "
                 f"{format_size(short)} is left under the container's memory limit"
             )
             replacement.stop_first = True
@@ -3314,7 +3399,8 @@ class Host:
         self.emit(
             replacement.kind,
             "warning",
-            f"worker {replacement.index} (pid {replacement.old_pid}) replaced by pid "
+            f"worker {self.worker_name(replacement.index)} (pid {replacement.old_pid}) "
+            "replaced by pid "
             f"{replacement.new_pid}: {replacement.reason}{capture}",
             group=self.group_of(replacement.index).name,
             reason=replacement.cause,
@@ -3334,7 +3420,7 @@ class Host:
 
             if ids:
                 log(
-                    f"worker {state.index} (pid {state.pid}) gave up "
+                    f"worker {self.worker_name(state.index)} (pid {state.pid}) gave up "
                     f"{len(ids)} request{'s' if len(ids) != 1 else ''} for the edge to "
                     f"answer: {', '.join(ids)}"
                 )
@@ -3454,7 +3540,7 @@ class Host:
                 {
                     "type": "response",
                     "id": request_id,
-                    "workers": sorted(workers, key=lambda worker: worker["index"]),
+                    "workers": self.public_answers(workers),
                 }
             )
 
@@ -3562,7 +3648,10 @@ class Host:
                 f"\n    {frame['file']}:{frame['line']} in {frame['function']}"
                 for frame in thread.get("frames", [])
             )
-            log(f"worker {state.index} (pid {state.pid}) {thread.get('name')}:{frames}")
+            log(
+                f"worker {self.worker_name(state.index)} (pid {state.pid}) "
+                f"{thread.get('name')}:{frames}"
+            )
 
         stuck = max(
             (thread for thread in threads if thread.get("request")),
@@ -3623,7 +3712,10 @@ class Host:
             and now >= replacement.kill_at
         ):
             replacement.killed = True
-            log(f"worker {replacement.index} (pid {replacement.old_pid}) did not stop, killing")
+            log(
+                f"worker {self.worker_name(replacement.index)} (pid {replacement.old_pid}) "
+                "did not stop, killing"
+            )
             self.signal(replacement.old_pid, signal.SIGKILL)
 
     def signal(self, pid: int, signum: int) -> None:
@@ -3691,14 +3783,16 @@ class Host:
 
                 if oom_killed:
                     self.report_oom_kill(
-                        index, f"worker {index} (pid {pid}) was killed by the kernel for memory"
+                        index,
+                        f"worker {self.worker_name(index)} (pid {pid}) "
+                        "was killed by the kernel for memory",
                     )
                     continue
 
                 self.emit(
                     "worker.exited",
                     "info",
-                    f"worker {index} (pid {pid}) stopped: scaled in",
+                    f"worker {self.worker_name(index)} (pid {pid}) stopped: scaled in",
                     group=self.group_of(index).name,
                     reason="scaled_in",
                 )
@@ -3717,20 +3811,24 @@ class Host:
                 if oom_killed:
                     self.report_oom_kill(
                         index,
-                        f"worker {index} (pid {pid}) was killed by the kernel for memory while "
+                        f"worker {self.worker_name(index)} (pid {pid}) "
+                        "was killed by the kernel for memory while "
                         f"being replaced by pid {replacement.new_pid}",
                     )
                     continue
 
                 if replacement.kind == "worker.timeout_killed":
-                    log(f"worker {index} (pid {pid}) exited after its drain grace")
+                    log(
+                        f"worker {self.worker_name(index)} (pid {pid}) exited after its drain grace"
+                    )
                     continue
 
                 capture = f"; {replacement.capture}" if replacement.capture else ""
                 self.emit(
                     replacement.kind,
                     "info",
-                    f"worker {index} (pid {pid}) replaced by pid {replacement.new_pid}: "
+                    f"worker {self.worker_name(index)} (pid {pid}) "
+                    f"replaced by pid {replacement.new_pid}: "
                     f"{replacement.reason}{capture}",
                     group=self.group_of(index).name,
                     reason=replacement.cause,
@@ -3751,7 +3849,8 @@ class Host:
                     if oom_killed:
                         self.report_oom_kill(
                             index,
-                            f"worker {index} replacement (pid {pid}) was killed by the kernel "
+                            f"worker {self.worker_name(index)} "
+                            f"replacement (pid {pid}) was killed by the kernel "
                             f"for memory before it was ready; pid {old.pid} keeps serving",
                         )
                         continue
@@ -3759,7 +3858,7 @@ class Host:
                     self.emit(
                         "worker.exited",
                         "error",
-                        f"worker {index} replacement (pid {pid}) exited with "
+                        f"worker {self.worker_name(index)} replacement (pid {pid}) exited with "
                         f"{describe(status)} before it was ready; pid {old.pid} keeps serving",
                         group=self.group_of(index).name,
                         reason="start_failed",
@@ -3788,7 +3887,8 @@ class Host:
                         self.emit(
                             "worker.oom_killed" if oom_killed else "worker.exited",
                             "error",
-                            f"worker {index} (pid {pid}) of the optional group {group.name} "
+                            f"worker {self.worker_name(index)} (pid {pid}) "
+                            f"of the optional group {group.name} "
                             f"failed {MAX_START_FAILURES} times at start, last with "
                             f"{describe(status)}; it is given up",
                             group=group.name,
@@ -3799,11 +3899,14 @@ class Host:
 
                     if oom_killed:
                         self.report_oom_kill(
-                            index, f"worker {index} (pid {pid}) was killed by the kernel for memory"
+                            index,
+                            f"worker {self.worker_name(index)} (pid {pid}) "
+                            "was killed by the kernel for memory",
                         )
 
                     log(
-                        f"worker {index} failed {MAX_START_FAILURES} times at start, "
+                        f"worker {self.worker_name(index)} "
+                        f"failed {MAX_START_FAILURES} times at start, "
                         f"last with {describe(status)}; stopping"
                     )
                     self.failed = True
@@ -3815,13 +3918,15 @@ class Host:
             if oom_killed:
                 self.report_oom_kill(
                     index,
-                    f"worker {index} (pid {pid}) was killed by the kernel for memory, restarting",
+                    f"worker {self.worker_name(index)} (pid {pid}) "
+                    "was killed by the kernel for memory, restarting",
                 )
             else:
                 self.emit(
                     "worker.exited",
                     "warning",
-                    f"worker {index} (pid {pid}) exited with {describe(status)}, restarting",
+                    f"worker {self.worker_name(index)} (pid {pid}) "
+                    f"exited with {describe(status)}, restarting",
                     group=self.group_of(index).name,
                     reason="crashed",
                 )
@@ -3892,7 +3997,8 @@ class Host:
 
         pids = ", ".join(str(child) for child in left)
         log(
-            f"worker {index} (pid {pid}) left pid{'s' if len(left) != 1 else ''} {pids} running; "
+            f"worker {self.worker_name(index)} (pid {pid}) "
+            f"left pid{'s' if len(left) != 1 else ''} {pids} running; "
             f"stopping {'them' if len(left) != 1 else 'it'} in {self.shutdown_timeout:g} s "
             f"unless {'they' if len(left) != 1 else 'it'} exit{'' if len(left) != 1 else 's'} first"
         )
@@ -3908,7 +4014,10 @@ class Host:
 
             if orphan.kill_at is not None and not orphan.killed and now >= orphan.kill_at:
                 orphan.killed = True
-                log(f"pid {orphan.pid}, left by worker {orphan.left_by}, did not stop, killing")
+                log(
+                    f"pid {orphan.pid}, left by worker {self.worker_name(orphan.left_by)}"
+                    ", did not stop, killing"
+                )
                 self.signal(orphan.pid, signal.SIGKILL)
 
     def stop_orphans(self) -> None:

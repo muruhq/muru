@@ -91,12 +91,12 @@ this:
 $ muructl status --processes
 edge  0.5 req/s  0 err/s  p50 3.1 ms  p95 9.4 ms  in flight 0  ws 0  conns 1  tls 0/s  in 0B/s  out 118B/s
 
-PID    ROLE          WHAT                          UP    CPU    RSS      REQ/S   BUSY   QUEUE   P95     GIL/LAG
-4100   run           controller and edge, :8080    12m   1.1%   24.0MB
-4105   └─ host       app:application (r1)          12m   0.0%   71.0MB   0.5     0/8    0       9.4 ms
-4106      ├─ relay   output to muructl             12m   0.0%   7.0MB
-4107      ├─ worker  worker 0                      12m   3.0%   96.0MB   0.3     0/4            9.4 ms
-4108      └─ worker  worker 1                      12m   2.8%   95.0MB   0.2     0/4            8.8 ms
+PID    ROLE           WHAT                          UP    CPU      RSS   REQ/S   BUSY   QUEUE      P95   GIL/LAG
+4100   run            controller and edge, :8080   12m   1.1%   24.0MB
+4105   └─ host        app:application (r1)         12m   0.0%   71.0MB     0.5    0/8       0   9.4 ms    0.1 ms
+4106      ├─ relay    output to muructl            12m   0.0%    7.0MB
+4107      ├─ worker   worker 0                     12m   3.0%   96.0MB     0.3    0/4           9.4 ms    0.1 ms
+4108      └─ worker   worker 1                     12m   2.8%   95.0MB     0.2    0/4           8.8 ms    0.1 ms
 ```
 
 A release is an immutable combination of application code, Python version

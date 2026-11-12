@@ -601,8 +601,14 @@ def test_the_processes_are_listed_as_the_daemon_supervises_them(
     assert (answer["mode"], root["role"], root["pid"]) == ("daemon", "daemon", daemon.process.pid)
     assert [child["role"] for child in root["children"]] == ["edge", "host"]
     edge, host = root["children"]
+    state = (daemon.base / "state").resolve()
+
+    # Issue 604: the daemon's row names whose daemon it is, as its title
+    # does, and a host's says what its release does with traffic.
+
+    assert root["what"] == f"user daemon, state {state}", root["what"]
     assert edge["what"] == f"listening on 127.0.0.1:{daemon.port}"
-    assert host["what"] == "shop@r1"
+    assert (host["what"], host["state"]) == ("shop@r1 serving", "serving")
     relay, *workers = host["children"]
     assert relay["what"] == "shop@r1 output to apps/shop/r1.log", relay
     assert relay["os_parent_pid"] == root["pid"] and not relay["readopted"]
@@ -612,13 +618,20 @@ def test_the_processes_are_listed_as_the_daemon_supervises_them(
     ]
     assert all(process["user"] and process["rss_bytes"] for process in [root, edge, host])
 
+    # What the default mount runs as, which chooses GIL/LAG (issue 607).
+
+    assert [process["interface"] for process in [host, *workers]] == ["wsgi"] * 3
+
     def title(pid: int) -> str:
         return subprocess.run(
             ["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, check=False
         ).stdout.strip()
 
-    assert title(root["pid"]) == "murud"
-    assert title(edge["pid"]) == "muru-edge"
+    # The daemon's state directory is not the default for a user's, so
+    # the titles name it.
+
+    assert title(root["pid"]) == f"muru daemon {state}"
+    assert title(edge["pid"]) == f"muru edge {state}"
     assert title(host["pid"]) == "muru host shop@r1"
     assert title(workers[0]["pid"]) == "muru worker shop@r1 default/0"
 
@@ -629,7 +642,9 @@ def test_the_processes_are_listed_as_the_daemon_supervises_them(
             Path(f"/proc/{pid}/comm").read_text().strip()
             for pid in (root["pid"], edge["pid"], host["pid"], relay["pid"], workers[0]["pid"])
         }
-        assert names == {"murud", "muru-edge", "muru-host", "muru-relay", "muru-worker"}, names
+        assert names == {"muru-daemon", "muru-edge", "muru-host", "muru-relay", "muru-worker"}, (
+            names
+        )
 
     # Narrowed to the application, the daemon stays and the edge goes.
 

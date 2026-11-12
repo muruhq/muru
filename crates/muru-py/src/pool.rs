@@ -369,6 +369,8 @@ pub struct Shared {
     /// The default mount's requests may be handed to the other
     /// interface (section 6.14).
     pub handoff: bool,
+    /// The worker's index within its group, for HELLO.
+    pub worker: u32,
     in_flight: AtomicU32,
     total: AtomicU64,
     next_id: AtomicU64,
@@ -412,6 +414,7 @@ impl Shared {
             gil_stall: None,
             grpc_methods: Vec::new(),
             handoff: false,
+            worker: 0,
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),
             next_id: AtomicU64::new(1),

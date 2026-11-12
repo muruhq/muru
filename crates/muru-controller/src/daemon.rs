@@ -303,6 +303,10 @@ struct RolloutRun {
 /// over.
 const SIGNAL_WINDOW: Duration = Duration::from_secs(4);
 
+/// How long `muructl logs reopen` waits for the edge and the relays to say
+/// they have reopened their files before it answers anyway.
+const REOPEN_WAIT: Duration = Duration::from_secs(5);
+
 /// A request for the reconciler, answered when it has been carried out.
 pub enum Command {
     /// Everything the dashboard shows (section 10.7).
@@ -607,7 +611,7 @@ pub enum Command {
         /// The operation: status, stacks, tasks, inspect or logging.
         op: String,
         /// One worker, or every worker.
-        worker: Option<u32>,
+        worker: Option<muru_common::worker::WorkerName>,
         /// The operation's arguments.
         args: serde_json::Value,
         /// Answered with each worker's reply, or why none could be asked.
@@ -987,12 +991,17 @@ impl Backend {
         }
     }
 
-    /// Have the release's log relay open the release log again by name.
-    /// Instances write their own files. Returns whether it was told.
-    fn reopen_log(&self) -> bool {
+    /// Have the release's log relay open the release log again by name,
+    /// and with `workers` the host's workers run their on_reopen_logs
+    /// hook once it has. A managed server's instances write to the
+    /// release's log file themselves, on a descriptor they were started
+    /// with, and cannot be told to reopen it, so that file is rotated in
+    /// place. When the relay was told, gives what changes once it has
+    /// reopened the file.
+    fn reopen_log(&self, workers: bool) -> Option<tokio::sync::watch::Receiver<u64>> {
         match self {
-            Self::Host(host) => host.signal_relay(libc::SIGUSR1),
-            Self::Servers(_) | Self::Dormant => false,
+            Self::Host(host) => host.reopen_log(workers),
+            Self::Servers(_) | Self::Dormant => None,
         }
     }
 
@@ -1031,17 +1040,6 @@ impl Backend {
             Self::Host(host) => host.release(),
             Self::Servers(servers) => servers.release(),
             Self::Dormant => {}
-        }
-    }
-
-    /// Send the host a signal, which is how it is told to reopen its log
-    /// file. A managed server's instances take none: each writes to the
-    /// release's log file itself, on a descriptor it was started with,
-    /// and cannot be told to reopen it, so that file is rotated in place.
-    fn signal(&self, signal: i32) -> bool {
-        match self {
-            Self::Host(host) => host.signal(signal),
-            Self::Servers(_) | Self::Dormant => false,
         }
     }
 
@@ -1427,6 +1425,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             config.access_log.clone(),
             spool.clone(),
             service,
+            locations.scope(),
         )
         .await
         .map_err(|error| tracing::info!(%error, "no edge to re-adopt"))
@@ -1461,6 +1460,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 access_log: config.access_log,
                 spool,
                 identity: service,
+                scope: locations.scope(),
             })
             .await?
         }
@@ -2601,17 +2601,6 @@ fn command_mentions(pid: u32, path: &Path, title: &str) -> bool {
 /// 2.1), with whatever spaces `ps` shows for the rest of the area.
 fn names(command: &str, path: &Path, title: &str) -> bool {
     command.contains(&path.display().to_string()) || command.trim() == title
-}
-
-/// The index of the worker a link socket belongs to, from its name:
-/// `worker-N.sock`, or `worker-GROUP-N.sock` in a worker group.
-fn worker_index(socket: &str) -> Option<u32> {
-    let name = std::path::Path::new(socket).file_stem()?.to_str()?;
-    name.strip_prefix("worker-")?
-        .rsplit('-')
-        .next()?
-        .parse()
-        .ok()
 }
 
 impl Daemon {
@@ -4544,7 +4533,7 @@ impl Daemon {
                 let _ = done.send(self.reload().await);
             }
             Command::ReopenLogs { workers, done } => {
-                let _ = done.send(self.reopen_logs(workers));
+                self.reopen_logs_answering(workers, done);
             }
             Command::RotateLogs { logs, done } => {
                 let _ = done.send(self.rotate_named_logs(logs));
@@ -4616,11 +4605,12 @@ impl Daemon {
                     return;
                 }
 
+                let whom = worker.as_ref().map_or_else(
+                    || "every worker".to_owned(),
+                    |worker| format!("worker {worker}"),
+                );
+
                 if op == "attach" {
-                    let whom = worker.map_or_else(
-                        || "every worker".to_owned(),
-                        |index| format!("worker {index}"),
-                    );
                     self.events.emit(
                         "debug.attached",
                         &format!("{app}@{id}"),
@@ -4631,10 +4621,6 @@ impl Daemon {
 
                 if matches!(op.as_str(), "profile" | "trace" | "memory" | "exec") {
                     let subject = format!("{app}@{id}");
-                    let whom = worker.map_or_else(
-                        || "every worker".to_owned(),
-                        |index| format!("worker {index}"),
-                    );
 
                     let detail = if op == "exec" {
                         let code: String = args
@@ -4666,7 +4652,7 @@ impl Daemon {
                 match control {
                     Some(control) => {
                         self.last_request += 1;
-                        control.request(self.last_request, &op, worker, &args);
+                        control.request(self.last_request, &op, worker.as_ref(), &args);
                         self.asked.insert(self.last_request, done);
                     }
                     None => {
@@ -4916,12 +4902,18 @@ impl Daemon {
             }
 
             crate::host::own_session_std(&mut command, identity);
-            let _ = writeln!(log, "[build] {}", build.describe());
 
+            // Every line of the release's log has the full time in front,
+            // as the relay puts on the host's and the workers' lines.
+
+            let mut write = |line: &str| {
+                let time = muru_common::log::full(std::time::SystemTime::now());
+                let _ = writeln!(log, "{time} [build] {line}");
+            };
+
+            write(&build.describe());
             build
-                .run_command(command, &mut |line| {
-                    let _ = writeln!(log, "[build] {line}");
-                })
+                .run_command(command, &mut write)
                 .map_err(|error| error.to_string())
         })
         .await
@@ -6254,23 +6246,34 @@ impl Daemon {
     fn replace_unreachable(&mut self, applied: pb::Applied) {
         for worker in applied.unreachable {
             let subject = format!("{}@{}", worker.app, worker.release);
-            let index = worker_index(&worker.socket);
-            let whom = index.map_or_else(
-                || format!("the worker at {}", worker.socket),
-                |index| format!("worker {index}"),
-            );
-            let control = self
+            let running = self
                 .running
-                .get(&(worker.app.clone(), worker.release.clone()))
-                .and_then(|running| running.control.as_ref());
+                .get(&(worker.app.clone(), worker.release.clone()));
 
-            let action = match (index, control) {
-                (Some(index), Some(control)) => {
+            // The host announced which worker listens on each socket.
+
+            let name = running.and_then(|running| {
+                running
+                    .workers
+                    .iter()
+                    .find(|announced| announced.socket == worker.socket)
+                    .map(|announced| {
+                        muru_common::worker::WorkerName::new(&announced.group, announced.index)
+                    })
+            });
+            let whom = name.as_ref().map_or_else(
+                || format!("the worker at {}", worker.socket),
+                |name| format!("worker {name}"),
+            );
+            let control = running.and_then(|running| running.control.as_ref());
+
+            let action = match (&name, control) {
+                (Some(name), Some(control)) => {
                     self.last_request += 1;
                     control.request(
                         self.last_request,
                         "restart",
-                        Some(index),
+                        Some(name),
                         &serde_json::json!({ "force": true }),
                     );
                     "; it is being replaced"
@@ -9529,7 +9532,10 @@ impl Daemon {
         let mut known = vec![Known {
             pid: daemon,
             role: "daemon",
-            what: "muructl daemon run".to_owned(),
+            what: crate::processes::daemon_phrase(
+                self.locations.mode_word(),
+                &self.locations.state.path,
+            ),
             ..Known::default()
         }];
 
@@ -9544,6 +9550,17 @@ impl Daemon {
             });
         }
 
+        // Section 13.10: a host's row says what its release does with
+        // traffic, so an idle instance still shows which one serves.
+
+        let rollouts: Vec<Rollout> = self
+            .store
+            .rollouts(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rollout| rollout.state.is_active())
+            .collect();
+
         for ((app, id), running) in &self.running {
             let subject = format!("{app}@{id}");
 
@@ -9552,6 +9569,8 @@ impl Daemon {
                     let Some(host_pid) = host.pid() else {
                         continue;
                     };
+
+                    let (state, phrase) = self.routing_state(app, id, running, &rollouts);
 
                     let mut groups: Vec<String> = running
                         .groups
@@ -9563,14 +9582,23 @@ impl Daemon {
                         groups.insert(0, "default".to_owned());
                     }
 
+                    // What the default mount runs as chooses the figure a
+                    // worker's GIL/LAG shows.
+
+                    let interface = crate::processes::default_interface(
+                        &self.info.interfaces.announced(app, id),
+                    );
+
                     known.push(Known {
                         pid: host_pid,
                         parent: daemon,
                         role: "host",
-                        what: subject.clone(),
+                        what: crate::processes::host_phrase(&subject, &phrase),
                         app: app.clone(),
                         release: id.clone(),
                         groups,
+                        interface: interface.clone(),
+                        state,
                         ..Known::default()
                     });
 
@@ -9609,6 +9637,7 @@ impl Daemon {
                             group: worker.group.clone(),
                             index: Some(worker.index),
                             socket: Some(worker.socket.clone()),
+                            interface: interface.clone(),
                             ..Known::default()
                         });
                     }
@@ -9648,6 +9677,62 @@ impl Daemon {
         }
 
         known
+    }
+
+    /// A running release's part in routing, as a word for the answer and
+    /// a phrase for its host's row: a rollout's candidate is `canary`
+    /// with its share, the application's current release `serving`, one
+    /// draining or retained says so, with when a retained one stops in
+    /// local time, and a ready one that takes no traffic is `held`; one
+    /// still starting says its state.
+    fn routing_state(
+        &self,
+        app: &str,
+        id: &str,
+        running: &Running,
+        rollouts: &[Rollout],
+    ) -> (String, String) {
+        if let Some(rollout) = rollouts
+            .iter()
+            .find(|rollout| rollout.app == app && rollout.candidate == id)
+        {
+            return (
+                "canary".to_owned(),
+                format!("canary {}%", rollout.percent().min(100)),
+            );
+        }
+
+        let current = self
+            .store
+            .app(app)
+            .ok()
+            .and_then(|record| record.current)
+            .is_some_and(|current| current == id);
+        let state = self
+            .store
+            .release(app, id)
+            .map(|release| release.state)
+            .ok();
+
+        let word = match state {
+            Some(ReleaseState::Draining) => "draining",
+            Some(ReleaseState::Retained) => "retained",
+            _ if current => "serving",
+            Some(ReleaseState::Ready) => "held",
+            Some(other) => return (other.to_string(), other.to_string()),
+            None => return (String::new(), String::new()),
+        };
+
+        let phrase = if word == "retained" && running.retained_until_unix_ms > 0 {
+            let until =
+                std::time::UNIX_EPOCH + Duration::from_millis(running.retained_until_unix_ms);
+            let clock = muru_common::log::clock(until);
+            format!("retained until {}", &clock[..5])
+        } else {
+            word.to_owned()
+        };
+
+        (word.to_owned(), phrase)
     }
 
     /// The log files the daemon's writers keep, each with whether its
@@ -9797,7 +9882,7 @@ impl Daemon {
         self.edge.signal(libc::SIGUSR1);
 
         for running in self.running.values() {
-            running.backend.reopen_log();
+            running.backend.reopen_log(false);
         }
 
         let names: Vec<String> = rotated
@@ -9936,22 +10021,88 @@ impl Daemon {
         self.reopen_logs_because(workers, "")
     }
 
+    /// Reopen the log files as `reopen_logs` does, for `muructl logs
+    /// reopen`, and answer once every writer has: the edge, asked over its
+    /// control socket rather than signalled, and each relay, by its
+    /// report, so a logrotate postrotate that runs the command knows the
+    /// renamed files are complete when it returns (issue 609). A writer
+    /// that does not answer within `REOPEN_WAIT` does not hold the answer
+    /// back longer.
+    fn reopen_logs_answering(&mut self, workers: bool, done: oneshot::Sender<Reopened>) {
+        let (mut reopened, relays) = self.reopen_writers(workers, "", false);
+        let edge = self.edge.pid().map(|_| self.edge.reopen_logs());
+
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + REOPEN_WAIT;
+
+            reopened.edge = match edge {
+                Some(asked) => match tokio::time::timeout_at(deadline, asked).await {
+                    Ok(Ok(failed)) => {
+                        if !failed.is_empty() {
+                            tracing::warn!(%failed, "the edge could not reopen a log");
+                        }
+
+                        true
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(error = %format!("{error:#}"), "the edge could not be asked to reopen its logs");
+                        false
+                    }
+                    Err(_) => {
+                        tracing::warn!("the edge did not say it had reopened its logs in time");
+                        false
+                    }
+                },
+                None => false,
+            };
+
+            for mut relay in relays {
+                if tokio::time::timeout_at(deadline, relay.changed())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("a log relay did not say it had reopened its file in time");
+                    break;
+                }
+            }
+
+            let _ = done.send(reopened);
+        });
+    }
+
     /// Reopen the log files as `reopen_logs` does, with why in the
     /// event's message when it is not a command or a signal that asked.
     fn reopen_logs_because(&mut self, workers: bool, why: &str) -> Reopened {
+        self.reopen_writers(workers, why, true).0
+    }
+
+    /// Have every writer open its file again by name, the edge with
+    /// SIGUSR1 when `signal_edge`, and record it; gives what was told, and
+    /// for each relay told what changes once it has reopened its file.
+    fn reopen_writers(
+        &mut self,
+        workers: bool,
+        why: &str,
+        signal_edge: bool,
+    ) -> (Reopened, Vec<tokio::sync::watch::Receiver<u64>>) {
         self.reopen_own_log();
         self.renames.forget();
 
-        let edge = self.edge.signal(libc::SIGUSR1);
+        let edge = if signal_edge {
+            self.edge.signal(libc::SIGUSR1)
+        } else {
+            self.edge.pid().is_some()
+        };
         let mut hosts = 0;
+        let mut relays = Vec::new();
+
+        // A host's workers are told once its relay has reopened the
+        // release log, so what their hooks write goes to the new file.
 
         for running in self.running.values() {
-            if running.backend.reopen_log() {
+            if let Some(reopened) = running.backend.reopen_log(workers) {
                 hosts += 1;
-            }
-
-            if workers {
-                running.backend.signal(libc::SIGUSR2);
+                relays.push(reopened);
             }
         }
 
@@ -9967,7 +10118,7 @@ impl Daemon {
             if workers { " and their workers" } else { "" }
         );
         self.events.emit("logs.reopened", "logs", "info", &message);
-        Reopened { edge, hosts }
+        (Reopened { edge, hosts }, relays)
     }
 
     /// Mark a running release ready, once the snapshot that gives it to

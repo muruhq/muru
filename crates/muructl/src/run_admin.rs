@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
+use muru_common::worker::WorkerName;
 use muru_controller::host::{HostControl, WorkerReply};
 use muru_controller::logs::Logs;
 use muru_edge::Pools;
@@ -79,7 +80,7 @@ impl HostLink {
     fn ask(
         &mut self,
         op: &str,
-        worker: Option<u32>,
+        worker: Option<&WorkerName>,
         args: &serde_json::Value,
     ) -> Result<oneshot::Receiver<Result<Vec<WorkerReply>, String>>, String> {
         let Some(control) = &self.control else {
@@ -243,6 +244,8 @@ struct Seen {
     relay: Option<u32>,
     workers: Vec<muru_controller::host::HostWorker>,
     status: Vec<muru_controller::host::WorkerStatus>,
+    /// What the default mount runs as, once the host has said.
+    interface: String,
 }
 
 impl RunProcesses {
@@ -284,8 +287,22 @@ impl RunProcesses {
     }
 
     /// The workers the host announced.
-    pub fn workers(&self, workers: Vec<muru_controller::host::HostWorker>) {
-        self.seen.lock().expect("run processes poisoned").workers = workers;
+    /// The workers the host announced last, with what each mount runs
+    /// as when it said; an announcement naming no interface leaves the
+    /// last.
+    pub fn workers(
+        &self,
+        workers: Vec<muru_controller::host::HostWorker>,
+        interfaces: &[(String, String)],
+    ) {
+        let mut seen = self.seen.lock().expect("run processes poisoned");
+        seen.workers = workers;
+
+        let interface = muru_controller::processes::default_interface(interfaces);
+
+        if !interface.is_empty() {
+            seen.interface = interface;
+        }
     }
 
     /// What the workers last reported.
@@ -336,6 +353,8 @@ impl RunProcesses {
                 app: self.app.clone(),
                 release: release.clone(),
                 groups: self.groups.clone(),
+                interface: seen.interface.clone(),
+                state: "serving".to_owned(),
                 ..Known::default()
             });
 
@@ -355,6 +374,7 @@ impl RunProcesses {
                     group: worker.group.clone(),
                     index: Some(worker.index),
                     socket: Some(worker.socket.clone()),
+                    interface: seen.interface.clone(),
                     ..Known::default()
                 });
             }
@@ -493,7 +513,7 @@ impl RunState {
     pub async fn ask(
         &self,
         op: &str,
-        worker: Option<u32>,
+        worker: Option<WorkerName>,
         args: serde_json::Value,
     ) -> Result<Vec<WorkerReply>, String> {
         let wait = args
@@ -502,9 +522,9 @@ impl RunState {
             .map_or(ASK_WAIT, |seconds| {
                 Duration::from_secs_f64(seconds.clamp(0.0, 3600.0)) + ASK_MARGIN
             });
-        let whom = worker.map_or_else(
+        let whom = worker.as_ref().map_or_else(
             || "every worker".to_owned(),
-            |index| format!("worker {index}"),
+            |worker| format!("worker {worker}"),
         );
 
         match op {
@@ -531,7 +551,7 @@ impl RunState {
             _ => {}
         }
 
-        ask(&self.host, op, worker, &args, wait).await
+        ask(&self.host, op, worker.as_ref(), &args, wait).await
     }
 }
 
@@ -540,7 +560,7 @@ impl RunState {
 pub async fn ask(
     host: &SharedHostLink,
     op: &str,
-    worker: Option<u32>,
+    worker: Option<&WorkerName>,
     args: &serde_json::Value,
     wait: Duration,
 ) -> Result<Vec<WorkerReply>, String> {
@@ -592,13 +612,14 @@ pub fn debug_source(
                 .map_or(ASK_WAIT, |seconds| {
                     Duration::from_secs_f64(seconds) + ASK_MARGIN
                 });
-            let replies = ask(&host, &asked.op, asked.worker, &args, wait).await?;
+            let replies = ask(&host, &asked.op, asked.worker.as_ref(), &args, wait).await?;
             Ok(muru_dashboard::DebugAnswer {
                 release: asked.release,
                 workers: replies
                     .into_iter()
                     .map(|reply| muru_dashboard::WorkerAnswer {
                         index: reply.index,
+                        group: reply.group,
                         pid: reply.pid,
                         ok: reply.ok,
                         error: (!reply.error.is_empty()).then_some(reply.error),
@@ -1332,7 +1353,13 @@ impl Admin for Service {
 
         let answered = self
             .state
-            .ask(&request.op, request.worker, args)
+            .ask(
+                &request.op,
+                request
+                    .worker
+                    .map(|index| WorkerName::new(&request.group, index)),
+                args,
+            )
             .await
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(pb::DebugResponse {
@@ -1340,6 +1367,7 @@ impl Admin for Service {
                 .into_iter()
                 .map(|reply| pb::WorkerDebug {
                     index: reply.index,
+                    group: reply.group,
                     pid: reply.pid,
                     ok: reply.ok,
                     error: reply.error,
