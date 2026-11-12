@@ -157,7 +157,11 @@ def test_an_asgi_request_past_the_soft_timeout_is_cancelled() -> None:
         assert response.status == 504, response.body
         assert json.loads(response.body)["reason"] == "soft_timeout"
         assert server.wait_for_log("ran past the soft timeout of 1 s")
-        assert "CancelledError" in server.log_since_mark()
+
+        # The worker's traceback arrives a line at a time, after the line
+        # above, and the exception is its last (issue 614).
+
+        assert server.wait_for_log("CancelledError")
         assert server.get("/sleep?seconds=0.05").body == b"slept\n"
     finally:
         server.stop()
