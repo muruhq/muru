@@ -1552,14 +1552,16 @@ impl HostProcess {
     }
 
     /// Have the release's log relay open the release log again by name,
-    /// with SIGUSR1. Returns whether it was told.
+    /// with SIGUSR1. When it was told, gives what changes once it reports
+    /// that it has, for a caller that waits for the file to be reopened.
     ///
     /// With `workers`, the host is then told, with SIGUSR2, to have its
     /// workers run their on_reopen_logs hook, once the relay reports that
     /// it has reopened the file, so what the hooks write goes to the new
     /// one. A relay that does not report within `RELAY_REOPEN_WAIT`, or
     /// that was not running, does not hold the workers back.
-    pub fn reopen_log(&self, workers: bool) -> bool {
+    pub fn reopen_log(&self, workers: bool) -> Option<tokio::sync::watch::Receiver<u64>> {
+        let answer = self.relay.reopens.subscribe();
         let mut reopened = self.relay.reopens.subscribe();
         let told = signal_process(self.relay.pid(), libc::SIGUSR1);
 
@@ -1575,7 +1577,7 @@ impl HostProcess {
             });
         }
 
-        told
+        told.then_some(answer)
     }
 
     /// Lines of the release's output dropped so far, across its relays.

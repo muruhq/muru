@@ -303,6 +303,10 @@ struct RolloutRun {
 /// over.
 const SIGNAL_WINDOW: Duration = Duration::from_secs(4);
 
+/// How long `muructl logs reopen` waits for the edge and the relays to say
+/// they have reopened their files before it answers anyway.
+const REOPEN_WAIT: Duration = Duration::from_secs(5);
+
 /// A request for the reconciler, answered when it has been carried out.
 pub enum Command {
     /// Everything the dashboard shows (section 10.7).
@@ -992,11 +996,12 @@ impl Backend {
     /// hook once it has. A managed server's instances write to the
     /// release's log file themselves, on a descriptor they were started
     /// with, and cannot be told to reopen it, so that file is rotated in
-    /// place. Returns whether the relay was told.
-    fn reopen_log(&self, workers: bool) -> bool {
+    /// place. When the relay was told, gives what changes once it has
+    /// reopened the file.
+    fn reopen_log(&self, workers: bool) -> Option<tokio::sync::watch::Receiver<u64>> {
         match self {
             Self::Host(host) => host.reopen_log(workers),
-            Self::Servers(_) | Self::Dormant => false,
+            Self::Servers(_) | Self::Dormant => None,
         }
     }
 
@@ -4528,7 +4533,7 @@ impl Daemon {
                 let _ = done.send(self.reload().await);
             }
             Command::ReopenLogs { workers, done } => {
-                let _ = done.send(self.reopen_logs(workers));
+                self.reopen_logs_answering(workers, done);
             }
             Command::RotateLogs { logs, done } => {
                 let _ = done.send(self.rotate_named_logs(logs));
@@ -10016,21 +10021,88 @@ impl Daemon {
         self.reopen_logs_because(workers, "")
     }
 
+    /// Reopen the log files as `reopen_logs` does, for `muructl logs
+    /// reopen`, and answer once every writer has: the edge, asked over its
+    /// control socket rather than signalled, and each relay, by its
+    /// report, so a logrotate postrotate that runs the command knows the
+    /// renamed files are complete when it returns (issue 609). A writer
+    /// that does not answer within `REOPEN_WAIT` does not hold the answer
+    /// back longer.
+    fn reopen_logs_answering(&mut self, workers: bool, done: oneshot::Sender<Reopened>) {
+        let (mut reopened, relays) = self.reopen_writers(workers, "", false);
+        let edge = self.edge.pid().map(|_| self.edge.reopen_logs());
+
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + REOPEN_WAIT;
+
+            reopened.edge = match edge {
+                Some(asked) => match tokio::time::timeout_at(deadline, asked).await {
+                    Ok(Ok(failed)) => {
+                        if !failed.is_empty() {
+                            tracing::warn!(%failed, "the edge could not reopen a log");
+                        }
+
+                        true
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(error = %format!("{error:#}"), "the edge could not be asked to reopen its logs");
+                        false
+                    }
+                    Err(_) => {
+                        tracing::warn!("the edge did not say it had reopened its logs in time");
+                        false
+                    }
+                },
+                None => false,
+            };
+
+            for mut relay in relays {
+                if tokio::time::timeout_at(deadline, relay.changed())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("a log relay did not say it had reopened its file in time");
+                    break;
+                }
+            }
+
+            let _ = done.send(reopened);
+        });
+    }
+
     /// Reopen the log files as `reopen_logs` does, with why in the
     /// event's message when it is not a command or a signal that asked.
     fn reopen_logs_because(&mut self, workers: bool, why: &str) -> Reopened {
+        self.reopen_writers(workers, why, true).0
+    }
+
+    /// Have every writer open its file again by name, the edge with
+    /// SIGUSR1 when `signal_edge`, and record it; gives what was told, and
+    /// for each relay told what changes once it has reopened its file.
+    fn reopen_writers(
+        &mut self,
+        workers: bool,
+        why: &str,
+        signal_edge: bool,
+    ) -> (Reopened, Vec<tokio::sync::watch::Receiver<u64>>) {
         self.reopen_own_log();
         self.renames.forget();
 
-        let edge = self.edge.signal(libc::SIGUSR1);
+        let edge = if signal_edge {
+            self.edge.signal(libc::SIGUSR1)
+        } else {
+            self.edge.pid().is_some()
+        };
         let mut hosts = 0;
+        let mut relays = Vec::new();
 
         // A host's workers are told once its relay has reopened the
         // release log, so what their hooks write goes to the new file.
 
         for running in self.running.values() {
-            if running.backend.reopen_log(workers) {
+            if let Some(reopened) = running.backend.reopen_log(workers) {
                 hosts += 1;
+                relays.push(reopened);
             }
         }
 
@@ -10046,7 +10118,7 @@ impl Daemon {
             if workers { " and their workers" } else { "" }
         );
         self.events.emit("logs.reopened", "logs", "info", &message);
-        Reopened { edge, hosts }
+        (Reopened { edge, hosts }, relays)
     }
 
     /// Mark a running release ready, once the snapshot that gives it to

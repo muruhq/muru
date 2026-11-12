@@ -252,6 +252,23 @@ impl EdgeProcess {
         unsafe { libc::kill(pid as libc::pid_t, signal) == 0 }
     }
 
+    /// Have the edge open its log files again by name, as SIGUSR1 does,
+    /// and answer once they are open: `Ok` with what could not be
+    /// reopened, empty when everything was, or why the edge could not be
+    /// asked.
+    pub fn reopen_logs(&self) -> impl std::future::Future<Output = anyhow::Result<String>> + use<> {
+        let control = self.spec.control.clone();
+
+        async move {
+            let mut client = connect(&control).await?;
+            let answer = client
+                .reopen_logs(pb::ReopenLogsRequest {})
+                .await
+                .map_err(|status| anyhow::anyhow!("{}", status.message()))?;
+            Ok(answer.into_inner().error)
+        }
+    }
+
     /// Where the edge hands its listener back.
     pub fn listener_socket(&self) -> &Path {
         &self.spec.listener_socket

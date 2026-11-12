@@ -201,6 +201,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         limits: limits.clone(),
         version: AtomicU64::new(0),
         stop: stop_tx,
+        own_log: args.log.clone(),
         drainer: drainer.clone(),
     });
     let mut api = tokio::spawn(async move {
@@ -220,33 +221,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     let mut reopen = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
     tokio::spawn(async move {
         while reopen.recv().await.is_some() {
-            // The writer thread reopens the file after the lines queued
-            // before the signal, which this waits for off the runtime.
-
-            let log = Arc::clone(&access_log);
-
-            match tokio::task::spawn_blocking(move || log.reopen()).await {
-                Ok(Ok(())) => muru_common::muru_eprintln!("edge reopened the access log"),
-                Ok(Err(error)) => {
-                    muru_common::muru_eprintln!("edge could not reopen the access log: {error}")
-                }
-                Err(error) => {
-                    muru_common::muru_eprintln!("edge could not reopen the access log: {error}")
-                }
-            }
-
-            // Its own log is reopened onto its standard streams, after
-            // the line above, which goes to the file being replaced.
-
-            if let Some(path) = &own_log {
-                match muru_controller::logs::reopen_standard_streams(path) {
-                    Ok(()) => muru_common::muru_eprintln!("edge reopened {}", path.display()),
-                    Err(error) => muru_common::muru_eprintln!(
-                        "edge could not reopen {}: {error}",
-                        path.display()
-                    ),
-                }
-            }
+            let _ = reopen_files(&access_log, own_log.as_deref()).await;
         }
     });
 
@@ -312,6 +287,50 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     outcome
 }
 
+/// Section 11.3: open the access log, with the files virtual hosts name,
+/// and the edge's own log again by name, saying so in the edge's log, as
+/// SIGUSR1 and the ReopenLogs call ask. Gives what could not be reopened,
+/// or nothing.
+async fn reopen_files(
+    access_log: &Arc<muru_edge::access::AccessLog>,
+    own_log: Option<&std::path::Path>,
+) -> Option<String> {
+    let mut failed = None;
+
+    // The writer thread reopens the file after the lines queued before
+    // the request, which this waits for off the runtime.
+
+    let log = Arc::clone(access_log);
+
+    let reopened = match tokio::task::spawn_blocking(move || log.reopen()).await {
+        Ok(reopened) => reopened.map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+
+    match reopened {
+        Ok(()) => muru_common::muru_eprintln!("edge reopened the access log"),
+        Err(error) => {
+            muru_common::muru_eprintln!("edge could not reopen the access log: {error}");
+            failed = Some(format!("the access log: {error}"));
+        }
+    }
+
+    // Its own log is reopened onto its standard streams, after the line
+    // above, which goes to the file being replaced.
+
+    if let Some(path) = own_log {
+        match muru_controller::logs::reopen_standard_streams(path) {
+            Ok(()) => muru_common::muru_eprintln!("edge reopened {}", path.display()),
+            Err(error) => {
+                muru_common::muru_eprintln!("edge could not reopen {}: {error}", path.display());
+                failed = Some(format!("{}: {error}", path.display()));
+            }
+        }
+    }
+
+    failed
+}
+
 /// Serve the listener-return socket: each connection receives a copy of
 /// every listening socket over SCM_RIGHTS, in order, then the connection
 /// closes.
@@ -345,6 +364,9 @@ struct Control {
     /// Changes the limits a snapshot carries (section 4.6).
     limits: muru_edge::LimitsControl,
     stop: tokio::sync::mpsc::Sender<()>,
+    /// The edge's own log, which ReopenLogs opens again with the access
+    /// log.
+    own_log: Option<PathBuf>,
     /// Section 13.3: closes the connections and stops the accept loops
     /// when the daemon has the edge drain ahead of stopping it.
     drainer: muru_edge::Drainer,
@@ -588,6 +610,17 @@ impl EdgeControl for Control {
             &request.app,
             request.limit as usize,
         )))
+    }
+
+    async fn reopen_logs(
+        &self,
+        _: Request<pb::ReopenLogsRequest>,
+    ) -> Result<Response<pb::LogsReopened>, Status> {
+        let failed = reopen_files(&self.access_log, self.own_log.as_deref()).await;
+
+        Ok(Response::new(pb::LogsReopened {
+            error: failed.unwrap_or_default(),
+        }))
     }
 
     async fn stop(&self, _: Request<pb::StopRequest>) -> Result<Response<pb::Stopped>, Status> {
