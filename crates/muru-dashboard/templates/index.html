@@ -26,6 +26,9 @@
     <h2>Over time</h2>
     <div class="charts"><div id="chart-rate" class="chart"></div><div id="chart-latency" class="chart"></div><div id="chart-open" class="chart"></div></div>
   </section>
+  <section id="processes" hx-get="fragment/processes" hx-trigger="load, every 2s" hx-swap="innerHTML">
+    <h2>Processes</h2>
+  </section>
   <section id="requests" hx-get="fragment/requests" hx-trigger="every 2s" hx-swap="innerHTML">
     {% include "requests.html" %}
   </section>

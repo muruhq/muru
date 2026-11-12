@@ -29,7 +29,7 @@ use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, StreamBody};
-use hyper::body::{Body, Frame, Incoming};
+use hyper::body::{Body, Frame};
 use muru_proto::buffers;
 use muru_proto::descriptors::FdReader;
 use muru_proto::frame::{self, flag, kind};
@@ -1224,6 +1224,9 @@ pub struct Context<'a> {
     pub client_class: Arc<str>,
     /// The route's site mode (section 4.15), for the application.
     pub mode: Option<Arc<str>>,
+    /// The bytes of the request's body read so far and not yet taken by
+    /// an access record (section 11.1).
+    pub received: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<'a> Context<'a> {
@@ -1271,6 +1274,7 @@ impl<'a> Context<'a> {
             spool: self.spool.clone(),
             client_class: Arc::clone(&self.client_class),
             mode: None,
+            received: Arc::clone(&self.received),
         }
     }
 }
@@ -1372,6 +1376,9 @@ pub(crate) struct Recording {
     /// Counted as in flight, and listed, until the recording is dropped
     /// (section 11.7).
     pub(crate) in_flight: crate::access::InFlight,
+    /// The request body's bytes read so far, which the record takes when
+    /// it is written.
+    received: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Record a response the edge produced itself, such as a static file,
@@ -1436,9 +1443,11 @@ impl Recording {
                     .map_or_else(|| parts.uri.path().to_owned(), |target| target.to_string())
             }),
             version: format!("{:?}", parts.version),
+            listener: context.local.to_string(),
             status: 0,
             reason: String::new(),
             bytes: 0,
+            received: 0,
             worker: None,
             retried: false,
             queue: Duration::ZERO,
@@ -1456,7 +1465,14 @@ impl Recording {
             in_flight: context.access_log.begin(&record),
             record,
             started: Instant::now(),
+            received: Arc::clone(&context.received),
         }
+    }
+
+    /// Take the request body's bytes read since the last record of this
+    /// request took them, so a chain of hops counts them once.
+    fn take_received(&mut self) {
+        self.record.received += self.received.swap(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Section 4.10: the request went on by internal redirect. The hop
@@ -1465,6 +1481,7 @@ impl Recording {
     pub(crate) fn hop(mut self, status: u16) {
         self.record.status = status;
         self.record.total = self.started.elapsed();
+        self.take_received();
         self.log.record_hop(&self.record);
     }
 
@@ -1485,6 +1502,7 @@ impl Recording {
         self.record.reason = reason.to_owned();
         self.record.bytes = bytes;
         self.record.total = self.started.elapsed();
+        self.take_received();
 
         // Section 4.12: an error page sub-request counts in the metrics
         // of the application that served it, while the line is the
@@ -1613,7 +1631,7 @@ pub(crate) fn redirect(
 /// forms from the mount count as internal redirects (section 4.10).
 pub async fn handle(
     parts: &mut http::request::Parts,
-    body: Option<Incoming>,
+    body: Option<crate::body::RequestBody>,
     buffered: Option<Bytes>,
     pool: Arc<LinkPool>,
     context: &Context<'_>,
@@ -1696,7 +1714,7 @@ pub async fn handle(
 #[allow(clippy::too_many_arguments)] // two call sites; each argument is a distinct part of the request
 async fn handle_inner(
     parts: &mut http::request::Parts,
-    mut body: Option<Incoming>,
+    mut body: Option<crate::body::RequestBody>,
     buffered: Option<Bytes>,
     mut pool: Arc<LinkPool>,
     context: &Context<'_>,
@@ -2803,7 +2821,10 @@ fn set_content_length(head: &mut pb::RequestHead, length: u64) {
     });
 }
 
-pub(crate) async fn read_body(body: &mut Incoming, max_body_size: u64) -> Result<Bytes, BodyError> {
+pub(crate) async fn read_body(
+    body: &mut crate::body::RequestBody,
+    max_body_size: u64,
+) -> Result<Bytes, BodyError> {
     let mut data = BytesMut::new();
 
     while let Some(next) = body.frame().await {
@@ -3173,7 +3194,7 @@ async fn read_range(range: &mut FileRange) -> Result<Option<Bytes>, BoxError> {
 /// first, or the client goes away, send ABORT instead and discard what
 /// remains of the body.
 async fn pump_body(
-    mut body: Incoming,
+    mut body: crate::body::RequestBody,
     mut writer: Writer,
     back: Arc<Return>,
     expect: bool,
@@ -3259,7 +3280,12 @@ async fn pump_body(
 /// small. A client still waiting for 100 Continue has sent nothing; its
 /// body is left unread and hyper closes the connection after the
 /// response, since the body may yet follow.
-async fn abort(body: Incoming, mut writer: Writer, back: Arc<Return>, discard_rest: bool) {
+async fn abort(
+    body: crate::body::RequestBody,
+    mut writer: Writer,
+    back: Arc<Return>,
+    discard_rest: bool,
+) {
     let payload = pb::Abort::default().encode_to_vec();
 
     match frame::write(&mut writer, kind::ABORT, 0, payload.into()).await {
@@ -3289,7 +3315,7 @@ async fn abort(body: Incoming, mut writer: Writer, back: Arc<Return>, discard_re
 
 /// Read and drop the rest of a request body, saying whether it ended
 /// within the limit.
-async fn discard(mut body: Incoming) -> bool {
+async fn discard(mut body: crate::body::RequestBody) -> bool {
     let mut seen = 0;
 
     loop {

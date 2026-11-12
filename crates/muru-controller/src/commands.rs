@@ -681,6 +681,51 @@ struct Ending {
     ok: bool,
 }
 
+/// A command running now, as `muructl status --processes` lists it
+/// (section 13.10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningCommand {
+    /// Its pid.
+    pub pid: u32,
+    /// The application it runs for.
+    pub app: String,
+    /// The release it runs with.
+    pub release: String,
+    /// What the events call it.
+    pub label: String,
+}
+
+/// The commands this process runs now.
+static RUNNING: Mutex<Vec<RunningCommand>> = Mutex::new(Vec::new());
+
+/// The commands this process runs now, the daemon's or a run's.
+pub fn running() -> Vec<RunningCommand> {
+    RUNNING.lock().expect("running commands poisoned").clone()
+}
+
+/// A command's place in `RUNNING`, given up when it ends.
+struct Listed(u32);
+
+impl Listed {
+    fn new(command: RunningCommand) -> Self {
+        let pid = command.pid;
+        RUNNING
+            .lock()
+            .expect("running commands poisoned")
+            .push(command);
+        Self(pid)
+    }
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        RUNNING
+            .lock()
+            .expect("running commands poisoned")
+            .retain(|command| command.pid != self.0);
+    }
+}
+
 /// A command `run` started: what it writes, and a way to stop it while
 /// that is still read.
 pub struct Running {
@@ -955,6 +1000,12 @@ async fn supervise(
     };
 
     let pid = child.id().unwrap_or(0);
+    let _listed = Listed::new(RunningCommand {
+        pid,
+        app: prepared.app.clone(),
+        release: prepared.release.clone(),
+        label: prepared.label.clone(),
+    });
 
     let with = if prepared.inputs.is_empty() {
         String::new()

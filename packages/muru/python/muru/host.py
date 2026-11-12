@@ -428,6 +428,18 @@ def app_name(spec: str) -> str:
     return module_name.split(".")[0] or "default"
 
 
+def set_title(title: str, short: str) -> None:
+    """Set the process title `ps` shows (section 2.1).
+
+    On Linux the short name `top` shows is set too, so the host and each
+    worker tell themselves apart.
+    """
+
+    from muru import _native
+
+    _native.set_title(title, short)
+
+
 def process_model(threads: int, interface: str = "wsgi") -> str:
     """Name the process model of section 6.4 for a release."""
 
@@ -1244,6 +1256,12 @@ class Host:
             status = 1
 
             try:
+                group, within = self.placement[index]
+                context = self.release.context
+                set_title(
+                    f"muru worker {context.app}@{context.release} {group.name}/{within}",
+                    "muru-worker",
+                )
                 os.dup2(out_write, 1)
                 os.dup2(err_write, 2)
 
@@ -4774,6 +4792,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.memory_budget is not None:
         host.derive_hard_limit(args.memory_budget)
+
+    # Section 2.1: the host says which release it is; each worker it
+    # forks says so too, with its group and index.
+
+    set_title(f"muru host {context.app}@{context.release}", "muru-host")
 
     if args.single:
         # Section 13.1: no fork, so a debugger attached to this process sees

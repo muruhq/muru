@@ -11,6 +11,7 @@ ones it names.
 | Tool | Kind | Runs | Arguments |
 | --- | --- | --- | --- |
 | `status` | reads | `muructl status` | none |
+| `processes` | reads | `muructl status --processes` | `app` (an application, or `app@release`), `all` |
 | `list` | reads | `muructl app list`, `release list`, `host list`, `route list`, `upstream list`, `rollout status` or `overlay list` | `what` (apps, releases, hosts, routes, upstreams, rollouts, overlays), `app` |
 | `release` | reads | `muructl release show` | `release` (app@release) |
 | `commands` | reads | `muructl command list` | `target` |

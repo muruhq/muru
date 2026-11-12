@@ -31,6 +31,7 @@ use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 
 pub mod access;
 pub mod auth;
+pub mod body;
 pub mod buckets;
 pub mod classify;
 pub mod compression;
@@ -1357,7 +1358,12 @@ async fn serve<I>(
 
             let site = routing.site(host.as_deref(), parts.uri.path(), &client_class, &listener);
             let compression = site.compression;
-            let mut body = Some(body);
+
+            // Section 11.1: the body's bytes are counted as they are read,
+            // and each record of the request takes what was counted.
+
+            let received = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let mut body = Some(body::RequestBody::new(body, Arc::clone(&received)));
             let mut buffered: Option<Bytes> = None;
             let mut origin: Option<routing::Origin> = None;
             let mut internal: Option<link::Internal> = None;
@@ -1459,6 +1465,7 @@ async fn serve<I>(
                     spool: shared.spool.clone(),
                     client_class: Arc::clone(&client_class),
                     mode: None,
+                    received: Arc::clone(&received),
                 };
 
                 // Section 4.15: a client's own request draws from the
@@ -2159,7 +2166,7 @@ async fn serve<I>(
 #[allow(clippy::too_many_arguments)] // each argument is a distinct part of the request
 pub(crate) async fn dispatch(
     parts: &mut http::request::Parts,
-    body: Option<Incoming>,
+    body: Option<crate::body::RequestBody>,
     buffered: Option<Bytes>,
     pool: Arc<link::LinkPool>,
     upstream: Option<Arc<upstream::Upstream>>,

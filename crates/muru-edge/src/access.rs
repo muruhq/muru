@@ -551,12 +551,16 @@ pub struct Record {
     pub target: String,
     /// The HTTP version, for example HTTP/1.1.
     pub version: String,
+    /// The address of the listener the request arrived on.
+    pub listener: String,
     /// The response status.
     pub status: u16,
     /// The Appendix C.3 reason when the edge generated the response.
     pub reason: String,
     /// Body bytes sent to the client.
     pub bytes: u64,
+    /// Body bytes received from the client.
+    pub received: u64,
     /// The index of the worker that served the request, if one did.
     pub worker: Option<usize>,
     /// Section 4.8: the request was sent again to another worker after
@@ -748,6 +752,10 @@ impl Drop for WebSocket {
         record.started = SystemTime::now();
         record.total = lifetime;
         record.bytes = socket.sent_bytes.load(Ordering::Relaxed);
+        record.received = socket.received_bytes.load(Ordering::Relaxed);
+        self.log
+            .metrics
+            .count_websocket_bytes(&record, record.received, record.bytes);
         record.websocket = Some(WebSocketEnd {
             by,
             code,
@@ -1961,9 +1969,11 @@ mod tests {
             method: "GET".to_owned(),
             target: target.to_owned(),
             version: "HTTP/1.1".to_owned(),
+            listener: "127.0.0.1:8080".to_owned(),
             status,
             reason: String::new(),
             bytes: 0,
+            received: 0,
             worker: Some(0),
             retried: false,
             queue: Duration::ZERO,

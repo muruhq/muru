@@ -94,6 +94,23 @@ def test_requests_are_counted_and_served_to_a_scraper(scraped: tuple[Daemon, int
     assert 'muru_workers_ready{app="shop",release="r1",group="default"} 2\n' in text, text
     assert re.search(r"muru_snapshot_version [1-9]\d*\n", text), text
 
+    # Body bytes are counted by the listener they arrived on: none
+    # received by the two GETs, and what they answered sent.
+
+    bytes_labels = f'app="shop",release="r1",listener="127.0.0.1:{daemon.port}"'
+    assert f"muru_request_bytes_total{{{bytes_labels}}} 0\n" in text, text
+    assert re.search(rf"muru_response_bytes_total\{{{bytes_labels}\}} [1-9]\d*\n", text), text
+    connection = http.client.HTTPConnection("127.0.0.1", daemon.port, timeout=30)
+
+    try:
+        connection.request("POST", "/catalogue", body=b"twelve bytes")
+        connection.getresponse().read()
+    finally:
+        connection.close()
+
+    text = daemon.muructl("metrics").stdout
+    assert f"muru_request_bytes_total{{{bytes_labels}}} 12\n" in text, text
+
     # The listener serves the same text at /metrics and nothing else.
 
     status, headers, body = fetch(port, "/metrics")

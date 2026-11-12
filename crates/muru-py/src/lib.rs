@@ -345,12 +345,21 @@ fn memory_usage(py: Python<'_>) -> PyResult<Option<Bound<'_, pyo3::types::PyDict
     Ok(Some(sizes))
 }
 
+/// Set the process title the operating system shows (section 2.1): the
+/// command line `ps` shows, and on Linux the short name `top` shows. The
+/// host calls it at start and each worker after its fork.
+#[pyfunction]
+fn set_title(title: &str, short: &str) {
+    muru_common::title::set(title, short);
+}
+
 /// Module initialisation for `muru._native`.
 #[pymodule(gil_used = false)]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(serve, m)?)?;
     m.add_function(wrap_pyfunction!(memory_usage, m)?)?;
+    m.add_function(wrap_pyfunction!(set_title, m)?)?;
     m.add_function(wrap_pyfunction!(suspend_timeouts, m)?)?;
     m.add_function(wrap_pyfunction!(requests, m)?)?;
     m.add_function(wrap_pyfunction!(loop_beat, m)?)?;

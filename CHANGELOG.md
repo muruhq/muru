@@ -9,6 +9,31 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a24 (2026-11-12)
+
+### Added
+
+- Every process of Muru sets a title, so `ps`, `top` and `htop` tell them apart: `murud` for the daemon, `muru-edge` for the edge, `muru run APP` or `muru serve APP`, `muru host APP@RELEASE`, `muru relay APP@RELEASE` and `muru worker APP@RELEASE GROUP/INDEX`.
+
+  The edge counts body bytes received from clients and sent to them, as `muru_request_bytes_total` and `muru_response_bytes_total` by application, release and listener.
+
+  `muructl status --processes` shows the instance's processes as the tree Muru supervises, under the daemon, `muructl run` and `muructl serve`: the edge, each release's host, log relay and workers, managed server instances and running commands, with each one's user, uptime, CPU and memory, each worker's requests per second, busy slots, p95 and GIL wait or loop lag over the last second, and the instance's figures. `--app` narrows it, `--all` adds the processes Muru did not start, `--watch` keeps it live and `--json` prints it. The dashboard has the same view as a Processes section, and `/v1/processes`; it is also the MCP tool `processes`, and `live/processes.json` in a debug bundle. ([#595](https://github.com/muruhq/muru/issues/595))
+
+### Removed
+
+- Removed the dashboard's actions: its maintenance, promote, roll back, drain, scale and restart buttons, the `/actions/` paths, `muructl dashboard login --actions`, the `actions` key of the daemon's `[dashboard]` table and the `dashboard.action` event. The dashboard shows and never changes, in every mode, and answers every request but GET with 405; each change is a `muructl` command, which the dashboard guide lists. A daemon file that still sets `actions` is refused. ([#547](https://github.com/muruhq/muru/issues/547))
+
+### Fixed
+
+- A command run from the directory `muructl run DIR` was started in reaches that run, ahead of the user's daemon, and a command that the daemon answers while a development run is listening says so on standard error, naming the run and how to reach it. `muructl run` prints the directories its commands are reached from. ([#592](https://github.com/muruhq/muru/issues/592))
+
+### Documentation
+
+- The debugging guide gives the 256 MiB limit on a debug reply under "How
+  it reaches the worker", where it applies to every `muructl debug`
+  command, rather than under "Logger levels". ([#588](https://github.com/muruhq/muru/issues/588))
+
+
 ## 0.1.0a23 (2026-11-11)
 
 ### Added

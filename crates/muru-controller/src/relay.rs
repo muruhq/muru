@@ -130,6 +130,8 @@ pub struct RelayArgs {
     pub queue: usize,
     /// What a full queue does.
     pub overflow: Overflow,
+    /// The release, as app@release, which the process title names.
+    pub release: Option<String>,
 }
 
 /// Where a line came from, which is also its queue. The relay's own
@@ -781,6 +783,12 @@ fn describe_os_error(code: i32) -> String {
 
 /// Run a relay until the host and every pipe it was given have ended.
 pub fn run(args: RelayArgs) -> anyhow::Result<()> {
+    // Section 2.1: the relay says whose output it carries.
+
+    if let Some(release) = &args.release {
+        muru_common::title::set(&format!("muru relay {release}"), "muru-relay");
+    }
+
     let shared = Arc::new(Shared::new(args.queue, args.overflow));
     let destination = Destination::open(args.log_file.as_deref())?;
 
@@ -1497,6 +1505,7 @@ mod tests {
             log_file: Some(log.clone()),
             queue: DEFAULT_QUEUE,
             overflow: Overflow::DropOldest,
+            release: None,
         };
         let relay = std::thread::spawn(move || run(args));
 

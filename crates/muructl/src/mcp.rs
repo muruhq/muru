@@ -667,6 +667,29 @@ fn specs() -> Vec<Spec> {
             command: |_| Ok(words(&["status"])),
         },
         Spec {
+            name: "processes",
+            description: "The instance's processes as a tree: the daemon or the run, the edge, each release's host, log relay and workers, managed servers and running commands, each with its pid, user, uptime, CPU, memory and, for a worker, its requests per second, busy slots and p95 over the last second.",
+            changes: false,
+            properties: json!({
+                "app": {"type": "string", "description": "One application only, or one release as app@release"},
+                "all": {"type": "boolean", "description": "Also the processes Muru did not start, such as those a worker ran"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["status", "--processes"]);
+
+                if let Some(app) = text(arguments, "app") {
+                    command.extend(["--app".to_owned(), app]);
+                }
+
+                if arguments.get("all").and_then(serde_json::Value::as_bool) == Some(true) {
+                    command.push("--all".to_owned());
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "list",
             description: "List one kind of object: apps, releases (of one app, or all), hosts, routes, upstreams, rollouts (of one app, or all) or overlays.",
             changes: false,

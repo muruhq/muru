@@ -310,6 +310,11 @@ pub enum Command {
         /// Answered with the data.
         done: oneshot::Sender<muru_dashboard::NodeData>,
     },
+    /// The processes the daemon supervises (section 13.10).
+    Processes {
+        /// Answered with them, the daemon first.
+        done: oneshot::Sender<Vec<crate::processes::Known>>,
+    },
     /// The node's metrics as the Prometheus text exposition.
     Metrics {
         /// Answered with the text.
@@ -760,6 +765,36 @@ pub struct Handle {
     pub underway: crate::commands::Underway,
 }
 
+/// Section 13.10: the daemon's processes as ListProcesses answers, which
+/// the dashboard's Processes section shows as well; none when the daemon
+/// is stopping.
+pub async fn processes(
+    commands: &mpsc::Sender<Command>,
+    info: &Info,
+    request: muru_proto::admin::v1::ListProcessesRequest,
+) -> Option<muru_proto::admin::v1::Processes> {
+    let (done, answer) = oneshot::channel();
+    commands.send(Command::Processes { done }).await.ok()?;
+    let known = answer.await.ok()?;
+
+    let header = crate::processes::Header {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        mode: "daemon".to_owned(),
+        started_unix_ms: info.started_unix_ms,
+    };
+
+    Some(
+        crate::processes::snapshot(
+            known,
+            request,
+            header,
+            Arc::clone(&info.cpu),
+            &info.process_figures,
+        )
+        .await,
+    )
+}
+
 /// Facts about the running daemon, for status.
 pub struct Info {
     /// Where everything lives.
@@ -780,10 +815,6 @@ pub struct Info {
     /// The dashboard's login codes and sessions, when it is served
     /// (section 10.7).
     pub dashboard_sessions: Option<Arc<muru_dashboard::Sessions>>,
-    /// Whether a dashboard session may be given the actions, which
-    /// `muructl dashboard login --actions` asks for, and whether a session
-    /// that has them may act: `[dashboard] actions`, re-read on reload.
-    pub dashboard_actions: Arc<std::sync::atomic::AtomicBool>,
     /// The rate limits (section 4.15) and client classes (section 4.14)
     /// the daemon's file defines, which applied files may name.
     pub defined: std::sync::RwLock<crate::config::Defined>,
@@ -794,6 +825,11 @@ pub struct Info {
     /// WebSockets open by application and release, from the edge's
     /// metrics as last sampled.
     pub websockets: std::sync::Mutex<HashMap<(String, String), u64>>,
+    /// The live figures of `muructl status --processes`, sampled every
+    /// second (section 13.10).
+    pub process_figures: crate::processes::Live,
+    /// Each process's CPU time when last read, for its CPU percentage.
+    pub cpu: Arc<crate::processes::CpuMeter>,
     /// What each release's entrypoints run as, as its host last
     /// announced them.
     pub interfaces: Interfaces,
@@ -1326,9 +1362,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let metrics = settings.metrics;
     let dashboard = settings.dashboard;
     let dashboard_sessions = dashboard.is_some().then(muru_dashboard::Sessions::new);
-    let dashboard_actions = Arc::new(std::sync::atomic::AtomicBool::new(
-        settings.dashboard_actions,
-    ));
     let sinks = std::mem::take(&mut settings.sinks);
     let locations = config.locations;
 
@@ -1455,7 +1488,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         metrics,
         dashboard,
         dashboard_sessions: dashboard_sessions.clone(),
-        dashboard_actions: Arc::clone(&dashboard_actions),
         defined: std::sync::RwLock::new(crate::config::Defined {
             budget: crate::budget::View {
                 budget: settings.budget,
@@ -1466,6 +1498,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         python_logging: std::sync::RwLock::new(settings.python_logging.clone()),
         interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
+        process_figures: crate::processes::Live::default(),
+        cpu: Arc::default(),
         live: std::sync::Mutex::new(HashMap::new()),
         no_host: std::sync::Mutex::new(String::new()),
         pass_env: std::sync::RwLock::new(settings.pass_env.clone()),
@@ -1514,8 +1548,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 Arc::clone(&history),
                 events.clone(),
                 dashboard_sessions.unwrap_or_else(muru_dashboard::Sessions::new),
-                Arc::clone(&handle.store),
-                Arc::clone(&dashboard_actions),
+                Arc::clone(&handle.info),
             )))
         }
         None => None,
@@ -2156,7 +2189,8 @@ pub(crate) fn running_executable() -> anyhow::Result<PathBuf> {
 /// the one that name finds on the PATH or that path names now; what the
 /// kernel reports as the running executable may be a replaced file.
 pub fn installed_executable() -> anyhow::Result<PathBuf> {
-    let name = std::env::args_os()
+    let name = muru_common::title::args_os()
+        .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("the daemon has no command name"))?;
     let name = PathBuf::from(name);
@@ -2547,17 +2581,26 @@ fn adoption_message(adopted: &ServersRecord) -> String {
     }
 }
 
-/// Whether a process's command line names the path, which is how a host
-/// record is checked against the process that has its pid now.
-fn command_mentions(pid: u32, path: &Path) -> bool {
+/// Whether a process's command line names the path or is the title, which
+/// is how a host's or relay's record is checked against the process that
+/// has its pid now.
+fn command_mentions(pid: u32, path: &Path, title: &str) -> bool {
     let output = std::process::Command::new("ps")
         .args(["-o", "command=", "-p", &pid.to_string()])
         .output();
 
     match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout).contains(&path.display().to_string()),
+        Ok(output) => names(&String::from_utf8_lossy(&output.stdout), path, title),
         Err(_) => false,
     }
+}
+
+/// Whether a command line, as `ps` shows it, is the process a record
+/// names: it mentions `path`, as the process was started, or it is
+/// `title`, which the process set in place of its arguments (section
+/// 2.1), with whatever spaces `ps` shows for the rest of the area.
+fn names(command: &str, path: &Path, title: &str) -> bool {
+    command.contains(&path.display().to_string()) || command.trim() == title
 }
 
 /// The index of the worker a link socket belongs to, from its name:
@@ -2989,7 +3032,7 @@ impl Daemon {
         self.client_rules = settings.client_rules;
         self.clients = clients;
 
-        // Section 7.4: the budget, and the dashboard's actions switch.
+        // Section 7.4: the budget.
 
         if settings.budget != self.budget {
             self.budget = settings.budget;
@@ -3013,18 +3056,6 @@ impl Daemon {
             report.changed("[daemon] pass_env", "for releases started from now on");
         } else {
             report.unchanged("[daemon] pass_env");
-        }
-
-        let actions = settings.dashboard_actions;
-        let actions_were = self
-            .info
-            .dashboard_actions
-            .swap(actions, std::sync::atomic::Ordering::Relaxed);
-
-        if actions_were != actions {
-            report.changed("[dashboard] actions", if actions { "on" } else { "off" });
-        } else {
-            report.unchanged("[dashboard] actions");
         }
 
         // Section 11.5: sinks start, stop and restart on their cursors.
@@ -4161,7 +4192,7 @@ impl Daemon {
             return false;
         };
 
-        if !command_mentions(record.pid, &run_dir) {
+        if !command_mentions(record.pid, &run_dir, &format!("muru host {app}@{id}")) {
             tracing::info!(
                 pid = record.pid,
                 "release {app}@{id} could not be re-adopted: no process of its host has the pid"
@@ -4200,6 +4231,7 @@ impl Daemon {
             Some(self.host_log(app, id)),
             self.relay_settings,
             identity,
+            subject.clone(),
         ) {
             Ok(launch) => launch,
             Err(error) => {
@@ -4209,7 +4241,7 @@ impl Daemon {
         };
         let relay_pid = read_record::<RelayRecord>(&host_dir.join(crate::relay::RECORD))
             .map(|record| record.pid)
-            .filter(|pid| command_mentions(*pid, &host_dir));
+            .filter(|pid| command_mentions(*pid, &host_dir, &format!("muru relay {subject}")));
         let watcher = self.relay_watcher(&subject);
         let adopted = HostProcess::adopt(
             record.pid,
@@ -4536,6 +4568,9 @@ impl Daemon {
             }
             Command::Dashboard { done } => {
                 let _ = done.send(self.dashboard_data().await);
+            }
+            Command::Processes { done } => {
+                let _ = done.send(self.processes());
             }
             Command::HostAttached { app, id, control } => {
                 if let Some(running) = self.running.get_mut(&(app, id)) {
@@ -9471,6 +9506,148 @@ impl Daemon {
         if let Some(point) = self.sampler.observe(now, reading) {
             self.history.record(point);
         }
+
+        // Section 13.10: the live figures, from the same samples and what
+        // each release's workers last reported.
+
+        let reports: Vec<(String, String, Vec<crate::host::WorkerStatus>)> = self
+            .running
+            .iter()
+            .map(|((app, id), running)| (app.clone(), id.clone(), running.status.clone()))
+            .collect();
+        self.info.process_figures.observe(samples, &reports);
+    }
+
+    /// Section 13.10: the processes the daemon supervises, the daemon
+    /// first: the edge, each release's host, relay and workers as the
+    /// host last announced them, managed server instances, and the
+    /// commands it runs.
+    fn processes(&self) -> Vec<crate::processes::Known> {
+        use crate::processes::Known;
+
+        let daemon = std::process::id();
+        let mut known = vec![Known {
+            pid: daemon,
+            role: "daemon",
+            what: "muructl daemon run".to_owned(),
+            ..Known::default()
+        }];
+
+        if let Some(pid) = self.edge.pid() {
+            let listeners = self.info.listeners.read().expect("listeners poisoned");
+            known.push(Known {
+                pid,
+                parent: daemon,
+                role: "edge",
+                what: format!("listening on {}", crate::processes::addresses(&listeners)),
+                ..Known::default()
+            });
+        }
+
+        for ((app, id), running) in &self.running {
+            let subject = format!("{app}@{id}");
+
+            match &running.backend {
+                Backend::Host(host) => {
+                    let Some(host_pid) = host.pid() else {
+                        continue;
+                    };
+
+                    let mut groups: Vec<String> = running
+                        .groups
+                        .iter()
+                        .map(|group| group.name.clone())
+                        .collect();
+
+                    if !running.sockets.is_empty() || groups.is_empty() {
+                        groups.insert(0, "default".to_owned());
+                    }
+
+                    known.push(Known {
+                        pid: host_pid,
+                        parent: daemon,
+                        role: "host",
+                        what: subject.clone(),
+                        app: app.clone(),
+                        release: id.clone(),
+                        groups,
+                        ..Known::default()
+                    });
+
+                    if let Some(pid) = host.relay_pid() {
+                        let log = self.locations.release_log(app, id);
+                        let shown = log
+                            .strip_prefix(&self.locations.logs.path)
+                            .unwrap_or(&log)
+                            .display()
+                            .to_string();
+                        known.push(Known {
+                            pid,
+                            parent: host_pid,
+                            spawned_by: daemon,
+                            role: "relay",
+                            what: format!("{subject} output to {shown}"),
+                            app: app.clone(),
+                            release: id.clone(),
+                            ..Known::default()
+                        });
+                    }
+
+                    for worker in &running.workers {
+                        known.push(Known {
+                            pid: worker.pid,
+                            parent: host_pid,
+                            role: "worker",
+                            what: crate::processes::worker_phrase(
+                                &worker.group,
+                                worker.index,
+                                &worker.state,
+                                true,
+                            ),
+                            app: app.clone(),
+                            release: id.clone(),
+                            group: worker.group.clone(),
+                            index: Some(worker.index),
+                            socket: Some(worker.socket.clone()),
+                            ..Known::default()
+                        });
+                    }
+                }
+                Backend::Servers(servers) => {
+                    for instance in servers.record().instances {
+                        if instance.pid == 0 {
+                            continue;
+                        }
+
+                        known.push(Known {
+                            pid: instance.pid,
+                            parent: daemon,
+                            role: "server",
+                            what: format!("{subject} instance {}", instance.index),
+                            app: app.clone(),
+                            release: id.clone(),
+                            index: Some(instance.index),
+                            ..Known::default()
+                        });
+                    }
+                }
+                Backend::Dormant => {}
+            }
+        }
+
+        for command in crate::commands::running() {
+            known.push(Known {
+                pid: command.pid,
+                parent: daemon,
+                role: "command",
+                what: format!("{}@{} {}", command.app, command.release, command.label),
+                app: command.app,
+                release: command.release,
+                ..Known::default()
+            });
+        }
+
+        known
     }
 
     /// The log files the daemon's writers keep, each with whether its
@@ -10209,6 +10386,28 @@ fn step_message(steps: &[RolloutStep], step: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_names_a_process_by_its_path_or_its_title() {
+        let run_dir = Path::new("/run/muru/apps/shop/r42");
+
+        assert!(super::names(
+            "python -m muru.host --socket-dir /run/muru/apps/shop/r42/r1",
+            run_dir,
+            "muru host shop@r42"
+        ));
+        assert!(super::names(
+            "muru host shop@r42      ",
+            run_dir,
+            "muru host shop@r42"
+        ));
+        assert!(!super::names(
+            "muru host shop@r421",
+            run_dir,
+            "muru host shop@r42"
+        ));
+        assert!(!super::names("sleep 300", run_dir, "muru host shop@r42"));
+    }
 
     #[test]
     fn the_adoption_event_names_the_instances_kept_and_those_started_again() {

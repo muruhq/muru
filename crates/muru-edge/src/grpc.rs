@@ -25,7 +25,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use http_body::Frame;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, StreamBody};
-use hyper::body::Incoming;
+
 use muru_proto::frame::{self, kind};
 use muru_proto::worker::v1 as pb;
 use prost::Message;
@@ -257,7 +257,7 @@ fn empty() -> ResponseBody {
 /// Serve one call.
 pub(crate) async fn handle(
     parts: &http::request::Parts,
-    body: Option<Incoming>,
+    body: Option<crate::body::RequestBody>,
     pool: Arc<LinkPool>,
     context: &Context<'_>,
     protocol: Protocol,
@@ -633,7 +633,7 @@ async fn next_frame(mut state: Stream) -> Option<(Result<Frame<Bytes>, BoxError>
 /// A client that goes away, a malformed request, or the response ending
 /// first sends ABORT instead.
 async fn pump_messages(
-    body: Option<Incoming>,
+    body: Option<crate::body::RequestBody>,
     mut writer: Writer,
     back: Arc<Return>,
     mut decoder: Decoder,
@@ -863,7 +863,7 @@ const SERVICE_UNKNOWN: i32 = 3;
 /// other must be a registered service. Watch sends the status, then
 /// holds the call open until the client ends it.
 async fn health(
-    body: Option<Incoming>,
+    body: Option<crate::body::RequestBody>,
     pool: &LinkPool,
     protocol: Protocol,
     encoding: Encoding,
