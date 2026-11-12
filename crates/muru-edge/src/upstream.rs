@@ -868,7 +868,7 @@ fn scheme(shared: &Shared) -> &'static str {
 enum Payload {
     Empty,
     Buffered(Bytes),
-    Streamed(Incoming),
+    Streamed(crate::body::RequestBody),
 }
 
 impl Payload {
@@ -901,7 +901,7 @@ impl Payload {
 /// internal redirect, as from an application.
 pub async fn handle(
     parts: &mut http::request::Parts,
-    mut body: Option<Incoming>,
+    mut body: Option<crate::body::RequestBody>,
     buffered: Option<Bytes>,
     upstream: Arc<Upstream>,
     context: &Context<'_>,

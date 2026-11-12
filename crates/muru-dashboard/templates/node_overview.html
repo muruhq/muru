@@ -9,7 +9,7 @@
 </div>
 <h2 style="margin-top:1rem">Applications and releases</h2>
 <table>
-  <tr><th>Release</th><th>State</th><th>Serving</th><th class="num">Workers</th>{% if data.has_threads() %}<th class="num">Threads</th>{% endif %}{% if data.has_event_loop() %}<th class="num">Loop</th>{% endif %}<th class="num">WebSockets</th><th class="num">Queued</th><th>Created</th><th>Note</th>{% if csrf.is_some() %}<th>Actions</th>{% endif %}</tr>
+  <tr><th>Release</th><th>State</th><th>Serving</th><th class="num">Workers</th>{% if data.has_threads() %}<th class="num">Threads</th>{% endif %}{% if data.has_event_loop() %}<th class="num">Loop</th>{% endif %}<th class="num">WebSockets</th><th class="num">Queued</th><th>Created</th><th>Note</th></tr>
   {% for app in data.apps %}
   {% for release in app.releases %}
   <tr>
@@ -23,32 +23,6 @@
     <td class="num">{{ release.waiting }}</td>
     <td>{{ release.created }}</td>
     <td>{{ release.message }}</td>
-    {% if let Some(token) = csrf %}
-    <td class="actions">
-      {% if release.serving %}<form method="post" action="actions/maintenance">
-      <input type="hidden" name="csrf" value="{{ token }}">
-      <input type="hidden" name="app" value="{{ app.name }}">
-      {% if app.maintenance_since.is_empty() %}<input type="hidden" name="state" value="on"><button>Maintenance on</button>{% else %}<input type="hidden" name="state" value="off"><button>Maintenance off</button>{% endif %}
-      </form>{% endif %}
-      {% if release.serving && !app.previous.is_empty() %}<form method="post" action="actions/rollback">
-      <input type="hidden" name="csrf" value="{{ token }}">
-      <input type="hidden" name="app" value="{{ app.name }}">
-      <button>Roll back to {{ app.previous }}</button>
-      </form>{% endif %}
-      {% if !release.serving && release.state == "ready" %}<form method="post" action="actions/promote">
-      <input type="hidden" name="csrf" value="{{ token }}">
-      <input type="hidden" name="app" value="{{ app.name }}">
-      <input type="hidden" name="release" value="{{ release.id }}">
-      <button>Promote</button>
-      </form>{% endif %}
-      {% if release.workers > 0 %}<form method="post" action="actions/drain">
-      <input type="hidden" name="csrf" value="{{ token }}">
-      <input type="hidden" name="app" value="{{ app.name }}">
-      <input type="hidden" name="release" value="{{ release.id }}">
-      <button>Drain</button>
-      </form>{% endif %}
-    </td>
-    {% endif %}
   </tr>
   {% endfor %}
   {% endfor %}
@@ -66,25 +40,9 @@
 {% if !data.scaling.is_empty() %}
 <h3>Scaling</h3>
 <table>
-  <tr><th>Group</th><th>Workers</th><th>Policy</th><th class="num">CPU</th><th class="num">GC</th><th class="num">GIL wait p95</th><th class="num">Loop lag p95</th>{% if data.has_handoff_wait() %}<th class="num">Handoff wait p95</th>{% endif %}<th>Diagnosis</th><th>Last decision</th>{% if csrf.is_some() %}<th>Actions</th>{% endif %}</tr>
+  <tr><th>Group</th><th>Workers</th><th>Policy</th><th class="num">CPU</th><th class="num">GC</th><th class="num">GIL wait p95</th><th class="num">Loop lag p95</th>{% if data.has_handoff_wait() %}<th class="num">Handoff wait p95</th>{% endif %}<th>Diagnosis</th><th>Last decision</th></tr>
   {% for row in data.scaling %}
   <tr><td>{{ row.release }} {{ row.group }}{% if row.optional %} (optional){% endif %}</td><td>{{ row.workers }}</td><td>{{ row.policy }}</td><td class="num">{{ row.cpu }}</td><td class="num">{{ row.gc }}</td><td class="num">{{ row.gil_wait }}</td><td class="num">{{ row.loop_lag }}</td>{% if data.has_handoff_wait() %}<td class="num">{% if let Some(wait) = row.handoff_wait %}{{ wait }}{% else %}-{% endif %}</td>{% endif %}<td>{{ row.diagnosis }}{% if !row.advice.is_empty() %}<br><small>{{ row.advice }}</small>{% endif %}</td><td>{{ row.last_decision }}</td>
-    {% if let Some(token) = csrf %}
-    <td class="actions"><form method="post" action="actions/scale">
-      <input type="hidden" name="csrf" value="{{ token }}">
-      <input type="hidden" name="app" value="{{ row.app }}">
-      <input type="hidden" name="release" value="{{ row.id }}">
-      <input type="hidden" name="group" value="{{ row.group }}">
-      <input type="number" name="processes" min="1" size="3" aria-label="workers to pin" id="pin-{{ row.app }}-{{ row.id }}-{{ row.group }}" hx-preserve="true"> <button>Pin</button>
-    </form>{% if row.pinned %}<form method="post" action="actions/scale">
-      <input type="hidden" name="csrf" value="{{ token }}">
-      <input type="hidden" name="app" value="{{ row.app }}">
-      <input type="hidden" name="release" value="{{ row.id }}">
-      <input type="hidden" name="group" value="{{ row.group }}">
-      <input type="hidden" name="unpin" value="on">
-      <button>Unpin</button>
-    </form>{% endif %}</td>
-    {% endif %}
   </tr>
   {% endfor %}
 </table>

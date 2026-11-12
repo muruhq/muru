@@ -323,6 +323,10 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         assert len(json.loads(found["live/shop@r1/tasks.json"])["workers"]) == 2
         assert json.loads(found["live/requests.json"])["in_flight"] == 0
         assert json.loads(found["live/websockets.json"])["open"] == 0
+        processes = json.loads(found["live/processes.json"])
+        assert processes["root"]["role"] == "daemon", processes
+        host = next(child for child in processes["root"]["children"] if child["role"] == "host")
+        assert [child["role"] for child in host["children"]] == ["relay", "worker", "worker"]
         assert b"muru_requests_total" in found["figures/metrics.txt"]
         assert json.loads(found["figures/scaling/shop@r1.json"])["groups"][0]["group"] == "default"
 

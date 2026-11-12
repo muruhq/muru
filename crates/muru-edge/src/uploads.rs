@@ -26,7 +26,7 @@ use bytes::{Bytes, BytesMut};
 use futures::Stream;
 use http::{HeaderMap, StatusCode};
 use http_body_util::BodyExt as _;
-use hyper::body::Incoming;
+
 use muru_proto::edge::v1 as edge_pb;
 use muru_proto::worker::v1 as pb;
 
@@ -448,7 +448,7 @@ impl From<StreamError> for Refusal {
 /// The body's data, bounded by `max_body_size` and by `idle` between
 /// pieces.
 fn body_stream(
-    body: &mut Incoming,
+    body: &mut crate::body::RequestBody,
     max_body_size: u64,
     idle: Duration,
 ) -> impl Stream<Item = Result<Bytes, StreamError>> + Send + '_ {
@@ -494,7 +494,7 @@ pub async fn receive(
     spool: &Arc<Spool>,
     app: &str,
     headers: &HeaderMap,
-    body: &mut Incoming,
+    body: &mut crate::body::RequestBody,
     max_body_size: u64,
     idle: Duration,
 ) -> Result<Option<Received>, Refusal> {

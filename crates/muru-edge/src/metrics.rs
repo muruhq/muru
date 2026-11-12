@@ -105,6 +105,16 @@ pub const FAMILIES: &[Family] = &[
         help: "Time a request spent waiting for a worker (queue), in the application, and in total.",
     },
     Family {
+        name: "muru_request_bytes_total",
+        kind: Kind::Counter,
+        help: "Body bytes received from clients, by application, release and listener; a WebSocket's count when it closes.",
+    },
+    Family {
+        name: "muru_response_bytes_total",
+        kind: Kind::Counter,
+        help: "Body bytes sent to clients, by application, release and listener; a WebSocket's count when it closes.",
+    },
+    Family {
         name: "muru_request_retries_total",
         kind: Kind::Counter,
         help: "Requests sent again to another worker after the first closed its connection before reading them.",
@@ -300,6 +310,21 @@ pub const FAMILIES: &[Family] = &[
         help: "The routing snapshot in force at the edge.",
     },
 ];
+
+/// Section 13.10: each worker's requests completed, as the edge counts
+/// them, for the live figures of `muructl status --processes`. This and
+/// the other `LIVE_` samples are of no family, so the exposition never
+/// writes them; they reach the daemon with the rest.
+pub const LIVE_WORKER_REQUESTS: &str = "live_worker_requests_total";
+
+/// Each worker's total-time histogram, likewise, with `_bucket` samples.
+pub const LIVE_WORKER_DURATION: &str = "live_worker_duration_seconds";
+
+/// Each worker's slots holding a request now.
+pub const LIVE_WORKER_BUSY: &str = "live_worker_busy";
+
+/// Each worker's slots.
+pub const LIVE_WORKER_SLOTS: &str = "live_worker_slots";
 
 /// The histogram buckets in seconds, each with the `le` label it is
 /// written with; the +Inf bucket is implied.
@@ -504,6 +529,12 @@ struct Inner {
     rate_limited: BTreeMap<(String, String, String), u64>,
     /// TLS handshakes by listener and result (section 4.3).
     tls_handshakes: BTreeMap<(String, &'static str), u64>,
+    /// Body bytes received from clients and sent to them, by
+    /// application, release and listener.
+    bytes: BTreeMap<(String, String, String), (u64, u64)>,
+    /// Requests each worker completed and their total times, by group
+    /// and the worker's index (section 13.10).
+    workers: BTreeMap<(DurationKey, usize), (u64, Histogram)>,
     /// Requests handed across in the worker, by group and the interface
     /// they were handed to (section 6.14).
     handoffs: BTreeMap<(DurationKey, &'static str), u64>,
@@ -592,6 +623,25 @@ impl Metrics {
                 .or_default() += 1;
         }
 
+        let bytes = inner
+            .bytes
+            .entry((
+                record.app.clone(),
+                record.release.clone(),
+                record.listener.clone(),
+            ))
+            .or_default();
+        bytes.0 += record.received;
+        bytes.1 += record.bytes;
+
+        if let Some(index) = record.worker
+            && record.websocket.is_none()
+        {
+            let worker = inner.workers.entry((by_group.clone(), index)).or_default();
+            worker.0 += 1;
+            worker.1.observe(record.total);
+        }
+
         let durations = inner.durations.entry(by_group).or_default();
         durations.total.observe(record.total);
 
@@ -632,6 +682,22 @@ impl Metrics {
             })
             .or_insert_with(|| Histogram::with(&LIFETIME_BUCKETS))
             .observe(lifetime);
+    }
+
+    /// Count the bytes a WebSocket received from its client and sent to
+    /// it, when it closes, under the labels of its handshake's record.
+    pub fn count_websocket_bytes(&self, record: &Record, received: u64, sent: u64) {
+        let mut inner = self.inner.lock().expect("metrics poisoned");
+        let bytes = inner
+            .bytes
+            .entry((
+                record.app.clone(),
+                record.release.clone(),
+                record.listener.clone(),
+            ))
+            .or_default();
+        bytes.0 += received;
+        bytes.1 += sent;
     }
 
     /// Count an authentication sub-request (section 4.16) by its result:
@@ -769,6 +835,35 @@ impl Metrics {
                 ],
                 value: *count as f64,
             });
+        }
+
+        for ((app, release, listener), (received, sent)) in &inner.bytes {
+            let labels = [
+                ("app", app.as_str()),
+                ("release", release.as_str()),
+                ("listener", listener.as_str()),
+            ];
+            samples.push(Sample::new(
+                "muru_request_bytes_total",
+                &labels,
+                *received as f64,
+            ));
+            samples.push(Sample::new(
+                "muru_response_bytes_total",
+                &labels,
+                *sent as f64,
+            ));
+        }
+
+        for ((key, index), (count, histogram)) in &inner.workers {
+            let mut labels = key.labels();
+            labels.push(("worker".to_owned(), index.to_string()));
+            samples.push(Sample {
+                name: LIVE_WORKER_REQUESTS.to_owned(),
+                labels: labels.clone(),
+                value: *count as f64,
+            });
+            histogram.samples(LIVE_WORKER_DURATION, &labels, &mut samples);
         }
 
         for ((listener, result), count) in &inner.tls_handshakes {
@@ -995,6 +1090,28 @@ pub fn pool_samples(routing: &Routing) -> Vec<Sample> {
                     .expect("a side is the threads or the loop");
                 entry.1 += slots;
                 entry.2 += busy;
+            }
+
+            // Section 13.10: each worker's slots, named by its place in
+            // the pool, as the access record names it, and by its socket,
+            // as its host does.
+
+            for worker in &workers {
+                let index = worker.index.to_string();
+                let socket = worker.path.display().to_string();
+                let labels = [
+                    ("app", app),
+                    ("release", release),
+                    ("group", group.as_str()),
+                    ("worker", index.as_str()),
+                    ("socket", socket.as_str()),
+                ];
+                samples.push(Sample::new(
+                    LIVE_WORKER_BUSY,
+                    &labels,
+                    worker.in_flight as f64,
+                ));
+                samples.push(Sample::new(LIVE_WORKER_SLOTS, &labels, worker.slots as f64));
             }
 
             for (side, slots, busy) in sides {
@@ -1256,9 +1373,11 @@ mod tests {
             method: "GET".to_owned(),
             target: "/".to_owned(),
             version: "HTTP/1.1".to_owned(),
+            listener: "127.0.0.1:8080".to_owned(),
             status,
             reason: reason.to_owned(),
             bytes: 10,
+            received: 0,
             worker,
             retried: false,
             queue: Duration::from_millis(1),
@@ -1293,6 +1412,28 @@ mod tests {
         assert!(text.starts_with("# HELP muru_requests_total "), "{text}");
         assert!(
             text.contains("# TYPE muru_requests_total counter\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn bytes_are_counted_by_application_release_and_listener() {
+        let metrics = Metrics::default();
+        let posted = Record {
+            received: 300,
+            ..record(200, "", Some(0), 4)
+        };
+        metrics.observe(&posted);
+        metrics.observe(&record(200, "", Some(1), 4));
+        metrics.count_websocket_bytes(&record(101, "", Some(0), 0), 7, 5);
+        let text = render(&metrics.samples());
+        let labels = "{app=\"shop\",release=\"r1\",listener=\"127.0.0.1:8080\"}";
+        assert!(
+            text.contains(&format!("muru_request_bytes_total{labels} 307\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("muru_response_bytes_total{labels} 25\n")),
             "{text}"
         );
     }

@@ -1752,7 +1752,7 @@ pub struct Logging {
 }
 
 /// The `[dashboard]` table (section 10.7): where the daemon serves its
-/// dashboard and JSON gateway, and whether it takes actions.
+/// dashboard and JSON gateway, which show and never change.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Dashboard {
@@ -1760,11 +1760,6 @@ pub struct Dashboard {
     /// 127.0.0.1:8090; not served when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
-    /// Whether a person signed in with `muructl dashboard login` may act from
-    /// the dashboard; read-only when false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    #[schemars(extend("default" = false))]
-    pub actions: bool,
 }
 
 /// The `[overlay_webhook]` table (section 9.10): where the daemon takes

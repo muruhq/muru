@@ -17,16 +17,22 @@ import threading
 import time
 from pathlib import Path
 
+from support import server as support
 from support.daemon import SHOP, Daemon, start_daemon
 
 
-def nothing_left_of(daemon: Daemon) -> bool:
-    """Whether no process of the daemon's run directory remains."""
+def nothing_left_of(daemon: Daemon, ours: set[int]) -> bool:
+    """Whether no process of the daemon's run directory remains: none that
+    names it on its command line, and none of `ours`, the edge, hosts and
+    relays its records named before it stopped, which carry titles in
+    place of their command lines."""
 
     listing = subprocess.run(
         ["ps", "-ax", "-o", "command="], capture_output=True, text=True, check=False
     ).stdout
-    return not any(daemon.run_dir.name in line for line in listing.splitlines())
+    named = any(daemon.run_dir.name in line for line in listing.splitlines())
+    assert ours, "the daemon's records named none of its processes"
+    return not named and not support.still_running(ours)
 
 
 def request_in_the_background(daemon: Daemon, path: str) -> tuple[threading.Thread, list[str]]:
@@ -83,6 +89,7 @@ def test_sigterm_shuts_down_under_the_table_and_a_request_in_flight_finishes(
 
     try:
         daemon.deploy("shop", SHOP, "--processes", "1")
+        ours = support.recorded_pids(daemon.run_dir)
         thread, outcome = request_in_the_background(daemon, "/slow?ms=2000")
         time.sleep(0.5)
 
@@ -97,7 +104,7 @@ def test_sigterm_shuts_down_under_the_table_and_a_request_in_flight_finishes(
         assert elapsed < 10, elapsed
         assert "SIGTERM: shutting down" in daemon.log()
         assert "stopped in" in daemon.log()
-        assert nothing_left_of(daemon)
+        assert nothing_left_of(daemon, ours)
     finally:
         if daemon.process.poll() is None:
             daemon.stop()
@@ -111,6 +118,7 @@ def test_the_delay_closes_connections_while_the_edge_still_accepts(tmp_path: Pat
 
     try:
         daemon.deploy("shop", SHOP, "--processes", "1")
+        ours = support.recorded_pids(daemon.run_dir)
 
         # A keep-alive connection, served as usual before the signal.
 
@@ -141,7 +149,7 @@ def test_the_delay_closes_connections_while_the_edge_still_accepts(tmp_path: Pat
 
         assert daemon.get("/").status == 200
         assert daemon.process.wait(timeout=30) == 0
-        assert nothing_left_of(daemon)
+        assert nothing_left_of(daemon, ours)
     finally:
         connection.close()
 
@@ -156,6 +164,7 @@ def test_what_outruns_the_budget_is_killed(tmp_path: Path) -> None:
 
     try:
         daemon.deploy("shop", SHOP, "--processes", "1")
+        ours = support.recorded_pids(daemon.run_dir)
         thread, outcome = request_in_the_background(daemon, "/slow?ms=30000")
         time.sleep(0.5)
 
@@ -172,7 +181,7 @@ def test_what_outruns_the_budget_is_killed(tmp_path: Path) -> None:
         thread.join(timeout=10)
         assert outcome and outcome != ["status 200"], outcome
         assert "still in flight" in daemon.log()
-        assert nothing_left_of(daemon)
+        assert nothing_left_of(daemon, ours)
     finally:
         if daemon.process.poll() is None:
             daemon.stop()
@@ -183,6 +192,7 @@ def test_daemon_stop_shutdown_runs_the_same_sequence(tmp_path: Path) -> None:
 
     try:
         daemon.deploy("shop", SHOP, "--processes", "1")
+        ours = support.recorded_pids(daemon.run_dir)
         thread, outcome = request_in_the_background(daemon, "/slow?ms=2000")
         time.sleep(0.5)
         started = time.monotonic()
@@ -193,7 +203,7 @@ def test_daemon_stop_shutdown_runs_the_same_sequence(tmp_path: Path) -> None:
         assert outcome == ["status 200"]
         assert 1 < elapsed < 10, elapsed
         assert "stopped in" in daemon.log()
-        assert nothing_left_of(daemon)
+        assert nothing_left_of(daemon, ours)
     finally:
         if daemon.process.poll() is None:
             daemon.stop()
@@ -204,6 +214,7 @@ def test_reload_applies_the_shutdown_table(tmp_path: Path) -> None:
 
     try:
         daemon.deploy("shop", SHOP, "--processes", "1")
+        ours = support.recorded_pids(daemon.run_dir)
         config = tmp_path / "muru.toml"
         config.write_text(
             config.read_text().replace(
@@ -220,7 +231,7 @@ def test_reload_applies_the_shutdown_table(tmp_path: Path) -> None:
         daemon.process.send_signal(signal.SIGTERM)
         assert daemon.process.wait(timeout=30) == 0
         assert "SIGTERM: shutting down" in daemon.log()
-        assert nothing_left_of(daemon)
+        assert nothing_left_of(daemon, ours)
     finally:
         if daemon.process.poll() is None:
             daemon.stop()

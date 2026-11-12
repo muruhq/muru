@@ -206,6 +206,214 @@ pub struct RunState {
     pub events: Arc<RunEvents>,
     /// The settings in force, each with where it came from.
     pub settings: Arc<crate::print_config::Settings>,
+    /// What `muructl status --processes` lists (section 13.10).
+    pub processes: Arc<RunProcesses>,
+}
+
+/// What `muructl status --processes` lists of a development run or a
+/// `muructl serve` (section 13.10): the process itself, controller and
+/// edge in one, its host and log relay, and the workers as the host
+/// announced them, with the live figures sampled every second.
+pub struct RunProcesses {
+    /// run or serve.
+    pub mode: &'static str,
+    /// The application, as the run's log names it.
+    pub app: String,
+    /// The entrypoint, which the host's row names.
+    pub entrypoint: String,
+    /// The worker groups, the default first.
+    pub groups: Vec<String>,
+    /// The addresses the edge serves.
+    pub listeners: Vec<SocketAddr>,
+    /// When the run started, Unix milliseconds.
+    pub started_unix_ms: u64,
+    /// The release that serves, by number.
+    pub release: Arc<AtomicU32>,
+    /// The live figures.
+    pub live: muru_controller::processes::Live,
+    /// Each process's CPU time when last read.
+    pub cpu: Arc<muru_controller::processes::CpuMeter>,
+    seen: Mutex<Seen>,
+}
+
+/// What the run's loop last saw of its host.
+#[derive(Debug, Default)]
+struct Seen {
+    host: Option<u32>,
+    relay: Option<u32>,
+    workers: Vec<muru_controller::host::HostWorker>,
+    status: Vec<muru_controller::host::WorkerStatus>,
+}
+
+impl RunProcesses {
+    /// What the run lists, before its host has announced any worker.
+    pub fn new(
+        mode: &'static str,
+        app: String,
+        entrypoint: String,
+        groups: Vec<String>,
+        listeners: Vec<SocketAddr>,
+        release: Arc<AtomicU32>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            mode,
+            app,
+            entrypoint,
+            groups,
+            listeners,
+            started_unix_ms: muru_controller::model::now_unix_ms(),
+            release,
+            live: muru_controller::processes::Live::default(),
+            cpu: Arc::default(),
+            seen: Mutex::default(),
+        })
+    }
+
+    /// The serving host's pid and its relay's, as they are now; a new
+    /// host has announced no workers yet.
+    pub fn host(&self, host: Option<u32>, relay: Option<u32>) {
+        let mut seen = self.seen.lock().expect("run processes poisoned");
+
+        if seen.host != host {
+            seen.workers.clear();
+            seen.status.clear();
+        }
+
+        seen.host = host;
+        seen.relay = relay;
+    }
+
+    /// The workers the host announced.
+    pub fn workers(&self, workers: Vec<muru_controller::host::HostWorker>) {
+        self.seen.lock().expect("run processes poisoned").workers = workers;
+    }
+
+    /// What the workers last reported.
+    pub fn status(&self, status: Vec<muru_controller::host::WorkerStatus>) {
+        self.seen.lock().expect("run processes poisoned").status = status;
+    }
+
+    /// Take one second's reading of the live figures, from the edge's
+    /// samples and the workers' last reports.
+    pub fn observe(&self, samples: &[muru_edge::metrics::Sample]) {
+        let release = format!("r{}", self.release.load(Ordering::Relaxed));
+        let status = self
+            .seen
+            .lock()
+            .expect("run processes poisoned")
+            .status
+            .clone();
+        self.live
+            .observe(samples, &[(self.app.clone(), release, status)]);
+    }
+
+    /// The processes the run supervises, the run first.
+    fn known(&self) -> Vec<muru_controller::processes::Known> {
+        use muru_controller::processes::{Known, worker_phrase};
+
+        let me = std::process::id();
+        let seen = self.seen.lock().expect("run processes poisoned");
+        let release = format!("r{}", self.release.load(Ordering::Relaxed));
+        let listening: Vec<(SocketAddr, bool)> = self
+            .listeners
+            .iter()
+            .map(|address| (*address, false))
+            .collect();
+
+        let mut known = vec![Known {
+            pid: me,
+            role: self.mode,
+            what: format!("controller and edge, {}", ports(&listening)),
+            ..Known::default()
+        }];
+
+        if let Some(host) = seen.host {
+            known.push(Known {
+                pid: host,
+                parent: me,
+                role: "host",
+                what: format!("{} ({release})", self.entrypoint),
+                app: self.app.clone(),
+                release: release.clone(),
+                groups: self.groups.clone(),
+                ..Known::default()
+            });
+
+            for worker in &seen.workers {
+                known.push(Known {
+                    pid: worker.pid,
+                    parent: host,
+                    role: "worker",
+                    what: worker_phrase(
+                        &worker.group,
+                        worker.index,
+                        &worker.state,
+                        self.groups.len() > 1,
+                    ),
+                    app: self.app.clone(),
+                    release: release.clone(),
+                    group: worker.group.clone(),
+                    index: Some(worker.index),
+                    socket: Some(worker.socket.clone()),
+                    ..Known::default()
+                });
+            }
+        }
+
+        if let (Some(relay), Some(host)) = (seen.relay, seen.host) {
+            known.push(Known {
+                pid: relay,
+                parent: host,
+                spawned_by: me,
+                role: "relay",
+                what: "output to muructl".to_owned(),
+                app: self.app.clone(),
+                release: release.clone(),
+                ..Known::default()
+            });
+        }
+
+        for command in muru_controller::commands::running() {
+            known.push(Known {
+                pid: command.pid,
+                parent: me,
+                role: "command",
+                what: format!("{}@{} {}", command.app, command.release, command.label),
+                app: command.app,
+                release: command.release,
+                ..Known::default()
+            });
+        }
+
+        known
+    }
+
+    /// The answer to ListProcesses, which the dashboard shows as well.
+    pub async fn snapshot(&self, request: pb::ListProcessesRequest) -> pb::Processes {
+        let header = muru_controller::processes::Header {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            mode: self.mode.to_owned(),
+            started_unix_ms: self.started_unix_ms,
+        };
+
+        muru_controller::processes::snapshot(
+            self.known(),
+            request,
+            header,
+            Arc::clone(&self.cpu),
+            &self.live,
+        )
+        .await
+    }
+}
+
+/// The ports listened on, as `:8080, :8443`.
+fn ports(listeners: &[(SocketAddr, bool)]) -> String {
+    listeners
+        .iter()
+        .map(|(address, _)| format!(":{}", address.port()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What the run serves the application with, which a command of the
@@ -515,6 +723,10 @@ pub struct RunInfo {
     pub app: String,
     /// The project directory.
     pub project: PathBuf,
+    /// The directory `muructl run` was started from, which reaches the
+    /// run as its project directory does.
+    #[serde(default)]
+    pub started_from: Option<PathBuf>,
     /// The address the application is served on.
     pub listen: String,
     /// The admin socket.
@@ -567,6 +779,9 @@ impl Registration {
             pid: std::process::id(),
             app: app.to_owned(),
             project: project.to_path_buf(),
+            started_from: std::env::current_dir()
+                .and_then(|directory| directory.canonicalize())
+                .ok(),
             listen: listen.to_string(),
             socket: socket.clone(),
             runtime: library.map(Path::to_path_buf).into_iter().collect(),
@@ -617,6 +832,7 @@ impl Registration {
             pid: std::process::id(),
             app: app.to_owned(),
             project: project.to_path_buf(),
+            started_from: None,
             listen: listen.to_string(),
             socket: socket.to_path_buf(),
             runtime: Vec::new(),
@@ -829,6 +1045,15 @@ impl Admin for Service {
     type WatchEventsStream = EventStream;
     type TailLogsStream = LogStream;
     type RunCommandStream = CommandStream;
+
+    async fn list_processes(
+        &self,
+        request: Request<pb::ListProcessesRequest>,
+    ) -> Result<Response<pb::Processes>, Status> {
+        Ok(Response::new(
+            self.state.processes.snapshot(request.into_inner()).await,
+        ))
+    }
 
     async fn get_status(
         &self,

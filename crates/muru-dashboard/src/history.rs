@@ -118,7 +118,7 @@ impl Sampler {
 
 /// A quantile from cumulative histogram buckets, interpolated within the
 /// bucket it falls in, as Prometheus does; zero with no observations.
-fn quantile(buckets: &[(f64, f64)], q: f64) -> f64 {
+pub fn quantile(buckets: &[(f64, f64)], q: f64) -> f64 {
     let total = buckets.last().map_or(0.0, |(_, count)| *count);
 
     if total <= 0.0 {

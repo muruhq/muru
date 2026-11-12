@@ -1,0 +1,11 @@
+<h2>Processes</h2>
+{% if rows.is_empty() %}
+<p class="muted">{% if error.is_empty() %}No processes to show.{% else %}{{ error }}{% endif %}</p>
+{% else %}
+<table class="processes">
+  <tr><th class="num">PID</th><th>Role</th><th>What</th>{% if with_user %}<th>User</th>{% endif %}<th class="num">Up</th><th class="num">CPU</th><th class="num">RSS</th><th class="num">Req/s</th><th class="num">Busy</th><th class="num">Queue</th><th class="num">p95</th><th class="num">GIL wait / loop lag</th></tr>
+  {% for row in rows %}
+  <tr><td class="num">{{ row.pid }}</td><td class="tree">{{ row.tree }}{{ row.role }}</td><td>{% if let Some(link) = row.link %}<a href="{{ link }}">{{ row.what }}</a>{% else %}{{ row.what }}{% endif %}{% if !row.note.is_empty() %} <span class="muted">({{ row.note }})</span>{% endif %}</td>{% if with_user %}<td>{{ row.user }}</td>{% endif %}<td class="num">{{ row.up }}</td><td class="num">{{ row.cpu }}</td><td class="num">{{ row.rss }}</td><td class="num">{{ row.rate }}</td><td class="num">{{ row.busy }}</td><td class="num">{{ row.queue }}</td><td class="num">{{ row.p95 }}</td><td class="num">{{ row.wait }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}

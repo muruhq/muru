@@ -20,7 +20,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | `[[edge.pool]]`, `[[listener]]` | daemon file | listeners, protocols, processes, threads |
 | `[proxy]` | daemon or listener | trusted proxies and header types |
 | `[metrics]` | daemon file | the internal address `/metrics` is served on (`listen`), none by default |
-| `[dashboard]` | daemon file | the loopback address the dashboard and JSON gateway are served on (`listen`), none by default, and whether signed-in sessions may act (`actions`, false) |
+| `[dashboard]` | daemon file | the loopback address the dashboard and JSON gateway are served on (`listen`), none by default |
 | `[overlay_webhook]` | daemon file | the address of the overlays' signed webhook (`listen`) and its key (`secret` or `secret_file`), none by default |
 | `[limits]` | global, host, route, mount, group | request limits and timeouts |
 | `[logging.access]`, `[logging.apps]`, `[logging.python]` | global, application, release | sinks, formats, rotation, Python defaults |
@@ -145,6 +145,6 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable, output.dropping, output.held, output.failing, output.caught_up, output.relay_restarting |
 | Overlays | overlay.activated, overlay.ended, overlay.skipped, overlay.would_activate, overlay.warming, overlay.promoted |
 | Clients | ratelimit.enforcing, client_class.list_reloaded |
-| Dashboard | dashboard.login_issued, dashboard.action |
+| Dashboard | dashboard.login_issued |
 | Commands | command.started, command.finished, command.failed |
 | Debugging | request.soft_timeout, request.past_deadline, debug.profile, debug.trace, debug.memory, debug.exec, debug.bundle, debug.breakpoint, debug.breakpoint_expired, debug.attached, debug.detached |

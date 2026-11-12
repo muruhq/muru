@@ -86,3 +86,9 @@ another machine is an SSH tunnel or a proxy of the operator's own.
 
 Section 10.7 of the design specification; ADR 0026 on the users
 applications run as.
+
+The actions, the `--actions` session and the `[dashboard] actions`
+switch are superseded by [ADR 0060](0060-the-dashboard-shows-and-never-changes.md):
+the dashboard shows and never changes, in every mode. The session for
+every page, the bearer token, the relative addresses and the login
+links stand.

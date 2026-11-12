@@ -80,7 +80,24 @@ forks a replacement.
 | Edge | Listeners, TLS, HTTP, routing, load balancing, queues and limits, static files, compression, access logs | Run Python, hold state that cannot be rebuilt from routing |
 | Host | Importing the application once, forking workers, replacing workers that die | Serve requests |
 | Worker | Running the application, the WSGI and ASGI bridges, per-request threads or the event loop | Talk to clients, manage other workers |
+| Log relay | Writing a release's host and worker output to its log, beside the host | Run Python, serve requests |
 | Daemon | Releases, scaling, supervision, the admin API and dashboard | Carry traffic |
+
+`muructl status --processes` shows them as a tree. Under a development
+run, whose one process is the controller and the edge, it looks like
+this:
+
+```console
+$ muructl status --processes
+edge  0.5 req/s  0 err/s  p50 3.1 ms  p95 9.4 ms  in flight 0  ws 0  conns 1  tls 0/s  in 0B/s  out 118B/s
+
+PID    ROLE          WHAT                          UP    CPU    RSS      REQ/S   BUSY   QUEUE   P95     GIL/LAG
+4100   run           controller and edge, :8080    12m   1.1%   24.0MB
+4105   └─ host       app:application (r1)          12m   0.0%   71.0MB   0.5     0/8    0       9.4 ms
+4106      ├─ relay   output to muructl             12m   0.0%   7.0MB
+4107      ├─ worker  worker 0                      12m   3.0%   96.0MB   0.3     0/4            9.4 ms
+4108      └─ worker  worker 1                      12m   2.8%   95.0MB   0.2     0/4            8.8 ms
+```
 
 A release is an immutable combination of application code, Python version
 and settings. Several can run side by side, each with its own host and
