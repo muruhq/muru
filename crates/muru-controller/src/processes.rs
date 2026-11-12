@@ -540,6 +540,24 @@ pub async fn snapshot(
     }
 }
 
+/// The tree `snapshot` answers with, from known processes and readings
+/// given rather than taken: what the operating system says of each, its
+/// CPU and the live figures. The guides' examples are built with it.
+pub fn tree_from(
+    known: &[Known],
+    os: &HashMap<u32, OsProcess>,
+    cpu: &HashMap<u32, f64>,
+    figures: &Figures,
+) -> Option<pb::Process> {
+    let others = Others {
+        table: &[],
+        left_out: &HashSet::new(),
+        narrow: false,
+    };
+
+    tree(known, os, cpu, &others, figures)
+}
+
 /// The known processes the request keeps: with an application named, the
 /// root and that application's processes, of the release named if one
 /// is.
