@@ -31,6 +31,7 @@ spec:
             - {name: MURU_SERVE_SHUTDOWN_BUDGET, value: "25s"}
             - {name: MURU_SERVE_TRUSTED_PROXY, value: "private"}
             - {name: MURU_SERVE_LOG_FORMAT, value: "json"}
+            - {name: MURU_SERVE_PROCESSES, value: "2"}
             - name: POD_NAME
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - name: POD_NAMESPACE
@@ -54,8 +55,8 @@ spec:
             requests: {cpu: "1", memory: 512Mi}
             limits: {cpu: "2", memory: 1Gi}
           resizePolicy:
-            - {resourceName: cpu, restartPolicy: RestartContainer}
-            - {resourceName: memory, restartPolicy: RestartContainer}
+            - {resourceName: cpu, restartPolicy: NotRequired}
+            - {resourceName: memory, restartPolicy: NotRequired}
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
@@ -102,7 +103,7 @@ The pieces, in turn:
   for the edge. A rolling update loses no
   requests and needs no `preStop` hook; [stopping](containers.md#stopping)
   covers the sequence.
-- **Restarts in place.** A container restarted in place, by a resize, a
+- **Restarts in place.** A container restarted in place, by a
   failed liveness probe or anything else, keeps its pod, so its endpoint
   is not marked terminating and leaves the Service only once the
   readiness probe has failed `failureThreshold` times. Keep
@@ -124,13 +125,15 @@ The pieces, in turn:
   that. A volume with `medium: Memory` would count those bodies against
   the container's memory limit. `runAsNonRoot` needs the image's `USER`
   to be a number, as in the [image](containers.md#an-image).
-- **Resources.** The worker count is the CPU limit rounded up, 2 here,
-  and each worker's hard memory limit is worked out from the memory
-  limit, so a worker that grows is replaced before the kernel kills one.
-  [Sizing from the container's
-  limits](containers.md#sizing-from-the-containers-limits) shows the
-  arithmetic and the lines that report it. The `resizePolicy` restarts
-  the container when its limits change; [resizing](#resizing) says why.
+- **Resources.** `MURU_SERVE_PROCESSES` sets two workers, one for each
+  CPU of the limit; nothing is worked out from the limits. With the
+  memory limit, the memory guard replaces the largest worker when the
+  container runs short, before the kernel kills one, and the start lines
+  warn when two workers that each come to copy what the host holds would
+  not fit. [Container limits](containers.md#container-limits) shows where
+  the memory goes and the lines that report it. The `resizePolicy` lets
+  the limits change without a restart; [resizing](#resizing) says what
+  that changes.
 - **Logs.** With `MURU_SERVE_LOG_FORMAT=json` every line on standard
   output is one JSON record, a traceback included, carrying the pod, its
   namespace and its node from the Downward API variables, which is what a
@@ -139,32 +142,31 @@ The pieces, in turn:
 
 ## Resizing
 
-`muructl serve` reads its limits when it starts. Kubernetes can change a
-running container's CPU and memory in place, through `kubectl patch
---subresource resize` or a VerticalPodAutoscaler in its
-`InPlaceOrRecreate` mode. A container that keeps running after such a
-change goes on with the worker count and the hard limits of its old
-limits:
+Kubernetes can change a running container's CPU and memory in place,
+through `kubectl patch --subresource resize` or a VerticalPodAutoscaler
+in its `InPlaceOrRecreate` mode. With `restartPolicy: NotRequired` for
+both, the container keeps running, and `muructl serve` reads its limits
+when it uses them, so a resize applies at the next memory check:
 
-- with more CPU, the extra goes mostly unused;
-- with more memory, workers are still replaced at the old share, so
-  their use never shows the autoscaler that more would be taken;
-- with less memory, the hard limits are above what the container now
-  has, and the kernel may kill a worker before Muru replaces it.
+- **More memory** gives the workers more room at once, and the memory
+  guard works from the new limit.
+- **Less memory** is safe while the workers fit under it. Kubernetes
+  holds a decrease below what the container uses until its use drops.
+- **More or fewer CPUs** change the time the same workers get.
 
-`restartPolicy: RestartContainer` in the `resizePolicy` has the kubelet
-restart the container when the limit changes. The restart is an ordinary
-stop: readiness fails, the requests in flight finish, and the new
-container sizes itself from the new limits. With the readiness probe
-above no request is lost, as described under
-[restarts in place](#the-deployment). The pod stays where it is,
-on the same node with the same address.
+muructl logs each change, with the old and the new value, and gives its
+start warnings again against the new limits, so a decrease that leaves
+the workers too little room says so. `muructl status` in the pod shows
+the limits as they are now.
+
+The worker count and a worker's `hard_limit` are configuration, not
+limits, so a resize does not change them. Changing either is a change to
+the Deployment, which rolls out new pods.
 
 A VerticalPodAutoscaler in its `Recreate` mode evicts the pod and
-creates another with the new resources, which sizes itself as any new
-pod does. A HorizontalPodAutoscaler on `muru_capacity_utilisation`, below,
-and a VerticalPodAutoscaler on CPU and memory can run together, since
-they act on different figures.
+creates another with the new resources. A HorizontalPodAutoscaler on
+`muru_capacity_utilisation`, below, and a VerticalPodAutoscaler on CPU
+and memory can run together, since they act on different figures.
 
 ## Autoscaling
 

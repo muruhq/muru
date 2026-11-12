@@ -280,7 +280,7 @@ setting over it.
 | `--admin-listen ADDRESS` | `0.0.0.0:9090` | where the probes and metrics are served, or `off` |
 | `--admin-status` | off | serve `/status` on the admin port too |
 | `--min-ready N` | 1 | the workers ready in each required [group](#worker-groups-and-mounts) for `/readyz` to pass |
-| `--processes N` | `auto`, from the container's CPU limit | worker processes; see [sizing](#sizing-from-the-containers-limits) |
+| `--processes N` | 1 | worker processes in the default group; see [container limits](#container-limits) |
 | `--threads N` | 4 | threads per WSGI worker |
 | `--python PATH` | as above | the interpreter |
 | `--access-log WHAT` | `on` | `on`, `errors` (4xx and 5xx responses and requests slower than `--slow`) or `off` |
@@ -308,52 +308,231 @@ entrypoint's top-level module with underscores as hyphens. `--name`, or
 [metrics](metrics.md) and the `app` field of the logs use it, and
 `muructl run` names an application the same way.
 
-## Sizing from the container's limits
+## Container limits
 
-On Linux, `muructl serve` reads the container's CPU and memory limits at
-start, so a container limited to 2 CPUs on a 64-core node starts 2
-workers, not 64.
+On Linux with cgroup v2, `muructl serve` reads the container's limits
+from its own cgroup: the CPU quota in `cpu.max`, the CPUs it may run on
+in `cpuset.cpus.effective`, and the memory limit in `memory.max`. They
+size nothing. The worker count is `--processes`, 1 unless it is set, and
+each [group's](#worker-groups-and-mounts) own, and a worker has a hard
+memory limit only when one is set with `--memory hard_limit=...`. The
+limits are used to:
 
-- **Workers.** `--processes auto`, the default, is the CPU limit rounded
-  up: `--cpus 1.5` under Docker, or `resources.limits.cpu: 1500m` in
-  Kubernetes, gives 2. With no CPU limit it is the number of CPUs the
-  container may run on.
-- **Memory.** With a memory limit, each worker gets a hard limit unless
-  one is set with `--memory hard_limit=...`. Ten percent of the limit
-  (at least 128 MiB) is left for muructl and the page cache, and so is
-  what the application holds in memory after it is imported. The rest is
-  divided between the workers. A worker that grows past its share is
-  replaced as the [memory policy](memory.md) replaces one, with no request
-  lost, at the next memory check, every `check_interval` (5 seconds by
-  default). The headroom is what a worker may grow by between checks: in
-  a 1GB container with two workers, about 13MB a second each. A workload
-  that grows faster than that can reach the limit first, so it sets a
-  shorter interval with `--memory check_interval=1s`.
-- **Replacing a worker near the limit.** A worker replaced for memory
-  normally stays until its replacement is ready. When less is left under
-  the container's limit than one worker's hard limit, it leaves routing
-  and stops first, and its replacement is forked once it has gone. The
-  requests it holds finish, and for that moment the container has one
-  worker fewer. With a single worker, requests wait for the replacement
-  up to the [queue timeout](timeouts.md).
-- **Out-of-memory kills.** A worker the kernel kills anyway is reported
-  as a `worker.oom_killed` event and counted once in
-  `muru_worker_exits_total` with the reason `oom_killed`, whatever it was
-  doing, including being replaced, and the host starts another.
+- warn at start when the configuration does not fit them;
+- replace the largest worker when the container runs short of memory,
+  with the memory guard below;
+- decide whether a worker replaced for memory stops before its
+  replacement starts;
+- report a worker the kernel killed for memory;
+- show what is used and what is left, in `muructl status` and `/status`.
 
-The lines at start say what was worked out and from what, here under
-`docker run --cpus 2 --memory 1g`:
+On macOS, and in a container with no limits, there is nothing to read,
+and none of this applies.
+
+### Where the memory goes
+
+Everything in the container counts against `memory.max`:
 
 ```
-muru: 2 processes from cpu.max 200000 100000
-muru: memory budget 896MB (memory.max 1.0GB less 128MB)
-muru.host[11]: worker hard limit 432MB: the memory budget of 896MB less 32MB the host holds, over 2 workers
+memory.max
+├── headroom: 10% of the limit, at least 128MB, for muructl, the edge and the page cache
+├── the host: the interpreter and the application it imported, counted once
+├── each worker's own memory
+└── files on memory-backed mounts: spooled request bodies, and /tmp on a tmpfs
 ```
 
-The limits are read once at start, so a change to them (an in-place pod
-resize) takes effect when the container restarts. On macOS, and in a
-container with no limits, the worker count is the number of CPUs and no
-memory limit is derived.
+Each worker is forked from the host once the application has been
+imported, so at first it shares all of the host's memory and adds only
+what it allocates itself. A worker's memory is measured as its unique
+set size (`uss`, the [memory policy's](memory.md#what-is-measured)
+default), which counts only its own pages, so what the host holds is
+counted once, under the host.
+
+The sharing wears away as the worker runs. CPython keeps a reference
+count in every object and writes to it whenever the object is used, and
+the first write to a shared page gives the worker its own copy of that
+page. Over hours a worker's own memory climbs towards the size of what
+the host holds, even if the application never changes that memory.
+Muru calls `gc.freeze()` before each fork, which stops the garbage
+collector's writes, but not the reference counts'. So plan for each
+worker to end up holding a copy of the host's memory, as well as what it
+allocates itself.
+
+### The memory guard
+
+At every memory check, every `check_interval` (5 seconds by default),
+muructl reads what is left under `memory.max`, counting inactive file
+pages as free, since the kernel reclaims those first. When less than the
+headroom is left, it replaces the largest worker, by the memory policy's
+`measure`, through the usual drain, so no request is lost:
+
+- **One worker at a time.** The next worker is chosen once the one being
+  replaced has gone and its replacement is ready.
+- **Only when it helps.** When the workers' own memory, added up, is less
+  than the shortfall, or a replacement leaves no more room than there was
+  before it, replacing workers cannot bring the container back. muructl
+  logs a warning that says what holds the memory, the host or the memory
+  outside the workers and the host (muructl, the edge, the page cache and
+  files on memory-backed mounts), and replaces no more workers. It warns
+  again only after the container has been back above the headroom.
+- **Reported.** A worker the guard replaces is a `worker.recycled` event
+  that says the container was short of memory, counted in
+  `muru_worker_recycles_total` with the reason `container_memory`, apart
+  from a worker over its own limit, whose reason is `memory`.
+
+The headroom is also how far the workers may grow, together, between
+two checks before the kernel acts. A workload that grows faster than
+that sets a shorter interval with `--memory check_interval=1s`.
+
+### With a hard limit
+
+A `hard_limit` is the user's own limit on one worker, set with `--memory
+hard_limit=...` or in a group's `memory` table, and it is checked as the
+[memory policy](memory.md) describes. Both apply: the hard limit to a
+worker that grows too large on its own, and the guard to workers that
+together use more than the container has.
+
+| Container memory limit | `hard_limit` | A worker is replaced for its size |
+| --- | --- | --- |
+| none | not set | only by the soft limit, when one is set |
+| none | set | by its hard limit |
+| `memory.max` | not set | by the guard, when the container is short of memory |
+| `memory.max` | set | by its hard limit, or by the guard when the workers together leave the container short |
+
+A soft limit applies in every case when it is set. With a `memory.max`,
+the kernel's out-of-memory killer remains the last resort.
+
+### Replacing a worker near the limit
+
+A worker replaced for memory, by the guard or by its own limits,
+normally stays until its replacement is ready. When less is left under
+`memory.max` than the worker's current size, by the policy's measure, it
+leaves routing and stops first, and its replacement is forked once it
+has gone. The requests it holds finish, and for that moment the
+container has one worker fewer. With a single worker, requests wait for
+the replacement up to the [queue timeout](timeouts.md).
+
+A worker the kernel kills anyway is reported as a `worker.oom_killed`
+event and counted once in `muru_worker_exits_total` with the reason
+`oom_killed`, whatever it was doing, including being replaced, and the
+host starts another.
+
+### An example
+
+A container with 2 CPUs and 1GB of memory runs two workers of an
+application that holds 250MB once it has been imported:
+
+```
+docker run --cpus 2 --memory 1g -e MURU_SERVE_PROCESSES=2 registry.example.com/shop
+```
+
+It starts with these lines:
+
+```
+muru: container limits: 2 CPUs from cpu.max 200000 100000, memory.max 1.0GB with 128MB of headroom
+muru: the host holds 250MB once the application is imported
+```
+
+The guard acts once more than 896MB is used, the limit less the
+headroom. Just after start the container uses about 320MB: the host's
+250MB, about 15MB of each worker's own, and about 40MB for muructl and
+the edge. Over the following hours the workers' copies grow. When
+worker 0 has 330MB of its own and worker 1 has 280MB, the container uses
+900MB, so 124MB is left, less than the headroom. The guard replaces
+worker 0, the larger, and its event says:
+
+```
+worker.recycled  worker 0 (pid 52) is replaced: the container is short of memory, 124MB left under memory.max 1.0GB, less than the headroom of 128MB; it is the largest worker, uss 330MB
+```
+
+Since 124MB is less than worker 0's 330MB, worker 0 stops first, while
+worker 1 serves, and its replacement starts at about 15MB, which leaves
+about 440MB.
+
+The same application with three workers would start with a warning,
+since three full copies of the host's 250MB, with the host and the
+headroom, come to more than 1GB:
+
+```
+muru: warning: the host holds 250MB, and 3 workers that each come to copy it need 1.1GB with the headroom, more than memory.max 1.0GB; 2 workers fit; see https://docs.muruhq.dev/en/latest/howto/containers.html#container-limits
+```
+
+The workers start, but as their copies grow the guard, or a hard limit,
+keeps replacing them. An application that holds a lot once imported
+runs fewer workers, with more threads in each, since a worker's threads
+share one copy, or is given more memory.
+
+### Warnings at start
+
+Each of these is a warning, with a link to this section. muructl starts
+as configured.
+
+- **Workers over the CPUs.** When the workers configured, across every
+  group, are more than the CPU quota rounded up: `muru: warning: 6
+  workers over 3 groups is more than the 2 CPUs cpu.max allows`.
+- **A preload that would not fit when copied.** When what the host holds
+  once the application is imported, times the workers plus one, plus the
+  headroom, is more than `memory.max`, as in the example above. The
+  warning says how many workers would fit.
+- **Hard limits over the limit.** When a group's `hard_limit`, times its
+  workers, added up over the groups, is more than `memory.max`.
+- **Request bodies in memory.** When the run directory is on a
+  memory-backed filesystem, as below.
+
+### Request bodies and /tmp in memory
+
+Request bodies too large to hold in memory are spooled to files under
+the run directory, up to `--spool-quota`. When the run directory is a
+tmpfs, as in the [Compose example](#compose), or an `emptyDir` with
+`medium: Memory` in Kubernetes, those files count against `memory.max`.
+With a memory limit, muructl finds this at start, and then:
+
+- the spool's quota is the headroom, rather than 1GB, unless
+  `--spool-quota` is set, and the start line says so;
+- a `--spool-quota` larger than the headroom is kept, with a warning.
+
+Files an application writes to a memory-backed `/tmp` count against the
+limit in the same way. When it is memory outside the workers that
+leaves the container short, the guard's warning says so rather than
+replacing workers.
+
+### Changing the limits while it runs
+
+The limits are read when they are used, so a change made while the
+container runs, by `docker update` or a Kubernetes in-place resize,
+applies at the next memory check:
+
+- the guard works from the new limit, and its headroom from it;
+- muructl logs the old and the new value, and gives the warnings above
+  again against the new limits;
+- a spool quota taken from the headroom follows the new headroom;
+- `muructl status` and `/status` show the limits as they are now.
+
+Raising the memory gives the container more room at once. Lowering it
+is safe while the workers fit, and Kubernetes holds a decrease below
+what the container uses until its use drops. A change to the CPUs
+changes the time the same workers get. The worker count and a
+`hard_limit` are configuration, so changing either is a restart of the
+container, in Kubernetes a rollout of the Deployment.
+
+### What can be seen
+
+`muructl status` inside the container shows the limits as they are now,
+what is used and left, and what the guard is doing:
+
+```
+$ docker exec shop muructl status
+...
+cpu      2 CPUs from cpu.max 200000 100000
+memory   memory.max 1.0GB, 586MB used, 438MB left, headroom 128MB
+         workers 296MB, host 250MB
+guard    watching; it last replaced worker 0 (pid 52) at 07:40:12 UTC
+```
+
+The guard is `watching`, `replacing` a worker, or `holding` when
+replacing workers would not help. `/status`, with `--admin-status`,
+gives the same as its `limits` field, and so do `muructl status --json`
+and `muructl debug bundle`.
 
 ## Worker groups and mounts
 
@@ -373,9 +552,7 @@ mounts = ["reports"]
 processes = 1
 ```
 
-`--processes`, or the count worked out from the [container's
-limits](#sizing-from-the-containers-limits), sizes the default group. A
-named group's own `processes`, `threads`, `sync_threads` and
+`--processes` sizes the default group. A named group's own `processes`, `threads`, `sync_threads` and
 `concurrency` size its workers, and a group that leaves one out takes
 the release's.
 
@@ -636,7 +813,9 @@ services:
 ```
 
 The root filesystem is read-only, with the run directory and `/tmp` as
-memory-backed mounts. The health check asks `muructl probe ready` inside
+memory-backed mounts. Files in them count against the container's memory
+limit when it has one, as [request bodies and /tmp in
+memory](#request-bodies-and-tmp-in-memory) describes. The health check asks `muructl probe ready` inside
 the container, so `docker compose ps` shows the service healthy once its
 workers are ready. `docker compose exec shop muructl status` and the
 other commands of [inside the container](#inside-the-container) work as
