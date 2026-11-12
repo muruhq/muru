@@ -9559,6 +9559,13 @@ impl Daemon {
                         groups.insert(0, "default".to_owned());
                     }
 
+                    // What the default mount runs as chooses the figure a
+                    // worker's GIL/LAG shows.
+
+                    let interface = crate::processes::default_interface(
+                        &self.info.interfaces.announced(app, id),
+                    );
+
                     known.push(Known {
                         pid: host_pid,
                         parent: daemon,
@@ -9567,6 +9574,7 @@ impl Daemon {
                         app: app.clone(),
                         release: id.clone(),
                         groups,
+                        interface: interface.clone(),
                         ..Known::default()
                     });
 
@@ -9605,6 +9613,7 @@ impl Daemon {
                             group: worker.group.clone(),
                             index: Some(worker.index),
                             socket: Some(worker.socket.clone()),
+                            interface: interface.clone(),
                             ..Known::default()
                         });
                     }

@@ -86,8 +86,9 @@ path, and open it with the trailing slash: `https://example.com/proxy/8090/`.
   --processes`](daemon.md#the-processes) shows them: the daemon, the
   edge, each release's host, log relay and workers, and managed server
   instances, with their pids, users, uptime, CPU and memory, each
-  worker's requests per second, busy slots, p95 and GIL wait or loop
-  lag over the last second, and a host adopted again marked as one; a
+  worker's requests per second, busy slots, p95 and its event loop's
+  lag for an ASGI release or its GIL wait for a WSGI one over the last
+  second, and a host adopted again marked as one; a
   worker's row links to its [worker page](#looking-into-the-workers),
   and a host's or relay's to the logs below;
 - the [rollouts](rollouts.md) under way and the latest that ended, with

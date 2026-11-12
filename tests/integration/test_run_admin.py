@@ -403,6 +403,7 @@ def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
         assert (answer["mode"], root["role"], root["pid"]) == ("run", "run", server.process.pid)
         [host] = root["children"]
         assert (host["role"], host["what"]) == ("host", "plain_wsgi:application (r1)")
+        assert host["interface"] == "wsgi", host
         roles = [(child["role"], child["index"]) for child in host["children"]]
         assert roles == [("relay", None), ("worker", 0), ("worker", 1)], roles
         assert all(child["os_parent_pid"] == host["pid"] for child in host["children"][1:])

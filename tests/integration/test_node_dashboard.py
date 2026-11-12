@@ -612,6 +612,10 @@ def test_the_processes_are_listed_as_the_daemon_supervises_them(
     ]
     assert all(process["user"] and process["rss_bytes"] for process in [root, edge, host])
 
+    # What the default mount runs as, which chooses GIL/LAG (issue 607).
+
+    assert [process["interface"] for process in [host, *workers]] == ["wsgi"] * 3
+
     def title(pid: int) -> str:
         return subprocess.run(
             ["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, check=False

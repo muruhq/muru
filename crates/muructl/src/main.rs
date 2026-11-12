@@ -3829,8 +3829,8 @@ async fn run_with(
                 // that it does before it stops the old one.
 
                 match message {
-                    muru_controller::host::HostMessage::Workers { version, sockets, groups, workers, .. } => {
-                        run_processes.workers(workers);
+                    muru_controller::host::HostMessage::Workers { version, sockets, groups, workers, interfaces, .. } => {
+                        run_processes.workers(workers, &interfaces);
 
                         let release = format!("r{}", current.release);
                         let kept = pools.current().kept(&label, &release);

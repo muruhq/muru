@@ -122,6 +122,8 @@ struct Row {
     cpu: String,
     rss: String,
     figures: Option<pb::Figures>,
+    /// What the release's default mount runs as, which chooses GIL/LAG.
+    interface: String,
 }
 
 /// The view as text: with `every`, a line naming the instance, the time
@@ -204,7 +206,7 @@ fn render_at(answer: &pb::Processes, every: Option<Duration>, now: u64) -> Strin
             cells.extend([row.up.clone(), row.cpu.clone(), row.rss.clone()]);
 
             if with_figures {
-                cells.extend(figure_cells(row.figures.as_ref()));
+                cells.extend(figure_cells(row.figures.as_ref(), &row.interface));
             }
 
             cells
@@ -285,6 +287,7 @@ fn flatten(
             .map(crate::admin::human_size)
             .unwrap_or_default(),
         figures: process.figures,
+        interface: process.interface.clone(),
     });
 
     let below = if root {
@@ -319,6 +322,7 @@ fn flatten(
                 cpu: String::new(),
                 rss: String::new(),
                 figures: group.figures,
+                interface: process.interface.clone(),
             });
             shown_group.clone_from(&child.group);
         }
@@ -329,8 +333,10 @@ fn flatten(
 }
 
 /// The figure columns: requests per second, busy slots of the slots,
-/// requests waiting, p95 total time, and GIL wait or loop lag p95.
-fn figure_cells(figures: Option<&pb::Figures>) -> Vec<String> {
+/// requests waiting, p95 total time, and under GIL/LAG the p95 of the
+/// event loop's lag for a release whose default mount is ASGI and of the
+/// GIL wait for any other, either when the host has not said which.
+fn figure_cells(figures: Option<&pb::Figures>, interface: &str) -> Vec<String> {
     let Some(figures) = figures else {
         return vec![String::new(); 5];
     };
@@ -340,11 +346,13 @@ fn figure_cells(figures: Option<&pb::Figures>) -> Vec<String> {
         _ => String::new(),
     };
 
-    let wait = figures
-        .gil_wait_p95_ms
-        .or(figures.loop_lag_p95_ms)
-        .map(|ms| format!("{} ms", milliseconds(ms)))
-        .unwrap_or_default();
+    let wait = match interface {
+        "asgi" => figures.loop_lag_p95_ms,
+        "" => figures.gil_wait_p95_ms.or(figures.loop_lag_p95_ms),
+        _ => figures.gil_wait_p95_ms,
+    }
+    .map(|ms| format!("{} ms", milliseconds(ms)))
+    .unwrap_or_default();
 
     vec![
         figures.requests_per_second.map(rate).unwrap_or_default(),
@@ -540,7 +548,8 @@ mod tests {
             self.known.push(known);
         }
 
-        /// A worker's figures over the last second, with its GIL wait.
+        /// A worker's figures over the last second, with its GIL wait and
+        /// its loop's lag.
         #[allow(clippy::too_many_arguments)]
         fn worker(
             &mut self,
@@ -550,7 +559,7 @@ mod tests {
             busy: u32,
             slots: u32,
             p95: f64,
-            gil: f64,
+            wait: (Option<f64>, Option<f64>),
         ) {
             self.figures.workers.insert(
                 socket.to_owned(),
@@ -562,7 +571,7 @@ mod tests {
                     ..pb::Figures::default()
                 },
             );
-            self.figures.signals.insert(pid, (Some(gil), None));
+            self.figures.signals.insert(pid, wait);
         }
 
         /// A worker group's figures over the last second.
@@ -577,7 +586,7 @@ mod tests {
             slots: u32,
             queue: u32,
             p95: f64,
-            gil: f64,
+            wait: (Option<f64>, Option<f64>),
         ) {
             self.figures.groups.insert(
                 (app.to_owned(), release.to_owned(), group.to_owned()),
@@ -587,10 +596,20 @@ mod tests {
                     slots: Some(slots),
                     queue: Some(queue),
                     p95_ms: Some(p95),
-                    gil_wait_p95_ms: Some(gil),
-                    ..pb::Figures::default()
+                    gil_wait_p95_ms: wait.0,
+                    loop_lag_p95_ms: wait.1,
                 },
             );
+        }
+
+        /// Say what an application's default mount runs as, on its host
+        /// and workers, as the host announces it.
+        fn interface(&mut self, app: &str, interface: &str) {
+            for known in &mut self.known {
+                if known.app == app && matches!(known.role, "host" | "worker") {
+                    known.interface = interface.to_owned();
+                }
+            }
         }
 
         /// The answer to ListProcesses for the instance.
@@ -740,11 +759,55 @@ mod tests {
             1.0,
             120.0,
         );
-        example.worker(4310, "shop/r42/default-0.sock", 512.0, 14, 16, 40.2, 2.0);
-        example.worker(4311, "shop/r42/default-1.sock", 508.0, 13, 16, 42.0, 2.2);
-        example.worker(4320, "shop/r42/crawlers-0.sock", 61.0, 4, 8, 120.0, 0.4);
-        example.group("shop", "r42", "default", 1020.0, 27, 32, 3, 41.0, 2.1);
-        example.group("shop", "r42", "crawlers", 61.0, 4, 8, 0, 120.0, 0.4);
+        example.worker(
+            4310,
+            "shop/r42/default-0.sock",
+            512.0,
+            14,
+            16,
+            40.2,
+            (Some(2.0), None),
+        );
+        example.worker(
+            4311,
+            "shop/r42/default-1.sock",
+            508.0,
+            13,
+            16,
+            42.0,
+            (Some(2.2), None),
+        );
+        example.worker(
+            4320,
+            "shop/r42/crawlers-0.sock",
+            61.0,
+            4,
+            8,
+            120.0,
+            (Some(0.4), None),
+        );
+        example.group(
+            "shop",
+            "r42",
+            "default",
+            1020.0,
+            27,
+            32,
+            3,
+            41.0,
+            (Some(2.1), None),
+        );
+        example.group(
+            "shop",
+            "r42",
+            "crawlers",
+            61.0,
+            4,
+            8,
+            0,
+            120.0,
+            (Some(0.4), None),
+        );
 
         let [api, relay] = host(4330, 4242, "api", "r7", &["default"]);
         example.add(api, 4242, "api", day + 4 * 3600, 0.0, 88.0);
@@ -757,8 +820,28 @@ mod tests {
             4.2,
             131.0,
         );
-        example.worker(4340, "api/r7/default-0.sock", 203.0, 6, 64, 12.0, 1.1);
-        example.group("api", "r7", "default", 203.0, 6, 64, 0, 12.0, 1.1);
+        example.worker(
+            4340,
+            "api/r7/default-0.sock",
+            203.0,
+            6,
+            64,
+            12.0,
+            (Some(0.1), Some(48.0)),
+        );
+        example.group(
+            "api",
+            "r7",
+            "default",
+            203.0,
+            6,
+            64,
+            0,
+            12.0,
+            (Some(0.1), Some(48.0)),
+        );
+        example.interface("api", "asgi");
+        example.interface("shop", "wsgi");
 
         example.add(
             Known {
@@ -844,9 +927,26 @@ mod tests {
             2.8,
             95.0,
         );
-        example.worker(4107, "app/r1/default-0.sock", 0.3, 0, 4, 9.4, 0.1);
-        example.worker(4108, "app/r1/default-1.sock", 0.2, 0, 4, 8.8, 0.1);
-        example.group("app", "r1", "default", 0.5, 0, 8, 0, 9.4, 0.1);
+        example.worker(
+            4107,
+            "app/r1/default-0.sock",
+            0.3,
+            0,
+            4,
+            9.4,
+            (Some(0.1), None),
+        );
+        example.worker(
+            4108,
+            "app/r1/default-1.sock",
+            0.2,
+            0,
+            4,
+            8.8,
+            (Some(0.1), None),
+        );
+        example.group("app", "r1", "default", 0.5, 0, 8, 0, 9.4, (Some(0.1), None));
+        example.interface("app", "wsgi");
         example.figures.instance = pb::InstanceFigures {
             requests_per_second: 0.5,
             p50_ms: 3.1,

@@ -244,6 +244,8 @@ struct Seen {
     relay: Option<u32>,
     workers: Vec<muru_controller::host::HostWorker>,
     status: Vec<muru_controller::host::WorkerStatus>,
+    /// What the default mount runs as, once the host has said.
+    interface: String,
 }
 
 impl RunProcesses {
@@ -285,8 +287,22 @@ impl RunProcesses {
     }
 
     /// The workers the host announced.
-    pub fn workers(&self, workers: Vec<muru_controller::host::HostWorker>) {
-        self.seen.lock().expect("run processes poisoned").workers = workers;
+    /// The workers the host announced last, with what each mount runs
+    /// as when it said; an announcement naming no interface leaves the
+    /// last.
+    pub fn workers(
+        &self,
+        workers: Vec<muru_controller::host::HostWorker>,
+        interfaces: &[(String, String)],
+    ) {
+        let mut seen = self.seen.lock().expect("run processes poisoned");
+        seen.workers = workers;
+
+        let interface = muru_controller::processes::default_interface(interfaces);
+
+        if !interface.is_empty() {
+            seen.interface = interface;
+        }
     }
 
     /// What the workers last reported.
@@ -337,6 +353,7 @@ impl RunProcesses {
                 app: self.app.clone(),
                 release: release.clone(),
                 groups: self.groups.clone(),
+                interface: seen.interface.clone(),
                 ..Known::default()
             });
 
@@ -356,6 +373,7 @@ impl RunProcesses {
                     group: worker.group.clone(),
                     index: Some(worker.index),
                     socket: Some(worker.socket.clone()),
+                    interface: seen.interface.clone(),
                     ..Known::default()
                 });
             }

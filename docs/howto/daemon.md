@@ -663,9 +663,9 @@ edge  1,284 req/s  3.0 err/s  p50 4.0 ms  p95 38 ms  in flight 41  ws 212  conns
 PID    ROLE           WHAT                                   USER      UP     CPU       RSS   REQ/S    BUSY   QUEUE      P95   GIL/LAG
 4242   daemon         muructl daemon run                     muru    3d2h    0.3%    38.0MB
 4250   ├─ edge        listening on :80, :443                 muru    3d2h    2.1%    61.0MB   1,284
-4330   ├─ host        api@r7                                 api     1d4h    0.0%    88.0MB     203    6/64       0    12 ms    1.1 ms
+4330   ├─ host        api@r7                                 api     1d4h    0.0%    88.0MB     203    6/64       0    12 ms     48 ms
 4331   │  ├─ relay    api@r7 output to apps/api/r7.log       api     1d4h    0.0%     7.0MB
-4340   │  └─ worker   group default, worker 0                api     1d4h    4.2%   131.0MB     203    6/64            12 ms    1.1 ms
+4340   │  └─ worker   group default, worker 0                api     1d4h    4.2%   131.0MB     203    6/64            12 ms     48 ms
 4301   ├─ host        shop@r42                               shop   5h12m    0.0%    92.0MB
 4302   │  ├─ relay    shop@r42 output to apps/shop/r42.log   shop   5h12m    0.1%     7.0MB
        │  ├─ group    crawlers                                                                   61     4/8       0   120 ms    0.4 ms
@@ -691,10 +691,15 @@ in `ps`, which its row says.
 
 For a worker the figures are its requests per second, its slots holding
 a request of all its slots, the 95th percentile total time and, under
-GIL/LAG, its threads' GIL wait or its event loop's lag at the 95th
-percentile. Requests wait for a slot in their worker group, so QUEUE is
-a group's: a release with several groups has a row for each, and the
-host's row has the figures of a release with one.
+GIL/LAG, the 95th percentile of what holds its requests up: its event
+loop's lag when the release's default mount is ASGI, and its threads'
+wait for the GIL when it is WSGI. On a build of Python without the GIL
+a WSGI worker has no GIL wait, and the column is empty. Requests wait
+for a slot in their worker group, so QUEUE is a group's: a release with
+several groups has a row for each, and the host's row has the figures
+of a release with one, its GIL/LAG the workers' together. `--json`
+gives both figures, `gil_wait_p95_ms` and `loop_lag_p95_ms`, and the
+`interface` that chooses between them.
 
 - `--app APP[@RELEASE]` shows the daemon and one application's
   processes, or one release's.

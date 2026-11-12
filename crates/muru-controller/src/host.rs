@@ -100,7 +100,7 @@ pub struct WorkerReply {
 }
 
 /// What one worker last reported to its host (sections 7.6 and 7.7).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkerStatus {
     /// The worker's index within its group.
     pub index: u32,

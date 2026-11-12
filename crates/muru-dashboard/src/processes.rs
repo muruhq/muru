@@ -142,7 +142,8 @@ fn flatten(
             .unwrap_or_default(),
         ..ProcessRow::default()
     };
-    figures(process.get("figures"), &mut row);
+    let interface = text(process, "interface");
+    figures(process.get("figures"), &interface, &mut row);
     rows.push(row);
 
     let below = if root {
@@ -180,7 +181,7 @@ fn flatten(
                 what: group.clone(),
                 ..ProcessRow::default()
             };
-            figures(figured.get("figures"), &mut row);
+            figures(figured.get("figures"), &interface, &mut row);
             rows.push(row);
             shown_group = group;
         }
@@ -194,8 +195,10 @@ fn flatten(
     }
 }
 
-/// The figure cells of a row from its figures.
-fn figures(figures: Option<&serde_json::Value>, row: &mut ProcessRow) {
+/// The figure cells of a row from its figures. The wait is loop lag for a
+/// release whose default mount is ASGI, `interface`, and GIL wait for any
+/// other, either when the host has not said which.
+fn figures(figures: Option<&serde_json::Value>, interface: &str, row: &mut ProcessRow) {
     let Some(figures) = figures.filter(|figures| figures.is_object()) else {
         return;
     };
@@ -213,10 +216,16 @@ fn figures(figures: Option<&serde_json::Value>, row: &mut ProcessRow) {
     row.p95 = number(figures, "p95_ms")
         .map(|ms| format!("{ms:.1} ms"))
         .unwrap_or_default();
-    row.wait = number(figures, "gil_wait_p95_ms")
-        .or_else(|| number(figures, "loop_lag_p95_ms"))
-        .map(|ms| format!("{ms:.1} ms"))
-        .unwrap_or_default();
+    let gil = number(figures, "gil_wait_p95_ms");
+    let lag = number(figures, "loop_lag_p95_ms");
+
+    row.wait = match interface {
+        "asgi" => lag,
+        "" => gil.or(lag),
+        _ => gil,
+    }
+    .map(|ms| format!("{ms:.1} ms"))
+    .unwrap_or_default();
 }
 
 fn rate(value: f64) -> String {
@@ -269,7 +278,9 @@ mod tests {
                     "groups": [{"group": "default", "figures": {"queue": 2}}, {"group": "crawlers"}],
                     "children": [
                         {"pid": 21, "role": "worker", "app": "shop", "release": "r1", "group": "default", "index": 0,
-                         "figures": {"requests_per_second": 12.0, "busy": 1, "slots": 4, "p95_ms": 3.25}},
+                         "interface": "asgi",
+                         "figures": {"requests_per_second": 12.0, "busy": 1, "slots": 4, "p95_ms": 3.25,
+                                     "gil_wait_p95_ms": 0.2, "loop_lag_p95_ms": 30.0}},
                         {"pid": 22, "role": "worker", "app": "shop", "release": "r1", "group": "crawlers", "index": 0}
                     ]
                 }]
@@ -292,6 +303,11 @@ mod tests {
             (rows[3].rate.as_str(), rows[3].busy.as_str()),
             ("12", "1/4")
         );
+
+        // An ASGI worker's wait is its loop's lag, though it has a GIL
+        // wait as well.
+
+        assert_eq!(rows[3].wait, "30.0 ms");
         assert_eq!(
             rows[5].link.as_deref(),
             Some("worker?release=shop@r1&worker=crawlers/0")

@@ -207,6 +207,7 @@ message Process {
   Figures figures = 14;             // a worker's last second; a host's when its release has one group; the edge's
   repeated GroupFigures groups = 15; // a host's groups, when its release has more than one
   repeated Process children = 16;
+  string interface = 17;            // a host's and its workers': what the default mount runs as, wsgi, asgi or grpc; empty until the host has said
 }
 
 message Figures {
