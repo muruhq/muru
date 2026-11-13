@@ -155,7 +155,8 @@ pub struct SocketRow {
     pub path: String,
     /// The client address.
     pub client: String,
-    /// When it opened, HH:MM:SS.
+    /// When it opened, in the full UTC form, which the page shows as the
+    /// viewer's local clock.
     pub opened: String,
     /// How long it has been open.
     pub age: String,
@@ -352,8 +353,8 @@ pub struct AppRow {
     pub current: String,
     /// The release a rollback restores, or empty.
     pub previous: String,
-    /// When maintenance mode began, as a clock time, or empty when it is
-    /// off (section 4.12).
+    /// When maintenance mode began, in the full UTC form shown as the
+    /// viewer's local clock, or empty when it is off (section 4.12).
     pub maintenance_since: String,
     /// Its releases, newest first.
     pub releases: Vec<ReleaseRow>,
@@ -417,7 +418,8 @@ pub struct RolloutRow {
     pub percent: u32,
     /// What it is doing, or why it ended.
     pub message: String,
-    /// When it last changed, as a clock time.
+    /// When it last changed, in the full UTC form, shown as the viewer's
+    /// local clock.
     pub updated: String,
 }
 
@@ -446,7 +448,8 @@ pub struct ReleaseRow {
     pub event_loop: Option<SlotSide>,
     /// Requests waiting for a slot.
     pub waiting: usize,
-    /// When it was created, as a clock time.
+    /// When it was created, in the full UTC form, shown as the viewer's
+    /// local clock.
     pub created: String,
 }
 
@@ -463,8 +466,8 @@ pub struct HostRow {
     pub tls: bool,
     /// Whether it is the default host.
     pub default: bool,
-    /// When maintenance mode began for the host, as a clock time, or
-    /// empty when it is off.
+    /// When maintenance mode began for the host, in the full UTC form
+    /// shown as the viewer's local clock, or empty when it is off.
     pub maintenance_since: String,
 }
 
@@ -1217,6 +1220,7 @@ async fn processes_paths(
             rows: &rows,
             with_user,
             error: &error,
+            marked: rows.iter().any(|row| row.rate.ends_with('*')),
         }
         .render(),
     ))

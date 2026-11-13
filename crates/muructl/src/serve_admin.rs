@@ -55,6 +55,8 @@ pub struct Serving {
     pub required: Vec<String>,
     /// The settings worked out, for `/status`.
     pub settings: serde_json::Value,
+    /// The container's limits and the memory guard, for `/status`.
+    pub limits: crate::serve_limits::SharedReport,
 }
 
 impl Health {
@@ -213,10 +215,17 @@ impl Health {
             })
             .collect();
 
+        let limits = serving
+            .limits
+            .lock()
+            .expect("limits report poisoned")
+            .clone();
+
         serde_json::json!({
             "state": if self.stopping.load(Ordering::Relaxed) { "stopping" } else { "serving" },
             "groups": groups,
             "settings": serving.settings,
+            "limits": limits,
         })
     }
 }

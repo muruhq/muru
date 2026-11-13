@@ -9,7 +9,7 @@
 <table>
   <tr><th>Opened</th><th class="num">Open for</th><th>Release</th><th>Path</th><th>Client</th><th class="num">Received</th><th class="num">Sent</th><th>Worker</th><th>Request id</th></tr>
   {% for socket in data.websockets.sockets %}
-  <tr><td>{{ socket.opened }}</td><td class="num">{{ socket.age }}</td><td>{{ socket.release }}</td><td>{{ socket.path }}</td><td>{{ socket.client }}</td><td class="num">{{ socket.received }}</td><td class="num">{{ socket.sent }}</td><td>{{ socket.worker }}</td><td>{{ socket.request_id }}</td></tr>
+  <tr><td><time datetime="{{ socket.opened }}">{{ socket.opened }}</time></td><td class="num">{{ socket.age }}</td><td>{{ socket.release }}</td><td>{{ socket.path }}</td><td>{{ socket.client }}</td><td class="num">{{ socket.received }}</td><td class="num">{{ socket.sent }}</td><td>{{ socket.worker }}</td><td>{{ socket.request_id }}</td></tr>
   {% endfor %}
 </table>
 {% endif %}

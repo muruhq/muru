@@ -18,6 +18,17 @@ work=$HOME/muru
 
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 
+# Each run builds once from a fresh copy, which incremental compilation
+# does not speed up but fills the disk with (issue 630): it is off, and a
+# cache earlier runs left is removed.
+export CARGO_INCREMENTAL=0
+rm -rf "$work/target/debug/incremental" "$work/target/release/incremental"
+
+free_kb=$(df -Pk "$HOME" | awk 'NR == 2 { print $4 }')
+if [ "$free_kb" -lt $((5 * 1024 * 1024)) ]; then
+    echo "warning: the VM has $((free_kb / 1024))MB free; builds and docker images may not fit" >&2
+fi
+
 need_packages=()
 command -v rsync >/dev/null || need_packages+=(rsync)
 if [ "$action" = bench ] && { [ ! -e /usr/bin/apxs ] || [ ! -e /usr/sbin/apache2 ]; }; then

@@ -18,9 +18,10 @@ import sys
 import threading
 import time
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 from support import server as support
@@ -84,9 +85,11 @@ def start(
     app: str | None = "plain_wsgi:application",
     wait: bool = True,
     short: bool = False,
+    wrap: Callable[[list[str]], list[str]] | None = None,
 ) -> Serve:
     """Start muructl serve; `short` starts it as `muructl serve` alone, as a
-    container's command line does, with every setting in its variable."""
+    container's command line does, with every setting in its variable, and
+    `wrap` runs its command line through another, which execs it."""
 
     muructl = support.muructl_path()
     if muructl is None:
@@ -130,8 +133,8 @@ def start(
         variables["MURU_SERVE_ENTRYPOINT"] = app or ""
 
     process = subprocess.Popen(
-        command,
-        executable=str(muructl),
+        wrap(command) if wrap else command,
+        executable=None if wrap else str(muructl),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -187,6 +190,56 @@ def test_started_with_a_short_command_line_its_title_names_the_application(
 
         status, body = serve.get("/env?name=MURU_TEST_KEPT")
         assert status == 200 and json.loads(body)["value"] == "kept", body
+    finally:
+        serve.stop()
+
+
+def test_a_named_group_and_a_mount_are_served_and_ready_counts_the_group(
+    tmp_path: Path,
+) -> None:
+    """A project's named group and mount work under serve: a request for the
+    mount's path reaches the group's worker, /status lists both groups, and
+    /readyz counts each required group's workers, so the reports group with
+    one process holds it back at --min-ready 2 (issue 620)."""
+
+    mounted = support.ROOT / "tests" / "fixtures" / "projects" / "mounted"
+    serve = start(
+        tmp_path,
+        "--chdir",
+        str(mounted),
+        "--processes",
+        "2",
+        "--min-ready",
+        "2",
+        "--admin-status",
+        app=str(mounted),
+        wait=False,
+    )
+
+    try:
+        support.wait_for_port(serve.port, serve.process)
+
+        def groups() -> dict[str, Any]:
+            status, body = serve.admin("/status")
+            return json.loads(body).get("groups", {}) if status == 200 else {}
+
+        deadline = time.monotonic() + 30
+
+        while {name: group["ready"] for name, group in groups().items()} != {
+            "default": 2,
+            "reports": 1,
+        }:
+            assert time.monotonic() < deadline, (groups(), serve.output())
+            time.sleep(0.05)
+
+        status, body = serve.get("/reports/daily")
+        assert status == 200, body
+        answered = json.loads(body)
+        assert (answered["mount"], answered["group"]) == ("reports", "reports"), answered
+        assert json.loads(serve.get("/")[1])["group"] == "default"
+
+        status, reason = serve.admin("/readyz")
+        assert status == 503 and "group reports has 1 of 2 workers ready" in reason, reason
     finally:
         serve.stop()
 
@@ -658,3 +711,273 @@ def test_a_missing_runtime_library_is_not_fetched(tmp_path: Path) -> None:
     message = serve.output() + "".join(serve.stderr)
     assert "no runtime library for" in message, message
     assert "muructl build --runtime-dir" in message, message
+
+
+def sudo_write(path: Path, text: str) -> None:
+    """Write a cgroup file as root."""
+
+    subprocess.run(
+        ["sudo", "-n", "tee", str(path)],
+        input=text,
+        text=True,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+
+
+@pytest.mark.requires_root
+@pytest.mark.requires_linux
+def test_the_guard_and_status_follow_a_memory_limit_changed_while_serving(
+    tmp_path: Path,
+) -> None:
+    """A cgroup of its own, as a container's, whose memory.max the test
+    changes under a running serve, as docker update or an in-place resize
+    does (sections 7.7 and 13.9): the change is logged and shown, and with
+    less than the headroom left the guard replaces the largest worker,
+    which stops first. Needs a cgroup v2 root can write, as in the Linux
+    virtual machine; not in CI."""
+
+    root = Path("/sys/fs/cgroup")
+    assert (root / "cgroup.controllers").is_file(), "cgroup v2 is needed"
+    cgroup = root / f"muru-test-{os.getpid()}-{tmp_path.name}"
+    subprocess.run(["sudo", "-n", "mkdir", str(cgroup)], check=True)
+    serve: Serve | None = None
+
+    try:
+        sudo_write(cgroup / "memory.max", str(512 << 20))
+
+        # The shell moves itself into the cgroup, then becomes serve.
+
+        def into_cgroup(command: list[str]) -> list[str]:
+            joined = " ".join(f"'{part}'" for part in command)
+            return [
+                "sh",
+                "-c",
+                f"echo $$ | sudo -n tee {cgroup}/cgroup.procs >/dev/null && exec {joined}",
+            ]
+
+        serve = start(
+            tmp_path,
+            "--processes",
+            "2",
+            "--admin-status",
+            "--memory",
+            "check_interval=1s",
+            wrap=into_cgroup,
+        )
+        serve.wait_for("memory.max 512MB with 128MB of headroom")
+        serve.wait_for("once the application is imported")
+
+        def limits() -> dict[str, Any]:
+            return dict(json.loads(serve.admin("/status")[1])["limits"])
+
+        assert limits()["memory_max"] == 512 << 20
+        assert limits()["guard"] == "watching"
+
+        # Raised while it serves: said, and shown.
+
+        sudo_write(cgroup / "memory.max", str(1 << 30))
+        serve.wait_for("container limits changed: memory.max from 512MB to 1.0GB")
+        deadline = time.monotonic() + 10
+
+        while limits()["memory_max"] != 1 << 30:
+            assert time.monotonic() < deadline, limits()
+            time.sleep(0.1)
+
+        # One worker takes 400MB, then the limit comes down to leave less
+        # than the headroom: that worker is replaced, stopping first.
+
+        assert serve.get("/grow?mb=400")[0] == 200
+        deadline = time.monotonic() + 10
+
+        while limits()["workers_memory"] < 400 << 20:
+            assert time.monotonic() < deadline, limits()
+            time.sleep(0.1)
+
+        sudo_write(cgroup / "memory.max", str(limits()["memory_used"] + (60 << 20)))
+        serve.wait_for("the container was short of memory", timeout=15)
+        serve.wait_for("stops before its replacement starts", timeout=15)
+        serve.wait_for("replaced by pid", timeout=30)
+        assert limits()["last_replaced"].startswith("plain-wsgi@r1 worker ")
+        assert serve.admin("/readyz")[0] == 200
+    finally:
+        if serve is not None:
+            serve.stop()
+
+        subprocess.run(["sudo", "-n", "rmdir", str(cgroup)], check=False)
+
+
+def test_a_scaling_policy_scales_the_serve_out_under_load_and_back_in(tmp_path: Path) -> None:
+    """Section 13.9: a project's scaling policy applies under serve, as
+    under the daemon, and `muructl scale status` answers inside it."""
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    project = tmp_path / "shop"
+    project.mkdir()
+    (project / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+    (project / "pyproject.toml").write_text(
+        """[tool.muru]
+entrypoint = 'app:application'
+processes = 1
+threads = 1
+
+[tool.muru.scaling]
+mode = 'spare'
+min_workers = 1
+max_workers = 2
+min_spare = 1
+max_spare = 3
+scale_out_window = '1s'
+scale_in_window = '3s'
+hold_after_growth = '2s'
+reap_interval = '1s'
+idle_reap_after = '3s'
+min_lifetime = '1s'
+"""
+    )
+    serve = start(tmp_path, "--chdir", str(project), app=None)
+    stop = threading.Event()
+
+    def load() -> None:
+        while not stop.is_set():
+            try:
+                serve.get("/sleep?seconds=0.3")
+            except OSError:
+                time.sleep(0.1)
+
+    try:
+        # Two requests at a time against one single-threaded worker: the
+        # group is short and grows to its ceiling.
+
+        threads = [threading.Thread(target=load, daemon=True) for _ in range(2)]
+
+        for thread in threads:
+            thread.start()
+
+        serve.wait_for("default: scale out from 1 to 2 workers", timeout=30)
+        stop.set()
+
+        for thread in threads:
+            thread.join(timeout=10)
+
+        scale = subprocess.run(
+            [str(muructl), "scale", "status"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={**os.environ, "MURU_RUN_DIR": str(serve.run_dir)},
+        )
+        assert scale.returncode == 0, scale.stderr
+        assert "spare 1-2 workers" in scale.stdout, scale.stdout
+
+        # Idle again: drained back to the floor.
+
+        serve.wait_for("default: scale in from 2 to 1 workers", timeout=60)
+    finally:
+        stop.set()
+        serve.stop()
+
+
+@pytest.mark.requires_root
+@pytest.mark.requires_linux
+def test_memory_holds_a_scale_out_back_and_the_guard_scales_in(tmp_path: Path) -> None:
+    """Section 13.9: a scale-out is admitted against the cgroup's
+    memory.max, a worker counting at its hard limit, and short of memory
+    a group with a policy is scaled in rather than having its worker
+    replaced. Needs a cgroup v2 root can write, as in the Linux virtual
+    machine; not in CI."""
+
+    root = Path("/sys/fs/cgroup")
+    assert (root / "cgroup.controllers").is_file(), "cgroup v2 is needed"
+    cgroup = root / f"muru-test-{os.getpid()}-{tmp_path.name}"
+    subprocess.run(["sudo", "-n", "mkdir", str(cgroup)], check=True)
+    project = tmp_path / "shop"
+    project.mkdir()
+    (project / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+    (project / "pyproject.toml").write_text(
+        """[tool.muru]
+entrypoint = 'app:application'
+processes = 1
+threads = 1
+
+[tool.muru.memory]
+hard_limit = '300MB'
+check_interval = '1s'
+
+[tool.muru.scaling]
+mode = 'spare'
+min_workers = 1
+max_workers = 3
+min_spare = 1
+max_spare = 3
+scale_out_window = '1s'
+"""
+    )
+    serve: Serve | None = None
+    stop = threading.Event()
+
+    try:
+        # 560MB less 128MB of headroom leaves room for one more worker at
+        # its hard limit beside the first, and not a third.
+
+        sudo_write(cgroup / "memory.max", str(560 << 20))
+
+        def into_cgroup(command: list[str]) -> list[str]:
+            joined = " ".join(f"'{part}'" for part in command)
+            return [
+                "sh",
+                "-c",
+                f"echo $$ | sudo -n tee {cgroup}/cgroup.procs >/dev/null && exec {joined}",
+            ]
+
+        serve = start(
+            tmp_path, "--chdir", str(project), "--admin-status", app=None, wrap=into_cgroup
+        )
+        running = serve
+
+        def load() -> None:
+            while not stop.is_set():
+                try:
+                    running.get("/sleep?seconds=0.3")
+                except OSError:
+                    time.sleep(0.1)
+
+        threads = [threading.Thread(target=load, daemon=True) for _ in range(3)]
+
+        for thread in threads:
+            thread.start()
+
+        serve.wait_for("default: scale out from 1 to 2 workers", timeout=30)
+        serve.wait_for("more workers asked for fit memory.max: a worker counts 300MB", timeout=30)
+        stop.set()
+
+        for thread in threads:
+            thread.join(timeout=10)
+
+        # One worker grows by 120MB, under its hard limit. Then less than
+        # the headroom is left, which replacing it would make up: the
+        # group, above its one worker, is scaled in by it instead.
+
+        def limits() -> dict[str, Any]:
+            return dict(json.loads(serve.admin("/status")[1])["limits"])
+
+        assert serve.get("/grow?mb=120")[0] == 200
+        deadline = time.monotonic() + 10
+
+        while limits()["workers_memory"] < 120 << 20:
+            assert time.monotonic() < deadline, limits()
+            time.sleep(0.1)
+
+        sudo_write(cgroup / "memory.max", str(limits()["memory_used"] + (60 << 20)))
+        serve.wait_for("default: scale in from 2 to 1 workers: for memory", timeout=30)
+        serve.wait_for("leaves routing: scaled in for memory", timeout=10)
+        assert "the container was short of memory" in serve.output()
+        assert "replaced by pid" not in serve.output(), serve.output()
+    finally:
+        stop.set()
+
+        if serve is not None:
+            serve.stop()
+
+        subprocess.run(["sudo", "-n", "rmdir", str(cgroup)], check=False)

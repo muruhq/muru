@@ -391,13 +391,13 @@ The `[daemon]` table of the daemon's file: how the daemon itself runs.
 (config-daemon-daemon-budget)=
 ## `[daemon.budget]`
 
-The `[daemon.budget]` table: what the releases on the node may hold between them. Each limit is off when omitted.
+The `[daemon.budget]` table: what the releases on the node may hold between them. A limit left out is off, except that memory and cpu default to the daemon's own cgroup's limits when it has them (issue 384).
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `cpu` | number |  | CPU cores the workers use, as measured. |
-| `memory` | string |  | Memory for the hosts and workers, as a size such as 12GB. |
-| `workers` | integer |  | Worker processes and managed server instances. |
+| `cpu` | number |  | CPU cores the workers use, as measured. Omitted, it is the quota of the daemon's cgroup's cpu.max, read at each decision, and off without one. |
+| `memory` | string |  | Memory for the hosts and workers, as a size such as 12GB. Omitted, it is the daemon's cgroup's memory.max less a headroom of 10% (at least 128MB), read at each decision, and off without one. |
+| `workers` | integer |  | Worker processes and managed server instances; off when omitted. |
 
 (config-daemon-dashboard)=
 ## `[dashboard]`

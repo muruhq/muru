@@ -182,7 +182,7 @@ pub fn websockets_view(report: pb::WebSockets) -> WebSocketsView {
                 },
                 path: socket.path,
                 client: socket.client,
-                opened: crate::daemon::clock_hms(socket.opened_unix_ms),
+                opened: crate::daemon::full_time(socket.opened_unix_ms),
                 age: muru_dashboard::uptime(std::time::Duration::from_millis(
                     crate::model::now_unix_ms().saturating_sub(socket.opened_unix_ms),
                 )),

@@ -13,6 +13,7 @@ package muru.admin.v1;
 service Admin {
   // The daemon, its locations and listeners.
   rpc GetStatus(GetStatusRequest) returns (Status);
+  rpc Probe(ProbeRequest) returns (ProbeAnswer);
 
   // Section 13.10: the instance's processes as Muru supervises them, with
   // what the operating system says of each and the last second's figures.
@@ -159,6 +160,20 @@ service Admin {
   rpc ListCommands(ListCommandsRequest) returns (ListCommandsResponse);
 }
 
+// A probe's question (section 13.9): live, ready or startup, of the
+// daemon, narrowed to one application for ready and startup when app is
+// set, with the workers each needed group must have ready for ready.
+message ProbeRequest {
+  string probe = 1;                 // live, ready or startup
+  string app = 2;                   // every application when empty
+  uint32 min_ready = 3;             // 1 when 0
+}
+
+message ProbeAnswer {
+  bool ok = 1;
+  string reason = 2;                // why not, when not
+}
+
 message GetStatusRequest {}
 
 message ListProcessesRequest {
@@ -175,6 +190,26 @@ message Processes {
   uint64 sampled_unix_ms = 5;       // when the figures were taken
   InstanceFigures figures = 6;      // the instance's last second
   Process root = 7;                 // the daemon, run or serve, with the rest beneath it
+  CgroupLimits limits = 8;          // the cgroup's limits and the memory guard, when there is a cgroup v2
+}
+
+// A cgroup v2's limits as last read, and the memory guard watching its
+// memory.max (sections 7.7 and 13.9). Read when used, so they follow a
+// docker update or an in-place resize.
+message CgroupLimits {
+  string cgroup = 1;                // the cgroup's directory
+  double cpu_quota = 2;             // cpu.max's quota in CPUs; 0 without one
+  uint32 cpus = 3;                  // the CPUs of cpuset.cpus.effective; 0 when not read
+  uint64 memory_max = 4;            // bytes; 0 without a limit
+  uint64 memory_used = 5;           // memory.current less inactive file pages
+  uint64 memory_left = 6;           // memory_max less memory_used
+  uint64 headroom = 7;              // kept free: 10 % of memory_max, at least 128 MiB
+  uint64 workers_memory = 8;        // the workers' own memory, each by its policy's measure, added up
+  uint64 host_memory = 9;           // what the hosts hold, added up
+  string guard = 10;                // watching, replacing or holding; empty without a memory limit
+  string guard_note = 11;           // what the guard is doing, in words; empty while watching
+  string last_replaced = 12;        // the worker it last replaced, app@release worker NAME (pid N); empty for none
+  uint64 last_replaced_unix_ms = 13;
 }
 
 message InstanceFigures {
@@ -209,6 +244,7 @@ message Process {
   repeated Process children = 16;
   string interface = 17;            // a host's and its workers': what the default mount runs as, wsgi, asgi or grpc; empty until the host has said
   string state = 18;                // a host's release's part in routing: serving, canary, held, draining, retained, or its state while it starts
+  optional int32 oom_score_adj = 19; // Linux: /proc/PID/oom_score_adj, 500 for a worker (section 7.7); absent elsewhere
 }
 
 message Figures {
@@ -219,6 +255,7 @@ message Figures {
   optional double p95_ms = 5;       // total time
   optional double gil_wait_p95_ms = 6;
   optional double loop_lag_p95_ms = 7;
+  uint32 departed = 8;              // a host's or group's: workers no longer listed whose last second these figures count (issue 613)
 }
 
 message GroupFigures {
@@ -249,6 +286,7 @@ message Status {
   string config = 20;               // the daemon's configuration file, which need not exist; empty for a run
   string log_dir = 21;              // the daemon's log directory; empty for a run, which writes no log files
   string cache_dir = 22;            // the daemon's cache directory; empty for a run
+  CgroupLimits limits = 23;         // the cgroup's limits and the memory guard, when there is a cgroup v2
 }
 
 message ListWebSocketsRequest {

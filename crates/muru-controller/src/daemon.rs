@@ -30,7 +30,8 @@ use crate::model::{
     RolloutStep, now_unix_ms, valid_name,
 };
 use crate::rollouts::{Counters, Verdict, judge};
-use crate::scaling::{Decision, ScaleStatus, Scaler, Signals};
+use crate::scaling::{Decision, ScaleStatus};
+use crate::scaling::{GroupScaling, Step, decision_message};
 use crate::servers::{Servers, ServersRecord};
 use crate::store::Store;
 
@@ -729,27 +730,6 @@ struct GroupRecord {
     sockets: Vec<PathBuf>,
 }
 
-/// Section 7.4: one worker group's autoscaler and what was last asked of
-/// the host for it.
-struct GroupScaling {
-    name: String,
-    scaler: Scaler,
-    /// Slots a worker offers before any is routed to: its threads, or
-    /// its event loop's concurrency.
-    slots_per_worker: f64,
-    /// The count last asked of the host, so a count the host has not
-    /// reached yet is not asked for again every second.
-    requested: Option<u32>,
-    /// The threads a worker can run Python on at once without a GIL,
-    /// for its CPU share (section 7.3).
-    threads: u32,
-    /// The soft memory limit and what it measures, when one is set.
-    memory_limit: Option<(muru_config::Measure, u64)>,
-    /// The last scale-out the node's budget held back: the count asked
-    /// for, the count given and the limit, so each is one event.
-    denied: Option<(u32, u32, crate::budget::Limit)>,
-}
-
 /// Releases, as (app, release).
 type ReleaseSet = BTreeSet<(String, String)>;
 
@@ -785,6 +765,7 @@ pub async fn processes(
         version: env!("CARGO_PKG_VERSION").to_owned(),
         mode: "daemon".to_owned(),
         started_unix_ms: info.started_unix_ms,
+        limits: info.cgroup_limits.lock().expect("limits poisoned").clone(),
     };
 
     Some(
@@ -854,6 +835,14 @@ pub struct Info {
     /// Section 8.4: uv as found and how it is run, from the `[tools]`
     /// table read at start.
     pub provisioning: crate::provision::Provisioning,
+    /// Section 13.9: set once the daemon has finished starting, for the
+    /// startup and readiness probes.
+    pub started: std::sync::atomic::AtomicBool,
+    /// Set when the daemon begins to stop, which fails readiness.
+    pub stopping: std::sync::atomic::AtomicBool,
+    /// Sections 7.7 and 13.9: the daemon's cgroup limits as last read,
+    /// and the memory guard, for status.
+    pub cgroup_limits: std::sync::Mutex<Option<muru_proto::admin::v1::CgroupLimits>>,
 }
 
 /// What runs for one release now, for the API.
@@ -1111,9 +1100,10 @@ struct Running {
 }
 
 impl Running {
-    /// Section 7.4: what one worker of a group costs, from its workers'
-    /// mean proportional set size and CPU, the soft memory limit standing
-    /// in before any has reported, then `fallback`.
+    /// Section 7.4: what one worker of a group costs: its hard limit
+    /// when one is set (issue 384), else its workers' mean proportional
+    /// set size and CPU, the soft memory limit standing in before any has
+    /// reported, then `fallback`.
     fn worker_cost(&self, group: &GroupScaling, fallback: Option<u64>) -> crate::budget::Cost {
         let sizes: Vec<u64> = self
             .status
@@ -1124,7 +1114,9 @@ impl Running {
         let measured = (!sizes.is_empty()).then(|| sizes.iter().sum::<u64>() / sizes.len() as u64);
 
         crate::budget::Cost {
-            memory: measured
+            memory: group
+                .hard_limit
+                .or(measured)
                 .or(group.memory_limit.map(|(_, limit)| limit))
                 .or(fallback),
             cpu: group.scaler.worker_signals().cores,
@@ -1222,6 +1214,12 @@ impl Running {
 struct Daemon {
     store: Arc<Store>,
     events: Events,
+    /// Sections 7.7 and 13.9: the daemon's own cgroup, read again at
+    /// every memory check, and the memory guard watching its
+    /// `memory.max`, across every release's workers (issue 622).
+    cgroup: Option<crate::cgroup::Limits>,
+    guard: crate::guard::Guard,
+    guard_checked: Option<(Instant, Duration)>,
     locations: Locations,
     edge: EdgeProcess,
     info: Arc<Info>,
@@ -1301,7 +1299,10 @@ struct Daemon {
     certificates: HashMap<String, (String, String)>,
     /// Section 7.4: the node's budget, and the schedule windows already
     /// checked against it, by overlay and start.
-    budget: crate::budget::Budget,
+    /// The `[daemon.budget]` table as the file sets it; `budget()` is
+    /// the budget in force, with the cgroup's limits for what it leaves
+    /// out (issue 384).
+    budget_table: crate::budget::Budget,
     budget_checked: BTreeSet<(String, u64)>,
     /// The points the dashboard's charts draw, one a second.
     history: Arc<muru_dashboard::History>,
@@ -1506,6 +1507,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         service,
         servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
+        started: std::sync::atomic::AtomicBool::new(false),
+        stopping: std::sync::atomic::AtomicBool::new(false),
+        cgroup_limits: std::sync::Mutex::new(None),
     });
     let underway = crate::commands::Underway::default();
     let handle = Handle {
@@ -1526,6 +1530,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             Some(tokio::spawn(crate::metrics::serve(
                 listener,
                 handle.commands.clone(),
+                crate::probes::Probes {
+                    store: Arc::clone(&store),
+                    info: Arc::clone(&info),
+                },
             )))
         }
         None => None,
@@ -1680,7 +1688,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         overrides: config.overrides,
         sinks,
         certificates: HashMap::new(),
-        budget: settings.budget,
+        budget_table: settings.budget,
         budget_checked: BTreeSet::new(),
         history,
         sampler: muru_dashboard::Sampler::default(),
@@ -1696,7 +1704,24 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         commands: handle_commands,
         asked: HashMap::new(),
         last_request: 0,
+        cgroup: crate::cgroup::Limits::read(),
+        guard: crate::guard::Guard::default(),
+        guard_checked: None,
     };
+
+    if let Some(limits) = &daemon.cgroup {
+        tracing::info!("cgroup limits: {}", limits.describe());
+        let budget = daemon.budget();
+
+        if budget.is_set() {
+            tracing::info!(
+                "node budget: {}{}",
+                budget.describe(&crate::budget::Usage::default()),
+                daemon.budget_sources()
+            );
+        }
+    }
+
     daemon.restore().await;
     daemon.reconcile_traffic().await;
 
@@ -1722,6 +1747,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     daemon.edge.watch_wakes(wake_sender);
 
     crate::notify::ready(&format!("serving on {serving_on}"));
+    daemon
+        .info
+        .started
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Commands are carried out one at a time; a host dying in between is
     // noticed by the next pass. SIGTERM and SIGINT detach, as a service
@@ -1813,6 +1842,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 daemon.sample_history(samples.as_deref()).await;
                 daemon.advance_rollouts(samples.as_deref()).await;
                 daemon.autoscale(samples.as_deref()).await;
+                daemon.guard_memory();
                 daemon.refresh_client_lists().await;
                 daemon.reconcile_overlays().await;
                 daemon.check_clock();
@@ -1822,6 +1852,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
         daemon.publish_live();
     };
+
+    daemon
+        .info
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Section 13.3: by default the daemon detaches, leaving hosts and the
     // edge serving for the next daemon to re-adopt; with drain it takes
@@ -2704,7 +2739,7 @@ impl Daemon {
                         pools.iter().map(|pool| pool.loop_slots as usize).sum(),
                     ),
                     waiting: pools.iter().map(|pool| pool.waiting as usize).sum(),
-                    created: clock_hms(release.created_unix_ms),
+                    created: full_time(release.created_unix_ms),
                 });
             }
 
@@ -2715,7 +2750,7 @@ impl Daemon {
                 previous: app.previous.clone().unwrap_or_default(),
                 maintenance_since: maintenance
                     .get(&app.name)
-                    .map(|since| clock_hms(*since))
+                    .map(|since| full_time(*since))
                     .unwrap_or_default(),
                 releases,
             });
@@ -2811,7 +2846,7 @@ impl Daemon {
                 baseline: rollout.baseline,
                 state: rollout.state.as_str().to_owned(),
                 message: rollout.message,
-                updated: clock_hms(rollout.updated_unix_ms),
+                updated: full_time(rollout.updated_unix_ms),
             })
             .collect();
 
@@ -2824,7 +2859,7 @@ impl Daemon {
                 maintenance_since: self
                     .host_maintenance
                     .get(&name)
-                    .map(|since| clock_hms(*since))
+                    .map(|since| full_time(*since))
                     .unwrap_or_default(),
                 name,
                 names: host.names,
@@ -3023,11 +3058,11 @@ impl Daemon {
 
         // Section 7.4: the budget.
 
-        if settings.budget != self.budget {
-            self.budget = settings.budget;
+        if settings.budget != self.budget_table {
+            self.budget_table = settings.budget;
             report.changed(
                 "[daemon.budget]",
-                &self.budget.describe(&self.budget_usage()),
+                &self.budget().describe(&self.budget_usage()),
             );
         } else {
             report.unchanged("[daemon.budget]");
@@ -5353,8 +5388,11 @@ impl Daemon {
             loop_stall_timeout: Duration::from_millis(spec.timeouts.loop_stall_timeout_ms),
             gil_stall_timeout: Duration::from_millis(spec.timeouts.gil_stall_timeout_ms),
             memory: spec.memory.clone(),
-            memory_budget: None,
-            cgroup: None,
+            cgroup: self
+                .cgroup
+                .as_ref()
+                .filter(|limits| limits.memory_max.is_some())
+                .map(|limits| limits.dir.clone()),
             env,
             shown_env: spec
                 .env
@@ -7293,6 +7331,8 @@ impl Daemon {
     /// whose count is not what its scaler wants, after a restart or a
     /// restored pin, is asked for again.
     async fn autoscale(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
+        let budget = self.budget();
+
         let Some(samples) = samples else {
             return;
         };
@@ -7339,73 +7379,29 @@ impl Daemon {
                     .max()
                     .map(|at| now.saturating_duration_since(*at));
                 let group = &mut running.scalers[index];
-                let advisory = group.scaler.spec().advisory;
-                group.scaler.set_capacity(capacities.remove(&(
-                    app.clone(),
-                    id.clone(),
-                    group.name.clone(),
-                )));
+                let capacity = capacities.remove(&(app.clone(), id.clone(), group.name.clone()));
 
-                if advisory {
-                    group.scaler.sync(ready);
-                }
-
-                let before = group.scaler.desired();
-                let signals = Signals::from_samples(
-                    samples,
-                    app,
-                    id,
-                    &group.name,
-                    ready,
-                    group.slots_per_worker,
-                    youngest,
-                );
-
-                match group.scaler.observe(now, signals) {
-                    Some(Decision::ScaleOut { to, reason }) if !advisory => {
-                        let reason = format!(
-                            "{reason}; {}",
-                            describe_diagnosis(&group.scaler.diagnosis())
-                        );
+                match group.observe(now, samples, app, id, ready, youngest, capacity) {
+                    Step::Ask { from, to, reason } => {
                         let key = (app.clone(), id.clone(), name);
                         reasons.insert(key.clone(), (ready, reason));
                         asks.push(crate::budget::Ask {
                             key,
                             priority: priorities.get(app).copied().unwrap_or(0),
-                            from: before,
+                            from,
                             to,
                             cost,
                         });
                     }
-                    Some(Decision::ScaleOut { to, reason } | Decision::ScaleIn { to, reason }) => {
-                        let diagnosis = group.scaler.diagnosis();
-                        emitted.push((
-                            "scaling.decision",
-                            subject.clone(),
-                            "info",
-                            decision_message(
-                                &group.name,
-                                ready,
-                                to,
-                                &format!("{reason}; {}", describe_diagnosis(&diagnosis)),
-                                advisory,
-                            ),
-                        ));
+                    Step::Event(kind, level, message) => {
+                        emitted.push((kind, subject.clone(), level, message));
                     }
-                    Some(Decision::Suspended { reason }) => {
-                        emitted.push((
-                            "churn_budget.exhausted",
-                            subject.clone(),
-                            "warning",
-                            format!("{}: {reason}", group.name),
-                        ));
-                    }
-                    None => {}
+                    Step::Nothing => {}
                 }
             }
         }
 
-        for admitted in crate::budget::admit(&self.budget, used, asks) {
+        for admitted in crate::budget::admit(&budget, used, asks) {
             let (app, id, name) = &admitted.ask.key;
             let Some(group) = self
                 .running
@@ -7417,42 +7413,22 @@ impl Daemon {
 
             let subject = format!("{app}@{id}");
             let (ready, reason) = reasons.remove(&admitted.ask.key).unwrap_or_default();
-            let from = admitted.ask.from;
+            let held = admitted.limit.map_or_else(String::new, |limit| {
+                format!("the node's {limit} budget ({})", budget.describe(&used))
+            });
 
-            match admitted.limit {
-                Some(limit) => {
-                    let held = format!(
-                        "the node's {limit} budget ({})",
-                        self.budget.describe(&used)
-                    );
-                    group.scaler.limit(from, admitted.to, now, &held);
-                    let denial = (admitted.ask.to, admitted.to, limit);
-
-                    if group.denied != Some(denial) {
-                        group.denied = Some(denial);
-                        emitted.push((
-                            "scaling.denied_by_budget",
-                            subject.clone(),
-                            "warning",
-                            format!(
-                                "{name}: {} of the {} more workers asked for fit {held}, at priority {}",
-                                admitted.to - from,
-                                admitted.ask.to - from,
-                                admitted.ask.priority
-                            ),
-                        ));
-                    }
-                }
-                None => group.denied = None,
-            }
-
-            if admitted.to > from {
-                emitted.push((
-                    "scaling.decision",
-                    subject,
-                    "info",
-                    decision_message(name, ready, admitted.to, &reason, false),
-                ));
+            for (kind, level, message) in group.admitted(
+                now,
+                ready,
+                admitted.ask.from,
+                admitted.ask.to,
+                admitted.to,
+                admitted.limit,
+                &held,
+                &reason,
+                Some(admitted.ask.priority),
+            ) {
+                emitted.push((kind, subject.clone(), level, message));
             }
         }
 
@@ -7470,13 +7446,8 @@ impl Daemon {
                 };
 
                 let group = &mut running.scalers[index];
-                let desired = group.scaler.desired();
 
-                if !group.scaler.spec().advisory
-                    && desired != ready
-                    && group.requested != Some(desired)
-                {
-                    group.requested = Some(desired);
+                if let Some(desired) = group.wanted(ready) {
                     requests.push((app.clone(), id.clone(), group.name.clone(), desired));
                 }
             }
@@ -7495,7 +7466,7 @@ impl Daemon {
         // stopped.
 
         if self
-            .budget
+            .budget()
             .memory
             .is_some_and(|memory| used.memory > memory)
         {
@@ -7520,7 +7491,7 @@ impl Daemon {
     /// the start of its warm-up's lead or `BUDGET_LEAD` before it,
     /// whichever is longer, with an event when it does not fit.
     fn check_floors_ahead(&mut self, view: &crate::budget::View) {
-        if !self.budget.is_set() {
+        if !self.budget().is_set() {
             return;
         }
 
@@ -7745,6 +7716,8 @@ impl Daemon {
     /// stops retained releases to make room; the memory limit applies to
     /// both, as it does to a deploy.
     async fn wake(&mut self, wake: muru_proto::edge::v1::Wake) {
+        let budget = self.budget();
+
         let key = (wake.app.clone(), wake.release.clone());
         let subject = format!("{}@{}", wake.app, wake.release);
         let now = Instant::now();
@@ -7797,7 +7770,7 @@ impl Daemon {
 
         let lifted = crate::budget::Budget {
             workers: None,
-            ..self.budget
+            ..budget
         };
         let mut used = self.budget_usage();
         let mut admitted = crate::budget::admit(&lifted, used, vec![ask.clone()]).remove(0);
@@ -7828,10 +7801,7 @@ impl Daemon {
         };
 
         if let Some(limit) = admitted.limit {
-            let held = format!(
-                "the node's {limit} budget ({})",
-                self.budget.describe(&used)
-            );
+            let held = format!("the node's {limit} budget ({})", budget.describe(&used));
             group.scaler.limit(0, admitted.to, now, &held);
             self.events.emit(
                 "scaling.denied_by_budget",
@@ -7849,7 +7819,7 @@ impl Daemon {
         let mut message = decision_message(&wake.group, 0, to, &reason, false);
 
         if let Some(limit) = self
-            .budget
+            .budget()
             .workers
             .filter(|limit| used.workers + to > *limit)
         {
@@ -7888,7 +7858,7 @@ impl Daemon {
         let mut message = "a request is waiting: starting its host again".to_owned();
 
         if let Some(limit) = self
-            .budget
+            .budget()
             .workers
             .filter(|limit| used.workers + starting > *limit)
         {
@@ -7920,7 +7890,7 @@ impl Daemon {
     /// until the node is back under it or none is left; until then other
     /// releases' scale-out finds no room.
     async fn make_worker_room(&mut self, subject: &str) {
-        let Some(limit) = self.budget.workers else {
+        let Some(limit) = self.budget().workers else {
             return;
         };
 
@@ -7972,9 +7942,10 @@ impl Daemon {
     fn budget_view(&self, used: crate::budget::Usage) -> crate::budget::View {
         let fallback = self.node_mean_pss();
         let mut view = crate::budget::View {
-            budget: self.budget,
+            budget: self.budget(),
             used,
             fallback,
+            sources: self.budget_sources(),
             ..crate::budget::View::default()
         };
 
@@ -8014,7 +7985,7 @@ impl Daemon {
     /// when that is enough; refused with a `scaling.denied_by_budget`
     /// event when it is not.
     async fn make_room(&mut self, app: &str, spec: &ReleaseSpec) -> Result<(), String> {
-        if self.budget.memory.is_none() {
+        if self.budget().memory.is_none() {
             return Ok(());
         }
 
@@ -8196,6 +8167,239 @@ impl Daemon {
 
     /// Ask a release's host to bring a group to a worker count; the host
     /// announces the sockets as they change.
+    /// Section 7.4 and issue 384: the budget in force. The daemon file's
+    /// limits win; `memory` and `cpu` it leaves out default to the
+    /// daemon's own cgroup's, read now, so an in-place resize applies to
+    /// the next decision: `memory.max` less the headroom, and the quota
+    /// of `cpu.max`. `workers` has no default.
+    fn budget(&self) -> crate::budget::Budget {
+        let mut budget = self.budget_table;
+
+        let Some(limits) = self.cgroup.as_ref().map(crate::cgroup::Limits::again) else {
+            return budget;
+        };
+
+        if budget.memory.is_none() {
+            budget.memory = limits
+                .memory_max
+                .map(|limit| limit.saturating_sub(crate::cgroup::headroom(limit)));
+        }
+
+        if budget.cpu.is_none() {
+            budget.cpu = limits
+                .cpu_max
+                .map(|(quota, period)| quota as f64 / period.max(1) as f64);
+        }
+
+        budget
+    }
+
+    /// Where the budget's limits come from, for status: the cgroup's
+    /// files for those the daemon file leaves out.
+    fn budget_sources(&self) -> String {
+        let Some(limits) = self.cgroup.as_ref().map(crate::cgroup::Limits::again) else {
+            return String::new();
+        };
+
+        let mut from = Vec::new();
+
+        if self.budget_table.memory.is_none()
+            && let Some(limit) = limits.memory_max
+        {
+            from.push(format!(
+                "memory from memory.max {} less {} of headroom",
+                muru_config::format_size_approx(limit),
+                muru_config::format_size_approx(crate::cgroup::headroom(limit))
+            ));
+        }
+
+        if self.budget_table.cpu.is_none()
+            && let Some((quota, period)) = limits.cpu_max
+        {
+            from.push(format!("cpu from cpu.max {quota} {period}"));
+        }
+
+        if from.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", from.join(", "))
+        }
+    }
+
+    /// Sections 7.7 and 13.9: at every memory check, the shortest
+    /// `check_interval` of the running releases, read the daemon's
+    /// cgroup again and, with less than the headroom left under its
+    /// `memory.max`, have the largest worker of every release replaced,
+    /// or its group scaled in by it when its policy allows (issue 622).
+    fn guard_memory(&mut self) {
+        let Some(limits) = &self.cgroup else {
+            return;
+        };
+
+        let now = Instant::now();
+
+        if self
+            .guard_checked
+            .is_some_and(|(at, interval)| now.saturating_duration_since(at) < interval)
+        {
+            return;
+        }
+
+        let read = limits.again();
+        let changes = read.changes(limits);
+
+        if !changes.is_empty() {
+            tracing::info!("cgroup limits changed: {}", changes.join(", "));
+        }
+
+        self.cgroup = Some(read.clone());
+
+        // Every release's workers, each measured by its group's policy.
+
+        let mut workers = Vec::new();
+        let mut hosts = 0;
+        let mut interval = 5_000;
+
+        for ((app, id), running) in &self.running {
+            hosts += running.host_pss.unwrap_or(0);
+            let spec = self.store.release(app, id).ok().map(|release| release.spec);
+
+            if let Some(spec) = &spec {
+                interval = interval.min(spec.memory.check_interval_ms);
+            }
+
+            for worker in &running.status {
+                let policy = spec
+                    .as_ref()
+                    .map(|spec| {
+                        spec.groups
+                            .iter()
+                            .find(|group| group.name == worker.group)
+                            .and_then(|group| group.memory.clone())
+                            .unwrap_or_else(|| spec.memory.clone())
+                    })
+                    .unwrap_or_default();
+
+                let (size, measure) = match policy.measure {
+                    muru_config::Measure::Uss => (worker.uss, "uss"),
+                    muru_config::Measure::Pss => (worker.pss, "pss"),
+                    muru_config::Measure::Rss => (worker.rss, "rss"),
+                };
+
+                let name = muru_common::worker::WorkerName::new(&worker.group, worker.index);
+
+                workers.push(crate::guard::Worker {
+                    owner: format!("{app}@{id}"),
+                    group: name.group.clone(),
+                    index: worker.index,
+                    name: name.to_string(),
+                    pid: worker.pid,
+                    size: size.unwrap_or(0),
+                    measure,
+                });
+            }
+        }
+
+        self.guard_checked = Some((now, Duration::from_millis(interval.max(250))));
+        let memory = read.memory();
+
+        let action = match memory {
+            Some(memory) => self.guard.check(memory, &workers, hosts),
+            None => crate::guard::Action::Nothing,
+        };
+
+        *self.info.cgroup_limits.lock().expect("limits poisoned") = Some(crate::guard::report(
+            &read,
+            memory,
+            workers.iter().map(|worker| worker.size).sum(),
+            hosts,
+            Some(&self.guard),
+        ));
+
+        match action {
+            crate::guard::Action::Nothing => {}
+            crate::guard::Action::Hold(warning) => tracing::warn!("{warning}"),
+            crate::guard::Action::Replace {
+                owner,
+                group,
+                index,
+                pid,
+                reason,
+            } => self.guard_replace(&owner, &group, index, pid, &reason, &workers),
+        }
+    }
+
+    /// The guard chose a worker: its group is scaled in by it when the
+    /// group has a policy above its fewest workers, else it is replaced.
+    fn guard_replace(
+        &mut self,
+        owner: &str,
+        group: &str,
+        index: u32,
+        pid: u32,
+        reason: &str,
+        workers: &[crate::guard::Worker],
+    ) {
+        let Some((app, id)) = owner.split_once('@') else {
+            return;
+        };
+
+        let key = (app.to_owned(), id.to_owned());
+        let current = workers
+            .iter()
+            .filter(|worker| worker.owner == owner && worker.group == group)
+            .count() as u32;
+        let mut shrunk = None;
+
+        if let Some(running) = self.running.get_mut(&key)
+            && running.retained_until.is_none()
+            && let Some(scaling) = running
+                .scalers
+                .iter_mut()
+                .find(|scaling| scaling.name == group)
+        {
+            let spec = scaling.scaler.spec();
+
+            if !spec.is_static()
+                && !spec.advisory
+                && scaling.scaler.pinned().is_none()
+                && current > spec.min_workers
+            {
+                let to = current - 1;
+                let why = format!("for memory: {reason}");
+                scaling.scaler.shrink(current, to, Instant::now(), &why);
+                scaling.requested = Some(to);
+                shrunk = Some(decision_message(group, current, to, &why, false));
+            }
+        }
+
+        if let Some(message) = &shrunk {
+            self.guard.scaled_in();
+            self.events.emit("scaling.decision", owner, "info", message);
+        }
+
+        let Some(control) = self
+            .running
+            .get(&key)
+            .and_then(|running| running.control.as_ref())
+        else {
+            return;
+        };
+
+        self.last_request += 1;
+        control.request(
+            self.last_request,
+            "recycle",
+            Some(&muru_common::worker::WorkerName::new(group, index)),
+            &serde_json::json!({
+                "pid": pid,
+                "reason": reason,
+                "cause": "container_memory",
+                "retire": shrunk.is_some(),
+            }),
+        );
+    }
+
     fn ask_scale(&mut self, app: &str, id: &str, group: &str, processes: u32) {
         let Some(control) = self
             .running
@@ -9190,7 +9394,7 @@ impl Daemon {
                     control.acknowledge(version);
                 }
             }
-            HostMessage::Status { workers } => {
+            HostMessage::Status { workers, .. } => {
                 if let Some(running) = self.running.get_mut(&key) {
                     // Section 7.3: the workers' own signals, from what
                     // grew since a report at least a few seconds older,
@@ -9723,11 +9927,11 @@ impl Daemon {
             None => return (String::new(), String::new()),
         };
 
+        // The time is UTC, with the zone, as `release list` and the
+        // events give it (issue 618).
+
         let phrase = if word == "retained" && running.retained_until_unix_ms > 0 {
-            let until =
-                std::time::UNIX_EPOCH + Duration::from_millis(running.retained_until_unix_ms);
-            let clock = muru_common::log::clock(until);
-            format!("retained until {}", &clock[..5])
+            format!("retained until {}", clock(running.retained_until_unix_ms))
         } else {
             word.to_owned()
         };
@@ -10162,23 +10366,14 @@ fn unix_ms_of(instant: Option<Instant>) -> u64 {
     })
 }
 
-/// A Unix time as HH:MM:SS, UTC.
 /// A time in milliseconds since the epoch in the full form of section
 /// 11.8, for the dashboard to show as the viewer's local clock.
 pub(crate) fn full_time(unix_ms: u64) -> String {
     muru_common::log::full(std::time::UNIX_EPOCH + Duration::from_millis(unix_ms))
 }
 
-pub(crate) fn clock_hms(unix_ms: u64) -> String {
-    let seconds = (unix_ms / 1000) % 86_400;
-    format!(
-        "{:02}:{:02}:{:02}",
-        seconds / 3600,
-        (seconds % 3600) / 60,
-        seconds % 60
-    )
-}
-
+/// A Unix time as HH:MM with the zone, UTC: how `release list` and the
+/// process view give a retained release's deadline.
 fn clock(unix_ms: u64) -> String {
     let seconds = (unix_ms / 1000) % 86_400;
     format!("{:02}:{:02} UTC", seconds / 3600, (seconds % 3600) / 60)
@@ -10230,26 +10425,6 @@ fn restored_rotator(policy: crate::rotation::Policy, store: &Store) -> crate::ro
     crate::rotation::Rotator::restored(policy, present)
 }
 
-/// Sections 7.3 and 7.4: what one worker offers before the edge has
-/// counted any, and the threads it runs Python on at once without a GIL,
-/// by the interface the release's default mount runs as: its threads for
-/// WSGI, and for ASGI its event loop's concurrency, and its sync threads
-/// with the loop's own. gRPC calls are held on the event loop too
-/// (section 6.13).
-fn worker_size(
-    interface: muru_config::Interface,
-    threads: u32,
-    sync_threads: u32,
-    concurrency: u32,
-) -> (f64, u32) {
-    match interface {
-        muru_config::Interface::Asgi | muru_config::Interface::Grpc => {
-            (concurrency as f64, sync_threads + 1)
-        }
-        muru_config::Interface::Wsgi | muru_config::Interface::Auto => (threads as f64, threads),
-    }
-}
-
 /// Size each group's scaler for the interface the release runs as, which
 /// its host announces once it has loaded the application: a release left
 /// to be detected is sized as WSGI only until then.
@@ -10270,7 +10445,7 @@ fn size_scalers(
 
         if let Some((threads, sync_threads, concurrency)) = sizes {
             (scaling.slots_per_worker, scaling.threads) =
-                worker_size(interface, threads, sync_threads, concurrency);
+                crate::scaling::worker_size(interface, threads, sync_threads, concurrency);
         }
     }
 }
@@ -10290,33 +10465,38 @@ fn scalers_for(
         .memory
         .soft_limit
         .map(|limit| (spec.memory.measure, limit));
-    let mut scalers = vec![GroupScaling {
-        name: muru_edge::routing::DEFAULT_GROUP.to_owned(),
-        scaler: Scaler::new(spec.scaling.clone(), sockets.len() as u32),
-        slots_per_worker: 0.0,
-        requested: None,
-        threads: 0,
+    let mut scalers = vec![GroupScaling::new(
+        muru_edge::routing::DEFAULT_GROUP,
+        spec.scaling.clone(),
+        sockets.len() as u32,
         memory_limit,
-        denied: None,
-    }];
+    )];
 
     for group in &spec.groups {
         let current = groups
             .iter()
             .find(|record| record.name == group.name)
             .map_or(group.processes as usize, |record| record.sockets.len());
-        scalers.push(GroupScaling {
-            name: group.name.clone(),
-            scaler: Scaler::new(group.scaling.clone(), current as u32),
-            slots_per_worker: 0.0,
-            requested: None,
-            threads: 0,
+        scalers.push(GroupScaling::new(
+            &group.name,
+            group.scaling.clone(),
+            current as u32,
             memory_limit,
-            denied: None,
-        });
+        ));
     }
 
     size_scalers(&mut scalers, spec, interface);
+
+    // Issue 384: a worker of a group with a hard limit counts at it.
+
+    for scaling in &mut scalers {
+        scaling.hard_limit = spec
+            .groups
+            .iter()
+            .find(|group| group.name == scaling.name)
+            .and_then(|group| group.memory.as_ref())
+            .map_or(spec.memory.hard_limit, |memory| memory.hard_limit);
+    }
 
     for (name, count) in pins {
         if let Some(scaling) = scalers.iter_mut().find(|scaling| &scaling.name == name) {
@@ -10388,27 +10568,6 @@ fn clock_event(
 
 /// A scaling decision as its event says it.
 /// Section 7.3: a diagnosis as words for an event or a status line.
-fn describe_diagnosis(diagnosis: &crate::scaling::Diagnosis) -> String {
-    if diagnosis.advice.is_empty() {
-        format!("diagnosis: {}", diagnosis.summary)
-    } else {
-        format!(
-            "diagnosis: {}; for the next release, {}",
-            diagnosis.summary, diagnosis.advice
-        )
-    }
-}
-
-fn decision_message(group: &str, from: u32, to: u32, reason: &str, advisory: bool) -> String {
-    let verb = if to > from { "scale out" } else { "scale in" };
-
-    if advisory {
-        format!("advisory: would {verb} {group} from {from} to {to} workers: {reason}")
-    } else {
-        format!("{group}: {verb} from {from} to {to} workers: {reason}")
-    }
-}
-
 /// The applications a route sends requests to: the application, or a
 /// static route's fallback.
 fn route_apps(route: &muru_config::Route) -> Vec<&str> {
@@ -10611,6 +10770,15 @@ mod tests {
         );
     }
 
+    /// The process view and `release list` give a retained release's
+    /// deadline the same way, in UTC with the zone (issue 618).
+    #[test]
+    fn a_deadline_is_given_in_utc_with_the_zone() {
+        let at = (7 * 3600 + 40 * 60) * 1000 + 59_999;
+
+        assert_eq!(clock(at), "07:40 UTC");
+    }
+
     #[test]
     fn the_retained_note_says_what_a_rollback_costs() {
         let kept = |counts: &[u32]| {
@@ -10729,9 +10897,21 @@ mod tests {
         // Threads 4, sync threads 8, concurrency 1000: as WSGI until the
         // host has said what it detected, then by the loop.
 
-        assert_eq!(worker_size(Interface::Auto, 4, 8, 1000), (4.0, 4));
-        assert_eq!(worker_size(Interface::Wsgi, 4, 8, 1000), (4.0, 4));
-        assert_eq!(worker_size(Interface::Asgi, 4, 8, 1000), (1000.0, 9));
-        assert_eq!(worker_size(Interface::Grpc, 4, 8, 1000), (1000.0, 9));
+        assert_eq!(
+            crate::scaling::worker_size(Interface::Auto, 4, 8, 1000),
+            (4.0, 4)
+        );
+        assert_eq!(
+            crate::scaling::worker_size(Interface::Wsgi, 4, 8, 1000),
+            (4.0, 4)
+        );
+        assert_eq!(
+            crate::scaling::worker_size(Interface::Asgi, 4, 8, 1000),
+            (1000.0, 9)
+        );
+        assert_eq!(
+            crate::scaling::worker_size(Interface::Grpc, 4, 8, 1000),
+            (1000.0, 9)
+        );
     }
 }

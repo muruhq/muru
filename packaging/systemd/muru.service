@@ -15,8 +15,16 @@ LogsDirectory=muru
 RuntimeDirectory=muru
 RuntimeDirectoryPreserve=yes
 KillMode=process
+# A worker the kernel kills for memory is replaced by its host, so the
+# service carries on rather than stopping over one worker.
+OOMPolicy=continue
 Restart=on-failure
 LimitNOFILE=1048576
+# To bound what Muru may use on this machine, give the whole service a
+# limit; the node budget and the memory guard then work from it. See
+# the limits section of the systemd guide, howto/systemd.
+#MemoryMax=8G
+#CPUQuota=400%
 
 [Install]
 WantedBy=multi-user.target

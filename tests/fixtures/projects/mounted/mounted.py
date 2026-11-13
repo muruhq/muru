@@ -24,6 +24,7 @@ def _wsgi(name: str) -> Callable[..., Iterable[bytes]]:
                 "script_name": environ["SCRIPT_NAME"],
                 "path_info": environ["PATH_INFO"],
                 "context_interface": context().interface,
+                "group": context().group,
                 "pid": os.getpid(),
             }
         ).encode()

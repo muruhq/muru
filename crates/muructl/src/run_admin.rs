@@ -76,6 +76,52 @@ impl HostLink {
         }
     }
 
+    /// Have the host replace a worker for the memory guard (sections
+    /// 7.7 and 13.9), or with `retire` scale its group in by it, saying
+    /// why the host refused, if it does.
+    pub fn recycle(&mut self, worker: &WorkerName, pid: u32, reason: &str, retire: bool) {
+        let asked = self.ask(
+            "recycle",
+            Some(worker),
+            &serde_json::json!({
+                "pid": pid,
+                "reason": reason,
+                "cause": "container_memory",
+                "retire": retire,
+            }),
+        );
+
+        let answer = match asked {
+            Ok(answer) => answer,
+            Err(error) => {
+                muru_common::muru_println!("worker {worker} could not be replaced: {error}");
+                return;
+            }
+        };
+
+        let worker = worker.clone();
+
+        tokio::spawn(async move {
+            if let Ok(Err(error)) = answer.await {
+                muru_common::muru_println!("worker {worker} could not be replaced: {error}");
+            }
+        });
+    }
+
+    /// Section 13.9: bring a group to `processes` workers, as the
+    /// autoscaler asks.
+    pub fn scale(&mut self, group: &str, processes: u32) {
+        let asked = self.ask(
+            "scale",
+            None,
+            &serde_json::json!({"group": group, "processes": processes}),
+        );
+
+        if let Err(error) = asked {
+            muru_common::muru_println!("group {group} could not be scaled: {error}");
+        }
+    }
+
     /// Send a request to the host, returning what the answer arrives on.
     fn ask(
         &mut self,
@@ -234,6 +280,12 @@ pub struct RunProcesses {
     pub live: muru_controller::processes::Live,
     /// Each process's CPU time when last read.
     pub cpu: Arc<muru_controller::processes::CpuMeter>,
+    /// The container's limits and the memory guard, under `muructl
+    /// serve` in a cgroup v2 (sections 7.7 and 13.9).
+    pub limits: crate::serve_limits::SharedReport,
+    /// The groups' scaling under `muructl serve` (section 13.9), once it
+    /// has started.
+    pub scaling: std::sync::OnceLock<crate::serve_scaling::Shared>,
     seen: Mutex<Seen>,
 }
 
@@ -268,6 +320,8 @@ impl RunProcesses {
             release,
             live: muru_controller::processes::Live::default(),
             cpu: Arc::default(),
+            limits: Arc::default(),
+            scaling: std::sync::OnceLock::new(),
             seen: Mutex::default(),
         })
     }
@@ -303,6 +357,15 @@ impl RunProcesses {
         if !interface.is_empty() {
             seen.interface = interface;
         }
+    }
+
+    /// What every worker last reported.
+    pub fn statuses(&self) -> Vec<muru_controller::host::WorkerStatus> {
+        self.seen
+            .lock()
+            .expect("run processes poisoned")
+            .status
+            .clone()
     }
 
     /// What the workers last reported.
@@ -414,6 +477,7 @@ impl RunProcesses {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             mode: self.mode.to_owned(),
             started_unix_ms: self.started_unix_ms,
+            limits: self.limits.lock().expect("limits report poisoned").clone(),
         };
 
         muru_controller::processes::snapshot(
@@ -1076,6 +1140,37 @@ impl Admin for Service {
         ))
     }
 
+    // Section 13.9: under muructl serve the groups' scaling answers
+    // through the admin socket as the daemon's does. A container's count
+    // is its configuration, so it is not pinned from inside.
+
+    async fn get_scale_status(
+        &self,
+        _: Request<pb::GetScaleStatusRequest>,
+    ) -> Result<Response<pb::ScaleStatus>, Status> {
+        let Some(scaling) = self.state.processes.scaling.get() else {
+            return Err(self.needs_the_daemon("muructl scale"));
+        };
+
+        let status = scaling.lock().expect("scaling poisoned").status();
+        Ok(Response::new(status))
+    }
+
+    async fn set_scale(
+        &self,
+        _: Request<pb::SetScaleRequest>,
+    ) -> Result<Response<pb::ScaleStatus>, Status> {
+        if self.state.processes.scaling.get().is_none() {
+            return Err(self.needs_the_daemon("muructl scale"));
+        }
+
+        Err(Status::failed_precondition(
+            "muructl scale pin and unpin are not offered under muructl serve: a container's \
+             worker count is its configuration, so a different one is a new image or a \
+             changed deployment",
+        ))
+    }
+
     async fn get_status(
         &self,
         _: Request<pb::GetStatusRequest>,
@@ -1110,6 +1205,12 @@ impl Admin for Service {
             config: String::new(),
             log_dir: String::new(),
             cache_dir: String::new(),
+            limits: state
+                .processes
+                .limits
+                .lock()
+                .expect("limits report poisoned")
+                .clone(),
         }))
     }
 
@@ -1580,9 +1681,8 @@ impl Admin for Service {
         promote_rollout(pb::RolloutControlRequest) -> pb::Rollout, "muructl rollout";
         abort_rollout(pb::RolloutControlRequest) -> pb::Rollout, "muructl rollout";
         promote_release(pb::PromoteReleaseRequest) -> pb::Release, "muructl rollout";
-        set_scale(pb::SetScaleRequest) -> pb::ScaleStatus, "muructl scale";
-        get_scale_status(pb::GetScaleStatusRequest) -> pb::ScaleStatus, "muructl scale";
         set_maintenance(pb::SetMaintenanceRequest) -> pb::MaintenanceStatus, "muructl maintenance";
+        probe(pb::ProbeRequest) -> pb::ProbeAnswer, "muructl probe";
         dashboard_login(pb::DashboardLoginRequest) -> pb::DashboardLoginLink, "muructl dashboard";
         shutdown(pb::ShutdownRequest) -> pb::ShutdownResponse, "muructl daemon stop";
         list_hosts(pb::ListHostsRequest) -> pb::ListHostsResponse, "muructl host";
