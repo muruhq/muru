@@ -4,5 +4,6 @@
 
 #[cfg(feature = "log")]
 pub mod log;
+pub mod mounts;
 pub mod title;
 pub mod worker;

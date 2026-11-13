@@ -3067,6 +3067,11 @@ pub async fn show_status(path: &Path, json: bool) -> anyhow::Result<()> {
 
         println!("run dir  {}", status.run_dir);
         println!("websockets {} open", status.websockets);
+
+        if let Some(limits) = &status.limits {
+            print_limits(limits);
+        }
+
         return Ok(());
     }
 
@@ -3101,6 +3106,67 @@ pub async fn show_status(path: &Path, json: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// A cgroup's limits and the memory guard, as `muructl status` prints
+/// them (sections 7.7 and 13.9).
+fn print_limits(limits: &pb::CgroupLimits) {
+    print!("{}", limits_lines(limits));
+}
+
+fn limits_lines(limits: &pb::CgroupLimits) -> String {
+    use muru_config::format_size_approx as size;
+
+    let mut text = String::new();
+
+    let cpu = if limits.cpu_quota > 0.0 {
+        let quota = format!("{:.2}", limits.cpu_quota);
+        let quota = quota.trim_end_matches('0').trim_end_matches('.');
+        let noun = if quota == "1" { "CPU" } else { "CPUs" };
+        format!("{quota} {noun} from cpu.max")
+    } else if limits.cpus > 0 {
+        format!("no CPU quota, {} from cpuset.cpus.effective", limits.cpus)
+    } else {
+        "no CPU quota".to_owned()
+    };
+    text.push_str(&format!("cpu      {cpu}\n"));
+
+    if limits.memory_max == 0 {
+        text.push_str("memory   no memory.max\n");
+        return text;
+    }
+
+    text.push_str(&format!(
+        "memory   memory.max {}, {} used, {} left, headroom {}\n",
+        size(limits.memory_max),
+        size(limits.memory_used),
+        size(limits.memory_left),
+        size(limits.headroom)
+    ));
+    text.push_str(&format!(
+        "         workers {}, host {}\n",
+        size(limits.workers_memory),
+        size(limits.host_memory)
+    ));
+
+    let mut guard = match limits.guard.as_str() {
+        "watching" => "watching".to_owned(),
+        state => format!("{state}: {}", limits.guard_note),
+    };
+
+    if !limits.last_replaced.is_empty() {
+        let seconds = limits.last_replaced_unix_ms / 1000 % 86_400;
+        guard.push_str(&format!(
+            "; it last replaced {} at {:02}:{:02}:{:02} UTC",
+            limits.last_replaced,
+            seconds / 3600,
+            seconds % 3600 / 60,
+            seconds % 60
+        ));
+    }
+
+    text.push_str(&format!("guard    {guard}\n"));
+    text
 }
 
 /// The daemon's socket, configuration file and directories, as `daemon
@@ -9592,8 +9658,36 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 
 #[cfg(test)]
 mod tests {
+    use super::limits_lines;
     use super::metric_samples;
     use super::pb;
+
+    #[test]
+    fn the_limits_are_printed_as_the_guide_shows_them() {
+        let limits = pb::CgroupLimits {
+            cgroup: "/sys/fs/cgroup".to_owned(),
+            cpu_quota: 2.0,
+            cpus: 64,
+            memory_max: 1 << 30,
+            memory_used: 586 << 20,
+            memory_left: 438 << 20,
+            headroom: 128 << 20,
+            workers_memory: 296 << 20,
+            host_memory: 250 << 20,
+            guard: "watching".to_owned(),
+            guard_note: String::new(),
+            last_replaced: "shop@r1 worker 0 (pid 52)".to_owned(),
+            last_replaced_unix_ms: (7 * 3600 + 40 * 60 + 12) * 1000,
+        };
+
+        assert_eq!(
+            limits_lines(&limits),
+            "cpu      2 CPUs from cpu.max\n\
+             memory   memory.max 1.0GB, 586MB used, 438MB left, headroom 128MB\n\
+             \x20        workers 296MB, host 250MB\n\
+             guard    watching; it last replaced shop@r1 worker 0 (pid 52) at 07:40:12 UTC\n"
+        );
+    }
 
     #[test]
     fn discovery_reports_a_denied_run_directory_only_with_nothing_else_to_offer() {

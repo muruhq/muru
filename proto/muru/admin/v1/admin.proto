@@ -175,6 +175,26 @@ message Processes {
   uint64 sampled_unix_ms = 5;       // when the figures were taken
   InstanceFigures figures = 6;      // the instance's last second
   Process root = 7;                 // the daemon, run or serve, with the rest beneath it
+  CgroupLimits limits = 8;          // the cgroup's limits and the memory guard, when there is a cgroup v2
+}
+
+// A cgroup v2's limits as last read, and the memory guard watching its
+// memory.max (sections 7.7 and 13.9). Read when used, so they follow a
+// docker update or an in-place resize.
+message CgroupLimits {
+  string cgroup = 1;                // the cgroup's directory
+  double cpu_quota = 2;             // cpu.max's quota in CPUs; 0 without one
+  uint32 cpus = 3;                  // the CPUs of cpuset.cpus.effective; 0 when not read
+  uint64 memory_max = 4;            // bytes; 0 without a limit
+  uint64 memory_used = 5;           // memory.current less inactive file pages
+  uint64 memory_left = 6;           // memory_max less memory_used
+  uint64 headroom = 7;              // kept free: 10 % of memory_max, at least 128 MiB
+  uint64 workers_memory = 8;        // the workers' own memory, each by its policy's measure, added up
+  uint64 host_memory = 9;           // what the hosts hold, added up
+  string guard = 10;                // watching, replacing or holding; empty without a memory limit
+  string guard_note = 11;           // what the guard is doing, in words; empty while watching
+  string last_replaced = 12;        // the worker it last replaced, app@release worker NAME (pid N); empty for none
+  uint64 last_replaced_unix_ms = 13;
 }
 
 message InstanceFigures {
@@ -249,6 +269,7 @@ message Status {
   string config = 20;               // the daemon's configuration file, which need not exist; empty for a run
   string log_dir = 21;              // the daemon's log directory; empty for a run, which writes no log files
   string cache_dir = 22;            // the daemon's cache directory; empty for a run
+  CgroupLimits limits = 23;         // the cgroup's limits and the memory guard, when there is a cgroup v2
 }
 
 message ListWebSocketsRequest {

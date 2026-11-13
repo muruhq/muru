@@ -24,6 +24,7 @@ mod render;
 mod run_admin;
 mod serve;
 mod serve_admin;
+mod serve_limits;
 mod skill;
 mod watch;
 
@@ -2040,7 +2041,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
     let processes = args
         .processes
         .or(table.processes)
-        .unwrap_or(serve.map_or(DEFAULT_PROCESSES, |mode| mode.default_processes));
+        .unwrap_or(DEFAULT_PROCESSES);
     muru_controller::config::check_scaling(table.scaling.as_ref(), &table.groups, processes as u32)
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
@@ -3305,8 +3306,7 @@ async fn run_with(
         loop_stall_timeout: timeouts.loop_stall,
         gil_stall_timeout: timeouts.gil_stall,
         memory: memory.clone(),
-        memory_budget: serve.as_ref().and_then(|mode| mode.memory_budget),
-        cgroup: serve.as_ref().and_then(|mode| mode.cgroup.clone()),
+        cgroup: serve.as_ref().and_then(serve::Mode::cgroup),
         env,
         shown_env: resolved.env.keys().cloned().collect(),
         identity: None,
@@ -3403,6 +3403,14 @@ async fn run_with(
         .as_ref()
         .map_or_else(muru_edge::proxy::Trust::loopback, |mode| mode.trust.clone());
 
+    let spool = match &serve {
+        Some(mode) => Some(
+            muru_edge::uploads::Spool::new(mode.run_dir.join("spool"), Some(mode.spool_quota))
+                .with_context(|| format!("creating {}", mode.run_dir.join("spool").display()))?,
+        ),
+        None => None,
+    };
+
     let edge = match muru_edge::Edge::bind(muru_edge::Config {
         listen: http_address,
         app: label.clone(),
@@ -3427,15 +3435,7 @@ async fn run_with(
         },
         trust,
         https: tls.as_ref().map(|tls| tls.https.clone()),
-        spool: match &serve {
-            Some(mode) => Some(
-                muru_edge::uploads::Spool::new(mode.run_dir.join("spool"), Some(mode.spool_quota))
-                    .with_context(|| {
-                        format!("creating {}", mode.run_dir.join("spool").display())
-                    })?,
-            ),
-            None => None,
-        },
+        spool: spool.clone(),
         rate_buckets: None,
     })
     .await
@@ -3576,6 +3576,41 @@ async fn run_with(
         Arc::clone(&release_number),
     );
     run_processes.host(current.pid(), current.relay_pid());
+
+    // Sections 7.7 and 13.9: under serve in a cgroup v2, the limits are
+    // read again at every memory check and the memory guard watches
+    // memory.max. The start's warnings come now, the preload's once the
+    // host says what it holds.
+
+    let mut limits_watch = serve.as_ref().and_then(|mode| {
+        let limits = mode.limits.clone()?;
+        let spool = spool.as_ref().map(|spool| serve_limits::Spool {
+            spool: Arc::clone(spool),
+            rule: mode.spool.clone(),
+        });
+
+        Some(serve_limits::Watch::new(
+            limits,
+            &spec,
+            format!("{label}@r1"),
+            spool,
+            Arc::clone(&run_processes.limits),
+        ))
+    });
+
+    if let Some(watch) = &limits_watch {
+        for warning in watch.warnings() {
+            muru_common::muru_println!("warning: {warning}");
+        }
+    }
+
+    let mut limits_tick = tokio::time::interval(
+        limits_watch
+            .as_ref()
+            .map_or(Duration::from_secs(3600), serve_limits::Watch::interval),
+    );
+    limits_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_workers: Vec<muru_controller::host::WorkerStatus> = Vec::new();
 
     {
         let processes = Arc::clone(&run_processes);
@@ -3795,6 +3830,7 @@ async fn run_with(
                 "python": python.python.display().to_string(),
                 "runtime_library": library.version,
             }),
+            limits: Arc::clone(&run_processes.limits),
         });
     }
 
@@ -3879,12 +3915,34 @@ async fn run_with(
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);
                     }
-                    muru_controller::host::HostMessage::Status { workers } => {
+                    muru_controller::host::HostMessage::Status { workers, host_rss } => {
                         // The relay may have been started again since.
 
                         run_processes.host(current.pid(), current.relay_pid());
+
+                        if let Some(watch) = &mut limits_watch {
+                            watch.host(host_rss);
+                            last_workers.clone_from(&workers);
+                        }
+
                         run_processes.status(workers);
                     }
+                }
+            }
+            _ = limits_tick.tick(), if limits_watch.is_some() => {
+                let Some(watch) = &mut limits_watch else {
+                    continue;
+                };
+
+                match watch.check(&last_workers) {
+                    muru_controller::guard::Action::Replace { group, index, pid, reason, .. } => {
+                        let name = muru_common::worker::WorkerName::new(&group, index);
+                        host_link.lock().expect("host link poisoned").recycle(&name, pid, &reason);
+                    }
+                    muru_controller::guard::Action::Hold(warning) => {
+                        muru_common::muru_println!("warning: {warning}");
+                    }
+                    muru_controller::guard::Action::Nothing => {}
                 }
             }
             Some(path) = changed.recv() => {

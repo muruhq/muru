@@ -506,6 +506,9 @@ pub struct Header {
     pub mode: String,
     /// When the instance started, Unix milliseconds.
     pub started_unix_ms: u64,
+    /// The cgroup's limits and the memory guard, when there is a cgroup
+    /// v2 (sections 7.7 and 13.9).
+    pub limits: Option<pb::CgroupLimits>,
 }
 
 /// The answer to ListProcesses: the known processes as a tree, narrowed
@@ -581,6 +584,7 @@ pub async fn snapshot(
         sampled_unix_ms: crate::model::now_unix_ms(),
         root: tree(&known, &os, &cpu, &others, &figures),
         figures: Some(figures.instance),
+        limits: header.limits,
     }
 }
 

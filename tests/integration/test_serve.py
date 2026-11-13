@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -85,9 +85,11 @@ def start(
     app: str | None = "plain_wsgi:application",
     wait: bool = True,
     short: bool = False,
+    wrap: Callable[[list[str]], list[str]] | None = None,
 ) -> Serve:
     """Start muructl serve; `short` starts it as `muructl serve` alone, as a
-    container's command line does, with every setting in its variable."""
+    container's command line does, with every setting in its variable, and
+    `wrap` runs its command line through another, which execs it."""
 
     muructl = support.muructl_path()
     if muructl is None:
@@ -131,8 +133,8 @@ def start(
         variables["MURU_SERVE_ENTRYPOINT"] = app or ""
 
     process = subprocess.Popen(
-        command,
-        executable=str(muructl),
+        wrap(command) if wrap else command,
+        executable=None if wrap else str(muructl),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -709,3 +711,97 @@ def test_a_missing_runtime_library_is_not_fetched(tmp_path: Path) -> None:
     message = serve.output() + "".join(serve.stderr)
     assert "no runtime library for" in message, message
     assert "muructl build --runtime-dir" in message, message
+
+
+def sudo_write(path: Path, text: str) -> None:
+    """Write a cgroup file as root."""
+
+    subprocess.run(
+        ["sudo", "-n", "tee", str(path)],
+        input=text,
+        text=True,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+
+
+@pytest.mark.requires_root
+@pytest.mark.requires_linux
+def test_the_guard_and_status_follow_a_memory_limit_changed_while_serving(
+    tmp_path: Path,
+) -> None:
+    """A cgroup of its own, as a container's, whose memory.max the test
+    changes under a running serve, as docker update or an in-place resize
+    does (sections 7.7 and 13.9): the change is logged and shown, and with
+    less than the headroom left the guard replaces the largest worker,
+    which stops first. Needs a cgroup v2 root can write, as in the Linux
+    virtual machine; not in CI."""
+
+    root = Path("/sys/fs/cgroup")
+    assert (root / "cgroup.controllers").is_file(), "cgroup v2 is needed"
+    cgroup = root / f"muru-test-{os.getpid()}"
+    subprocess.run(["sudo", "-n", "mkdir", str(cgroup)], check=True)
+    serve: Serve | None = None
+
+    try:
+        sudo_write(cgroup / "memory.max", str(512 << 20))
+
+        # The shell moves itself into the cgroup, then becomes serve.
+
+        def into_cgroup(command: list[str]) -> list[str]:
+            joined = " ".join(f"'{part}'" for part in command)
+            return [
+                "sh",
+                "-c",
+                f"echo $$ | sudo -n tee {cgroup}/cgroup.procs >/dev/null && exec {joined}",
+            ]
+
+        serve = start(
+            tmp_path,
+            "--processes",
+            "2",
+            "--admin-status",
+            "--memory",
+            "check_interval=1s",
+            wrap=into_cgroup,
+        )
+        serve.wait_for("memory.max 512MB with 128MB of headroom")
+        serve.wait_for("once the application is imported")
+
+        def limits() -> dict[str, Any]:
+            return dict(json.loads(serve.admin("/status")[1])["limits"])
+
+        assert limits()["memory_max"] == 512 << 20
+        assert limits()["guard"] == "watching"
+
+        # Raised while it serves: said, and shown.
+
+        sudo_write(cgroup / "memory.max", str(1 << 30))
+        serve.wait_for("container limits changed: memory.max from 512MB to 1.0GB")
+        deadline = time.monotonic() + 10
+
+        while limits()["memory_max"] != 1 << 30:
+            assert time.monotonic() < deadline, limits()
+            time.sleep(0.1)
+
+        # One worker takes 400MB, then the limit comes down to leave less
+        # than the headroom: that worker is replaced, stopping first.
+
+        assert serve.get("/grow?mb=400")[0] == 200
+        deadline = time.monotonic() + 10
+
+        while limits()["workers_memory"] < 400 << 20:
+            assert time.monotonic() < deadline, limits()
+            time.sleep(0.1)
+
+        sudo_write(cgroup / "memory.max", str(limits()["memory_used"] + (60 << 20)))
+        serve.wait_for("the container was short of memory", timeout=15)
+        serve.wait_for("stops before its replacement starts", timeout=15)
+        serve.wait_for("replaced by pid", timeout=30)
+        assert limits()["last_replaced"].startswith("plain-wsgi@r1 worker ")
+        assert serve.admin("/readyz")[0] == 200
+    finally:
+        if serve is not None:
+            serve.stop()
+
+        subprocess.run(["sudo", "-n", "rmdir", str(cgroup)], check=False)

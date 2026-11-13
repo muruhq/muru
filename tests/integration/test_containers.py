@@ -358,27 +358,50 @@ def test_the_init_can_be_turned_off(container: Callable[..., Container]) -> None
     assert elapsed < 9, elapsed
 
 
-def test_serve_sizes_itself_from_the_container_limits(
+def test_serve_reports_the_container_limits_and_guards_its_memory(
     container: Callable[..., Container],
 ) -> None:
     instance = container(
         "muructl",
         "serve",
         "plain_wsgi:application",
+        "--memory",
+        "check_interval=1s",
         *TIMEOUTS,
         options=("--cpus", "1.5", "--memory", "512m", "--memory-swap", "512m"),
     )
     wait_until_serving(instance)
     logs = instance.logs()
-    assert "muru: 2 processes from cpu.max 150000 100000" in logs, logs
-    assert "muru: memory budget 384MB (memory.max 512MB less 128MB)" in logs, logs
-    assert "worker hard limit" in logs, logs
+    assert (
+        "muru: container limits: 1.5 CPUs from cpu.max 150000 100000, "
+        "memory.max 512MB with 128MB of headroom"
+    ) in logs, logs
+    wait_for(lambda: "once the application is imported" in instance.logs())
+
+    # A worker that leaves less than the headroom under memory.max is
+    # replaced by the guard, stopping first since its successor would not
+    # fit beside it, though no hard limit is set.
+
+    thread, _ = instance.request_in_the_background("/grow?mb=400")
+    wait_for(lambda: "the container was short of memory" in instance.logs())
+    thread.join(timeout=30)
+    assert "stops before its replacement starts" in instance.logs(), instance.logs()
+    wait_until_serving(instance)
+
+    # A resize while it runs is read at the next check.
+
+    subprocess.run(
+        ["docker", "update", "--memory", "768m", "--memory-swap", "768m", instance.name],
+        check=True,
+        capture_output=True,
+    )
+    wait_for(lambda: "memory.max from 512MB to 768MB" in instance.logs())
 
     # A worker that takes more than the container has, at once, is killed
     # by the kernel before its hard limit is checked; that is said, counted
     # and the worker started again.
 
-    thread, _ = instance.request_in_the_background("/grow?mb=600")
+    thread, _ = instance.request_in_the_background("/grow?mb=900")
     wait_for(lambda: "worker.oom_killed" in instance.logs())
     thread.join(timeout=30)
     metrics = instance.exec(
@@ -389,6 +412,7 @@ def test_serve_sizes_itself_from_the_container_limits(
     ).stdout
     assert 'muru_worker_exits_total{app="plain-wsgi"' in metrics, metrics
     assert 'reason="oom_killed"} 1' in metrics, metrics
+    assert 'reason="container_memory"} 1' in metrics, metrics
     wait_until_serving(instance)
 
 

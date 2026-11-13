@@ -76,6 +76,32 @@ impl HostLink {
         }
     }
 
+    /// Have the host replace a worker for the memory guard (sections
+    /// 7.7 and 13.9), saying why the host refused, if it does.
+    pub fn recycle(&mut self, worker: &WorkerName, pid: u32, reason: &str) {
+        let asked = self.ask(
+            "recycle",
+            Some(worker),
+            &serde_json::json!({"pid": pid, "reason": reason, "cause": "container_memory"}),
+        );
+
+        let answer = match asked {
+            Ok(answer) => answer,
+            Err(error) => {
+                muru_common::muru_println!("worker {worker} could not be replaced: {error}");
+                return;
+            }
+        };
+
+        let worker = worker.clone();
+
+        tokio::spawn(async move {
+            if let Ok(Err(error)) = answer.await {
+                muru_common::muru_println!("worker {worker} could not be replaced: {error}");
+            }
+        });
+    }
+
     /// Send a request to the host, returning what the answer arrives on.
     fn ask(
         &mut self,
@@ -234,6 +260,9 @@ pub struct RunProcesses {
     pub live: muru_controller::processes::Live,
     /// Each process's CPU time when last read.
     pub cpu: Arc<muru_controller::processes::CpuMeter>,
+    /// The container's limits and the memory guard, under `muructl
+    /// serve` in a cgroup v2 (sections 7.7 and 13.9).
+    pub limits: crate::serve_limits::SharedReport,
     seen: Mutex<Seen>,
 }
 
@@ -268,6 +297,7 @@ impl RunProcesses {
             release,
             live: muru_controller::processes::Live::default(),
             cpu: Arc::default(),
+            limits: Arc::default(),
             seen: Mutex::default(),
         })
     }
@@ -414,6 +444,7 @@ impl RunProcesses {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             mode: self.mode.to_owned(),
             started_unix_ms: self.started_unix_ms,
+            limits: self.limits.lock().expect("limits report poisoned").clone(),
         };
 
         muru_controller::processes::snapshot(
@@ -1110,6 +1141,12 @@ impl Admin for Service {
             config: String::new(),
             log_dir: String::new(),
             cache_dir: String::new(),
+            limits: state
+                .processes
+                .limits
+                .lock()
+                .expect("limits report poisoned")
+                .clone(),
         }))
     }
 

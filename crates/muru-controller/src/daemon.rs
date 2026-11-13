@@ -785,6 +785,7 @@ pub async fn processes(
         version: env!("CARGO_PKG_VERSION").to_owned(),
         mode: "daemon".to_owned(),
         started_unix_ms: info.started_unix_ms,
+        limits: None,
     };
 
     Some(
@@ -5353,7 +5354,6 @@ impl Daemon {
             loop_stall_timeout: Duration::from_millis(spec.timeouts.loop_stall_timeout_ms),
             gil_stall_timeout: Duration::from_millis(spec.timeouts.gil_stall_timeout_ms),
             memory: spec.memory.clone(),
-            memory_budget: None,
             cgroup: None,
             env,
             shown_env: spec
@@ -9190,7 +9190,7 @@ impl Daemon {
                     control.acknowledge(version);
                 }
             }
-            HostMessage::Status { workers } => {
+            HostMessage::Status { workers, .. } => {
                 if let Some(running) = self.running.get_mut(&key) {
                     // Section 7.3: the workers' own signals, from what
                     // grew since a report at least a few seconds older,

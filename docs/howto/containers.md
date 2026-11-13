@@ -442,7 +442,7 @@ worker 0 has 330MB of its own and worker 1 has 280MB, the container uses
 worker 0, the larger, and its event says:
 
 ```
-worker.recycled  worker 0 (pid 52) is replaced: the container is short of memory, 124MB left under memory.max 1.0GB, less than the headroom of 128MB; it is the largest worker, uss 330MB
+worker 0 (pid 52) replaced by pid 61: the container was short of memory, 124MB left under memory.max 1.0GB, less than the headroom of 128MB; it was the largest worker, uss 330MB
 ```
 
 Since 124MB is less than worker 0's 330MB, worker 0 stops first, while
@@ -523,14 +523,15 @@ what is used and left, and what the guard is doing:
 ```
 $ docker exec shop muructl status
 ...
-cpu      2 CPUs from cpu.max 200000 100000
+cpu      2 CPUs from cpu.max
 memory   memory.max 1.0GB, 586MB used, 438MB left, headroom 128MB
          workers 296MB, host 250MB
-guard    watching; it last replaced worker 0 (pid 52) at 07:40:12 UTC
+guard    watching; it last replaced shop@r1 worker 0 (pid 52) at 07:40:12 UTC
 ```
 
 The guard is `watching`, `replacing` a worker, or `holding` when
-replacing workers would not help. `/status`, with `--admin-status`,
+replacing workers would not help, with what it is doing after the
+state. `/status`, with `--admin-status`,
 gives the same as its `limits` field, and so do `muructl status --json`
 and `muructl debug bundle`.
 

@@ -20,6 +20,7 @@ pub mod disk;
 pub mod edges;
 pub mod events;
 pub mod fdpass;
+pub mod guard;
 pub mod host;
 pub mod locations;
 pub mod log_files;
