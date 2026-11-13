@@ -53,6 +53,7 @@ pub mod requests;
 pub mod routing;
 pub mod static_files;
 pub mod tls;
+pub mod toolbar;
 pub mod uploads;
 pub mod upstream;
 pub mod wake;
@@ -566,6 +567,11 @@ struct Shared {
     links: Arc<development::Links>,
     /// Where a development run keeps its request records (section 11.7).
     recorder: Option<Arc<recorder::Recorder>>,
+    /// Draws the panels the reserved prefix answers (section 4.20),
+    /// made when first asked for, once the dashboard's address is known.
+    renderer: std::sync::OnceLock<panels::Renderer>,
+    /// The pages whose policy kept the toolbar out, each said once.
+    warned: toolbar::Warned,
     occasions: occasions::Setting,
     access_log: Arc<access::AccessLog>,
     /// The node's limits in force, which a snapshot may replace.
@@ -866,6 +872,8 @@ impl Edge {
                 development: config.development,
                 links: Arc::default(),
                 recorder: config.recorder.filter(|_| config.development),
+                renderer: std::sync::OnceLock::new(),
+                warned: toolbar::Warned::default(),
                 occasions: config.occasions,
                 access_log,
                 tuning,
@@ -1351,6 +1359,20 @@ async fn serve<I>(
 
             let routing = shared.pools.current();
             let (mut parts, body) = request.into_parts();
+
+            // Section 4.20: the reserved prefix is the edge's in a
+            // development run that keeps records, answered from them before
+            // routing, and never recorded.
+
+            if let Some(recorder) = shared.recorder.as_ref()
+                && toolbar::reserved(parts.uri.path())
+            {
+                let renderer = shared
+                    .renderer
+                    .get_or_init(|| panels::Renderer::new(shared.links.dashboard()));
+                let hosts = shared.links.hosts();
+                return Ok::<_, Infallible>(toolbar::answer(&parts, hosts, recorder, renderer));
+            }
             let forwarded = routing.trust_on(&local).resolve(&peer, &mut parts.headers);
             let accept_encoding = parts.headers.get(http::header::ACCEPT_ENCODING).cloned();
             let method = parts.method.clone();
@@ -1773,6 +1795,8 @@ async fn serve<I>(
                                 .await
                                 {
                                     link::record(&context, &parts, status, reason, bytes);
+                                    let mut response = response;
+                                    response.extensions_mut().insert(toolbar::EdgeFile);
                                     served = Some(link::Handled::Response(response));
                                 }
                             }
@@ -1909,6 +1933,8 @@ async fn serve<I>(
                                 _,
                             ) => {
                                 link::record(&context, &parts, status, reason, bytes);
+                                let mut response = response;
+                                response.extensions_mut().insert(toolbar::EdgeFile);
                                 link::Handled::Response(response)
                             }
                             (_, Some(selection)) => {
@@ -2126,6 +2152,37 @@ async fn serve<I>(
 
             for rules in site.response_headers.iter().flatten() {
                 rules.apply(response.headers_mut());
+            }
+
+            // Section 4.20: with the toolbar on, a page a browser loads gets
+            // its tag, before compression; a page whose policy would refuse
+            // the tag gets none, and the terminal says why once.
+
+            let mut response = response;
+
+            if shared.links.toolbar_on() && noted.as_ref().is_some_and(|noted| noted.recorded()) {
+                match toolbar::insertable(&method, &parts.headers, &response) {
+                    Ok(nonce) => {
+                        let dashboard = shared.links.request_page(&base_id);
+                        let tag = toolbar::tag(
+                            forwarded.prefix.as_deref().unwrap_or(""),
+                            &base_id,
+                            dashboard.as_deref(),
+                            nonce.as_deref(),
+                        );
+                        response = toolbar::insert(response, tag);
+                    }
+                    Err(toolbar::Skip::Policy) => {
+                        if shared.warned.first(parts.uri.path()) {
+                            muru_common::muru_println!(
+                                "no toolbar on {}: its content security policy allows scripts \
+                                 only by hash or from elsewhere",
+                                parts.uri.path()
+                            );
+                        }
+                    }
+                    Err(toolbar::Skip::NotAPage) => {}
+                }
             }
 
             // Section 4.17: compressed for the client when the policy and

@@ -370,6 +370,36 @@ message RequestRecord {
   repeated RecordedHeader response_headers = 30;
   RequestCompression compression = 31;
   repeated Panel panels = 32;
+  string worker_part = 33;          // expected, arrived or missing; empty when the worker was not asked for it
+  WorkerPart from_worker = 34;      // what the worker saw, once it arrived
+}
+
+// The worker's part of a request's record (section 11.7). Times are
+// milliseconds from when the worker took the request, 0 for one that did
+// not happen.
+message WorkerPart {
+  string thread = 1;
+  double to_start_response = 2;
+  double to_first_byte = 3;
+  double to_last_byte = 4;
+  double to_close = 5;
+  uint64 body_bytes = 6;            // before compression
+  string body_source = 7;           // iterable, file_wrapper, write, asgi_body, pathsend or zerocopysend
+  bool sent_by_edge = 8;
+  string outcome = 9;               // completed, client_disconnected, failed or timeout
+  string reason = 10;
+  string error_phase = 11;          // call, iteration or close
+  string error = 12;
+  string traceback = 13;
+  repeated RequestLog logs = 14;
+  uint32 logs_dropped = 15;
+}
+
+message RequestLog {
+  double at_ms = 1;                 // from when the worker took the request
+  string level = 2;
+  string logger = 3;
+  string message = 4;
 }
 
 message RequestConnection {

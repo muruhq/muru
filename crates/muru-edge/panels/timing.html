@@ -1,14 +1,20 @@
-{#- The Timing panel: the request's phases as spans on its clock. -#}
+{#- The Timing panel: the request's phases as spans on its clock, each
+    drawn as a bar placed where it starts and as wide as it lasts. -#}
 {%- set total = panel.spans[0].duration_ms if panel.spans else 0 -%}
+{%- macro bar(span) -%}
+{%- set from = [[(span.start_ms * 100 / total)|round|int, 0]|max, 100]|min if total > 0 else 0 -%}
+{%- set width = [[(span.duration_ms * 100 / total)|round|int, 0]|max, 100 - from]|min if total > 0 else 0 -%}
+<span class="track" title="{{ span.start_ms|round(2) }} ms to {{ (span.start_ms + span.duration_ms)|round(2) }} ms"><span class="bar from-{{ from }} for-{{ width }}"></span></span>
+{%- endmacro -%}
 <table class="spans">
-<thead><tr><th>Phase</th><th class="num">Starts</th><th class="num">Takes</th><th>Of the request</th></tr></thead>
+<thead><tr><th>Phase</th><th class="num">Starts</th><th class="num">Takes</th><th>On the request's clock</th></tr></thead>
 <tbody>
 {%- for span in panel.spans recursive %}
 <tr class="{{ span.category }}">
 <td class="depth-{{ loop.depth }}">{{ span.name }}</td>
 <td class="num">{{ span.start_ms|round(2) }} ms</td>
 <td class="num">{{ span.duration_ms|round(2) }} ms</td>
-<td><meter min="0" max="{{ total }}" value="{{ span.duration_ms }}" title="{{ span.duration_ms|round(2) }} ms"></meter></td>
+<td>{{ bar(span) }}</td>
 </tr>
 {%- if span.children %}{{ loop(span.children) }}{% endif %}
 {%- endfor %}
@@ -16,4 +22,21 @@
 </table>
 {%- if not panel.spans %}
 <p class="muted">No times are known yet.</p>
+{%- else %}
+<details>
+<summary>What the phases are</summary>
+<dl>
+<dt>request</dt><dd>From the request's arrival at Muru until the last byte of its response was sent.</dd>
+<dt>waiting for a worker</dt><dd>Until a worker was free to take the request.</dd>
+<dt>until the response head</dt><dd>From handing the request to the worker until the response's status and headers came back from it.</dd>
+<dt>sending the response</dt><dd>From then until the last byte was sent to the client.</dd>
+<dt>in the worker</dt><dd>The worker's own account, from receiving the request until the application was done with it.</dd>
+<dt>until the response starts</dt><dd>Until the application called <code>start_response</code>, or sent <code>http.response.start</code>.</dd>
+<dt>producing the body</dt><dd>From the body's first byte to its last.</dd>
+<dt>finishing</dt><dd>Until the body's <code>close()</code> returned, or the ASGI application returned.</dd>
+</dl>
+</details>
 {%- endif %}
+{%- for value in panel.values %}
+<p class="warning">The {{ value.name }} {% if value.value == "still to come" %}is still to come.{% else %}{{ value.value }}.{% endif %}</p>
+{%- endfor %}

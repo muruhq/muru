@@ -404,15 +404,26 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
             "timing",
             "where",
             "response",
+            "logs",
+            "errors",
             "connection",
         ]
+
+        # The worker's part follows the response (issue 635): its thread,
+        # its times and where the body came from.
+
+        assert found["worker_part"] == "arrived"
+        worker = found["from_worker"]
+        assert worker["thread"] and worker["body_source"] == "iterable"
+        assert worker["outcome"] == "completed"
+        assert 0 < worker["to_start_response"] <= worker["to_close"]
 
         # The text form names the request and draws each panel.
 
         text = muructl(runtime, "debug", "request", request_id, cwd=support.FIXTURES).stdout
         assert text.startswith("GET / HTTP/1.1  200  "), text
         assert f"request {request_id}\n" in text
-        assert "\nTiming\n" in text and "    application" in text
+        assert "\nTiming\n" in text and "    until the response head" in text
         assert "    cookie: ***" in text
 
         # The access log's JSON names the connection in every mode.
@@ -431,6 +442,24 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
         assert json.loads(read(f"/v1/requests/{request_id}"))["request_id"] == request_id
         assert f'href="request/{request_id}"' in read("/fragment/requests")
 
+        # A failed request's record has the exception, its traceback and
+        # the log record that reported it.
+
+        failed = server.get("/error")
+        assert failed.status == 500
+        failed_id = failed.header("x-request-id")
+        assert failed_id is not None
+        deadline = time.monotonic() + 10
+
+        while (broken := record(failed_id))["in_progress"]:
+            assert time.monotonic() < deadline, broken
+            time.sleep(0.05)
+
+        worker = broken["from_worker"]
+        assert (worker["outcome"], worker["error_phase"]) == ("failed", "call")
+        assert "RuntimeError: deliberate failure" in worker["traceback"]
+        assert any(line["logger"] == "muru" and line["level"] == "ERROR" for line in worker["logs"])
+
         # A request the run does not keep is said to be so.
 
         missing = muructl(
@@ -444,6 +473,70 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
 
         assert refused.value.code == 404
         assert "no longer kept" in json.loads(refused.value.read())["error"]
+    finally:
+        server.stop()
+
+
+def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) -> None:
+    """With --toolbar the edge inserts the toolbar's tag into an HTML page
+    a browser loads (section 4.20), and answers the reserved prefix from
+    the run's records, to loopback and its own pages only."""
+
+    port = support.free_port()
+    server = start(runtime, port=port, args=["--toolbar"])
+
+    try:
+        assert server.wait_for_log("toolbar on:")
+        page = server.get("/page", headers={"Sec-Fetch-Dest": "document"})
+        request_id = page.header("x-request-id")
+        assert request_id is not None
+        assert page.header("content-length") is None
+        tag = (
+            f'<script src="/_muru/toolbar.js" data-request="{request_id}" '
+            f'data-dashboard="http://127.0.0.1:{port}/request/{request_id}" async></script>'
+        )
+        assert page.body.decode() == f"<html><body><h1>Page</h1>{tag}</body></html>"
+
+        # A fetch from the page is left alone, and a trusted proxy's prefix
+        # goes in front of the script's address.
+
+        fetched = server.get("/page", headers={"Sec-Fetch-Dest": "empty"})
+        assert b"_muru" not in fetched.body
+        proxied = server.get(
+            "/page",
+            headers={"Sec-Fetch-Dest": "document", "X-Forwarded-Prefix": "/proxy/8080"},
+        )
+        assert b'<script src="/proxy/8080/_muru/toolbar.js"' in proxied.body
+
+        # The reserved prefix: the script, the record and a panel, and
+        # nothing for another site's page or an unknown host.
+
+        script = server.get("/_muru/toolbar.js", headers={"Sec-Fetch-Site": "same-origin"})
+        assert script.status == 200
+        assert script.header("content-type") == "text/javascript"
+        deadline = time.monotonic() + 10
+
+        while True:
+            answer = server.get(f"/_muru/requests/{request_id}.json")
+            assert answer.status == 200
+            found = json.loads(answer.body)
+
+            if not found["in_progress"]:
+                break
+
+            assert time.monotonic() < deadline, found
+            time.sleep(0.05)
+
+        assert found["request_id"] == request_id and found["target"] == "/page"
+        panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html")
+        assert panel.status == 200 and "<table" in panel.body.decode()
+        assert server.get("/_muru/requests/NOSUCH.json").status == 404
+        refused = server.get(
+            f"/_muru/requests/{request_id}.json", headers={"Sec-Fetch-Site": "cross-site"}
+        )
+        assert refused.status == 403
+        rebound = server.get(f"/_muru/requests/{request_id}.json", headers={"Host": "evil.test"})
+        assert rebound.status == 403
     finally:
         server.stop()
 

@@ -506,6 +506,11 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
         run(args.no_compression, "compression"),
     ));
     rows.push(Row::new(
+        "toolbar",
+        serving.toolbar,
+        run(args.toolbar || args.no_toolbar, "toolbar"),
+    ));
+    rows.push(Row::new(
         "timestamps",
         serving.timestamps,
         run(args.timestamps || args.no_timestamps, "timestamps"),

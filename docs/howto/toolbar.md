@@ -1,14 +1,99 @@
 # Inspecting requests in development
 
-`muructl run` tells the browser how long each request waited for a
-worker and how long the application took, and keeps a record of every
-request it serves. The record is looked up by the request's ID on the
-dashboard, with `muructl debug request` and through the MCP server, so a
-JSON API's requests can be inspected as easily as a page's.
+`muructl run` keeps a record of every request it serves: its timing,
+where it was routed, its response and headers, what the application
+logged and the exception it raised. With `--toolbar` each HTML page
+shows the record of the request that produced it, in a toolbar on the
+page. The same record is looked up by the request's ID on the dashboard,
+with `muructl debug request` and through the MCP server, so a JSON API's
+requests can be inspected as easily as a page's, and every response
+tells the browser's own developer tools how long it took.
 
 All of this is part of development mode: under `--allow-public`,
-`muructl serve` and the daemon, responses carry neither header and no
-records are kept.
+`muructl serve` and the daemon, there is no toolbar, responses carry
+neither header and no records are kept.
+
+## The toolbar on the page
+
+Turn the toolbar on for a run with `--toolbar`:
+
+```console
+$ muructl run shop.wsgi:application --toolbar
+...
+muru: toolbar on: the edge inserts it into HTML pages, with each request's record under /_muru/
+```
+
+or for every run of the project with `toolbar = true` in its
+`[tool.muru.run]` table, or for your own checkout in `muru.local.toml`
+(see [settings for muructl run](run-settings.md)). `--no-toolbar` turns a
+file's setting off for one run.
+
+Each HTML page then has a badge in its bottom right corner with the
+request's status, its total and queue times, the worker that served it,
+and how many log records and errors it had. Clicking the badge opens the
+record's panels, the same ones the [dashboard's request
+page](#a-requests-record) shows, as tabs, and "open in dashboard" opens
+that page. A page whose response is still streaming updates as the
+record fills in. The toolbar only shows: it has no forms and changes
+nothing.
+
+The application is not changed. Muru inserts one tag before the page's
+`</body>`:
+
+```html
+<script src="/_muru/toolbar.js" data-request="01JCZ8X4R3T5V6W7Y8Z9A0B1C2" async></script>
+```
+
+It goes into a page a browser loads as a document, so `fetch()` and htmx
+requests, which say otherwise in `Sec-Fetch-Dest`, are left as they are.
+Muru never changes:
+
+- a response to anything but GET, or one whose status is 204, 206 or
+  304;
+- a response that is not `text/html`, or has no `</body>`;
+- a response the application encoded itself (`Content-Encoding`) or
+  marked `Cache-Control: no-transform`;
+- a file Muru sends itself, a static file or a file hint.
+
+A changed page loses its `Content-Length` and a strong `ETag` becomes
+weak, since its bytes are no longer the application's own. Compression
+applies after the tag is inserted.
+
+### Content security policy
+
+The tag is loaded from the page's own origin, so a policy that allows
+`'self'` for scripts needs nothing. When the policy gives scripts a
+nonce, Muru puts the same nonce on the tag, and the toolbar uses it for
+its stylesheet too. A policy that allows scripts only by hash, or only
+from elsewhere, would refuse the tag, so the page gets none, and the run
+says once, on the terminal, which path and why.
+
+### The reserved prefix
+
+The toolbar's files and data are under `/_muru/` on the application's
+own address, answered by Muru without reaching the application:
+
+| Path | Gives |
+| --- | --- |
+| `/_muru/toolbar.js`, `/_muru/toolbar.css` | the toolbar itself |
+| `/_muru/requests/ID.json` | the record, as `muructl debug request ID --json` prints it |
+| `/_muru/requests/ID/panels/NAME.html` | one panel of the record, drawn |
+
+They answer GET only, with or without `--toolbar`, and only to requests
+for `localhost`, a loopback address or a name the run was given with
+`--host`, which stops another site reaching them through a DNS name it
+points at your machine. A request a browser makes from another site's
+page is refused. A route of the application under `/_muru/` is not
+reached during a development run.
+
+Behind a development proxy that serves the run under a path, as
+jupyter-server-proxy and code-server do, the tag carries the path the
+proxy sends in `X-Forwarded-Prefix`.
+
+A page served by another server, such as a front end's own development
+server calling a Python API that Muru serves, gets no toolbar, since
+Muru never sees it; the API's requests still carry the timings below and
+have records.
 
 ## Timings in the browser
 
@@ -55,12 +140,27 @@ tunnel or a proxy. With `--dashboard off` the header is not sent.
 
 The page shows the record as panels:
 
-- **Timing:** the request's phases from its arrival: the wait for a
-  worker, the application until the response head, and sending the
-  response, each with when it started and how long it took.
+- **Timing:** the request's phases from its arrival, each with when it
+  started, how long it took and a bar placed where it falls in the
+  request:
+
+  - **waiting for a worker**, until one was free to take the request;
+  - **until the response head**, from handing the request to the worker
+    until the response's status and headers came back;
+  - **in the worker**, the worker's own account of the same time, from
+    receiving the request: **until the response starts** (the
+    application calling `start_response` or sending
+    `http.response.start`), **producing the body** from its first byte
+    to its last, and **finishing**, until the body's `close()` returned
+    or the ASGI application returned;
+  - **sending the response**, from the head's arrival until the last
+    byte was sent to the client.
+
+  The panel lists the same under "What the phases are".
 
 - **Where:** the application and release, host and virtual host,
-  mount, worker group and worker, client and client class, the listener,
+  mount, worker group, worker and the thread that ran the request,
+  client and client class, the listener,
   internal redirects, a handoff between WSGI and ASGI, whether the
   request was sent again to another worker, and the routing snapshot.
 
@@ -69,8 +169,23 @@ The page shows the record as panels:
   (compression is off for the route, the application asked for none,
   the response was already encoded, its type is not one compressed, the
   body is under `min_size`, the client accepts none of the encodings
-  offered), and the request headers as they arrived and the response
-  headers as they were sent.
+  offered), what the application produced before compression and where
+  it came from (an iterable, `write()`, `wsgi.file_wrapper`, ASGI body
+  messages or a file sent by Muru itself), and the request headers as
+  they arrived and the response headers as they were sent.
+
+- **Logs:** the log records and warnings the application made while
+  serving the request, each with its time on the request's clock, its
+  level, logger and message, and a traceback when the record has one.
+  They are the records the `muru_request_id` tag names, which is every
+  record made in the request's thread or task. The first 200 are kept
+  and the rest counted. Output from `print()` is not kept, since it
+  names no request.
+
+- **Errors:** the exception the application did not catch, whether it
+  was raised calling the application or while producing the body, and
+  its traceback, as the development error page shows it; or, for an
+  error Muru answered itself, its reason.
 
 - **Connection:** the connection's ID, the request's position on it,
   how long the connection was idle before the request, for the first
@@ -82,6 +197,9 @@ The dashboard's recent requests link to each request's page, and
 `/v1/requests/ID` on the dashboard's address gives the record as JSON.
 A record still being written, for a response that is still streaming,
 says so; reloading the page shows the rest once the response has ended.
+The worker sends its part of the record just after the response, so a
+record is complete a moment after the last byte arrives. If the worker
+stopped before sending it, the Timing panel says so and shows the rest.
 
 The [access log](logging.md)'s JSON lines name the connection too, as
 `connection` and `connection_requests`, in every mode.
@@ -107,14 +225,15 @@ find it:
 
 ```console
 $ muructl debug request 01JCZ8X4R3T5V6W7Y8Z9A0B1C2
-GET /orders/42 HTTP/1.1  200  18ms  at 10:42:07.123
+GET /orders/42 HTTP/1.1  500  2.0ms  at 10:42:07.123
 request 01JCZ8X4R3T5V6W7Y8Z9A0B1C2
 
 Timing
-  request        18ms  from 0.0ms
-    queue        0.2ms  from 0.0ms
-    application  18ms  from 0.2ms
-    send         0.3ms  from 18ms
+  request                    2.0ms  from 0.0ms
+    waiting for a worker     0.0ms  from 0.0ms
+    until the response head  1.9ms  from 0.0ms
+    in the worker            1.8ms  from 0.0ms
+    sending the response     0.0ms  from 1.9ms
 
 Where
   application       shop@r3
@@ -122,6 +241,7 @@ Where
   mount             default
   group             default
   worker            0
+  thread            muru-app-0
   client            127.0.0.1
   client class      default
   listener          127.0.0.1:8080
@@ -129,8 +249,8 @@ Where
   routing snapshot  0
 
 Response
-  status      200
-  sent        1234B
+  status      500 app_error
+  sent        351B
   received    0B
   compressed  no: the body is under min_size
   Request headers
@@ -139,8 +259,25 @@ Response
     cookie: ***
   Response headers
     content-type: text/html; charset=utf-8
-    x-request-id: 01JCZ8X4R3T5V6W7Y8Z9A0B1C2
     ...
+
+Logs
+  Log records
+    0.3ms  WARNING  shop.orders  order 42 has no lines
+    0.5ms  ERROR  muru  the application raised an exception
+      Traceback (most recent call last):
+        ...
+      KeyError: 'lines'
+
+Errors
+  outcome    failed
+  reason     app_error
+  raised in  call
+  error      the application raised an exception
+  traceback
+    Traceback (most recent call last):
+      ...
+    KeyError: 'lines'
 
 Connection
   id            01JCZ8X4R3T5V6W7Y8Z9A0B1C0

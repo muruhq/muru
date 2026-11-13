@@ -1,0 +1,18 @@
+{#- The Logs panel: the request's log records and warnings. -#}
+{%- for table in panel.tables %}
+{%- if table.rows %}
+<table class="logs">
+<thead><tr>{% for column in table.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead>
+<tbody>
+{%- for row in table.rows %}
+<tr class="{{ row.cells[1]|lower }}"><td class="num">{{ row.cells[0] }}</td><td>{% if row.cells[1] in ["ERROR", "CRITICAL"] %}<span class="error">{{ row.cells[1] }}</span>{% elif row.cells[1] == "WARNING" %}<span class="warning">{{ row.cells[1] }}</span>{% else %}{{ row.cells[1] }}{% endif %}</td><td>{{ row.cells[2] }}</td><td><pre>{{ row.cells[3] }}</pre></td></tr>
+{%- endfor %}
+</tbody>
+</table>
+{%- else %}
+<p class="muted">No log records or warnings. Output from print() is not kept.</p>
+{%- endif %}
+{%- endfor %}
+{%- for value in panel.values %}
+<p class="muted">{{ value.value }}.</p>
+{%- endfor %}

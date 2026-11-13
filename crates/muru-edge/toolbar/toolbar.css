@@ -1,0 +1,26 @@
+/* The development toolbar, inside its own shadow root so the page's
+   styles and its own do not meet. */
+:host { all: initial; }
+.toolbar { position: fixed; right: 12px; bottom: 12px; z-index: 2147483647; max-width: min(64rem, calc(100vw - 24px)); font: 13px/1.45 system-ui, sans-serif; color: #1f2933; }
+.badge { display: flex; gap: 0.6em; align-items: baseline; margin-left: auto; padding: 0.35em 0.8em; border: 1px solid #334e68; border-radius: 999px; background: #102a43; color: #d9e2ec; font: inherit; cursor: pointer; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25); }
+.badge .name { font-weight: 700; color: #fff; }
+.badge .status { font-weight: 600; color: #8ee4af; }
+.badge .status.error, .badge .count.error { color: #ff9b8f; }
+.badge .count.warning { color: #ffd479; }
+.badge .muted { color: #9fb3c8; }
+.body { display: flex; flex-direction: column; margin-bottom: 8px; max-height: min(70vh, 40rem); background: #fff; border: 1px solid #d9e2ec; border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2); overflow: hidden; }
+.toolbar { display: flex; flex-direction: column-reverse; align-items: flex-end; }
+.toolbar.collapsed .body { display: none; }
+.tabs { display: flex; flex-wrap: wrap; gap: 0.25em; padding: 0.5em 0.75em 0; border-bottom: 1px solid #e4ebf2; }
+.tab { padding: 0.3em 0.8em; border: none; border-bottom: 2px solid transparent; background: none; font: inherit; color: #627d98; cursor: pointer; }
+.tab.open { color: #102a43; border-bottom-color: #2f6fde; font-weight: 600; }
+.content { padding: 0.75em 1em; overflow: auto; min-width: 32rem; }
+.footer { display: flex; justify-content: space-between; gap: 1em; padding: 0.4em 1em; border-top: 1px solid #e4ebf2; font-size: 12px; }
+.footer a { color: #2f6fde; }
+.muted { color: #627d98; }
+@media (prefers-color-scheme: dark) {
+  .toolbar { color: #d9e2ec; }
+  .body { background: #1f2933; border-color: #334e68; }
+  .tabs, .footer { border-color: #334e68; }
+  .tab.open { color: #fff; }
+}

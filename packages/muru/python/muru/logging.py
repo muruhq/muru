@@ -119,17 +119,71 @@ class _FallbackHandler(logging.StreamHandler):  # type: ignore[type-arg]
         super().emit(record)
 
 
+CAPTURE_LIMIT = 200
+"""The most log records a development run's request record keeps."""
+
+# Section 11.7: the log records of the requests a development run keeps
+# records of, by request id, from the worker taking a request until it
+# sends the worker's part of its record. Each entry is the records kept,
+# as (created, level, logger, message), and how many were past the limit.
+
+_captures: dict[str, tuple[list[tuple[float, str, str, str]], list[int]]] = {}
+
+
+def _capture_start(request: str) -> None:
+    """Start keeping the log records of a request, for its record."""
+
+    _captures[request] = ([], [0])
+
+
+def _capture_take(request: str) -> tuple[list[tuple[float, str, str, str]], int]:
+    """Stop keeping a request's log records, and return them and how many were dropped."""
+
+    kept, dropped = _captures.pop(request, ([], [0]))
+    return kept, dropped[0]
+
+
+def _capture(record: logging.LogRecord, request: str) -> None:
+    """Keep a record for its request's record, with its traceback, up to the limit."""
+
+    captured = _captures.get(request)
+
+    if captured is None:
+        return
+
+    kept, dropped = captured
+
+    if len(kept) >= CAPTURE_LIMIT:
+        dropped[0] += 1
+        return
+
+    try:
+        message = record.getMessage()
+    except Exception:
+        message = str(record.msg)
+
+    if record.exc_info:
+        message = f"{message}\n{''.join(traceback.format_exception(*record.exc_info)).rstrip()}"
+
+    kept.append((record.created, record.levelname, record.name, message))
+
+
 def _tagging(factory: Callable[..., logging.LogRecord]) -> Callable[..., logging.LogRecord]:
     """Wrap a record factory so every record carries the Muru tags."""
 
     def tagged(*args: Any, **kwargs: Any) -> logging.LogRecord:
         record = factory(*args, **kwargs)
         where = context()
-        record.muru_request_id = request_id()
+        current = request_id()
+        record.muru_request_id = current
         record.muru_app = where.app
         record.muru_release = where.release
         record.muru_group = where.group
         record.muru_worker = where.worker_id
+
+        if _captures and current is not None and current in _captures:
+            _capture(record, current)
+
         return record
 
     tagged.muru_tagging = True  # type: ignore[attr-defined]

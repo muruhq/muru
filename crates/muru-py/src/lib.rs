@@ -12,6 +12,7 @@ mod handoff;
 mod link;
 mod memory;
 mod pool;
+mod record;
 mod signals;
 mod uploads;
 mod wsgi;

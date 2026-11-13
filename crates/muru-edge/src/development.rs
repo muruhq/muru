@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use muru_proto::admin::v1 as admin;
+use muru_proto::worker::v1::WorkerRecord;
 
 use crate::access::Record;
 use crate::recorder::{Recorder, Slot};
@@ -127,18 +128,21 @@ pub struct Request {
     connection: Option<Arc<Connection>>,
 }
 
-/// How far a record has come together.
+/// How far a record has come together: its head, made as the response's
+/// head goes out, the access log's record when the response ends, and
+/// the worker's part after it, which may come in any order.
 #[derive(Debug, Default)]
-enum Joined {
-    /// Neither half yet.
-    #[default]
-    Waiting,
-    /// The access log's record came first.
-    Logged(Box<Record>),
-    /// The head is in the ring, waiting for the access log's record.
-    Open(Slot),
-    /// Both halves are in.
-    Done,
+struct Joined {
+    /// The record in the ring, once its head is in.
+    slot: Option<Slot>,
+    /// The access log's record, when it came before the head.
+    logged: Option<Box<Record>>,
+    /// The worker's part, when it came before the head.
+    worker: Option<WorkerRecord>,
+    /// The worker was asked for its part.
+    expected: bool,
+    /// The worker's part will not come.
+    missing: bool,
 }
 
 impl Drop for Request {
@@ -168,6 +172,7 @@ impl Request {
 
     /// The access log's record of the request, written when its response
     /// ended: it completes the record if the head is in, or waits for it.
+    /// A later hop's replaces an earlier one's.
     pub fn logged(&self, record: &Record) {
         let Some(recorder) = &self.recorder else {
             return;
@@ -175,19 +180,15 @@ impl Request {
 
         let mut joined = self.joined.lock().expect("request record poisoned");
 
-        match std::mem::take(&mut *joined) {
-            Joined::Open(slot) => {
-                recorder.complete(&slot, record);
-                *joined = Joined::Done;
-            }
-            Joined::Waiting => *joined = Joined::Logged(Box::new(record.clone())),
-            done => *joined = done,
+        match &joined.slot {
+            Some(slot) => recorder.complete(slot, record),
+            None => joined.logged = Some(Box::new(record.clone())),
         }
     }
 
     /// The head of the request's record, made as the response's head
-    /// goes out: it is kept in the ring, complete if the access log's
-    /// record is in, or open until it is.
+    /// goes out: it is kept in the ring with whatever else of the record
+    /// came first, and in progress until the rest is in.
     pub fn opened(&self, mut head: admin::RequestRecord) {
         let Some(recorder) = &self.recorder else {
             return;
@@ -195,17 +196,69 @@ impl Request {
 
         let mut joined = self.joined.lock().expect("request record poisoned");
 
-        match std::mem::take(&mut *joined) {
-            Joined::Logged(record) => {
-                crate::recorder::fill(&mut head, &record);
-                recorder.open(head);
-                *joined = Joined::Done;
-            }
-            Joined::Waiting => {
-                head.in_progress = true;
-                *joined = Joined::Open(recorder.open(head));
-            }
-            done => *joined = done,
+        if joined.slot.is_some() {
+            return;
+        }
+
+        head.in_progress = true;
+
+        if joined.expected {
+            head.worker_part = crate::recorder::WORKER_EXPECTED.to_owned();
+        }
+
+        if let Some(part) = joined.worker.take() {
+            crate::recorder::worker(&mut head, part);
+        } else if joined.missing {
+            crate::recorder::worker_missing(&mut head);
+        }
+
+        if let Some(record) = joined.logged.take() {
+            crate::recorder::fill(&mut head, &record);
+        }
+
+        joined.slot = Some(recorder.open(head));
+    }
+
+    /// The worker was asked for its part of the record, which follows the
+    /// response.
+    pub fn expect_worker(&self) {
+        let mut joined = self.joined.lock().expect("request record poisoned");
+        joined.expected = true;
+        joined.missing = false;
+
+        if let (Some(recorder), Some(slot)) = (&self.recorder, &joined.slot) {
+            recorder.update(slot, |record| {
+                record.worker_part = crate::recorder::WORKER_EXPECTED.to_owned();
+                record.in_progress = true;
+            });
+        }
+    }
+
+    /// The worker's part of the record arrived.
+    pub fn worker_part(&self, part: WorkerRecord) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+
+        let mut joined = self.joined.lock().expect("request record poisoned");
+
+        match &joined.slot {
+            Some(slot) => recorder.update(slot, |record| crate::recorder::worker(record, part)),
+            None => joined.worker = Some(part),
+        }
+    }
+
+    /// The worker's part of the record will not come.
+    pub fn worker_missing(&self) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+
+        let mut joined = self.joined.lock().expect("request record poisoned");
+        joined.missing = true;
+
+        if let Some(slot) = &joined.slot {
+            recorder.update(slot, crate::recorder::worker_missing);
         }
     }
 
@@ -227,6 +280,11 @@ impl Request {
 #[derive(Debug, Default)]
 pub struct Links {
     dashboard: OnceLock<String>,
+    /// The run's own host names besides loopback, which the reserved
+    /// prefix answers to (section 4.20).
+    hosts: OnceLock<Vec<String>>,
+    /// The toolbar goes into the run's HTML pages.
+    toolbar: std::sync::atomic::AtomicBool,
 }
 
 impl Links {
@@ -241,6 +299,33 @@ impl Links {
         };
 
         let _ = self.dashboard.set(base);
+    }
+
+    /// The dashboard's address, once it is named.
+    pub fn dashboard(&self) -> Option<&str> {
+        self.dashboard.get().map(String::as_str)
+    }
+
+    /// Name the run's own host names besides loopback, which the
+    /// reserved prefix answers to. The first call wins.
+    pub fn set_hosts(&self, hosts: Vec<String>) {
+        let _ = self.hosts.set(hosts);
+    }
+
+    /// Insert the toolbar into the run's HTML pages.
+    pub fn set_toolbar(&self) {
+        self.toolbar.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the toolbar goes into the run's HTML pages.
+    pub fn toolbar_on(&self) -> bool {
+        self.toolbar.load(Ordering::Relaxed)
+    }
+
+    /// The run's own host names the reserved prefix answers to, besides
+    /// loopback.
+    pub fn hosts(&self) -> &[String] {
+        self.hosts.get().map_or(&[], Vec::as_slice)
     }
 
     /// The dashboard's page for a request, when the dashboard is on.
@@ -315,6 +400,81 @@ fn millis(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(recorder: &Arc<Recorder>) -> Request {
+        let connection = Arc::new(Connection::new("C1".to_owned(), Instant::now(), false));
+        Request::new(Some(Arc::clone(recorder)), connection)
+    }
+
+    fn head(request_id: &str) -> admin::RequestRecord {
+        admin::RequestRecord {
+            request_id: request_id.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn part() -> WorkerRecord {
+        WorkerRecord {
+            thread: "muru-wsgi-0".to_owned(),
+            outcome: "completed".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_head_the_access_record_and_the_workers_part_join_in_any_order() {
+        let recorder = Arc::new(Recorder::default());
+
+        // In the usual order: asked, head, access record, worker's part.
+        // The record is in progress until the last of them.
+
+        let usual = request(&recorder);
+        usual.expect_worker();
+        usual.opened(head("A"));
+        usual.logged(&crate::recorder::tests::logged("A-2"));
+        let record = recorder.get("A").unwrap();
+        assert!(record.in_progress);
+        assert_eq!(record.worker_part, crate::recorder::WORKER_EXPECTED);
+        assert_eq!(record.status, 200);
+        usual.worker_part(part());
+        let record = recorder.get("A").unwrap();
+        assert!(!record.in_progress);
+        assert_eq!(record.worker_part, crate::recorder::WORKER_ARRIVED);
+        assert_eq!(record.from_worker.unwrap().thread, "muru-wsgi-0");
+
+        // The access record and the worker's part before the head.
+
+        let early = request(&recorder);
+        early.expect_worker();
+        early.logged(&crate::recorder::tests::logged("B"));
+        early.worker_part(part());
+        early.opened(head("B"));
+        let record = recorder.get("B").unwrap();
+        assert!(!record.in_progress);
+        assert_eq!(record.request_id, "B");
+        assert!(record.from_worker.is_some());
+
+        // A worker's part that never comes leaves the record complete,
+        // and says so.
+
+        let lost = request(&recorder);
+        lost.expect_worker();
+        lost.opened(head("C"));
+        lost.logged(&crate::recorder::tests::logged("C"));
+        lost.worker_missing();
+        let record = recorder.get("C").unwrap();
+        assert!(!record.in_progress);
+        assert_eq!(record.worker_part, crate::recorder::WORKER_MISSING);
+
+        // Nothing asked of the worker, nothing waited for.
+
+        let plain = request(&recorder);
+        plain.opened(head("D"));
+        plain.logged(&crate::recorder::tests::logged("D"));
+        let record = recorder.get("D").unwrap();
+        assert!(!record.in_progress);
+        assert!(record.worker_part.is_empty());
+    }
 
     #[test]
     fn server_timing_names_the_queue_the_application_and_the_request() {

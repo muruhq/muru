@@ -32,13 +32,15 @@ access_log_exclude = ["/static/*"]
 slow = "500ms"
 dashboard = "127.0.0.1:8082"    # or "off"
 compression = false
+toolbar = true                  # the debug toolbar on HTML pages
 timestamps = true               # the full UTC time in front of every line
 env_file = ".env"               # variables the run starts with
 ```
 
 In a `muru.toml` the same keys go in a `[run]` table at the top level.
 Each key is a flag of `muructl run`, named in snake case and taking the
-same values; `compression = false` stands for `--no-compression`, and
+same values; `compression = false` stands for `--no-compression`,
+`--no-toolbar` turns a table's `toolbar = true` off for one run, and
 `--no-timestamps` turns a table's `timestamps = true` off for one run. With
 the table above, `muructl run` on its own is the whole command in place
 of:

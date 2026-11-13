@@ -30,6 +30,7 @@ message Hello {
   repeated MountPool mount_pools = 9; // every named mount: the side it runs on, and its own slots or connections when it has them (section 6.7)
   repeated string websocket_mounts = 10; // the named mounts that accept websocket scopes (section 6.14)
   uint32 worker = 11;               // its index within its group, which the edge names it by in the access log and its reports
+  bool records = 12;                // sends a RECORD frame after a response whose head asked for one (section 11.7)
 }
 
 // A named mount (section 6.7): the side it runs on, whose count its
@@ -93,6 +94,7 @@ message RequestHead {
   string client_class = 28;         // section 4.14: the class the edge assigned, default when no rule matched
   string mode = 29;                 // section 4.15: the route's site mode, as muru.mode; none when empty
   bool borrowed = 30;               // section 6.7: the edge gave the request a shared thread its mount borrows
+  bool record = 31;                 // section 11.7: send a RECORD frame of the worker's part after the response
 }
 
 // What a REQUEST frame opens (sections 5.6 and 6.13). A gRPC call's
@@ -187,6 +189,35 @@ message End {
 // Payload of a CLOSE frame in either direction: the end of a WebSocket
 // (section 5.6). Edge to worker it is websocket.disconnect; worker to edge
 // it is the application closing.
+// The worker's part of a development run's request record (section
+// 11.7), on a RECORD frame after the response when the request head asked
+// for it. Times are milliseconds from when the worker took the request,
+// and 0 for one that did not happen.
+message WorkerRecord {
+  string thread = 1;                // the thread that ran the application
+  double to_start_response = 2;     // start_response called, or http.response.start sent
+  double to_first_byte = 3;         // the first body frame written to the edge
+  double to_last_byte = 4;          // the last body frame written
+  double to_close = 5;              // close() returned, or the application returned
+  uint64 body_bytes = 6;            // body bytes the application produced, before compression
+  string body_source = 7;           // iterable, file_wrapper, write, asgi_body, pathsend or zerocopysend
+  bool sent_by_edge = 8;            // the edge sent a file by its descriptor
+  string outcome = 9;               // completed, client_disconnected, failed or timeout
+  string reason = 10;               // the access log's reason when not completed
+  string error_phase = 11;          // call, iteration or close, when the application failed
+  string error = 12;                // the exception, in a line
+  string traceback = 13;            // its traceback
+  repeated LogLine logs = 14;       // the request's log records and warnings, in order
+  uint32 logs_dropped = 15;         // records past the cap, counted
+}
+
+message LogLine {
+  double at = 1;                    // milliseconds from when the worker took the request
+  string level = 2;
+  string logger = 3;
+  string message = 4;               // with the exception's traceback when the record has one
+}
+
 message Close {
   uint32 code = 1;                  // a WebSocket close code, 1000 when none was given
   string reason = 2;

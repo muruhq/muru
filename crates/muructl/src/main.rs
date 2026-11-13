@@ -635,6 +635,18 @@ struct RunArgs {
     #[arg(long)]
     no_compression: bool,
 
+    /// Insert the debug toolbar into the application's HTML pages: a
+    /// badge for the request that produced each page, opening to its
+    /// timing, routing, response, logs, errors and connection. Off under
+    /// --allow-public.
+    #[arg(long, conflicts_with = "no_toolbar")]
+    toolbar: bool,
+
+    /// No toolbar for this run, over a run table or muru.local.toml that
+    /// turns it on.
+    #[arg(long)]
+    no_toolbar: bool,
+
     /// Put the full UTC time in front of every line on the terminal.
     /// Access log lines carry the request's time either way.
     #[arg(long)]
@@ -1723,6 +1735,9 @@ struct Serving {
     /// The dashboard's address, off, or none for the default.
     dashboard: Option<String>,
     compression: bool,
+    /// Whether the edge inserts the toolbar into HTML pages, in
+    /// development mode only.
+    toolbar: bool,
     /// Whether every line on the terminal carries the full time.
     timestamps: bool,
     /// The muru.local.toml read, when there was one.
@@ -1811,6 +1826,9 @@ impl Serving {
                 .clone()
                 .or_else(|| settings.dashboard.clone()),
             compression: !args.no_compression && settings.compression != Some(false),
+            toolbar: !args.allow_public
+                && !args.no_toolbar
+                && (args.toolbar || settings.toolbar == Some(true)),
             timestamps: !args.no_timestamps
                 && (args.timestamps || settings.timestamps == Some(true)),
             local,
@@ -3589,6 +3607,22 @@ async fn run_with(
             "--allow-public: development behaviours are off, but muructl run is not the \
              supported way to run in production; that is the daemon (muructl daemon start)"
         );
+    }
+
+    // Section 4.20: the reserved prefix answers to the run's own names
+    // besides loopback, and with --toolbar the edge inserts the toolbar
+    // into HTML pages, which the start-up says.
+
+    if development && serve.is_none() {
+        edge.links().set_hosts(resolved.serving.hosts.clone());
+
+        if resolved.serving.toolbar {
+            edge.links().set_toolbar();
+            muru_common::muru_println!(
+                "toolbar on: the edge inserts it into HTML pages, with each request's record \
+                 under /_muru/"
+            );
+        }
     }
 
     if let Some(tls) = &tls {
