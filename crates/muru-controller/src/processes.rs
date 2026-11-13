@@ -761,6 +761,26 @@ fn tree(
         nodes.insert(process.pid, (process.parent, node));
     }
 
+    // Issue 611: after a daemon restart a host and its relay are adopted
+    // again together, with the same OS parent, so the host's mark says it
+    // for both; a relay is marked only when its own differs. Its
+    // os_parent_pid still says it.
+
+    let marked_hosts: HashMap<u32, u32> = nodes
+        .iter()
+        .filter(|(_, (_, node))| node.role == "host" && node.readopted)
+        .map(|(pid, (_, node))| (*pid, node.os_parent_pid))
+        .collect();
+
+    for (parent, node) in nodes.values_mut() {
+        if node.role == "relay"
+            && node.readopted
+            && marked_hosts.get(parent) == Some(&node.os_parent_pid)
+        {
+            node.readopted = false;
+        }
+    }
+
     // Section 13.10: with --all, what descends from a known process and is
     // not one of them, beneath its operating system parent.
 
@@ -1320,6 +1340,70 @@ mod tests {
 
     fn sample(name: &str, labels: &[(&str, &str)], value: f64) -> Sample {
         Sample::new(name, labels, value)
+    }
+
+    #[test]
+    fn a_relay_adopted_again_with_its_host_is_not_marked_twice() {
+        let process = |pid: u32, parent: u32, role: &'static str| Known {
+            pid,
+            parent,
+            spawned_by: if role == "relay" { 10 } else { 0 },
+            role,
+            app: "shop".to_owned(),
+            release: "r1".to_owned(),
+            ..Known::default()
+        };
+        let known = [
+            process(10, 0, "daemon"),
+            process(20, 10, "host"),
+            process(25, 20, "relay"),
+            process(40, 10, "host"),
+            process(45, 40, "relay"),
+        ];
+        let os = |pid: u32, parent: u32| OsProcess {
+            pid,
+            parent,
+            ..OsProcess::default()
+        };
+
+        // After a restart host 20 and its relay both have the init as
+        // their OS parent; host 40 was started by this daemon, but its
+        // relay was adopted again on its own.
+
+        let found: HashMap<u32, OsProcess> =
+            [os(10, 1), os(20, 1), os(25, 1), os(40, 10), os(45, 1)]
+                .into_iter()
+                .map(|found| (found.pid, found))
+                .collect();
+        let none = HashSet::new();
+        let nothing = Others {
+            table: &[],
+            left_out: &none,
+            narrow: false,
+        };
+        let root = tree(
+            &known,
+            &found,
+            &HashMap::new(),
+            &nothing,
+            &Figures::default(),
+        )
+        .expect("a root");
+        let find = |pid: u32| {
+            root.children
+                .iter()
+                .find(|host| host.pid == pid)
+                .expect("the host")
+        };
+
+        let host = find(20);
+        assert!(host.readopted);
+        assert!(!host.children[0].readopted);
+        assert_eq!(host.children[0].os_parent_pid, 1);
+
+        let host = find(40);
+        assert!(!host.readopted);
+        assert!(host.children[0].readopted);
     }
 
     #[test]
