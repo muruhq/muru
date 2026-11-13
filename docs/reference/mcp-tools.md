@@ -19,7 +19,7 @@ ones it names.
 | `logs` | reads | `muructl logs`, the lines returned as an array | `target`, `lines` (default 100, at most 1000), `access` |
 | `cache` | reads | `muructl cache list` | none |
 | `log_files` | reads | `muructl logs list` | none |
-| `debug` | reads | `muructl debug status`, `stacks`, `tasks`, `memory` or `inspect`, never with `--env` | `what`, `target`, `worker` |
+| `debug` | reads | `muructl debug status`, `stacks`, `tasks`, `memory` or `inspect`, never with `--env`; or `debug request`, a development run's record of one request | `what` (status, stacks, tasks, memory, inspect, request), `target`, `worker`, `request_id` (for request) |
 | `scale_status` | reads | `muructl scale status` | `target` |
 | `config` | reads | `muructl config show` or `config diff` | `action` (show, diff), `app`, `effective`, `file` |
 | `metrics` | reads | `muructl metrics`, the samples kept to those whose name starts with `prefix` | `prefix` |

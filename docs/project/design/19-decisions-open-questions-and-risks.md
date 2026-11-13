@@ -40,6 +40,7 @@ specification is maintained.
 | Order of interfaces | Prove the architecture with WSGI first (phases 0 and 1). ASGI, including lifespan and WebSockets, follows in phase 2 |
 | Repository and registry | github.com/muruhq/muru, with container images on ghcr.io/muruhq |
 | Dashboard | Server-rendered askama templates with htmx, Server-Sent Events and uPlot, via the JSON gateway. Built with cargo only. Minimal read-only version in muructl run from phase 1. Shows and never changes, in every mode; control is muructl's (ADR 0060) |
+| Development toolbar | Inserted by the edge into HTML pages of a development run, opt-in with --toolbar, its files and data at the reserved prefix /_muru/ on the application's origin; Server-Timing and Muru-Request-Link on every response of a development run; nothing of it under --allow-public, muructl serve or the daemon (ADR 0062). Panels are data in the request record drawn by minijinja templates and sanitised, the built-in panels included, with no panel JavaScript (ADR 0063) |
 | Managed HTTP server releases | In scope for migration cutovers in phase 3: fixed instances, server profiles, full traffic management, no Python-specific features (section 9.9) |
 | Free-threading | Supported from phase 1 with the WSGI bridge, with the extension designed for it from the outset (section 6.11) |
 | Runtime wheels | Version-specific wheels for every supported CPython, regular and free-threaded. No abi3 |

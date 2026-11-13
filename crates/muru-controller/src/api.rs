@@ -1523,6 +1523,15 @@ impl Admin for Service {
         }))
     }
 
+    async fn get_request(
+        &self,
+        _request: Request<pb::GetRequestRequest>,
+    ) -> Result<Response<pb::RequestRecord>, Status> {
+        Err(Status::failed_precondition(
+            "the daemon keeps no request records: only muructl run in development mode does",
+        ))
+    }
+
     async fn list_requests(
         &self,
         request: Request<pb::ListRequestsRequest>,

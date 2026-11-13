@@ -1,0 +1,19 @@
+{#- The Timing panel: the request's phases as spans on its clock. -#}
+{%- set total = panel.spans[0].duration_ms if panel.spans else 0 -%}
+<table class="spans">
+<thead><tr><th>Phase</th><th class="num">Starts</th><th class="num">Takes</th><th>Of the request</th></tr></thead>
+<tbody>
+{%- for span in panel.spans recursive %}
+<tr class="{{ span.category }}">
+<td class="depth-{{ loop.depth }}">{{ span.name }}</td>
+<td class="num">{{ span.start_ms|round(2) }} ms</td>
+<td class="num">{{ span.duration_ms|round(2) }} ms</td>
+<td><meter min="0" max="{{ total }}" value="{{ span.duration_ms }}" title="{{ span.duration_ms|round(2) }} ms"></meter></td>
+</tr>
+{%- if span.children %}{{ loop(span.children) }}{% endif %}
+{%- endfor %}
+</tbody>
+</table>
+{%- if not panel.spans %}
+<p class="muted">No times are known yet.</p>
+{%- endif %}

@@ -994,6 +994,13 @@ pub enum DebugCommand {
     /// --diff since a snapshot kept with --snapshot.
     Memory(MemoryArgs),
 
+    /// A development run's record of one request, by the ID in its
+    /// X-Request-ID header: its timing, where it was routed, its
+    /// response and headers, with secret values masked, and its
+    /// connection. muructl run keeps the records of its last 1000
+    /// requests.
+    Request(RequestRecordArgs),
+
     /// Run Python code in the workers and print its output and value.
     /// Allowed as it is under muructl run; under the daemon, only when
     /// its [daemon] table sets debug_exec.
@@ -1022,6 +1029,21 @@ pub enum DebugCommand {
     /// is under muructl run; under the daemon, only when its [daemon]
     /// table sets debug_exec.
     Attach(AttachArgs),
+}
+
+/// `muructl debug request`.
+#[derive(Args)]
+pub struct RequestRecordArgs {
+    /// The request's ID, as X-Request-ID, Server-Timing and the access
+    /// log give it.
+    #[arg(value_name = "ID")]
+    request_id: String,
+
+    #[command(flatten)]
+    output: JsonArgs,
+
+    #[command(flatten)]
+    socket: SocketArgs,
 }
 
 /// `muructl debug inspect`.
@@ -1258,6 +1280,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
     let command = match command {
         DebugCommand::Report(args) => return crate::diagnostics::report::report(args).await,
         DebugCommand::Bundle(args) => return crate::diagnostics::bundle::bundle(args).await,
+        DebugCommand::Request(args) => return request_record(args).await,
         other => other,
     };
 
@@ -1331,7 +1354,10 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
                 "timeout_s": exec.timeout.as_secs_f64(),
             }),
         ),
-        DebugCommand::Attach(_) | DebugCommand::Report(_) | DebugCommand::Bundle(_) => {
+        DebugCommand::Attach(_)
+        | DebugCommand::Report(_)
+        | DebugCommand::Bundle(_)
+        | DebugCommand::Request(_) => {
             unreachable!("attach, report and bundle are handled above")
         }
     };
@@ -1354,7 +1380,10 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::Trace(_) => print_trace(&response),
         DebugCommand::Memory(_) => print_memory(&response),
         DebugCommand::Exec(_) => print_exec(&response),
-        DebugCommand::Attach(_) | DebugCommand::Report(_) | DebugCommand::Bundle(_) => {}
+        DebugCommand::Attach(_)
+        | DebugCommand::Report(_)
+        | DebugCommand::Bundle(_)
+        | DebugCommand::Request(_) => {}
     }
 
     Ok(())
@@ -2834,6 +2863,114 @@ pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Print a development run's record of one request (section 11.7).
+async fn request_record(args: RequestRecordArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.socket()?).await?;
+    let record = client
+        .get_request(pb::GetRequestRequest {
+            request_id: args.request_id,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if args.output.json {
+        return print_answer(&record);
+    }
+
+    print!("{}", request_text(&record));
+    Ok(())
+}
+
+/// A request's record as text: a line naming the request, then each
+/// panel's spans, values and tables.
+fn request_text(record: &pb::RequestRecord) -> String {
+    use std::fmt::Write as _;
+
+    let millis =
+        |ms: f64| muru_edge::access::format_duration(Duration::from_secs_f64(ms.max(0.0) / 1000.0));
+    let at = muru_common::log::clock(
+        std::time::UNIX_EPOCH + Duration::from_millis(record.started_unix_ms),
+    );
+    let mut text = String::new();
+
+    if record.in_progress {
+        let _ = writeln!(
+            text,
+            "{} {} {}  in progress  at {at}",
+            record.method, record.target, record.version
+        );
+    } else {
+        let _ = writeln!(
+            text,
+            "{} {} {}  {}  {}  at {at}",
+            record.method,
+            record.target,
+            record.version,
+            record.status,
+            millis(record.total_ms)
+        );
+    }
+
+    let _ = writeln!(text, "request {}", record.request_id);
+
+    for panel in &record.panels {
+        let _ = writeln!(text, "\n{}", panel.title);
+
+        // Spans indented by depth, each with where it starts on the
+        // request's clock.
+
+        let mut spans: Vec<(usize, &pb::PanelSpan)> =
+            panel.spans.iter().rev().map(|span| (0, span)).collect();
+        let mut lines = Vec::new();
+
+        while let Some((depth, span)) = spans.pop() {
+            lines.push((
+                format!("{}{}", "  ".repeat(depth), span.name),
+                format!(
+                    "{}  from {}",
+                    millis(span.duration_ms),
+                    millis(span.start_ms)
+                ),
+            ));
+            spans.extend(span.children.iter().rev().map(|child| (depth + 1, child)));
+        }
+
+        lines.extend(
+            panel
+                .values
+                .iter()
+                .map(|value| (value.name.clone(), value.value.clone())),
+        );
+        let width = lines.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+
+        for (name, value) in &lines {
+            let _ = writeln!(text, "  {name:<width$}  {value}");
+        }
+
+        for table in &panel.tables {
+            let _ = writeln!(text, "  {}", table.caption);
+
+            if table.rows.is_empty() {
+                let _ = writeln!(text, "    none");
+            }
+
+            for row in &table.rows {
+                match row.cells.as_slice() {
+                    [name, value] => {
+                        let _ = writeln!(text, "    {name}: {value}");
+                    }
+                    cells => {
+                        let _ = writeln!(text, "    {}", cells.join("  "));
+                    }
+                }
+            }
+        }
+    }
+
+    text
 }
 
 /// What `muructl requests` shows.

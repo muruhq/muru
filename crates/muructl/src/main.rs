@@ -447,6 +447,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         https: None,
         spool: None,
         rate_buckets: None,
+        recorder: None,
     })
     .await
     .map_err(|error| explain_bind_error(error, SocketAddr::new(args.bind.ip, 0)))?;
@@ -3452,6 +3453,11 @@ async fn run_with(
         None => None,
     };
 
+    // Section 11.7: a development run keeps a record of each request,
+    // for the dashboard and the admin socket as well as the edge.
+
+    let recorder = development.then(|| Arc::new(muru_edge::recorder::Recorder::default()));
+
     let edge = match muru_edge::Edge::bind(muru_edge::Config {
         listen: http_address,
         app: label.clone(),
@@ -3478,6 +3484,7 @@ async fn run_with(
         https: tls.as_ref().map(|tls| tls.https.clone()),
         spool: spool.clone(),
         rate_buckets: None,
+        recorder: recorder.clone(),
     })
     .await
     {
@@ -3753,12 +3760,26 @@ async fn run_with(
                 access_log: edge.access_log(),
                 logs: logs.clone(),
                 processes: Arc::clone(&run_processes),
+                recorder: recorder.clone(),
             },
         )
         .await
         {
             Ok(address) => {
                 muru_common::muru_println!("dashboard on http://{address}/");
+
+                // Section 4.20: each response of a development run names
+                // its request's page, under the address the dashboard is
+                // reached at, as the login links do.
+
+                if development {
+                    let reached = std::env::var("MURU_DASHBOARD_URL")
+                        .ok()
+                        .filter(|url| !url.trim().is_empty())
+                        .unwrap_or_else(|| format!("http://{address}/"));
+                    edge.links().set_dashboard(reached.trim());
+                }
+
                 dashboard_address = Some(address);
             }
             Err(error) => muru_common::muru_println!("no dashboard: {error:#}"),
@@ -3846,6 +3867,7 @@ async fn run_with(
             events: Arc::clone(&run_events),
             settings: Arc::clone(&settings),
             processes: Arc::clone(&run_processes),
+            recorder: recorder.clone(),
         });
 
         match run_admin::serve(state, admin_stop_rx).await {

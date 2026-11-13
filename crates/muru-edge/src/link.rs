@@ -1236,6 +1236,13 @@ pub struct Context<'a> {
     /// The bytes of the request's body read so far and not yet taken by
     /// an access record (section 11.1).
     pub received: Arc<std::sync::atomic::AtomicU64>,
+    /// What a development run notes of the request for its response
+    /// (section 4.20); none outside development mode.
+    pub noted: Option<Arc<crate::development::Request>>,
+    /// The connection the request arrived on (section 11.7).
+    pub connection: Arc<crate::development::Connection>,
+    /// The request's position on it, 1 for the first.
+    pub connection_request: u64,
 }
 
 impl<'a> Context<'a> {
@@ -1284,6 +1291,9 @@ impl<'a> Context<'a> {
             client_class: Arc::clone(&self.client_class),
             mode: None,
             received: Arc::clone(&self.received),
+            noted: self.noted.clone(),
+            connection: Arc::clone(&self.connection),
+            connection_request: self.connection_request,
         }
     }
 }
@@ -1388,6 +1398,8 @@ pub(crate) struct Recording {
     /// The request body's bytes read so far, which the record takes when
     /// it is written.
     received: Arc<std::sync::atomic::AtomicU64>,
+    /// Where a development run notes the times for the response.
+    noted: Option<Arc<crate::development::Request>>,
 }
 
 /// Record a response the edge produced itself, such as a static file,
@@ -1466,6 +1478,8 @@ impl Recording {
             client_class: context.client_class.to_string(),
             websocket: None,
             handoff: None,
+            connection: context.connection.id.clone(),
+            connection_requests: context.connection_request,
         };
 
         Self {
@@ -1475,6 +1489,24 @@ impl Recording {
             record,
             started: Instant::now(),
             received: Arc::clone(&context.received),
+            noted: context.noted.clone(),
+        }
+    }
+
+    /// The response head arrived from a worker or an upstream after
+    /// `application`: the record takes the time, and a development run
+    /// notes it with the queue's for the response (section 4.20), unless
+    /// this hop is a sub-request of the edge's own.
+    pub(crate) fn head_arrived(&mut self, application: Duration) {
+        self.record.application = application;
+
+        if let Some(noted) = &self.noted
+            && !self.silent
+        {
+            noted.note(crate::development::Timing {
+                queue: self.record.queue,
+                application,
+            });
         }
     }
 
@@ -1502,6 +1534,11 @@ impl Recording {
         self.record.total = self.started.elapsed();
         let opened = self.record.clone();
         let log = Arc::clone(&self.log);
+
+        if let Some(noted) = &self.noted {
+            noted.logged(&self.record);
+        }
+
         log.record(self.record);
         log.open_websocket(opened)
     }
@@ -1520,6 +1557,13 @@ impl Recording {
         if self.silent {
             self.log.record_hop(&self.record);
         } else {
+            // Section 11.7: a development run's record of the request
+            // takes the access log's.
+
+            if let Some(noted) = &self.noted {
+                noted.logged(&self.record);
+            }
+
             self.log.record(self.record);
         }
     }
@@ -2164,7 +2208,7 @@ async fn handle_inner(
     let mut recording = failing.recording.lock().expect("recording poisoned").take();
 
     if let Some(recording) = recording.as_mut() {
-        recording.record.application = dispatched.elapsed();
+        recording.head_arrived(dispatched.elapsed());
         recording.record.status = u16::try_from(head.status).unwrap_or(500);
 
         // Section 11.7: a response flushed as it goes streams, for as long
