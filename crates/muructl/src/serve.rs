@@ -1498,11 +1498,16 @@ mod tests {
         let (run, mode, _) = prepare(&args, Some(&limits), |_| None).expect("prepares");
         assert_eq!(run.processes, None);
         assert_eq!(mode.cgroup(), Some(PathBuf::from("/sys/fs/cgroup")));
+
+        // The first line gives the limits; a line about the spool follows
+        // where the run directory is in memory, as /run is on many Linux
+        // machines, which a test of its own covers.
+
         assert_eq!(
-            mode.start_lines,
-            [
+            mode.start_lines.first().map(String::as_str),
+            Some(
                 "container limits: 1.5 CPUs from cpu.max 150000 100000, memory.max 4.0GB with 410MB of headroom"
-            ]
+            )
         );
 
         // There is no count worked out from the CPUs to ask for.
