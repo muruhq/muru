@@ -1,14 +1,99 @@
 # Inspecting requests in development
 
-`muructl run` tells the browser how long each request waited for a
-worker and how long the application took, and keeps a record of every
-request it serves. The record is looked up by the request's ID on the
-dashboard, with `muructl debug request` and through the MCP server, so a
-JSON API's requests can be inspected as easily as a page's.
+`muructl run` keeps a record of every request it serves: its timing,
+where it was routed, its response and headers, what the application
+logged and the exception it raised. With `--toolbar` each HTML page
+shows the record of the request that produced it, in a toolbar on the
+page. The same record is looked up by the request's ID on the dashboard,
+with `muructl debug request` and through the MCP server, so a JSON API's
+requests can be inspected as easily as a page's, and every response
+tells the browser's own developer tools how long it took.
 
 All of this is part of development mode: under `--allow-public`,
-`muructl serve` and the daemon, responses carry neither header and no
-records are kept.
+`muructl serve` and the daemon, there is no toolbar, responses carry
+neither header and no records are kept.
+
+## The toolbar on the page
+
+Turn the toolbar on for a run with `--toolbar`:
+
+```console
+$ muructl run shop.wsgi:application --toolbar
+...
+muru: toolbar on: the edge inserts it into HTML pages, with each request's record under /_muru/
+```
+
+or for every run of the project with `toolbar = true` in its
+`[tool.muru.run]` table, or for your own checkout in `muru.local.toml`
+(see [settings for muructl run](run-settings.md)). `--no-toolbar` turns a
+file's setting off for one run.
+
+Each HTML page then has a badge in its bottom right corner with the
+request's status, its total and queue times, the worker that served it,
+and how many log records and errors it had. Clicking the badge opens the
+record's panels, the same ones the [dashboard's request
+page](#a-requests-record) shows, as tabs, and "open in dashboard" opens
+that page. A page whose response is still streaming updates as the
+record fills in. The toolbar only shows: it has no forms and changes
+nothing.
+
+The application is not changed. Muru inserts one tag before the page's
+`</body>`:
+
+```html
+<script src="/_muru/toolbar.js" data-request="01JCZ8X4R3T5V6W7Y8Z9A0B1C2" async></script>
+```
+
+It goes into a page a browser loads as a document, so `fetch()` and htmx
+requests, which say otherwise in `Sec-Fetch-Dest`, are left as they are.
+Muru never changes:
+
+- a response to anything but GET, or one whose status is 204, 206 or
+  304;
+- a response that is not `text/html`, or has no `</body>`;
+- a response the application encoded itself (`Content-Encoding`) or
+  marked `Cache-Control: no-transform`;
+- a file Muru sends itself, a static file or a file hint.
+
+A changed page loses its `Content-Length` and a strong `ETag` becomes
+weak, since its bytes are no longer the application's own. Compression
+applies after the tag is inserted.
+
+### Content security policy
+
+The tag is loaded from the page's own origin, so a policy that allows
+`'self'` for scripts needs nothing. When the policy gives scripts a
+nonce, Muru puts the same nonce on the tag, and the toolbar uses it for
+its stylesheet too. A policy that allows scripts only by hash, or only
+from elsewhere, would refuse the tag, so the page gets none, and the run
+says once, on the terminal, which path and why.
+
+### The reserved prefix
+
+The toolbar's files and data are under `/_muru/` on the application's
+own address, answered by Muru without reaching the application:
+
+| Path | Gives |
+| --- | --- |
+| `/_muru/toolbar.js`, `/_muru/toolbar.css` | the toolbar itself |
+| `/_muru/requests/ID.json` | the record, as `muructl debug request ID --json` prints it |
+| `/_muru/requests/ID/panels/NAME.html` | one panel of the record, drawn |
+
+They answer GET only, with or without `--toolbar`, and only to requests
+for `localhost`, a loopback address or a name the run was given with
+`--host`, which stops another site reaching them through a DNS name it
+points at your machine. A request a browser makes from another site's
+page is refused. A route of the application under `/_muru/` is not
+reached during a development run.
+
+Behind a development proxy that serves the run under a path, as
+jupyter-server-proxy and code-server do, the tag carries the path the
+proxy sends in `X-Forwarded-Prefix`.
+
+A page served by another server, such as a front end's own development
+server calling a Python API that Muru serves, gets no toolbar, since
+Muru never sees it; the API's requests still carry the timings below and
+have records.
 
 ## Timings in the browser
 

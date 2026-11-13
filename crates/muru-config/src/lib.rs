@@ -5239,6 +5239,11 @@ pub struct RunSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = true))]
     pub compression: Option<bool>,
+    /// Whether the edge inserts the development toolbar into the run's
+    /// HTML pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub toolbar: Option<bool>,
     /// Whether every line on the terminal carries the full UTC time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
@@ -5279,6 +5284,7 @@ impl RunSettings {
             slow: over.slow.clone().or_else(|| self.slow.clone()),
             dashboard: over.dashboard.clone().or_else(|| self.dashboard.clone()),
             compression: over.compression.or(self.compression),
+            toolbar: over.toolbar.or(self.toolbar),
             timestamps: over.timestamps.or(self.timestamps),
             env_file: over.env_file.clone().or_else(|| self.env_file.clone()),
         }

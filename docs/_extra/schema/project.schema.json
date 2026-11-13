@@ -841,6 +841,11 @@
         "tls_key": {
           "description": "Its private key, relative to the project.",
           "type": "string"
+        },
+        "toolbar": {
+          "default": false,
+          "description": "Whether the edge inserts the development toolbar into the run's HTML pages.",
+          "type": "boolean"
         }
       },
       "type": "object"

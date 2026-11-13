@@ -273,6 +273,7 @@ The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a muru.toml and i
 | `timestamps` | boolean | `false` | Whether every line on the terminal carries the full UTC time. |
 | `tls_cert` | string |  | A certificate chain to serve, relative to the project. |
 | `tls_key` | string |  | Its private key, relative to the project. |
+| `toolbar` | boolean | `false` | Whether the edge inserts the development toolbar into the run's HTML pages. |
 
 (config-project-tool-muru-scaling)=
 ## `[tool.muru.scaling]`

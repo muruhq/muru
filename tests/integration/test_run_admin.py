@@ -477,6 +477,70 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
         server.stop()
 
 
+def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) -> None:
+    """With --toolbar the edge inserts the toolbar's tag into an HTML page
+    a browser loads (section 4.20), and answers the reserved prefix from
+    the run's records, to loopback and its own pages only."""
+
+    port = support.free_port()
+    server = start(runtime, port=port, args=["--toolbar"])
+
+    try:
+        assert server.wait_for_log("toolbar on:")
+        page = server.get("/page", headers={"Sec-Fetch-Dest": "document"})
+        request_id = page.header("x-request-id")
+        assert request_id is not None
+        assert page.header("content-length") is None
+        tag = (
+            f'<script src="/_muru/toolbar.js" data-request="{request_id}" '
+            f'data-dashboard="http://127.0.0.1:{port}/request/{request_id}" async></script>'
+        )
+        assert page.body.decode() == f"<html><body><h1>Page</h1>{tag}</body></html>"
+
+        # A fetch from the page is left alone, and a trusted proxy's prefix
+        # goes in front of the script's address.
+
+        fetched = server.get("/page", headers={"Sec-Fetch-Dest": "empty"})
+        assert b"_muru" not in fetched.body
+        proxied = server.get(
+            "/page",
+            headers={"Sec-Fetch-Dest": "document", "X-Forwarded-Prefix": "/proxy/8080"},
+        )
+        assert b'<script src="/proxy/8080/_muru/toolbar.js"' in proxied.body
+
+        # The reserved prefix: the script, the record and a panel, and
+        # nothing for another site's page or an unknown host.
+
+        script = server.get("/_muru/toolbar.js", headers={"Sec-Fetch-Site": "same-origin"})
+        assert script.status == 200
+        assert script.header("content-type") == "text/javascript"
+        deadline = time.monotonic() + 10
+
+        while True:
+            answer = server.get(f"/_muru/requests/{request_id}.json")
+            assert answer.status == 200
+            found = json.loads(answer.body)
+
+            if not found["in_progress"]:
+                break
+
+            assert time.monotonic() < deadline, found
+            time.sleep(0.05)
+
+        assert found["request_id"] == request_id and found["target"] == "/page"
+        panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html")
+        assert panel.status == 200 and "<table" in panel.body.decode()
+        assert server.get("/_muru/requests/NOSUCH.json").status == 404
+        refused = server.get(
+            f"/_muru/requests/{request_id}.json", headers={"Sec-Fetch-Site": "cross-site"}
+        )
+        assert refused.status == 403
+        rebound = server.get(f"/_muru/requests/{request_id}.json", headers={"Host": "evil.test"})
+        assert rebound.status == 403
+    finally:
+        server.stop()
+
+
 def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
     port = support.free_port()
     server = start(runtime, port=port)

@@ -280,6 +280,11 @@ impl Request {
 #[derive(Debug, Default)]
 pub struct Links {
     dashboard: OnceLock<String>,
+    /// The run's own host names besides loopback, which the reserved
+    /// prefix answers to (section 4.20).
+    hosts: OnceLock<Vec<String>>,
+    /// The toolbar goes into the run's HTML pages.
+    toolbar: std::sync::atomic::AtomicBool,
 }
 
 impl Links {
@@ -294,6 +299,33 @@ impl Links {
         };
 
         let _ = self.dashboard.set(base);
+    }
+
+    /// The dashboard's address, once it is named.
+    pub fn dashboard(&self) -> Option<&str> {
+        self.dashboard.get().map(String::as_str)
+    }
+
+    /// Name the run's own host names besides loopback, which the
+    /// reserved prefix answers to. The first call wins.
+    pub fn set_hosts(&self, hosts: Vec<String>) {
+        let _ = self.hosts.set(hosts);
+    }
+
+    /// Insert the toolbar into the run's HTML pages.
+    pub fn set_toolbar(&self) {
+        self.toolbar.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the toolbar goes into the run's HTML pages.
+    pub fn toolbar_on(&self) -> bool {
+        self.toolbar.load(Ordering::Relaxed)
+    }
+
+    /// The run's own host names the reserved prefix answers to, besides
+    /// loopback.
+    pub fn hosts(&self) -> &[String] {
+        self.hosts.get().map_or(&[], Vec::as_slice)
     }
 
     /// The dashboard's page for a request, when the dashboard is on.

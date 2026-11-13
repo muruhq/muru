@@ -2616,6 +2616,8 @@ pub(crate) async fn serve_hint(
                 recording.complete(status, "", bytes);
             }
 
+            let mut response = response;
+            response.extensions_mut().insert(crate::toolbar::EdgeFile);
             response
         }
         Ok(_) => {
