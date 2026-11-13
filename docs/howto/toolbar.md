@@ -140,13 +140,23 @@ tunnel or a proxy. With `--dashboard off` the header is not sent.
 
 The page shows the record as panels:
 
-- **Timing:** the request's phases from its arrival: the wait for a
-  worker, the application until the response head, and sending the
-  response, each with when it started and how long it took. Below them
-  are the worker's own phases: until the application called
-  `start_response` (or sent `http.response.start`), from its first body
-  byte to its last, and until it ended, which for WSGI is `close()`
-  returning.
+- **Timing:** the request's phases from its arrival, each with when it
+  started, how long it took and a bar placed where it falls in the
+  request:
+
+  - **waiting for a worker**, until one was free to take the request;
+  - **until the response head**, from handing the request to the worker
+    until the response's status and headers came back;
+  - **in the worker**, the worker's own account of the same time, from
+    receiving the request: **until the response starts** (the
+    application calling `start_response` or sending
+    `http.response.start`), **producing the body** from its first byte
+    to its last, and **finishing**, until the body's `close()` returned
+    or the ASGI application returned;
+  - **sending the response**, from the head's arrival until the last
+    byte was sent to the client.
+
+  The panel lists the same under "What the phases are".
 
 - **Where:** the application and release, host and virtual host,
   mount, worker group, worker and the thread that ran the request,
@@ -219,11 +229,11 @@ GET /orders/42 HTTP/1.1  500  2.0ms  at 10:42:07.123
 request 01JCZ8X4R3T5V6W7Y8Z9A0B1C2
 
 Timing
-  request          2.0ms  from 0.0ms
-    queue          0.0ms  from 0.0ms
-    application    1.9ms  from 0.0ms
-    send           0.0ms  from 1.9ms
-    worker         1.8ms  from 0.0ms
+  request                    2.0ms  from 0.0ms
+    waiting for a worker     0.0ms  from 0.0ms
+    until the response head  1.9ms  from 0.0ms
+    in the worker            1.8ms  from 0.0ms
+    sending the response     0.0ms  from 1.9ms
 
 Where
   application       shop@r3

@@ -195,9 +195,19 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
         if record.app_ms > 0.0 || record.queue_ms > 0.0 {
             let answered = record.queue_ms + record.app_ms;
             request.children = vec![
-                span("queue", 0.0, record.queue_ms, "edge"),
-                span("application", record.queue_ms, record.app_ms, "application"),
-                span("send", answered, record.total_ms - answered, "edge"),
+                span("waiting for a worker", 0.0, record.queue_ms, "edge"),
+                span(
+                    "until the response head",
+                    record.queue_ms,
+                    record.app_ms,
+                    "application",
+                ),
+                span(
+                    "sending the response",
+                    answered,
+                    record.total_ms - answered,
+                    "edge",
+                ),
             ];
         }
 
@@ -210,7 +220,7 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
 
             if worker.to_start_response > 0.0 {
                 phases.push(span(
-                    "start_response",
+                    "until the response starts",
                     at(0.0),
                     worker.to_start_response,
                     "worker",
@@ -219,21 +229,36 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
 
             if worker.to_first_byte > 0.0 {
                 phases.push(span(
-                    "body",
+                    "producing the body",
                     at(worker.to_first_byte),
                     worker.to_last_byte - worker.to_first_byte,
                     "worker",
                 ));
             }
 
-            if worker.to_close > 0.0 {
+            // Finishing follows the response; an application that failed
+            // before starting one has only its whole time.
+
+            if worker.to_close > 0.0
+                && (worker.to_start_response > 0.0 || worker.to_first_byte > 0.0)
+            {
                 let from = worker.to_last_byte.max(worker.to_start_response);
-                phases.push(span("end", at(from), worker.to_close - from, "worker"));
+                phases.push(span(
+                    "finishing",
+                    at(from),
+                    worker.to_close - from,
+                    "worker",
+                ));
             }
 
-            let mut whole = span("worker", at(0.0), worker.to_close, "worker");
+            let mut whole = span("in the worker", at(0.0), worker.to_close, "worker");
             whole.children = phases;
-            request.children.push(whole);
+
+            // It goes beside the edge's view of the same time, before the
+            // sending that follows it.
+
+            let at = request.children.len().min(2);
+            request.children.insert(at, whole);
         }
 
         spans.push(request);
@@ -626,30 +651,46 @@ mod tests {
             html.contains("<td class=\"depth-1\">request</td>"),
             "{html}"
         );
-        assert!(html.contains("<td class=\"depth-2\">queue</td>"), "{html}");
         assert!(
-            html.contains("<td class=\"depth-2\">application</td>"),
+            html.contains("<td class=\"depth-2\">waiting for a worker</td>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<td class=\"depth-2\">until the response head</td>"),
             "{html}"
         );
         assert!(html.contains("17.9 ms"), "{html}");
-        assert!(html.contains("<meter"), "{html}");
-        assert!(html.contains("max=\"18.4\""), "{html}");
+        assert!(html.contains("What the phases are"), "{html}");
+
+        // Each bar starts where its phase does, in whole percent of the
+        // request: the request's own across all of it, the application's
+        // from 0.2 ms of 18.4 for 17.9 ms.
+
+        assert!(html.contains("class=\"bar from-0 for-100\""), "{html}");
+        assert!(html.contains("class=\"bar from-1 for-97\""), "{html}");
     }
 
     #[test]
     fn the_timing_panel_places_the_workers_phases_after_the_queue() {
         let html = drawn("timing");
-        assert!(html.contains("<td class=\"depth-2\">worker</td>"), "{html}");
         assert!(
-            html.contains("<td class=\"depth-3\">start_response</td>"),
+            html.contains("<td class=\"depth-2\">in the worker</td>"),
             "{html}"
         );
-        assert!(html.contains("<td class=\"depth-3\">body</td>"), "{html}");
+        assert!(
+            html.contains("<td class=\"depth-3\">until the response starts</td>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<td class=\"depth-3\">producing the body</td>"),
+            "{html}"
+        );
 
         // The body starts 15 ms into the worker's clock, after 0.2 ms of
         // queue.
 
         assert!(html.contains("15.2 ms"), "{html}");
+        assert!(html.contains("class=\"bar from-83 for-11\""), "{html}");
 
         let mut missing = fixture();
         missing.from_worker = None;
