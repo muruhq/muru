@@ -3361,7 +3361,8 @@ impl Service {
 }
 
 /// The scaling state of a release's groups as the API shows it.
-fn scale_message(
+/// A release's groups' scaling as the admin API answers it.
+pub fn scale_message(
     app: &str,
     release: &str,
     groups: Vec<(String, crate::scaling::ScaleStatus)>,

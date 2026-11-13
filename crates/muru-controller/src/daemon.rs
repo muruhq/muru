@@ -30,7 +30,8 @@ use crate::model::{
     RolloutStep, now_unix_ms, valid_name,
 };
 use crate::rollouts::{Counters, Verdict, judge};
-use crate::scaling::{Decision, ScaleStatus, Scaler, Signals};
+use crate::scaling::{Decision, ScaleStatus};
+use crate::scaling::{GroupScaling, Step, decision_message};
 use crate::servers::{Servers, ServersRecord};
 use crate::store::Store;
 
@@ -727,27 +728,6 @@ struct GroupRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     optional: bool,
     sockets: Vec<PathBuf>,
-}
-
-/// Section 7.4: one worker group's autoscaler and what was last asked of
-/// the host for it.
-struct GroupScaling {
-    name: String,
-    scaler: Scaler,
-    /// Slots a worker offers before any is routed to: its threads, or
-    /// its event loop's concurrency.
-    slots_per_worker: f64,
-    /// The count last asked of the host, so a count the host has not
-    /// reached yet is not asked for again every second.
-    requested: Option<u32>,
-    /// The threads a worker can run Python on at once without a GIL,
-    /// for its CPU share (section 7.3).
-    threads: u32,
-    /// The soft memory limit and what it measures, when one is set.
-    memory_limit: Option<(muru_config::Measure, u64)>,
-    /// The last scale-out the node's budget held back: the count asked
-    /// for, the count given and the limit, so each is one event.
-    denied: Option<(u32, u32, crate::budget::Limit)>,
 }
 
 /// Releases, as (app, release).
@@ -7339,68 +7319,24 @@ impl Daemon {
                     .max()
                     .map(|at| now.saturating_duration_since(*at));
                 let group = &mut running.scalers[index];
-                let advisory = group.scaler.spec().advisory;
-                group.scaler.set_capacity(capacities.remove(&(
-                    app.clone(),
-                    id.clone(),
-                    group.name.clone(),
-                )));
+                let capacity = capacities.remove(&(app.clone(), id.clone(), group.name.clone()));
 
-                if advisory {
-                    group.scaler.sync(ready);
-                }
-
-                let before = group.scaler.desired();
-                let signals = Signals::from_samples(
-                    samples,
-                    app,
-                    id,
-                    &group.name,
-                    ready,
-                    group.slots_per_worker,
-                    youngest,
-                );
-
-                match group.scaler.observe(now, signals) {
-                    Some(Decision::ScaleOut { to, reason }) if !advisory => {
-                        let reason = format!(
-                            "{reason}; {}",
-                            describe_diagnosis(&group.scaler.diagnosis())
-                        );
+                match group.observe(now, samples, app, id, ready, youngest, capacity) {
+                    Step::Ask { from, to, reason } => {
                         let key = (app.clone(), id.clone(), name);
                         reasons.insert(key.clone(), (ready, reason));
                         asks.push(crate::budget::Ask {
                             key,
                             priority: priorities.get(app).copied().unwrap_or(0),
-                            from: before,
+                            from,
                             to,
                             cost,
                         });
                     }
-                    Some(Decision::ScaleOut { to, reason } | Decision::ScaleIn { to, reason }) => {
-                        let diagnosis = group.scaler.diagnosis();
-                        emitted.push((
-                            "scaling.decision",
-                            subject.clone(),
-                            "info",
-                            decision_message(
-                                &group.name,
-                                ready,
-                                to,
-                                &format!("{reason}; {}", describe_diagnosis(&diagnosis)),
-                                advisory,
-                            ),
-                        ));
+                    Step::Event(kind, level, message) => {
+                        emitted.push((kind, subject.clone(), level, message));
                     }
-                    Some(Decision::Suspended { reason }) => {
-                        emitted.push((
-                            "churn_budget.exhausted",
-                            subject.clone(),
-                            "warning",
-                            format!("{}: {reason}", group.name),
-                        ));
-                    }
-                    None => {}
+                    Step::Nothing => {}
                 }
             }
         }
@@ -7417,42 +7353,25 @@ impl Daemon {
 
             let subject = format!("{app}@{id}");
             let (ready, reason) = reasons.remove(&admitted.ask.key).unwrap_or_default();
-            let from = admitted.ask.from;
+            let held = admitted.limit.map_or_else(String::new, |limit| {
+                format!(
+                    "the node's {limit} budget ({})",
+                    self.budget.describe(&used)
+                )
+            });
 
-            match admitted.limit {
-                Some(limit) => {
-                    let held = format!(
-                        "the node's {limit} budget ({})",
-                        self.budget.describe(&used)
-                    );
-                    group.scaler.limit(from, admitted.to, now, &held);
-                    let denial = (admitted.ask.to, admitted.to, limit);
-
-                    if group.denied != Some(denial) {
-                        group.denied = Some(denial);
-                        emitted.push((
-                            "scaling.denied_by_budget",
-                            subject.clone(),
-                            "warning",
-                            format!(
-                                "{name}: {} of the {} more workers asked for fit {held}, at priority {}",
-                                admitted.to - from,
-                                admitted.ask.to - from,
-                                admitted.ask.priority
-                            ),
-                        ));
-                    }
-                }
-                None => group.denied = None,
-            }
-
-            if admitted.to > from {
-                emitted.push((
-                    "scaling.decision",
-                    subject,
-                    "info",
-                    decision_message(name, ready, admitted.to, &reason, false),
-                ));
+            for (kind, level, message) in group.admitted(
+                now,
+                ready,
+                admitted.ask.from,
+                admitted.ask.to,
+                admitted.to,
+                admitted.limit,
+                &held,
+                &reason,
+                Some(admitted.ask.priority),
+            ) {
+                emitted.push((kind, subject.clone(), level, message));
             }
         }
 
@@ -7470,13 +7389,8 @@ impl Daemon {
                 };
 
                 let group = &mut running.scalers[index];
-                let desired = group.scaler.desired();
 
-                if !group.scaler.spec().advisory
-                    && desired != ready
-                    && group.requested != Some(desired)
-                {
-                    group.requested = Some(desired);
+                if let Some(desired) = group.wanted(ready) {
                     requests.push((app.clone(), id.clone(), group.name.clone(), desired));
                 }
             }
@@ -10232,26 +10146,6 @@ fn restored_rotator(policy: crate::rotation::Policy, store: &Store) -> crate::ro
     crate::rotation::Rotator::restored(policy, present)
 }
 
-/// Sections 7.3 and 7.4: what one worker offers before the edge has
-/// counted any, and the threads it runs Python on at once without a GIL,
-/// by the interface the release's default mount runs as: its threads for
-/// WSGI, and for ASGI its event loop's concurrency, and its sync threads
-/// with the loop's own. gRPC calls are held on the event loop too
-/// (section 6.13).
-fn worker_size(
-    interface: muru_config::Interface,
-    threads: u32,
-    sync_threads: u32,
-    concurrency: u32,
-) -> (f64, u32) {
-    match interface {
-        muru_config::Interface::Asgi | muru_config::Interface::Grpc => {
-            (concurrency as f64, sync_threads + 1)
-        }
-        muru_config::Interface::Wsgi | muru_config::Interface::Auto => (threads as f64, threads),
-    }
-}
-
 /// Size each group's scaler for the interface the release runs as, which
 /// its host announces once it has loaded the application: a release left
 /// to be detected is sized as WSGI only until then.
@@ -10272,7 +10166,7 @@ fn size_scalers(
 
         if let Some((threads, sync_threads, concurrency)) = sizes {
             (scaling.slots_per_worker, scaling.threads) =
-                worker_size(interface, threads, sync_threads, concurrency);
+                crate::scaling::worker_size(interface, threads, sync_threads, concurrency);
         }
     }
 }
@@ -10292,30 +10186,24 @@ fn scalers_for(
         .memory
         .soft_limit
         .map(|limit| (spec.memory.measure, limit));
-    let mut scalers = vec![GroupScaling {
-        name: muru_edge::routing::DEFAULT_GROUP.to_owned(),
-        scaler: Scaler::new(spec.scaling.clone(), sockets.len() as u32),
-        slots_per_worker: 0.0,
-        requested: None,
-        threads: 0,
+    let mut scalers = vec![GroupScaling::new(
+        muru_edge::routing::DEFAULT_GROUP,
+        spec.scaling.clone(),
+        sockets.len() as u32,
         memory_limit,
-        denied: None,
-    }];
+    )];
 
     for group in &spec.groups {
         let current = groups
             .iter()
             .find(|record| record.name == group.name)
             .map_or(group.processes as usize, |record| record.sockets.len());
-        scalers.push(GroupScaling {
-            name: group.name.clone(),
-            scaler: Scaler::new(group.scaling.clone(), current as u32),
-            slots_per_worker: 0.0,
-            requested: None,
-            threads: 0,
+        scalers.push(GroupScaling::new(
+            &group.name,
+            group.scaling.clone(),
+            current as u32,
             memory_limit,
-            denied: None,
-        });
+        ));
     }
 
     size_scalers(&mut scalers, spec, interface);
@@ -10390,27 +10278,6 @@ fn clock_event(
 
 /// A scaling decision as its event says it.
 /// Section 7.3: a diagnosis as words for an event or a status line.
-fn describe_diagnosis(diagnosis: &crate::scaling::Diagnosis) -> String {
-    if diagnosis.advice.is_empty() {
-        format!("diagnosis: {}", diagnosis.summary)
-    } else {
-        format!(
-            "diagnosis: {}; for the next release, {}",
-            diagnosis.summary, diagnosis.advice
-        )
-    }
-}
-
-fn decision_message(group: &str, from: u32, to: u32, reason: &str, advisory: bool) -> String {
-    let verb = if to > from { "scale out" } else { "scale in" };
-
-    if advisory {
-        format!("advisory: would {verb} {group} from {from} to {to} workers: {reason}")
-    } else {
-        format!("{group}: {verb} from {from} to {to} workers: {reason}")
-    }
-}
-
 /// The applications a route sends requests to: the application, or a
 /// static route's fallback.
 fn route_apps(route: &muru_config::Route) -> Vec<&str> {
@@ -10740,9 +10607,21 @@ mod tests {
         // Threads 4, sync threads 8, concurrency 1000: as WSGI until the
         // host has said what it detected, then by the loop.
 
-        assert_eq!(worker_size(Interface::Auto, 4, 8, 1000), (4.0, 4));
-        assert_eq!(worker_size(Interface::Wsgi, 4, 8, 1000), (4.0, 4));
-        assert_eq!(worker_size(Interface::Asgi, 4, 8, 1000), (1000.0, 9));
-        assert_eq!(worker_size(Interface::Grpc, 4, 8, 1000), (1000.0, 9));
+        assert_eq!(
+            crate::scaling::worker_size(Interface::Auto, 4, 8, 1000),
+            (4.0, 4)
+        );
+        assert_eq!(
+            crate::scaling::worker_size(Interface::Wsgi, 4, 8, 1000),
+            (4.0, 4)
+        );
+        assert_eq!(
+            crate::scaling::worker_size(Interface::Asgi, 4, 8, 1000),
+            (1000.0, 9)
+        );
+        assert_eq!(
+            crate::scaling::worker_size(Interface::Grpc, 4, 8, 1000),
+            (1000.0, 9)
+        );
     }
 }

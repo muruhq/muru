@@ -468,7 +468,8 @@ Each of these is a warning, with a link to this section. muructl starts
 as configured.
 
 - **Workers over the CPUs.** When the workers configured, across every
-  group, are more than the CPU quota rounded up: `muru: warning: 6
+  group, a group with a [scaling policy](#scaling-inside-the-container)
+  at its `max_workers`, are more than the CPU quota rounded up: `muru: warning: 6
   workers over 3 groups is more than the 2 CPUs cpu.max allows`.
 - **A preload that would not fit when copied.** When what the host holds
   once the application is imported, times the workers plus one, plus the
@@ -562,6 +563,66 @@ ready, except a group marked `optional = true`, which never holds
 readiness back. While a group is short, `/readyz` answers 503 and says
 which, for example `group reports has 1 of 2 workers ready`. `/status`,
 with `--admin-status`, lists each group with its workers ready.
+
+## Scaling inside the container
+
+A worker group keeps the count it is configured with unless it has a
+[scaling policy](scaling.md). With a `[tool.muru.scaling]` table, or a
+group's own `scaling` table, `muructl serve` scales the group as the
+daemon does, with the same modes, signals and bounds:
+
+```toml
+[tool.muru]
+entrypoint = "shop.wsgi:application"
+processes = 2
+threads = 4
+
+[tool.muru.scaling]
+mode = "spare"
+min_workers = 2
+max_workers = 6
+min_spare = 1
+max_spare = 3
+```
+
+`min_workers` and `max_workers` are the only bounds on the count. The
+start line warns when `max_workers`, added up over the groups, is more
+than the CPUs, as it does for a fixed count.
+
+**Memory holds growth back.** With a memory limit, a scale-out goes
+ahead only when what is left under `memory.max`, less the headroom, has
+room for one more worker. A worker counts at its group's `hard_limit`
+when one is set, so `max_workers` can be reached only when that many
+hard limits fit; otherwise at what the group's workers measure (their
+proportional set size), else the group's soft limit, else the mean of
+the container's workers. A scale-out held back is shown as `held at` in
+`muructl scale status` and is a `scaling.denied_by_budget` event, with
+the room it needed and what was left. More room, as after a resize,
+lets a scale-out the policy asks for go ahead; it never adds workers on
+its own.
+
+**Short of memory, a group with a policy shrinks.** When the [memory
+guard](#the-memory-guard) would replace the largest worker, and that
+worker's group has a policy and more than `min_workers` workers, the
+group is scaled in by that worker instead: it drains, and no replacement
+starts. It is a `scaling.decision` event that says it was for memory,
+with the room left. At `min_workers`, or in a group without a policy,
+the worker is replaced as above. So lowering a pod's memory in place
+shrinks it, never below `min_workers`.
+
+While the guard is acting, or the room is under the headroom, no
+scale-out is admitted, and the policy grows the group again only once
+the room is a worker's cost above the headroom, so the count does not
+swing back and forth. A worker the guard replaces is not a scale-in, and
+a scale-in the policy asks for goes ahead as usual.
+
+`muructl scale status` works inside the container through the admin
+socket, and `/readyz` and `--min-ready` count the workers ready, however
+many the policy is bringing the group to. A `--min-ready` above a
+group's `min_workers` is refused at start. `muructl scale pin` and
+`unpin` are not offered under `muructl serve`: a container's count is
+its configuration, and a different one is a new image or a changed
+Deployment.
 
 ## Probes and metrics
 

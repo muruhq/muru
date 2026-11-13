@@ -2563,8 +2563,9 @@ class Host:
     ) -> None:
         """Replace one worker for the supervisor, with its reason and cause.
 
-        A worker that has been replaced since it was chosen, so that its
-        pid is no longer `pid`, is left alone.
+        With `retire`, the worker drains with no successor, as a scale-in
+        drains one. A worker that has been replaced since it was chosen,
+        so that its pid is no longer `pid`, is left alone.
         """
 
         pid = int(args.get("pid", 0))
@@ -2595,12 +2596,19 @@ class Host:
             )
             return
 
-        self.replace(
-            state,
-            str(args.get("reason", "replaced on the supervisor's request")),
-            "worker.recycled",
-            str(args.get("cause", "")),
-        )
+        # Section 13.9: a group with a scaling policy is scaled in by the
+        # worker instead, which drains with no successor.
+
+        if args.get("retire"):
+            self.retire(state, f"scaled in for memory: {args.get('reason', '')}")
+        else:
+            self.replace(
+                state,
+                str(args.get("reason", "replaced on the supervisor's request")),
+                "worker.recycled",
+                str(args.get("cause", "")),
+            )
+
         self.send_to_supervisor(
             {
                 "type": "response",
@@ -2659,7 +2667,11 @@ class Host:
         if not candidates:
             return
 
-        state = max(candidates, key=lambda candidate: candidate.started_at)
+        self.retire(max(candidates, key=lambda candidate: candidate.started_at), "scaled in")
+
+    def retire(self, state: WorkerState, why: str) -> None:
+        """Take one worker out of routing and then stop it, with no successor."""
+
         state.replaced = True
         retirement = Replacement(
             state.index, state.pid, "scaled in", "worker.exited", "scaled_in", retire=True
@@ -2668,7 +2680,7 @@ class Host:
         self.routed[state.index] = None
         retirement.announced = self.announce()
         retirement.announced_at = time.monotonic()
-        log(f"worker {self.worker_name(state.index)} (pid {state.pid}) leaves routing: scaled in")
+        log(f"worker {self.worker_name(state.index)} (pid {state.pid}) leaves routing: {why}")
 
     def answer_status(self, request_id: int, wanted: int | None) -> None:
         """Answer `debug status` with each worker's state and what it holds.

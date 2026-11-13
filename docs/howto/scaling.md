@@ -1,8 +1,9 @@
 # Scaling
 
 A worker group has a fixed number of processes unless it is given a
-scaling policy. With one, the daemon watches what the edge reports for the
-group each second, forks more workers when they are wanted and drains them
+scaling policy. With one, the daemon, or [`muructl serve` in a
+container](containers.md#scaling-inside-the-container), watches what the
+edge reports for the group each second, forks more workers when they are wanted and drains them
 slowly when they are not. Workers fork from the preloaded host, so a new
 one costs a fork rather than an import and is serving within seconds.
 

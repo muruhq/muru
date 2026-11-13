@@ -4178,9 +4178,9 @@ pub enum ScaleCommand {
     /// and churn.
     Status {
         /// The release as app@release, or an application for its serving
-        /// release.
+        /// release; the one application of `muructl serve` when left out.
         #[arg(value_name = "APP[@RELEASE]")]
-        target: String,
+        target: Option<String>,
 
         #[command(flatten)]
         socket: SocketArgs,
@@ -4425,7 +4425,11 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
         output,
     }) = args.command
     {
-        let (app, release) = split_target(&target)?;
+        let (app, release) = match target.as_deref() {
+            Some(target) => split_target(target)?,
+            None => ("", ""),
+        };
+
         let mut client = client::connect(&socket.socket()?).await?;
         let status = client
             .get_scale_status(pb::GetScaleStatusRequest {

@@ -5388,6 +5388,17 @@ pub fn check_scaling(
     groups: &BTreeMap<String, muru_config::Group>,
     processes: u32,
 ) -> Result<(), String> {
+    resolve_scalings(release, groups, processes).map(|_| ())
+}
+
+/// The scaling policies a project's tables give: the default group's,
+/// then each named group's by name, checked as `check_scaling` checks
+/// them. `muructl serve` scales by them (section 13.9).
+pub fn resolve_scalings(
+    release: Option<&muru_config::Scaling>,
+    groups: &BTreeMap<String, muru_config::Group>,
+    processes: u32,
+) -> Result<(ScalingSpec, Vec<(String, ScalingSpec)>), String> {
     let (scaling, _) = resolve_scaling(release, processes, "scaling")?;
     let mut resolved = Vec::new();
 
@@ -5397,13 +5408,16 @@ pub fn check_scaling(
             group.processes.map_or(processes, |value| value as u32),
             &format!("worker group {name}: scaling"),
         )?;
-        resolved.push((name.as_str(), group_scaling));
+        resolved.push((name.clone(), group_scaling));
     }
 
     check_idle_host(
         &scaling,
-        resolved.iter().map(|(name, scaling)| (*name, scaling)),
-    )
+        resolved
+            .iter()
+            .map(|(name, scaling)| (name.as_str(), scaling)),
+    )?;
+    Ok((scaling, resolved))
 }
 
 /// Section 7.4: a host that stops when idle needs every worker group to

@@ -805,3 +805,179 @@ def test_the_guard_and_status_follow_a_memory_limit_changed_while_serving(
             serve.stop()
 
         subprocess.run(["sudo", "-n", "rmdir", str(cgroup)], check=False)
+
+
+def test_a_scaling_policy_scales_the_serve_out_under_load_and_back_in(tmp_path: Path) -> None:
+    """Section 13.9: a project's scaling policy applies under serve, as
+    under the daemon, and `muructl scale status` answers inside it."""
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    project = tmp_path / "shop"
+    project.mkdir()
+    (project / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+    (project / "pyproject.toml").write_text(
+        """[tool.muru]
+entrypoint = 'app:application'
+processes = 1
+threads = 1
+
+[tool.muru.scaling]
+mode = 'spare'
+min_workers = 1
+max_workers = 2
+min_spare = 1
+max_spare = 3
+scale_out_window = '1s'
+scale_in_window = '3s'
+hold_after_growth = '2s'
+reap_interval = '1s'
+idle_reap_after = '3s'
+min_lifetime = '1s'
+"""
+    )
+    serve = start(tmp_path, "--chdir", str(project), app=None)
+    stop = threading.Event()
+
+    def load() -> None:
+        while not stop.is_set():
+            try:
+                serve.get("/sleep?seconds=0.3")
+            except OSError:
+                time.sleep(0.1)
+
+    try:
+        # Two requests at a time against one single-threaded worker: the
+        # group is short and grows to its ceiling.
+
+        threads = [threading.Thread(target=load, daemon=True) for _ in range(2)]
+
+        for thread in threads:
+            thread.start()
+
+        serve.wait_for("default: scale out from 1 to 2 workers", timeout=30)
+        stop.set()
+
+        for thread in threads:
+            thread.join(timeout=10)
+
+        scale = subprocess.run(
+            [str(muructl), "scale", "status"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={**os.environ, "MURU_RUN_DIR": str(serve.run_dir)},
+        )
+        assert scale.returncode == 0, scale.stderr
+        assert "spare 1-2 workers" in scale.stdout, scale.stdout
+
+        # Idle again: drained back to the floor.
+
+        serve.wait_for("default: scale in from 2 to 1 workers", timeout=60)
+    finally:
+        stop.set()
+        serve.stop()
+
+
+@pytest.mark.requires_root
+@pytest.mark.requires_linux
+def test_memory_holds_a_scale_out_back_and_the_guard_scales_in(tmp_path: Path) -> None:
+    """Section 13.9: a scale-out is admitted against the cgroup's
+    memory.max, a worker counting at its hard limit, and short of memory
+    a group with a policy is scaled in rather than having its worker
+    replaced. Needs a cgroup v2 root can write, as in the Linux virtual
+    machine; not in CI."""
+
+    root = Path("/sys/fs/cgroup")
+    assert (root / "cgroup.controllers").is_file(), "cgroup v2 is needed"
+    cgroup = root / f"muru-test-{os.getpid()}"
+    subprocess.run(["sudo", "-n", "mkdir", str(cgroup)], check=True)
+    project = tmp_path / "shop"
+    project.mkdir()
+    (project / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+    (project / "pyproject.toml").write_text(
+        """[tool.muru]
+entrypoint = 'app:application'
+processes = 1
+threads = 1
+
+[tool.muru.memory]
+hard_limit = '300MB'
+check_interval = '1s'
+
+[tool.muru.scaling]
+mode = 'spare'
+min_workers = 1
+max_workers = 3
+min_spare = 1
+max_spare = 3
+scale_out_window = '1s'
+"""
+    )
+    serve: Serve | None = None
+    stop = threading.Event()
+
+    try:
+        # 560MB less 128MB of headroom leaves room for one more worker at
+        # its hard limit beside the first, and not a third.
+
+        sudo_write(cgroup / "memory.max", str(560 << 20))
+
+        def into_cgroup(command: list[str]) -> list[str]:
+            joined = " ".join(f"'{part}'" for part in command)
+            return [
+                "sh",
+                "-c",
+                f"echo $$ | sudo -n tee {cgroup}/cgroup.procs >/dev/null && exec {joined}",
+            ]
+
+        serve = start(
+            tmp_path, "--chdir", str(project), "--admin-status", app=None, wrap=into_cgroup
+        )
+        running = serve
+
+        def load() -> None:
+            while not stop.is_set():
+                try:
+                    running.get("/sleep?seconds=0.3")
+                except OSError:
+                    time.sleep(0.1)
+
+        threads = [threading.Thread(target=load, daemon=True) for _ in range(3)]
+
+        for thread in threads:
+            thread.start()
+
+        serve.wait_for("default: scale out from 1 to 2 workers", timeout=30)
+        serve.wait_for("more workers asked for fit memory.max: a worker counts 300MB", timeout=30)
+        stop.set()
+
+        for thread in threads:
+            thread.join(timeout=10)
+
+        # One worker grows by 120MB, under its hard limit. Then less than
+        # the headroom is left, which replacing it would make up: the
+        # group, above its one worker, is scaled in by it instead.
+
+        def limits() -> dict[str, Any]:
+            return dict(json.loads(serve.admin("/status")[1])["limits"])
+
+        assert serve.get("/grow?mb=120")[0] == 200
+        deadline = time.monotonic() + 10
+
+        while limits()["workers_memory"] < 120 << 20:
+            assert time.monotonic() < deadline, limits()
+            time.sleep(0.1)
+
+        sudo_write(cgroup / "memory.max", str(limits()["memory_used"] + (60 << 20)))
+        serve.wait_for("default: scale in from 2 to 1 workers: for memory", timeout=30)
+        serve.wait_for("leaves routing: scaled in for memory", timeout=10)
+        assert "the container was short of memory" in serve.output()
+        assert "replaced by pid" not in serve.output(), serve.output()
+    finally:
+        stop.set()
+
+        if serve is not None:
+            serve.stop()
+
+        subprocess.run(["sudo", "-n", "rmdir", str(cgroup)], check=False)

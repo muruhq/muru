@@ -740,6 +740,24 @@ impl Scaler {
         self.last = Some((now, format!("held at {}: {reason}", self.desired)));
     }
 
+    /// Sections 7.7 and 13.9: the memory guard scaled the group in by a
+    /// worker, from `from` to `to`, rather than replacing it; the count
+    /// it is brought to follows, and it counts as a scale-in.
+    pub fn shrink(&mut self, from: u32, to: u32, now: Instant, reason: &str) {
+        if self.pinned.is_some() || to >= from {
+            return;
+        }
+
+        self.desired = to;
+        self.out_since = None;
+        self.last_in = Some(now);
+        self.decisions.1 += 1;
+        self.last = Some((
+            now,
+            format!("scale in from {from} to {to} workers: {reason}"),
+        ));
+    }
+
     /// What holds the group back, from the latest signals.
     pub fn diagnosis(&self) -> Diagnosis {
         let utilization = if self.signals.total > 0.0 {
@@ -1254,6 +1272,247 @@ impl Scaler {
         self.decisions.1 += 1;
         self.last = Some((now, format!("scaled in to {to}: {reason}")));
         Some(Decision::ScaleIn { to, reason })
+    }
+}
+
+/// Section 7.4: one worker group's autoscaler and what was last asked of
+/// the host for it. The daemon and `muructl serve` drive it the same way
+/// each second: [`GroupScaling::observe`] on the edge's samples, the
+/// scale-outs it asks for admitted against a budget, the answer given to
+/// [`GroupScaling::admitted`], and [`GroupScaling::wanted`] for the count
+/// to ask of the host.
+#[derive(Debug)]
+pub struct GroupScaling {
+    /// The group's name.
+    pub name: String,
+    /// Its autoscaler.
+    pub scaler: Scaler,
+    /// Slots a worker offers before any is routed to: its threads, or
+    /// its event loop's concurrency.
+    pub slots_per_worker: f64,
+    /// The count last asked of the host, so a count the host has not
+    /// reached yet is not asked for again every second.
+    pub requested: Option<u32>,
+    /// The threads a worker can run Python on at once without a GIL,
+    /// for its CPU share (section 7.3).
+    pub threads: u32,
+    /// The soft memory limit and what it measures, when one is set.
+    pub memory_limit: Option<(muru_config::Measure, u64)>,
+    /// The last scale-out the budget held back: the count asked for, the
+    /// count given and the limit, so each is one event.
+    pub denied: Option<(u32, u32, crate::budget::Limit)>,
+}
+
+/// What one second's observation of a group comes to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Step {
+    /// Nothing to do.
+    Nothing,
+    /// A scale-out, to admit against the budget before it is carried
+    /// out.
+    Ask {
+        /// The count the group was being brought to.
+        from: u32,
+        /// The count it asks for.
+        to: u32,
+        /// Why, with the diagnosis.
+        reason: String,
+    },
+    /// An event to raise as it is, its kind, level and message: a
+    /// scale-in, an advisory group's recommendation, or a suspension.
+    Event(&'static str, &'static str, String),
+}
+
+impl GroupScaling {
+    /// A group's scaling, with `current` workers, before it is sized for
+    /// its interface.
+    pub fn new(
+        name: &str,
+        spec: ScalingSpec,
+        current: u32,
+        memory_limit: Option<(muru_config::Measure, u64)>,
+    ) -> Self {
+        Self {
+            name: name.to_owned(),
+            scaler: Scaler::new(spec, current),
+            slots_per_worker: 0.0,
+            requested: None,
+            threads: 0,
+            memory_limit,
+            denied: None,
+        }
+    }
+
+    /// Take one second's samples for the group of release `app@id`, with
+    /// `ready` workers routed to, the youngest that long ready, and what
+    /// schedules and overlays set over its policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe(
+        &mut self,
+        now: Instant,
+        samples: &[Sample],
+        app: &str,
+        id: &str,
+        ready: u32,
+        youngest: Option<Duration>,
+        capacity: Option<Capacity>,
+    ) -> Step {
+        let advisory = self.scaler.spec().advisory;
+        self.scaler.set_capacity(capacity);
+
+        if advisory {
+            self.scaler.sync(ready);
+        }
+
+        let before = self.scaler.desired();
+        let signals = Signals::from_samples(
+            samples,
+            app,
+            id,
+            &self.name,
+            ready,
+            self.slots_per_worker,
+            youngest,
+        );
+
+        match self.scaler.observe(now, signals) {
+            Some(Decision::ScaleOut { to, reason }) if !advisory => Step::Ask {
+                from: before,
+                to,
+                reason: format!("{reason}; {}", describe_diagnosis(&self.scaler.diagnosis())),
+            },
+            Some(Decision::ScaleOut { to, reason } | Decision::ScaleIn { to, reason }) => {
+                let diagnosis = self.scaler.diagnosis();
+
+                Step::Event(
+                    "scaling.decision",
+                    "info",
+                    decision_message(
+                        &self.name,
+                        ready,
+                        to,
+                        &format!("{reason}; {}", describe_diagnosis(&diagnosis)),
+                        advisory,
+                    ),
+                )
+            }
+            Some(Decision::Suspended { reason }) => Step::Event(
+                "churn_budget.exhausted",
+                "warning",
+                format!("{}: {reason}", self.name),
+            ),
+            None => Step::Nothing,
+        }
+    }
+
+    /// What the budget made of a scale-out from `from` to `asked`: `to`
+    /// admitted, held back by `limit` when it was fewer, `held` saying by
+    /// what. Returns the events to raise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admitted(
+        &mut self,
+        now: Instant,
+        ready: u32,
+        from: u32,
+        asked: u32,
+        to: u32,
+        limit: Option<crate::budget::Limit>,
+        held: &str,
+        reason: &str,
+        priority: Option<i32>,
+    ) -> Vec<(&'static str, &'static str, String)> {
+        let mut events = Vec::new();
+
+        match limit {
+            Some(limit) => {
+                self.scaler.limit(from, to, now, held);
+                let denial = (asked, to, limit);
+
+                if self.denied != Some(denial) {
+                    self.denied = Some(denial);
+                    let priority = priority
+                        .map_or_else(String::new, |priority| format!(", at priority {priority}"));
+
+                    events.push((
+                        "scaling.denied_by_budget",
+                        "warning",
+                        format!(
+                            "{}: {} of the {} more workers asked for fit {held}{priority}",
+                            self.name,
+                            to - from,
+                            asked - from
+                        ),
+                    ));
+                }
+            }
+            None => self.denied = None,
+        }
+
+        if to > from {
+            events.push((
+                "scaling.decision",
+                "info",
+                decision_message(&self.name, ready, to, reason, false),
+            ));
+        }
+
+        events
+    }
+
+    /// The count to ask of the host, once, when the group is being
+    /// brought to one it does not have.
+    pub fn wanted(&mut self, ready: u32) -> Option<u32> {
+        let desired = self.scaler.desired();
+
+        if self.scaler.spec().advisory || desired == ready || self.requested == Some(desired) {
+            return None;
+        }
+
+        self.requested = Some(desired);
+        Some(desired)
+    }
+}
+
+/// Sections 7.3 and 7.4: what one worker offers before the edge has
+/// counted any, and the threads it runs Python on at once without a GIL,
+/// by the interface the release's default mount runs as: its threads for
+/// WSGI, and for ASGI its event loop's concurrency, and its sync threads
+/// with the loop's own. gRPC calls are held on the event loop too
+/// (section 6.13).
+pub fn worker_size(
+    interface: muru_config::Interface,
+    threads: u32,
+    sync_threads: u32,
+    concurrency: u32,
+) -> (f64, u32) {
+    match interface {
+        muru_config::Interface::Asgi | muru_config::Interface::Grpc => {
+            (concurrency as f64, sync_threads + 1)
+        }
+        muru_config::Interface::Wsgi | muru_config::Interface::Auto => (threads as f64, threads),
+    }
+}
+
+/// A scaler's diagnosis as the end of a decision's reason.
+pub fn describe_diagnosis(diagnosis: &Diagnosis) -> String {
+    if diagnosis.advice.is_empty() {
+        format!("diagnosis: {}", diagnosis.summary)
+    } else {
+        format!(
+            "diagnosis: {}; for the next release, {}",
+            diagnosis.summary, diagnosis.advice
+        )
+    }
+}
+
+/// A decision as its event says it.
+pub fn decision_message(group: &str, from: u32, to: u32, reason: &str, advisory: bool) -> String {
+    let verb = if to > from { "scale out" } else { "scale in" };
+
+    if advisory {
+        format!("advisory: would {verb} {group} from {from} to {to} workers: {reason}")
+    } else {
+        format!("{group}: {verb} from {from} to {to} workers: {reason}")
     }
 }
 

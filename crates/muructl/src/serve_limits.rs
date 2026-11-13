@@ -47,6 +47,7 @@ impl Watch {
     pub fn new(
         limits: Limits,
         spec: &HostSpec,
+        most: Option<&HashMap<String, u32>>,
         owner: String,
         spool: Option<Spool>,
         report: SharedReport,
@@ -54,7 +55,7 @@ impl Watch {
         let mut watch = Self {
             limits,
             guard: Guard::default(),
-            asked: asked(spec),
+            asked: asked(spec, most),
             interval: Duration::from_millis(spec.memory.check_interval_ms.max(250)),
             measures: spec
                 .groups
@@ -74,6 +75,11 @@ impl Watch {
     /// How often the limits are read: the release's memory check.
     pub fn interval(&self) -> Duration {
         self.interval
+    }
+
+    /// The worker the guard chose is scaled in rather than replaced.
+    pub fn scaled_in(&mut self) {
+        self.guard.scaled_in();
     }
 
     /// The warnings the configuration gets now, for the start.
@@ -202,12 +208,21 @@ impl Watch {
 }
 
 /// What the release asks of the limits: its workers over every group,
-/// and the hard limits times them.
-fn asked(spec: &HostSpec) -> Asked {
-    let groups = std::iter::once((spec.processes, spec.memory.hard_limit)).chain(
+/// a group with a scaling policy at its most, and the hard limits times
+/// them.
+fn asked(spec: &HostSpec, most: Option<&HashMap<String, u32>>) -> Asked {
+    let count = |name: &str, processes: usize| {
+        most.and_then(|most| most.get(name))
+            .map_or(processes, |most| (*most as usize).max(processes))
+    };
+    let groups = std::iter::once((
+        count(muru_edge::routing::DEFAULT_GROUP, spec.processes),
+        spec.memory.hard_limit,
+    ))
+    .chain(
         spec.groups
             .iter()
-            .map(|group| (group.processes, group.memory.hard_limit)),
+            .map(|group| (count(&group.name, group.processes), group.memory.hard_limit)),
     );
 
     let mut asked = Asked {

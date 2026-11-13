@@ -81,6 +81,9 @@ enum State {
         pid: u32,
         left_before: u64,
         since: Instant,
+        /// Whether a successor takes its place: not when its group is
+        /// scaled in by it instead (issue 623).
+        successor: bool,
     },
     /// Replacing workers would not help, so none is replaced until the
     /// cgroup has been above the headroom again.
@@ -136,15 +139,17 @@ impl Guard {
             pid,
             left_before,
             since,
+            successor,
         } = &self.state
         {
             let gone = !workers.iter().any(|worker| worker.pid == *pid);
-            let succeeded = workers.iter().any(|worker| {
-                worker.owner == *owner
-                    && worker.group == *group
-                    && worker.index == *index
-                    && worker.size > 0
-            });
+            let succeeded = !successor
+                || workers.iter().any(|worker| {
+                    worker.owner == *owner
+                        && worker.group == *group
+                        && worker.index == *index
+                        && worker.size > 0
+                });
 
             if !(gone && succeeded) && now.duration_since(*since) < REPLACEMENT_WAIT {
                 return Action::Nothing;
@@ -216,6 +221,7 @@ impl Guard {
             pid: largest.pid,
             left_before: left,
             since: now,
+            successor: true,
         };
         self.last = Some(Replaced {
             worker: format!(
@@ -240,12 +246,28 @@ impl Guard {
         match &self.state {
             State::Watching => ("watching", String::new()),
             State::Replacing {
-                owner, name, pid, ..
+                owner,
+                name,
+                pid,
+                successor,
+                ..
             } => (
                 "replacing",
-                format!("replacing {owner} worker {name} (pid {pid})"),
+                if *successor {
+                    format!("replacing {owner} worker {name} (pid {pid})")
+                } else {
+                    format!("scaling in by {owner} worker {name} (pid {pid})")
+                },
             ),
             State::Holding(why) => ("holding", why.clone()),
+        }
+    }
+
+    /// The worker chosen is not replaced but its group scaled in by it,
+    /// so it is done once the worker has gone (issue 623).
+    pub fn scaled_in(&mut self) {
+        if let State::Replacing { successor, .. } = &mut self.state {
+            *successor = false;
         }
     }
 
@@ -583,6 +605,35 @@ mod tests {
         let gone = [worker(1, 11, 280 * MB)];
         let action = guard.check_at(reading(600 * MB), &gone, 250 * MB, start + REPLACEMENT_WAIT);
         assert_eq!(action, Action::Nothing);
+        assert_eq!(guard.state().0, "watching");
+    }
+
+    #[test]
+    fn a_worker_scaled_in_rather_than_replaced_is_done_once_it_has_gone() {
+        let mut guard = Guard::default();
+        let start = Instant::now();
+        let workers = [worker(0, 10, 330 * MB), worker(1, 11, 280 * MB)];
+
+        assert!(matches!(
+            guard.check_at(reading(900 * MB), &workers, 250 * MB, start),
+            Action::Replace { .. }
+        ));
+        guard.scaled_in();
+        assert!(
+            guard
+                .state()
+                .1
+                .starts_with("scaling in by shop@r1 worker 0")
+        );
+
+        // No successor comes: the worker gone and the room back is enough.
+
+        let gone = [worker(1, 11, 280 * MB)];
+        let later = start + Duration::from_secs(5);
+        assert_eq!(
+            guard.check_at(reading(570 * MB), &gone, 250 * MB, later),
+            Action::Nothing
+        );
         assert_eq!(guard.state().0, "watching");
     }
 
