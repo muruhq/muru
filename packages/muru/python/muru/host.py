@@ -129,6 +129,12 @@ LEAK_RECYCLES = 3
 
 MEMORY_CAUSES = ("memory", "container_memory")
 
+# Section 7.7 (issue 624): the score every worker raises its own
+# /proc/self/oom_score_adj to after the fork, so the kernel picks a worker,
+# which its host replaces, before a host, the edge or another service.
+
+WORKER_OOM_SCORE_ADJ = 500
+
 # A worker exiting with an error this soon after its fork failed to start.
 
 STARTUP_WINDOW_SECONDS = 5.0
@@ -1323,6 +1329,7 @@ class Host:
                     f"muru worker {context.app}@{context.release} {group.name}/{within}",
                     "muru-worker",
                 )
+                raise_oom_score()
                 os.dup2(out_write, 1)
                 os.dup2(err_write, 2)
 
@@ -4259,6 +4266,26 @@ class Host:
                 os.unlink(self.output_path or "")
             except OSError:
                 pass
+
+
+def raise_oom_score(path: str = "/proc/self/oom_score_adj") -> None:
+    """Make this worker the kernel's first choice when memory runs out.
+
+    Section 7.7 (issue 624): a worker the kernel kills is replaced by its
+    host, where a host, a relay, the edge, the daemon or another service
+    on the machine would not be. Raising the score needs no privilege; a
+    score already higher, as an operator may set, is kept. Linux only.
+    """
+
+    try:
+        with open(path) as current:
+            score = int(current.read())
+
+        if score < WORKER_OOM_SCORE_ADJ:
+            with open(path, "w") as raised:
+                raised.write(str(WORKER_OOM_SCORE_ADJ))
+    except (OSError, ValueError):
+        pass
 
 
 def oom_kills(cgroup: str | None) -> int | None:

@@ -91,12 +91,17 @@ LogsDirectory=muru
 RuntimeDirectory=muru
 RuntimeDirectoryPreserve=yes
 KillMode=process
+OOMPolicy=continue
 Restart=on-failure
 LimitNOFILE=1048576
+#MemoryMax=8G
+#CPUQuota=400%
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+**Limits and the OOM killer (issue 624).** Muru sizes nothing from a machine's total memory, since on a shared machine that says nothing of its share; limits come from a cgroup the operator sets, as a container's come from the platform. The unit carries `MemoryMax=` and `CPUQuota=` commented out, for a drop-in (`systemctl edit muru`): with them the node budget's defaults (section 7.4) and the memory guard (section 7.7) work from the unit's cgroup, read when used, so `systemctl set-property` applies without a restart. `OOMPolicy=continue` is set because systemd's default, `stop`, stops the whole unit when the kernel OOM-kills any of its processes: checked on systemd 255 with `MemoryMax=300M` and a worker allocating 400MB, the default ran `ExecStop`, drained and stopped every release and restarted the daemon (`Failed with result 'oom-kill'`), where `continue` left the unit running while the host replaced the worker and reported `worker.oom_killed` (recorded in issue 624). systemd-oomd kills a whole cgroup, so the unit sets no `ManagedOOM*=` and the guide says to leave them unset.
 
 The unit runs the daemon as root, and the daemon keeps root for itself alone: the edge and the applications that name no user run as the service user (ADR 0026), `muru` unless `--user` or the `[daemon]` table names another, which the packages create through sysusers.d and a hand installation creates before the first start; the daemon refuses to start without it. The directory settings let systemd create and own the locations (section 13.8), which the daemon reads from the environment, so no paths are hard-coded. KillMode=process keeps hosts and their log relays running if systemd restarts the daemon, so they can be re-adopted, and RuntimeDirectoryPreserve=yes keeps their sockets in place across that restart. The daemon notifies readiness with sd_notify. Without systemd, muructl daemon start, stop, restart and status manage a background daemon. muructl daemon start waits up to 30 seconds for the admin socket to answer and watches the process it started meanwhile, so a daemon that exits first is reported at once, with its exit status and the last lines it wrote to daemon.log.
 

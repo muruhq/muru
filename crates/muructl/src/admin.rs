@@ -3134,7 +3134,11 @@ fn limits_lines(limits: &pb::CgroupLimits) -> String {
         let noun = if quota == "1" { "CPU" } else { "CPUs" };
         format!("{quota} {noun} from cpu.max")
     } else if limits.cpus > 0 {
-        format!("no CPU quota, {} from cpuset.cpus.effective", limits.cpus)
+        let noun = if limits.cpus == 1 { "CPU" } else { "CPUs" };
+        format!(
+            "no CPU quota, {} {noun} from cpuset.cpus.effective",
+            limits.cpus
+        )
     } else {
         "no CPU quota".to_owned()
     };

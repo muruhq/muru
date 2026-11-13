@@ -40,6 +40,8 @@ pub struct OsProcess {
     pub cpu_ns: Option<u64>,
     /// Its resident set size in bytes, likewise.
     pub rss: Option<u64>,
+    /// Its `oom_score_adj` on Linux (section 7.7, issue 624).
+    pub oom_score_adj: Option<i32>,
     /// Its command line, or its name where the line cannot be read.
     pub name: String,
 }
@@ -69,6 +71,9 @@ pub fn read(pid: u32) -> Option<OsProcess> {
     let uid = std::fs::metadata(format!("/proc/{pid}"))
         .ok()
         .map(|meta| meta.uid());
+    let oom_score_adj = std::fs::read_to_string(format!("/proc/{pid}/oom_score_adj"))
+        .ok()
+        .and_then(|text| text.trim().parse().ok());
 
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
     let line = String::from_utf8_lossy(&cmdline).replace('\0', " ");
@@ -81,6 +86,7 @@ pub fn read(pid: u32) -> Option<OsProcess> {
         started_unix_ms,
         cpu_ns,
         rss,
+        oom_score_adj,
         name: if line.is_empty() {
             comm
         } else {
@@ -170,6 +176,7 @@ pub fn read(pid: u32) -> Option<OsProcess> {
             (ticks * u128::from(numer) / u128::from(denom.max(1))) as u64
         }),
         rss: task.map(|task| task.pti_resident_size),
+        oom_score_adj: None,
         name: if long.is_empty() {
             name(&bsd.pbi_comm)
         } else {
@@ -867,6 +874,7 @@ fn node(pid: u32, found: Option<&OsProcess>, cpu: &HashMap<u32, f64>) -> pb::Pro
         started_unix_ms: found.and_then(|found| found.started_unix_ms),
         cpu_percent: cpu.get(&pid).map(|percent| (percent * 10.0).round() / 10.0),
         rss_bytes: found.and_then(|found| found.rss),
+        oom_score_adj: found.and_then(|found| found.oom_score_adj),
         ..pb::Process::default()
     }
 }

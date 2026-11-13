@@ -20,8 +20,16 @@ LogsDirectory=muru
 RuntimeDirectory=muru
 RuntimeDirectoryPreserve=yes
 KillMode=process
+# A worker the kernel kills for memory is replaced by its host, so the
+# service carries on rather than stopping over one worker.
+OOMPolicy=continue
 Restart=on-failure
 LimitNOFILE=1048576
+# To bound what Muru may use on this machine, give the whole service a
+# limit; the node budget and the memory guard then work from it. See
+# the limits section of the systemd guide, howto/systemd.
+#MemoryMax=8G
+#CPUQuota=400%
 
 [Install]
 WantedBy=multi-user.target
@@ -90,6 +98,67 @@ does the same as the command. A certificate renewal needs the same
 reload, so a certbot deploy hook of `systemctl reload muru` makes the
 renewed certificate live, as the [virtual hosts
 guide](virtual-hosts.md#tls) describes.
+
+## Limits
+
+The unit sets no memory or CPU limit, since only the operator can say
+what Muru may use of the machine, and Muru sizes nothing from the
+machine's own memory. To bound it, give the whole service a limit with a
+drop-in:
+
+```
+$ sudo systemctl edit muru
+```
+
+```
+[Service]
+MemoryMax=8G
+CPUQuota=400%
+```
+
+With a limit on the service's cgroup:
+
+- **The node budget** takes its `memory` and `cpu` from it when the
+  daemon file's `[daemon.budget]` leaves them out: `memory.max` less a
+  headroom of 10% (at least 128MB), and the quota, here 4 CPUs. Deploys,
+  canaries beside the serving release and scale-outs are admitted
+  against it before anything starts, as the [scaling
+  guide](scaling.md#the-nodes-budget) describes.
+- **The memory guard** watches what is left under the limit at every
+  memory check, and with less than the headroom left replaces the
+  largest worker of any release, one at a time, or scales its group in
+  when its scaling policy allows, as [container
+  limits](containers.md#the-memory-guard) describes for a container.
+- **The limits are read when they are used**, so a change takes effect
+  without a restart:
+
+  ```
+  $ sudo systemctl set-property muru MemoryMax=12G
+  ```
+
+`muructl daemon status` shows the limits read, what is used and left,
+what the guard is doing, and which budget limits came from the cgroup.
+
+**When the kernel kills a worker.** Each worker raises its own
+`oom_score_adj` to 500 as it starts, so when memory runs out, under the
+service's limit or the machine's, the kernel's out-of-memory killer
+picks a worker first, which its host replaces, rather than a host, the
+edge, the daemon or another service on the machine. Hosts, log relays,
+the edge and the daemon keep the score they started with.
+`muructl status --processes --json` gives each process's
+`oom_score_adj`. A worker the kernel kills is a `worker.oom_killed` event.
+
+`OOMPolicy=continue` keeps the service running when that happens. With
+systemd's default, `stop`, a single worker killed for memory stops the
+whole unit: `ExecStop` drains and stops every release, and
+`Restart=on-failure` then starts the daemon again.
+
+**systemd-oomd**, enabled by default on Ubuntu and Fedora, acts on a
+unit only when the unit or a slice above it sets
+`ManagedOOMMemoryPressure=kill` or `ManagedOOMSwap=kill`, and then kills
+a whole cgroup at once, which for this unit is the daemon, the edge and
+every release together. Leave both unset for `muru.service`, and bound
+it with `MemoryMax=` instead, which the memory guard works within.
 
 ## Logs
 

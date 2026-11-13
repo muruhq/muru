@@ -244,6 +244,7 @@ message Process {
   repeated Process children = 16;
   string interface = 17;            // a host's and its workers': what the default mount runs as, wsgi, asgi or grpc; empty until the host has said
   string state = 18;                // a host's release's part in routing: serving, canary, held, draining, retained, or its state while it starts
+  optional int32 oom_score_adj = 19; // Linux: /proc/PID/oom_score_adj, 500 for a worker (section 7.7); absent elsewhere
 }
 
 message Figures {

@@ -654,3 +654,16 @@ def test_a_shutdown_with_a_budget_of_its_own_leaves_the_workers_less_time(
     assert instance.time_to_stop() == 0.0
     stop_by.write_text("not a time")
     assert instance.time_to_stop() == 7.0
+
+
+def test_a_worker_raises_its_oom_score_and_keeps_a_higher_one(tmp_path: Path) -> None:
+    score = tmp_path / "oom_score_adj"
+    score.write_text("0\n")
+    host.raise_oom_score(str(score))
+    assert score.read_text() == "500"
+
+    score.write_text("800\n")
+    host.raise_oom_score(str(score))
+    assert score.read_text() == "800\n"
+
+    host.raise_oom_score(str(tmp_path / "missing"))

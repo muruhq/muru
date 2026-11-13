@@ -79,7 +79,10 @@ the limit than the worker's current size.
 [Container limits](containers.md#container-limits) describes the guard,
 where a container's memory goes, and what to set for an application that
 holds a lot once it is imported. The kernel's out-of-memory killer
-remains the last resort.
+remains the last resort. On Linux each worker raises its own
+`oom_score_adj` to 500 as it starts, so when memory runs out the kernel
+kills a worker, which its host replaces, before a host, the edge or
+another service on the machine.
 
 ## Metrics
 
