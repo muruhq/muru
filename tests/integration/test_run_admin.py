@@ -423,7 +423,7 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
         text = muructl(runtime, "debug", "request", request_id, cwd=support.FIXTURES).stdout
         assert text.startswith("GET / HTTP/1.1  200  "), text
         assert f"request {request_id}\n" in text
-        assert "\nTiming\n" in text and "    application" in text
+        assert "\nTiming\n" in text and "    until the response head" in text
         assert "    cookie: ***" in text
 
         # The access log's JSON names the connection in every mode.
