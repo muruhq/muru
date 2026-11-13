@@ -1,0 +1,124 @@
+# Inspecting requests in development
+
+`muructl run` tells the browser how long each request waited for a
+worker and how long the application took, and keeps a record of every
+request it serves. The record is looked up by the request's ID on the
+dashboard, with `muructl debug request` and through the MCP server, so a
+JSON API's requests can be inspected as easily as a page's.
+
+All of this is part of development mode: under `--allow-public`,
+`muructl serve` and the daemon, responses carry neither header and no
+records are kept.
+
+## Timings in the browser
+
+Every response of a development run carries a `Server-Timing` header:
+
+```
+Server-Timing: queue;dur=0.21, app;dur=17.93, muru;desc="01JCZ8X4R3T5V6W7Y8Z9A0B1C2"
+```
+
+- `queue` is how long the request waited for a worker, in milliseconds.
+
+- `app` is the time from handing the request to the worker until the
+  response head arrived.
+
+- `muru` carries the request's ID, the same as `X-Request-ID`.
+
+The browser's developer tools show the figures with no setup: in the
+Network tab, select a request and open its Timing section, where Chrome
+and Firefox list them under Server Timing. A static file, a redirect or
+an error answered by Muru itself carries only `muru`, since no worker
+was involved.
+
+There is no total, since the headers are sent before the body is
+complete. The total and the time to the last byte are in the request's
+record.
+
+## A request's record
+
+Each response also carries `Muru-Request-Link`, the address of the
+request's page on the run's dashboard:
+
+```
+Muru-Request-Link: http://127.0.0.1:8081/request/01JCZ8X4R3T5V6W7Y8Z9A0B1C2
+```
+
+The address is the dashboard's own, or the one in `MURU_DASHBOARD_URL`
+when the run's environment sets it, for a dashboard reached through a
+tunnel or a proxy. With `--dashboard off` the header is not sent.
+
+The page shows the record as panels:
+
+- **Timing:** the queue, the application and the total time.
+
+- **Where:** the application and release, virtual host, mount, worker
+  group and worker, client class, internal redirects, a handoff between
+  WSGI and ASGI, and whether the request was sent again to another
+  worker.
+
+- **Response:** the status, the bytes sent and received, whether the
+  response was compressed and why not when it was not, and the request
+  and response headers.
+
+- **Connection:** the connection's ID, the request's position on it,
+  how long the connection was idle before the request, for the first
+  request on an HTTPS connection how long the handshake took, and
+  whether Muru closed the connection after this response because it had
+  served its share of requests.
+
+The dashboard's recent requests link to each request's page, and
+`/v1/requests/ID` on the dashboard's address gives the record as JSON.
+
+### What is kept
+
+The run keeps the records of its last 1000 requests in memory, fewer
+when they would take more than 32 MiB. They are kept across reloads and
+are gone when the run stops. A request whose record has been dropped, or
+one the run never served, is answered as no longer kept.
+
+Bodies are never kept, only their sizes. Header values that may hold
+secrets are shown as `***`: `Cookie`, `Set-Cookie`, `Authorization` and
+`Proxy-Authorization` always, any header whose name contains SECRET,
+TOKEN, PASSWORD, PASSWD, KEY, CREDENTIAL or AUTH or ends in `-DSN`, and
+the password of a URL in any other header.
+
+## From the command line
+
+`muructl debug request` prints a record from the run's admin socket,
+found from the project directory as the other `muructl debug` commands
+find it:
+
+```console
+$ muructl debug request 01JCZ8X4R3T5V6W7Y8Z9A0B1C2
+GET /orders/42 HTTP/1.1  200  18.4ms  at 10:42:07.123
+
+Timing
+  queue        0.2ms
+  application  17.9ms
+  total        18.4ms
+
+Where
+  application   shop@r3
+  host          localhost
+  mount         default
+  group         default
+  worker        0
+  client class  default
+
+Response
+  status      200
+  sent        1.2 KB
+  received    0 B
+  compressed  no: under min_size
+  ...
+```
+
+`--json` prints the whole record, in the shape the
+[JSON output reference](../reference/json-output.md) describes. The
+ID is the one in `X-Request-ID`, in the `muru` entry of `Server-Timing`
+and in the access log.
+
+A coding agent reads the same record through the
+[MCP server](coding-agents.md): its `debug` tool takes `request` with the
+request's ID.

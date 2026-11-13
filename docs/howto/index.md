@@ -108,6 +108,8 @@ Recipes for specific tasks, assuming you already know the basics. The
 - [Inspecting workers](debugging.md): stacks, profiles, memory and a
   debugger in running workers, a report to attach to a bug report, and
   a bundle of a whole system for triage.
+- [Inspecting requests in development](toolbar.md): timings in the
+  browser and a record of each request a development run serves.
 
 ## Coding agents
 
@@ -163,5 +165,6 @@ metrics
 events
 dashboard
 debugging
+toolbar
 coding-agents
 ```
