@@ -87,6 +87,8 @@ struct WorkerSlots {
     worker_type: String,
     /// Whether its default mount accepts websocket scopes (section 5.6).
     websockets: bool,
+    /// It sends its part of a request's record when asked (section 11.7).
+    records: bool,
     /// The named mounts that accept websocket scopes (section 6.14).
     websocket_mounts: Vec<String>,
     /// Its default mount runs on the event loop.
@@ -178,6 +180,7 @@ impl WorkerSlots {
             event_loop,
             worker_type: hello.worker_type,
             websockets: hello.websockets,
+            records: hello.records,
             websocket_mounts: hello.websocket_mounts,
             mounts,
             grpc: hello.grpc_methods,
@@ -633,6 +636,9 @@ pub(crate) struct Lease {
     pub(crate) on_loop: bool,
     /// Whether the worker accepts websocket scopes.
     websockets: bool,
+    /// Whether the worker sends its part of a request's record when asked
+    /// (section 11.7).
+    records: bool,
     /// The pool the connection came from, when it is not the one asked:
     /// a woken group's (section 7.4).
     pub(crate) woken: Option<Arc<LinkPool>>,
@@ -877,6 +883,7 @@ impl LinkPool {
                 borrowed,
                 on_loop: worker.on_loop(mount),
                 websockets: worker.accepts_websockets(mount),
+                records: worker.records,
                 woken: None,
             });
         }
@@ -953,6 +960,37 @@ async fn handshake(path: &PathBuf) -> io::Result<(Conn, pb::Hello)> {
     Ok((Conn { reader, writer }, hello))
 }
 
+/// How long the edge waits after a response for the worker's part of
+/// its record (section 11.7). The worker sends it once the application
+/// has finished, which with a declared Content-Length can come after the
+/// last byte, while close() runs.
+const RECORD_WAIT: Duration = Duration::from_secs(10);
+
+/// Read the RECORD frame that follows a response and hand it to the
+/// request's record. The reader comes back when the frame did, to go back
+/// to the pool; anything else leaves the connection to be closed.
+async fn read_record(mut reader: Reader, noted: &crate::development::Request) -> Option<Reader> {
+    let read = tokio::time::timeout(RECORD_WAIT, frame::read(&mut reader)).await;
+
+    let record = match read {
+        Ok(Ok(Some(next))) if next.kind == kind::RECORD => {
+            pb::WorkerRecord::decode(next.payload).ok()
+        }
+        _ => None,
+    };
+
+    match record {
+        Some(record) => {
+            noted.worker_part(record);
+            Some(reader)
+        }
+        None => {
+            noted.worker_missing();
+            None
+        }
+    }
+}
+
 /// Collects the two halves of a leased connection as each direction
 /// finishes, and returns the connection to the pool when both are back
 /// intact. A half reported as broken closes the connection instead.
@@ -973,6 +1011,10 @@ pub(crate) struct Return {
     ended: AtomicBool,
     /// The request's stored uploads (section 4.11), dropped with it.
     uploads: Mutex<Option<crate::uploads::Received>>,
+    /// Where the worker's part of the request's record goes, when the
+    /// request head asked for it (section 11.7): the RECORD frame that
+    /// follows the response is read before the connection goes back.
+    record: Mutex<Option<Arc<crate::development::Request>>>,
     /// How the request body ended: None while the body pump is sending
     /// it on, then whether it was read to its end.
     settled: watch::Sender<Option<bool>>,
@@ -1004,8 +1046,16 @@ impl Return {
             client_stalled: AtomicBool::new(false),
             ended: AtomicBool::new(false),
             uploads: Mutex::new(None),
+            record: Mutex::new(None),
             settled: watch::Sender::new(Some(true)),
         })
+    }
+
+    /// The worker will send its part of the request's record after the
+    /// response, for `noted`.
+    fn expect_record(&self, noted: Arc<crate::development::Request>) {
+        noted.expect_worker();
+        *self.record.lock().expect("record poisoned") = Some(noted);
     }
 
     /// Keep the request's stored uploads until the request ends.
@@ -1048,8 +1098,34 @@ impl Return {
         self.proceed.notify_one();
     }
 
-    pub(crate) fn give_reader(&self, reader: Option<Reader>) {
+    pub(crate) fn give_reader(self: &Arc<Self>, reader: Option<Reader>) {
         self.ended.store(true, Ordering::Relaxed);
+        let expected = self.record.lock().expect("record poisoned").take();
+
+        // Section 11.7: the RECORD frame comes before the connection is
+        // idle, so it is read first; the connection is closed when it does
+        // not come.
+
+        match (reader, expected) {
+            (Some(reader), Some(noted)) => {
+                let back = Arc::clone(self);
+
+                tokio::spawn(async move {
+                    let reader = read_record(reader, &noted).await;
+                    back.reader_back(reader);
+                });
+            }
+            (reader, expected) => {
+                if let Some(noted) = expected {
+                    noted.worker_missing();
+                }
+
+                self.reader_back(reader);
+            }
+        }
+    }
+
+    fn reader_back(&self, reader: Option<Reader>) {
         let mut state = self.state.lock().expect("return state poisoned");
         state.reader = reader;
         self.report(&mut state);
@@ -2005,6 +2081,7 @@ async fn handle_inner(
             borrowed,
             on_loop,
             websockets,
+            records,
             woken,
         } = lease;
         head.borrowed = borrowed;
@@ -2028,6 +2105,17 @@ async fn handle_inner(
         } else {
             pb::Scope::Http as i32
         };
+
+        // Section 11.7: a development run that keeps records asks the
+        // worker for its part of the record of a client's request, sent
+        // after the response; not for a sub-request of the edge's own.
+
+        let noted = context
+            .noted
+            .as_ref()
+            .filter(|noted| noted.recorded())
+            .filter(|_| records && !upgrading && !precheck && context.handler.is_none());
+        head.record = noted.is_some();
 
         let end = upgrading
             || buffered.as_ref().map_or_else(
@@ -2057,13 +2145,13 @@ async fn handle_inner(
 
         match written {
             Ok(()) => {
-                break (
-                    Return::new(Arc::clone(&pool), worker, permit),
-                    reader,
-                    writer,
-                    end,
-                    upgrading,
-                );
+                let back = Return::new(Arc::clone(&pool), worker, permit);
+
+                if let Some(noted) = noted {
+                    back.expect_record(Arc::clone(noted));
+                }
+
+                break (back, reader, writer, end, upgrading);
             }
             Err(error) if !retried => {
                 tracing::debug!(%error, worker, "the worker closed its connection before reading the request; sending it again");

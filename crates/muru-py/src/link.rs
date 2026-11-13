@@ -35,6 +35,7 @@ use muru_proto::descriptors::FdReader;
 use crate::asgi;
 use crate::handoff;
 use crate::pool::Shared;
+use crate::record;
 use crate::wsgi::{self, Outgoing};
 
 /// Errors from the link server.
@@ -1094,6 +1095,7 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
         mount_pools: shared.mount_pools(),
         websocket_mounts: shared.websocket_mounts(),
         worker: shared.worker,
+        records: true,
     };
 
     if frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into())
@@ -1222,6 +1224,19 @@ async fn handle_request(
             ..Default::default()
         };
         frame::write(writer, kind::END, 0, end.encode_to_vec().into()).await?;
+
+        // Section 11.7: a record asked for is sent, saying what failed.
+
+        if head.record {
+            let record = pb::WorkerRecord {
+                outcome: "failed".to_owned(),
+                reason: end.reason,
+                error: end.error,
+                ..Default::default()
+            };
+            write_record(writer, &record).await?;
+        }
+
         return Ok(None);
     };
 
@@ -1256,6 +1271,16 @@ async fn handle_request(
     let (request_id, interrupt) = shared.request_started(&head);
     shared.request_outgoing(request_id, out_tx.clone());
     let websocket = head.scope == pb::Scope::Websocket as i32;
+
+    // Section 11.7: when the edge asked for a record, the request's log
+    // records are kept from now until the record is sent.
+
+    let trace = shared.request_trace(request_id);
+    let edge_id = head.request_id.clone();
+
+    if trace.is_some() {
+        record::start_logs(&edge_id);
+    }
 
     // Section 6.14: the request may be handed to the event loop, which
     // then finishes it; the slot is how this task learns of it.
@@ -1404,7 +1429,7 @@ async fn handle_request(
         }
     };
     let write_side = async {
-        let result = write_response_after(first, out_rx, writer).await;
+        let result = write_response_after(first, out_rx, writer, trace.as_deref()).await;
 
         if let Some(channel) = slot.channel() {
             channel.complete();
@@ -1426,7 +1451,22 @@ async fn handle_request(
 
     let early = read_result?;
     write_result?;
+
+    // Section 11.7: the worker's part of the record follows the response.
+
+    if let Some(trace) = trace {
+        let logs = record::take_logs(&edge_id);
+        let record = trace.to_message(cancelled.load(Ordering::Relaxed), logs);
+        write_record(writer, &record).await?;
+    }
+
     Ok(early)
+}
+
+/// Send the worker's part of a request's record, on a RECORD frame after
+/// the response (section 11.7).
+async fn write_record(writer: &mut Writer, record: &pb::WorkerRecord) -> io::Result<()> {
+    frame::write(writer, kind::RECORD, 0, record.encode_to_vec().into()).await
 }
 
 /// Run one request as a task on the event loop: body frames become
@@ -1456,6 +1496,18 @@ async fn handle_asgi_request(
     let head = Arc::new(head);
     let (request_id, interrupt) = shared.request_started(&head);
     shared.request_outgoing(request_id, out_tx.clone());
+
+    // Section 11.7: when the edge asked for a record, the request's log
+    // records are kept from before the task starts until it is sent.
+
+    let trace = shared.request_trace(request_id);
+
+    if let Some(trace) = &trace {
+        trace.on_loop();
+        record::start_logs(&head.request_id);
+    }
+
+    let aborted = AtomicBool::new(false);
     let fds: Vec<RawFd> = uploads.iter().map(AsRawFd::as_raw_fd).collect();
     let _uploads = uploads;
     let offer = asgi::Offer {
@@ -1518,6 +1570,7 @@ async fn handle_asgi_request(
                         break;
                     }
                     kind::ABORT => {
+                        aborted.store(true, Ordering::Relaxed);
                         channel.disconnect();
                         break;
                     }
@@ -1537,7 +1590,10 @@ async fn handle_asgi_request(
             match watch_request(reader, &done).await? {
                 Interrupt::Done => return Ok(None),
                 Interrupt::Request(next) => return Ok(Some(next)),
-                Interrupt::Abort => channel.disconnect(),
+                Interrupt::Abort => {
+                    aborted.store(true, Ordering::Relaxed);
+                    channel.disconnect();
+                }
                 Interrupt::Closed => {
                     channel.disconnect();
                     return Err(io::Error::new(
@@ -1549,7 +1605,7 @@ async fn handle_asgi_request(
         }
     };
     let write_side = async {
-        let result = write_response(out_rx, writer).await;
+        let result = write_response_after(None, out_rx, writer, trace.as_deref()).await;
         channel.complete();
         done.notify_one();
         result
@@ -1563,6 +1619,15 @@ async fn handle_asgi_request(
 
     let early = read_result?;
     write_result?;
+
+    // Section 11.7: the worker's part of the record follows the response.
+
+    if let Some(trace) = trace {
+        let logs = record::take_logs(&head.request_id);
+        let record = trace.to_message(aborted.load(Ordering::Relaxed), logs);
+        write_record(writer, &record).await?;
+    }
+
     Ok(early)
 }
 
@@ -1837,7 +1902,7 @@ async fn write_grpc_response(
 
 /// Turn the application's output into frames, coalescing small chunks.
 async fn write_response(rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -> io::Result<()> {
-    write_response_after(None, rx, writer).await
+    write_response_after(None, rx, writer, None).await
 }
 
 /// Write a response whose first item, `first`, has already been taken
@@ -1846,6 +1911,7 @@ async fn write_response_after(
     mut first: Option<Outgoing>,
     mut rx: mpsc::Receiver<Outgoing>,
     writer: &mut Writer,
+    trace: Option<&record::Trace>,
 ) -> io::Result<()> {
     let mut pending_head: Option<Bytes> = None;
     let mut head_written = false;
@@ -1870,6 +1936,13 @@ async fn write_response_after(
             },
             (None, None) => Some(rx.recv().await),
         };
+
+        // Section 11.7: what the writer takes of the response, for the
+        // record when the edge asked for one.
+
+        if let (Some(trace), Some(taken)) = (trace, &item) {
+            trace.observe(taken.as_ref());
+        }
 
         // Section 6.14: a handoff tells the edge which side the request
         // is on now, before anything of the response.

@@ -17,3 +17,6 @@
 {%- if not panel.spans %}
 <p class="muted">No times are known yet.</p>
 {%- endif %}
+{%- for value in panel.values %}
+<p class="warning">The {{ value.name }} {% if value.value == "still to come" %}is still to come.{% else %}{{ value.value }}.{% endif %}</p>
+{%- endfor %}

@@ -21,6 +21,8 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("timing", include_str!("../panels/timing.html")),
     ("where", include_str!("../panels/where.html")),
     ("response", include_str!("../panels/response.html")),
+    ("logs", include_str!("../panels/logs.html")),
+    ("errors", include_str!("../panels/errors.html")),
     ("connection", include_str!("../panels/connection.html")),
 ];
 
@@ -151,6 +153,8 @@ pub fn builtin(record: &admin::RequestRecord) -> Vec<admin::Panel> {
         timing(record),
         place(record),
         response(record),
+        logs(record),
+        errors(record),
         connection(record),
     ]
 }
@@ -178,8 +182,12 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
     };
 
     let mut spans = Vec::new();
+    let mut values = Vec::new();
 
-    if !record.in_progress {
+    // The access log's record gives the request's own times, once the
+    // response has ended.
+
+    if record.status != 0 {
         let mut request = span("request", 0.0, record.total_ms, "request");
 
         // A worker or an upstream answered: its time, and the queue's.
@@ -193,13 +201,145 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
             ];
         }
 
+        // The worker's phases, on its clock, which starts as the queue
+        // ends.
+
+        if let Some(worker) = &record.from_worker {
+            let at = |ms: f64| record.queue_ms + ms;
+            let mut phases = Vec::new();
+
+            if worker.to_start_response > 0.0 {
+                phases.push(span(
+                    "start_response",
+                    at(0.0),
+                    worker.to_start_response,
+                    "worker",
+                ));
+            }
+
+            if worker.to_first_byte > 0.0 {
+                phases.push(span(
+                    "body",
+                    at(worker.to_first_byte),
+                    worker.to_last_byte - worker.to_first_byte,
+                    "worker",
+                ));
+            }
+
+            if worker.to_close > 0.0 {
+                let from = worker.to_last_byte.max(worker.to_start_response);
+                phases.push(span("end", at(from), worker.to_close - from, "worker"));
+            }
+
+            let mut whole = span("worker", at(0.0), worker.to_close, "worker");
+            whole.children = phases;
+            request.children.push(whole);
+        }
+
         spans.push(request);
+    }
+
+    match record.worker_part.as_str() {
+        crate::recorder::WORKER_EXPECTED => {
+            values.push(value("worker's part", "still to come"));
+        }
+        crate::recorder::WORKER_MISSING => values.push(value(
+            "worker's part",
+            "did not arrive: the worker stopped, or its connection failed",
+        )),
+        _ => {}
     }
 
     admin::Panel {
         name: "timing".to_owned(),
         title: "Timing".to_owned(),
         spans,
+        values,
+        ..Default::default()
+    }
+}
+
+/// The request's log records and warnings, as the worker kept them.
+fn logs(record: &admin::RequestRecord) -> admin::Panel {
+    let mut values = Vec::new();
+    let mut rows = Vec::new();
+
+    if let Some(worker) = &record.from_worker {
+        rows = worker
+            .logs
+            .iter()
+            .map(|line| admin::PanelRow {
+                cells: vec![
+                    millis(record.queue_ms + line.at_ms),
+                    line.level.clone(),
+                    line.logger.clone(),
+                    line.message.clone(),
+                ],
+            })
+            .collect();
+
+        if worker.logs_dropped > 0 {
+            values.push(value(
+                "not kept",
+                format!(
+                    "{} more records were not kept, past the limit",
+                    worker.logs_dropped
+                ),
+            ));
+        }
+    }
+
+    admin::Panel {
+        name: "logs".to_owned(),
+        title: "Logs".to_owned(),
+        values,
+        tables: vec![admin::PanelTable {
+            caption: "Log records".to_owned(),
+            columns: ["At", "Level", "Logger", "Message"]
+                .map(str::to_owned)
+                .to_vec(),
+            rows,
+        }],
+        ..Default::default()
+    }
+}
+
+/// The application's unhandled exception, or the edge's reason for an
+/// error it answered itself.
+fn errors(record: &admin::RequestRecord) -> admin::Panel {
+    let mut values = Vec::new();
+
+    if let Some(worker) = &record.from_worker
+        && !worker.outcome.is_empty()
+        && worker.outcome != "completed"
+    {
+        values.push(value("outcome", worker.outcome.replace('_', " ")));
+
+        if !worker.reason.is_empty() {
+            values.push(value("reason", worker.reason.clone()));
+        }
+
+        if !worker.error_phase.is_empty() {
+            values.push(value("raised in", worker.error_phase.clone()));
+        }
+
+        if !worker.error.is_empty() {
+            values.push(value("error", worker.error.clone()));
+        }
+
+        if !worker.traceback.is_empty() {
+            values.push(value("traceback", worker.traceback.trim_end().to_owned()));
+        }
+    }
+
+    if values.is_empty() && !record.reason.is_empty() && record.status >= 400 {
+        values.push(value("edge's reason", record.reason.clone()));
+    }
+
+    admin::Panel {
+        name: "errors".to_owned(),
+        title: "Errors".to_owned(),
+        values,
         ..Default::default()
     }
 }
@@ -239,6 +379,14 @@ fn place(record: &admin::RequestRecord) -> admin::Panel {
             .worker
             .map_or_else(|| "-".to_owned(), |worker| worker.to_string()),
     ));
+    if let Some(worker) = record
+        .from_worker
+        .as_ref()
+        .filter(|worker| !worker.thread.is_empty())
+    {
+        values.push(value("thread", worker.thread.clone()));
+    }
+
     values.push(value("client", or_dash(&record.client)));
     values.push(value("client class", or_dash(&record.client_class)));
     values.push(value("listener", or_dash(&record.listener)));
@@ -305,18 +453,47 @@ fn response(record: &admin::RequestRecord) -> admin::Panel {
     admin::Panel {
         name: "response".to_owned(),
         title: "Response".to_owned(),
-        values: vec![
-            value("status", status),
-            value("sent", format_bytes(record.bytes)),
-            value("received", format_bytes(record.received)),
-            value("compressed", compressed),
-        ],
+        values: [
+            vec![
+                value("status", status),
+                value("sent", format_bytes(record.bytes)),
+                value("received", format_bytes(record.received)),
+                value("compressed", compressed),
+            ],
+            body(record),
+        ]
+        .concat(),
         tables: vec![
             headers("Request headers", &record.request_headers),
             headers("Response headers", &record.response_headers),
         ],
         ..Default::default()
     }
+}
+
+/// What the application produced, from the worker's part: its bytes
+/// before compression, where they came from, and whether the edge sent a
+/// file itself.
+fn body(record: &admin::RequestRecord) -> Vec<admin::PanelValue> {
+    let Some(worker) = record
+        .from_worker
+        .as_ref()
+        .filter(|worker| !worker.body_source.is_empty())
+    else {
+        return Vec::new();
+    };
+
+    let mut produced = format!(
+        "{} from {}",
+        format_bytes(worker.body_bytes),
+        worker.body_source.replace('_', " ")
+    );
+
+    if worker.sent_by_edge {
+        produced.push_str(", the file sent by the edge");
+    }
+
+    vec![value("produced", produced)]
 }
 
 /// The connection the request arrived on.
@@ -402,6 +579,30 @@ mod tests {
                 encoding: String::new(),
                 skipped: "small".to_owned(),
             }),
+            worker_part: crate::recorder::WORKER_ARRIVED.to_owned(),
+            from_worker: Some(admin::WorkerPart {
+                thread: "muru-wsgi-1".to_owned(),
+                to_start_response: 2.0,
+                to_first_byte: 15.0,
+                to_last_byte: 17.0,
+                to_close: 17.5,
+                body_bytes: 1234,
+                body_source: "iterable".to_owned(),
+                outcome: "failed".to_owned(),
+                reason: "app_error".to_owned(),
+                error_phase: "iteration".to_owned(),
+                error: "the application raised an exception".to_owned(),
+                traceback: "Traceback (most recent call last):\n  ...\nKeyError: '<id>'\n"
+                    .to_owned(),
+                logs: vec![admin::RequestLog {
+                    at_ms: 3.0,
+                    level: "WARNING".to_owned(),
+                    logger: "shop.orders".to_owned(),
+                    message: "low stock for <b>42</b>".to_owned(),
+                }],
+                logs_dropped: 2,
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -436,8 +637,67 @@ mod tests {
     }
 
     #[test]
+    fn the_timing_panel_places_the_workers_phases_after_the_queue() {
+        let html = drawn("timing");
+        assert!(html.contains("<td class=\"depth-2\">worker</td>"), "{html}");
+        assert!(
+            html.contains("<td class=\"depth-3\">start_response</td>"),
+            "{html}"
+        );
+        assert!(html.contains("<td class=\"depth-3\">body</td>"), "{html}");
+
+        // The body starts 15 ms into the worker's clock, after 0.2 ms of
+        // queue.
+
+        assert!(html.contains("15.2 ms"), "{html}");
+
+        let mut missing = fixture();
+        missing.from_worker = None;
+        missing.worker_part = crate::recorder::WORKER_MISSING.to_owned();
+        let html = Renderer::new(None).render(&timing(&missing));
+        assert!(html.contains("The worker's part did not arrive"), "{html}");
+    }
+
+    #[test]
+    fn the_logs_panel_lists_the_records_escaped_and_counts_the_rest() {
+        let html = drawn("logs");
+        assert!(
+            html.contains("<span class=\"warning\">WARNING</span>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("low stock for &lt;b&gt;42&lt;/b&gt;"),
+            "{html}"
+        );
+        assert!(html.contains("3.2ms"), "{html}");
+        assert!(html.contains("2 more records were not kept"), "{html}");
+
+        let mut quiet = fixture();
+        quiet.from_worker = None;
+        let html = Renderer::new(None).render(&logs(&quiet));
+        assert!(html.contains("No log records or warnings"), "{html}");
+    }
+
+    #[test]
+    fn the_errors_panel_gives_the_exception_and_its_traceback() {
+        let html = drawn("errors");
+        assert!(
+            html.contains("<th>raised in</th><td>iteration</td>"),
+            "{html}"
+        );
+        assert!(html.contains("<pre class=\"error\">Traceback"), "{html}");
+        assert!(html.contains("KeyError: '&lt;id&gt;'"), "{html}");
+
+        let mut fine = fixture();
+        fine.from_worker = None;
+        let html = Renderer::new(None).render(&errors(&fine));
+        assert!(html.contains("No errors."), "{html}");
+    }
+
+    #[test]
     fn the_where_panel_names_the_release_and_the_redirects() {
         let html = drawn("where");
+        assert!(html.contains("muru-wsgi-1"), "{html}");
         assert!(
             html.contains("<th>application</th><td class=\"mono\">shop@r3</td>"),
             "{html}"
@@ -453,6 +713,7 @@ mod tests {
     fn the_response_panel_escapes_and_masks_the_headers() {
         let html = drawn("response");
         assert!(html.contains("no: the body is under min_size"), "{html}");
+        assert!(html.contains("1234B from iterable"), "{html}");
         assert!(
             html.contains("<summary>Request headers <span class=\"badge\">2</span></summary>"),
             "{html}"

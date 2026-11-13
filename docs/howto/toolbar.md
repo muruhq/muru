@@ -57,10 +57,15 @@ The page shows the record as panels:
 
 - **Timing:** the request's phases from its arrival: the wait for a
   worker, the application until the response head, and sending the
-  response, each with when it started and how long it took.
+  response, each with when it started and how long it took. Below them
+  are the worker's own phases: until the application called
+  `start_response` (or sent `http.response.start`), from its first body
+  byte to its last, and until it ended, which for WSGI is `close()`
+  returning.
 
 - **Where:** the application and release, host and virtual host,
-  mount, worker group and worker, client and client class, the listener,
+  mount, worker group, worker and the thread that ran the request,
+  client and client class, the listener,
   internal redirects, a handoff between WSGI and ASGI, whether the
   request was sent again to another worker, and the routing snapshot.
 
@@ -69,8 +74,23 @@ The page shows the record as panels:
   (compression is off for the route, the application asked for none,
   the response was already encoded, its type is not one compressed, the
   body is under `min_size`, the client accepts none of the encodings
-  offered), and the request headers as they arrived and the response
-  headers as they were sent.
+  offered), what the application produced before compression and where
+  it came from (an iterable, `write()`, `wsgi.file_wrapper`, ASGI body
+  messages or a file sent by Muru itself), and the request headers as
+  they arrived and the response headers as they were sent.
+
+- **Logs:** the log records and warnings the application made while
+  serving the request, each with its time on the request's clock, its
+  level, logger and message, and a traceback when the record has one.
+  They are the records the `muru_request_id` tag names, which is every
+  record made in the request's thread or task. The first 200 are kept
+  and the rest counted. Output from `print()` is not kept, since it
+  names no request.
+
+- **Errors:** the exception the application did not catch, whether it
+  was raised calling the application or while producing the body, and
+  its traceback, as the development error page shows it; or, for an
+  error Muru answered itself, its reason.
 
 - **Connection:** the connection's ID, the request's position on it,
   how long the connection was idle before the request, for the first
@@ -82,6 +102,9 @@ The dashboard's recent requests link to each request's page, and
 `/v1/requests/ID` on the dashboard's address gives the record as JSON.
 A record still being written, for a response that is still streaming,
 says so; reloading the page shows the rest once the response has ended.
+The worker sends its part of the record just after the response, so a
+record is complete a moment after the last byte arrives. If the worker
+stopped before sending it, the Timing panel says so and shows the rest.
 
 The [access log](logging.md)'s JSON lines name the connection too, as
 `connection` and `connection_requests`, in every mode.
@@ -107,14 +130,15 @@ find it:
 
 ```console
 $ muructl debug request 01JCZ8X4R3T5V6W7Y8Z9A0B1C2
-GET /orders/42 HTTP/1.1  200  18ms  at 10:42:07.123
+GET /orders/42 HTTP/1.1  500  2.0ms  at 10:42:07.123
 request 01JCZ8X4R3T5V6W7Y8Z9A0B1C2
 
 Timing
-  request        18ms  from 0.0ms
-    queue        0.2ms  from 0.0ms
-    application  18ms  from 0.2ms
-    send         0.3ms  from 18ms
+  request          2.0ms  from 0.0ms
+    queue          0.0ms  from 0.0ms
+    application    1.9ms  from 0.0ms
+    send           0.0ms  from 1.9ms
+    worker         1.8ms  from 0.0ms
 
 Where
   application       shop@r3
@@ -122,6 +146,7 @@ Where
   mount             default
   group             default
   worker            0
+  thread            muru-app-0
   client            127.0.0.1
   client class      default
   listener          127.0.0.1:8080
@@ -129,8 +154,8 @@ Where
   routing snapshot  0
 
 Response
-  status      200
-  sent        1234B
+  status      500 app_error
+  sent        351B
   received    0B
   compressed  no: the body is under min_size
   Request headers
@@ -139,8 +164,25 @@ Response
     cookie: ***
   Response headers
     content-type: text/html; charset=utf-8
-    x-request-id: 01JCZ8X4R3T5V6W7Y8Z9A0B1C2
     ...
+
+Logs
+  Log records
+    0.3ms  WARNING  shop.orders  order 42 has no lines
+    0.5ms  ERROR  muru  the application raised an exception
+      Traceback (most recent call last):
+        ...
+      KeyError: 'lines'
+
+Errors
+  outcome    failed
+  reason     app_error
+  raised in  call
+  error      the application raised an exception
+  traceback
+    Traceback (most recent call last):
+      ...
+    KeyError: 'lines'
 
 Connection
   id            01JCZ8X4R3T5V6W7Y8Z9A0B1C0

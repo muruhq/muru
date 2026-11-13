@@ -51,6 +51,10 @@ pub mod kind {
     /// `Detach`), worker to edge, before any of the response (section
     /// 6.14).
     pub const DETACH: u8 = 12;
+    /// The worker's part of a development run's request record (protobuf
+    /// `WorkerRecord`), worker to edge, after the response's end when the
+    /// request head asked for it (section 11.7).
+    pub const RECORD: u8 = 13;
     // Kind 10 is reserved for INFORMATIONAL (design specification
     // section 5.2).
 }

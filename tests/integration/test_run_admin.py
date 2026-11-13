@@ -404,8 +404,19 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
             "timing",
             "where",
             "response",
+            "logs",
+            "errors",
             "connection",
         ]
+
+        # The worker's part follows the response (issue 635): its thread,
+        # its times and where the body came from.
+
+        assert found["worker_part"] == "arrived"
+        worker = found["from_worker"]
+        assert worker["thread"] and worker["body_source"] == "iterable"
+        assert worker["outcome"] == "completed"
+        assert 0 < worker["to_start_response"] <= worker["to_close"]
 
         # The text form names the request and draws each panel.
 
@@ -430,6 +441,24 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
         assert "<h2>Connection</h2>" in page and "hunter2" not in page
         assert json.loads(read(f"/v1/requests/{request_id}"))["request_id"] == request_id
         assert f'href="request/{request_id}"' in read("/fragment/requests")
+
+        # A failed request's record has the exception, its traceback and
+        # the log record that reported it.
+
+        failed = server.get("/error")
+        assert failed.status == 500
+        failed_id = failed.header("x-request-id")
+        assert failed_id is not None
+        deadline = time.monotonic() + 10
+
+        while (broken := record(failed_id))["in_progress"]:
+            assert time.monotonic() < deadline, broken
+            time.sleep(0.05)
+
+        worker = broken["from_worker"]
+        assert (worker["outcome"], worker["error_phase"]) == ("failed", "call")
+        assert "RuntimeError: deliberate failure" in worker["traceback"]
+        assert any(line["logger"] == "muru" and line["level"] == "ERROR" for line in worker["logs"])
 
         # A request the run does not keep is said to be so.
 

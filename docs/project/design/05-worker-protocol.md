@@ -47,6 +47,7 @@ Every frame is a six byte header followed by its payload: a 32 bit little-endian
 | INFORMATIONAL | 10 | worker to edge | ResponseHead | A 1xx response before the final head, for example 103 Early Hints. Phase 2 |
 | FILE | 11 | worker to edge | FileHint | The response body is a range of the file whose descriptor is attached to the frame (section 5.7). Phase 2 |
 | DETACH | 12 | worker to edge | Detach | The request moved from an application thread to the event loop, or back, so the edge counts it against async slots or slots accordingly (section 6.14) |
+| RECORD | 13 | worker to edge | WorkerRecord | The worker's part of a development run's request record, after the response's end, sent only when the request head asked for it (section 11.7) |
 
 Flags: END (0x01) on the last frame of a direction; TEXT (0x02) on a text MESSAGE; MORE (0x04) reserved for message fragments if max_message_size ever needs to be exceeded.
 
@@ -61,6 +62,8 @@ The messages, with the exact definitions in proto/muru/worker/v1/worker.proto:
 - **End:** trailers, and an error string when the body is incomplete. In place of a response head: the Appendix C.3 reason (app_error) and a detail string, the traceback, which the edge shows only in development mode.
 
 - **Abort:** a reason, for logs.
+
+- **WorkerRecord:** the worker's part of a development run's request record (section 11.7): the thread, the times from taking the request to start_response, the first and last body bytes and the application's end, the body's bytes and source, whether the edge sent a file, the outcome, the exception and its traceback, and the request's log records. Hello's `records` says the worker sends it, and RequestHead's `record` asks for it.
 
 - **Close:** a WebSocket close code (1000 when the application gave none) and reason. **FileHint:** offset and length within the attached descriptor; the END flag on the frame ends the body with the range, otherwise body frames follow it. **Detach:** the side the request moved to, threads or the event loop.
 
@@ -89,7 +92,7 @@ sequenceDiagram
   E->>E: connection back in the pool
 ```
 
-A connection is idle again when both directions have ended: the request direction with END, the END flag or ABORT, and the response direction with END or the END flag. Either side closing the connection abandons the request on it; the edge answers the client with 502 if no response head has been sent, and the worker stops the application's iteration.
+A connection is idle again when both directions have ended: the request direction with END, the END flag or ABORT, and the response direction with END or the END flag, followed by a RECORD frame when the request head asked for one (section 11.7). The edge reads that frame before it returns the connection to the pool, waiting up to 10 s for it, since with a declared Content-Length the body can end before the application's close() returns; a connection whose RECORD does not come is closed. Either side closing the connection abandons the request on it; the edge answers the client with 502 if no response head has been sent, and the worker stops the application's iteration.
 
 ## 5.4 Streaming and flush policy
 

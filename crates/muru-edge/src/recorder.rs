@@ -116,9 +116,14 @@ impl Recorder {
     /// Complete a record with the access log's record of its request,
     /// once its response has ended.
     pub fn complete(&self, slot: &Slot, logged: &Record) {
+        self.update(slot, |record| fill(record, logged));
+    }
+
+    /// Change a record kept in the ring, and count its new size.
+    pub fn update(&self, slot: &Slot, change: impl FnOnce(&mut admin::RequestRecord)) {
         let bytes = {
             let mut record = slot.lock().expect("request record poisoned");
-            fill(&mut record, logged);
+            change(&mut record);
             record.encoded_len()
         };
 
@@ -250,10 +255,10 @@ pub fn head(head: Head<'_>) -> admin::RequestRecord {
     }
 }
 
-/// Lay the access log's record of a request over its record, which
-/// then is no longer in progress.
+/// Lay the access log's record of a request over its record, which then
+/// is in progress only while the worker's part is still to come.
 pub fn fill(record: &mut admin::RequestRecord, logged: &Record) {
-    record.in_progress = false;
+    record.in_progress = record.worker_part == WORKER_EXPECTED;
     record.started_unix_ms = logged
         .started
         .duration_since(UNIX_EPOCH)
@@ -282,6 +287,57 @@ pub fn fill(record: &mut admin::RequestRecord, logged: &Record) {
     record.redirects = logged.redirects.clone();
     record.client_class = logged.client_class.clone();
     record.handoff = logged.handoff.unwrap_or_default().to_owned();
+}
+
+/// The worker's part of a record is still to come.
+pub const WORKER_EXPECTED: &str = "expected";
+
+/// The worker's part of a record arrived.
+pub const WORKER_ARRIVED: &str = "arrived";
+
+/// The worker's part of a record did not come: the worker died, or the
+/// connection to it failed.
+pub const WORKER_MISSING: &str = "missing";
+
+/// Lay the worker's part over a record, which is then in progress only
+/// while the access log's record is still to come.
+pub fn worker(record: &mut admin::RequestRecord, part: muru_proto::worker::v1::WorkerRecord) {
+    record.worker_part = WORKER_ARRIVED.to_owned();
+    record.in_progress = record.status == 0;
+    record.from_worker = Some(admin::WorkerPart {
+        thread: part.thread,
+        to_start_response: part.to_start_response,
+        to_first_byte: part.to_first_byte,
+        to_last_byte: part.to_last_byte,
+        to_close: part.to_close,
+        body_bytes: part.body_bytes,
+        body_source: part.body_source,
+        sent_by_edge: part.sent_by_edge,
+        outcome: part.outcome,
+        reason: part.reason,
+        error_phase: part.error_phase,
+        error: part.error,
+        traceback: part.traceback,
+        logs: part
+            .logs
+            .into_iter()
+            .map(|line| admin::RequestLog {
+                at_ms: line.at,
+                level: line.level,
+                logger: line.logger,
+                message: line.message,
+            })
+            .collect(),
+        logs_dropped: part.logs_dropped,
+    });
+}
+
+/// Mark a record's worker part as never arriving.
+pub fn worker_missing(record: &mut admin::RequestRecord) {
+    if record.worker_part == WORKER_EXPECTED {
+        record.worker_part = WORKER_MISSING.to_owned();
+        record.in_progress = record.status == 0;
+    }
 }
 
 /// The time now, in Unix milliseconds.
@@ -361,13 +417,13 @@ fn mask_url(text: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
     use super::*;
 
-    fn logged(request_id: &str) -> Record {
+    pub(crate) fn logged(request_id: &str) -> Record {
         Record {
             started: UNIX_EPOCH + Duration::from_millis(1_700_000_000_123),
             request_id: request_id.to_owned(),

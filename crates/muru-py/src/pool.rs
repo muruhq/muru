@@ -128,6 +128,9 @@ pub struct RequestInfo {
     /// Given up: the edge has answered the client, whatever the
     /// application thread still does.
     pub abandoned: bool,
+    /// What the worker sees of the request, when the edge asked for a
+    /// record of it (section 11.7).
+    pub trace: Option<Arc<crate::record::Trace>>,
 }
 
 /// Which of a condemned worker's requests to give up.
@@ -611,9 +614,22 @@ impl Shared {
                     websocket: false,
                     outgoing: None,
                     abandoned: false,
+                    trace: head
+                        .record
+                        .then(|| Arc::new(crate::record::Trace::new(Instant::now(), "iterable"))),
                 },
             );
         (id, interrupt)
+    }
+
+    /// What the worker sees of a request the edge asked for a record of
+    /// (section 11.7); none for any other.
+    pub fn request_trace(&self, id: u64) -> Option<Arc<crate::record::Trace>> {
+        self.active
+            .lock()
+            .expect("active requests poisoned")
+            .get(&id)
+            .and_then(|info| info.trace.clone())
     }
 
     /// Note a request's channel to the edge, for giving it up.

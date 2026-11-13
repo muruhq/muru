@@ -165,6 +165,9 @@ pub struct StartResponse {
     /// streaming response can be exempted from the timeouts.
     shared: Arc<Shared>,
     request: u64,
+    /// What the worker sees of the request, when the edge asked for a
+    /// record of it (section 11.7).
+    trace: Option<Arc<crate::record::Trace>>,
 }
 
 impl StartResponse {
@@ -182,6 +185,7 @@ impl StartResponse {
                 handed_off: false,
             }),
             sink: Sink { tx, interrupt },
+            trace: shared.request_trace(request),
             shared,
             request,
         }
@@ -377,11 +381,19 @@ impl StartResponse {
         state.headers = headers;
         drop(state);
 
+        if let Some(trace) = &this.trace {
+            trace.start_response();
+        }
+
         slf.getattr(intern!(py, "write"))
     }
 
     /// The `write` callable of PEP 3333: send one chunk immediately.
     fn write(&self, py: Python<'_>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
+        if let Some(trace) = &self.trace {
+            trace.body_source("write");
+        }
+
         self.send_body(py, bytes_from_py(data))
     }
 }
@@ -1051,6 +1063,14 @@ pub fn run(
     let finished = tx.clone();
     let bridge_tx = tx.clone();
     let started = StartResponse::new(tx, Arc::clone(shared), request, Arc::clone(&interrupt));
+
+    if let Some(trace) = &started.trace {
+        trace.thread(
+            std::thread::current()
+                .name()
+                .unwrap_or("application thread"),
+        );
+    }
 
     let start_response = match Bound::new(py, started) {
         Ok(start_response) => start_response,

@@ -2947,7 +2947,18 @@ fn request_text(record: &pb::RequestRecord) -> String {
         let width = lines.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
 
         for (name, value) in &lines {
-            let _ = writeln!(text, "  {name:<width$}  {value}");
+            // A value of several lines, such as a traceback, goes below
+            // its name, indented.
+
+            if value.contains('\n') {
+                let _ = writeln!(text, "  {name}");
+
+                for line in value.lines() {
+                    let _ = writeln!(text, "    {line}");
+                }
+            } else {
+                let _ = writeln!(text, "  {name:<width$}  {value}");
+            }
         }
 
         for table in &panel.tables {
@@ -2963,7 +2974,13 @@ fn request_text(record: &pb::RequestRecord) -> String {
                         let _ = writeln!(text, "    {name}: {value}");
                     }
                     cells => {
-                        let _ = writeln!(text, "    {}", cells.join("  "));
+                        let line = cells.join("  ");
+                        let mut lines = line.lines();
+                        let _ = writeln!(text, "    {}", lines.next().unwrap_or_default());
+
+                        for more in lines {
+                            let _ = writeln!(text, "      {more}");
+                        }
                     }
                 }
             }
