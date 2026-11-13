@@ -181,6 +181,13 @@ impl Guard {
             return Action::Nothing;
         }
 
+        // Until a worker has reported its memory, as just after a start,
+        // there is nothing to judge by.
+
+        if !workers.is_empty() && workers.iter().all(|worker| worker.size == 0) {
+            return Action::Nothing;
+        }
+
         // Replacing workers can free at most their own memory.
 
         let shortfall = headroom - left;
@@ -632,6 +639,18 @@ mod tests {
         let later = start + Duration::from_secs(5);
         assert_eq!(
             guard.check_at(reading(570 * MB), &gone, 250 * MB, later),
+            Action::Nothing
+        );
+        assert_eq!(guard.state().0, "watching");
+    }
+
+    #[test]
+    fn nothing_is_judged_before_a_worker_has_reported() {
+        let mut guard = Guard::default();
+        let unmeasured = [worker(0, 10, 0), worker(1, 11, 0)];
+
+        assert_eq!(
+            guard.check(reading(GB - 50 * MB), &unmeasured, 0),
             Action::Nothing
         );
         assert_eq!(guard.state().0, "watching");
