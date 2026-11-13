@@ -1,7 +1,7 @@
 {#- The Logs panel: the request's log records and warnings. -#}
 {%- for table in panel.tables %}
 {%- if table.rows %}
-<table class="mono">
+<table class="logs">
 <thead><tr>{% for column in table.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead>
 <tbody>
 {%- for row in table.rows %}

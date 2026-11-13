@@ -4,7 +4,9 @@
 .panel table.values th { width: 12rem; font-weight: 600; color: #627d98; white-space: nowrap; }
 .panel td { overflow-wrap: anywhere; }
 .panel .num { text-align: right; white-space: nowrap; }
-.panel .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }
+.panel .mono, .panel pre, .panel code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; }
+.panel .mono pre, .panel .mono code, .panel pre code { font-size: inherit; }
+.panel pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .panel .muted { color: #627d98; }
 .panel .warning { color: #946200; }
 .panel .error { color: #b42318; }

@@ -15,7 +15,6 @@
 .tab { padding: 0.3em 0.8em; border: none; border-bottom: 2px solid transparent; background: none; font: inherit; color: #627d98; cursor: pointer; }
 .tab.open { color: #102a43; border-bottom-color: #2f6fde; font-weight: 600; }
 .content { padding: 0.75em 1em; overflow: auto; min-width: 32rem; }
-.content pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
 .footer { display: flex; justify-content: space-between; gap: 1em; padding: 0.4em 1em; border-top: 1px solid #e4ebf2; font-size: 12px; }
 .footer a { color: #2f6fde; }
 .muted { color: #627d98; }
