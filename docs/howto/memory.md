@@ -62,10 +62,27 @@ treats a stuck one: it leaves routing at once, a replacement is forked,
 and it is told to stop after `hard_drain_grace`.
 
 A worker index recycled for memory three times within an hour raises a
-`memory.leak_suspected` warning, once an hour. Container and cgroup
-limits remain the kernel's backstop. Under `muructl serve` a hard limit
-nobody set is [derived from the container's memory
-limit](containers.md#sizing-from-the-containers-limits).
+`memory.leak_suspected` warning, once an hour.
+
+## Under a container's memory limit
+
+The limits above are each worker's own. When the workers run in a
+cgroup with a memory limit, as in a container, a memory guard also
+watches the limit itself: when less than the headroom is left under it
+(10% of the limit, at least 128MB), the largest worker is replaced, one
+at a time, whether or not a hard limit is set. Both can apply, the hard
+limit to one worker that grows too large, and the guard to workers that
+together use more than the container has. A worker replaced for memory,
+by either, stops before its replacement starts when less is left under
+the limit than the worker's current size.
+
+[Container limits](containers.md#container-limits) describes the guard,
+where a container's memory goes, and what to set for an application that
+holds a lot once it is imported. The kernel's out-of-memory killer
+remains the last resort. On Linux each worker raises its own
+`oom_score_adj` to 500 as it starts, so when memory runs out the kernel
+kills a worker, which its host replaces, before a host, the edge or
+another service on the machine.
 
 ## Metrics
 

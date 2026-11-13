@@ -123,6 +123,18 @@ CONTROL_TIMEOUT_SECONDS = 5.0
 LEAK_WINDOW_SECONDS = 3600.0
 LEAK_RECYCLES = 3
 
+# Sections 7.7 and 13.9: the causes of a replacement for memory, a
+# worker's own limits and the memory guard's, either of which stops the
+# worker first when the cgroup has no room for its successor beside it.
+
+MEMORY_CAUSES = ("memory", "container_memory")
+
+# Section 7.7 (issue 624): the score every worker raises its own
+# /proc/self/oom_score_adj to after the fork, so the kernel picks a worker,
+# which its host replaces, before a host, the edge or another service.
+
+WORKER_OOM_SCORE_ADJ = 500
+
 # A worker exiting with an error this soon after its fork failed to start.
 
 STARTUP_WINDOW_SECONDS = 5.0
@@ -1013,11 +1025,15 @@ class Host:
         self.memory_recycles: dict[int, list[float]] = {}
         self.leak_warned: dict[int, float] = {}
 
-        # Section 13.9: the container's cgroup, whose count of processes
-        # the kernel killed for memory tells such a worker from a crash.
+        # Section 13.9: the cgroup the workers run in, whose count of
+        # processes the kernel killed for memory tells such a worker from
+        # a crash, and what is left under whose limit decides whether a
+        # worker replaced for memory stops first.
 
         self.cgroup = cgroup
         self.oom_kills = oom_kills(cgroup)
+        self.own_memory_at = -1.0
+        self.own_memory_measured: dict[str, int] = {}
 
         # Section 6.10: whether orphaned descendants come to this process,
         # and those that have, each with when it is to be stopped.
@@ -1313,6 +1329,7 @@ class Host:
                     f"muru worker {context.app}@{context.release} {group.name}/{within}",
                     "muru-worker",
                 )
+                raise_oom_score()
                 os.dup2(out_write, 1)
                 os.dup2(err_write, 2)
 
@@ -2367,6 +2384,10 @@ class Host:
             self.restart_worker(request_id, wanted, asked, args)
             return
 
+        if op == "recycle":
+            self.recycle_worker(request_id, wanted, asked, args)
+            return
+
         if op == "status":
             self.answer_status(request_id, wanted)
             return
@@ -2540,6 +2561,69 @@ class Host:
             }
         )
 
+    # Sections 7.7 and 13.9: the memory guard, which watches the whole
+    # cgroup from the supervisor, has a worker replaced as the host's own
+    # memory limits replace one.
+
+    def recycle_worker(
+        self, request_id: int, wanted: int | None, asked: str, args: dict[str, Any]
+    ) -> None:
+        """Replace one worker for the supervisor, with its reason and cause.
+
+        With `retire`, the worker drains with no successor, as a scale-in
+        drains one. A worker that has been replaced since it was chosen,
+        so that its pid is no longer `pid`, is left alone.
+        """
+
+        pid = int(args.get("pid", 0))
+        state = next(
+            (
+                candidate
+                for candidate in self.states.values()
+                if candidate.index == wanted and not candidate.replaced
+            ),
+            None,
+        )
+        error = ""
+
+        if state is None or (pid and state.pid != pid):
+            error = f"no worker {asked} with pid {pid}"
+        elif not state.ready:
+            error = f"worker {asked} is still starting"
+        elif state.index in self.replacing:
+            error = f"worker {asked} is already being replaced"
+        elif state.debug_sessions:
+            error = f"worker {asked} is being debugged"
+        elif self.control_listener is None:
+            error = "workers cannot be replaced without a control socket"
+
+        if error or state is None:
+            self.send_to_supervisor(
+                {"type": "response", "id": request_id, "workers": [], "error": error}
+            )
+            return
+
+        # Section 13.9: a group with a scaling policy is scaled in by the
+        # worker instead, which drains with no successor.
+
+        if args.get("retire"):
+            self.retire(state, f"scaled in for memory: {args.get('reason', '')}")
+        else:
+            self.replace(
+                state,
+                str(args.get("reason", "replaced on the supervisor's request")),
+                "worker.recycled",
+                str(args.get("cause", "")),
+            )
+
+        self.send_to_supervisor(
+            {
+                "type": "response",
+                "id": request_id,
+                "workers": [{**self.worker_fields(state.index), "pid": state.pid, "ok": True}],
+            }
+        )
+
     def active_indices(self, group: Group) -> list[int]:
         """Return the group's indices with a worker that serves or is starting, in order."""
 
@@ -2590,7 +2674,11 @@ class Host:
         if not candidates:
             return
 
-        state = max(candidates, key=lambda candidate: candidate.started_at)
+        self.retire(max(candidates, key=lambda candidate: candidate.started_at), "scaled in")
+
+    def retire(self, state: WorkerState, why: str) -> None:
+        """Take one worker out of routing and then stop it, with no successor."""
+
         state.replaced = True
         retirement = Replacement(
             state.index, state.pid, "scaled in", "worker.exited", "scaled_in", retire=True
@@ -2599,7 +2687,7 @@ class Host:
         self.routed[state.index] = None
         retirement.announced = self.announce()
         retirement.announced_at = time.monotonic()
-        log(f"worker {self.worker_name(state.index)} (pid {state.pid}) leaves routing: scaled in")
+        log(f"worker {self.worker_name(state.index)} (pid {state.pid}) leaves routing: {why}")
 
     def answer_status(self, request_id: int, wanted: int | None) -> None:
         """Answer `debug status` with each worker's state and what it holds.
@@ -2952,41 +3040,6 @@ class Host:
             self.check_memory(state)
             self.send_status()
 
-    def derive_hard_limit(self, budget: int) -> None:
-        """Section 13.9: a hard limit nobody set, from the container's budget.
-
-        What the host holds after preload is shared with the workers until
-        written, so it is taken off the budget once and the rest divided
-        between the workers.
-        """
-
-        from muru import _native
-
-        measured = _native.memory_usage()
-        held = measured["rss"] if measured else 0
-        share = (budget - held) // max(self.worker_count, 1)
-        policies = [self.memory, *(group.memory for group in self.groups if group.memory)]
-        unset = [policy for policy in policies if policy.hard_limit is None]
-
-        if not unset:
-            return
-
-        if share <= 0:
-            log(
-                f"the memory budget of {format_size(budget)} leaves nothing for the workers "
-                f"after the {format_size(held)} the host holds; no hard limit is derived"
-            )
-            return
-
-        for policy in unset:
-            policy.hard_limit = share
-
-        log(
-            f"worker hard limit {format_size(share)}: the memory budget of "
-            f"{format_size(budget)} less {format_size(held)} the host holds, over "
-            f"{self.worker_count} workers"
-        )
-
     def check_memory(self, state: WorkerState) -> None:
         """Section 7.7: hold a worker to the memory limits."""
 
@@ -3066,11 +3119,12 @@ class Host:
             )
 
     def send_status(self) -> None:
-        """Tell the supervisor what every worker last reported."""
+        """Tell the supervisor what every worker last reported, and what the host holds."""
 
         self.send_to_supervisor(
             {
                 "type": "status",
+                "host": self.own_memory(),
                 "workers": [
                     {
                         **self.worker_fields(state.index),
@@ -3087,6 +3141,23 @@ class Host:
                 ],
             }
         )
+
+    def own_memory(self) -> dict[str, int]:
+        """Return the host's own memory, measured at most once a second.
+
+        Sections 7.7 and 13.9: the supervisor counts it once, apart from
+        the workers', for the memory guard and the start warnings.
+        """
+
+        now = time.monotonic()
+
+        if now - self.own_memory_at >= 1.0:
+            from muru import _native
+
+            self.own_memory_at = now
+            self.own_memory_measured = dict(_native.memory_usage() or {})
+
+        return self.own_memory_measured
 
     def worker_ready(self, state: WorkerState) -> None:
         """Note that a worker listens; a replacement enters routing and is announced."""
@@ -3322,8 +3393,10 @@ class Host:
         hard = hard or kind == "worker.timeout_killed"
         log(f"worker {self.worker_name(index)} (pid {state.pid}) {reason}; replacing it")
 
-        if "limit" in reason:
+        if cause == "memory":
             self.note_memory_recycle(index)
+
+        if cause in MEMORY_CAUSES:
             self.capture_objects(state, replacement)
 
         if hard:
@@ -3350,13 +3423,13 @@ class Host:
         # would kill for, so with no room for a second this one leaves
         # routing and stops first, and reap() forks its successor.
 
-        short = self.short_of_memory(index) if cause == "memory" else None
+        short = self.short_of_memory(state) if cause in MEMORY_CAUSES else None
 
         if short is not None:
             log(
                 f"worker {self.worker_name(index)} (pid {state.pid}) "
                 "stops before its replacement starts: "
-                f"{format_size(short)} is left under the container's memory limit"
+                f"{format_size(short)} is left under the memory limit, less than its size"
             )
             replacement.stop_first = True
             replacement.terminate_at = None
@@ -3370,13 +3443,19 @@ class Host:
         if kind == "worker.timeout_killed":
             self.report_timeout_kill(replacement)
 
-    def short_of_memory(self, index: int) -> int | None:
-        """Return what is left under the container's limit, if less than one worker may use."""
+    def short_of_memory(self, state: WorkerState) -> int | None:
+        """Return what is left under the cgroup's limit, if less than the worker's size.
 
-        policy = self.group_of(index).memory or self.memory
+        The size is the worker's own memory now, by its policy's measure,
+        which its replacement may come to hold as well; with no limit, or
+        before the worker has been measured, nothing is short.
+        """
+
+        policy = self.group_of(state.index).memory or self.memory
+        size = state.memory.get(policy.measure)
         left = memory_left(self.cgroup)
 
-        if left is None or policy.hard_limit is None or left >= policy.hard_limit:
+        if left is None or size is None or left >= size:
             return None
 
         return left
@@ -4189,6 +4268,26 @@ class Host:
                 pass
 
 
+def raise_oom_score(path: str = "/proc/self/oom_score_adj") -> None:
+    """Make this worker the kernel's first choice when memory runs out.
+
+    Section 7.7 (issue 624): a worker the kernel kills is replaced by its
+    host, where a host, a relay, the edge, the daemon or another service
+    on the machine would not be. Raising the score needs no privilege; a
+    score already higher, as an operator may set, is kept. Linux only.
+    """
+
+    try:
+        with open(path) as current:
+            score = int(current.read())
+
+        if score < WORKER_OOM_SCORE_ADJ:
+            with open(path, "w") as raised:
+                raised.write(str(WORKER_OOM_SCORE_ADJ))
+    except (OSError, ValueError):
+        pass
+
+
 def oom_kills(cgroup: str | None) -> int | None:
     """Read the kernel's count of the cgroup's processes killed for memory."""
 
@@ -4656,18 +4755,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="how often a worker measures its memory",
     )
     parser.add_argument(
-        "--memory-budget",
-        type=int,
-        default=None,
-        metavar="BYTES",
-        help="the container's memory for the host and its workers, from which a hard limit "
-        "nobody set is derived",
-    )
-    parser.add_argument(
         "--cgroup",
         default=None,
         metavar="DIR",
-        help="the container's cgroup directory, whose memory.events counts kills for memory",
+        help="the cgroup the workers run in: what is left under its memory.max decides whether a "
+        "worker replaced for memory stops first, and its memory.events counts kills for memory",
     )
     return parser.parse_args(argv)
 
@@ -4898,9 +4990,6 @@ def main(argv: list[str] | None = None) -> int:
         handoff=args.handoff,
         cgroup=args.cgroup,
     )
-
-    if args.memory_budget is not None:
-        host.derive_hard_limit(args.memory_budget)
 
     # Section 2.1: the host says which release it is; each worker it
     # forks says so too, with its group and index.

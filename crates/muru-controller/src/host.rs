@@ -55,6 +55,9 @@ pub enum HostMessage {
     Status {
         /// One entry per worker.
         workers: Vec<WorkerStatus>,
+        /// The host's own resident memory, when measured (sections 7.7
+        /// and 13.9).
+        host_rss: Option<u64>,
     },
     /// The workers' answers to a request (section 11.7).
     Response {
@@ -304,6 +307,7 @@ impl HostMessage {
                     .unwrap_or_default(),
             }),
             "status" => Some(Self::Status {
+                host_rss: value["host"]["rss"].as_u64(),
                 workers: value["workers"]
                     .as_array()
                     .map(|workers| {
@@ -544,11 +548,10 @@ pub struct HostSpec {
     pub gil_stall_timeout: Duration,
     /// The memory policy for the workers (section 7.7).
     pub memory: crate::model::MemoryPolicy,
-    /// Section 13.9: the container's memory budget, from which the host
-    /// derives each worker's hard limit when the policy sets none.
-    pub memory_budget: Option<u64>,
-    /// Section 13.9: the container's cgroup directory, whose
-    /// `memory.events` tells a worker the kernel killed for memory.
+    /// Sections 7.7 and 13.9: the cgroup the workers run in, whose
+    /// `memory.events` tells a worker the kernel killed for memory, and
+    /// what is left under whose `memory.max` decides whether a worker
+    /// replaced for memory stops before its replacement starts.
     pub cgroup: Option<PathBuf>,
     /// Environment variables for the host and its workers (section
     /// 10.8), secret values already resolved.
@@ -1131,10 +1134,6 @@ impl HostProcess {
 
         if let Some(bytes) = spec.memory.hard_limit {
             command.arg("--memory-hard-limit").arg(bytes.to_string());
-        }
-
-        if let Some(bytes) = spec.memory_budget {
-            command.arg("--memory-budget").arg(bytes.to_string());
         }
 
         if let Some(dir) = &spec.cgroup {

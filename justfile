@@ -128,9 +128,15 @@ docs-open: docs
         echo "open $page in a browser"
     fi
 
-# Linux virtual machine for Linux-only tests.
+# Linux virtual machine for Linux-only tests: starts the muru instance, or creates it when there is none.
 vm-up:
-    limactl start --name muru packaging/dev/lima.yaml
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if limactl list -q | grep -qx muru; then
+        limactl start muru
+    else
+        limactl start --name muru packaging/dev/lima.yaml
+    fi
 
 # Copy the source into the VM, build there, and run the unit and integration suites.
 vm-test *args:

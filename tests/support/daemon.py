@@ -16,7 +16,7 @@ import ssl
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -281,6 +281,7 @@ def start_daemon(
     config_extra: str = "",
     arguments: list[str] | None = None,
     env: dict[str, str] | None = None,
+    wrap: Callable[[list[str]], list[str]] | None = None,
 ) -> Daemon:
     """Start a daemon in the foreground with directories under `base`.
 
@@ -290,6 +291,7 @@ def start_daemon(
     otherwise it serves plain HTTP on `port`. `arguments` are passed to
     `muructl daemon run` as given, and `env` is added to its environment. A second daemon over the
     same `run_dir` and listeners re-adopts what the first left running.
+    `wrap` runs the command line through another, which execs it.
     """
 
     muructl = support.muructl_path()
@@ -330,22 +332,23 @@ def start_daemon(
     log_path = base / "daemon.out"
 
     with log_path.open("ab") as handle:
+        command = [
+            str(muructl),
+            "daemon",
+            "run",
+            "--state-dir",
+            str(base / "state"),
+            "--run-dir",
+            str(run_dir),
+            "--log-dir",
+            str(base / "logs"),
+            "--cache-dir",
+            str(base / "cache"),
+            *where,
+            *(arguments or []),
+        ]
         process = subprocess.Popen(
-            [
-                str(muructl),
-                "daemon",
-                "run",
-                "--state-dir",
-                str(base / "state"),
-                "--run-dir",
-                str(run_dir),
-                "--log-dir",
-                str(base / "logs"),
-                "--cache-dir",
-                str(base / "cache"),
-                *where,
-                *(arguments or []),
-            ],
+            wrap(command) if wrap else command,
             stdout=handle,
             stderr=subprocess.STDOUT,
             env={**inherited(), **(env or {})},

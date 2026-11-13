@@ -382,11 +382,13 @@ def test_a_worker_short_of_room_stops_before_its_replacement_is_forked(
         return 5001
 
     instance.cgroup = str(tmp_path)
-    instance.memory.hard_limit = 300
+    state.memory = {"uss": 300}
     instance.spawn = spawn  # type: ignore[method-assign]
     instance.routed[0] = state.path
 
-    # It leaves routing and nothing is forked while it holds its memory.
+    # 200 is left, less than the worker's 300, with or without a hard
+    # limit: it leaves routing and nothing is forked while it holds its
+    # memory.
 
     instance.replace(state, "uss is over the hard limit", "worker.recycled", "memory", hard=True)
     replacement = instance.replacing[0]
@@ -411,7 +413,7 @@ def test_a_worker_with_room_or_condemned_for_something_else_is_replaced_first(
     container_memory(tmp_path, used=200, limit=1000)
     instance, state, _sent, _asked = replacing_host(tmp_path, monkeypatch)
     instance.cgroup = str(tmp_path)
-    instance.memory.hard_limit = 300
+    state.memory = {"uss": 300}
 
     instance.replace(state, "over the limit", "worker.recycled", "memory")
     assert not instance.replacing[0].stop_first and instance.replacing[0].new_pid == 5001
@@ -421,6 +423,33 @@ def test_a_worker_with_room_or_condemned_for_something_else_is_replaced_first(
     state.replaced = False
     instance.replace(state, "served its share", "worker.recycled", "max_requests")
     assert not instance.replacing[0].stop_first and instance.replacing[0].new_pid == 5001
+
+
+def test_the_memory_guard_has_a_worker_recycled_and_stopped_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container_memory(tmp_path, used=950, limit=1000)
+    instance, state, sent, _asked = replacing_host(tmp_path, monkeypatch)
+    instance.cgroup = str(tmp_path)
+    state.ready = True
+    state.memory = {"uss": 300}
+
+    # A worker replaced since it was chosen is left alone.
+
+    instance.recycle_worker(7, 0, "0", {"pid": 9999, "reason": "short"})
+    assert sent[-1]["error"] == "no worker 0 with pid 9999"
+    assert not instance.replacing
+
+    instance.recycle_worker(
+        8,
+        0,
+        "0",
+        {"pid": 4242, "reason": "the container was short of memory", "cause": "container_memory"},
+    )
+    assert sent[-1] == {"type": "response", "id": 8, "workers": [sent[-1]["workers"][0]]}
+    replacement = instance.replacing[0]
+    assert replacement.kind == "worker.recycled" and replacement.cause == "container_memory"
+    assert replacement.stop_first and replacement.new_pid is None
 
 
 def test_arguments_are_checked_against_the_interface(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -625,3 +654,16 @@ def test_a_shutdown_with_a_budget_of_its_own_leaves_the_workers_less_time(
     assert instance.time_to_stop() == 0.0
     stop_by.write_text("not a time")
     assert instance.time_to_stop() == 7.0
+
+
+def test_a_worker_raises_its_oom_score_and_keeps_a_higher_one(tmp_path: Path) -> None:
+    score = tmp_path / "oom_score_adj"
+    score.write_text("0\n")
+    host.raise_oom_score(str(score))
+    assert score.read_text() == "500"
+
+    score.write_text("800\n")
+    host.raise_oom_score(str(score))
+    assert score.read_text() == "800\n"
+
+    host.raise_oom_score(str(tmp_path / "missing"))

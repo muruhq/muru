@@ -1,19 +1,25 @@
-//! The container's limits as cgroup v2 gives them (design specification
-//! section 13.9): the CPU quota and CPUs for the worker count, and the
-//! memory limit for the workers' hard limits. They are read from the
+//! A cgroup v2's limits (design specification sections 7.7 and 13.9):
+//! the CPU quota and CPUs, reported and warned against, and the memory
+//! limit, which the memory guard watches. They are read from the
 //! process's own cgroup, which in a container with its own cgroup
-//! namespace is the root of the mount.
+//! namespace is the root of the mount, and read again whenever they are
+//! used, since `docker update` and an in-place pod resize rewrite them.
 
 use std::path::{Path, PathBuf};
+
+use muru_config::format_size_approx as size;
 
 /// Where cgroup v2 is mounted.
 const MOUNT: &str = "/sys/fs/cgroup";
 
-/// What is left of the memory limit for muructl, the edge and the page
-/// cache: this share of it, and at least `HEADROOM_MIN`.
+/// What is kept free under the memory limit for muructl, the edge and
+/// the page cache: this share of it, and at least `HEADROOM_MIN`.
 const HEADROOM_PERCENT: u64 = 10;
 
 const HEADROOM_MIN: u64 = 128 * 1024 * 1024;
+
+/// Where the containers guide explains the limits, for the warnings.
+pub const GUIDE: &str = "https://docs.muruhq.dev/en/latest/howto/containers.html#container-limits";
 
 /// The limits of one cgroup, each absent when it is not set.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,44 +68,183 @@ impl Limits {
             return None;
         };
 
+        Some(Self::read_dir(dir))
+    }
+
+    /// The limits as the files of `dir` give them now.
+    pub fn read_dir(dir: PathBuf) -> Self {
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
 
-        Some(Self {
+        Self {
             cpu_max: read("cpu.max").and_then(|text| parse_cpu_max(&text)),
             cpus: read("cpuset.cpus.effective").and_then(|text| count_cpus(&text)),
             memory_max: read("memory.max").and_then(|text| text.trim().parse().ok()),
             dir,
-        })
-    }
-
-    /// The worker count the CPU limit gives, with the file it came from:
-    /// the quota rounded up, at least 1 and at most the CPUs, or the CPUs
-    /// with no quota.
-    pub fn processes(&self) -> Option<(usize, String)> {
-        let quota = self.cpu_max.map(|(quota, period)| {
-            let count = usize::try_from(quota.div_ceil(period.max(1)))
-                .unwrap_or(usize::MAX)
-                .max(1);
-            (count, format!("cpu.max {quota} {period}"))
-        });
-        let cpus = self
-            .cpus
-            .map(|cpus| (cpus, format!("cpuset.cpus.effective, {cpus} CPUs")));
-
-        match (quota, cpus) {
-            (Some(quota), Some(cpus)) if cpus.0 < quota.0 => Some(cpus),
-            (quota, cpus) => quota.or(cpus),
         }
     }
 
-    /// The memory the workers and the host may use: the limit less the
-    /// headroom, and the headroom.
-    pub fn memory_budget(&self) -> Option<(u64, u64)> {
-        let limit = self.memory_max?;
-        let headroom = (limit / 100 * HEADROOM_PERCENT).max(HEADROOM_MIN);
-        let budget = limit.checked_sub(headroom).filter(|budget| *budget > 0)?;
-        Some((budget, headroom))
+    /// The same cgroup's limits read again.
+    pub fn again(&self) -> Self {
+        Self::read_dir(self.dir.clone())
     }
+
+    /// The CPUs the quota allows, rounded up and held to the CPUs the
+    /// cgroup may run on, with the file that holds it back; none without
+    /// a quota.
+    pub fn cpus_allowed(&self) -> Option<(usize, &'static str)> {
+        let (quota, period) = self.cpu_max?;
+        let count = usize::try_from(quota.div_ceil(period.max(1)))
+            .unwrap_or(usize::MAX)
+            .max(1);
+
+        match self.cpus {
+            Some(cpus) if cpus < count => Some((cpus, "cpuset.cpus.effective")),
+            _ => Some((count, "cpu.max")),
+        }
+    }
+
+    /// The headroom kept under `memory.max`, without a limit none.
+    pub fn headroom(&self) -> Option<u64> {
+        self.memory_max.map(headroom)
+    }
+
+    /// The limits in a line: `2 CPUs from cpu.max 200000 100000,
+    /// memory.max 1.0GB with 128MB of headroom`.
+    pub fn describe(&self) -> String {
+        let cpu = match (self.cpu_max, self.cpus) {
+            (Some((quota, period)), _) => format!(
+                "{} from cpu.max {quota} {period}",
+                cpus_text(quota as f64 / period.max(1) as f64)
+            ),
+            (None, Some(cpus)) => format!(
+                "no CPU quota, {} from cpuset.cpus.effective",
+                cpus_text(cpus as f64)
+            ),
+            (None, None) => "no CPU quota".to_owned(),
+        };
+
+        let memory = match self.memory_max {
+            Some(limit) => format!(
+                "memory.max {} with {} of headroom",
+                size(limit),
+                size(headroom(limit))
+            ),
+            None => "no memory.max".to_owned(),
+        };
+
+        format!("{cpu}, {memory}")
+    }
+
+    /// What changed since `before`, a phrase for each limit, such as
+    /// `memory.max from 1.0GB to 2.0GB`.
+    pub fn changes(&self, before: &Self) -> Vec<String> {
+        let mut changes = Vec::new();
+
+        if self.cpu_max != before.cpu_max {
+            let text = |cpu_max: Option<(u64, u64)>| match cpu_max {
+                Some((quota, period)) => format!("{quota} {period}"),
+                None => "max".to_owned(),
+            };
+            changes.push(format!(
+                "cpu.max from {} to {}",
+                text(before.cpu_max),
+                text(self.cpu_max)
+            ));
+        }
+
+        if self.cpus != before.cpus {
+            let text = |cpus: Option<usize>| cpus.map_or_else(|| "none".to_owned(), cpus_text_int);
+            changes.push(format!(
+                "cpuset.cpus.effective from {} to {}",
+                text(before.cpus),
+                text(self.cpus)
+            ));
+        }
+
+        if self.memory_max != before.memory_max {
+            let text = |limit: Option<u64>| limit.map_or_else(|| "max".to_owned(), size);
+            changes.push(format!(
+                "memory.max from {} to {}",
+                text(before.memory_max),
+                text(self.memory_max)
+            ));
+        }
+
+        changes
+    }
+
+    /// What the cgroup uses of its memory limit now, without a limit
+    /// none.
+    pub fn memory(&self) -> Option<Memory> {
+        let limit = self.memory_max?;
+        let used = memory_used(&self.dir)?;
+        Some(Memory { limit, used })
+    }
+}
+
+/// The headroom kept under a memory limit: 10 % of it, at least 128 MiB.
+pub fn headroom(limit: u64) -> u64 {
+    (limit / 100 * HEADROOM_PERCENT).max(HEADROOM_MIN)
+}
+
+/// A cgroup's memory limit and what it uses of it, inactive file pages
+/// counted as free, since the kernel reclaims those before it kills
+/// anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Memory {
+    /// `memory.max`.
+    pub limit: u64,
+    /// `memory.current` less `inactive_file` of `memory.stat`.
+    pub used: u64,
+}
+
+impl Memory {
+    /// What is left under the limit.
+    pub fn left(&self) -> u64 {
+        self.limit.saturating_sub(self.used)
+    }
+
+    /// The headroom kept under the limit.
+    pub fn headroom(&self) -> u64 {
+        headroom(self.limit)
+    }
+}
+
+/// What the cgroup at `dir` uses of memory, inactive file pages left
+/// out.
+pub fn memory_used(dir: &Path) -> Option<u64> {
+    let current: u64 = std::fs::read_to_string(dir.join("memory.current"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let inactive = std::fs::read_to_string(dir.join("memory.stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.lines()
+                .find_map(|line| line.strip_prefix("inactive_file "))
+                .and_then(|count| count.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+
+    Some(current.saturating_sub(inactive))
+}
+
+/// A count of CPUs as a person says it: `2 CPUs`, `1.5 CPUs`, `1 CPU`.
+fn cpus_text(cpus: f64) -> String {
+    if (cpus - 1.0).abs() < f64::EPSILON {
+        return "1 CPU".to_owned();
+    }
+
+    if cpus.fract().abs() < 0.005 {
+        format!("{cpus:.0} CPUs")
+    } else {
+        format!("{} CPUs", format!("{cpus:.2}").trim_end_matches('0'))
+    }
+}
+
+fn cpus_text_int(cpus: usize) -> String {
+    cpus_text(cpus as f64)
 }
 
 /// `cpu.max`'s quota and period, or none for `max`, no quota.
@@ -161,15 +306,16 @@ mod tests {
     }
 
     #[test]
-    fn the_quota_is_rounded_up_and_held_to_the_cpus() {
+    fn the_cpus_allowed_are_the_quota_rounded_up_and_held_to_the_cpus() {
         let dir = cgroup(&[
             ("cpu.max", "150000 100000\n"),
             ("cpuset.cpus.effective", "0-63\n"),
         ]);
         let limits = Limits::read_from(dir.path(), "0::/\n").expect("limits");
+        assert_eq!(limits.cpus_allowed(), Some((2, "cpu.max")));
         assert_eq!(
-            limits.processes(),
-            Some((2, "cpu.max 150000 100000".to_owned()))
+            limits.describe(),
+            "1.5 CPUs from cpu.max 150000 100000, no memory.max"
         );
 
         let dir = cgroup(&[
@@ -177,35 +323,77 @@ mod tests {
             ("cpuset.cpus.effective", "0-1,4\n"),
         ]);
         let limits = Limits::read_from(dir.path(), "0::/\n").expect("limits");
-        assert_eq!(limits.processes().map(|(count, _)| count), Some(3));
+        assert_eq!(limits.cpus_allowed(), Some((3, "cpuset.cpus.effective")));
 
         let dir = cgroup(&[
             ("cpu.max", "max 100000\n"),
             ("cpuset.cpus.effective", "2-5\n"),
         ]);
         let limits = Limits::read_from(dir.path(), "0::/\n").expect("limits");
-        assert_eq!(limits.processes().map(|(count, _)| count), Some(4));
+        assert_eq!(limits.cpus_allowed(), None);
 
         let dir = cgroup(&[("cpu.max", "1000 100000\n")]);
         let limits = Limits::read_from(dir.path(), "0::/\n").expect("limits");
-        assert_eq!(limits.processes().map(|(count, _)| count), Some(1));
+        assert_eq!(limits.cpus_allowed(), Some((1, "cpu.max")));
     }
 
     #[test]
-    fn the_memory_budget_leaves_headroom() {
-        let dir = cgroup(&[("memory.max", "4294967296\n")]);
-        let limits = Limits::read_from(dir.path(), "0::/\n").expect("limits");
-        let (budget, headroom) = limits.memory_budget().expect("budget");
-        assert_eq!(headroom, 4_294_967_296 / 100 * 10);
-        assert_eq!(budget + headroom, 4_294_967_296);
+    fn the_headroom_is_a_tenth_of_the_limit_and_at_least_128_mib() {
+        assert_eq!(headroom(4 << 30), (4u64 << 30) / 100 * 10);
+        assert_eq!(headroom(1 << 30), 128 << 20);
 
-        let dir = cgroup(&[("memory.max", "268435456\n")]);
+        let dir = cgroup(&[
+            ("cpu.max", "200000 100000\n"),
+            ("memory.max", "1073741824\n"),
+        ]);
         let limits = Limits::read_from(dir.path(), "0::/\n").expect("limits");
-        assert_eq!(limits.memory_budget(), Some((128 << 20, 128 << 20)));
+        assert_eq!(limits.headroom(), Some(128 << 20));
+        assert_eq!(
+            limits.describe(),
+            "2 CPUs from cpu.max 200000 100000, memory.max 1.0GB with 128MB of headroom"
+        );
 
         let dir = cgroup(&[("memory.max", "max\n")]);
         let limits = Limits::read_from(dir.path(), "0::/\n").expect("limits");
-        assert_eq!(limits.memory_budget(), None);
+        assert_eq!(limits.headroom(), None);
+        assert_eq!(limits.memory(), None);
+    }
+
+    #[test]
+    fn what_is_used_leaves_out_inactive_file_pages() {
+        let dir = cgroup(&[
+            ("memory.max", "1073741824\n"),
+            ("memory.current", "943718400\n"),
+            (
+                "memory.stat",
+                "anon 600000000\nfile 300000000\ninactive_file 104857600\n",
+            ),
+        ]);
+        let limits = Limits::read_from(dir.path(), "0::/\n").expect("limits");
+        let memory = limits.memory().expect("memory");
+        assert_eq!(memory.used, 943_718_400 - 104_857_600);
+        assert_eq!(memory.left(), (1 << 30) - (943_718_400 - 104_857_600));
+        assert_eq!(memory.headroom(), 128 << 20);
+    }
+
+    #[test]
+    fn a_change_is_said_limit_by_limit() {
+        let dir = cgroup(&[
+            ("cpu.max", "200000 100000\n"),
+            ("memory.max", "1073741824\n"),
+        ]);
+        let before = Limits::read_from(dir.path(), "0::/\n").expect("limits");
+        assert!(before.again().changes(&before).is_empty());
+
+        std::fs::write(dir.path().join("memory.max"), "2147483648\n").expect("write");
+        std::fs::write(dir.path().join("cpu.max"), "max 100000\n").expect("write");
+        assert_eq!(
+            before.again().changes(&before),
+            [
+                "cpu.max from 200000 100000 to max",
+                "memory.max from 1.0GB to 2.0GB"
+            ]
+        );
     }
 
     #[test]

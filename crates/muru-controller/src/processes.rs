@@ -40,6 +40,8 @@ pub struct OsProcess {
     pub cpu_ns: Option<u64>,
     /// Its resident set size in bytes, likewise.
     pub rss: Option<u64>,
+    /// Its `oom_score_adj` on Linux (section 7.7, issue 624).
+    pub oom_score_adj: Option<i32>,
     /// Its command line, or its name where the line cannot be read.
     pub name: String,
 }
@@ -69,6 +71,9 @@ pub fn read(pid: u32) -> Option<OsProcess> {
     let uid = std::fs::metadata(format!("/proc/{pid}"))
         .ok()
         .map(|meta| meta.uid());
+    let oom_score_adj = std::fs::read_to_string(format!("/proc/{pid}/oom_score_adj"))
+        .ok()
+        .and_then(|text| text.trim().parse().ok());
 
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
     let line = String::from_utf8_lossy(&cmdline).replace('\0', " ");
@@ -81,6 +86,7 @@ pub fn read(pid: u32) -> Option<OsProcess> {
         started_unix_ms,
         cpu_ns,
         rss,
+        oom_score_adj,
         name: if line.is_empty() {
             comm
         } else {
@@ -170,6 +176,7 @@ pub fn read(pid: u32) -> Option<OsProcess> {
             (ticks * u128::from(numer) / u128::from(denom.max(1))) as u64
         }),
         rss: task.map(|task| task.pti_resident_size),
+        oom_score_adj: None,
         name: if long.is_empty() {
             name(&bsd.pbi_comm)
         } else {
@@ -506,6 +513,9 @@ pub struct Header {
     pub mode: String,
     /// When the instance started, Unix milliseconds.
     pub started_unix_ms: u64,
+    /// The cgroup's limits and the memory guard, when there is a cgroup
+    /// v2 (sections 7.7 and 13.9).
+    pub limits: Option<pb::CgroupLimits>,
 }
 
 /// The answer to ListProcesses: the known processes as a tree, narrowed
@@ -581,6 +591,7 @@ pub async fn snapshot(
         sampled_unix_ms: crate::model::now_unix_ms(),
         root: tree(&known, &os, &cpu, &others, &figures),
         figures: Some(figures.instance),
+        limits: header.limits,
     }
 }
 
@@ -747,7 +758,71 @@ fn tree(
                 .collect();
         }
 
+        // Issue 613: a host's or group's figures may count, for a second,
+        // a worker that has exited and is no longer listed beneath it.
+
+        if process.role == "host" {
+            let listed: HashSet<&str> = known
+                .iter()
+                .filter(|worker| {
+                    worker.role == "worker"
+                        && worker.app == process.app
+                        && worker.release == process.release
+                })
+                .filter_map(|worker| worker.socket.as_deref())
+                .collect();
+            let departed = |group: &str| {
+                figures
+                    .counted
+                    .get(&(
+                        process.app.clone(),
+                        process.release.clone(),
+                        group.to_owned(),
+                    ))
+                    .map_or(0, |counted| {
+                        counted
+                            .iter()
+                            .filter(|socket| {
+                                socket
+                                    .as_deref()
+                                    .is_none_or(|socket| !listed.contains(socket))
+                            })
+                            .count() as u32
+                    })
+            };
+
+            if let Some(own) = &mut node.figures {
+                own.departed = departed(process.groups.first().map_or("default", String::as_str));
+            }
+
+            for group in &mut node.groups {
+                if let Some(own) = &mut group.figures {
+                    own.departed = departed(&group.group);
+                }
+            }
+        }
+
         nodes.insert(process.pid, (process.parent, node));
+    }
+
+    // Issue 611: after a daemon restart a host and its relay are adopted
+    // again together, with the same OS parent, so the host's mark says it
+    // for both; a relay is marked only when its own differs. Its
+    // os_parent_pid still says it.
+
+    let marked_hosts: HashMap<u32, u32> = nodes
+        .iter()
+        .filter(|(_, (_, node))| node.role == "host" && node.readopted)
+        .map(|(pid, (_, node))| (*pid, node.os_parent_pid))
+        .collect();
+
+    for (parent, node) in nodes.values_mut() {
+        if node.role == "relay"
+            && node.readopted
+            && marked_hosts.get(parent) == Some(&node.os_parent_pid)
+        {
+            node.readopted = false;
+        }
     }
 
     // Section 13.10: with --all, what descends from a known process and is
@@ -863,6 +938,7 @@ fn node(pid: u32, found: Option<&OsProcess>, cpu: &HashMap<u32, f64>) -> pb::Pro
         started_unix_ms: found.and_then(|found| found.started_unix_ms),
         cpu_percent: cpu.get(&pid).map(|percent| (percent * 10.0).round() / 10.0),
         rss_bytes: found.and_then(|found| found.rss),
+        oom_score_adj: found.and_then(|found| found.oom_score_adj),
         ..pb::Process::default()
     }
 }
@@ -897,6 +973,9 @@ pub struct Figures {
     pub groups: HashMap<(String, String, String), pb::Figures>,
     /// Each worker's GIL wait and loop lag p95, by pid.
     pub signals: HashMap<u32, (Option<f64>, Option<f64>)>,
+    /// The workers whose requests of the last second each group's
+    /// figures count, by socket, none for one whose socket is not known.
+    pub counted: HashMap<(String, String, String), Vec<Option<String>>>,
 }
 
 /// One reading of the counters the figures are the differences of.
@@ -1137,6 +1216,14 @@ fn rates(
             .or_default();
         group.0 += (requests - requests_before).max(0.0);
 
+        if requests - requests_before > 0.0 {
+            figures
+                .counted
+                .entry((key.0.clone(), key.1.clone(), key.2.clone()))
+                .or_default()
+                .push(sockets.get(key).cloned());
+        }
+
         for (bits, (le, count)) in &deltas {
             group.1.entry(*bits).or_insert((*le, 0.0)).1 += count;
         }
@@ -1308,6 +1395,137 @@ mod tests {
 
     fn sample(name: &str, labels: &[(&str, &str)], value: f64) -> Sample {
         Sample::new(name, labels, value)
+    }
+
+    #[test]
+    fn a_host_whose_figures_count_a_worker_no_longer_listed_says_so() {
+        let known = [
+            Known {
+                pid: 10,
+                role: "daemon",
+                ..Known::default()
+            },
+            Known {
+                pid: 20,
+                parent: 10,
+                role: "host",
+                app: "shop".to_owned(),
+                release: "r1".to_owned(),
+                ..Known::default()
+            },
+            Known {
+                pid: 21,
+                parent: 20,
+                role: "worker",
+                app: "shop".to_owned(),
+                release: "r1".to_owned(),
+                index: Some(0),
+                socket: Some("/run/w0.sock".to_owned()),
+                ..Known::default()
+            },
+        ];
+        let found: HashMap<u32, OsProcess> = [(10, 1), (20, 10), (21, 20)]
+            .into_iter()
+            .map(|(pid, parent)| {
+                (
+                    pid,
+                    OsProcess {
+                        pid,
+                        parent,
+                        ..OsProcess::default()
+                    },
+                )
+            })
+            .collect();
+        let key = ("shop".to_owned(), "r1".to_owned(), "default".to_owned());
+        let mut figures = Figures::default();
+        figures.groups.insert(key.clone(), pb::Figures::default());
+
+        // Worker 1 served its last requests and exited within the second.
+
+        figures.counted.insert(
+            key,
+            vec![
+                Some("/run/w0.sock".to_owned()),
+                Some("/run/w1.sock".to_owned()),
+            ],
+        );
+        let none = HashSet::new();
+        let nothing = Others {
+            table: &[],
+            left_out: &none,
+            narrow: false,
+        };
+        let root = tree(&known, &found, &HashMap::new(), &nothing, &figures).expect("a root");
+        let host = &root.children[0];
+        assert_eq!(
+            host.figures.as_ref().map(|figures| figures.departed),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_relay_adopted_again_with_its_host_is_not_marked_twice() {
+        let process = |pid: u32, parent: u32, role: &'static str| Known {
+            pid,
+            parent,
+            spawned_by: if role == "relay" { 10 } else { 0 },
+            role,
+            app: "shop".to_owned(),
+            release: "r1".to_owned(),
+            ..Known::default()
+        };
+        let known = [
+            process(10, 0, "daemon"),
+            process(20, 10, "host"),
+            process(25, 20, "relay"),
+            process(40, 10, "host"),
+            process(45, 40, "relay"),
+        ];
+        let os = |pid: u32, parent: u32| OsProcess {
+            pid,
+            parent,
+            ..OsProcess::default()
+        };
+
+        // After a restart host 20 and its relay both have the init as
+        // their OS parent; host 40 was started by this daemon, but its
+        // relay was adopted again on its own.
+
+        let found: HashMap<u32, OsProcess> =
+            [os(10, 1), os(20, 1), os(25, 1), os(40, 10), os(45, 1)]
+                .into_iter()
+                .map(|found| (found.pid, found))
+                .collect();
+        let none = HashSet::new();
+        let nothing = Others {
+            table: &[],
+            left_out: &none,
+            narrow: false,
+        };
+        let root = tree(
+            &known,
+            &found,
+            &HashMap::new(),
+            &nothing,
+            &Figures::default(),
+        )
+        .expect("a root");
+        let find = |pid: u32| {
+            root.children
+                .iter()
+                .find(|host| host.pid == pid)
+                .expect("the host")
+        };
+
+        let host = find(20);
+        assert!(host.readopted);
+        assert!(!host.children[0].readopted);
+        assert_eq!(host.children[0].os_parent_pid, 1);
+
+        let host = find(40);
+        assert!(!host.readopted);
+        assert!(host.children[0].readopted);
     }
 
     #[test]

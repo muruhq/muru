@@ -253,6 +253,31 @@ impl Admin for Service {
         .ok_or_else(|| Status::unavailable("the daemon is stopping"))
     }
 
+    async fn probe(
+        &self,
+        request: Request<pb::ProbeRequest>,
+    ) -> Result<Response<pb::ProbeAnswer>, Status> {
+        let request = request.into_inner();
+
+        if !matches!(request.probe.as_str(), "live" | "ready" | "startup") {
+            return Err(Status::invalid_argument(format!(
+                "{:?} is not a probe: live, ready or startup",
+                request.probe
+            )));
+        }
+
+        let probes = crate::probes::Probes {
+            store: Arc::clone(&self.handle.store),
+            info: Arc::clone(&self.handle.info),
+        };
+        let answer = probes.answer(&request.probe, &request.app, request.min_ready);
+
+        Ok(Response::new(pb::ProbeAnswer {
+            ok: answer.is_ok(),
+            reason: answer.err().unwrap_or_default(),
+        }))
+    }
+
     async fn get_status(
         &self,
         _: Request<pb::GetStatusRequest>,
@@ -264,7 +289,7 @@ impl Admin for Service {
             let view = &info.defined.read().expect("defined names poisoned").budget;
 
             if view.budget.is_set() {
-                view.budget.describe(&view.used)
+                format!("{}{}", view.budget.describe(&view.used), view.sources)
             } else {
                 String::new()
             }
@@ -312,6 +337,7 @@ impl Admin for Service {
             config: info.locations.config.path.display().to_string(),
             log_dir: info.locations.logs.path.display().to_string(),
             cache_dir: info.locations.cache.path.display().to_string(),
+            limits: info.cgroup_limits.lock().expect("limits poisoned").clone(),
         }))
     }
 
@@ -3360,7 +3386,8 @@ impl Service {
 }
 
 /// The scaling state of a release's groups as the API shows it.
-fn scale_message(
+/// A release's groups' scaling as the admin API answers it.
+pub fn scale_message(
     app: &str,
     release: &str,
     groups: Vec<(String, crate::scaling::ScaleStatus)>,

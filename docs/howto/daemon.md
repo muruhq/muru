@@ -666,7 +666,7 @@ PID    ROLE           WHAT                                   USER      UP     CP
 4330   ├─ host        api@r7 serving                         api     1d4h    0.0%    88.0MB     203    6/64       0    12 ms     48 ms
 4331   │  ├─ relay    api@r7 output to apps/api/r7.log       api     1d4h    0.0%     7.0MB
 4340   │  └─ worker   group default, worker 0                api     1d4h    4.2%   131.0MB     203    6/64            12 ms     48 ms
-4290   ├─ host        shop@r41 retained until 07:40          shop   5h13m    0.0%    91.0MB
+4290   ├─ host        shop@r41 retained until 07:40 UTC      shop   5h13m    0.0%    91.0MB
 4291   │  ├─ relay    shop@r41 output to apps/shop/r41.log   shop   5h13m    0.0%     7.0MB
        │  ├─ group    crawlers
 4293   │  ├─ worker   group crawlers, worker 0               shop   5h13m    0.0%   118.0MB
@@ -705,7 +705,7 @@ its name, so an idle instance shows which release serves:
 | `canary 10%` | is a rollout's candidate, taking that share of the traffic |
 | `held` | is ready and takes no traffic, as a deploy with `--hold` leaves it |
 | `draining` | is off the route, finishing the requests it has |
-| `retained until 07:40` | is kept warm for a rollback until then, in local time |
+| `retained until 07:40 UTC` | is kept warm for a rollback until then, given in UTC as `release list` gives it |
 
 A release still starting shows its state, `starting` or `warming`.
 `--json` gives the same as each host's `state`.
@@ -721,6 +721,11 @@ several groups has a row for each, and the host's row has the figures
 of a release with one, its GIL/LAG the workers' together. `--json`
 gives both figures, `gil_wait_p95_ms` and `loop_lag_p95_ms`, and the
 `interface` that chooses between them.
+
+A worker that exits within a second after it served, as one scaled in
+does, still counts in its host's or group's figures for that second,
+though it is no longer listed. Such a row's REQ/S is marked `*`, and a
+line under the table says why; `--json` gives the count as `departed`.
 
 - `--app APP[@RELEASE]` shows the daemon and one application's
   processes, or one release's.
@@ -870,38 +875,140 @@ its socket.
 
 ## In a container
 
-`muructl daemon run` can be a container's main process. When muructl
-finds itself PID 1 it starts as an init of its own, as `tini` would: PID
-1 forwards SIGTERM, SIGINT, SIGHUP, SIGUSR1, SIGUSR2 and SIGQUIT to the
-daemon, which runs as its child, collects every process that exits, so
-nothing in the container stays a zombie, and exits with the daemon's
-status when the daemon exits. An image that uses `tini` or `docker run
---init` sets `MURU_NO_INIT=1`, and the daemon runs as PID 1 itself.
+The daemon can run as the main process of a container that is kept and
+updated in place, such as a container on a virtual machine used to keep
+it apart from other services. Releases are deployed into it as on a
+machine, with rollouts, canaries and rollbacks, and the state store is
+kept on a volume.
 
-Under the init, and for a daemon that is PID 1 itself, SIGTERM means
-shutdown rather than detach: when PID 1 exits the kernel kills every
-other process in the container, so detaching would kill the edge and
-every worker mid-request. `docker stop` therefore drains and stops
-everything inside the budget above, whose default of eight seconds is
-under the ten `docker stop` allows, and the container exits 0. A
-`[shutdown]` table with `on_sigterm = 'detach'` turns that off, for a
-container that keeps its hosts across a daemon restart of its own.
+For a container that is replaced rather than changed, one application
+configured from its image with its logs on standard output, use
+[`muructl serve`](containers.md) instead.
+
+### Volumes
+
+Two directories outlive the container:
+
+- the state store, so that the deployed releases, their history and the
+  events survive a new container;
+- the log directory, so that the logs can be read after the container
+  has gone and collected while it runs.
+
+The run directory and `/tmp` hold only what the running processes need,
+and can be memory-backed.
+
+### Logs
+
+Each stream goes to its own file in the log directory, as on a machine:
+`daemon.log`, `edge.log`, `access.log`, and `apps/APP/RELEASE.log` for
+each release's output. Every line of every file starts with its full UTC
+time, and the access log is JSON lines, one record a request. A log
+agent on the machine that runs the container, such as Fluent Bit,
+Vector or Promtail, tails the log directory's volume. The container's
+standard output holds the daemon's own lines and nothing else.
+
+`muructl logs` reads the same files through `docker exec`:
+
+```
+docker exec shop-node muructl logs shop --follow
+docker exec shop-node muructl logs --access --follow
+```
+
+### Stopping
+
+When muructl finds itself PID 1 it starts as an init of its own, as
+`tini` would: PID 1 forwards SIGTERM, SIGINT, SIGHUP, SIGUSR1, SIGUSR2
+and SIGQUIT to the daemon, which runs as its child, collects every
+process that exits, so nothing in the container stays a zombie, and
+exits with the daemon's status when the daemon exits. An image that uses
+`tini` or `docker run --init` sets `MURU_NO_INIT=1`, and the daemon runs
+as PID 1 itself.
+
+As a container's main process the daemon takes SIGTERM as shutdown
+rather than detach, since when PID 1 exits the kernel kills every other
+process in the container. `docker stop` therefore drains and stops
+everything inside the [shutdown budget](#stopping-and-restarting), 8
+seconds by default, under the 10 that `docker stop` allows, and the
+container exits 0. An application whose requests or shutdown take longer
+raises both, the budget in the daemon file and the container's own grace
+with `docker run --stop-timeout` or Compose's `stop_grace_period`:
+
+```toml
+[shutdown]
+budget = "25s"
+```
+
+A `[shutdown]` table with `on_sigterm = 'detach'` turns the shutdown
+off, for a container that restarts its own daemon and keeps its hosts
+across the restart.
+
+### Probes
+
+`muructl probe` asks the daemon the questions a container platform asks,
+over its admin socket, so a health check needs no port and no `curl`:
+
+```dockerfile
+HEALTHCHECK --interval=5s CMD ["muructl", "probe", "ready", "--run-dir", "/run/muru"]
+```
+
+It exits 0 when the answer is yes and 1 when it is no, saying why on
+standard error.
+
+| Probe | Yes when |
+| --- | --- |
+| `live` | the daemon answers and its edge is running; a busy worker never makes it fail |
+| `ready` | the daemon has started and is not stopping, and each application's serving release has a worker ready in each of its worker groups that is not optional |
+| `startup` | the daemon has finished starting, having taken over the processes it found or started the releases afresh, and each serving release has a worker ready again |
+
+An application with no serving release, never deployed or with its
+deploys failed, holds neither `ready` nor `startup` back. `--app APP`
+asks `ready` and `startup` of one application, and `--min-ready N` asks
+`ready` for that many workers in each group rather than one.
+
+With a [metrics address](metrics.md), the daemon answers the same three
+on it as `/livez`, `/readyz` and `/startupz`, 200 for yes and 503 for no
+with the reason, for something outside the container that can only make
+HTTP requests.
+
+### Listening and the admin socket
 
 The daemon listens on `127.0.0.1:8080` unless told otherwise, so in a
-container it takes `--listen 0.0.0.0:8080` or a `[[listener]]` entry,
-and its applications and logs are in the locations above, so a volume
-for the state store keeps the deployed releases across a restart of the
-container. To run one application in a container, with its configuration
-from the image and its logs on standard output, use `muructl serve`
-instead; [in a container](containers.md) covers it.
+container it takes `--listen 0.0.0.0:8080` or a `[[listener]]` entry.
+The admin socket is in the run directory, inside the container, so the
+commands that manage it run through `docker exec`, and only someone who
+may exec into the container can use them:
+
+```
+docker exec shop-node muructl deploy shop /srv/shop
+docker exec shop-node muructl status --processes
+docker exec shop-node muructl dashboard login
+```
+
+### Memory limits
+
+When the container has a memory limit, the daemon reads it from its own
+cgroup's `memory.max` at every memory check, and the memory guard of
+[container limits](containers.md#the-memory-guard) watches it across
+every release: with less than the headroom left (10% of the limit, at
+least 128MB), the largest worker of any release is replaced, one at a
+time, or its group scaled in by it when the group has a scaling policy
+above its `min_workers`. `muructl status` shows the limits, what is used
+and left, and what the guard is doing.
+
+The [node's budget](scaling.md#the-nodes-budget) takes its `memory` and
+`cpu` from the same cgroup when the daemon file leaves them out, so a
+deploy, a canary beside the serving release and a scale-out are admitted
+against the container's limits before anything starts.
+
+### Building nothing at run time
 
 The daemon does not know it is in a container, and does not need to: it
-resolves interpreters and builds environments as it does on a node, which
-is right in a development container, where the source is mounted and the
-network is there. An image built ahead of time, with its interpreters and
-environments in it, says so in the daemon file, and the daemon then
-installs nothing at run time and fails at once, naming what the image
-lacks:
+resolves interpreters and builds environments as it does on a machine,
+which is right in a development container, where the source is mounted
+and the network is there. An image built ahead of time, with its
+interpreters and environments in it, says so in the daemon file, and the
+daemon then installs nothing at run time and fails at once, naming what
+the image lacks:
 
 ```toml
 [tools]
@@ -912,6 +1019,45 @@ python_downloads = "never"      # a Python the image lacks fails the release
 with `--build never` on each deploy, or `when = "never"` in the project's
 `[tool.muru.build]` table or a declared release's `build` table, so that
 the environment in the image is used as it is.
+
+### A Compose service
+
+```yaml
+services:
+  shop-node:
+    image: registry.example.com/muru-node:1.0.0
+    command:
+      - muructl
+      - daemon
+      - run
+      - --listen
+      - 0.0.0.0:8080
+      - --state-dir
+      - /var/lib/muru
+      - --run-dir
+      - /run/muru
+      - --log-dir
+      - /var/log/muru
+    ports: ["8080:8080"]
+    volumes:
+      - state:/var/lib/muru
+      - logs:/var/log/muru
+    tmpfs: [/run/muru, /tmp]
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "muructl", "probe", "ready", "--run-dir", "/run/muru"]
+      interval: 5s
+    stop_grace_period: 30s
+volumes:
+  state:
+  logs:
+```
+
+The state store and the logs are on named volumes, the run directory and
+`/tmp` in memory. `stop_grace_period` is above the shutdown budget the
+daemon file sets, as above. `docker compose ps` shows the service healthy
+once the daemon has started and every serving release has its workers
+ready.
 
 ## Upgrading
 

@@ -9,6 +9,38 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a26 (2026-11-13)
+
+### Added
+
+- The node budget's `memory` and `cpu` default to the daemon's own cgroup's limits, `memory.max` less the headroom and the quota of `cpu.max`, read at each decision, when `[daemon.budget]` leaves them out, as in a container or under a systemd unit with `MemoryMax=` or `CPUQuota=`; `muructl daemon status` says which came from the cgroup. A worker of a group with a `hard_limit` counts at it in the budget. ([#384](https://github.com/muruhq/muru/issues/384))
+- Under `muructl serve` in a container with a memory limit, a memory guard replaces the largest worker, one at a time, when less than the headroom (10% of `memory.max`, at least 128MB) is left, reported as `worker.recycled` with the reason `container_memory`, and holds off with a warning when replacing workers would not help. The limits are read at every memory check, so `docker update` or an in-place pod resize applies without a restart; the start lines give the limits read and warn when the workers are more than the CPUs, when a preload would not fit once each worker holds a copy of it, when hard limits add up to more than the limit, and when request bodies are spooled to memory, whose quota is then the headroom; and `muructl status`, `/status` and their JSON show the limits, what is used and left, and what the guard is doing. ([#621](https://github.com/muruhq/muru/issues/621))
+- `muructl probe live`, `ready` and `startup` ask the daemon as well as `muructl serve`, over its admin socket, with `--app` and `--min-ready`, exiting 1 with the reason on standard error; the daemon answers the same as `/livez`, `/readyz` and `/startupz` on its metrics address. An application with no serving release does not hold readiness back. The daemon reads its own cgroup's limits and, with a `memory.max`, its memory guard replaces the largest worker of any release, or scales its group in when its policy allows, and `muructl status` shows the limits. The daemon guide's "In a container" section covers a container that is kept: volumes, logs, stopping, probes, the admin socket, memory limits and a Compose service. ([#622](https://github.com/muruhq/muru/issues/622))
+- `muructl serve` applies a project's scaling policy, `[tool.muru.scaling]` or a group's `scaling` table, as the daemon does, with a scale-out admitted only when one more worker fits under the container's `memory.max` less the headroom, a worker counting at its group's `hard_limit` when one is set. Short of memory, the memory guard scales a group with a policy in by its largest worker rather than replacing it, never below `min_workers`. `muructl scale status` works inside the container, with the application optional; `scale pin` and `unpin` say they are not offered there, and a `--min-ready` above a group's `min_workers` is refused at start. ([#623](https://github.com/muruhq/muru/issues/623))
+- On Linux each worker raises its own `oom_score_adj` to 500 as it starts, so the kernel's out-of-memory killer picks a worker, which its host replaces, before a host, the edge, the daemon or another service; `status --processes --json` gives each process's `oom_score_adj`. The systemd unit sets `OOMPolicy=continue`, since systemd's default stops the whole service when the kernel kills one worker, and carries `MemoryMax=` and `CPUQuota=` as commented-out lines; the systemd guide's new limits section says what a limit on the unit does. ([#624](https://github.com/muruhq/muru/issues/624))
+
+### Changed
+
+- After a daemon restart, `muructl status --processes`, its JSON and the dashboard mark a re-adopted host and leave its log relay unmarked when both have the same OS parent, rather than saying it twice and widening the WHAT column; the relay's `os_parent_pid` still gives it. ([#611](https://github.com/muruhq/muru/issues/611))
+- In the second after a scale-in, `muructl status --processes` and the dashboard mark a host's or group's REQ/S with `*` when its figures count a worker that has exited and is no longer listed, with a line under the table saying so, and `--json` gives the count as `departed`. ([#613](https://github.com/muruhq/muru/issues/613))
+- `muructl status --processes`, its `--json` and the dashboard's Processes section give the time a retained release is kept until in UTC with the zone, `retained until 07:40 UTC`, as `muructl release list` does, rather than in the daemon's local time without one. ([#618](https://github.com/muruhq/muru/issues/618))
+- A worker replaced for memory stops before its replacement starts when less is left under the cgroup's memory limit than the worker's own size, whether or not a hard limit is set. The Kubernetes guide's Deployment sets `resizePolicy: NotRequired` for CPU and memory and its worker count with `MURU_SERVE_PROCESSES`. ([#621](https://github.com/muruhq/muru/issues/621))
+
+### Removed
+
+- `muructl serve` no longer sizes anything from the container's limits: `--processes auto` is gone and `--processes` defaults to 1, as under `muructl run`, and a worker has a hard memory limit only when one is set, rather than a share of `memory.max` worked out at start. ([#621](https://github.com/muruhq/muru/issues/621))
+
+### Fixed
+
+- `just vm-up` starts the `muru` Lima instance when it exists and is stopped, and creates it from `packaging/dev/lima.yaml` only when there is none. ([#615](https://github.com/muruhq/muru/issues/615))
+- `muructl events` gives each event's time as the local clock, as other terminal clocks are, rather than a UTC clock with no zone, and the dashboard shows a release's creation, a rollout's last change, maintenance and a WebSocket's opening in the viewer's local time, with the full UTC time on hover, rather than a UTC clock. ([#625](https://github.com/muruhq/muru/issues/625))
+
+### Documentation
+
+- The Kubernetes and containers guides say that `muructl debug stacks` and `muructl debug profile` work in a locked-down pod, with every capability dropped, no privilege escalation and the `RuntimeDefault` seccomp profile, with no `SYS_PTRACE` added. ([#111](https://github.com/muruhq/muru/issues/111))
+- The containers guide says that `/readyz` and `--min-ready` count the workers ready in each worker group that is not optional, rather than in every mount, and has a section on named worker groups and mounts under `muructl serve`. ([#620](https://github.com/muruhq/muru/issues/620))
+
+
 ## 0.1.0a25 (2026-11-12)
 
 ### Changed

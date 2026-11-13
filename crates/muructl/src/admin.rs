@@ -195,6 +195,11 @@ impl SocketArgs {
         arguments
     }
 
+    /// The runtime directory the command was given, if any.
+    pub fn run_dir(&self) -> Option<&Path> {
+        self.locations.run_dir.as_deref()
+    }
+
     /// The daemon's log, for a command of the daemon's own that names
     /// it: where the instance's options and the daemon's files put it.
     fn daemon_log(&self, files: &DaemonFileArgs) -> PathBuf {
@@ -3067,6 +3072,11 @@ pub async fn show_status(path: &Path, json: bool) -> anyhow::Result<()> {
 
         println!("run dir  {}", status.run_dir);
         println!("websockets {} open", status.websockets);
+
+        if let Some(limits) = &status.limits {
+            print_limits(limits);
+        }
+
         return Ok(());
     }
 
@@ -3100,7 +3110,76 @@ pub async fn show_status(path: &Path, json: bool) -> anyhow::Result<()> {
         println!("budget   {}", status.budget);
     }
 
+    if let Some(limits) = &status.limits {
+        print_limits(limits);
+    }
+
     Ok(())
+}
+
+/// A cgroup's limits and the memory guard, as `muructl status` prints
+/// them (sections 7.7 and 13.9).
+fn print_limits(limits: &pb::CgroupLimits) {
+    print!("{}", limits_lines(limits));
+}
+
+fn limits_lines(limits: &pb::CgroupLimits) -> String {
+    use muru_config::format_size_approx as size;
+
+    let mut text = String::new();
+
+    let cpu = if limits.cpu_quota > 0.0 {
+        let quota = format!("{:.2}", limits.cpu_quota);
+        let quota = quota.trim_end_matches('0').trim_end_matches('.');
+        let noun = if quota == "1" { "CPU" } else { "CPUs" };
+        format!("{quota} {noun} from cpu.max")
+    } else if limits.cpus > 0 {
+        let noun = if limits.cpus == 1 { "CPU" } else { "CPUs" };
+        format!(
+            "no CPU quota, {} {noun} from cpuset.cpus.effective",
+            limits.cpus
+        )
+    } else {
+        "no CPU quota".to_owned()
+    };
+    text.push_str(&format!("cpu      {cpu}\n"));
+
+    if limits.memory_max == 0 {
+        text.push_str("memory   no memory.max\n");
+        return text;
+    }
+
+    text.push_str(&format!(
+        "memory   memory.max {}, {} used, {} left, headroom {}\n",
+        size(limits.memory_max),
+        size(limits.memory_used),
+        size(limits.memory_left),
+        size(limits.headroom)
+    ));
+    text.push_str(&format!(
+        "         workers {}, host {}\n",
+        size(limits.workers_memory),
+        size(limits.host_memory)
+    ));
+
+    let mut guard = match limits.guard.as_str() {
+        "watching" => "watching".to_owned(),
+        state => format!("{state}: {}", limits.guard_note),
+    };
+
+    if !limits.last_replaced.is_empty() {
+        let seconds = limits.last_replaced_unix_ms / 1000 % 86_400;
+        guard.push_str(&format!(
+            "; it last replaced {} at {:02}:{:02}:{:02} UTC",
+            limits.last_replaced,
+            seconds / 3600,
+            seconds % 3600 / 60,
+            seconds % 60
+        ));
+    }
+
+    text.push_str(&format!("guard    {guard}\n"));
+    text
 }
 
 /// The daemon's socket, configuration file and directories, as `daemon
@@ -4112,9 +4191,9 @@ pub enum ScaleCommand {
     /// and churn.
     Status {
         /// The release as app@release, or an application for its serving
-        /// release.
+        /// release; the one application of `muructl serve` when left out.
         #[arg(value_name = "APP[@RELEASE]")]
-        target: String,
+        target: Option<String>,
 
         #[command(flatten)]
         socket: SocketArgs,
@@ -4359,7 +4438,11 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
         output,
     }) = args.command
     {
-        let (app, release) = split_target(&target)?;
+        let (app, release) = match target.as_deref() {
+            Some(target) => split_target(target)?,
+            None => ("", ""),
+        };
+
         let mut client = client::connect(&socket.socket()?).await?;
         let status = client
             .get_scale_status(pb::GetScaleStatusRequest {
@@ -9514,17 +9597,12 @@ fn format_access_line(line: &str, timed: bool) -> String {
 }
 
 fn format_event(event: &pb::Event) -> String {
-    let seconds = event.time_unix_ms / 1000;
-    let time = time::OffsetDateTime::from_unix_timestamp(seconds as i64)
-        .map(|time| {
-            format!(
-                "{:02}:{:02}:{:02}",
-                time.hour(),
-                time.minute(),
-                time.second()
-            )
-        })
-        .unwrap_or_default();
+    // Section 11.8: a short clock is the reader's local time (issue 625);
+    // `--json` keeps the full UTC time.
+
+    let at = std::time::UNIX_EPOCH + Duration::from_millis(event.time_unix_ms);
+    let clock = muru_common::log::clock(at);
+    let time = clock.split('.').next().unwrap_or_default();
     format!(
         "{:>6} {time} {:<8} {:<20} {:<24} {}",
         event.sequence, event.level, event.r#type, event.subject, event.message
@@ -9592,8 +9670,36 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 
 #[cfg(test)]
 mod tests {
+    use super::limits_lines;
     use super::metric_samples;
     use super::pb;
+
+    #[test]
+    fn the_limits_are_printed_as_the_guide_shows_them() {
+        let limits = pb::CgroupLimits {
+            cgroup: "/sys/fs/cgroup".to_owned(),
+            cpu_quota: 2.0,
+            cpus: 64,
+            memory_max: 1 << 30,
+            memory_used: 586 << 20,
+            memory_left: 438 << 20,
+            headroom: 128 << 20,
+            workers_memory: 296 << 20,
+            host_memory: 250 << 20,
+            guard: "watching".to_owned(),
+            guard_note: String::new(),
+            last_replaced: "shop@r1 worker 0 (pid 52)".to_owned(),
+            last_replaced_unix_ms: (7 * 3600 + 40 * 60 + 12) * 1000,
+        };
+
+        assert_eq!(
+            limits_lines(&limits),
+            "cpu      2 CPUs from cpu.max\n\
+             memory   memory.max 1.0GB, 586MB used, 438MB left, headroom 128MB\n\
+             \x20        workers 296MB, host 250MB\n\
+             guard    watching; it last replaced shop@r1 worker 0 (pid 52) at 07:40:12 UTC\n"
+        );
+    }
 
     #[test]
     fn discovery_reports_a_denied_run_directory_only_with_nothing_else_to_offer() {

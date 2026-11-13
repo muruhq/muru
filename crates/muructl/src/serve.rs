@@ -89,7 +89,7 @@ pub struct ServeArgs {
     #[arg(long)]
     factory: bool,
 
-    /// Worker processes, or auto for the CPU count (the default).
+    /// Worker processes in the default group (default 1).
     #[arg(long, value_name = "N")]
     processes: Option<String>,
 
@@ -193,7 +193,7 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DIR")]
     runtime_dir: Option<String>,
 
-    /// The most request bodies spooled to disk at once (default 1GB).
+    /// The most request bodies spooled to disk at once (default 1GB, or the memory headroom when the run directory is in memory under a memory limit).
     #[arg(long, value_name = "SIZE")]
     spool_quota: Option<String>,
 
@@ -490,20 +490,80 @@ pub struct Mode {
     pub runtime_dir: PathBuf,
     /// Lines as JSON objects.
     pub json: bool,
-    /// The spool's quota in bytes.
+    /// The spool's quota in bytes, under the limits read at start.
     pub spool_quota: u64,
-    /// The worker count when nothing sets one.
-    pub default_processes: usize,
+    /// How the spool's quota follows the limits.
+    pub spool: SpoolRule,
     /// Whose forwarding headers the edge applies.
     pub trust: muru_edge::proxy::Trust,
     /// The delay and budget of the stop SIGTERM starts.
     pub shutdown: muru_controller::shutdown::Policy,
-    /// The container's memory budget, for the workers' hard limits.
-    pub memory_budget: Option<u64>,
+    /// The container's cgroup limits as read at start, which the run
+    /// reads again at every memory check (sections 7.7 and 13.9).
+    pub limits: Option<Limits>,
+    /// What was read from the container's limits, a line each, for the
+    /// start and `--print-config`.
+    pub start_lines: Vec<String>,
+}
+
+impl Mode {
     /// The container's cgroup directory.
-    pub cgroup: Option<PathBuf>,
-    /// What was worked out from the container's limits, a line each.
-    pub sizing: Vec<String>,
+    pub fn cgroup(&self) -> Option<PathBuf> {
+        self.limits.as_ref().map(|limits| limits.dir.clone())
+    }
+}
+
+/// How the request body spool's quota follows the container's limits
+/// (section 13.9).
+#[derive(Debug, Clone)]
+pub struct SpoolRule {
+    /// The quota set, or the default.
+    pub spool_quota: u64,
+    /// Whether the quota was set, rather than taken from the default.
+    pub spool_quota_set: bool,
+    /// Whether the run directory, and so the spool, is held in memory,
+    /// on a tmpfs or ramfs, where its files count against `memory.max`.
+    pub spool_in_memory: bool,
+    /// The run directory.
+    pub run_dir: PathBuf,
+}
+
+impl SpoolRule {
+    /// The spool's quota under `limits`, with what to say of it: in
+    /// memory under a memory limit the quota is the headroom unless one
+    /// was set, and one set above the headroom is kept with a warning.
+    pub fn spool_quota_under(&self, limits: Option<&Limits>) -> (u64, Option<String>) {
+        let headroom = limits.and_then(Limits::headroom);
+
+        let (true, Some(headroom)) = (self.spool_in_memory, headroom) else {
+            return (self.spool_quota, None);
+        };
+
+        let place = self.run_dir.display();
+
+        if !self.spool_quota_set {
+            return (
+                headroom,
+                Some(format!(
+                    "request bodies are spooled to memory under {place}, so their quota is the \
+                     headroom, {}",
+                    muru_config::format_size_approx(headroom)
+                )),
+            );
+        }
+
+        let note = (self.spool_quota > headroom).then(|| {
+            format!(
+                "warning: request bodies are spooled to memory under {place}, and their quota \
+                 of {} is more than the headroom of {}; see {}",
+                muru_config::format_size_approx(self.spool_quota),
+                muru_config::format_size_approx(headroom),
+                muru_controller::cgroup::GUIDE
+            )
+        });
+
+        (self.spool_quota, note)
+    }
 }
 
 /// A clap parser for `muructl run`'s arguments alone, which `serve` fills
@@ -535,7 +595,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         Ok((run_args, mode, layered)) => {
             muru_common::log::json_lines(mode.json);
 
-            for line in &mode.sizing {
+            for line in &mode.start_lines {
                 muru_common::muru_println!("{line}");
             }
 
@@ -742,40 +802,24 @@ fn prepare(
         None => DEFAULT_SPOOL_QUOTA,
     };
 
-    // Section 13.9: the worker count and the memory budget from the
-    // container's limits, where cgroup v2 gives them, with a line for
-    // each saying what it came from.
+    // The worker count is the configuration's, never the container's
+    // (ADR 0061).
 
-    let (default_processes, cpu_source) = match limits.and_then(Limits::processes) {
-        Some((count, source)) => (count, Some(source)),
-        None => (
-            std::thread::available_parallelism().map_or(1, usize::from),
-            None,
-        ),
-    };
-
-    let processes_set = layered.text("processes").is_some_and(|text| text != "auto")
-        || table
-            .as_ref()
-            .is_some_and(|(_, tool)| tool.processes.is_some());
-    let memory_budget = limits.and_then(Limits::memory_budget);
-    let mut sizing = Vec::new();
-
-    if let Some(source) = cpu_source
-        && !processes_set
+    if let Some(text) = layered.text("processes")
+        && text.parse::<usize>().is_err()
     {
-        sizing.push(format!("{default_processes} processes from {source}"));
+        anyhow::bail!("--processes {text:?} is not a number of workers");
     }
 
-    if let (Some((budget, headroom)), Some(limit)) =
-        (memory_budget, limits.and_then(|limits| limits.memory_max))
-    {
-        sizing.push(format!(
-            "memory budget {} (memory.max {} less {})",
-            muru_config::format_size_approx(budget),
-            muru_config::format_size_approx(limit),
-            muru_config::format_size_approx(headroom)
-        ));
+    // Section 13.9: the limits read are reported, and nothing is sized
+    // from them. The spool counts against memory.max when the run
+    // directory is held in memory.
+
+    let run_dir = PathBuf::from(layered.text("run_dir").unwrap_or(DEFAULT_RUN_DIR));
+    let mut start_lines = Vec::new();
+
+    if let Some(limits) = limits {
+        start_lines.push(format!("container limits: {}", limits.describe()));
     }
 
     // Loopback peers' forwarding headers are applied unless proxies are
@@ -815,17 +859,28 @@ fn prepare(
         admin_listen,
         admin_status: layered.flag("admin_status"),
         min_ready,
-        run_dir: PathBuf::from(layered.text("run_dir").unwrap_or(DEFAULT_RUN_DIR)),
+        run_dir: run_dir.clone(),
         runtime_dir: PathBuf::from(layered.text("runtime_dir").unwrap_or(DEFAULT_RUNTIME_DIR)),
         json,
         spool_quota,
-        default_processes,
+        spool: SpoolRule {
+            spool_quota,
+            spool_quota_set: layered.text("spool_quota").is_some(),
+            spool_in_memory: muru_common::mounts::in_memory(&run_dir),
+            run_dir: run_dir.clone(),
+        },
         trust,
         shutdown,
-        memory_budget: memory_budget.map(|(budget, _)| budget),
-        cgroup: limits.map(|limits| limits.dir.clone()),
-        sizing,
+        limits: limits.cloned(),
+        start_lines,
     };
+
+    // The spool's quota from the headroom, when it is held in memory.
+
+    let mut mode = mode;
+    let (quota, note) = mode.spool.spool_quota_under(limits);
+    mode.spool_quota = quota;
+    mode.start_lines.extend(note);
 
     // muructl run's arguments: production behaviours on, nothing built,
     // no dashboard, no reload.
@@ -882,10 +937,8 @@ fn prepare(
         }
     }
 
-    match layered.text("processes") {
-        Some("auto") => argv.extend(["--processes".to_owned(), default_processes.to_string()]),
-        Some(count) => argv.extend(["--processes".to_owned(), count.to_owned()]),
-        None => {}
+    if let Some(count) = layered.text("processes") {
+        argv.extend(["--processes".to_owned(), count.to_owned()]);
     }
 
     match layered.text("access_log").unwrap_or("on") {
@@ -1021,7 +1074,7 @@ fn report(layered: &Layered, mode: &Mode) -> crate::print_config::Serve {
     }
 
     let mut trailer = vec![mode.shutdown.describe()];
-    trailer.extend(mode.sizing.iter().cloned());
+    trailer.extend(mode.start_lines.iter().cloned());
 
     crate::print_config::Serve {
         rows,
@@ -1155,21 +1208,33 @@ pub fn runtime_library(
     }
 }
 
-/// `muructl probe`: ask a `muructl serve` in this container one of the
-/// probes' questions over the socket in its run directory.
-#[derive(Debug, Args)]
+/// `muructl probe`: ask a `muructl serve` in this container, or the
+/// daemon, one of the probes' questions (section 13.9).
+#[derive(Args)]
 pub struct ProbeArgs {
     /// live, ready or startup.
     #[arg(value_name = "PROBE")]
     probe: String,
 
-    /// The run directory of the serve to ask (default MURU_RUN_DIR, else
-    /// /run/muru).
-    #[arg(long, value_name = "DIR")]
-    run_dir: Option<PathBuf>,
+    /// Narrow ready and startup to one application of the daemon.
+    #[arg(long, value_name = "APP")]
+    app: Option<String>,
+
+    /// The workers each needed group of a daemon's serving releases must
+    /// have ready for ready (default 1); under muructl serve its own
+    /// --min-ready applies.
+    #[arg(long, value_name = "N")]
+    min_ready: Option<u32>,
+
+    #[command(flatten)]
+    socket: crate::admin::SocketArgs,
 }
 
-/// Run `muructl probe`, exiting 0 when the answer is yes and 1 otherwise.
+/// Run `muructl probe`, exiting 0 when the answer is yes and 1 otherwise,
+/// with why on standard error. A `muructl serve` is found first, by the
+/// probe socket in its run directory (`--run-dir`, else MURU_RUN_DIR,
+/// else /run/muru); otherwise the daemon is asked over its admin socket,
+/// found as the other commands find it.
 pub fn probe(args: ProbeArgs) -> anyhow::Result<()> {
     let path = match args.probe.as_str() {
         "live" => "/livez",
@@ -1179,13 +1244,32 @@ pub fn probe(args: ProbeArgs) -> anyhow::Result<()> {
     };
 
     let run_dir = args
-        .run_dir
+        .socket
+        .run_dir()
+        .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("MURU_RUN_DIR").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_RUN_DIR));
     let socket = run_dir.join(PROBE_SOCKET);
 
+    let (ok, text) = if socket.exists() {
+        probe_serve(&socket, path)
+    } else {
+        probe_daemon(&args)
+    };
+
+    if ok {
+        println!("{text}");
+        std::process::exit(0);
+    }
+
+    eprintln!("muru: {text}");
+    std::process::exit(1);
+}
+
+/// Ask a serve over its probe socket.
+fn probe_serve(socket: &Path, path: &str) -> (bool, String) {
     let answer = (|| -> std::io::Result<String> {
-        let mut stream = std::os::unix::net::UnixStream::connect(&socket)?;
+        let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
         write!(stream, "GET {path} HTTP/1.0\r\nHost: probe\r\n\r\n")?;
         let mut text = String::new();
@@ -1196,11 +1280,10 @@ pub fn probe(args: ProbeArgs) -> anyhow::Result<()> {
     let text = match answer {
         Ok(text) => text,
         Err(error) => {
-            println!(
-                "muru: no muructl serve answers at {} ({error})",
-                socket.display()
+            return (
+                false,
+                format!("no muructl serve answers at {} ({error})", socket.display()),
             );
-            std::process::exit(1);
         }
     };
 
@@ -1209,8 +1292,42 @@ pub fn probe(args: ProbeArgs) -> anyhow::Result<()> {
         .split_once("\r\n\r\n")
         .map_or("", |(_, body)| body)
         .trim();
-    println!("{body}");
-    std::process::exit(if ok { 0 } else { 1 });
+    (ok, body.to_owned())
+}
+
+/// Ask the daemon over its admin socket.
+fn probe_daemon(args: &ProbeArgs) -> (bool, String) {
+    let asked = async {
+        let socket = args.socket.socket()?;
+        let mut client = muru_controller::client::connect(&socket).await?;
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.probe(muru_proto::admin::v1::ProbeRequest {
+                probe: args.probe.clone(),
+                app: args.app.clone().unwrap_or_default(),
+                min_ready: args.min_ready.unwrap_or(1),
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the daemon did not answer within 5 s"))?
+        .map_err(|status| anyhow::anyhow!("{}", status.message()))?
+        .into_inner();
+        anyhow::Ok(answer)
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return (false, error.to_string()),
+    };
+
+    match runtime.block_on(asked) {
+        Ok(answer) if answer.ok => (true, "ok".to_owned()),
+        Ok(answer) => (false, answer.reason),
+        Err(error) => (false, format!("{error:#}")),
+    }
 }
 
 #[cfg(test)]
@@ -1370,7 +1487,7 @@ mod tests {
     }
 
     #[test]
-    fn the_container_limits_size_the_workers_and_say_so() {
+    fn the_container_limits_are_reported_and_size_nothing() {
         let limits = Limits {
             dir: PathBuf::from("/sys/fs/cgroup"),
             cpu_max: Some((150_000, 100_000)),
@@ -1379,23 +1496,66 @@ mod tests {
         };
         let args = parse(&["app:application"]);
         let (run, mode, _) = prepare(&args, Some(&limits), |_| None).expect("prepares");
-        assert_eq!(mode.default_processes, 2);
         assert_eq!(run.processes, None);
-        assert_eq!(mode.cgroup, Some(PathBuf::from("/sys/fs/cgroup")));
-        assert_eq!(mode.memory_budget, Some((4 << 30) - (4 << 30) / 100 * 10));
+        assert_eq!(mode.cgroup(), Some(PathBuf::from("/sys/fs/cgroup")));
+
+        // The first line gives the limits; a line about the spool follows
+        // where the run directory is in memory, as /run is on many Linux
+        // machines, which a test of its own covers.
+
         assert_eq!(
-            mode.sizing,
-            [
-                "2 processes from cpu.max 150000 100000",
-                "memory budget 3.6GB (memory.max 4.0GB less 410MB)"
-            ]
+            mode.start_lines.first().map(String::as_str),
+            Some(
+                "container limits: 1.5 CPUs from cpu.max 150000 100000, memory.max 4.0GB with 410MB of headroom"
+            )
         );
 
-        // A worker count given says nothing of the CPU limit.
+        // There is no count worked out from the CPUs to ask for.
 
-        let args = parse(&["app:application", "--processes", "3"]);
+        let args = parse(&["app:application", "--processes", "auto"]);
+        let Err(error) = prepare(&args, Some(&limits), |_| None) else {
+            panic!("--processes auto was accepted");
+        };
+        assert!(
+            error.to_string().contains("is not a number of workers"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_spool_in_memory_takes_the_headroom_as_its_quota() {
+        let limits = Limits {
+            dir: PathBuf::from("/sys/fs/cgroup"),
+            cpu_max: None,
+            cpus: None,
+            memory_max: Some(1 << 30),
+        };
+        let args = parse(&["app:application"]);
         let (_, mode, _) = prepare(&args, Some(&limits), |_| None).expect("prepares");
-        assert_eq!(mode.sizing.len(), 1);
+        let mut mode = mode.spool;
+        mode.spool_in_memory = true;
+        mode.spool_quota = DEFAULT_SPOOL_QUOTA;
+
+        let (quota, note) = mode.spool_quota_under(Some(&limits));
+        assert_eq!(quota, 128 << 20);
+        assert!(note.is_some_and(|note| note.ends_with("their quota is the headroom, 128MB")));
+
+        // One that is set is kept, with a warning when it is more than
+        // the headroom.
+
+        mode.spool_quota_set = true;
+        let (quota, note) = mode.spool_quota_under(Some(&limits));
+        assert_eq!(quota, DEFAULT_SPOOL_QUOTA);
+        assert!(note.is_some_and(|note| note.starts_with("warning: ")));
+
+        mode.spool_quota = 64 << 20;
+        assert_eq!(mode.spool_quota_under(Some(&limits)), (64 << 20, None));
+
+        // Without a memory limit nothing changes.
+
+        mode.spool_quota_set = false;
+        mode.spool_quota = DEFAULT_SPOOL_QUOTA;
+        assert_eq!(mode.spool_quota_under(None), (DEFAULT_SPOOL_QUOTA, None));
     }
 
     #[test]
