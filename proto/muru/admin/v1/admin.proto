@@ -255,6 +255,7 @@ message Figures {
   optional double p95_ms = 5;       // total time
   optional double gil_wait_p95_ms = 6;
   optional double loop_lag_p95_ms = 7;
+  uint32 departed = 8;              // a host's or group's: workers no longer listed whose last second these figures count (issue 613)
 }
 
 message GroupFigures {

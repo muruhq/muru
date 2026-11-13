@@ -246,7 +246,30 @@ fn render_at(answer: &pb::Processes, every: Option<Duration>, now: u64) -> Strin
         text.push('\n');
     }
 
+    if marked(answer.root.as_ref()) {
+        text.push_str("* counts the last second of a worker that has exited and is not listed\n");
+    }
+
     text
+}
+
+/// Whether any row's figures count a worker no longer listed.
+fn marked(process: Option<&pb::Process>) -> bool {
+    let Some(process) = process else {
+        return false;
+    };
+
+    process
+        .figures
+        .as_ref()
+        .is_some_and(|figures| figures.departed > 0)
+        || process.groups.iter().any(|group| {
+            group
+                .figures
+                .as_ref()
+                .is_some_and(|figures| figures.departed > 0)
+        })
+        || process.children.iter().any(|child| marked(Some(child)))
 }
 
 /// The rows of a process and those beneath it, with the tree's lines: a
@@ -354,8 +377,16 @@ fn figure_cells(figures: Option<&pb::Figures>, interface: &str) -> Vec<String> {
     .map(|ms| format!("{} ms", milliseconds(ms)))
     .unwrap_or_default();
 
+    // Issue 613: a mark where the figures count, for a second, a worker
+    // that has exited and is no longer listed.
+
+    let mark = if figures.departed > 0 { "*" } else { "" };
+
     vec![
-        figures.requests_per_second.map(rate).unwrap_or_default(),
+        figures
+            .requests_per_second
+            .map(|value| format!("{}{mark}", rate(value)))
+            .unwrap_or_default(),
         busy,
         figures
             .queue
@@ -598,6 +629,7 @@ mod tests {
                     p95_ms: Some(p95),
                     gil_wait_p95_ms: wait.0,
                     loop_lag_p95_ms: wait.1,
+                    departed: 0,
                 },
             );
         }
@@ -1058,6 +1090,32 @@ mod tests {
                  MURU_WRITE_EXAMPLES=1 writes it"
             );
         }
+    }
+
+    #[test]
+    fn figures_counting_a_worker_that_has_gone_are_marked_and_explained() {
+        let mut answer = daemon_example();
+        let shown = render_at(&answer, None, NOW);
+        assert!(!shown.contains("* counts"), "{shown}");
+
+        let host = answer
+            .root
+            .as_mut()
+            .and_then(|root| root.children.iter_mut().find(|child| child.role == "host"))
+            .expect("a host");
+
+        if let Some(figures) = host.figures.as_mut() {
+            figures.departed = 1;
+        }
+
+        let shown = render_at(&answer, None, NOW);
+        assert!(
+            shown.ends_with(
+                "* counts the last second of a worker that has exited and is not listed\n"
+            ),
+            "{shown}"
+        );
+        assert!(shown.contains("203*"), "{shown}");
     }
 
     #[test]

@@ -722,6 +722,11 @@ of a release with one, its GIL/LAG the workers' together. `--json`
 gives both figures, `gil_wait_p95_ms` and `loop_lag_p95_ms`, and the
 `interface` that chooses between them.
 
+A worker that exits within a second after it served, as one scaled in
+does, still counts in its host's or group's figures for that second,
+though it is no longer listed. Such a row's REQ/S is marked `*`, and a
+line under the table says why; `--json` gives the count as `departed`.
+
 - `--app APP[@RELEASE]` shows the daemon and one application's
   processes, or one release's.
 

@@ -1217,6 +1217,7 @@ async fn processes_paths(
             rows: &rows,
             with_user,
             error: &error,
+            marked: rows.iter().any(|row| row.rate.ends_with('*')),
         }
         .render(),
     ))

@@ -758,6 +758,50 @@ fn tree(
                 .collect();
         }
 
+        // Issue 613: a host's or group's figures may count, for a second,
+        // a worker that has exited and is no longer listed beneath it.
+
+        if process.role == "host" {
+            let listed: HashSet<&str> = known
+                .iter()
+                .filter(|worker| {
+                    worker.role == "worker"
+                        && worker.app == process.app
+                        && worker.release == process.release
+                })
+                .filter_map(|worker| worker.socket.as_deref())
+                .collect();
+            let departed = |group: &str| {
+                figures
+                    .counted
+                    .get(&(
+                        process.app.clone(),
+                        process.release.clone(),
+                        group.to_owned(),
+                    ))
+                    .map_or(0, |counted| {
+                        counted
+                            .iter()
+                            .filter(|socket| {
+                                socket
+                                    .as_deref()
+                                    .is_none_or(|socket| !listed.contains(socket))
+                            })
+                            .count() as u32
+                    })
+            };
+
+            if let Some(own) = &mut node.figures {
+                own.departed = departed(process.groups.first().map_or("default", String::as_str));
+            }
+
+            for group in &mut node.groups {
+                if let Some(own) = &mut group.figures {
+                    own.departed = departed(&group.group);
+                }
+            }
+        }
+
         nodes.insert(process.pid, (process.parent, node));
     }
 
@@ -929,6 +973,9 @@ pub struct Figures {
     pub groups: HashMap<(String, String, String), pb::Figures>,
     /// Each worker's GIL wait and loop lag p95, by pid.
     pub signals: HashMap<u32, (Option<f64>, Option<f64>)>,
+    /// The workers whose requests of the last second each group's
+    /// figures count, by socket, none for one whose socket is not known.
+    pub counted: HashMap<(String, String, String), Vec<Option<String>>>,
 }
 
 /// One reading of the counters the figures are the differences of.
@@ -1169,6 +1216,14 @@ fn rates(
             .or_default();
         group.0 += (requests - requests_before).max(0.0);
 
+        if requests - requests_before > 0.0 {
+            figures
+                .counted
+                .entry((key.0.clone(), key.1.clone(), key.2.clone()))
+                .or_default()
+                .push(sockets.get(key).cloned());
+        }
+
         for (bits, (le, count)) in &deltas {
             group.1.entry(*bits).or_insert((*le, 0.0)).1 += count;
         }
@@ -1340,6 +1395,73 @@ mod tests {
 
     fn sample(name: &str, labels: &[(&str, &str)], value: f64) -> Sample {
         Sample::new(name, labels, value)
+    }
+
+    #[test]
+    fn a_host_whose_figures_count_a_worker_no_longer_listed_says_so() {
+        let known = [
+            Known {
+                pid: 10,
+                role: "daemon",
+                ..Known::default()
+            },
+            Known {
+                pid: 20,
+                parent: 10,
+                role: "host",
+                app: "shop".to_owned(),
+                release: "r1".to_owned(),
+                ..Known::default()
+            },
+            Known {
+                pid: 21,
+                parent: 20,
+                role: "worker",
+                app: "shop".to_owned(),
+                release: "r1".to_owned(),
+                index: Some(0),
+                socket: Some("/run/w0.sock".to_owned()),
+                ..Known::default()
+            },
+        ];
+        let found: HashMap<u32, OsProcess> = [(10, 1), (20, 10), (21, 20)]
+            .into_iter()
+            .map(|(pid, parent)| {
+                (
+                    pid,
+                    OsProcess {
+                        pid,
+                        parent,
+                        ..OsProcess::default()
+                    },
+                )
+            })
+            .collect();
+        let key = ("shop".to_owned(), "r1".to_owned(), "default".to_owned());
+        let mut figures = Figures::default();
+        figures.groups.insert(key.clone(), pb::Figures::default());
+
+        // Worker 1 served its last requests and exited within the second.
+
+        figures.counted.insert(
+            key,
+            vec![
+                Some("/run/w0.sock".to_owned()),
+                Some("/run/w1.sock".to_owned()),
+            ],
+        );
+        let none = HashSet::new();
+        let nothing = Others {
+            table: &[],
+            left_out: &none,
+            narrow: false,
+        };
+        let root = tree(&known, &found, &HashMap::new(), &nothing, &figures).expect("a root");
+        let host = &root.children[0];
+        assert_eq!(
+            host.figures.as_ref().map(|figures| figures.departed),
+            Some(1)
+        );
     }
 
     #[test]

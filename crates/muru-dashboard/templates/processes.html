@@ -8,4 +8,5 @@
   <tr><td class="num">{{ row.pid }}</td><td class="tree">{{ row.tree }}{{ row.role }}</td><td>{% if let Some(link) = row.link %}<a href="{{ link }}">{{ row.what }}</a>{% else %}{{ row.what }}{% endif %}{% if !row.note.is_empty() %} <span class="muted">({{ row.note }})</span>{% endif %}</td>{% if with_user %}<td>{{ row.user }}</td>{% endif %}<td class="num">{{ row.up }}</td><td class="num">{{ row.cpu }}</td><td class="num">{{ row.rss }}</td><td class="num">{{ row.rate }}</td><td class="num">{{ row.busy }}</td><td class="num">{{ row.queue }}</td><td class="num">{{ row.p95 }}</td><td class="num">{{ row.wait }}</td></tr>
   {% endfor %}
 </table>
+{% if marked %}<p class="muted">* counts the last second of a worker that has exited and is not listed</p>{% endif %}
 {% endif %}

@@ -58,6 +58,9 @@ pub struct ProcessesFragment<'a> {
     pub with_user: bool,
     /// Why there are no rows, or empty.
     pub error: &'a str,
+    /// Whether a row's figures count a worker no longer listed, which a
+    /// note under the table explains (issue 613).
+    pub marked: bool,
 }
 
 /// The rows of an answer, with `now` in Unix milliseconds for uptimes.
@@ -203,8 +206,16 @@ fn figures(figures: Option<&serde_json::Value>, interface: &str, row: &mut Proce
         return;
     };
 
+    // Issue 613: marked where the figures count, for a second, a worker
+    // that has exited and is no longer listed.
+
+    let mark = if number(figures, "departed").is_some_and(|count| count > 0.0) {
+        "*"
+    } else {
+        ""
+    };
     row.rate = number(figures, "requests_per_second")
-        .map(rate)
+        .map(|value| format!("{}{mark}", rate(value)))
         .unwrap_or_default();
     row.busy = match (number(figures, "busy"), number(figures, "slots")) {
         (Some(busy), Some(slots)) => format!("{}/{}", busy as u64, slots as u64),
