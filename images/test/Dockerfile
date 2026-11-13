@@ -9,18 +9,25 @@ FROM python:3.13-slim-bookworm AS build
 ENV PATH=/root/.cargo/bin:$PATH \
     DEBIAN_FRONTEND=noninteractive
 
+WORKDIR /src
+
+# The toolchain the tree pins, with its components, is installed in the
+# same layer as rustup: installing them later, into a toolchain an earlier
+# layer holds, renames its directories, which overlayfs refuses.
+COPY rust-toolchain.toml .
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential pkg-config curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+    && rustup toolchain install \
     && pip install --no-cache-dir maturin
 
-WORKDIR /src
 COPY . .
 
-# The toolchain the tree pins is installed on first use; a debug build is
-# enough for the scenarios and takes half the time of a release build.
+# A debug build is enough for the scenarios and takes half the time of a
+# release build.
 RUN cargo build -p muructl \
     && cd packages/muru \
     && maturin build --out /wheels
