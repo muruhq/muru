@@ -12,7 +12,6 @@ import signal
 import socket
 import subprocess
 import sys
-import sysconfig
 import threading
 import time
 import urllib.request
@@ -586,14 +585,10 @@ def test_a_blocked_event_loop_is_on_the_requests_record(runtime: Path) -> None:
         panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html").body.decode()
         assert ">event loop held</td>" in panel and "During the request" in panel
 
-        # The run's interpreter is this one's build: with a GIL, the
-        # request's start on the loop waited for it; without one, nothing
-        # is shown. The build is asked rather than this process, whose lock
-        # an earlier import may have turned on.
+        # With a GIL, the request's start on the loop waited for it;
+        # without one, nothing is shown.
 
-        free_threaded = sysconfig.get_config_var("Py_GIL_DISABLED") == 1
-
-        if not free_threaded or os.environ.get("PYTHON_GIL") == "1":
+        if support.workers_have_a_gil():
             assert worker["gil_waits"] >= 1, worker
         else:
             assert worker["gil_waits"] == 0 and ">waiting for the GIL</td>" not in panel

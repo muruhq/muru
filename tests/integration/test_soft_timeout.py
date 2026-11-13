@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import re
 import socket
-import sys
 import threading
 import time
 
@@ -291,7 +290,7 @@ def test_the_hard_timeout_answers_the_stuck_request_at_once() -> None:
 
 
 @pytest.mark.skipif(
-    not getattr(sys, "_is_gil_enabled", lambda: True)(),
+    not support.workers_have_a_gil(),
     reason="a free-threaded build has no interpreter lock to hold",
 )
 def test_a_stall_on_a_condemned_worker_ends_its_grace() -> None:

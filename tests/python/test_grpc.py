@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import sys
+import sysconfig
 from typing import Any
 
 import pytest
@@ -24,7 +24,7 @@ try:
 
     from muru import _grpc
 except ImportError:
-    if os.environ.get("CI") and getattr(sys, "_is_gil_enabled", lambda: True)():
+    if os.environ.get("CI") and sysconfig.get_config_var("Py_GIL_DISABLED") != 1:
         raise
 
     pytest.skip(
