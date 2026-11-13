@@ -18,6 +18,11 @@ use http_body::{Body, Frame};
 use http_body_util::BodyExt as _;
 use http_body_util::combinators::UnsyncBoxBody;
 
+use muru_proto::admin::v1 as admin;
+use percent_encoding::percent_decode_str;
+use serde::Serialize;
+
+use crate::development::Links;
 use crate::panels::Renderer;
 use crate::recorder::Recorder;
 use crate::{BoxError, ResponseBody};
@@ -42,6 +47,9 @@ pub fn stylesheet() -> String {
 #[derive(Debug, Clone, Copy)]
 pub struct EdgeFile;
 
+/// The most requests `requests?ids=` answers for at once.
+pub const MAX_BATCH: usize = 100;
+
 /// The closing tag the toolbar goes before.
 const BODY_END: &[u8] = b"</body>";
 
@@ -51,12 +59,12 @@ pub fn reserved(path: &str) -> bool {
 }
 
 /// Answer a request under the reserved prefix: the toolbar's files, a
-/// record as JSON, or one of its panels drawn. Only GET and HEAD, only
-/// from a loopback host or one of the run's own names, and never from
-/// another site's page.
+/// record as JSON, one of its panels drawn, or the summaries of several
+/// records. Only GET and HEAD, only from a loopback host or one of the
+/// run's own names, and never from another site's page.
 pub fn answer(
     parts: &http::request::Parts,
-    hosts: &[String],
+    links: &Links,
     recorder: &Recorder,
     renderer: &Renderer,
 ) -> Response<ResponseBody> {
@@ -64,7 +72,7 @@ pub fn answer(
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served here\n");
     }
 
-    if let Err(why) = allowed(&parts.headers, hosts) {
+    if let Err(why) = allowed(&parts.headers, links.hosts()) {
         return plain(StatusCode::FORBIDDEN, why);
     }
 
@@ -73,6 +81,7 @@ pub fn answer(
     let response = match within {
         "toolbar.js" => content("text/javascript", Bytes::from_static(SCRIPT.as_bytes())),
         "toolbar.css" => content("text/css", Bytes::from(stylesheet())),
+        "requests" => batch(parts.uri.query(), links, recorder),
         _ => record_path(within, recorder, renderer),
     };
 
@@ -122,6 +131,117 @@ fn record_path(within: &str, recorder: &Recorder, renderer: &Renderer) -> Respon
         ),
         None => plain(StatusCode::NOT_FOUND, "the record has no such panel\n"),
     }
+}
+
+/// What the page view shows of one request (section 4.20): enough to
+/// fill its row without the whole record.
+#[derive(Debug, Serialize)]
+struct Summary {
+    request_id: String,
+    in_progress: bool,
+    method: String,
+    target: String,
+    status: u32,
+    total_ms: f64,
+    queue_ms: f64,
+    app_ms: f64,
+    /// No worker or upstream answered: a static file, a redirect or an
+    /// error of the edge's own.
+    served_by_edge: bool,
+    group: String,
+    worker: Option<u32>,
+    /// The log records kept and those dropped past the limit.
+    logs: u64,
+    /// 1 when the request failed, as the badge counts it.
+    errors: u32,
+    connection: String,
+    connection_position: u64,
+    /// The request's page on the dashboard, when the dashboard is on.
+    link: Option<String>,
+}
+
+impl Summary {
+    fn of(record: &admin::RequestRecord, links: &Links) -> Self {
+        let worker = record.from_worker.as_ref();
+        let logs = worker.map_or(0, |worker| {
+            worker.logs.len() as u64 + u64::from(worker.logs_dropped)
+        });
+        let failed = worker
+            .is_some_and(|worker| !worker.outcome.is_empty() && worker.outcome != "completed")
+            || record.status >= 500;
+
+        Self {
+            request_id: record.request_id.clone(),
+            in_progress: record.in_progress,
+            method: record.method.clone(),
+            target: record.target.clone(),
+            status: record.status,
+            total_ms: record.total_ms,
+            queue_ms: record.queue_ms,
+            app_ms: record.app_ms,
+            served_by_edge: record.status != 0
+                && record.worker.is_none()
+                && record.queue_ms == 0.0
+                && record.app_ms == 0.0,
+            group: record.group.clone(),
+            worker: record.worker,
+            logs,
+            errors: u32::from(failed),
+            connection: record
+                .connection
+                .as_ref()
+                .map(|connection| connection.id.clone())
+                .unwrap_or_default(),
+            connection_position: record
+                .connection
+                .as_ref()
+                .map_or(0, |connection| connection.position),
+            link: links.request_page(&record.request_id),
+        }
+    }
+}
+
+/// `requests?ids=ID,ID`: the summaries of the records named, in the order
+/// first asked, and the IDs no longer kept. Each ID is percent-decoded
+/// after the list is split, so one may hold an encoded comma.
+fn batch(query: Option<&str>, links: &Links, recorder: &Recorder) -> Response<ResponseBody> {
+    let mut seen = HashSet::new();
+    let request_ids: Vec<String> = query
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|pair| pair.strip_prefix("ids="))
+        .flat_map(|list| list.split(','))
+        .map(|id| percent_decode_str(id).decode_utf8_lossy().into_owned())
+        .filter(|id| !id.is_empty() && seen.insert(id.clone()))
+        .collect();
+
+    if request_ids.is_empty() {
+        return plain(
+            StatusCode::BAD_REQUEST,
+            "name the requests with ids=ID,ID\n",
+        );
+    }
+
+    if request_ids.len() > MAX_BATCH {
+        return plain(
+            StatusCode::BAD_REQUEST,
+            "at most 100 requests are answered at once\n",
+        );
+    }
+
+    let mut found = recorder.read_each(&request_ids, |record| Summary::of(record, links));
+    let mut requests = Vec::with_capacity(found.len());
+    let mut not_kept = Vec::new();
+
+    for request_id in request_ids {
+        match found.remove(&request_id) {
+            Some(summary) => requests.push(summary),
+            None => not_kept.push(request_id),
+        }
+    }
+
+    let body = serde_json::json!({ "requests": requests, "not_kept": not_kept });
+    content("application/json", Bytes::from(body.to_string()))
 }
 
 fn not_kept(request_id: &str) -> Response<ResponseBody> {
@@ -667,6 +787,87 @@ mod tests {
         assert_eq!(
             policy("default-src https://cdn.example.com"),
             Err(Skip::Policy)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_batch_path_summarises_each_record_named_in_one_answer() {
+        let recorder = Recorder::default();
+
+        let slot = recorder.open(admin::RequestRecord {
+            request_id: "A".to_owned(),
+            ..Default::default()
+        });
+        recorder.complete(&slot, &crate::recorder::tests::logged("A"));
+        recorder.update(&slot, |record| {
+            crate::recorder::worker(
+                record,
+                muru_proto::worker::v1::WorkerRecord {
+                    outcome: "failed".to_owned(),
+                    logs: vec![Default::default(); 2],
+                    logs_dropped: 1,
+                    ..Default::default()
+                },
+            );
+        });
+
+        // A static file the edge answered itself, and an ID holding an
+        // encoded comma.
+
+        let slot = recorder.open(admin::RequestRecord {
+            request_id: "B,1".to_owned(),
+            ..Default::default()
+        });
+        let mut file = crate::recorder::tests::logged("B,1");
+        file.worker = None;
+        file.queue = std::time::Duration::ZERO;
+        file.application = std::time::Duration::ZERO;
+        recorder.complete(&slot, &file);
+
+        let links = Links::default();
+        links.set_dashboard("http://127.0.0.1:8081/");
+        let ask = |target: &str| {
+            let (parts, ()) = http::Request::get(target)
+                .header(http::header::HOST, "127.0.0.1:8080")
+                .body(())
+                .unwrap()
+                .into_parts();
+            answer(&parts, &links, &recorder, &Renderer::new(None))
+        };
+
+        let response = ask("/_muru/requests?ids=B%2C1,NOSUCH,A,B%2C1");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let found: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let requests = found["requests"].as_array().unwrap();
+        assert_eq!(requests.len(), 2, "{found}");
+        assert_eq!(found["not_kept"], serde_json::json!(["NOSUCH"]));
+
+        let file = &requests[0];
+        assert_eq!(file["request_id"], "B,1");
+        assert_eq!(file["served_by_edge"], true);
+        assert_eq!(file["worker"], serde_json::Value::Null);
+
+        let failed = &requests[1];
+        assert_eq!(failed["request_id"], "A");
+        assert_eq!(failed["status"], 200);
+        assert_eq!(failed["served_by_edge"], false);
+        assert_eq!((&failed["logs"], &failed["errors"]), (&3.into(), &1.into()));
+        assert_eq!(failed["link"], "http://127.0.0.1:8081/request/A");
+
+        // None named, or too many, is refused.
+
+        assert_eq!(ask("/_muru/requests").status(), StatusCode::BAD_REQUEST);
+        let many = vec!["X"; MAX_BATCH + 1].join(",");
+        assert_eq!(
+            ask(&format!("/_muru/requests?ids={many}")).status(),
+            StatusCode::OK,
+            "the same ID many times is one"
+        );
+        let many: Vec<String> = (0..=MAX_BATCH).map(|n| n.to_string()).collect();
+        assert_eq!(
+            ask(&format!("/_muru/requests?ids={}", many.join(","))).status(),
+            StatusCode::BAD_REQUEST
         );
     }
 

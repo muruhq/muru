@@ -9,7 +9,7 @@
 //! [`crate::development::Request`] joins them. Bodies are never kept,
 //! and header values that may hold secrets are masked as they are taken.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -156,6 +156,35 @@ impl Recorder {
 
         record.panels = crate::panels::builtin(&record);
         Some(record)
+    }
+
+    /// Read the records of several requests in one pass over the ring,
+    /// each the newest kept under its ID, by what `read` takes from it.
+    /// An ID not kept is absent from the answer.
+    pub fn read_each<T>(
+        &self,
+        request_ids: &[String],
+        read: impl Fn(&admin::RequestRecord) -> T,
+    ) -> HashMap<String, T> {
+        let wanted: HashSet<&str> = request_ids.iter().map(String::as_str).collect();
+        let mut found = HashMap::with_capacity(wanted.len());
+        let ring = self.ring.lock().expect("recorder poisoned");
+
+        for kept in ring.kept.iter().rev() {
+            if found.len() == wanted.len() {
+                break;
+            }
+
+            let record = kept.slot.lock().expect("request record poisoned");
+
+            if wanted.contains(record.request_id.as_str())
+                && !found.contains_key(&record.request_id)
+            {
+                found.insert(record.request_id.clone(), read(&record));
+            }
+        }
+
+        found
     }
 
     /// How many records are kept, and their bytes.

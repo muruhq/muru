@@ -531,6 +531,21 @@ def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) 
         panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html")
         assert panel.status == 200 and "<table" in panel.body.decode()
         assert server.get("/_muru/requests/NOSUCH.json").status == 404
+
+        # The page view's summaries, several in one answer, and the IDs
+        # no longer kept.
+
+        batch = json.loads(server.get(f"/_muru/requests?ids={request_id},NOSUCH").body)
+        assert [summary["request_id"] for summary in batch["requests"]] == [request_id]
+        assert batch["not_kept"] == ["NOSUCH"]
+        summary = batch["requests"][0]
+        assert (summary["target"], summary["status"], summary["served_by_edge"]) == (
+            "/page",
+            200,
+            False,
+        )
+        assert summary["connection"] == found["connection"]["id"]
+        assert server.get("/_muru/requests").status == 400
         refused = server.get(
             f"/_muru/requests/{request_id}.json", headers={"Sec-Fetch-Site": "cross-site"}
         )
