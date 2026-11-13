@@ -31,6 +31,11 @@ and Firefox list them under Server Timing. A static file, a redirect or
 an error answered by Muru itself carries only `muru`, since no worker
 was involved.
 
+Browsers show the `muru` entry differently: Safari shows the request's
+ID alone, and Chrome shows `muru` and the ID cut short to fit its
+column. The full ID is in the same response's `X-Request-ID` header, and
+`Muru-Request-Link` is the address of its page.
+
 There is no total, since the headers are sent before the body is
 complete. The total and the time to the last byte are in the request's
 record.
@@ -50,16 +55,22 @@ tunnel or a proxy. With `--dashboard off` the header is not sent.
 
 The page shows the record as panels:
 
-- **Timing:** the queue, the application and the total time.
+- **Timing:** the request's phases from its arrival: the wait for a
+  worker, the application until the response head, and sending the
+  response, each with when it started and how long it took.
 
-- **Where:** the application and release, virtual host, mount, worker
-  group and worker, client class, internal redirects, a handoff between
-  WSGI and ASGI, and whether the request was sent again to another
-  worker.
+- **Where:** the application and release, host and virtual host,
+  mount, worker group and worker, client and client class, the listener,
+  internal redirects, a handoff between WSGI and ASGI, whether the
+  request was sent again to another worker, and the routing snapshot.
 
 - **Response:** the status, the bytes sent and received, whether the
-  response was compressed and why not when it was not, and the request
-  and response headers.
+  response was [compressed](compression.md) and why not when it was not
+  (compression is off for the route, the application asked for none,
+  the response was already encoded, its type is not one compressed, the
+  body is under `min_size`, the client accepts none of the encodings
+  offered), and the request headers as they arrived and the response
+  headers as they were sent.
 
 - **Connection:** the connection's ID, the request's position on it,
   how long the connection was idle before the request, for the first
@@ -69,6 +80,11 @@ The page shows the record as panels:
 
 The dashboard's recent requests link to each request's page, and
 `/v1/requests/ID` on the dashboard's address gives the record as JSON.
+A record still being written, for a response that is still streaming,
+says so; reloading the page shows the rest once the response has ended.
+
+The [access log](logging.md)'s JSON lines name the connection too, as
+`connection` and `connection_requests`, in every mode.
 
 ### What is kept
 
@@ -91,27 +107,46 @@ find it:
 
 ```console
 $ muructl debug request 01JCZ8X4R3T5V6W7Y8Z9A0B1C2
-GET /orders/42 HTTP/1.1  200  18.4ms  at 10:42:07.123
+GET /orders/42 HTTP/1.1  200  18ms  at 10:42:07.123
+request 01JCZ8X4R3T5V6W7Y8Z9A0B1C2
 
 Timing
-  queue        0.2ms
-  application  17.9ms
-  total        18.4ms
+  request        18ms  from 0.0ms
+    queue        0.2ms  from 0.0ms
+    application  18ms  from 0.2ms
+    send         0.3ms  from 18ms
 
 Where
-  application   shop@r3
-  host          localhost
-  mount         default
-  group         default
-  worker        0
-  client class  default
+  application       shop@r3
+  host              localhost
+  mount             default
+  group             default
+  worker            0
+  client            127.0.0.1
+  client class      default
+  listener          127.0.0.1:8080
+  sent again        no
+  routing snapshot  0
 
 Response
   status      200
-  sent        1.2 KB
-  received    0 B
-  compressed  no: under min_size
-  ...
+  sent        1234B
+  received    0B
+  compressed  no: the body is under min_size
+  Request headers
+    host: localhost:8080
+    accept: text/html
+    cookie: ***
+  Response headers
+    content-type: text/html; charset=utf-8
+    x-request-id: 01JCZ8X4R3T5V6W7Y8Z9A0B1C2
+    ...
+
+Connection
+  id            01JCZ8X4R3T5V6W7Y8Z9A0B1C0
+  position      1
+  idle before   0.1ms
+  closed after  no
 ```
 
 `--json` prints the whole record, in the shape the

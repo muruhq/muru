@@ -2,10 +2,18 @@
 //! specification section 4.20): `Server-Timing` with the queue and
 //! application times and the request ID, and `Muru-Request-Link` naming
 //! the request's page on the dashboard. Neither is sent outside
-//! development mode.
+//! development mode. Also the connection a request arrived on, which
+//! the access log names in every mode, and the joining of the two
+//! halves of a request's record (section 11.7).
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use muru_proto::admin::v1 as admin;
+
+use crate::access::Record;
+use crate::recorder::{Recorder, Slot};
 
 use http::header::{HeaderName, HeaderValue};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -34,15 +42,173 @@ pub struct Timing {
     pub application: Duration,
 }
 
+/// One connection a listener accepted: its ID, given at accept from
+/// the request ID generator, and what its requests' records say of it.
+#[derive(Debug)]
+pub struct Connection {
+    /// The connection's ID.
+    pub id: String,
+    /// How long the TLS handshake took, from accept, on a TLS connection.
+    pub handshake: Option<Duration>,
+    /// Requests that have arrived on it.
+    arrived: AtomicU64,
+    /// Requests on it whose records are still open, for the idle time.
+    active: AtomicUsize,
+    /// When the connection was last idle from: the end of its handshake,
+    /// or of its last request.
+    idle_since: Mutex<Instant>,
+}
+
+/// A request's place on its connection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Arrival {
+    /// 1 for the connection's first request.
+    pub position: u64,
+    /// How long the connection was idle before the request arrived:
+    /// zero while another of its requests was still open.
+    pub idle: Duration,
+}
+
+impl Connection {
+    /// A connection accepted at `accepted`, ready for its first request
+    /// now, after its handshake on a TLS connection.
+    pub fn new(id: String, accepted: Instant, tls: bool) -> Self {
+        let now = Instant::now();
+
+        Self {
+            id,
+            handshake: tls.then(|| now.saturating_duration_since(accepted)),
+            arrived: AtomicU64::new(0),
+            active: AtomicUsize::new(0),
+            idle_since: Mutex::new(now),
+        }
+    }
+
+    /// A request arrived: its position, and, when `tracked` (a
+    /// development run, whose record ends it), how long the connection
+    /// was idle before it.
+    pub fn arrive(&self, tracked: bool) -> Arrival {
+        let position = self.arrived.fetch_add(1, Ordering::Relaxed) + 1;
+
+        let idle = if tracked && self.active.fetch_add(1, Ordering::AcqRel) == 0 {
+            self.idle_since
+                .lock()
+                .expect("connection idle time poisoned")
+                .elapsed()
+        } else {
+            Duration::ZERO
+        };
+
+        Arrival { position, idle }
+    }
+
+    /// A tracked request's record is done with: the connection is idle
+    /// from now once no other is open.
+    fn done(&self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            *self
+                .idle_since
+                .lock()
+                .expect("connection idle time poisoned") = Instant::now();
+        }
+    }
+}
+
 /// What a development run learns of one client request as it is
 /// handled, shared by every hop of it (section 4.10) so that the final
-/// response can carry it.
+/// response can carry it, and the request's record while its two halves
+/// come together.
 #[derive(Debug, Default)]
 pub struct Request {
     timing: Mutex<Option<Timing>>,
+    joined: Mutex<Joined>,
+    recorder: Option<Arc<Recorder>>,
+    /// Told when the request is done with, for its idle time.
+    connection: Option<Arc<Connection>>,
+}
+
+/// How far a record has come together.
+#[derive(Debug, Default)]
+enum Joined {
+    /// Neither half yet.
+    #[default]
+    Waiting,
+    /// The access log's record came first.
+    Logged(Box<Record>),
+    /// The head is in the ring, waiting for the access log's record.
+    Open(Slot),
+    /// Both halves are in.
+    Done,
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        if let Some(connection) = &self.connection {
+            connection.done();
+        }
+    }
 }
 
 impl Request {
+    /// A request whose record goes to `recorder`, if the run keeps them,
+    /// on a connection that is told when it is done with.
+    pub fn new(recorder: Option<Arc<Recorder>>, connection: Arc<Connection>) -> Self {
+        Self {
+            timing: Mutex::default(),
+            joined: Mutex::default(),
+            recorder,
+            connection: Some(connection),
+        }
+    }
+
+    /// Whether the run keeps the request's record.
+    pub fn recorded(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    /// The access log's record of the request, written when its response
+    /// ended: it completes the record if the head is in, or waits for it.
+    pub fn logged(&self, record: &Record) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+
+        let mut joined = self.joined.lock().expect("request record poisoned");
+
+        match std::mem::take(&mut *joined) {
+            Joined::Open(slot) => {
+                recorder.complete(&slot, record);
+                *joined = Joined::Done;
+            }
+            Joined::Waiting => *joined = Joined::Logged(Box::new(record.clone())),
+            done => *joined = done,
+        }
+    }
+
+    /// The head of the request's record, made as the response's head
+    /// goes out: it is kept in the ring, complete if the access log's
+    /// record is in, or open until it is.
+    pub fn opened(&self, mut head: admin::RequestRecord) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+
+        let mut joined = self.joined.lock().expect("request record poisoned");
+
+        match std::mem::take(&mut *joined) {
+            Joined::Logged(record) => {
+                crate::recorder::fill(&mut head, &record);
+                recorder.open(head);
+                *joined = Joined::Done;
+            }
+            Joined::Waiting => {
+                head.in_progress = true;
+                *joined = Joined::Open(recorder.open(head));
+            }
+            done => *joined = done,
+        }
+    }
+
     /// Note the times of the hop whose response head just arrived; a
     /// later hop's replace an earlier one's.
     pub fn note(&self, timing: Timing) {

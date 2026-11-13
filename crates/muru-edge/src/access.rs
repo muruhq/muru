@@ -584,6 +584,11 @@ pub struct Record {
     /// The interface the worker handed the request to, `asgi` or `wsgi`
     /// (section 6.14); none for a request served where it arrived.
     pub handoff: Option<&'static str>,
+    /// The connection the request arrived on, by an ID from the request
+    /// ID generator given when it was accepted (section 11.7).
+    pub connection: String,
+    /// The request's position on its connection, 1 for the first.
+    pub connection_requests: u64,
 }
 
 /// How a WebSocket ended.
@@ -1687,7 +1692,7 @@ pub fn json_line(record: &Record) -> String {
     let mut line = String::with_capacity(320);
     let _ = write!(
         line,
-        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"virtual_host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"retried\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}],\"client_class\":{},\"websocket\":{},\"handoff\":{}}}",
+        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"virtual_host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"retried\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}],\"client_class\":{},\"websocket\":{},\"handoff\":{},\"connection\":{},\"connection_requests\":{}}}",
         json_string(&record.request_id),
         json_string(&record.client.to_string()),
         json_string(&record.app),
@@ -1732,6 +1737,8 @@ pub fn json_line(record: &Record) -> String {
         record
             .handoff
             .map_or_else(|| "null".to_owned(), json_string),
+        json_string(&record.connection),
+        record.connection_requests,
     );
     line.push('\n');
     line
@@ -1983,6 +1990,8 @@ mod tests {
             client_class: "default".to_owned(),
             websocket: None,
             handoff: None,
+            connection: "01JCZ8X4R3T5V6W7Y8Z9A0B1C2".to_owned(),
+            connection_requests: 1,
         }
     }
 

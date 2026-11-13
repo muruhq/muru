@@ -53,10 +53,10 @@ Chosen option: panels are data drawn by templates, because it gives one
 mechanism for every panel, keeps script out of panels and keeps the
 record small.
 
-- **A panel is data in the record,** in one of three shapes: `spans`,
-  named intervals on the request's clock, which may nest; `table`,
-  columns and rows; and `values`, names with values. The JSON of the
-  record carries the data, not HTML.
+- **A panel is data in the record,** made of three shapes, any of them
+  empty: `spans`, named intervals on the request's clock, which may
+  nest; `tables`, columns and rows; and `values`, names with values.
+  The JSON of the record carries the data, not HTML.
 
 - **A template draws it.** The edge renders each panel from a minijinja
   template when the panel is asked for, in the run's process. The

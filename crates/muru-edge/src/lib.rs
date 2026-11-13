@@ -45,8 +45,10 @@ pub mod ja4;
 pub mod link;
 pub mod metrics;
 pub mod occasions;
+pub mod panels;
 pub mod proxy;
 pub mod ratelimit;
+pub mod recorder;
 pub mod requests;
 pub mod routing;
 pub mod static_files;
@@ -113,6 +115,9 @@ pub struct Config {
     /// other edge processes (section 4.15); the process's own buckets
     /// when absent, or when the table cannot be mapped.
     pub rate_buckets: Option<PathBuf>,
+    /// Where a development run keeps its request records (section 11.7);
+    /// none outside development mode.
+    pub recorder: Option<Arc<recorder::Recorder>>,
 }
 
 /// An HTTPS listener next to the HTTP one (section 13.1 in development).
@@ -559,6 +564,8 @@ struct Shared {
     development: bool,
     /// Where a development run's responses link to (section 4.20).
     links: Arc<development::Links>,
+    /// Where a development run keeps its request records (section 11.7).
+    recorder: Option<Arc<recorder::Recorder>>,
     occasions: occasions::Setting,
     access_log: Arc<access::AccessLog>,
     /// The node's limits in force, which a snapshot may replace.
@@ -858,6 +865,7 @@ impl Edge {
                 request_ids: errors::RequestIds::new(),
                 development: config.development,
                 links: Arc::default(),
+                recorder: config.recorder.filter(|_| config.development),
                 occasions: config.occasions,
                 access_log,
                 tuning,
@@ -1057,6 +1065,7 @@ async fn accept(
             _ = draining.wait_for(|phase| *phase == Phase::Draining) => return Ok(()),
         };
         let _ = stream.set_nodelay(true);
+        let accepted = Instant::now();
         let shared = Arc::clone(&shared);
 
         // Section 4.18: a client over its share is closed at once; a full
@@ -1130,8 +1139,17 @@ async fn accept(
                         return;
                     }
 
+                    // Section 11.7: the connection's ID, from the request ID
+                    // generator.
+
+                    let connection = Arc::new(development::Connection::new(
+                        shared.request_ids.next(),
+                        accepted,
+                        false,
+                    ));
                     serve(
                         stream, peer, local, None, shared, tuning, token, guard, trusted,
+                        connection,
                     )
                     .await;
                 });
@@ -1163,6 +1181,11 @@ async fn accept(
                             metrics.count_tls_handshake(&listener, "completed");
                             let mut info = tls::info(stream.get_ref().1);
                             info.ja4 = ja4.unwrap_or_default();
+                            let connection = Arc::new(development::Connection::new(
+                                shared.request_ids.next(),
+                                accepted,
+                                true,
+                            ));
                             serve(
                                 stream,
                                 peer,
@@ -1173,6 +1196,7 @@ async fn accept(
                                 token,
                                 guard,
                                 trusted,
+                                connection,
                             )
                             .await;
                         }
@@ -1273,6 +1297,7 @@ async fn serve<I>(
     token: Arc<()>,
     guard: connections::Guard,
     trusted: bool,
+    connection: Arc<development::Connection>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1307,8 +1332,19 @@ async fn serve<I>(
         let base_id = shared.request_ids.next();
         let served = Arc::clone(&served);
         let limits = Arc::clone(&limits);
+        let connection = Arc::clone(&connection);
         let _ = first_request.send_replace(true);
         async move {
+            // Section 11.7: the request's place on its connection, and in
+            // a development run that keeps records, its headers as they
+            // arrived, masked.
+
+            let arrival = connection.arrive(shared.development);
+            let request_headers = shared
+                .recorder
+                .as_ref()
+                .map(|_| recorder::headers(request.headers()));
+
             // Section 4.7: forwarding headers from a trusted proxy say who
             // the client is and how it connected; from anyone else they
             // are removed.
@@ -1389,9 +1425,12 @@ async fn serve<I>(
             // Section 4.20: what a development run tells the browser,
             // gathered over every hop of the request.
 
-            let noted = shared
-                .development
-                .then(|| Arc::new(development::Request::default()));
+            let noted = shared.development.then(|| {
+                Arc::new(development::Request::new(
+                    shared.recorder.clone(),
+                    Arc::clone(&connection),
+                ))
+            });
 
             // Section 4.6: the limits of the route the client's own
             // request matched, over its host's and the node's, which its
@@ -1484,6 +1523,8 @@ async fn serve<I>(
                     mode: None,
                     received: Arc::clone(&received),
                     noted: noted.clone(),
+                    connection: Arc::clone(&connection),
+                    connection_request: arrival.position,
                 };
 
                 // Section 4.15: a client's own request draws from the
@@ -2090,15 +2131,16 @@ async fn serve<I>(
             // Section 4.17: compressed for the client when the policy and
             // the response allow it.
 
-            let mut response =
+            let (mut response, compressed) =
                 compression::apply(compression, &method, accept_encoding.as_ref(), response);
 
             // Section 4.18: the connection closes after its share of
             // requests.
 
             let count = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let closed_after = max_requests > 0 && count >= max_requests;
 
-            if max_requests > 0 && count >= max_requests {
+            if closed_after {
                 response
                     .headers_mut()
                     .insert(CONNECTION, HeaderValue::from_static("close"));
@@ -2142,6 +2184,27 @@ async fn serve<I>(
                     routing::PREVIEW_HEADER,
                     HeaderValue::from_static(routing::PREVIEW_IGNORED),
                 );
+            }
+
+            // Section 11.7: the head of a development run's record of the
+            // request, with the response's headers as the client gets them.
+
+            if let (Some(noted), Some(request_headers)) = (&noted, request_headers)
+                && noted.recorded()
+            {
+                noted.opened(recorder::head(recorder::Head {
+                    request_id: &base_id,
+                    method: method.as_str(),
+                    target: &client_target,
+                    version: parts.version,
+                    client: client.ip(),
+                    request_headers,
+                    response_headers: response.headers(),
+                    compressed,
+                    connection: &connection,
+                    arrival,
+                    closed_after,
+                }));
             }
 
             Ok::<_, Infallible>(response)
@@ -2557,6 +2620,7 @@ mod tests {
             https: None,
             spool: None,
             rate_buckets: None,
+            recorder: None,
         })
         .await
         .expect("binding the edge")

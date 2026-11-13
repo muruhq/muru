@@ -1,0 +1,21 @@
+{#- The Response panel: what was sent, compression, and the headers. -#}
+<table class="values">
+<tbody>
+{%- for value in panel.values %}
+<tr><th>{{ value.name }}</th><td>{{ value.value }}</td></tr>
+{%- endfor %}
+</tbody>
+</table>
+{%- for table in panel.tables %}
+<details>
+<summary>{{ table.caption }} <span class="badge">{{ table.rows|length }}</span></summary>
+<table class="mono">
+<thead><tr>{% for column in table.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead>
+<tbody>
+{%- for row in table.rows %}
+<tr>{% for cell in row.cells %}<td{% if cell == "***" %} class="muted" title="masked"{% endif %}>{{ cell }}</td>{% endfor %}</tr>
+{%- endfor %}
+</tbody>
+</table>
+</details>
+{%- endfor %}

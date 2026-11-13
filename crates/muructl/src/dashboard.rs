@@ -51,6 +51,8 @@ pub struct Inputs {
     pub logs: Logs,
     /// What the Processes section shows (section 13.10).
     pub processes: Arc<crate::run_admin::RunProcesses>,
+    /// The request records a development run keeps (section 11.7).
+    pub recorder: Option<Arc<muru_edge::recorder::Recorder>>,
 }
 
 /// Bind the dashboard and serve it in the background. Returns its address.
@@ -114,15 +116,83 @@ pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> 
             serde_json::to_value(answer).map_err(|error| error.to_string())
         })
     });
+    let requests = request_source(inputs.recorder.clone(), &inputs.app, bound);
     let source: Source = Arc::new(move || collect(&inputs));
     tokio::spawn(async move {
-        if let Err(error) =
-            muru_dashboard::serve(listener, source, metrics, history, debug, processes).await
+        if let Err(error) = muru_dashboard::serve(
+            listener, source, metrics, history, debug, processes, requests,
+        )
+        .await
         {
             tracing::warn!(%error, "the dashboard stopped");
         }
     });
     Ok(bound)
+}
+
+/// Section 10.7: a request's record for its page, its panels drawn from
+/// their templates and sanitised as the toolbar draws them.
+fn request_source(
+    recorder: Option<Arc<muru_edge::recorder::Recorder>>,
+    app: &str,
+    bound: SocketAddr,
+) -> muru_dashboard::RequestSource {
+    let renderer = muru_edge::panels::Renderer::new(Some(&format!("http://{bound}/")));
+    let app = app.to_owned();
+
+    Arc::new(move |request_id: &str| {
+        let Some(recorder) = &recorder else {
+            return Err(format!(
+                "{app} is not served by muructl run in development mode, which alone keeps \
+                 request records"
+            ));
+        };
+
+        let record = recorder.get(request_id).ok_or_else(|| {
+            format!(
+                "Request {request_id} is no longer kept: the run keeps the records of its last \
+                 {} requests.",
+                muru_edge::recorder::CAPACITY
+            )
+        })?;
+
+        Ok(request_view(&record, &renderer))
+    })
+}
+
+/// A record as the request page shows it.
+pub fn request_view(
+    record: &muru_proto::admin::v1::RequestRecord,
+    renderer: &muru_edge::panels::Renderer,
+) -> muru_dashboard::RequestView {
+    let summary = if record.in_progress {
+        format!("{} {} (in progress)", record.method, record.target)
+    } else {
+        format!(
+            "{} {} {} in {}",
+            record.method,
+            record.target,
+            record.status,
+            format_duration(Duration::from_secs_f64(record.total_ms.max(0.0) / 1000.0))
+        )
+    };
+
+    muru_dashboard::RequestView {
+        request_id: record.request_id.clone(),
+        summary,
+        in_progress: record.in_progress,
+        json: serde_json::to_value(record).unwrap_or_default(),
+        panels: record
+            .panels
+            .iter()
+            .map(|panel| muru_dashboard::PanelView {
+                name: panel.name.clone(),
+                title: panel.title.clone(),
+                html: renderer.render(panel),
+            })
+            .collect(),
+        stylesheet: muru_edge::panels::STYLESHEET,
+    }
 }
 
 fn collect(inputs: &Inputs) -> Data {
@@ -232,5 +302,6 @@ fn collect(inputs: &Inputs) -> Data {
             .iter()
             .map(|line| muru_dashboard::LogLine::parse(line))
             .collect(),
+        records: inputs.recorder.is_some(),
     }
 }

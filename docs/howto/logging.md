@@ -283,7 +283,8 @@ A JSON line has these fields:
  "version": "HTTP/1.1", "status": 200, "reason": "", "bytes": 18, "worker": 0,
  "retried": false, "queue_ms": 0.2, "app_ms": 0.3, "total_ms": 0.7, "snapshot": 3,
  "redirects": [],
- "client_class": "default", "websocket": null, "handoff": null}
+ "client_class": "default", "websocket": null, "handoff": null,
+ "connection": "01M5P6WZBK740HFT2N80MAV4YT", "connection_requests": 1}
 ```
 
 `reason` is empty for responses the application produced and names the
@@ -306,7 +307,12 @@ and null otherwise. `websocket` is null except on a WebSocket's
 closing line, where it holds `event` (`closed`), `by`, `code`, `close`
 (the outcome the [metrics](metrics.md) name), `received`, `sent` and
 `received_bytes`; that line's `total_ms` is how long the socket was open
-and its `bytes` what was sent to the client. The compact line shows the group, the mount and
+and its `bytes` what was sent to the client. `connection` names the
+connection the request arrived on, by an ID made as the request IDs are
+when the connection was accepted, and `connection_requests` is the
+request's position on it, 1 for the first, so the requests a keep-alive
+connection or an HTTP/2 connection carried can be picked out. Neither is
+on the compact line. The compact line shows the group, the mount and
 the class (as `class=`) only when they are not `default`.
 
 ## Times on log lines

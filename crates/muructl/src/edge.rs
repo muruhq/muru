@@ -173,6 +173,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             https: None,
             spool,
             rate_buckets: args.rate_buckets.clone(),
+            recorder: None,
         },
         inherited,
         Arc::clone(&resolver),

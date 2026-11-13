@@ -1387,6 +1387,8 @@ mod tests {
             client_class: "default".to_owned(),
             websocket: None,
             handoff: None,
+            connection: String::new(),
+            connection_requests: 1,
         }
     }
 

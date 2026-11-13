@@ -255,6 +255,9 @@ pub struct RunState {
     pub settings: Arc<crate::print_config::Settings>,
     /// What `muructl status --processes` lists (section 13.10).
     pub processes: Arc<RunProcesses>,
+    /// The request records a development run keeps (section 11.7); none
+    /// under `--allow-public` and `muructl serve`.
+    pub recorder: Option<Arc<muru_edge::recorder::Recorder>>,
 }
 
 /// What `muructl status --processes` lists of a development run or a
@@ -1430,6 +1433,34 @@ impl Admin for Service {
             request.limit as usize,
         );
         Ok(Response::new(muru_edge::requests::admin_list(report)))
+    }
+
+    async fn get_request(
+        &self,
+        request: Request<pb::GetRequestRequest>,
+    ) -> Result<Response<pb::RequestRecord>, Status> {
+        let request_id = request.into_inner().request_id;
+
+        let Some(recorder) = &self.state.recorder else {
+            return Err(Status::failed_precondition(format!(
+                "this {} of {} keeps no request records: only muructl run in development \
+                 mode does",
+                if self.state.processes.mode == "serve" {
+                    "muructl serve"
+                } else {
+                    "run with --allow-public"
+                },
+                self.state.app
+            )));
+        };
+
+        recorder.get(&request_id).map(Response::new).ok_or_else(|| {
+            Status::not_found(format!(
+                "request {request_id} is no longer kept: the run keeps the records of its last \
+                 {} requests",
+                muru_edge::recorder::CAPACITY
+            ))
+        })
     }
 
     async fn debug(

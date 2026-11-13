@@ -1239,6 +1239,10 @@ pub struct Context<'a> {
     /// What a development run notes of the request for its response
     /// (section 4.20); none outside development mode.
     pub noted: Option<Arc<crate::development::Request>>,
+    /// The connection the request arrived on (section 11.7).
+    pub connection: Arc<crate::development::Connection>,
+    /// The request's position on it, 1 for the first.
+    pub connection_request: u64,
 }
 
 impl<'a> Context<'a> {
@@ -1288,6 +1292,8 @@ impl<'a> Context<'a> {
             mode: None,
             received: Arc::clone(&self.received),
             noted: self.noted.clone(),
+            connection: Arc::clone(&self.connection),
+            connection_request: self.connection_request,
         }
     }
 }
@@ -1472,6 +1478,8 @@ impl Recording {
             client_class: context.client_class.to_string(),
             websocket: None,
             handoff: None,
+            connection: context.connection.id.clone(),
+            connection_requests: context.connection_request,
         };
 
         Self {
@@ -1526,6 +1534,11 @@ impl Recording {
         self.record.total = self.started.elapsed();
         let opened = self.record.clone();
         let log = Arc::clone(&self.log);
+
+        if let Some(noted) = &self.noted {
+            noted.logged(&self.record);
+        }
+
         log.record(self.record);
         log.open_websocket(opened)
     }
@@ -1544,6 +1557,13 @@ impl Recording {
         if self.silent {
             self.log.record_hop(&self.record);
         } else {
+            // Section 11.7: a development run's record of the request
+            // takes the access log's.
+
+            if let Some(noted) = &self.noted {
+                noted.logged(&self.record);
+            }
+
             self.log.record(self.record);
         }
     }

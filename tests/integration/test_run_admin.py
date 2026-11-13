@@ -356,6 +356,98 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
     assert not gone.exists()
 
 
+def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
+    """A development run keeps a record of each request (section 11.7),
+    which `muructl debug request` and the dashboard's request page read
+    by the ID the response names, with secret header values masked."""
+
+    port = support.free_port()
+    server = start(runtime, port=port)
+
+    def read(path: str) -> str:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=10) as response:
+            body: bytes = response.read()
+            return body.decode()
+
+    def record(request_id: str) -> dict[str, Any]:
+        answer = muructl(runtime, "debug", "request", request_id, "--json", cwd=support.FIXTURES)
+        assert "hunter2" not in answer.stdout
+        found: dict[str, Any] = json.loads(answer.stdout)
+        return found
+
+    try:
+        response = server.get("/", headers={"Cookie": "session=hunter2", "X-Api-Key": "hunter2"})
+        assert response.status == 200
+        request_id = response.header("x-request-id")
+        assert request_id is not None
+
+        # The record completes once the response has ended, which can
+        # come a moment after the client has read it.
+
+        deadline = time.monotonic() + 10
+
+        while (found := record(request_id))["in_progress"]:
+            assert time.monotonic() < deadline, found
+            time.sleep(0.05)
+
+        assert (found["method"], found["target"], found["status"]) == ("GET", "/", 200)
+        assert found["app"] == "plain-wsgi" and found["worker"] in (0, 1)
+        assert found["connection"]["position"] == 1
+        assert len(found["connection"]["id"]) == 26
+        assert found["connection"]["closed_after"] is False
+        sent = {header["name"]: header["value"] for header in found["request_headers"]}
+        assert sent["cookie"] == "***" and sent["x-api-key"] == "***"
+        answered = {header["name"] for header in found["response_headers"]}
+        assert {"x-request-id", "server-timing", "muru-request-link"} <= answered
+        assert found["compression"]["compressed"] is False
+        assert [panel["name"] for panel in found["panels"]] == [
+            "timing",
+            "where",
+            "response",
+            "connection",
+        ]
+
+        # The text form names the request and draws each panel.
+
+        text = muructl(runtime, "debug", "request", request_id, cwd=support.FIXTURES).stdout
+        assert text.startswith("GET / HTTP/1.1  200  "), text
+        assert f"request {request_id}\n" in text
+        assert "\nTiming\n" in text and "    application" in text
+        assert "    cookie: ***" in text
+
+        # The access log's JSON names the connection in every mode.
+
+        logged = muructl(runtime, "logs", "--access", "--json", cwd=support.FIXTURES).stdout
+        line = next(json.loads(row) for row in logged.splitlines() if request_id in row)
+        assert line["connection"] == found["connection"]["id"]
+        assert line["connection_requests"] == 1
+
+        # The dashboard's page holds the same panels, and its JSON is the
+        # record; the recent requests link to the page.
+
+        page = read(f"/request/{request_id}")
+        assert '<section id="panel-timing" class="panel">' in page
+        assert "<h2>Connection</h2>" in page and "hunter2" not in page
+        assert json.loads(read(f"/v1/requests/{request_id}"))["request_id"] == request_id
+        assert f'href="request/{request_id}"' in read("/fragment/requests")
+
+        # A request the run does not keep is said to be so.
+
+        missing = muructl(
+            runtime, "debug", "request", "NOSUCHREQUEST", cwd=support.FIXTURES, check=False
+        )
+        assert missing.returncode != 0
+        assert "request NOSUCHREQUEST is no longer kept" in missing.stderr
+
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            read("/v1/requests/NOSUCHREQUEST")
+
+        assert refused.value.code == 404
+        assert "no longer kept" in json.loads(refused.value.read())["error"]
+    finally:
+        server.stop()
+
+
 def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
     port = support.free_port()
     server = start(runtime, port=port)

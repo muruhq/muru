@@ -124,6 +124,10 @@ service Admin {
   // group and listed (section 11.7).
   rpc ListRequests(ListRequestsRequest) returns (RequestList);
 
+  // A development run's record of one request, by its ID (section
+  // 11.7). The daemon and muructl serve keep none.
+  rpc GetRequest(GetRequestRequest) returns (RequestRecord);
+
   // Re-read the daemon's configuration file for what can change while
   // running (section 13.3).
   rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
@@ -323,6 +327,101 @@ message OpenWebSocket {
   uint64 sent = 12;                 // messages to the client
   uint64 received_bytes = 13;
   uint64 sent_bytes = 14;
+}
+
+message GetRequestRequest {
+  string request_id = 1;
+}
+
+// What a development run keeps of one request (section 11.7): the
+// access log's record, the connection, the headers with secret values
+// masked, the compression decision, and the panels drawn from them.
+// Bodies are never kept.
+message RequestRecord {
+  string request_id = 1;
+  bool in_progress = 2;             // the response has not ended yet
+  uint64 started_unix_ms = 3;
+  string client = 4;
+  string app = 5;
+  string release = 6;
+  string host = 7;
+  string virtual_host = 8;
+  string group = 9;
+  string mount = 10;
+  uint64 snapshot = 11;
+  string method = 12;
+  string target = 13;               // the path with its query string
+  string version = 14;
+  string listener = 15;
+  uint32 status = 16;
+  string reason = 17;               // the edge's, when it produced the response
+  uint64 bytes = 18;                // body bytes sent
+  uint64 received = 19;             // body bytes received
+  optional uint32 worker = 20;      // its index within its group
+  bool retried = 21;
+  double queue_ms = 22;
+  double app_ms = 23;
+  double total_ms = 24;
+  repeated string redirects = 25;   // internal redirect targets, in order
+  string client_class = 26;
+  string handoff = 27;              // asgi or wsgi when the worker handed it across
+  RequestConnection connection = 28;
+  repeated RecordedHeader request_headers = 29;
+  repeated RecordedHeader response_headers = 30;
+  RequestCompression compression = 31;
+  repeated Panel panels = 32;
+}
+
+message RequestConnection {
+  string id = 1;
+  uint64 position = 2;              // 1 for the connection's first request
+  double idle_ms = 3;               // idle before the request arrived
+  optional double tls_handshake_ms = 4;  // the first request on a TLS connection
+  bool closed_after = 5;            // closed after this response: its share of requests was reached
+}
+
+message RecordedHeader {
+  string name = 1;
+  string value = 2;                 // *** when masked
+}
+
+message RequestCompression {
+  bool compressed = 1;
+  string encoding = 2;              // the encoding sent, or the one the response already had
+  string skipped = 3;               // why not, when not compressed
+}
+
+// One panel of a request's record, as data (ADR 0063): spans on the
+// request's clock, values, and tables, any of them empty.
+message Panel {
+  string name = 1;                  // timing, where, response, connection
+  string title = 2;
+  repeated PanelSpan spans = 3;
+  repeated PanelValue values = 4;
+  repeated PanelTable tables = 5;
+}
+
+message PanelSpan {
+  string name = 1;
+  double start_ms = 2;              // from the request's arrival
+  double duration_ms = 3;
+  string category = 4;
+  repeated PanelSpan children = 5;
+}
+
+message PanelValue {
+  string name = 1;
+  string value = 2;
+}
+
+message PanelTable {
+  string caption = 1;
+  repeated string columns = 2;
+  repeated PanelRow rows = 3;
+}
+
+message PanelRow {
+  repeated string cells = 1;
 }
 
 message ListRequestsRequest {
