@@ -13,7 +13,7 @@
   {% for app in data.apps %}
   {% for release in app.releases %}
   <tr>
-    <td>{% if release.workers > 0 %}<a href="workers?release={{ app.name }}@{{ release.id }}">{{ app.name }}@{{ release.id }}</a>{% else %}{{ app.name }}@{{ release.id }}{% endif %}{% if !app.maintenance_since.is_empty() && release.serving %} <span class="state-draining">maintenance since {{ app.maintenance_since }}</span>{% endif %}</td>
+    <td>{% if release.workers > 0 %}<a href="workers?release={{ app.name }}@{{ release.id }}">{{ app.name }}@{{ release.id }}</a>{% else %}{{ app.name }}@{{ release.id }}{% endif %}{% if !app.maintenance_since.is_empty() && release.serving %} <span class="state-draining">maintenance since <time datetime="{{ app.maintenance_since }}">{{ app.maintenance_since }}</time></span>{% endif %}</td>
     <td class="state-{{ release.state }}">{{ release.state }}</td>
     <td>{% if release.serving %}yes{% endif %}</td>
     <td class="num">{{ release.workers }}</td>
@@ -21,7 +21,7 @@
     {% if data.has_event_loop() %}<td class="num">{{ crate::side_cell(release.event_loop) }}</td>{% endif %}
     <td class="num">{{ release.websockets }}</td>
     <td class="num">{{ release.waiting }}</td>
-    <td>{{ release.created }}</td>
+    <td><time datetime="{{ release.created }}">{{ release.created }}</time></td>
     <td>{{ release.message }}</td>
   </tr>
   {% endfor %}
@@ -33,7 +33,7 @@
 <table>
   <tr><th>Rollout</th><th>Candidate</th><th>Baseline</th><th>State</th><th class="num">Share</th><th>Updated</th><th>Message</th></tr>
   {% for rollout in data.rollouts %}
-  <tr><td>{{ rollout.app }} {{ rollout.id }}</td><td>{{ rollout.candidate }}</td><td>{{ rollout.baseline }}</td><td class="rollout-{{ rollout.state }}">{{ rollout.state }}</td><td class="num">{{ rollout.percent }}%</td><td>{{ rollout.updated }}</td><td>{{ rollout.message }}</td></tr>
+  <tr><td>{{ rollout.app }} {{ rollout.id }}</td><td>{{ rollout.candidate }}</td><td>{{ rollout.baseline }}</td><td class="rollout-{{ rollout.state }}">{{ rollout.state }}</td><td class="num">{{ rollout.percent }}%</td><td><time datetime="{{ rollout.updated }}">{{ rollout.updated }}</time></td><td>{{ rollout.message }}</td></tr>
   {% endfor %}
 </table>
 {% endif %}
@@ -52,7 +52,7 @@
 <table>
   <tr><th>Host</th><th>Names</th><th>Listeners</th><th>TLS</th><th>Default</th></tr>
   {% for host in data.hosts %}
-  <tr><td>{{ host.name }}{% if !host.maintenance_since.is_empty() %} <span class="state-draining">maintenance since {{ host.maintenance_since }}</span>{% endif %}</td><td>{{ host.names.join(", ") }}</td><td>{{ host.listeners.join(", ") }}</td><td>{% if host.tls %}yes{% endif %}</td><td>{% if host.default %}yes{% endif %}</td></tr>
+  <tr><td>{{ host.name }}{% if !host.maintenance_since.is_empty() %} <span class="state-draining">maintenance since <time datetime="{{ host.maintenance_since }}">{{ host.maintenance_since }}</time></span>{% endif %}</td><td>{{ host.names.join(", ") }}</td><td>{{ host.listeners.join(", ") }}</td><td>{% if host.tls %}yes{% endif %}</td><td>{% if host.default %}yes{% endif %}</td></tr>
   {% endfor %}
 </table>
 {% endif %}

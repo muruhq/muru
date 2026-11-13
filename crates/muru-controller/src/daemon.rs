@@ -2739,7 +2739,7 @@ impl Daemon {
                         pools.iter().map(|pool| pool.loop_slots as usize).sum(),
                     ),
                     waiting: pools.iter().map(|pool| pool.waiting as usize).sum(),
-                    created: clock_hms(release.created_unix_ms),
+                    created: full_time(release.created_unix_ms),
                 });
             }
 
@@ -2750,7 +2750,7 @@ impl Daemon {
                 previous: app.previous.clone().unwrap_or_default(),
                 maintenance_since: maintenance
                     .get(&app.name)
-                    .map(|since| clock_hms(*since))
+                    .map(|since| full_time(*since))
                     .unwrap_or_default(),
                 releases,
             });
@@ -2846,7 +2846,7 @@ impl Daemon {
                 baseline: rollout.baseline,
                 state: rollout.state.as_str().to_owned(),
                 message: rollout.message,
-                updated: clock_hms(rollout.updated_unix_ms),
+                updated: full_time(rollout.updated_unix_ms),
             })
             .collect();
 
@@ -2859,7 +2859,7 @@ impl Daemon {
                 maintenance_since: self
                     .host_maintenance
                     .get(&name)
-                    .map(|since| clock_hms(*since))
+                    .map(|since| full_time(*since))
                     .unwrap_or_default(),
                 name,
                 names: host.names,
@@ -10370,17 +10370,6 @@ fn unix_ms_of(instant: Option<Instant>) -> u64 {
 /// 11.8, for the dashboard to show as the viewer's local clock.
 pub(crate) fn full_time(unix_ms: u64) -> String {
     muru_common::log::full(std::time::UNIX_EPOCH + Duration::from_millis(unix_ms))
-}
-
-/// A Unix time as HH:MM:SS, UTC.
-pub(crate) fn clock_hms(unix_ms: u64) -> String {
-    let seconds = (unix_ms / 1000) % 86_400;
-    format!(
-        "{:02}:{:02}:{:02}",
-        seconds / 3600,
-        (seconds % 3600) / 60,
-        seconds % 60
-    )
 }
 
 /// A Unix time as HH:MM with the zone, UTC: how `release list` and the

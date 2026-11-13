@@ -9597,17 +9597,12 @@ fn format_access_line(line: &str, timed: bool) -> String {
 }
 
 fn format_event(event: &pb::Event) -> String {
-    let seconds = event.time_unix_ms / 1000;
-    let time = time::OffsetDateTime::from_unix_timestamp(seconds as i64)
-        .map(|time| {
-            format!(
-                "{:02}:{:02}:{:02}",
-                time.hour(),
-                time.minute(),
-                time.second()
-            )
-        })
-        .unwrap_or_default();
+    // Section 11.8: a short clock is the reader's local time (issue 625);
+    // `--json` keeps the full UTC time.
+
+    let at = std::time::UNIX_EPOCH + Duration::from_millis(event.time_unix_ms);
+    let clock = muru_common::log::clock(at);
+    let time = clock.split('.').next().unwrap_or_default();
     format!(
         "{:>6} {time} {:<8} {:<20} {:<24} {}",
         event.sequence, event.level, event.r#type, event.subject, event.message
