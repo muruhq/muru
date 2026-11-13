@@ -1370,8 +1370,12 @@ async fn serve<I>(
                 let renderer = shared
                     .renderer
                     .get_or_init(|| panels::Renderer::new(shared.links.dashboard()));
-                let hosts = shared.links.hosts();
-                return Ok::<_, Infallible>(toolbar::answer(&parts, hosts, recorder, renderer));
+                return Ok::<_, Infallible>(toolbar::answer(
+                    &parts,
+                    &shared.links,
+                    recorder,
+                    renderer,
+                ));
             }
             let forwarded = routing.trust_on(&local).resolve(&peer, &mut parts.headers);
             let accept_encoding = parts.headers.get(http::header::ACCEPT_ENCODING).cloned();

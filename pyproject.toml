@@ -57,6 +57,12 @@ docs = [
 package = false
 default-groups = ["dev", "docs", "fixtures", "grpc"]
 
+# The docs are built on a current interpreter. soupsieve, which furo brings
+# in, is past CVE-2026-126190 only from 4.0, which needs Python 3.11.5, so
+# the docs group is not resolved for anything older (#653).
+[tool.uv.dependency-groups]
+docs = { requires-python = ">=3.11.5" }
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

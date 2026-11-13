@@ -6,9 +6,13 @@
 //! The times are taken where the worker already handles each piece of the
 //! response: start_response or the head, the body as the link's writer
 //! takes it, and the application's end. The log records are kept by the
-//! runtime library's record factory, by the request's id.
+//! runtime library's record factory, by the request's id. What held the
+//! request up is taken where the worker already measures it: the GIL
+//! waits of section 7.3, the garbage collector's totals of section 11.1
+//! read at the start and the end, and the event loop's late heartbeats.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use muru_proto::worker::v1 as pb;
@@ -20,6 +24,16 @@ use crate::wsgi::Outgoing;
 /// The runtime library's functions that keep a request's log records.
 static CAPTURE: PyOnceLock<(Py<PyAny>, Py<PyAny>)> = PyOnceLock::new();
 
+/// Set once the edge has asked for a record, which it does only in a
+/// development run: until then the pool and the event loop's heartbeat
+/// keep nothing for one.
+static ASKED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the edge has asked this worker for a record.
+pub(crate) fn asked() -> bool {
+    ASKED.load(Ordering::Relaxed)
+}
+
 /// What the worker saw of one request, for its record.
 #[derive(Debug)]
 pub struct Trace {
@@ -27,6 +41,8 @@ pub struct Trace {
     started: Instant,
     /// The same moment on the wall clock, for the log records' times.
     started_wall: SystemTime,
+    /// The garbage collector's totals then, by generation.
+    gc_before: [(u64, u64); 4],
     state: Mutex<State>,
 }
 
@@ -44,6 +60,13 @@ struct State {
     body_source: Option<&'static str>,
     sent_by_edge: bool,
     error: Option<Failure>,
+    /// From the worker taking the request to a thread having it.
+    thread_wait: Option<Duration>,
+    /// The waits for the GIL on the request's behalf: their sum, how
+    /// many, and the first.
+    gil_wait: Duration,
+    gil_waits: u32,
+    gil_first: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -59,10 +82,12 @@ impl Trace {
     /// from `default_source` unless something more particular is seen.
     pub fn new(started: Instant, default_source: &'static str) -> Self {
         let elapsed = started.elapsed();
+        ASKED.store(true, Ordering::Relaxed);
 
         Self {
             started,
             started_wall: SystemTime::now() - elapsed,
+            gc_before: crate::gc::totals(),
             state: Mutex::new(State {
                 default_source,
                 ..State::default()
@@ -89,6 +114,30 @@ impl Trace {
     /// The thread that runs the application, by its name.
     pub fn thread(&self, name: &str) {
         self.state().thread = name.to_owned();
+    }
+
+    /// An application thread took the request at `ready`, and then
+    /// waited `waited` for the GIL.
+    pub fn picked_up(&self, ready: Instant, waited: Duration) {
+        self.state()
+            .thread_wait
+            .get_or_insert(ready.saturating_duration_since(self.started));
+        self.gil(waited);
+    }
+
+    /// The request's thread, or the event loop on its behalf, waited
+    /// `waited` for the GIL. A build without one has no GIL wait.
+    pub fn gil(&self, waited: Duration) {
+        if crate::signals::gil_enabled() {
+            self.add_gil(waited);
+        }
+    }
+
+    fn add_gil(&self, waited: Duration) {
+        let mut state = self.state();
+        state.gil_wait += waited;
+        state.gil_waits += 1;
+        state.gil_first.get_or_insert(waited);
     }
 
     /// The application called start_response; the first call counts.
@@ -164,7 +213,7 @@ impl Trace {
         // A response that failed ends the writer before the application's
         // end reaches it; the record is made once the application is done.
 
-        state.close.get_or_insert(at);
+        let close = *state.close.get_or_insert(at);
         let millis = |at: Option<Duration>| at.map_or(0.0, |at| at.as_secs_f64() * 1000.0);
 
         let (outcome, reason) = match (&state.error, cancelled) {
@@ -175,6 +224,13 @@ impl Trace {
             (Some(failure), _) => ("failed", failure.reason.clone()),
             (None, false) => ("completed", String::new()),
         };
+
+        // The collections that ended meanwhile, and the longest the event
+        // loop was held, which belong to the worker and not the request.
+
+        let gc = gc_during(&self.gc_before, &crate::gc::totals());
+        let (loop_lag_at, loop_lag) = crate::link::loop_held(self.started, self.started + close)
+            .unwrap_or((Duration::ZERO, Duration::ZERO));
 
         let started_wall = self.started_wall;
         let lines = logs
@@ -227,8 +283,31 @@ impl Trace {
                 .unwrap_or_default(),
             logs: lines,
             logs_dropped: logs.dropped,
+            thread_wait: millis(state.thread_wait),
+            gil_wait: millis(Some(state.gil_wait)),
+            gil_waits: state.gil_waits,
+            gil_wait_first: millis(state.gil_first),
+            gc,
+            loop_lag: millis(Some(loop_lag)),
+            loop_lag_at: millis(Some(loop_lag_at)),
         }
     }
+}
+
+/// The collections between two reads of the collector's totals, for each
+/// generation that had any.
+fn gc_during(before: &[(u64, u64); 4], after: &[(u64, u64); 4]) -> Vec<pb::GcDuring> {
+    before
+        .iter()
+        .zip(after)
+        .enumerate()
+        .filter(|(_, (before, after))| after.0 > before.0)
+        .map(|(slot, (before, after))| pb::GcDuring {
+            generation: crate::gc::name(slot).to_owned(),
+            collections: u32::try_from(after.0 - before.0).unwrap_or(u32::MAX),
+            ms: after.1.saturating_sub(before.1) as f64 / 1_000_000.0,
+        })
+        .collect()
 }
 
 /// A request's log records as the runtime library kept them: each one's
@@ -337,6 +416,41 @@ mod tests {
             gone.to_message(true, Logs::default()).outcome,
             "client_disconnected"
         );
+    }
+
+    #[test]
+    fn what_held_the_request_up_is_on_its_record() {
+        let started = Instant::now();
+        let trace = Trace::new(started, "iterable");
+        trace.state().thread_wait = Some(Duration::from_millis(3));
+        trace.add_gil(Duration::from_millis(2));
+        trace.add_gil(Duration::from_millis(1));
+        let record = trace.to_message(false, Logs::default());
+        assert!((record.thread_wait - 3.0).abs() < 1e-9);
+        assert!((record.gil_wait - 3.0).abs() < 1e-9);
+        assert_eq!(record.gil_waits, 2);
+        assert!((record.gil_wait_first - 2.0).abs() < 1e-9);
+
+        // A thread that took the request later counts from the worker
+        // taking it.
+
+        let later = Trace::new(started, "iterable");
+        later
+            .state()
+            .thread_wait
+            .get_or_insert(Duration::from_millis(5));
+        assert!(later.to_message(false, Logs::default()).thread_wait >= 5.0);
+
+        // Only the generations with collections in between are named.
+
+        let gc = gc_during(
+            &[(4, 1_000_000), (1, 0), (0, 0), (0, 0)],
+            &[(6, 3_500_000), (1, 0), (1, 2_000_000), (0, 0)],
+        );
+        assert_eq!(gc.len(), 2);
+        assert_eq!((gc[0].generation.as_str(), gc[0].collections), ("0", 2));
+        assert!((gc[0].ms - 2.5).abs() < 1e-9);
+        assert_eq!((gc[1].generation.as_str(), gc[1].collections), ("2", 1));
     }
 
     #[test]

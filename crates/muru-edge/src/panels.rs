@@ -251,6 +251,44 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
                 ));
             }
 
+            // What held the request up, where it can be placed: the wait
+            // for a thread, the first wait for the GIL after it, and the
+            // longest the event loop was held.
+
+            if worker.thread_wait > 0.0 {
+                phases.push(span(
+                    "waiting for a thread",
+                    at(0.0),
+                    worker.thread_wait,
+                    "contention",
+                ));
+            }
+
+            if worker.gil_wait_first > 0.0 {
+                phases.push(span(
+                    "waiting for the GIL",
+                    at(worker.thread_wait),
+                    worker.gil_wait_first,
+                    "contention",
+                ));
+            }
+
+            if worker.loop_lag > 0.0 {
+                phases.push(span(
+                    "event loop held",
+                    at(worker.loop_lag_at),
+                    worker.loop_lag,
+                    "contention",
+                ));
+            }
+
+            // A wait goes before the phase that starts with it.
+
+            phases.sort_by(|one, other| {
+                one.start_ms.total_cmp(&other.start_ms).then_with(|| {
+                    (one.category != "contention").cmp(&(other.category != "contention"))
+                })
+            });
             let mut whole = span("in the worker", at(0.0), worker.to_close, "worker");
             whole.children = phases;
 
@@ -280,7 +318,100 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
         title: "Timing".to_owned(),
         spans,
         values,
-        ..Default::default()
+        tables: record
+            .from_worker
+            .as_ref()
+            .map(during)
+            .filter(|table| !table.rows.is_empty())
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// `count` of `noun`, in the plural unless it is one.
+fn counted(count: u32, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// What held a request up while the worker had it, as a table of what
+/// and how long, with what the timeline cannot place: the GIL waits in
+/// all and the garbage collections. Empty when nothing did.
+fn during(worker: &admin::WorkerPart) -> admin::PanelTable {
+    let mut rows = Vec::new();
+    let mut row = |what: &str, took: String| {
+        rows.push(admin::PanelRow {
+            cells: vec![what.to_owned(), took],
+        });
+    };
+
+    if worker.thread_wait > 0.0 {
+        row("waiting for a thread", millis(worker.thread_wait));
+    }
+
+    if worker.gil_waits > 0 {
+        row(
+            "waiting for the GIL",
+            format!(
+                "{} in {}",
+                millis(worker.gil_wait),
+                counted(worker.gil_waits, "wait")
+            ),
+        );
+    }
+
+    if !worker.gc.is_empty() {
+        let collections: u32 = worker
+            .gc
+            .iter()
+            .map(|generation| generation.collections)
+            .sum();
+        let ms: f64 = worker.gc.iter().map(|generation| generation.ms).sum();
+        let generations: Vec<String> = worker
+            .gc
+            .iter()
+            .map(|generation| {
+                let name = if generation.generation == "full" {
+                    "the whole heap".to_owned()
+                } else {
+                    format!("generation {}", generation.generation)
+                };
+                format!(
+                    "{} of {name} in {}",
+                    generation.collections,
+                    millis(generation.ms)
+                )
+            })
+            .collect();
+        row(
+            "garbage collection",
+            format!(
+                "{} in {}: {}",
+                millis(ms),
+                counted(collections, "collection"),
+                generations.join(", ")
+            ),
+        );
+    }
+
+    if worker.loop_lag > 0.0 {
+        row(
+            "event loop held",
+            format!(
+                "{} at the longest, from {} on the worker's clock",
+                millis(worker.loop_lag),
+                millis(worker.loop_lag_at)
+            ),
+        );
+    }
+
+    admin::PanelTable {
+        caption: "During the request".to_owned(),
+        columns: vec!["What".to_owned(), "Took".to_owned()],
+        rows,
     }
 }
 
@@ -697,6 +828,51 @@ mod tests {
         missing.worker_part = crate::recorder::WORKER_MISSING.to_owned();
         let html = Renderer::new(None).render(&timing(&missing));
         assert!(html.contains("The worker's part did not arrive"), "{html}");
+    }
+
+    #[test]
+    fn the_timing_panel_marks_what_held_the_request_up() {
+        let mut record = fixture();
+        let worker = record.from_worker.as_mut().unwrap();
+        worker.thread_wait = 0.5;
+        worker.gil_wait = 0.4;
+        worker.gil_waits = 3;
+        worker.gil_wait_first = 0.3;
+        worker.gc = vec![admin::RequestGc {
+            generation: "2".to_owned(),
+            collections: 1,
+            ms: 1.5,
+        }];
+        worker.loop_lag = 9.0;
+        worker.loop_lag_at = 4.0;
+        let html = Renderer::new(None).render(&timing(&record));
+
+        // The waits that can be placed are spans in the worker's, in the
+        // order they began.
+
+        let thread = html.find(">waiting for a thread</td>").unwrap();
+        let gil = html.find(">waiting for the GIL</td>").unwrap();
+        let held = html.find(">event loop held</td>").unwrap();
+        let body = html.find(">producing the body</td>").unwrap();
+        assert!(thread < gil && gil < held && held < body, "{html}");
+        assert!(html.contains("<tr class=\"contention\">"), "{html}");
+
+        // The table has all of it.
+
+        assert!(
+            html.contains("<caption>During the request</caption>"),
+            "{html}"
+        );
+        assert!(html.contains("0.4ms in 3 waits"), "{html}");
+        assert!(
+            html.contains("1.5ms in 1 collection: 1 of generation 2 in 1.5ms"),
+            "{html}"
+        );
+        assert!(html.contains("9.0ms at the longest, from 4.0ms"), "{html}");
+
+        // Nothing held up, no table.
+
+        assert!(timing(&fixture()).tables.is_empty());
     }
 
     #[test]

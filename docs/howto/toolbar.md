@@ -59,6 +59,75 @@ A changed page loses its `Content-Length` and a strong `ETag` becomes
 weak, since its bytes are no longer the application's own. Compression
 applies after the tag is inserted.
 
+### Every request the page made
+
+The toolbar's "This page" tab lists every request the page has made:
+the document itself, its stylesheets, scripts and images, and the calls
+its scripts made with `fetch()` or `XMLHttpRequest`, as a waterfall on
+the page's clock. The list and its timings come from the browser, and
+the toolbar matches each request to its record by the ID in its
+`Server-Timing` header, so nothing in the page's own code is changed.
+Requests the page makes later are added as they end.
+
+Each row has:
+
+- the request's address, and what made it, as the browser names it:
+  `navigation` for the document, `script`, `css`, `img`, `fetch`,
+  `xmlhttprequest` and so on;
+
+- its status, and how long it took, from the browser starting it until
+  the last byte of its response arrived;
+
+- a bar placed where the request falls on the page's clock, with the
+  time it waited for a worker drawn in blue where the request reached
+  Muru, so a request queued behind another of the page's requests shows
+  as one;
+
+- from its record, how long it waited for a worker, the worker that
+  served it (`edge` for a request Muru answered itself, such as a static
+  file), and its log records and errors;
+
+- its connection: a short label for each connection the page's requests
+  used, `c1`, `c2` and so on in the order they first appear, with the
+  request's position on it, and whether the browser opened the
+  connection for it (`new`) or used one already open (`reused`);
+
+- the protocol the browser used, such as `http/1.1` or `h2`.
+
+Clicking a row opens that request's record: the tabs show its panels,
+and "this page's request" goes back to the document's. A request whose
+response is still streaming is refreshed until it ends.
+
+Some rows have the browser's figures and no record:
+
+- a response the browser took from its cache is marked `cache`, since
+  no request reached Muru, rather than shown with the record of the
+  response it was first cached from;
+
+- a request to another origin, such as a font from a CDN;
+
+- a request whose record is no longer kept, which says so.
+
+The browser decides what the list holds, and the tab states its limits:
+
+- A request is listed when its response ends, so a streamed response or
+  a long-running fetch appears only once it has finished.
+
+- WebSockets are not listed.
+
+- The browser holds 250 of a page's requests by default until the
+  toolbar starts, and drops the rest; requests made after the toolbar
+  started are all listed. The tab says when the browser's list was full.
+
+- Redirects that led to the page are not shown: the document's row is
+  the response that ended them.
+
+- A page that is not a secure context gets no `Server-Timing` from the
+  browser, so only the document's own row has its record. `localhost`,
+  a loopback address and an HTTPS page are secure contexts; a name given
+  with `--host` and served over plain HTTP is not, and is served over
+  HTTPS with [`--https`](https.md).
+
 ### Content security policy
 
 The tag is loaded from the page's own origin, so a policy that allows
@@ -78,6 +147,12 @@ own address, answered by Muru without reaching the application:
 | `/_muru/toolbar.js`, `/_muru/toolbar.css` | the toolbar itself |
 | `/_muru/requests/ID.json` | the record, as `muructl debug request ID --json` prints it |
 | `/_muru/requests/ID/panels/NAME.html` | one panel of the record, drawn |
+| `/_muru/requests?ids=ID,ID` | what the "This page" tab shows of each request named, at most 100 |
+
+`requests?ids=` answers with `requests`, one entry for each request
+named that is still kept, with its method, target, status, times,
+worker, counts of log records and errors, connection and the address of
+its page on the dashboard, and `not_kept`, the IDs of the rest.
 
 They answer GET only, with or without `--toolbar`, and only to requests
 for `localhost`, a loopback address or a name the run was given with
@@ -155,6 +230,29 @@ The page shows the record as panels:
     or the ASGI application returned;
   - **sending the response**, from the head's arrival until the last
     byte was sent to the client.
+
+  Under "in the worker", marked where they happened, are the waits that
+  were not the request's own work:
+
+  - **waiting for a thread**, from the worker taking a WSGI request
+    until one of its threads started it;
+
+  - **waiting for the GIL**, as that thread, or the event loop for an
+    ASGI request, started running Python;
+
+  - **event loop held**, the longest stretch during the request in
+    which the worker's event loop did not get to run. It says the loop
+    was blocked, by this request or another one on it, not what blocked
+    it.
+
+  A table under the waterfall, "During the request", gives the same
+  with what cannot be placed on it: the GIL wait in all with how many
+  waits there were, counting those as an ASGI request's `receive()`
+  calls were woken, and the garbage collections that ran while the
+  request was in the worker, how many and how long they took, by
+  generation. A collection pauses every thread of the worker, so it
+  holds up whatever requests are in flight. On a free-threaded build
+  there is no GIL, and no GIL wait is shown.
 
   The panel lists the same under "What the phases are".
 

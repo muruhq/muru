@@ -393,6 +393,19 @@ message WorkerPart {
   string traceback = 13;
   repeated RequestLog logs = 14;
   uint32 logs_dropped = 15;
+  double thread_wait = 16;          // a WSGI request's wait for an application thread
+  double gil_wait = 17;             // its waits for the GIL, summed; 0 without a GIL
+  uint32 gil_waits = 18;
+  double gil_wait_first = 19;       // the wait as it started
+  repeated RequestGc gc = 20;       // collections that ended during the request, by generation
+  double loop_lag = 21;             // the longest stretch of the request with the event loop held
+  double loop_lag_at = 22;          // when that stretch began
+}
+
+message RequestGc {
+  string generation = 1;            // 0, 1, 2, or full on a free-threaded build
+  uint32 collections = 2;
+  double ms = 3;
 }
 
 message RequestLog {

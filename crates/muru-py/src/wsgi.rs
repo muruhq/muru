@@ -1070,6 +1070,10 @@ pub fn run(
                 .name()
                 .unwrap_or("application thread"),
         );
+
+        if let Some((ready, waited)) = crate::pool::take_pickup() {
+            trace.picked_up(ready, waited);
+        }
     }
 
     let start_response = match Bound::new(py, started) {

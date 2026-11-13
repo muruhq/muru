@@ -18,6 +18,19 @@
 .footer { display: flex; justify-content: space-between; gap: 1em; padding: 0.4em 1em; border-top: 1px solid #e4ebf2; font-size: 12px; }
 .footer a { color: #2f6fde; }
 .muted { color: #627d98; }
+.tabs .shown { display: flex; gap: 0.6em; align-items: baseline; margin-left: 0.75em; padding: 0.3em 0; font-size: 12px; }
+.tabs .back { padding: 0; border: none; background: none; font: inherit; color: #2f6fde; text-decoration: underline; cursor: pointer; }
+
+/* The page view: a row for each request the page made, with its bar on
+   the page's clock and its queue drawn over it. */
+.page th, .page td { white-space: nowrap; }
+.page .what { max-width: 20rem; overflow: hidden; text-overflow: ellipsis; }
+.page tr.pick { cursor: pointer; }
+.page tr.pick:hover td { background: rgba(47, 111, 222, 0.08); }
+.page tr.shown td { background: rgba(47, 111, 222, 0.16); }
+.panel .page .track { min-width: 10rem; }
+.panel .page .bar.queue { background: #5b8def; }
+.panel .page tr.plain .bar { background: #9fb3c8; }
 @media (prefers-color-scheme: dark) {
   .toolbar { color: #d9e2ec; }
   .body { background: #1f2933; border-color: #334e68; }
