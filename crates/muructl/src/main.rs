@@ -3759,6 +3759,19 @@ async fn run_with(
         {
             Ok(address) => {
                 muru_common::muru_println!("dashboard on http://{address}/");
+
+                // Section 4.20: each response of a development run names
+                // its request's page, under the address the dashboard is
+                // reached at, as the login links do.
+
+                if development {
+                    let reached = std::env::var("MURU_DASHBOARD_URL")
+                        .ok()
+                        .filter(|url| !url.trim().is_empty())
+                        .unwrap_or_else(|| format!("http://{address}/"));
+                    edge.links().set_dashboard(reached.trim());
+                }
+
                 dashboard_address = Some(address);
             }
             Err(error) => muru_common::muru_println!("no dashboard: {error:#}"),

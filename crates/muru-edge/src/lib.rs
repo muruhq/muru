@@ -36,6 +36,7 @@ pub mod buckets;
 pub mod classify;
 pub mod compression;
 pub mod connections;
+pub mod development;
 pub mod endpoints;
 pub mod errors;
 pub mod grpc;
@@ -556,6 +557,8 @@ struct Shared {
     pools: Arc<Pools>,
     request_ids: errors::RequestIds,
     development: bool,
+    /// Where a development run's responses link to (section 4.20).
+    links: Arc<development::Links>,
     occasions: occasions::Setting,
     access_log: Arc<access::AccessLog>,
     /// The node's limits in force, which a snapshot may replace.
@@ -854,6 +857,7 @@ impl Edge {
                 pools,
                 request_ids: errors::RequestIds::new(),
                 development: config.development,
+                links: Arc::default(),
                 occasions: config.occasions,
                 access_log,
                 tuning,
@@ -963,6 +967,12 @@ impl Edge {
             .iter()
             .map(|(_, address, acceptor)| (*address, acceptor.is_some()))
             .collect()
+    }
+
+    /// Where a development run's responses link to: the dashboard, once
+    /// it is named (section 4.20).
+    pub fn links(&self) -> Arc<development::Links> {
+        Arc::clone(&self.shared.links)
     }
 
     /// The access log, for the dashboard and the CLI.
@@ -1376,6 +1386,13 @@ async fn serve<I>(
             let mut checks = 0usize;
             let mut admitted = false;
 
+            // Section 4.20: what a development run tells the browser,
+            // gathered over every hop of the request.
+
+            let noted = shared
+                .development
+                .then(|| Arc::new(development::Request::default()));
+
             // Section 4.6: the limits of the route the client's own
             // request matched, over its host's and the node's, which its
             // sub-requests keep.
@@ -1466,6 +1483,7 @@ async fn serve<I>(
                     client_class: Arc::clone(&client_class),
                     mode: None,
                     received: Arc::clone(&received),
+                    noted: noted.clone(),
                 };
 
                 // Section 4.15: a client's own request draws from the
@@ -2092,6 +2110,18 @@ async fn serve<I>(
                 response
                     .headers_mut()
                     .insert(errors::X_REQUEST_ID.clone(), value);
+            }
+
+            // Section 4.20: a development run's timings and the link to
+            // the request's page.
+
+            if shared.development {
+                development::annotate(
+                    response.headers_mut(),
+                    &base_id,
+                    noted.as_ref(),
+                    &shared.links,
+                );
             }
 
             // Section 9.4: the cookies the release choice issued.
