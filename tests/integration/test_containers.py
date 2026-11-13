@@ -247,7 +247,9 @@ def test_muructl_serve_is_pid_1_with_the_init_and_leaves_no_zombie(
 
     processes = instance.processes()
     assert processes[0][:2] == (1, 0) and processes[0][3] == "muructl", processes
-    assert any(pid != 1 and parent == 1 and name == "muructl" for pid, parent, _, name in processes)
+    assert any(
+        pid != 1 and parent == 1 and name == "muru-serve" for pid, parent, _, name in processes
+    ), processes
 
     # A request starts a child and runs past the hard timeout, which kills
     # the worker; the host, a subreaper, stops the child and collects it,
@@ -349,8 +351,8 @@ def test_the_init_can_be_turned_off(container: Callable[..., Container]) -> None
     # PID 1 runs the command itself, and a stop still drains.
 
     processes = instance.processes()
-    assert processes[0][3] == "muructl"
-    assert not any(pid != 1 and name == "muructl" for pid, _, _, name in processes), processes
+    assert processes[0][3] == "muru-serve", processes
+    assert not any(pid != 1 and name == "muru-serve" for pid, _, _, name in processes), processes
     elapsed, code = instance.stop()
     assert code == 0, instance.logs()
     assert elapsed < 9, elapsed
