@@ -4,6 +4,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # Crates that build without a Python interpreter (muru-py needs one).
 default_crates := "--workspace --exclude muru-py"
+venv_python := justfile_directory() / ".venv" / "bin" / "python"
 
 # List the available recipes.
 default:
@@ -48,7 +49,7 @@ lint-text:
 lint-rust:
     cargo fmt --all --check
     cargo clippy {{default_crates}} --all-targets -- -D warnings
-    PYO3_PYTHON="{{justfile_directory()}}/.venv/bin/python" cargo clippy -p muru-py --all-targets -- -D warnings
+    PYO3_PYTHON="{{venv_python}}" cargo clippy -p muru-py --all-targets -- -D warnings
 
 lint-python:
     uv run ruff format --check .
@@ -64,8 +65,11 @@ fmt:
 # Rust unit tests and Python unit tests.
 test: test-rust test-python
 
+# The extension's own tests link against the development virtualenv's
+# libpython, which Linux finds through LD_LIBRARY_PATH.
 test-rust:
     cargo nextest run {{default_crates}}
+    PYO3_PYTHON="{{venv_python}}" LD_LIBRARY_PATH="$("{{venv_python}}" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')" cargo nextest run -p muru-py
 
 test-python:
     uv run pytest
