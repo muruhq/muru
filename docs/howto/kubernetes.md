@@ -301,3 +301,14 @@ kubectl exec deploy/shop -- muructl command run backup
 ```
 
 Whoever may exec into the pod may use them, which RBAC decides.
+
+The debugging commands work in the pod above as it is, with every
+capability dropped, no privilege escalation and the `RuntimeDefault`
+seccomp profile, and need no `SYS_PTRACE` or other change to its
+security context. `muructl debug stacks` and `muructl debug profile`
+reach the host, which reads its own workers: on Python 3.15 and later it
+reads them from outside, as their parent and the same user, which the
+kernel allows a process to do to its descendants; on earlier versions
+it asks each worker, which needs nothing at all. In a namespace that
+enforces the `restricted` Pod Security Standard nothing has to be
+added.

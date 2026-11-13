@@ -772,7 +772,11 @@ docker exec shop muructl restart --all
 
 The commands that name an application or a release take the one being
 served when given none. Only someone who may exec into the container can
-use them. Commands that
+use them. The debugging commands need no added capability: with every
+capability dropped, `no-new-privileges` and the runtime's default
+seccomp profile, the host still reads its workers' stacks and profiles,
+as their parent, as the [Kubernetes
+guide](kubernetes.md#looking-inside-a-pod) describes. Commands that
 manage releases, hosts or the daemon say they need the daemon.
 
 The project's declared [commands](commands.md#the-projects-own-commands)
