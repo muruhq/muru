@@ -20,6 +20,14 @@
 {%- endfor %}
 </tbody>
 </table>
+{%- for table in panel.tables %}
+<table class="values">
+<caption>{{ table.caption }}</caption>
+{%- for row in table.rows %}
+<tr><th>{{ row.cells[0] }}</th><td>{{ row.cells[1] }}</td></tr>
+{%- endfor %}
+</table>
+{%- endfor %}
 {%- if not panel.spans %}
 <p class="muted">No times are known yet.</p>
 {%- else %}
@@ -34,6 +42,9 @@
 <dt>until the response starts</dt><dd>Until the application called <code>start_response</code>, or sent <code>http.response.start</code>.</dd>
 <dt>producing the body</dt><dd>From the body's first byte to its last.</dd>
 <dt>finishing</dt><dd>Until the body's <code>close()</code> returned, or the ASGI application returned.</dd>
+<dt>waiting for a thread</dt><dd>From the worker taking a WSGI request until one of its threads started it.</dd>
+<dt>waiting for the GIL</dt><dd>As that thread, or the event loop, started running Python for the request. The table gives every wait the request had, and garbage collections, which pause every thread of the worker.</dd>
+<dt>event loop held</dt><dd>The longest stretch during the request in which the worker's event loop did not get to run: it was blocked, by this request or another.</dd>
 </dl>
 </details>
 {%- endif %}

@@ -12,6 +12,7 @@ import signal
 import socket
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import urllib.request
@@ -552,6 +553,50 @@ def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) 
         assert refused.status == 403
         rebound = server.get(f"/_muru/requests/{request_id}.json", headers={"Host": "evil.test"})
         assert rebound.status == 403
+    finally:
+        server.stop()
+
+
+def test_a_blocked_event_loop_is_on_the_requests_record(runtime: Path) -> None:
+    """What held a request up is on its record (section 11.7): an ASGI
+    request that blocks its event loop for longer than the loop's
+    heartbeat shows the loop held, on the Timing panel too."""
+
+    server = support.start("plain_asgi:application", workers=1, env={"MURU_RUN_DIR": str(runtime)})
+
+    try:
+        assert server.wait_for_log("admin socket"), server.log()
+        response = server.get("/block?seconds=1.2")
+        assert response.status == 200
+        request_id = response.header("x-request-id")
+        deadline = time.monotonic() + 10
+
+        while (found := json.loads(server.get(f"/_muru/requests/{request_id}.json").body))[
+            "in_progress"
+        ]:
+            assert time.monotonic() < deadline, found
+            time.sleep(0.05)
+
+        # A heartbeat was due within half a second of the request's start,
+        # so the loop was held for at least the rest of the block.
+
+        worker = found["from_worker"]
+        assert worker["loop_lag"] >= 500, worker
+        assert worker["loop_lag"] + worker["loop_lag_at"] <= worker["to_close"] + 1, worker
+        panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html").body.decode()
+        assert ">event loop held</td>" in panel and "During the request" in panel
+
+        # The run's interpreter is this one's build: with a GIL, the
+        # request's start on the loop waited for it; without one, nothing
+        # is shown. The build is asked rather than this process, whose lock
+        # an earlier import may have turned on.
+
+        free_threaded = sysconfig.get_config_var("Py_GIL_DISABLED") == 1
+
+        if not free_threaded or os.environ.get("PYTHON_GIL") == "1":
+            assert worker["gil_waits"] >= 1, worker
+        else:
+            assert worker["gil_waits"] == 0 and ">waiting for the GIL</td>" not in panel
     finally:
         server.stop()
 

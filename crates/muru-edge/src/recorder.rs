@@ -358,6 +358,21 @@ pub fn worker(record: &mut admin::RequestRecord, part: muru_proto::worker::v1::W
             })
             .collect(),
         logs_dropped: part.logs_dropped,
+        thread_wait: part.thread_wait,
+        gil_wait: part.gil_wait,
+        gil_waits: part.gil_waits,
+        gil_wait_first: part.gil_wait_first,
+        gc: part
+            .gc
+            .into_iter()
+            .map(|generation| admin::RequestGc {
+                generation: generation.generation,
+                collections: generation.collections,
+                ms: generation.ms,
+            })
+            .collect(),
+        loop_lag: part.loop_lag,
+        loop_lag_at: part.loop_lag_at,
     });
 }
 

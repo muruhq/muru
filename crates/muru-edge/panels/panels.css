@@ -19,6 +19,8 @@
 .panel .bar { position: absolute; top: 0; bottom: 0; min-width: 2px; background: #3f9c5a; }
 .panel tr.edge .bar { background: #5b8def; }
 .panel tr.worker .bar { background: #8a63d2; }
+.panel tr.contention .bar { background: #d08a1e; }
+.panel caption { text-align: left; font-weight: 600; padding: 0.6rem 0 0.25rem; }
 .panel dt { font-weight: 600; }
 .panel dd { margin: 0 0 0.4rem 1.2rem; }
 .panel .depth-2 { padding-left: 1.6rem; }

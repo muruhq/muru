@@ -209,6 +209,21 @@ message WorkerRecord {
   string traceback = 13;            // its traceback
   repeated LogLine logs = 14;       // the request's log records and warnings, in order
   uint32 logs_dropped = 15;         // records past the cap, counted
+  double thread_wait = 16;          // from taking a WSGI request to an application thread having it
+  double gil_wait = 17;             // the request's waits for the GIL, summed; 0 without a GIL
+  uint32 gil_waits = 18;            // how many
+  double gil_wait_first = 19;       // the wait as the request started
+  repeated GcDuring gc = 20;        // collections that ended during the request, by generation
+  double loop_lag = 21;             // the longest stretch of the request with the event loop held
+  double loop_lag_at = 22;          // when that stretch began
+}
+
+// The garbage collections of one generation that ended during a request
+// (section 11.7): 0, 1, 2, or full on a free-threaded build.
+message GcDuring {
+  string generation = 1;
+  uint32 collections = 2;
+  double ms = 3;
 }
 
 message LogLine {

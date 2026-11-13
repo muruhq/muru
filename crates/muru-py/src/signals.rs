@@ -93,7 +93,7 @@ fn cpu_ms() -> u64 {
 
 /// Whether the interpreter runs with a GIL: always, unless it is a
 /// free-threaded build with the GIL off. Asked once.
-fn gil_enabled() -> bool {
+pub(crate) fn gil_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
 
     *ENABLED.get_or_init(|| {

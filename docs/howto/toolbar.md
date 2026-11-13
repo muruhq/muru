@@ -231,6 +231,29 @@ The page shows the record as panels:
   - **sending the response**, from the head's arrival until the last
     byte was sent to the client.
 
+  Under "in the worker", marked where they happened, are the waits that
+  were not the request's own work:
+
+  - **waiting for a thread**, from the worker taking a WSGI request
+    until one of its threads started it;
+
+  - **waiting for the GIL**, as that thread, or the event loop for an
+    ASGI request, started running Python;
+
+  - **event loop held**, the longest stretch during the request in
+    which the worker's event loop did not get to run. It says the loop
+    was blocked, by this request or another one on it, not what blocked
+    it.
+
+  A table under the waterfall, "During the request", gives the same
+  with what cannot be placed on it: the GIL wait in all with how many
+  waits there were, counting those as an ASGI request's `receive()`
+  calls were woken, and the garbage collections that ran while the
+  request was in the worker, how many and how long they took, by
+  generation. A collection pauses every thread of the worker, so it
+  holds up whatever requests are in flight. On a free-threaded build
+  there is no GIL, and no GIL wait is shown.
+
   The panel lists the same under "What the phases are".
 
 - **Where:** the application and release, host and virtual host,
