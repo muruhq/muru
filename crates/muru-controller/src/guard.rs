@@ -85,9 +85,14 @@ enum State {
         /// scaled in by it instead (issue 623).
         successor: bool,
     },
-    /// Replacing workers would not help, so none is replaced until the
-    /// cgroup has been above the headroom again.
+    /// A replacement left no more room than there was, so none is
+    /// replaced until the cgroup has been above the headroom again.
     Holding(String),
+    /// The workers' own memory cannot make up the shortfall as they last
+    /// reported it. Judged again at every check, since reports trail the
+    /// cgroup's reading, but warned of once until the cgroup has been
+    /// above the headroom.
+    Waiting(String),
 }
 
 /// The last worker the guard replaced, for status.
@@ -104,6 +109,11 @@ pub struct Replaced {
 pub struct Guard {
     state: State,
     last: Option<Replaced>,
+    /// Whether the cgroup was already short, with too little worker
+    /// memory to make it up, at the check before: the workers' reports
+    /// may not yet show what took the room, so that is warned of only
+    /// when a second check finds the same.
+    short_before: bool,
 }
 
 impl Default for Guard {
@@ -111,6 +121,7 @@ impl Default for Guard {
         Self {
             state: State::Watching,
             last: None,
+            short_before: false,
         }
     }
 }
@@ -174,6 +185,7 @@ impl Guard {
 
         if left >= headroom {
             self.state = State::Watching;
+            self.short_before = false;
             return Action::Nothing;
         }
 
@@ -198,6 +210,15 @@ impl Guard {
             .max_by_key(|worker| worker.size);
 
         let Some(largest) = largest.filter(|_| own >= shortfall) else {
+            if matches!(self.state, State::Waiting(_)) {
+                return Action::Nothing;
+            }
+
+            if !self.short_before {
+                self.short_before = true;
+                return Action::Nothing;
+            }
+
             let warning = format!(
                 "the container is short of memory, {} left under memory.max {}, less than the \
                  headroom of {}, and replacing workers would not help: {}",
@@ -206,7 +227,7 @@ impl Guard {
                 size(headroom),
                 held(memory, workers, hosts)
             );
-            self.state = State::Holding(warning.clone());
+            self.state = State::Waiting(warning.clone());
             return Action::Hold(warning);
         };
 
@@ -266,7 +287,7 @@ impl Guard {
                     format!("scaling in by {owner} worker {name} (pid {pid})")
                 },
             ),
-            State::Holding(why) => ("holding", why.clone()),
+            State::Holding(why) | State::Waiting(why) => ("holding", why.clone()),
         }
     }
 
@@ -532,6 +553,14 @@ mod tests {
         // a tmpfs say, holds the memory.
 
         let workers = [worker(0, 10, 30 * MB), worker(1, 11, 30 * MB)];
+
+        // The first check waits for the workers' next reports, which may
+        // not yet show what took the room.
+
+        assert_eq!(
+            guard.check(reading(GB - 28 * MB), &workers, 100 * MB),
+            Action::Nothing
+        );
         let action = guard.check(reading(GB - 28 * MB), &workers, 100 * MB);
         let Action::Hold(warning) = action else {
             panic!("expected a hold, got {action:?}");
@@ -560,9 +589,52 @@ mod tests {
             Action::Nothing
         );
         assert_eq!(guard.state().0, "watching");
+        assert_eq!(
+            guard.check(reading(GB - 28 * MB), &workers, 100 * MB),
+            Action::Nothing
+        );
         assert!(matches!(
             guard.check(reading(GB - 28 * MB), &workers, 100 * MB),
             Action::Hold(_)
+        ));
+    }
+
+    #[test]
+    fn a_worker_whose_report_trails_the_reading_is_replaced_once_it_reports() {
+        let mut guard = Guard::default();
+
+        // The cgroup already holds the 400MB a worker took, but the
+        // worker last reported 4MB: no verdict yet.
+
+        let stale = [worker(0, 10, 4 * MB)];
+        assert_eq!(
+            guard.check(reading(GB - 75 * MB), &stale, 33 * MB),
+            Action::Nothing
+        );
+
+        // Its next report shows it: it is replaced, with no warning.
+
+        let fresh = [worker(0, 10, 404 * MB)];
+        assert!(matches!(
+            guard.check(reading(GB - 75 * MB), &fresh, 33 * MB),
+            Action::Replace { index: 0, .. }
+        ));
+
+        // Had it warned, a later report that shows the room taken still
+        // gets the worker replaced.
+
+        let mut guard = Guard::default();
+        assert_eq!(
+            guard.check(reading(GB - 75 * MB), &stale, 33 * MB),
+            Action::Nothing
+        );
+        assert!(matches!(
+            guard.check(reading(GB - 75 * MB), &stale, 33 * MB),
+            Action::Hold(_)
+        ));
+        assert!(matches!(
+            guard.check(reading(GB - 75 * MB), &fresh, 33 * MB),
+            Action::Replace { index: 0, .. }
         ));
     }
 

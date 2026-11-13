@@ -369,12 +369,14 @@ headroom is left, it replaces the largest worker, by the memory policy's
 - **One worker at a time.** The next worker is chosen once the one being
   replaced has gone and its replacement is ready.
 - **Only when it helps.** When the workers' own memory, added up, is less
-  than the shortfall, or a replacement leaves no more room than there was
-  before it, replacing workers cannot bring the container back. muructl
-  logs a warning that says what holds the memory, the host or the memory
-  outside the workers and the host (muructl, the edge, the page cache and
-  files on memory-backed mounts), and replaces no more workers. It warns
-  again only after the container has been back above the headroom.
+  than the shortfall at two checks in a row, replacing workers cannot
+  bring the container back: muructl logs a warning that says what holds
+  the memory, the host or the memory outside the workers and the host
+  (muructl, the edge, the page cache and files on memory-backed mounts),
+  and replaces a worker only once the workers' reports show they hold
+  enough. When a replacement leaves no more room than there was before
+  it, it replaces no more workers until the container has been back
+  above the headroom. It warns again only after that.
 - **Reported.** A worker the guard replaces is a `worker.recycled` event
   that says the container was short of memory, counted in
   `muru_worker_recycles_total` with the reason `container_memory`, apart
