@@ -1682,6 +1682,7 @@ impl Admin for Service {
         abort_rollout(pb::RolloutControlRequest) -> pb::Rollout, "muructl rollout";
         promote_release(pb::PromoteReleaseRequest) -> pb::Release, "muructl rollout";
         set_maintenance(pb::SetMaintenanceRequest) -> pb::MaintenanceStatus, "muructl maintenance";
+        probe(pb::ProbeRequest) -> pb::ProbeAnswer, "muructl probe";
         dashboard_login(pb::DashboardLoginRequest) -> pb::DashboardLoginLink, "muructl dashboard";
         shutdown(pb::ShutdownRequest) -> pb::ShutdownResponse, "muructl daemon stop";
         list_hosts(pb::ListHostsRequest) -> pb::ListHostsResponse, "muructl host";

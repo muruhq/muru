@@ -739,7 +739,7 @@ def test_the_guard_and_status_follow_a_memory_limit_changed_while_serving(
 
     root = Path("/sys/fs/cgroup")
     assert (root / "cgroup.controllers").is_file(), "cgroup v2 is needed"
-    cgroup = root / f"muru-test-{os.getpid()}"
+    cgroup = root / f"muru-test-{os.getpid()}-{tmp_path.name}"
     subprocess.run(["sudo", "-n", "mkdir", str(cgroup)], check=True)
     serve: Serve | None = None
 
@@ -890,7 +890,7 @@ def test_memory_holds_a_scale_out_back_and_the_guard_scales_in(tmp_path: Path) -
 
     root = Path("/sys/fs/cgroup")
     assert (root / "cgroup.controllers").is_file(), "cgroup v2 is needed"
-    cgroup = root / f"muru-test-{os.getpid()}"
+    cgroup = root / f"muru-test-{os.getpid()}-{tmp_path.name}"
     subprocess.run(["sudo", "-n", "mkdir", str(cgroup)], check=True)
     project = tmp_path / "shop"
     project.mkdir()

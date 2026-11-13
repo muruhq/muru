@@ -29,6 +29,7 @@ pub mod metrics;
 pub mod model;
 pub mod notify;
 pub mod overlays;
+pub mod probes;
 pub mod processes;
 pub mod provision;
 pub mod relay;

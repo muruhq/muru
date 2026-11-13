@@ -13,6 +13,7 @@ package muru.admin.v1;
 service Admin {
   // The daemon, its locations and listeners.
   rpc GetStatus(GetStatusRequest) returns (Status);
+  rpc Probe(ProbeRequest) returns (ProbeAnswer);
 
   // Section 13.10: the instance's processes as Muru supervises them, with
   // what the operating system says of each and the last second's figures.
@@ -157,6 +158,20 @@ service Admin {
   // Section 9.12: the commands a release declares, with their inputs
   // and the application's last run of each.
   rpc ListCommands(ListCommandsRequest) returns (ListCommandsResponse);
+}
+
+// A probe's question (section 13.9): live, ready or startup, of the
+// daemon, narrowed to one application for ready and startup when app is
+// set, with the workers each needed group must have ready for ready.
+message ProbeRequest {
+  string probe = 1;                 // live, ready or startup
+  string app = 2;                   // every application when empty
+  uint32 min_ready = 3;             // 1 when 0
+}
+
+message ProbeAnswer {
+  bool ok = 1;
+  string reason = 2;                // why not, when not
 }
 
 message GetStatusRequest {}

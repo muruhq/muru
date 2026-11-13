@@ -322,6 +322,12 @@ def test_docker_stop_drains_the_daemon(container: Callable[..., Container]) -> N
     ).stdout
     assert "ready and serving" in deployed, deployed
     wait_until_serving(instance)
+
+    # A health check needs nothing but muructl: the daemon answers the
+    # readiness probe over its admin socket.
+
+    probed = instance.exec("muructl", "probe", "ready", "--run-dir", "/run/muru", check=False)
+    assert probed.returncode == 0, probed.stdout + probed.stderr
     thread, outcome = instance.request_in_the_background("/slow?ms=3000")
     time.sleep(0.5)
 

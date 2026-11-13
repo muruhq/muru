@@ -195,6 +195,11 @@ impl SocketArgs {
         arguments
     }
 
+    /// The runtime directory the command was given, if any.
+    pub fn run_dir(&self) -> Option<&Path> {
+        self.locations.run_dir.as_deref()
+    }
+
     /// The daemon's log, for a command of the daemon's own that names
     /// it: where the instance's options and the daemon's files put it.
     fn daemon_log(&self, files: &DaemonFileArgs) -> PathBuf {
@@ -3103,6 +3108,10 @@ pub async fn show_status(path: &Path, json: bool) -> anyhow::Result<()> {
 
     if !status.budget.is_empty() {
         println!("budget   {}", status.budget);
+    }
+
+    if let Some(limits) = &status.limits {
+        print_limits(limits);
     }
 
     Ok(())

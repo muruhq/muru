@@ -1208,21 +1208,33 @@ pub fn runtime_library(
     }
 }
 
-/// `muructl probe`: ask a `muructl serve` in this container one of the
-/// probes' questions over the socket in its run directory.
-#[derive(Debug, Args)]
+/// `muructl probe`: ask a `muructl serve` in this container, or the
+/// daemon, one of the probes' questions (section 13.9).
+#[derive(Args)]
 pub struct ProbeArgs {
     /// live, ready or startup.
     #[arg(value_name = "PROBE")]
     probe: String,
 
-    /// The run directory of the serve to ask (default MURU_RUN_DIR, else
-    /// /run/muru).
-    #[arg(long, value_name = "DIR")]
-    run_dir: Option<PathBuf>,
+    /// Narrow ready and startup to one application of the daemon.
+    #[arg(long, value_name = "APP")]
+    app: Option<String>,
+
+    /// The workers each needed group of a daemon's serving releases must
+    /// have ready for ready (default 1); under muructl serve its own
+    /// --min-ready applies.
+    #[arg(long, value_name = "N")]
+    min_ready: Option<u32>,
+
+    #[command(flatten)]
+    socket: crate::admin::SocketArgs,
 }
 
-/// Run `muructl probe`, exiting 0 when the answer is yes and 1 otherwise.
+/// Run `muructl probe`, exiting 0 when the answer is yes and 1 otherwise,
+/// with why on standard error. A `muructl serve` is found first, by the
+/// probe socket in its run directory (`--run-dir`, else MURU_RUN_DIR,
+/// else /run/muru); otherwise the daemon is asked over its admin socket,
+/// found as the other commands find it.
 pub fn probe(args: ProbeArgs) -> anyhow::Result<()> {
     let path = match args.probe.as_str() {
         "live" => "/livez",
@@ -1232,13 +1244,32 @@ pub fn probe(args: ProbeArgs) -> anyhow::Result<()> {
     };
 
     let run_dir = args
-        .run_dir
+        .socket
+        .run_dir()
+        .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("MURU_RUN_DIR").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_RUN_DIR));
     let socket = run_dir.join(PROBE_SOCKET);
 
+    let (ok, text) = if socket.exists() {
+        probe_serve(&socket, path)
+    } else {
+        probe_daemon(&args)
+    };
+
+    if ok {
+        println!("{text}");
+        std::process::exit(0);
+    }
+
+    eprintln!("muru: {text}");
+    std::process::exit(1);
+}
+
+/// Ask a serve over its probe socket.
+fn probe_serve(socket: &Path, path: &str) -> (bool, String) {
     let answer = (|| -> std::io::Result<String> {
-        let mut stream = std::os::unix::net::UnixStream::connect(&socket)?;
+        let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
         write!(stream, "GET {path} HTTP/1.0\r\nHost: probe\r\n\r\n")?;
         let mut text = String::new();
@@ -1249,11 +1280,10 @@ pub fn probe(args: ProbeArgs) -> anyhow::Result<()> {
     let text = match answer {
         Ok(text) => text,
         Err(error) => {
-            println!(
-                "muru: no muructl serve answers at {} ({error})",
-                socket.display()
+            return (
+                false,
+                format!("no muructl serve answers at {} ({error})", socket.display()),
             );
-            std::process::exit(1);
         }
     };
 
@@ -1262,8 +1292,42 @@ pub fn probe(args: ProbeArgs) -> anyhow::Result<()> {
         .split_once("\r\n\r\n")
         .map_or("", |(_, body)| body)
         .trim();
-    println!("{body}");
-    std::process::exit(if ok { 0 } else { 1 });
+    (ok, body.to_owned())
+}
+
+/// Ask the daemon over its admin socket.
+fn probe_daemon(args: &ProbeArgs) -> (bool, String) {
+    let asked = async {
+        let socket = args.socket.socket()?;
+        let mut client = muru_controller::client::connect(&socket).await?;
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.probe(muru_proto::admin::v1::ProbeRequest {
+                probe: args.probe.clone(),
+                app: args.app.clone().unwrap_or_default(),
+                min_ready: args.min_ready.unwrap_or(1),
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the daemon did not answer within 5 s"))?
+        .map_err(|status| anyhow::anyhow!("{}", status.message()))?
+        .into_inner();
+        anyhow::Ok(answer)
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return (false, error.to_string()),
+    };
+
+    match runtime.block_on(asked) {
+        Ok(answer) if answer.ok => (true, "ok".to_owned()),
+        Ok(answer) => (false, answer.reason),
+        Err(error) => (false, format!("{error:#}")),
+    }
 }
 
 #[cfg(test)]

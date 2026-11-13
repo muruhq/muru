@@ -765,7 +765,7 @@ pub async fn processes(
         version: env!("CARGO_PKG_VERSION").to_owned(),
         mode: "daemon".to_owned(),
         started_unix_ms: info.started_unix_ms,
-        limits: None,
+        limits: info.cgroup_limits.lock().expect("limits poisoned").clone(),
     };
 
     Some(
@@ -835,6 +835,14 @@ pub struct Info {
     /// Section 8.4: uv as found and how it is run, from the `[tools]`
     /// table read at start.
     pub provisioning: crate::provision::Provisioning,
+    /// Section 13.9: set once the daemon has finished starting, for the
+    /// startup and readiness probes.
+    pub started: std::sync::atomic::AtomicBool,
+    /// Set when the daemon begins to stop, which fails readiness.
+    pub stopping: std::sync::atomic::AtomicBool,
+    /// Sections 7.7 and 13.9: the daemon's cgroup limits as last read,
+    /// and the memory guard, for status.
+    pub cgroup_limits: std::sync::Mutex<Option<muru_proto::admin::v1::CgroupLimits>>,
 }
 
 /// What runs for one release now, for the API.
@@ -1203,6 +1211,12 @@ impl Running {
 struct Daemon {
     store: Arc<Store>,
     events: Events,
+    /// Sections 7.7 and 13.9: the daemon's own cgroup, read again at
+    /// every memory check, and the memory guard watching its
+    /// `memory.max`, across every release's workers (issue 622).
+    cgroup: Option<crate::cgroup::Limits>,
+    guard: crate::guard::Guard,
+    guard_checked: Option<(Instant, Duration)>,
     locations: Locations,
     edge: EdgeProcess,
     info: Arc<Info>,
@@ -1487,6 +1501,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         service,
         servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
+        started: std::sync::atomic::AtomicBool::new(false),
+        stopping: std::sync::atomic::AtomicBool::new(false),
+        cgroup_limits: std::sync::Mutex::new(None),
     });
     let underway = crate::commands::Underway::default();
     let handle = Handle {
@@ -1507,6 +1524,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             Some(tokio::spawn(crate::metrics::serve(
                 listener,
                 handle.commands.clone(),
+                crate::probes::Probes {
+                    store: Arc::clone(&store),
+                    info: Arc::clone(&info),
+                },
             )))
         }
         None => None,
@@ -1677,7 +1698,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         commands: handle_commands,
         asked: HashMap::new(),
         last_request: 0,
+        cgroup: crate::cgroup::Limits::read(),
+        guard: crate::guard::Guard::default(),
+        guard_checked: None,
     };
+
+    if let Some(limits) = &daemon.cgroup {
+        tracing::info!("cgroup limits: {}", limits.describe());
+    }
+
     daemon.restore().await;
     daemon.reconcile_traffic().await;
 
@@ -1703,6 +1732,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     daemon.edge.watch_wakes(wake_sender);
 
     crate::notify::ready(&format!("serving on {serving_on}"));
+    daemon
+        .info
+        .started
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Commands are carried out one at a time; a host dying in between is
     // noticed by the next pass. SIGTERM and SIGINT detach, as a service
@@ -1794,6 +1827,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 daemon.sample_history(samples.as_deref()).await;
                 daemon.advance_rollouts(samples.as_deref()).await;
                 daemon.autoscale(samples.as_deref()).await;
+                daemon.guard_memory();
                 daemon.refresh_client_lists().await;
                 daemon.reconcile_overlays().await;
                 daemon.check_clock();
@@ -1803,6 +1837,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
         daemon.publish_live();
     };
+
+    daemon
+        .info
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Section 13.3: by default the daemon detaches, leaving hosts and the
     // edge serving for the next daemon to re-adopt; with drain it takes
@@ -5334,7 +5373,11 @@ impl Daemon {
             loop_stall_timeout: Duration::from_millis(spec.timeouts.loop_stall_timeout_ms),
             gil_stall_timeout: Duration::from_millis(spec.timeouts.gil_stall_timeout_ms),
             memory: spec.memory.clone(),
-            cgroup: None,
+            cgroup: self
+                .cgroup
+                .as_ref()
+                .filter(|limits| limits.memory_max.is_some())
+                .map(|limits| limits.dir.clone()),
             env,
             shown_env: spec
                 .env
@@ -8110,6 +8153,180 @@ impl Daemon {
 
     /// Ask a release's host to bring a group to a worker count; the host
     /// announces the sockets as they change.
+    /// Sections 7.7 and 13.9: at every memory check, the shortest
+    /// `check_interval` of the running releases, read the daemon's
+    /// cgroup again and, with less than the headroom left under its
+    /// `memory.max`, have the largest worker of every release replaced,
+    /// or its group scaled in by it when its policy allows (issue 622).
+    fn guard_memory(&mut self) {
+        let Some(limits) = &self.cgroup else {
+            return;
+        };
+
+        let now = Instant::now();
+
+        if self
+            .guard_checked
+            .is_some_and(|(at, interval)| now.saturating_duration_since(at) < interval)
+        {
+            return;
+        }
+
+        let read = limits.again();
+        let changes = read.changes(limits);
+
+        if !changes.is_empty() {
+            tracing::info!("cgroup limits changed: {}", changes.join(", "));
+        }
+
+        self.cgroup = Some(read.clone());
+
+        // Every release's workers, each measured by its group's policy.
+
+        let mut workers = Vec::new();
+        let mut hosts = 0;
+        let mut interval = 5_000;
+
+        for ((app, id), running) in &self.running {
+            hosts += running.host_pss.unwrap_or(0);
+            let spec = self.store.release(app, id).ok().map(|release| release.spec);
+
+            if let Some(spec) = &spec {
+                interval = interval.min(spec.memory.check_interval_ms);
+            }
+
+            for worker in &running.status {
+                let policy = spec
+                    .as_ref()
+                    .map(|spec| {
+                        spec.groups
+                            .iter()
+                            .find(|group| group.name == worker.group)
+                            .and_then(|group| group.memory.clone())
+                            .unwrap_or_else(|| spec.memory.clone())
+                    })
+                    .unwrap_or_default();
+
+                let (size, measure) = match policy.measure {
+                    muru_config::Measure::Uss => (worker.uss, "uss"),
+                    muru_config::Measure::Pss => (worker.pss, "pss"),
+                    muru_config::Measure::Rss => (worker.rss, "rss"),
+                };
+
+                let name = muru_common::worker::WorkerName::new(&worker.group, worker.index);
+
+                workers.push(crate::guard::Worker {
+                    owner: format!("{app}@{id}"),
+                    group: name.group.clone(),
+                    index: worker.index,
+                    name: name.to_string(),
+                    pid: worker.pid,
+                    size: size.unwrap_or(0),
+                    measure,
+                });
+            }
+        }
+
+        self.guard_checked = Some((now, Duration::from_millis(interval.max(250))));
+        let memory = read.memory();
+
+        let action = match memory {
+            Some(memory) => self.guard.check(memory, &workers, hosts),
+            None => crate::guard::Action::Nothing,
+        };
+
+        *self.info.cgroup_limits.lock().expect("limits poisoned") = Some(crate::guard::report(
+            &read,
+            memory,
+            workers.iter().map(|worker| worker.size).sum(),
+            hosts,
+            Some(&self.guard),
+        ));
+
+        match action {
+            crate::guard::Action::Nothing => {}
+            crate::guard::Action::Hold(warning) => tracing::warn!("{warning}"),
+            crate::guard::Action::Replace {
+                owner,
+                group,
+                index,
+                pid,
+                reason,
+            } => self.guard_replace(&owner, &group, index, pid, &reason, &workers),
+        }
+    }
+
+    /// The guard chose a worker: its group is scaled in by it when the
+    /// group has a policy above its fewest workers, else it is replaced.
+    fn guard_replace(
+        &mut self,
+        owner: &str,
+        group: &str,
+        index: u32,
+        pid: u32,
+        reason: &str,
+        workers: &[crate::guard::Worker],
+    ) {
+        let Some((app, id)) = owner.split_once('@') else {
+            return;
+        };
+
+        let key = (app.to_owned(), id.to_owned());
+        let current = workers
+            .iter()
+            .filter(|worker| worker.owner == owner && worker.group == group)
+            .count() as u32;
+        let mut shrunk = None;
+
+        if let Some(running) = self.running.get_mut(&key)
+            && running.retained_until.is_none()
+            && let Some(scaling) = running
+                .scalers
+                .iter_mut()
+                .find(|scaling| scaling.name == group)
+        {
+            let spec = scaling.scaler.spec();
+
+            if !spec.is_static()
+                && !spec.advisory
+                && scaling.scaler.pinned().is_none()
+                && current > spec.min_workers
+            {
+                let to = current - 1;
+                let why = format!("for memory: {reason}");
+                scaling.scaler.shrink(current, to, Instant::now(), &why);
+                scaling.requested = Some(to);
+                shrunk = Some(decision_message(group, current, to, &why, false));
+            }
+        }
+
+        if let Some(message) = &shrunk {
+            self.guard.scaled_in();
+            self.events.emit("scaling.decision", owner, "info", message);
+        }
+
+        let Some(control) = self
+            .running
+            .get(&key)
+            .and_then(|running| running.control.as_ref())
+        else {
+            return;
+        };
+
+        self.last_request += 1;
+        control.request(
+            self.last_request,
+            "recycle",
+            Some(&muru_common::worker::WorkerName::new(group, index)),
+            &serde_json::json!({
+                "pid": pid,
+                "reason": reason,
+                "cause": "container_memory",
+                "retire": shrunk.is_some(),
+            }),
+        );
+    }
+
     fn ask_scale(&mut self, app: &str, id: &str, group: &str, processes: u32) {
         let Some(control) = self
             .running
