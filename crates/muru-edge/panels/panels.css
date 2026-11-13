@@ -4,6 +4,7 @@
 .panel table.values th { width: 12rem; font-weight: 600; color: #627d98; white-space: nowrap; }
 .panel td { overflow-wrap: anywhere; }
 .panel .num { text-align: right; white-space: nowrap; }
+.panel table.logs td:not(:last-child) { white-space: nowrap; overflow-wrap: normal; }
 .panel .mono, .panel pre, .panel code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; }
 .panel .mono pre, .panel .mono code, .panel pre code { font-size: inherit; }
 .panel pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
