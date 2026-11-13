@@ -886,6 +886,12 @@ class WorkerState:
 
     past_deadline: dict[str, PastDeadline] = field(default_factory=dict)
 
+    # Section 13.9 (issue 662): whether it has been said that this
+    # worker's replacement for memory waits for another of its group to
+    # be back in routing, so it is said once.
+
+    stop_first_held: bool = False
+
 
 @dataclass
 class PastDeadline:
@@ -2592,6 +2598,11 @@ class Host:
             error = f"worker {asked} is still starting"
         elif state.index in self.replacing:
             error = f"worker {asked} is already being replaced"
+        elif (busy := self.replacing_for_memory()) is not None:
+            error = (
+                f"worker {self.worker_name(busy.index)} is being replaced for memory, "
+                "and workers are replaced for memory one at a time"
+            )
         elif state.debug_sessions:
             error = f"worker {asked} is being debugged"
         elif self.control_listener is None:
@@ -2608,13 +2619,22 @@ class Host:
 
         if args.get("retire"):
             self.retire(state, f"scaled in for memory: {args.get('reason', '')}")
-        else:
-            self.replace(
-                state,
-                str(args.get("reason", "replaced on the supervisor's request")),
-                "worker.recycled",
-                str(args.get("cause", "")),
+        elif not self.replace(
+            state,
+            str(args.get("reason", "replaced on the supervisor's request")),
+            "worker.recycled",
+            str(args.get("cause", "")),
+        ):
+            self.send_to_supervisor(
+                {
+                    "type": "response",
+                    "id": request_id,
+                    "workers": [],
+                    "error": f"worker {asked} would stop first and leave its group "
+                    "with no worker in routing",
+                }
             )
+            return
 
         self.send_to_supervisor(
             {
@@ -3119,7 +3139,12 @@ class Host:
             )
 
     def send_status(self) -> None:
-        """Tell the supervisor what every worker last reported, and what the host holds."""
+        """Tell the supervisor what every worker last reported, and what the host holds.
+
+        It also lists the replacements for memory under way, which the
+        memory guard counts as its one at a time (section 13.9, issue
+        662).
+        """
 
         self.send_to_supervisor(
             {
@@ -3138,6 +3163,11 @@ class Host:
                     }
                     for state in sorted(self.states.values(), key=lambda state: state.index)
                     if not state.replaced
+                ],
+                "memory_replacements": [
+                    {**self.worker_fields(replacement.index), "pid": replacement.old_pid}
+                    for replacement in self.replacing.values()
+                    if replacement.cause in MEMORY_CAUSES
                 ],
             }
         )
@@ -3322,7 +3352,7 @@ class Host:
         cause: str = "",
         hard: bool = False,
         abandon: dict[str, str] | None = None,
-    ) -> None:
+    ) -> bool:
         """Start replacing a worker with a fresh one on a new socket.
 
         `cause` is the reason as one word, for the supervisor's counters.
@@ -3331,11 +3361,11 @@ class Host:
         edge answers now rather than after the grace: the oldest, which is
         the stuck one, or all of them when the whole worker is stalled. A
         worker being debugged is pinned: the policy applies once the last
-        session ends.
+        session ends. Return whether a replacement was started.
         """
 
         if state.debug_sessions:
-            return
+            return False
 
         # A worker condemned twice, by the silence check and then by its
         # own stall event, or by the hard timeout and then a stall, is
@@ -3369,14 +3399,14 @@ class Host:
                 replacement.kill_at = now + STALLED_KILL_SECONDS
                 self.signal(state.pid, signal.SIGTERM)
 
-            return
+            return False
 
         if self.control_listener is None:
             if not getattr(self, "_warned_no_control", False):
                 self._warned_no_control = True
                 log("no control socket, so workers cannot be replaced; the policy is ignored")
 
-            return
+            return False
 
         index = state.index
 
@@ -3384,13 +3414,39 @@ class Host:
         # the worker it was to replace keeps serving.
 
         if self.start_failures.get(index, 0) >= MAX_START_FAILURES:
-            return
+            return False
+
+        # Section 13.9: two large workers alive at once is what the kernel
+        # would kill for, so with no room for a second this one leaves
+        # routing and stops first, and reap() forks its successor. It does
+        # not while it is the last of its group in routing and another of
+        # the group is out of it, being replaced or starting (issue 662):
+        # its replacement waits until that one is back.
+
+        short = self.short_of_memory(state) if cause in MEMORY_CAUSES else None
+        away = self.away_from_group(index) if cause in MEMORY_CAUSES else None
+
+        if short is not None and away is not None:
+            if not state.stop_first_held:
+                state.stop_first_held = True
+                log(
+                    f"worker {self.worker_name(index)} (pid {state.pid}) {reason}; it is "
+                    f"replaced once worker {self.worker_name(away)} is back in routing, since "
+                    "it would stop first and its group would have no worker"
+                )
+
+            return False
 
         state.replaced = True
         self.generation[index] = self.generation.get(index, 0) + 1
         replacement = Replacement(index, state.pid, reason, kind, cause)
         self.replacing[index] = replacement
-        hard = hard or kind == "worker.timeout_killed"
+
+        # A worker over its hard limit leaves routing at once, but not as
+        # its group's last in routing while another is away: it serves
+        # until its successor is ready, as a replacement usually does.
+
+        hard = (hard or kind == "worker.timeout_killed") and away is None
         log(f"worker {self.worker_name(index)} (pid {state.pid}) {reason}; replacing it")
 
         if cause == "memory":
@@ -3419,12 +3475,6 @@ class Host:
                 self.hard_drain_grace if grace is None else grace
             )
 
-        # Section 13.9: two large workers alive at once is what the kernel
-        # would kill for, so with no room for a second this one leaves
-        # routing and stops first, and reap() forks its successor.
-
-        short = self.short_of_memory(state) if cause in MEMORY_CAUSES else None
-
         if short is not None:
             log(
                 f"worker {self.worker_name(index)} (pid {state.pid}) "
@@ -3436,12 +3486,50 @@ class Host:
             self.routed[index] = None
             replacement.announced = self.announce()
             replacement.announced_at = time.monotonic()
-            return
+            return True
 
         replacement.new_pid = self.spawn(index, replacing=True)
 
         if kind == "worker.timeout_killed":
             self.report_timeout_kill(replacement)
+
+        return True
+
+    def away_from_group(self, index: int) -> int | None:
+        """Return another worker of the group out of routing, when it is the group's last in.
+
+        Section 13.9 (issue 662): the other is being replaced or is
+        starting, so a worker that stopped first now would leave its
+        group with no worker in routing. None when another of the group
+        is in routing, or when the group has no other worker.
+        """
+
+        others = [other for other in self.active_indices(self.group_of(index)) if other != index]
+
+        if any(self.routed.get(other) is not None for other in others):
+            return None
+
+        return next(
+            (other for other in others if other in self.replacing or other in self.starting),
+            None,
+        )
+
+    def replacing_for_memory(self) -> Replacement | None:
+        """Return a replacement for memory under way, if there is one.
+
+        Sections 7.7 and 13.9 (issue 662): the memory guard replaces one
+        worker at a time, and a worker's own limits replacing one counts
+        as that one.
+        """
+
+        return next(
+            (
+                replacement
+                for replacement in self.replacing.values()
+                if replacement.cause in MEMORY_CAUSES
+            ),
+            None,
+        )
 
     def short_of_memory(self, state: WorkerState) -> int | None:
         """Return what is left under the cgroup's limit, if less than the worker's size.

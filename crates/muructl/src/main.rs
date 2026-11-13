@@ -3698,6 +3698,7 @@ async fn run_with(
     );
     limits_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_workers: Vec<muru_controller::host::WorkerStatus> = Vec::new();
+    let mut last_replacing: Vec<muru_controller::host::MemoryReplacement> = Vec::new();
 
     if let Some(scaling) = &scaling {
         let _ = run_processes.scaling.set(Arc::clone(scaling));
@@ -4029,6 +4030,15 @@ async fn run_with(
 
                         let release = format!("r{}", current.release);
                         let kept = pools.current().kept(&label, &release);
+
+                        // Section 13.9 (issue 662): a group with no worker in
+                        // routing for a moment, its last stopping before its
+                        // replacement starts, holds requests until one is
+                        // back, up to the queue timeout, as the daemon's do.
+
+                        let waiting: Vec<String> = std::iter::once(muru_edge::routing::DEFAULT_GROUP.to_owned())
+                            .chain(groups.iter().map(|(name, _)| name.clone()))
+                            .collect();
                         let connected = muru_edge::routing::AppPools::connect(
                             &label,
                             &release,
@@ -4045,6 +4055,7 @@ async fn run_with(
                                 .with_sendfile(Arc::clone(&sendfile))
                                 .with_grpc_web(&resolved.grpc_web_origins)
                                 .with_static_dirs(static_paths.clone())
+                                .with_waking(&waiting)
                         });
 
                         match connected {
@@ -4069,7 +4080,7 @@ async fn run_with(
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);
                     }
-                    muru_controller::host::HostMessage::Status { workers, host_rss } => {
+                    muru_controller::host::HostMessage::Status { workers, host_rss, memory_replacements } => {
                         // The relay may have been started again since.
 
                         run_processes.host(current.pid(), current.relay_pid());
@@ -4077,6 +4088,7 @@ async fn run_with(
                         if let Some(watch) = &mut limits_watch {
                             watch.host(host_rss);
                             last_workers.clone_from(&workers);
+                            last_replacing = memory_replacements;
                         }
 
                         if let Some(scaling) = &scaling {
@@ -4092,7 +4104,7 @@ async fn run_with(
                     continue;
                 };
 
-                match watch.check(&last_workers) {
+                match watch.check(&last_workers, &last_replacing) {
                     muru_controller::guard::Action::Replace { group, index, pid, reason, .. } => {
                         // Section 13.9: a group with a policy above its
                         // fewest workers is scaled in by the worker.

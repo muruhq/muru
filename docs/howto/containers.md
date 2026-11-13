@@ -367,7 +367,9 @@ headroom is left, it replaces the largest worker, by the memory policy's
 `measure`, through the usual drain, so no request is lost:
 
 - **One worker at a time.** The next worker is chosen once the one being
-  replaced has gone and its replacement is ready.
+  replaced has gone and its replacement is ready. A worker being replaced
+  for its own memory limits counts as that one, so the guard chooses
+  none while it is.
 - **Only when it helps.** When the workers' own memory, added up, is less
   than the shortfall at two checks in a row, replacing workers cannot
   bring the container back: muructl logs a warning that says what holds
@@ -411,8 +413,19 @@ normally stays until its replacement is ready. When less is left under
 `memory.max` than the worker's current size, by the policy's measure, it
 leaves routing and stops first, and its replacement is forked once it
 has gone. The requests it holds finish, and for that moment the
-container has one worker fewer. With a single worker, requests wait for
-the replacement up to the [queue timeout](timeouts.md).
+container has one worker fewer.
+
+The last worker of a group in routing is never stopped first while
+another worker of the group is out of routing, being replaced or
+starting: its replacement waits until that worker is back. A worker
+over its hard limit normally leaves routing as soon as it is replaced,
+but as its group's last in routing it serves until its successor is
+ready.
+
+While a group has no worker in routing, as with a single worker that
+stops first, requests wait for the replacement up to the
+[queue timeout](timeouts.md), and are answered 503 with the reason
+`cold_start_timeout` if none is ready by then.
 
 A worker the kernel kills anyway is reported as a `worker.oom_killed`
 event and counted once in `muru_worker_exits_total` with the reason

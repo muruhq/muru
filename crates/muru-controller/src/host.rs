@@ -58,6 +58,9 @@ pub enum HostMessage {
         /// The host's own resident memory, when measured (sections 7.7
         /// and 13.9).
         host_rss: Option<u64>,
+        /// The workers being replaced for memory, which the memory guard
+        /// counts as its one at a time (section 13.9, issue 662).
+        memory_replacements: Vec<MemoryReplacement>,
     },
     /// The workers' answers to a request (section 11.7).
     Response {
@@ -100,6 +103,19 @@ pub struct WorkerReply {
     pub error: String,
     /// Its answer as JSON text, when it did.
     pub result_json: String,
+}
+
+/// A worker its host is replacing for memory, by the worker's own limits
+/// or the memory guard's ask, until its successor has taken its place
+/// (section 13.9).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryReplacement {
+    /// The worker's group.
+    pub group: String,
+    /// Its index within the group.
+    pub index: u32,
+    /// The pid of the worker being replaced.
+    pub pid: u32,
 }
 
 /// What one worker last reported to its host (sections 7.6 and 7.7).
@@ -347,6 +363,22 @@ impl HostMessage {
                                 handoff_wait: counts(&worker["handoff_wait"]),
                                 handoff_wait_us: worker["handoff_wait_us"].as_u64().unwrap_or(0),
                                 gc: generations(&worker["gc"]),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                memory_replacements: value["memory_replacements"]
+                    .as_array()
+                    .map(|replacements| {
+                        replacements
+                            .iter()
+                            .map(|replacement| MemoryReplacement {
+                                group: replacement["group"]
+                                    .as_str()
+                                    .unwrap_or("default")
+                                    .to_owned(),
+                                index: replacement["index"].as_u64().unwrap_or(0) as u32,
+                                pid: replacement["pid"].as_u64().unwrap_or(0) as u32,
                             })
                             .collect()
                     })
