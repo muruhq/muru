@@ -103,8 +103,8 @@ Recipes for specific tasks, assuming you already know the basics. The
   workers.
 - [Events and webhooks](events.md): every change of state, and sinks
   that receive them.
-- [The dashboard](dashboard.md): charts, workers and actions in a
-  browser.
+- [The dashboard](dashboard.md): charts, workers, requests and logs in
+  a browser, read-only.
 - [Inspecting workers](debugging.md): stacks, profiles, memory and a
   debugger in running workers, a report to attach to a bug report, and
   a bundle of a whole system for triage.
