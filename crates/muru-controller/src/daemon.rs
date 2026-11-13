@@ -1100,9 +1100,10 @@ struct Running {
 }
 
 impl Running {
-    /// Section 7.4: what one worker of a group costs, from its workers'
-    /// mean proportional set size and CPU, the soft memory limit standing
-    /// in before any has reported, then `fallback`.
+    /// Section 7.4: what one worker of a group costs: its hard limit
+    /// when one is set (issue 384), else its workers' mean proportional
+    /// set size and CPU, the soft memory limit standing in before any has
+    /// reported, then `fallback`.
     fn worker_cost(&self, group: &GroupScaling, fallback: Option<u64>) -> crate::budget::Cost {
         let sizes: Vec<u64> = self
             .status
@@ -1113,7 +1114,9 @@ impl Running {
         let measured = (!sizes.is_empty()).then(|| sizes.iter().sum::<u64>() / sizes.len() as u64);
 
         crate::budget::Cost {
-            memory: measured
+            memory: group
+                .hard_limit
+                .or(measured)
                 .or(group.memory_limit.map(|(_, limit)| limit))
                 .or(fallback),
             cpu: group.scaler.worker_signals().cores,
@@ -1296,7 +1299,10 @@ struct Daemon {
     certificates: HashMap<String, (String, String)>,
     /// Section 7.4: the node's budget, and the schedule windows already
     /// checked against it, by overlay and start.
-    budget: crate::budget::Budget,
+    /// The `[daemon.budget]` table as the file sets it; `budget()` is
+    /// the budget in force, with the cgroup's limits for what it leaves
+    /// out (issue 384).
+    budget_table: crate::budget::Budget,
     budget_checked: BTreeSet<(String, u64)>,
     /// The points the dashboard's charts draw, one a second.
     history: Arc<muru_dashboard::History>,
@@ -1682,7 +1688,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         overrides: config.overrides,
         sinks,
         certificates: HashMap::new(),
-        budget: settings.budget,
+        budget_table: settings.budget,
         budget_checked: BTreeSet::new(),
         history,
         sampler: muru_dashboard::Sampler::default(),
@@ -1705,6 +1711,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     if let Some(limits) = &daemon.cgroup {
         tracing::info!("cgroup limits: {}", limits.describe());
+        let budget = daemon.budget();
+
+        if budget.is_set() {
+            tracing::info!(
+                "node budget: {}{}",
+                budget.describe(&crate::budget::Usage::default()),
+                daemon.budget_sources()
+            );
+        }
     }
 
     daemon.restore().await;
@@ -3043,11 +3058,11 @@ impl Daemon {
 
         // Section 7.4: the budget.
 
-        if settings.budget != self.budget {
-            self.budget = settings.budget;
+        if settings.budget != self.budget_table {
+            self.budget_table = settings.budget;
             report.changed(
                 "[daemon.budget]",
-                &self.budget.describe(&self.budget_usage()),
+                &self.budget().describe(&self.budget_usage()),
             );
         } else {
             report.unchanged("[daemon.budget]");
@@ -7316,6 +7331,8 @@ impl Daemon {
     /// whose count is not what its scaler wants, after a restart or a
     /// restored pin, is asked for again.
     async fn autoscale(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
+        let budget = self.budget();
+
         let Some(samples) = samples else {
             return;
         };
@@ -7384,7 +7401,7 @@ impl Daemon {
             }
         }
 
-        for admitted in crate::budget::admit(&self.budget, used, asks) {
+        for admitted in crate::budget::admit(&budget, used, asks) {
             let (app, id, name) = &admitted.ask.key;
             let Some(group) = self
                 .running
@@ -7397,10 +7414,7 @@ impl Daemon {
             let subject = format!("{app}@{id}");
             let (ready, reason) = reasons.remove(&admitted.ask.key).unwrap_or_default();
             let held = admitted.limit.map_or_else(String::new, |limit| {
-                format!(
-                    "the node's {limit} budget ({})",
-                    self.budget.describe(&used)
-                )
+                format!("the node's {limit} budget ({})", budget.describe(&used))
             });
 
             for (kind, level, message) in group.admitted(
@@ -7452,7 +7466,7 @@ impl Daemon {
         // stopped.
 
         if self
-            .budget
+            .budget()
             .memory
             .is_some_and(|memory| used.memory > memory)
         {
@@ -7477,7 +7491,7 @@ impl Daemon {
     /// the start of its warm-up's lead or `BUDGET_LEAD` before it,
     /// whichever is longer, with an event when it does not fit.
     fn check_floors_ahead(&mut self, view: &crate::budget::View) {
-        if !self.budget.is_set() {
+        if !self.budget().is_set() {
             return;
         }
 
@@ -7702,6 +7716,8 @@ impl Daemon {
     /// stops retained releases to make room; the memory limit applies to
     /// both, as it does to a deploy.
     async fn wake(&mut self, wake: muru_proto::edge::v1::Wake) {
+        let budget = self.budget();
+
         let key = (wake.app.clone(), wake.release.clone());
         let subject = format!("{}@{}", wake.app, wake.release);
         let now = Instant::now();
@@ -7754,7 +7770,7 @@ impl Daemon {
 
         let lifted = crate::budget::Budget {
             workers: None,
-            ..self.budget
+            ..budget
         };
         let mut used = self.budget_usage();
         let mut admitted = crate::budget::admit(&lifted, used, vec![ask.clone()]).remove(0);
@@ -7785,10 +7801,7 @@ impl Daemon {
         };
 
         if let Some(limit) = admitted.limit {
-            let held = format!(
-                "the node's {limit} budget ({})",
-                self.budget.describe(&used)
-            );
+            let held = format!("the node's {limit} budget ({})", budget.describe(&used));
             group.scaler.limit(0, admitted.to, now, &held);
             self.events.emit(
                 "scaling.denied_by_budget",
@@ -7806,7 +7819,7 @@ impl Daemon {
         let mut message = decision_message(&wake.group, 0, to, &reason, false);
 
         if let Some(limit) = self
-            .budget
+            .budget()
             .workers
             .filter(|limit| used.workers + to > *limit)
         {
@@ -7845,7 +7858,7 @@ impl Daemon {
         let mut message = "a request is waiting: starting its host again".to_owned();
 
         if let Some(limit) = self
-            .budget
+            .budget()
             .workers
             .filter(|limit| used.workers + starting > *limit)
         {
@@ -7877,7 +7890,7 @@ impl Daemon {
     /// until the node is back under it or none is left; until then other
     /// releases' scale-out finds no room.
     async fn make_worker_room(&mut self, subject: &str) {
-        let Some(limit) = self.budget.workers else {
+        let Some(limit) = self.budget().workers else {
             return;
         };
 
@@ -7929,9 +7942,10 @@ impl Daemon {
     fn budget_view(&self, used: crate::budget::Usage) -> crate::budget::View {
         let fallback = self.node_mean_pss();
         let mut view = crate::budget::View {
-            budget: self.budget,
+            budget: self.budget(),
             used,
             fallback,
+            sources: self.budget_sources(),
             ..crate::budget::View::default()
         };
 
@@ -7971,7 +7985,7 @@ impl Daemon {
     /// when that is enough; refused with a `scaling.denied_by_budget`
     /// event when it is not.
     async fn make_room(&mut self, app: &str, spec: &ReleaseSpec) -> Result<(), String> {
-        if self.budget.memory.is_none() {
+        if self.budget().memory.is_none() {
             return Ok(());
         }
 
@@ -8153,6 +8167,65 @@ impl Daemon {
 
     /// Ask a release's host to bring a group to a worker count; the host
     /// announces the sockets as they change.
+    /// Section 7.4 and issue 384: the budget in force. The daemon file's
+    /// limits win; `memory` and `cpu` it leaves out default to the
+    /// daemon's own cgroup's, read now, so an in-place resize applies to
+    /// the next decision: `memory.max` less the headroom, and the quota
+    /// of `cpu.max`. `workers` has no default.
+    fn budget(&self) -> crate::budget::Budget {
+        let mut budget = self.budget_table;
+
+        let Some(limits) = self.cgroup.as_ref().map(crate::cgroup::Limits::again) else {
+            return budget;
+        };
+
+        if budget.memory.is_none() {
+            budget.memory = limits
+                .memory_max
+                .map(|limit| limit.saturating_sub(crate::cgroup::headroom(limit)));
+        }
+
+        if budget.cpu.is_none() {
+            budget.cpu = limits
+                .cpu_max
+                .map(|(quota, period)| quota as f64 / period.max(1) as f64);
+        }
+
+        budget
+    }
+
+    /// Where the budget's limits come from, for status: the cgroup's
+    /// files for those the daemon file leaves out.
+    fn budget_sources(&self) -> String {
+        let Some(limits) = self.cgroup.as_ref().map(crate::cgroup::Limits::again) else {
+            return String::new();
+        };
+
+        let mut from = Vec::new();
+
+        if self.budget_table.memory.is_none()
+            && let Some(limit) = limits.memory_max
+        {
+            from.push(format!(
+                "memory from memory.max {} less {} of headroom",
+                muru_config::format_size_approx(limit),
+                muru_config::format_size_approx(crate::cgroup::headroom(limit))
+            ));
+        }
+
+        if self.budget_table.cpu.is_none()
+            && let Some((quota, period)) = limits.cpu_max
+        {
+            from.push(format!("cpu from cpu.max {quota} {period}"));
+        }
+
+        if from.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", from.join(", "))
+        }
+    }
+
     /// Sections 7.7 and 13.9: at every memory check, the shortest
     /// `check_interval` of the running releases, read the daemon's
     /// cgroup again and, with less than the headroom left under its
@@ -10424,6 +10497,17 @@ fn scalers_for(
     }
 
     size_scalers(&mut scalers, spec, interface);
+
+    // Issue 384: a worker of a group with a hard limit counts at it.
+
+    for scaling in &mut scalers {
+        scaling.hard_limit = spec
+            .groups
+            .iter()
+            .find(|group| group.name == scaling.name)
+            .and_then(|group| group.memory.as_ref())
+            .map_or(spec.memory.hard_limit, |memory| memory.hard_limit);
+    }
 
     for (name, count) in pins {
         if let Some(scaling) = scalers.iter_mut().find(|scaling| &scaling.name == name) {

@@ -204,19 +204,19 @@
     },
     "Budget": {
       "additionalProperties": false,
-      "description": "The `[daemon.budget]` table: what the releases on the node may hold between them. Each limit is off when omitted.",
+      "description": "The `[daemon.budget]` table: what the releases on the node may hold between them. A limit left out is off, except that memory and cpu default to the daemon's own cgroup's limits when it has them (issue 384).",
       "properties": {
         "cpu": {
-          "description": "CPU cores the workers use, as measured.",
+          "description": "CPU cores the workers use, as measured. Omitted, it is the quota of the daemon's cgroup's cpu.max, read at each decision, and off without one.",
           "format": "double",
           "type": "number"
         },
         "memory": {
-          "description": "Memory for the hosts and workers, as a size such as 12GB.",
+          "description": "Memory for the hosts and workers, as a size such as 12GB. Omitted, it is the daemon's cgroup's memory.max less a headroom of 10% (at least 128MB), read at each decision, and off without one.",
           "type": "string"
         },
         "workers": {
-          "description": "Worker processes and managed server instances.",
+          "description": "Worker processes and managed server instances; off when omitted.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"

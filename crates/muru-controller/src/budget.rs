@@ -270,13 +270,23 @@ pub struct View {
     /// The memory the retained releases hold, which they give back to
     /// make room for a release.
     pub retained: u64,
+    /// Where the limits the daemon file leaves out come from, such as
+    /// ` (memory from memory.max 2.0GB less 205MB of headroom)`, or empty.
+    pub sources: String,
 }
 
 impl View {
-    /// What a worker of an application's group costs: its serving
-    /// release's measure, else the soft limit `spec` sets, else the
-    /// node's mean.
-    fn cost(&self, app: &str, group: &str, soft_limit: Option<u64>) -> Cost {
+    /// What a worker of an application's group costs: the hard limit
+    /// `spec` sets for it, the user's own statement of how large a worker
+    /// may grow (issue 384), else its serving release's measure, else the
+    /// soft limit, else the node's mean.
+    fn cost(
+        &self,
+        app: &str,
+        group: &str,
+        hard_limit: Option<u64>,
+        soft_limit: Option<u64>,
+    ) -> Cost {
         let measured = self
             .groups
             .get(&(app.to_owned(), group.to_owned()))
@@ -284,14 +294,18 @@ impl View {
             .unwrap_or_default();
 
         Cost {
-            memory: measured.memory.or(soft_limit).or(self.fallback),
+            memory: hard_limit
+                .or(measured.memory)
+                .or(soft_limit)
+                .or(self.fallback),
             cpu: measured.cpu,
         }
     }
 
     /// The memory a new release of `app` would take: its host and its
-    /// workers at their starting counts, each worker at what the
-    /// application's serving release measures, else the soft limit, else
+    /// workers at their starting counts, each worker at its group's hard
+    /// limit when one is set, else what the application's serving
+    /// release measures, else the soft limit, else
     /// the node's mean, and the host at what the serving host measures,
     /// else a worker's. None when nothing is known, and for a managed
     /// server, whose memory is not measured.
@@ -301,16 +315,23 @@ impl View {
         }
 
         let soft_limit = spec.memory.soft_limit;
-        let groups = std::iter::once((muru_edge::routing::DEFAULT_GROUP, spec.processes)).chain(
-            spec.groups
-                .iter()
-                .map(|group| (group.name.as_str(), group.processes)),
-        );
+        let groups = std::iter::once((
+            muru_edge::routing::DEFAULT_GROUP,
+            spec.processes,
+            spec.memory.hard_limit,
+        ))
+        .chain(spec.groups.iter().map(|group| {
+            let hard = group
+                .memory
+                .as_ref()
+                .map_or(spec.memory.hard_limit, |memory| memory.hard_limit);
+            (group.name.as_str(), group.processes, hard)
+        }));
         let mut total = 0;
         let mut each = None;
 
-        for (group, count) in groups {
-            let memory = self.cost(app, group, soft_limit).memory?;
+        for (group, count, hard_limit) in groups {
+            let memory = self.cost(app, group, hard_limit, soft_limit).memory?;
             each.get_or_insert(memory);
             total += memory * count as u64;
         }
@@ -359,7 +380,7 @@ impl View {
             &self.used,
             held,
             floor,
-            self.cost(app, group, soft_limit),
+            self.cost(app, group, None, soft_limit),
         )
     }
 }
@@ -382,6 +403,32 @@ mod tests {
     use super::*;
 
     const MB: u64 = 1024 * 1024;
+
+    #[test]
+    fn a_worker_counts_at_its_hard_limit_before_what_it_measures() {
+        let mut view = View {
+            fallback: Some(50 * MB),
+            ..View::default()
+        };
+        view.groups.insert(
+            ("shop".to_owned(), "default".to_owned()),
+            (
+                2,
+                Cost {
+                    memory: Some(120 * MB),
+                    cpu: None,
+                },
+            ),
+        );
+
+        let cost = |hard, soft| view.cost("shop", "default", hard, soft).memory;
+        assert_eq!(cost(Some(300 * MB), Some(80 * MB)), Some(300 * MB));
+        assert_eq!(cost(None, Some(80 * MB)), Some(120 * MB));
+
+        let unmeasured = |hard, soft| view.cost("shop", "reports", hard, soft).memory;
+        assert_eq!(unmeasured(None, Some(80 * MB)), Some(80 * MB));
+        assert_eq!(unmeasured(None, None), Some(50 * MB));
+    }
 
     fn ask(key: &str, priority: i32, from: u32, to: u32, memory: u64) -> Ask<String> {
         Ask {

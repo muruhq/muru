@@ -135,6 +135,11 @@ max_workers = 2
             assert time.monotonic() < deadline, limits()
             time.sleep(0.2)
 
+        # Issue 384: the budget's memory is the cgroup's, less the headroom.
+
+        status = daemon.muructl("status").stdout
+        assert "(memory from memory.max 1.0GB less 128MB of headroom" in status, status
+
         # One worker takes 120MB; then less than the headroom is left.
 
         assert daemon.get("/grow?mb=120").status == 200

@@ -1298,6 +1298,9 @@ pub struct GroupScaling {
     pub threads: u32,
     /// The soft memory limit and what it measures, when one is set.
     pub memory_limit: Option<(muru_config::Measure, u64)>,
+    /// The hard memory limit, when one is set: what a worker counts as
+    /// against a budget (issue 384).
+    pub hard_limit: Option<u64>,
     /// The last scale-out the budget held back: the count asked for, the
     /// count given and the limit, so each is one event.
     pub denied: Option<(u32, u32, crate::budget::Limit)>,
@@ -1339,6 +1342,7 @@ impl GroupScaling {
             requested: None,
             threads: 0,
             memory_limit,
+            hard_limit: None,
             denied: None,
         }
     }

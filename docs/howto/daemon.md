@@ -990,6 +990,11 @@ time, or its group scaled in by it when the group has a scaling policy
 above its `min_workers`. `muructl status` shows the limits, what is used
 and left, and what the guard is doing.
 
+The [node's budget](scaling.md#the-nodes-budget) takes its `memory` and
+`cpu` from the same cgroup when the daemon file leaves them out, so a
+deploy, a canary beside the serving release and a scale-out are admitted
+against the container's limits before anything starts.
+
 ### Building nothing at run time
 
 The daemon does not know it is in a container, and does not need to: it

@@ -289,7 +289,7 @@ impl Admin for Service {
             let view = &info.defined.read().expect("defined names poisoned").budget;
 
             if view.budget.is_set() {
-                view.budget.describe(&view.used)
+                format!("{}{}", view.budget.describe(&view.used), view.sources)
             } else {
                 String::new()
             }

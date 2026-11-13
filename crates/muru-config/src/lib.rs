@@ -1482,17 +1482,23 @@ pub enum PythonDownloads {
 }
 
 /// The `[daemon.budget]` table (section 7.4): what the releases on the
-/// node may hold between them. Each limit is off when omitted.
+/// node may hold between them. A limit left out is off, except that
+/// memory and cpu default to the daemon's own cgroup's limits when it has
+/// them (issue 384).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
-    /// Worker processes and managed server instances.
+    /// Worker processes and managed server instances; off when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workers: Option<u32>,
-    /// Memory for the hosts and workers, as a size such as 12GB.
+    /// Memory for the hosts and workers, as a size such as 12GB. Omitted,
+    /// it is the daemon's cgroup's memory.max less a headroom of 10% (at
+    /// least 128MB), read at each decision, and off without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<String>,
-    /// CPU cores the workers use, as measured.
+    /// CPU cores the workers use, as measured. Omitted, it is the quota of
+    /// the daemon's cgroup's cpu.max, read at each decision, and off
+    /// without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu: Option<f64>,
 }

@@ -248,10 +248,17 @@ cpu = 6
 | `memory` | Memory for the hosts and their workers |
 | `cpu` | CPU cores the workers use |
 
-Each limit is off when it is left out, and `muructl daemon reload` picks
-up a change. A worker counts at what its group's workers measure, its
-proportional set size and the CPU it uses, and before any has reported at
-the group's `memory.soft_limit`, else at the mean of the node's workers.
+Each limit is off when it is left out, except that `memory` and `cpu`
+default to the limits of the daemon's own cgroup when it has them, as in
+a container or under a systemd unit with `MemoryMax=` or `CPUQuota=`:
+`memory` to `memory.max` less a headroom of 10% (at least 128MB), and
+`cpu` to the quota of `cpu.max`. These are read at each decision, so a
+resize of the container applies to the next one, and a value in the
+file wins. `muructl daemon reload` picks up a change to the file. A
+worker counts at its group's `memory.hard_limit` when one is set, else
+at what its group's workers measure, its proportional set size and the
+CPU it uses, and before any has reported at the group's
+`memory.soft_limit`, else at the mean of the node's workers.
 On Linux each host counts at its own memory too. `muructl daemon status`
 shows what is held:
 
@@ -259,6 +266,12 @@ shows what is held:
 $ muructl daemon status
 ...
 budget   27 of 32 workers, 9.8GB of 12GB memory, 3.1 of 6 cores
+```
+
+A limit taken from the cgroup says where it came from:
+
+```
+budget   1.2GB of 1.8GB memory, 1.4 of 2 cores (memory from memory.max 2.0GB less 205MB of headroom, cpu from cpu.max 200000 100000)
 ```
 
 A scale-out, including the climb to a schedule's floor, is given as many
