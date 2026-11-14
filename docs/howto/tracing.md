@@ -89,7 +89,31 @@ entry point as the table names it, `feed.asgi:app` here. Where a framework's
 instrumentation records the request too, the middleware's boundary is the
 outer one and records it, and the framework's passes through, so a
 framework's request settings no longer apply; leave `tracing_middleware`
-off for those. A gRPC entry point is not wrapped.
+off for those. A gRPC entry point is not wrapped. While tracing is off,
+`tracing_middleware` has no effect, so a project can say which entry
+points to wrap and leave tracing itself to each developer.
+
+## Tracing on one machine
+
+`tracing` in a project's `muru.local.toml` takes the place of the
+project's, for `muructl run` on that machine, so a developer can trace
+their own runs without a change to the committed settings:
+
+```toml
+# muru.local.toml
+tracing = true
+```
+
+or, with a configuration of their own:
+
+```toml
+[tracing]
+config = "my-tracing.toml"
+```
+
+The project still needs wrapture in its dependencies, and the
+`tracing_middleware` keys stay the project's. `muructl run --print-config`
+shows which file `tracing` came from.
 
 ## Preloading and the workers
 

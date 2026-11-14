@@ -2,7 +2,7 @@
 
 # muru.local.toml
 
-A developer's own settings for `muructl run`, in `muru.local.toml` beside the project, which is not committed. Its `[run]` table holds the keys of `[tool.muru.run]` and takes precedence over them; lists add to the project's. Its `[[instrumentation]]` entries come before the project's.
+A developer's own settings for `muructl run`, in `muru.local.toml` beside the project, which is not committed. Its `[run]` table holds the keys of `[tool.muru.run]` and takes precedence over them; lists add to the project's. Its `[[instrumentation]]` entries come before the project's, and its `tracing` takes the place of the project's.
 
 The JSON Schema of the same keys, for an editor that checks TOML against one, is `https://docs.muruhq.dev/en/latest/schema/local.schema.json`.
 
@@ -14,6 +14,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `build` | table, {ref}`[build] <config-local-build>` |  | When `muructl run` builds the environment. |
 | `instrumentation` | array of tables, {ref}`[[instrumentation]] <config-local-instrumentation>` |  | Instrumentation modules for this machine's runs, before the project's own. |
 | `run` | table, {ref}`[run] <config-local-run>` |  | How `muructl run` serves the project, over `[tool.muru.run]`. |
+| `tracing` | boolean or table, {ref}`[tracing] <config-local-tracing>` |  | Tracing with wrapture for this machine's runs, in place of the project's `tracing`. |
 
 (config-local-build)=
 ## `[build]`
@@ -61,3 +62,12 @@ The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a muru.toml and i
 | `tls_cert` | string |  | A certificate chain to serve, relative to the project. |
 | `tls_key` | string |  | Its private key, relative to the project. |
 | `toolbar` | boolean | `false` | Whether the edge inserts the development toolbar into the run's HTML pages. |
+
+(config-local-tracing)=
+## `[tracing]`
+
+Tracing turned on with its settings, in place of `tracing = true`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `config` | string | found by wrapture | The wrapture configuration: a `wrapture.toml`, or a `pyproject.toml` with a `[tool.wrapture]` table, relative to the project's directory. |

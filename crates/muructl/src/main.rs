@@ -1864,8 +1864,11 @@ struct Resolved {
     /// The instrumentation modules (section 6.15): muru.local.toml's,
     /// then the table's.
     instrumentation: Vec<muru_config::Instrumentation>,
-    /// The table's `tracing` key (section 11.6), as written.
+    /// `tracing` (section 11.6) as written: muru.local.toml's, else the
+    /// table's.
     tracing: Option<muru_config::Tracing>,
+    /// The muru.local.toml `tracing` came from, when it came from one.
+    tracing_from_local: Option<PathBuf>,
     /// The table's `tracing_middleware` key, for the entrypoint.
     tracing_middleware: Option<bool>,
     /// The instrumentation entry that sets tracing up, when it is on;
@@ -2025,10 +2028,23 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         None => muru_config::load_local(&project, source.as_deref())?,
     };
 
-    let (local, local_run, local_build_when, local_instrumentation) = match local_file {
-        Some((path, file)) => (Some(path), file.run, file.build_when, file.instrumentation),
-        None => (None, muru_config::RunSettings::default(), None, Vec::new()),
-    };
+    let (local, local_run, local_build_when, local_instrumentation, local_tracing) =
+        match local_file {
+            Some((path, file)) => (
+                Some(path),
+                file.run,
+                file.build_when,
+                file.instrumentation,
+                file.tracing,
+            ),
+            None => (
+                None,
+                muru_config::RunSettings::default(),
+                None,
+                Vec::new(),
+                None,
+            ),
+        };
 
     // Section 6.15: this machine's instrumentation modules come before the
     // project's, so a tool one developer adds measures the others too.
@@ -2041,10 +2057,14 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     // Section 11.6: tracing is set up by a module of Muru's own, at the
-    // head of the list the host is given.
+    // head of the list the host is given. muru.local.toml's tracing takes
+    // the place of the project's, for this machine's runs.
+
+    let tracing_from_local = local_tracing.is_some().then(|| local.clone()).flatten();
+    let tracing = local_tracing.or_else(|| table.tracing.clone());
 
     let tracing_entry = muru_config::tracing_instrumentation(
-        table.tracing.as_ref(),
+        tracing.as_ref(),
         table.tracing_middleware,
         &table.mounts,
         &instrumentation,
@@ -2210,7 +2230,8 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
             .unwrap_or(muru_config::Preload::Auto),
         hooks: args.hooks.clone().or(table.hooks),
         instrumentation,
-        tracing: table.tracing,
+        tracing,
+        tracing_from_local,
         tracing_middleware: table.tracing_middleware,
         tracing_entry,
         project,

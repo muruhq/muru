@@ -4104,8 +4104,10 @@ impl<'de> Deserialize<'de> for Tracing {
 /// None when tracing is off. Its settings carry the configuration file
 /// and which entry points are wrapped in the request middleware: the
 /// entrypoint when `entrypoint_middleware` says so, and each mount whose
-/// `tracing_middleware` does. A middleware asked for with tracing off,
-/// or the module listed by hand, is refused.
+/// `tracing_middleware` does. With tracing off the middleware keys are
+/// unused, so a project can say which entry points to wrap and leave
+/// tracing to a developer's muru.local.toml. The module listed by hand
+/// is refused.
 pub fn tracing_instrumentation(
     tracing: Option<&Tracing>,
     entrypoint_middleware: Option<bool>,
@@ -4126,10 +4128,6 @@ pub fn tracing_instrumentation(
     let wrapped_entrypoint = entrypoint_middleware == Some(true);
 
     let Some(tracing) = tracing.filter(|tracing| tracing.enabled()) else {
-        if wrapped_entrypoint || !wrapped_mounts.is_empty() {
-            return Err("tracing_middleware needs tracing to be on".to_owned());
-        }
-
         return Ok(None);
     };
 
@@ -5349,6 +5347,9 @@ pub struct LocalFile {
     /// The `[[instrumentation]]` entries, which come before the
     /// project's (section 6.15).
     pub instrumentation: Vec<Instrumentation>,
+    /// `tracing` (section 11.6), which takes the place of the project's
+    /// for this machine's runs.
+    pub tracing: Option<Tracing>,
 }
 
 /// The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a
@@ -6088,12 +6089,14 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
         |path| path.display().to_string(),
     );
 
-    if let Some(key) = document
-        .keys()
-        .find(|key| !matches!(key.as_str(), "run" | "build" | "instrumentation"))
-    {
+    if let Some(key) = document.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "run" | "build" | "instrumentation" | "tracing"
+        )
+    }) {
         return Err(format!(
-            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table, the when key of [build] and [[instrumentation]]; the application's settings belong in {there}"
+            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table, the when key of [build], [[instrumentation]] and tracing; the application's settings belong in {there}"
         ));
     }
 
@@ -6142,10 +6145,21 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
 
     check_instrumentation(&instrumentation)?;
 
+    let tracing = match document.get("tracing") {
+        Some(tracing) => Some(
+            tracing
+                .clone()
+                .try_into::<Tracing>()
+                .map_err(|error| format!("tracing: {error}"))?,
+        ),
+        None => None,
+    };
+
     Ok(LocalFile {
         run,
         build_when,
         instrumentation,
+        tracing,
     })
 }
 
@@ -7066,15 +7080,20 @@ traffic = { classes = { ai-crawler = 'r1' } }"
     }
 
     #[test]
-    fn tracing_off_refuses_a_middleware_and_the_module_is_not_listed_by_hand() {
+    fn tracing_off_leaves_a_middleware_unused_and_the_module_is_not_listed_by_hand() {
         let off = parse_muru_toml("tracing = false\n").unwrap();
         assert_eq!(
             tracing_instrumentation(off.tracing.as_ref(), None, &off.mounts, &[]).unwrap(),
             None
         );
 
-        let error = tracing_instrumentation(None, Some(true), &BTreeMap::new(), &[]).unwrap_err();
-        assert_eq!(error, "tracing_middleware needs tracing to be on");
+        // A project may say which entry points to wrap and leave tracing
+        // itself to a developer's muru.local.toml.
+
+        assert_eq!(
+            tracing_instrumentation(None, Some(true), &BTreeMap::new(), &[]).unwrap(),
+            None
+        );
 
         let listed = [Instrumentation {
             module: TRACING_MODULE.to_owned(),
@@ -7088,6 +7107,25 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         )
         .unwrap_err();
         assert!(error.contains("set up by the tracing key"), "{error}");
+    }
+
+    #[test]
+    fn the_local_file_takes_tracing() {
+        let local = parse_local("tracing = true\n", None).unwrap();
+        assert_eq!(local.tracing, Some(Tracing::Enabled(true)));
+
+        let local = parse_local("[tracing]\nconfig = 'mine.toml'\n", None).unwrap();
+        assert_eq!(
+            local.tracing,
+            Some(Tracing::Settings(TracingSettings {
+                config: Some("mine.toml".to_owned())
+            }))
+        );
+
+        let error = parse_local("tracing = 'on'\n", None).unwrap_err();
+        assert!(error.starts_with("tracing: "), "{error}");
+
+        assert_eq!(parse_local("", None).unwrap().tracing, None);
     }
 
     #[test]

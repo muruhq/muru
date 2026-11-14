@@ -358,10 +358,16 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
         ));
     }
 
-    // Section 11.6: tracing and the entrypoint's request middleware.
+    // Section 11.6: tracing, from muru.local.toml or the project, and the
+    // entrypoint's request middleware.
 
     if let Some(tracing) = &resolved.tracing {
-        top.push(Row::new("tracing", tracing, project.clone()));
+        let source = match &resolved.tracing_from_local {
+            Some(path) => path.display().to_string(),
+            None => project.clone(),
+        };
+
+        top.push(Row::new("tracing", tracing, source));
     }
 
     if let Some(middleware) = resolved.tracing_middleware {

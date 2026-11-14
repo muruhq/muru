@@ -105,8 +105,11 @@ port = 9100
 dashboard = "off"
 ```
 
-It holds the `[run]` table and nothing else; a key outside it is refused
-with a message naming the committed file where the application's settings
+Beside the `[run]` table it takes only the `when` key of `[build]`,
+[`[[instrumentation]]`](instrumentation.md#listing-the-modules) entries,
+which come before the project's, and [`tracing`](tracing.md#tracing-on-one-machine),
+which takes the place of the project's. Any other key is refused with a
+message naming the committed file where the application's settings
 belong. It is never committed: `muructl run` says once per run that it is
 using the file, and if the project's `.gitignore` does not cover it, the
 start-up line says so. `muructl deploy` does not read it.
