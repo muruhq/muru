@@ -50,7 +50,9 @@ CALLBACKS = (
     "before_import",
     "after_import",
     "load_finished",
+    "worker_started",
     "wrap_application",
+    "worker_stopped",
 )
 
 # How a load ended, as load_finished is told (section 6.15): the host
@@ -203,6 +205,7 @@ class Instruments:
         self.entries = list(entries)
         self.loaded: list[Instrument] = []
         self.outcome: str | None = None
+        self.worker_started = False
 
     def load(
         self,
@@ -265,6 +268,21 @@ class Instruments:
 
         for instrument in reversed(self.loaded):
             instrument.call(callback, *args)
+
+    def start_worker(self, context: Any) -> None:
+        """Run worker_started in listed order, in a worker before its post_fork hook."""
+
+        self.worker_started = True
+        self.call("worker_started", context)
+
+    def stop_worker(self, context: Any) -> None:
+        """Run worker_stopped in reverse order, once, if worker_started ran."""
+
+        if not self.worker_started:
+            return
+
+        self.worker_started = False
+        self.call_reversed("worker_stopped", context)
 
     def wrap(self, context: Any, target: Target, application: Any, interface: str) -> Any:
         """Give an entry point's application to each module's wrap_application.

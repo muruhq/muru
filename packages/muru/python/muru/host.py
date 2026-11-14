@@ -63,6 +63,7 @@ from muru import RequestTimeout, _asgi, _inspect, _instrumentation, _outside, pr
 from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
+from muru._context import context as muru_context
 from muru._instrumentation import Entry, InstrumentationError, Instruments, Target
 from muru.hooks import Hooks
 
@@ -1469,6 +1470,27 @@ class Host:
         path: str | None = None,
         control: int | None = None,
     ) -> int:
+        """Run a worker, then the instrumentation modules' worker_stopped.
+
+        Section 6.15: worker_stopped is the last thing a worker does, after
+        lifespan shutdown, on_exit, the ``atexit`` callbacks and the loop
+        stopping, whether the worker served, failed to start or failed
+        while serving, in every worker that ran worker_started.
+        """
+
+        try:
+            return self.run_worker(index, lifeline, report, path, control)
+        finally:
+            self.release.instruments.stop_worker(muru_context())
+
+    def run_worker(
+        self,
+        index: int,
+        lifeline: int | None = None,
+        report: int | None = None,
+        path: str | None = None,
+        control: int | None = None,
+    ) -> int:
         """Run a worker: enable collection, run the hooks, then serve until the server stops.
 
         `lifeline` is the read end of the host's pipe, which the server
@@ -1579,6 +1601,10 @@ class Host:
 
                 instruments.finished(context, _instrumentation.SERVE)
 
+            # Section 6.15: the instrumentation modules start in the worker
+            # just before post_fork, before the loop exists.
+
+            release.instruments.start_worker(context)
             hooks.call("post_fork", context)
 
             # Section 6.8: a factory is called per worker, after post_fork,

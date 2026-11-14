@@ -63,7 +63,9 @@ them by name; nothing in the configuration says which a module has.
 | `before_import(context, target)` | Before the application's hooks module, its entrypoint and each mount is imported |
 | `after_import(context, target)` | After each of those imports, with `target.error` set when it failed |
 | `load_finished(context, outcome)` | Once the application is loaded, or its load has failed, before any worker is forked |
+| `worker_started(context)` | In each worker, just before its `post_fork` hook |
 | `wrap_application(context, target, application, interface)` | In each worker, once for each entry point, with its application, before the worker serves; what it returns is served in place of the application |
+| `worker_stopped(context)` | In each worker that ran `worker_started`, as the last thing it does |
 
 A module sees only its own settings, and the application sees none of
 them.
@@ -208,6 +210,72 @@ def wrap_application(context, target, application, interface):
   with the services registered, which is not a callable. The call is
   still made, so a tool hears of every entry point, but anything other
   than `None` or the same object is logged and not served.
+
+## A worker's start and stop
+
+`worker_started` and `worker_stopped` give a tool, such as an APM
+agent, a start in each worker and a place for its final send, without
+the application's `post_fork` and `on_exit` hooks.
+
+```python
+# apm_setup.py
+import someapm
+
+
+def configure(settings):
+    someapm.settings(app_name=settings["app_name"])
+
+
+def worker_started(context):
+    someapm.start(worker=context.worker_id)
+
+
+def worker_stopped(context):
+    someapm.shutdown(timeout=3)
+```
+
+- **worker_started** runs in listed order just before the `post_fork`
+  hook, whether the application was preloaded or imported in the
+  worker. The worker's event loop does not exist yet, so a tool cannot
+  depend on it.
+
+- **worker_stopped** runs in reverse order as the last thing the worker
+  does: after ASGI lifespan shutdown, the `on_exit` hook, the `atexit`
+  callbacks and the event loop stopping. What the application does
+  while it shuts down is still instrumented, and is in the tool's final
+  send. It also runs when the worker fails to start or fails while
+  serving, as long as `worker_started` ran.
+
+- **Its time.** `worker_stopped` runs in what is left of the worker's
+  stop budget. A worker the host kills when the budget is spent, or the
+  kernel kills, does not run it.
+
+- **atexit.** A tool that also flushes from an `atexit` callback sees
+  `worker_stopped` as a second shutdown, and has to tolerate it.
+
+## The whole sequence
+
+Under preload, with every callback a module can define, a release runs
+in this order:
+
+1. In the host: Muru's own start-up, then for each instrumentation
+   module in listed order, its import, `configure` and `load_started`.
+2. The import check takes its baseline.
+3. `before_import` and `after_import` around the hooks module, the
+   entrypoint (with a factory the host calls) and each mount.
+4. The `on_load` hook, then the `pre_fork` hook.
+5. The import check's findings, then `load_finished`, in reverse order.
+6. The workers are forked. In each worker: `worker_started`, the
+   `post_fork` hook, a factory called in the worker, `wrap_application`
+   for each entry point, ASGI lifespan startup, the `on_ready` hook,
+   then serving.
+7. When a worker stops: the `on_drain` hook, the requests in flight
+   finish, ASGI lifespan shutdown, the `on_exit` hook, the `atexit`
+   callbacks, the event loop stops, then `worker_stopped`, in reverse
+   order.
+
+With per-worker imports, steps 1 to 5 run in each worker, after the
+fork and before `worker_started`, with `load_finished` told `serve`.
 
 ## When the modules are imported
 

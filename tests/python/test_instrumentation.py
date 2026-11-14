@@ -341,3 +341,40 @@ def test_check_runs_the_load_callbacks_as_the_host_does(
         ("after", "first_tool", "entrypoint", None),
         ("finished", "first_tool", "check"),
     ]
+
+
+WORKER = """
+import instrumented_order as order
+
+
+def worker_started(context):
+    order.CALLS.append(("started", __name__))
+
+
+def worker_stopped(context):
+    order.CALLS.append(("stopped", __name__))
+"""
+
+
+def test_worker_stopped_runs_in_reverse_once_and_only_after_worker_started(
+    modules: Path,
+) -> None:
+    (modules / "first_tool.py").write_text(WORKER)
+    (modules / "second_tool.py").write_text(WORKER)
+    instruments = Instruments([Entry("first_tool"), Entry("second_tool")])
+    instruments.load()
+
+    # A worker that failed before it started its modules stops none.
+
+    instruments.stop_worker(None)
+    assert calls() == []
+
+    instruments.start_worker(None)
+    instruments.stop_worker(None)
+    instruments.stop_worker(None)
+    assert calls() == [
+        ("started", "first_tool"),
+        ("started", "second_tool"),
+        ("stopped", "second_tool"),
+        ("stopped", "first_tool"),
+    ]
