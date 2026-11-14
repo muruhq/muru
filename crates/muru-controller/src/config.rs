@@ -4021,11 +4021,32 @@ pub fn resolve_spec(
     // Section 6.15: the instrumentation list is a table, so it comes from
     // the declaration, else the source, never the release before.
 
-    let instrumentation = tables
+    let mut instrumentation = tables
         .instrumentation
         .unwrap_or(&table.instrumentation)
         .to_vec();
     muru_config::check_instrumentation(&instrumentation)?;
+
+    // Section 11.6: the source's tracing key puts its module at the head
+    // of the list, with the entry points to wrap. A declaration exported
+    // from a release already carries the entry, and keeps it as it is.
+
+    let carried = instrumentation
+        .iter()
+        .any(|entry| entry.module == muru_config::TRACING_MODULE);
+
+    if !carried {
+        let entry = muru_config::tracing_instrumentation(
+            table.tracing.as_ref(),
+            table.tracing_middleware,
+            mounts,
+            &instrumentation,
+        )?;
+
+        if let Some(entry) = entry {
+            instrumentation.insert(0, entry);
+        }
+    }
 
     let interface = match request.interface.as_str() {
         "" => table
@@ -6021,6 +6042,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         max_connections: mount.max_connections.map(|value| value as usize),
                         handoff: mount.handoff,
                         max_body_size: mount.limits.max_body_size_text(),
+                        tracing_middleware: None,
                     },
                 )
             })
@@ -7010,6 +7032,65 @@ mod tests {
             resolve(twice).unwrap_err(),
             "instrumentation module apm is listed twice"
         );
+    }
+
+    #[test]
+    fn the_sources_tracing_puts_its_module_first_and_an_export_keeps_it() {
+        let source =
+            std::env::temp_dir().join(format!("muru-config-tracing-{}", std::process::id()));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("pyproject.toml"),
+            "[tool.muru]\nentrypoint = 'shop.wsgi:application'\ntracing = true\n\
+             [[tool.muru.instrumentation]]\nmodule = 'importtimer'\n\
+             [tool.muru.mounts.raw]\npath = '/raw'\nentrypoint = 'raw:app'\n\
+             tracing_middleware = true\n",
+        )
+        .unwrap();
+        let resolve = |keys: &str| {
+            let text = format!(
+                "[app.shop.release.r1]\nsource = '{}'\npython = '/usr/bin/python3'\n{keys}",
+                source.display()
+            );
+            let document = Document::parse(&text).unwrap();
+            resolve_declared(
+                "shop",
+                &document.app["shop"].release["r1"],
+                &source.display().to_string(),
+                &crate::provision::Provisioning::off(),
+            )
+        };
+
+        let spec = resolve("").unwrap();
+        let modules: Vec<&str> = spec
+            .instrumentation
+            .iter()
+            .map(|entry| entry.module.as_str())
+            .collect();
+
+        assert_eq!(modules, [muru_config::TRACING_MODULE, "importtimer"]);
+        assert_eq!(
+            spec.instrumentation[0].settings["middleware"],
+            serde_json::json!({"entrypoint": false, "mounts": ["raw"]})
+        );
+
+        // The exported list carries the entry, and declaring it again
+        // keeps it rather than adding a second.
+
+        let exported = table_from(&spec).instrumentation.unwrap();
+        let declared =
+            toml::to_string(&serde_json::json!({ "instrumentation": exported })).unwrap();
+        let declared = declared.replace(
+            "[[instrumentation]]",
+            "[[app.shop.release.r1.instrumentation]]",
+        );
+        let declared = declared.replace(
+            "[instrumentation.settings",
+            "[app.shop.release.r1.instrumentation.settings",
+        );
+
+        let again = resolve(&declared).unwrap();
+        assert_eq!(again.instrumentation, spec.instrumentation);
     }
 
     #[test]

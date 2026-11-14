@@ -49,6 +49,42 @@ no fork, so `pre_fork` does not run.
 [Preload and fork safety](../explanation/preload.md) explains what the
 hooks are for.
 
+## Signals Muru keeps
+
+Muru handles some signals itself in the host and in each worker, from the
+moment the process starts, before the instrumentation modules or the
+application are imported:
+
+| Process | Signals |
+| --- | --- |
+| The host | SIGTERM, SIGINT, SIGCHLD, SIGUSR1, SIGUSR2 |
+| A worker | SIGTERM, SIGINT, SIGUSR1, SIGUSR2, SIGQUIT |
+
+- **A stop while loading.** SIGTERM or SIGINT while the host preloads the
+  application ends the host cleanly: the import is abandoned, the
+  instrumentation modules' `load_finished` is told `stopped`, and the
+  host says it was stopped. In a worker that has not started serving,
+  through its imports, `post_fork`, lifespan startup and `on_ready`, the
+  start is abandoned, and what had started shuts down as a stop would:
+  lifespan shutdown, `on_exit`, the `atexit` callbacks and the
+  instrumentation modules' `worker_stopped`. Once the worker serves, a
+  stop drains its requests as usual.
+
+- **A reopen or reclaim while loading.** SIGUSR1 and SIGUSR2 do not end
+  a process that is still loading. A worker acts on them once it serves:
+  `on_reopen_logs` runs then.
+
+- **Other code cannot take them.** `signal.signal()` for one of these
+  signals is refused in that process: the handler is not installed, a
+  warning in the log names the signal and the module and line the call
+  came from, and the call returns the handler in force, so the code goes
+  on. This covers the application, its hooks and the instrumentation
+  modules, and `loop.add_signal_handler()`, which calls
+  `signal.signal()`. Other signals are installed as usual. A C extension
+  that calls `sigaction` itself, or `faulthandler.register()`, is not
+  checked. To act when a worker stops or reopens its logs, use the
+  `on_drain`, `on_exit` and `on_reopen_logs` hooks.
+
 ## Instrumentation callbacks
 
 An instrumentation module, listed in `[[tool.muru.instrumentation]]`,

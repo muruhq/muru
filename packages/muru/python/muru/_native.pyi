@@ -70,6 +70,13 @@ def serve(
 def memory_usage() -> dict[str, int] | None:
     """Return the worker's rss, pss and uss in bytes, or None where unmeasured."""
 
+def claim_signals() -> None:
+    """Note the stop, reopen and reclaim signals from now on, for the server to act on.
+
+    On top of the handlers in place, so one that arrives before the server
+    serves is acted on once it does (issue 673).
+    """
+
 def set_title(title: str, short: str) -> None:
     """Set the process title ps shows, and on Linux the short name top shows."""
 

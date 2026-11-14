@@ -14,6 +14,7 @@ mod memory;
 mod pool;
 mod record;
 mod signals;
+mod startup_signals;
 mod uploads;
 mod wsgi;
 
@@ -255,6 +256,16 @@ pub(crate) static SERVING: std::sync::Mutex<std::sync::Weak<pool::Shared>> =
 
 /// Section 7.6: the event loop's heartbeat, which the loop stall
 /// watchdog waits for.
+/// Note SIGTERM, SIGINT, SIGUSR1 and SIGUSR2 from now on, on top of the
+/// handlers in place, so the server acts on any that arrive before it
+/// serves (issue 673). Called in a worker right after its Python handlers
+/// are installed; neither is replaced afterwards.
+#[pyfunction]
+fn claim_signals() -> PyResult<()> {
+    startup_signals::claim()
+        .map_err(|error| pyo3::exceptions::PyOSError::new_err(error.to_string()))
+}
+
 #[pyfunction]
 fn loop_beat() {
     link::loop_beat();
@@ -363,6 +374,7 @@ fn set_title(title: &str, short: &str) {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(serve, m)?)?;
+    m.add_function(wrap_pyfunction!(claim_signals, m)?)?;
     m.add_function(wrap_pyfunction!(memory_usage, m)?)?;
     m.add_function(wrap_pyfunction!(set_title, m)?)?;
     m.add_function(wrap_pyfunction!(suspend_timeouts, m)?)?;

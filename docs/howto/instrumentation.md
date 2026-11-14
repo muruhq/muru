@@ -147,6 +147,7 @@ def load_finished(context, outcome):
   | `fallback` | The host starts again with per-worker imports |
   | `refused` | `preload = true` refused what the import check found, and the release fails |
   | `failed` | An import, a factory the host calls, `on_load` or `pre_fork` failed, or an instrumentation module could not be imported |
+  | `stopped` | A stop signal arrived while the application was loading, and the host or the worker ends |
   | `check` | `muructl check` is done |
 
   Nothing is turned off for a module there: a timer removes itself, and
@@ -303,7 +304,9 @@ later one's import.
   the log, as an entrypoint that cannot be imported does.
 
 - An exception from one of a module's functions, `configure` included,
-  is logged with its traceback and the release carries on.
+  is logged with its traceback and the release carries on. Under
+  `muructl check` it fails the check, which names the module, the
+  function and the exception, with the traceback on standard error.
 
 - An attribute with one of these names that is not a function is
   logged and left out.

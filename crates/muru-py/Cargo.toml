@@ -20,6 +20,7 @@ muru-common = { path = "../muru-common", default-features = false }
 muru-proto = { workspace = true }
 prost = { workspace = true }
 pyo3 = { workspace = true }
+signal-hook-registry = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

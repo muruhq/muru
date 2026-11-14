@@ -59,13 +59,15 @@ CALLBACKS = (
 # forks the workers from what it loaded; this process serves what it
 # loaded (a worker with per-worker imports, or --single); the host starts
 # again with per-worker imports; preload = true refused what the import
-# check found; something failed; or muructl check is done.
+# check found; something failed; a signal stopped the process while it
+# loaded; or muructl check is done.
 
 FORK = "fork"
 SERVE = "serve"
 FALLBACK = "fallback"
 REFUSED = "refused"
 FAILED = "failed"
+STOPPED = "stopped"
 CHECK = "check"
 
 
@@ -151,6 +153,8 @@ class Instrument:
     name: str
     module: ModuleType
     functions: dict[str, Callable[..., Any]] = field(default_factory=dict)
+    failures: list[tuple[str, BaseException]] = field(default_factory=list)
+    """The callbacks that raised, with what they raised, for a check's report."""
 
     @classmethod
     def found(cls, name: str, module: ModuleType) -> Instrument:
@@ -190,6 +194,7 @@ class Instrument:
         try:
             function(*args)
         except Exception as error:
+            self.failures.append((callback, error))
             muru_logging._report(
                 error, f"the {callback} callback of instrumentation module {self.name} failed"
             )

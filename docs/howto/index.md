@@ -114,6 +114,8 @@ Recipes for specific tasks, assuming you already know the basics. The
 - [Instrumentation modules](instrumentation.md): tools such as import
   timers and APM agents, set up for a release apart from the
   application.
+- [Tracing with wrapture](tracing.md): each request's calls, queries
+  and renders recorded as a tree, with no change to the application.
 
 ## Coding agents
 
@@ -171,5 +173,6 @@ dashboard
 debugging
 toolbar
 instrumentation
+tracing
 coding-agents
 ```

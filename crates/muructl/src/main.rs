@@ -1864,6 +1864,16 @@ struct Resolved {
     /// The instrumentation modules (section 6.15): muru.local.toml's,
     /// then the table's.
     instrumentation: Vec<muru_config::Instrumentation>,
+    /// `tracing` (section 11.6) as written: muru.local.toml's, else the
+    /// table's.
+    tracing: Option<muru_config::Tracing>,
+    /// The muru.local.toml `tracing` came from, when it came from one.
+    tracing_from_local: Option<PathBuf>,
+    /// The table's `tracing_middleware` key, for the entrypoint.
+    tracing_middleware: Option<bool>,
+    /// The instrumentation entry that sets tracing up, when it is on;
+    /// the host is given it ahead of the listed modules.
+    tracing_entry: Option<muru_config::Instrumentation>,
     /// The directory the host runs in.
     project: PathBuf,
     /// The file the table came from, when there was one.
@@ -1915,6 +1925,19 @@ struct Resolved {
     serving: Serving,
     /// The tables as they were read, for --print-config.
     layers: print_config::Layers,
+}
+
+impl Resolved {
+    /// The instrumentation modules the host is given (sections 6.15 and
+    /// 11.6): tracing's own module first when tracing is on, so its
+    /// request middleware is the outermost wrapper, then the listed ones.
+    fn host_instrumentation(&self) -> Vec<muru_config::Instrumentation> {
+        self.tracing_entry
+            .iter()
+            .chain(&self.instrumentation)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -2005,10 +2028,23 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         None => muru_config::load_local(&project, source.as_deref())?,
     };
 
-    let (local, local_run, local_build_when, local_instrumentation) = match local_file {
-        Some((path, file)) => (Some(path), file.run, file.build_when, file.instrumentation),
-        None => (None, muru_config::RunSettings::default(), None, Vec::new()),
-    };
+    let (local, local_run, local_build_when, local_instrumentation, local_tracing) =
+        match local_file {
+            Some((path, file)) => (
+                Some(path),
+                file.run,
+                file.build_when,
+                file.instrumentation,
+                file.tracing,
+            ),
+            None => (
+                None,
+                muru_config::RunSettings::default(),
+                None,
+                Vec::new(),
+                None,
+            ),
+        };
 
     // Section 6.15: this machine's instrumentation modules come before the
     // project's, so a tool one developer adds measures the others too.
@@ -2019,6 +2055,21 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         .collect();
     muru_config::check_instrumentation(&instrumentation)
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    // Section 11.6: tracing is set up by a module of Muru's own, at the
+    // head of the list the host is given. muru.local.toml's tracing takes
+    // the place of the project's, for this machine's runs.
+
+    let tracing_from_local = local_tracing.is_some().then(|| local.clone()).flatten();
+    let tracing = local_tracing.or_else(|| table.tracing.clone());
+
+    let tracing_entry = muru_config::tracing_instrumentation(
+        tracing.as_ref(),
+        table.tracing_middleware,
+        &table.mounts,
+        &instrumentation,
+    )
+    .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     let layers = print_config::Layers::new(&table, &run_table, &local_run);
     let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
@@ -2179,6 +2230,10 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
             .unwrap_or(muru_config::Preload::Auto),
         hooks: args.hooks.clone().or(table.hooks),
         instrumentation,
+        tracing,
+        tracing_from_local,
+        tracing_middleware: table.tracing_middleware,
+        tracing_entry,
         project,
         source,
         groups: table.groups,
@@ -2816,12 +2871,14 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
 
     // Section 6.15: the instrumentation modules, as the host is given them.
 
-    if resolved.instrumentation.is_empty() {
+    let instrumentation = resolved.host_instrumentation();
+
+    if instrumentation.is_empty() {
         command.env_remove(muru_controller::host::INSTRUMENTATION_VARIABLE);
     } else {
         command.env(
             muru_controller::host::INSTRUMENTATION_VARIABLE,
-            serde_json::to_string(&resolved.instrumentation)?,
+            serde_json::to_string(&instrumentation)?,
         );
     }
 
@@ -3345,7 +3402,7 @@ async fn run_with(
         concurrency: resolved.concurrency,
         preload: resolved.preload,
         hooks: resolved.hooks.clone(),
-        instrumentation: resolved.instrumentation.clone(),
+        instrumentation: resolved.host_instrumentation(),
         chdir: Some(resolved.project.clone()),
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
         single: args.single,
@@ -3486,10 +3543,27 @@ async fn run_with(
         relay_watcher(&label, "r1", &run_events),
     )?;
 
-    if let Err(error) = current.wait_ready(START_TIMEOUT).await {
-        current.stop(stop_budget).await;
-        let _ = std::fs::remove_dir_all(&run_dir);
-        return Err(error);
+    // Issue 673: a stop while the workers come up, the application still
+    // loading, stops the run then rather than once they are ready.
+
+    let started = tokio::select! {
+        ready = current.wait_ready(START_TIMEOUT) => Some(ready),
+        _ = interrupt.recv() => None,
+        _ = terminate.recv() => None,
+    };
+
+    match started {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            current.stop(stop_budget).await;
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Err(error);
+        }
+        None => {
+            current.stop(stop_budget).await;
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Ok(());
+        }
     }
 
     let (control, mut host_messages) = host_control(&current).await;

@@ -59,7 +59,7 @@ from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any
 
-from muru import RequestTimeout, _asgi, _inspect, _instrumentation, _outside, preload
+from muru import RequestTimeout, _asgi, _inspect, _instrumentation, _outside, _signals, preload
 from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
@@ -1354,7 +1354,20 @@ class Host:
         # once by each process.
 
         flush_streams()
-        pid = os.fork()
+
+        # Issue 673: the worker gets the stop, reopen and reclaim signals
+        # only once its own handlers are in place.
+
+        _signals.hold()
+
+        try:
+            pid = os.fork()
+        except BaseException:
+            _signals.release()
+            raise
+
+        if pid != 0:
+            _signals.release()
 
         if pid == 0:
             status = 1
@@ -1530,19 +1543,13 @@ class Host:
                 + (", trimmed the heap" if trimmed else "")
             )
 
-        # The host's handlers and wake-up pipe belong to the host; the native
-        # server installs its own handling of SIGTERM, SIGINT and SIGUSR1.
+        # Issue 673: the worker's own signal handling, before anything of
+        # the application runs here: a stop while it starts unwinds it,
+        # the native server acts on what arrives before it serves, and the
+        # application, its hooks and the instrumentation modules cannot
+        # take these signals.
 
-        signal.set_wakeup_fd(-1)
-
-        for signum in (
-            signal.SIGTERM,
-            signal.SIGINT,
-            signal.SIGCHLD,
-            signal.SIGUSR1,
-            signal.SIGUSR2,
-        ):
-            signal.signal(signum, signal.SIG_DFL)
+        _signals.start_worker()
 
         # Section 7.1: MURU_GROUP and the context identify the group after
         # the fork, and the group's sizes are the worker's.
@@ -1555,6 +1562,8 @@ class Host:
 
         loop: _asgi.Loop | None = None
         lifespan: _asgi.Lifespan | None = None
+        lifespans: list[_asgi.Lifespan] = []
+        hooks = Hooks()
 
         # Section 6.8: an interface not settled in the host, because the
         # workers import the application or a factory makes it, is
@@ -1595,6 +1604,9 @@ class Host:
                     )
                     hooks.call("on_load", context)
                     hooks.call("pre_fork", context)
+                except _signals.Stopped:
+                    instruments.finished(context, _instrumentation.STOPPED)
+                    raise
                 except BaseException:
                     instruments.finished(context, _instrumentation.FAILED)
                     raise
@@ -1769,7 +1781,6 @@ class Host:
                 lifespan = _asgi.Lifespan(app, loop, release.spec)
                 lifespan.startup()
 
-            lifespans: list[_asgi.Lifespan] = []
             served_mounts: list[
                 tuple[str, Any, Any, tuple[int, int] | None, tuple[int, int] | None, bool]
             ] = []
@@ -1825,6 +1836,23 @@ class Host:
 
             _asgi.start_registered(loop)
             hooks.call("on_ready", context)
+        except _signals.Stopped as stopped:
+            # Issue 673: told to stop before it served. What started is
+            # shut down as a stop would, within the exit grace, and
+            # worker_stopped follows in worker().
+
+            log(f"worker {self.worker_name(index)} received {stopped.name} while starting")
+            deadline = time.monotonic() + self.exit_grace
+            _asgi.stop_registered(deadline)
+
+            for started_lifespan in [*lifespans, *([lifespan] if lifespan else [])]:
+                started_lifespan.shutdown(deadline)
+
+            hooks.call_logged("on_exit", context)
+            run_exit_callbacks()
+            if loop is not None:
+                loop.stop()
+            return 0
         except Exception as error:
             log(
                 f"worker {self.worker_name(index)} "
@@ -1835,6 +1863,11 @@ class Host:
             if loop is not None:
                 loop.stop()
             return 1
+
+        # Issue 673: started. A stop from here is the native server's,
+        # which drains as any stop does, so it no longer raises.
+
+        _signals.started()
 
         from muru import _native
 
@@ -1983,15 +2016,15 @@ class Host:
         def request_workers_reopen(_signum: int, _frame: Any) -> None:
             self.workers_reopen_requested = True
 
-        signal.signal(signal.SIGTERM, request_stop)
-        signal.signal(signal.SIGINT, request_stop)
-        signal.signal(signal.SIGCHLD, lambda _signum, _frame: None)
+        _signals.install(signal.SIGTERM, request_stop)
+        _signals.install(signal.SIGINT, request_stop)
+        _signals.install(signal.SIGCHLD, lambda _signum, _frame: None)
 
         # The relay owns the release log and reopens it. A handler rather
         # than SIG_IGN, so a worker's own handling starts from the default.
 
-        signal.signal(signal.SIGUSR1, ignore)
-        signal.signal(signal.SIGUSR2, request_workers_reopen)
+        _signals.install(signal.SIGUSR1, ignore)
+        _signals.install(signal.SIGUSR2, request_workers_reopen)
 
         # Section 13.3: a host under the daemon outlives it, so the daemon
         # can be restarted or upgraded and re-adopt it; one under muructl
@@ -4983,8 +5016,39 @@ def without_preload(argv: list[str]) -> list[str]:
     return kept
 
 
+# The instrumentation modules of the load in progress, and its context,
+# so a stop during the load runs their load_finished (issue 673).
+
+_loading: tuple[Instruments, Context] | None = None
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Run the host: preload, fork, supervise."""
+    """Run the host: preload, fork, supervise.
+
+    The host's signals are taken first (issue 673), so a stop while the
+    application loads ends the host cleanly: the load unwinds, the
+    instrumentation modules hear it was stopped, and the host says so.
+    """
+
+    _signals.start_host()
+
+    try:
+        return _main(argv)
+    except _signals.Stopped as stopped:
+        log(f"received {stopped.name} while loading, stopping")
+
+        if _loading is not None:
+            instruments, context = _loading
+            instruments.finished(context, _instrumentation.STOPPED)
+
+        return 0
+
+
+def _main(argv: list[str] | None) -> int:
+    # The host's start: everything main() does, inside its handling of a
+    # stop.
+
+    global _loading
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(arguments)
@@ -5063,6 +5127,7 @@ def main(argv: list[str] | None = None) -> int:
         # application is imported.
 
         instruments = release.instruments
+        _loading = (instruments, context)
 
         try:
             instruments.load(context)

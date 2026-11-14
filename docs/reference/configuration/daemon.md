@@ -247,6 +247,7 @@ A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` ta
 | `sendfile_header` | string | the release's | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
 | `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. |
 | `threads` | integer or table, {ref}`[app.NAME.release.ID.mounts.NAME.threads] <config-daemon-app-name-release-id-mounts-name-threads>` |  | Threads of the mount's own, for a WSGI or gRPC mount; it shares the worker's pool when absent. |
+| `tracing_middleware` | boolean | `false` | Wrap the mount's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for. |
 
 (config-daemon-app-name-release-id-mounts-name-threads)=
 ## `[app.NAME.release.ID.mounts.NAME.threads]`

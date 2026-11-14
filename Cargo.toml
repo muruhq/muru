@@ -48,6 +48,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "c
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12", "webpki-tokio"] }
 jiff = "0.2"
 libc = "0.2"
+signal-hook-registry = "1.4"
 mime_guess = "2"
 minijinja = { version = "3.1", features = ["serde"] }
 multer = "3.1"

@@ -92,7 +92,8 @@ impl File {
                 "A developer's own settings for `muructl run`, in `muru.local.toml` beside \
                  the project, which is not committed. Its `[run]` table holds the keys of \
                  `[tool.muru.run]` and takes precedence over them; lists add to the \
-                 project's. Its `[[instrumentation]]` entries come before the project's."
+                 project's. Its `[[instrumentation]]` entries come before the project's, \
+                 and its `tracing` takes the place of the project's."
             }
         }
     }
@@ -112,6 +113,9 @@ struct LocalFile {
     /// Instrumentation modules for this machine's runs, before the
     /// project's own.
     instrumentation: Option<Vec<crate::Instrumentation>>,
+    /// Tracing with wrapture for this machine's runs, in place of the
+    /// project's `tracing`.
+    tracing: Option<crate::Tracing>,
 }
 
 /// The `[build]` table of muru.local.toml.

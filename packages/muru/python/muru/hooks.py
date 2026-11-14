@@ -13,6 +13,7 @@ import importlib
 from collections.abc import Callable
 from typing import Any
 
+from muru import _signals
 from muru import logging as muru_logging
 from muru._context import Context
 
@@ -81,6 +82,10 @@ class Hooks:
 
         try:
             self.call(hook, context)
+        except _signals.Stopped:
+            # A stop while the process starts is not the hook's failure.
+
+            raise
         except BaseException as error:
             muru_logging._report(error, f"the {hook} hook failed")
             return False

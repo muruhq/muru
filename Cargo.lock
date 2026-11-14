@@ -1600,6 +1600,7 @@ dependencies = [
  "muru-proto",
  "prost",
  "pyo3",
+ "signal-hook-registry",
  "tokio",
  "tracing",
 ]
