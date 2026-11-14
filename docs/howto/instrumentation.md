@@ -147,6 +147,7 @@ def load_finished(context, outcome):
   | `fallback` | The host starts again with per-worker imports |
   | `refused` | `preload = true` refused what the import check found, and the release fails |
   | `failed` | An import, a factory the host calls, `on_load` or `pre_fork` failed, or an instrumentation module could not be imported |
+  | `stopped` | A stop signal arrived while the application was loading, and the host or the worker ends |
   | `check` | `muructl check` is done |
 
   Nothing is turned off for a module there: a timer removes itself, and

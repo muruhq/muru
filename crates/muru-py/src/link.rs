@@ -174,6 +174,11 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
 
         std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))?;
         let mut signals = Signals::new()?;
+
+        // Issue 673: what arrived while the worker was starting is acted
+        // on now that the server's own handling is there.
+
+        crate::startup_signals::replay();
         let mut lifeline = Lifeline::new(lifeline)?;
 
         // The first report says the worker is listening; the rest keep

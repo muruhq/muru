@@ -59,13 +59,15 @@ CALLBACKS = (
 # forks the workers from what it loaded; this process serves what it
 # loaded (a worker with per-worker imports, or --single); the host starts
 # again with per-worker imports; preload = true refused what the import
-# check found; something failed; or muructl check is done.
+# check found; something failed; a signal stopped the process while it
+# loaded; or muructl check is done.
 
 FORK = "fork"
 SERVE = "serve"
 FALLBACK = "fallback"
 REFUSED = "refused"
 FAILED = "failed"
+STOPPED = "stopped"
 CHECK = "check"
 
 

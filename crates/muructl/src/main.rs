@@ -3543,10 +3543,27 @@ async fn run_with(
         relay_watcher(&label, "r1", &run_events),
     )?;
 
-    if let Err(error) = current.wait_ready(START_TIMEOUT).await {
-        current.stop(stop_budget).await;
-        let _ = std::fs::remove_dir_all(&run_dir);
-        return Err(error);
+    // Issue 673: a stop while the workers come up, the application still
+    // loading, stops the run then rather than once they are ready.
+
+    let started = tokio::select! {
+        ready = current.wait_ready(START_TIMEOUT) => Some(ready),
+        _ = interrupt.recv() => None,
+        _ = terminate.recv() => None,
+    };
+
+    match started {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            current.stop(stop_budget).await;
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Err(error);
+        }
+        None => {
+            current.stop(stop_budget).await;
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Ok(());
+        }
     }
 
     let (control, mut host_messages) = host_control(&current).await;
