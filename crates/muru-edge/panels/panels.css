@@ -2,7 +2,9 @@
 .panel table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
 .panel th, .panel td { text-align: left; padding: 0.25rem 0.6rem; border-bottom: 1px solid rgba(127, 127, 127, 0.25); vertical-align: top; }
 .panel table.values th { width: 12rem; font-weight: 600; color: #627d98; white-space: nowrap; }
-.panel td { overflow-wrap: anywhere; }
+/* Cells wrap, whatever the page around the panel says, so a long name or
+   statement does not push the table sideways. */
+.panel td { overflow-wrap: anywhere; white-space: normal; }
 .panel .num { text-align: right; white-space: nowrap; }
 .panel table.logs td:not(:last-child) { white-space: nowrap; overflow-wrap: normal; }
 .panel .mono, .panel pre, .panel code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; }
