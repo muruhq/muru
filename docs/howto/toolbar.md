@@ -315,6 +315,21 @@ secrets are shown as `***`: `Cookie`, `Set-Cookie`, `Authorization` and
 TOKEN, PASSWORD, PASSWD, KEY, CREDENTIAL or AUTH or ends in `-DSN`, and
 the password of a URL in any other header.
 
+Query parameters that may hold secrets are shown as `***` too, in the
+request's target, its internal redirects and the `Referer`, `Location`
+and `Content-Location` headers: `/books?token=abc&page=2` is kept as
+`/books?token=***&page=2`. A parameter's name is compared with its case,
+`-`, `_` and `.` ignored, and for a name like `user[password]`, its last
+bracketed part, so `access_token`, `accessToken` and `Access-Token` are
+one name. These names are secrets: `password`, `passwd`, `pwd`,
+`secret`, `token`, `access_token`, `refresh_token`, `id_token`,
+`api_key`, `key`, `client_secret`, `auth`, `jwt`, `code`, `oauth_token`,
+`private_token`, `session`, `session_id`, `sessid`, `jsessionid`,
+`phpsessid`, `sig`, `signature`, `X-Amz-Signature`,
+`X-Amz-Security-Token` and `X-Goog-Signature`, and any name ending in
+`token`, `secret`, `password` or `passwd`, such as `csrf_token`. The
+access log writes the query as it came.
+
 ## From the command line
 
 `muructl debug request` prints a record from the run's admin socket,

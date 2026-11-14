@@ -359,7 +359,8 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
 def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
     """A development run keeps a record of each request (section 11.7),
     which `muructl debug request` and the dashboard's request page read
-    by the ID the response names, with secret header values masked."""
+    by the ID the response names, with secret header values and query
+    parameters masked."""
 
     port = support.free_port()
     server = start(runtime, port=port)
@@ -376,7 +377,10 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
         return found
 
     try:
-        response = server.get("/", headers={"Cookie": "session=hunter2", "X-Api-Key": "hunter2"})
+        response = server.get(
+            "/?token=hunter2&page=2",
+            headers={"Cookie": "session=hunter2", "X-Api-Key": "hunter2"},
+        )
         assert response.status == 200
         request_id = response.header("x-request-id")
         assert request_id is not None
@@ -390,7 +394,11 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
             assert time.monotonic() < deadline, found
             time.sleep(0.05)
 
-        assert (found["method"], found["target"], found["status"]) == ("GET", "/", 200)
+        assert (found["method"], found["target"], found["status"]) == (
+            "GET",
+            "/?token=***&page=2",
+            200,
+        )
         assert found["app"] == "plain-wsgi" and found["worker"] in (0, 1)
         assert found["connection"]["position"] == 1
         assert len(found["connection"]["id"]) == 26
@@ -421,7 +429,7 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
         # The text form names the request and draws each panel.
 
         text = muructl(runtime, "debug", "request", request_id, cwd=support.FIXTURES).stdout
-        assert text.startswith("GET / HTTP/1.1  200  "), text
+        assert text.startswith("GET /?token=***&page=2 HTTP/1.1  200  "), text
         assert f"request {request_id}\n" in text
         assert "\nTiming\n" in text and "    until the response head" in text
         assert "    cookie: ***" in text

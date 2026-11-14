@@ -47,6 +47,45 @@ const SECRET_WORDS: &[&str] = &[
     "AUTH",
 ];
 
+/// Query parameters whose values are secrets, by normalised name (see
+/// [`secret_parameter`]), aligned with what wrapture masks in the query
+/// it records for the same request.
+const SECRET_PARAMETERS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "accesstoken",
+    "refreshtoken",
+    "idtoken",
+    "apikey",
+    "key",
+    "clientsecret",
+    "auth",
+    "jwt",
+    "code",
+    "oauthtoken",
+    "privatetoken",
+    "session",
+    "sessionid",
+    "sessid",
+    "jsessionid",
+    "phpsessid",
+    "sig",
+    "signature",
+    "xamzsignature",
+    "xamzsecuritytoken",
+    "xgoogsignature",
+];
+
+/// Endings of a normalised parameter name that make its value a secret:
+/// `csrf_token`, `github_token`, `new_password`.
+const SECRET_PARAMETER_ENDINGS: &[&str] = &["token", "secret", "password", "passwd"];
+
+/// Headers whose values are URLs, whose query is masked as the target's.
+const URL_HEADERS: &[&str] = &["referer", "location", "content-location"];
+
 /// One record in the ring, shared with the request that is filling it.
 pub type Slot = Arc<Mutex<admin::RequestRecord>>;
 
@@ -268,7 +307,7 @@ pub fn head(head: Head<'_>) -> admin::RequestRecord {
         started_unix_ms: now_unix_ms(),
         client: head.client.to_string(),
         method: head.method.to_owned(),
-        target: head.target.to_owned(),
+        target: mask_query(head.target),
         version: format!("{:?}", head.version),
         connection: Some(admin::RequestConnection {
             id: head.connection.id.clone(),
@@ -301,7 +340,7 @@ pub fn fill(record: &mut admin::RequestRecord, logged: &Record) {
     record.mount = logged.mount.clone();
     record.snapshot = logged.snapshot;
     record.method = logged.method.clone();
-    record.target = logged.target.clone();
+    record.target = mask_query(&logged.target);
     record.version = logged.version.clone();
     record.listener = logged.listener.clone();
     record.status = u32::from(logged.status);
@@ -313,7 +352,11 @@ pub fn fill(record: &mut admin::RequestRecord, logged: &Record) {
     record.queue_ms = logged.queue.as_secs_f64() * 1000.0;
     record.app_ms = logged.application.as_secs_f64() * 1000.0;
     record.total_ms = logged.total.as_secs_f64() * 1000.0;
-    record.redirects = logged.redirects.clone();
+    record.redirects = logged
+        .redirects
+        .iter()
+        .map(|redirect| mask_query(redirect))
+        .collect();
     record.client_class = logged.client_class.clone();
     record.handoff = logged.handoff.unwrap_or_default().to_owned();
 }
@@ -436,7 +479,85 @@ pub fn mask(name: &str, value: &str) -> String {
     }
 
     masked.push_str(&mask_url(&part));
+
+    // A header that carries a URL keeps the secrets in its query out of
+    // the record, as the target does.
+
+    if URL_HEADERS.contains(&lower.as_str()) {
+        return mask_query(&masked);
+    }
+
     masked
+}
+
+/// A target or URL with the values of its secret query parameters masked
+/// (see [`secret_parameter`]), and everything else as it came: the path,
+/// the fragment, the order and spelling of the parameters, and the
+/// values of the others.
+pub fn mask_query(target: &str) -> String {
+    let Some((before, after)) = target.split_once('?') else {
+        return target.to_owned();
+    };
+
+    let (query, fragment) = match after.split_once('#') {
+        Some((query, fragment)) => (query, Some(fragment)),
+        None => (after, None),
+    };
+
+    let parameters: Vec<String> = query
+        .split('&')
+        .map(|parameter| match parameter.split_once('=') {
+            Some((name, _)) if secret_parameter(name) => format!("{name}={MASKED}"),
+            _ => parameter.to_owned(),
+        })
+        .collect();
+
+    let mut masked = format!("{before}?{}", parameters.join("&"));
+
+    if let Some(fragment) = fragment {
+        masked.push('#');
+        masked.push_str(fragment);
+    }
+
+    masked
+}
+
+/// Whether a query parameter's value is a secret, by its name as it
+/// appears in the query. The name is decoded and case-folded, its last
+/// bracketed part taken for a form-style name (`user[password]` is
+/// `password`), and `-`, `_` and `.` removed, so `access_token`,
+/// `accessToken` and `Access-Token` are one name. It is a secret when
+/// it is one of [`SECRET_PARAMETERS`] or ends in one of
+/// [`SECRET_PARAMETER_ENDINGS`].
+fn secret_parameter(raw: &str) -> bool {
+    let decoded = percent_encoding::percent_decode_str(&raw.replace('+', " "))
+        .decode_utf8_lossy()
+        .to_lowercase();
+
+    let mut name = decoded.as_str();
+
+    // `token[]` is a list named `token`; `user[password]` is the
+    // password of a user.
+
+    while let Some(stripped) = name.strip_suffix("[]") {
+        name = stripped;
+    }
+
+    if let Some(inner) = name.strip_suffix(']')
+        && let Some(open) = inner.rfind('[')
+    {
+        name = &inner[open + 1..];
+    }
+
+    let normalised: String = name
+        .chars()
+        .filter(|character| !matches!(character, '-' | '_' | '.'))
+        .collect();
+
+    SECRET_PARAMETERS.contains(&normalised.as_str())
+        || SECRET_PARAMETER_ENDINGS
+            .iter()
+            .any(|ending| normalised.ends_with(ending))
 }
 
 /// A URL with its password masked, or the text as it was when it is not
@@ -580,6 +701,74 @@ pub(crate) mod tests {
         assert!(
             kept.iter()
                 .any(|header| header.name == "cookie" && header.value == MASKED)
+        );
+    }
+
+    #[test]
+    fn secret_query_parameters_are_masked_and_the_rest_kept_as_it_came() {
+        assert_eq!(
+            mask_query("/books?token=abc&page=2"),
+            "/books?token=***&page=2"
+        );
+        assert_eq!(mask_query("/books"), "/books");
+        assert_eq!(mask_query("/books?"), "/books?");
+        assert_eq!(
+            mask_query("/login?next=/a&code=xyz&state=s#top"),
+            "/login?next=/a&code=***&state=s#top"
+        );
+
+        // A name with no value, or an empty one, has nothing to hide, and
+        // a repeated name is masked each time.
+
+        assert_eq!(mask_query("/a?token&key="), "/a?token&key=***");
+        assert_eq!(mask_query("/a?sig=1&sig=2"), "/a?sig=***&sig=***");
+    }
+
+    #[test]
+    fn a_parameter_name_is_normalised_before_it_is_matched() {
+        for name in [
+            "access_token",
+            "accessToken",
+            "Access-Token",
+            "access.token",
+            "API_KEY",
+            "api-key",
+            "apiKey",
+            "X-Amz-Security-Token",
+            "user%5Bpassword%5D",
+            "user[password]",
+            "auth[token]",
+            "token[]",
+            "csrf_token",
+            "github_token",
+            "new_password",
+            "client_secret",
+            "PHPSESSID",
+        ] {
+            assert!(secret_parameter(name), "{name} is a secret");
+        }
+
+        for name in [
+            "author", "keyword", "monkey", "sort_key", "page", "q", "state", "next",
+        ] {
+            assert!(!secret_parameter(name), "{name} is not a secret");
+        }
+    }
+
+    #[test]
+    fn a_url_header_has_its_query_masked() {
+        assert_eq!(
+            mask("Referer", "https://shop.example/cart?session=abc&step=2"),
+            "https://shop.example/cart?session=***&step=2"
+        );
+        assert_eq!(
+            mask("Location", "/login?next=/orders"),
+            "/login?next=/orders"
+        );
+        assert_eq!(mask("Location", "/done?token=t"), "/done?token=***");
+        assert_eq!(
+            mask("Content-Type", "text/plain?token=t"),
+            "text/plain?token=t"
         );
     }
 }
