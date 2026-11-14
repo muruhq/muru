@@ -116,3 +116,49 @@ def test_a_panel_is_declared_once_and_not_as_a_built_in(monkeypatch: pytest.Monk
 
     with pytest.raises(ValueError, match="holds values, not spans"):
         _panels.add_span(first, Span("x", 0, 0))
+
+
+def test_concurrent_requests_keep_their_own_entries(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each request finds its own record through the request id of the
+    # thread serving it, so concurrent requests, on a GIL build or a
+    # free-threaded one, never mix their entries.
+
+    import contextvars
+    import threading
+
+    monkeypatch.setattr(_panels, "_declared", {})
+    values = _panels.panel("library", "Library", "values")
+    rows = _panels.panel("queries", "Queries", "tables", tables={"Queries": ["request", "n"]})
+    requests, rounds = 16, 100
+    taken: dict[int, list[tuple[object, ...]]] = {}
+    together = threading.Barrier(requests)
+
+    def serve(index: int) -> None:
+        _panels._start(f"C{index}")
+        _request_id.set(f"C{index}")
+        together.wait()
+
+        for n in range(rounds):
+            _panels.add_value(values, "page", f"/page/{index}")
+            _panels.add_row(rows, [index, n])
+
+        taken[index] = _panels._take(f"C{index}")
+
+    threads = [
+        threading.Thread(target=contextvars.copy_context().run, args=(serve, index))
+        for index in range(requests)
+    ]
+
+    for thread in threads:
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    for index in range(requests):
+        found = {panel[0]: panel for panel in taken[index]}
+        assert found["library"][3] == [("page", f"/page/{index}")]
+        kept = found["queries"][4][0][2]
+        assert len(kept) == rounds and all(row[0] == str(index) for row in kept)
+
+    assert not [request for request in _panels._requests if request.startswith("C")]
