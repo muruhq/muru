@@ -11,16 +11,19 @@ from support import server as support
 APP = """
 from muru import _panels
 
-library = _panels.panel("library", "Library", "values")
-trace = _panels.panel("trace", "Trace", "spans")
+LIBRARY = _panels.ValuesPanel("library", "Library")
+TRACE = _panels.SpansPanel("trace", "Trace")
 
 
 def application(environ, start_response):
-    started = _panels.now()
-    _panels.add_value(library, "recording", _panels.recording())
-    _panels.add_value(library, "books", 7)
-    query = _panels.Span("query", started + 0.5, 1.0, "database")
-    _panels.add_span(trace, _panels.Span("view", started, 2.0, "view", [query]))
+    library = LIBRARY.current()
+    library["recording"] = library.active
+    library["books"] = 7
+
+    with TRACE.current().span("view", category="view"):
+        with TRACE.current().span("query", category="database"):
+            pass
+
     start_response("200 OK", [("Content-Type", "text/plain")])
     return [b"listed"]
 """

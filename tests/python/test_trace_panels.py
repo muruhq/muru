@@ -107,6 +107,25 @@ def test_events_of_a_request_not_recorded_are_left_alone() -> None:
     assert _panels._take("T1") == []
 
 
+def test_a_tree_closing_outside_its_requests_context_is_still_its_requests(
+    recorded: str,
+) -> None:
+    trees = _trace_panels._Trees()
+    view = Event("call", "view")
+    trees.entered(view)
+    view.started = time.perf_counter()
+    view.duration = 0.001
+
+    token = _request_id.set(None)
+
+    try:
+        trees.closed(view)
+    finally:
+        _request_id.reset(token)
+
+    assert taken(recorded)["trace"][2][0][0] == "view"
+
+
 def test_a_tree_past_its_limit_is_cut_and_says_so(
     recorded: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

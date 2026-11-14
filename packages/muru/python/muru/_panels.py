@@ -1,37 +1,47 @@
-"""Panels Muru's extensions add to a request's record (issue 677, ADR 0063).
+"""Panels Muru's extensions add to a request's record (issues 677, 679, ADR 0063).
 
 A development run keeps a record of each request it serves (section 11.7),
 drawn as panels in the toolbar, on the dashboard's request page and by
 ``muructl debug request``. The built-in panels are worked out by the edge
 from the record; this module lets code in the worker add panels of its
-own, as data in the shapes the edge draws: ``spans``, named intervals on
-the record's clock that may nest; ``tables``, rows under captioned
-columns; and ``values``, names with values. A panel with no template of
-its own is drawn by the edge's generic one.
+own, as data in the shapes the edge draws, each declared once by a class
+of its own:
 
-A panel is declared once, with ``panel()``, and filled during a request
-with ``add_span()``, ``add_row()`` and ``add_value()``. Entries are kept
-only for a request the edge asked the worker to record, which it does in
-a development run alone: ``recording()`` says whether the current one is,
-and outside one every call does nothing and returns False. Each panel
-keeps at most ``PANEL_LIMIT`` entries and a request ``REQUEST_LIMIT``
-across its panels; what is past them is counted and shown. A span counts
-once for itself and once for each span beneath it.
+- ``SpansPanel``: named intervals on the record's clock that may nest.
+- ``TablesPanel``: rows under captioned columns, in one or more tables.
+- ``ValuesPanel``: names with values.
+
+A panel with no template of its own is drawn by the edge's generic one.
+
+During a request, ``current()`` on a declared panel gives a handle for the
+request being served, and entries are added through its methods. Entries
+are kept only for a request the edge asked the worker to record, which it
+does in a development run alone; for any other request the handle keeps
+nothing, so code adds to a panel the same way wherever it runs. A handle's
+``active`` says whether it keeps anything, for code that would do real
+work only to feed a panel.
+
+Each panel keeps at most ``PANEL_LIMIT`` entries and a request
+``REQUEST_LIMIT`` across its panels; what is past them is counted and
+shown. A span counts once for itself and once for each span beneath it.
 
 The worker starts keeping a request's panels when it takes the request
 and takes them with the worker's part of its record, by the request's id,
-as it does the request's log records. The API is Muru's own for now:
-third-party panels are not offered.
+as it does the request's log records. A handle kept past that keeps
+nothing. The API is Muru's own for now: third-party panels are not
+offered.
 """
 
 from __future__ import annotations
 
+import contextlib
 import re
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from muru import logging as muru_logging
 from muru._context import request_id
@@ -41,15 +51,14 @@ __all__ = [
     "REQUEST_LIMIT",
     "Panel",
     "Span",
-    "add_dropped",
-    "add_row",
-    "add_span",
-    "add_value",
-    "at",
-    "now",
+    "Spans",
+    "SpansPanel",
+    "Table",
+    "Tables",
+    "TablesPanel",
+    "Values",
+    "ValuesPanel",
     "on_first_record",
-    "panel",
-    "recording",
 ]
 
 PANEL_LIMIT = 500
@@ -57,8 +66,6 @@ PANEL_LIMIT = 500
 
 REQUEST_LIMIT = 2000
 """The most entries a request keeps across its panels."""
-
-SHAPES = ("spans", "tables", "values")
 
 # The built-in panels' names, and the page view's tab, which a declared
 # panel may not take.
@@ -68,25 +75,12 @@ RESERVED = frozenset({"timing", "where", "response", "logs", "errors", "connecti
 _NAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
 
-@dataclass(frozen=True)
-class Panel:
-    """A declared panel.
-
-    Its name, its title as its tab shows it, its shape, and for a tables
-    panel each table's caption and columns.
-    """
-
-    name: str
-    title: str
-    shape: str
-    tables: tuple[tuple[str, tuple[str, ...]], ...] = ()
-
-
 @dataclass
 class Span:
     """A named interval of a spans panel, with the spans beneath it.
 
-    Times are milliseconds on the record's clock, as ``now()`` gives them.
+    Times are milliseconds on the record's clock, as a handle's ``now()``
+    gives them.
     """
 
     name: str
@@ -101,48 +95,7 @@ class Span:
         return 1 + sum(child.size() for child in self.children)
 
 
-_declared: dict[str, Panel] = {}
-_declaring = threading.Lock()
-
-
-def panel(
-    name: str,
-    title: str,
-    shape: str,
-    *,
-    tables: Mapping[str, Sequence[str]] | None = None,
-) -> Panel:
-    """Declare a panel, once per process.
-
-    Declaring it again the same way returns the same panel.
-    `name` is lowercase letters, digits and hyphens, and none of the
-    built-in panels'. `shape` is ``spans``, ``tables`` or ``values``. A
-    tables panel names its tables, by caption, with their columns.
-    """
-
-    if not _NAME.match(name) or name in RESERVED:
-        raise ValueError(f"{name!r} cannot name a panel")
-
-    if shape not in SHAPES:
-        raise ValueError(f"a panel's shape is one of {', '.join(SHAPES)}, not {shape!r}")
-
-    if (shape == "tables") != bool(tables):
-        raise ValueError("a tables panel, and only one, names its tables and their columns")
-
-    declared = Panel(
-        name,
-        title,
-        shape,
-        tuple((caption, tuple(columns)) for caption, columns in (tables or {}).items()),
-    )
-
-    with _declaring:
-        existing = _declared.setdefault(name, declared)
-
-    if existing != declared:
-        raise ValueError(f"the panel {name!r} is already declared otherwise")
-
-    return existing
+# What one request's panels keep, from when the worker took it.
 
 
 @dataclass
@@ -158,11 +111,13 @@ class _Entries:
 
 @dataclass
 class _Request:
-    # What one request's panels keep, from when the worker took it.
+    # A request's panels, by name, with their declarations. Once taken, it
+    # keeps nothing more.
 
     started: float
     lock: threading.Lock = field(default_factory=threading.Lock)
     kept: int = 0
+    taken: bool = False
     panels: dict[str, tuple[Panel, _Entries]] = field(default_factory=dict)
 
     def entries(self, declared: Panel) -> _Entries:
@@ -198,56 +153,298 @@ def _current() -> _Request | None:
     return _requests.get(current) if current is not None else None
 
 
-def recording() -> bool:
-    """Say whether the request being served is recorded, so entries for it are kept."""
+# The declarations.
 
-    return _current() is not None
+_declared: dict[str, Panel] = {}
+_declaring = threading.Lock()
 
 
-def now() -> float:
-    """Return the record's clock: milliseconds since the worker took the request.
+class Panel:
+    """A declared panel: its name, and its title as its tab shows it.
 
-    Outside a recorded request it is 0.
+    Declared by a class for its shape, once per process; declaring it
+    again the same way gives an equal panel whose handles add to the
+    same entries.
     """
 
-    kept = _current()
+    shape: ClassVar[str] = ""
 
-    if kept is None:
-        return 0.0
+    __slots__ = ("_idle", "name", "tables", "title")
 
-    return (time.perf_counter() - kept.started) * 1000.0
+    def __init__(
+        self, name: str, title: str, tables: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    ) -> None:
+        if not _NAME.match(name) or name in RESERVED:
+            raise ValueError(f"{name!r} cannot name a panel")
+
+        self.name = name
+        self.title = title
+        self.tables = tables
+
+        with _declaring:
+            existing = _declared.setdefault(name, self)
+
+        if existing != self:
+            raise ValueError(f"the panel {name!r} is already declared otherwise")
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not type(self) or not isinstance(other, Panel):
+            return NotImplemented
+
+        return (self.name, self.title, self.tables) == (other.name, other.title, other.tables)
+
+    def __hash__(self) -> int:
+        return hash((type(self), self.name, self.title, self.tables))
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.name!r}, {self.title!r})"
 
 
-def at(seconds: float) -> float:
-    """Return a ``time.perf_counter()`` reading on the record's clock.
+class SpansPanel(Panel):
+    """A panel of spans: named intervals on the record's clock that may nest."""
 
-    Milliseconds since the worker took the request being served, as
-    ``now()`` gives them; 0 outside a recorded request.
-    """
+    shape = "spans"
 
-    kept = _current()
+    def __init__(self, name: str, title: str) -> None:
+        super().__init__(name, title)
+        self._idle = Spans(self, None)
 
-    if kept is None:
-        return 0.0
+    def current(self) -> Spans:
+        """Return the panel for the request being served."""
 
-    return (seconds - kept.started) * 1000.0
+        kept = _current()
+        return self._idle if kept is None else Spans(self, kept)
 
 
-def add_dropped(declared: Panel, count: int) -> None:
-    """Count entries the panel's own code left out of the request being served.
+class TablesPanel(Panel):
+    """A panel of tables, each named by its caption, with its columns."""
 
-    For an extension that cuts what it adds to fit, so the panel says
-    how many were not kept, with those past its caps.
-    """
+    shape = "tables"
 
-    kept = _current()
+    def __init__(self, name: str, title: str, *, tables: Mapping[str, Sequence[str]]) -> None:
+        if not tables:
+            raise ValueError("a tables panel names its tables and their columns")
 
-    if kept is None or count <= 0:
-        return
+        super().__init__(
+            name,
+            title,
+            tuple((caption, tuple(columns)) for caption, columns in tables.items()),
+        )
+        self._idle = Tables(self, None)
 
-    with kept.lock:
-        kept.entries(declared).dropped += count
+    def current(self) -> Tables:
+        """Return the panel for the request being served."""
 
+        kept = _current()
+        return self._idle if kept is None else Tables(self, kept)
+
+
+class ValuesPanel(Panel):
+    """A panel of names with values."""
+
+    shape = "values"
+
+    def __init__(self, name: str, title: str) -> None:
+        super().__init__(name, title)
+        self._idle = Values(self, None)
+
+    def current(self) -> Values:
+        """Return the panel for the request being served."""
+
+        kept = _current()
+        return self._idle if kept is None else Values(self, kept)
+
+
+# The handles.
+
+
+class _Handle:
+    # A declared panel for one request, or for none, when it keeps nothing.
+
+    __slots__ = ("_kept", "_panel")
+
+    def __init__(self, panel: Panel, kept: _Request | None) -> None:
+        self._panel = panel
+        self._kept = kept
+
+    @property
+    def active(self) -> bool:
+        """Say whether entries added now are kept, the request being recorded."""
+
+        return self._kept is not None and not self._kept.taken
+
+    def now(self) -> float:
+        """Return the record's clock: milliseconds since the worker took the request.
+
+        0 when the handle keeps nothing.
+        """
+
+        return self.at(time.perf_counter())
+
+    def at(self, seconds: float) -> float:
+        """Return a ``time.perf_counter()`` reading on the record's clock.
+
+        Milliseconds since the worker took the request, as ``now()`` gives
+        them; 0 when the handle keeps nothing.
+        """
+
+        if self._kept is None:
+            return 0.0
+
+        return (seconds - self._kept.started) * 1000.0
+
+    def add_dropped(self, count: int) -> None:
+        """Count entries the panel's own code left out, to be shown with those past its caps."""
+
+        kept = self._kept
+
+        if kept is None or count <= 0:
+            return
+
+        with kept.lock:
+            if not kept.taken:
+                kept.entries(self._panel).dropped += count
+
+    def _add(self, size: int, add: Callable[[_Entries], None]) -> bool:
+        # An entry of `size`, kept by `add` if the caps allow it.
+
+        kept = self._kept
+
+        if kept is None:
+            return False
+
+        with kept.lock:
+            if kept.taken:
+                return False
+
+            entries = kept.entries(self._panel)
+
+            if not kept.admit(entries, size):
+                return False
+
+            add(entries)
+
+        return True
+
+
+# The span a block timed by Spans.span() is in, with its request and panel,
+# so a block within it of the same panel nests beneath it.
+
+_open_span: ContextVar[tuple[_Request, str, Span] | None] = ContextVar(
+    "muru_open_span", default=None
+)
+
+_NOTHING = contextlib.nullcontext()
+
+
+class Spans(_Handle):
+    """A spans panel for the request being served."""
+
+    __slots__ = ()
+
+    def add(self, span: Span) -> bool:
+        """Add a span, with those beneath it. Returns whether it was kept."""
+
+        return self._add(span.size(), lambda entries: entries.spans.append(span))
+
+    def span(self, name: str, category: str = "") -> contextlib.AbstractContextManager[None]:
+        """Time a block as a span, beneath the one an enclosing block is timing.
+
+        The span is added as its block ends, however it ends, and with
+        those timed within it once the outermost ends.
+        """
+
+        if self._kept is None:
+            return _NOTHING
+
+        return self._timed(self._kept, name, category)
+
+    @contextlib.contextmanager
+    def _timed(self, kept: _Request, name: str, category: str) -> Iterator[None]:
+        opened = Span(name, self.now(), 0.0, category)
+        enclosing = _open_span.get()
+
+        if enclosing is not None and not (
+            enclosing[0] is kept and enclosing[1] == self._panel.name
+        ):
+            enclosing = None
+
+        token = _open_span.set((kept, self._panel.name, opened))
+
+        try:
+            yield
+        finally:
+            _open_span.reset(token)
+            opened.duration = self.now() - opened.start
+
+            if enclosing is not None:
+                enclosing[2].children.append(opened)
+            else:
+                self.add(opened)
+
+
+class Tables(_Handle):
+    """A tables panel for the request being served."""
+
+    __slots__ = ()
+
+    def table(self, caption: str) -> Table:
+        """Return one of the panel's tables, by its caption."""
+
+        if not any(declared == caption for declared, _ in self._panel.tables):
+            raise ValueError(f"the panel {self._panel.name!r} has no table {caption!r}")
+
+        return Table(self, caption)
+
+
+class Table:
+    """One table of a tables panel, for the request being served."""
+
+    __slots__ = ("_caption", "_tables")
+
+    def __init__(self, tables: Tables, caption: str) -> None:
+        self._tables = tables
+        self._caption = caption
+
+    def add_row(self, cells: Sequence[Any]) -> bool:
+        """Add a row, each cell as text. Returns whether it was kept."""
+
+        if self._tables._kept is None:
+            return False
+
+        row = [str(cell) for cell in cells]
+        caption = self._caption
+        return self._tables._add(
+            1, lambda entries: entries.rows.setdefault(caption, []).append(row)
+        )
+
+
+class Values(_Handle):
+    """A values panel for the request being served; a value is set by name, as in a dict."""
+
+    __slots__ = ()
+
+    def __setitem__(self, name: str, value: Any) -> None:
+        kept = self._kept
+
+        if kept is None:
+            return
+
+        with kept.lock:
+            if kept.taken:
+                return
+
+            entries = kept.entries(self._panel)
+
+            # Setting a value again replaces it, and takes no more room.
+
+            if name not in entries.values and not kept.admit(entries, 1):
+                return
+
+            entries.values[name] = str(value)
+
+
+# Setting up for the first record.
 
 _first: list[Callable[[], None]] = []
 _first_started = False
@@ -267,87 +464,6 @@ def on_first_record(callback: Callable[[], None]) -> None:
         return
 
     _first.append(callback)
-
-
-def add_span(declared: Panel, span: Span) -> bool:
-    """Add a span, with those beneath it, to a spans panel of the request being served.
-
-    Returns whether it was kept.
-    """
-
-    _check(declared, "spans")
-    kept = _current()
-
-    if kept is None:
-        return False
-
-    with kept.lock:
-        entries = kept.entries(declared)
-
-        if not kept.admit(entries, span.size()):
-            return False
-
-        entries.spans.append(span)
-
-    return True
-
-
-def add_row(declared: Panel, cells: Sequence[Any], *, table: str | None = None) -> bool:
-    """Add a row to a tables panel of the request being served.
-
-    The row goes in `table`, by its caption, else the first table. Returns
-    whether it was kept.
-    """
-
-    _check(declared, "tables")
-    captions = [caption for caption, _ in declared.tables]
-    caption = captions[0] if table is None else table
-
-    if caption not in captions:
-        raise ValueError(f"the panel {declared.name!r} has no table {caption!r}")
-
-    kept = _current()
-
-    if kept is None:
-        return False
-
-    with kept.lock:
-        entries = kept.entries(declared)
-
-        if not kept.admit(entries, 1):
-            return False
-
-        entries.rows.setdefault(caption, []).append([str(cell) for cell in cells])
-
-    return True
-
-
-def add_value(declared: Panel, name: str, value: Any) -> bool:
-    """Set a value of a values panel of the request being served.
-
-    Setting it again replaces it. Returns whether it was kept.
-    """
-
-    _check(declared, "values")
-    kept = _current()
-
-    if kept is None:
-        return False
-
-    with kept.lock:
-        entries = kept.entries(declared)
-
-        if name not in entries.values and not kept.admit(entries, 1):
-            return False
-
-        entries.values[name] = str(value)
-
-    return True
-
-
-def _check(declared: Panel, shape: str) -> None:
-    if declared.shape != shape:
-        raise ValueError(f"the panel {declared.name!r} holds {declared.shape}, not {shape}")
 
 
 # The worker's side: called by the runtime as it takes a request it records
@@ -385,6 +501,8 @@ def _take(request: str) -> list[tuple[Any, ...]]:
         return []
 
     with kept.lock:
+        kept.taken = True
+
         return [
             (
                 declared.name,
