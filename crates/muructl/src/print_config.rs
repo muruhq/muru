@@ -358,6 +358,16 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
         ));
     }
 
+    // Section 11.6: tracing and the entrypoint's request middleware.
+
+    if let Some(tracing) = &resolved.tracing {
+        top.push(Row::new("tracing", tracing, project.clone()));
+    }
+
+    if let Some(middleware) = resolved.tracing_middleware {
+        top.push(Row::new("tracing_middleware", middleware, project.clone()));
+    }
+
     if let Some(python) = args.python.as_ref().or(resolved.python.as_ref()) {
         top.push(Row::new(
             "python",
@@ -660,6 +670,14 @@ pub fn serve_settings(resolved: &crate::Resolved, serve: Serve) -> Settings {
             &resolved.instrumentation,
             project.clone(),
         ));
+    }
+
+    if let Some(tracing) = &resolved.tracing {
+        top.push(Row::new("tracing", tracing, project.clone()));
+    }
+
+    if let Some(middleware) = resolved.tracing_middleware {
+        top.push(Row::new("tracing_middleware", middleware, project.clone()));
     }
 
     if let Some(requests) = resolved.max_requests {

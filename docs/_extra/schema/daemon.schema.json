@@ -1643,6 +1643,11 @@
         "threads": {
           "$ref": "#/$defs/MountThreads",
           "description": "Threads of the mount's own, for a WSGI or gRPC mount; it shares the worker's pool when absent."
+        },
+        "tracing_middleware": {
+          "default": false,
+          "description": "Wrap the mount's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for.",
+          "type": "boolean"
         }
       },
       "required": [

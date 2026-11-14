@@ -662,6 +662,11 @@
         "threads": {
           "$ref": "#/$defs/MountThreads",
           "description": "Threads of the mount's own, for a WSGI or gRPC mount; it shares the worker's pool when absent."
+        },
+        "tracing_middleware": {
+          "default": false,
+          "description": "Wrap the mount's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -1345,6 +1350,31 @@
         }
       },
       "type": "object"
+    },
+    "Tracing": {
+      "anyOf": [
+        {
+          "description": "`true` to trace with the configuration wrapture finds itself: `WRAPTURE_CONFIG`, else `wrapture.toml`, else a `[tool.wrapture]` table in `pyproject.toml`, in the project's directory.",
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/TracingSettings",
+          "description": "Tracing on, with its settings."
+        }
+      ],
+      "description": "Whether and how a release is traced with wrapture: `tracing = true`, or a `[tracing]` table."
+    },
+    "TracingSettings": {
+      "additionalProperties": false,
+      "description": "Tracing turned on with its settings, in place of `tracing = true`.",
+      "properties": {
+        "config": {
+          "description": "The wrapture configuration: a `wrapture.toml`, or a `pyproject.toml` with a `[tool.wrapture]` table, relative to the project's directory.",
+          "type": "string",
+          "x-default": "found by wrapture"
+        }
+      },
+      "type": "object"
     }
   },
   "$id": "https://docs.muruhq.dev/en/latest/schema/project.schema.json",
@@ -1554,6 +1584,16 @@
     "timeouts": {
       "$ref": "#/$defs/Timeouts",
       "description": "The timeouts the host enforces on its workers, and those of a request the release serves, which the edge enforces."
+    },
+    "tracing": {
+      "$ref": "#/$defs/Tracing",
+      "default": false,
+      "description": "Trace the application with wrapture: `true` to use the configuration wrapture finds itself, or a table naming the file. The project's environment needs the wrapture package."
+    },
+    "tracing_middleware": {
+      "default": false,
+      "description": "Wrap the entrypoint's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for.",
+      "type": "boolean"
     }
   },
   "title": "The project's [tool.muru] table",

@@ -1864,6 +1864,13 @@ struct Resolved {
     /// The instrumentation modules (section 6.15): muru.local.toml's,
     /// then the table's.
     instrumentation: Vec<muru_config::Instrumentation>,
+    /// The table's `tracing` key (section 11.6), as written.
+    tracing: Option<muru_config::Tracing>,
+    /// The table's `tracing_middleware` key, for the entrypoint.
+    tracing_middleware: Option<bool>,
+    /// The instrumentation entry that sets tracing up, when it is on;
+    /// the host is given it ahead of the listed modules.
+    tracing_entry: Option<muru_config::Instrumentation>,
     /// The directory the host runs in.
     project: PathBuf,
     /// The file the table came from, when there was one.
@@ -1915,6 +1922,19 @@ struct Resolved {
     serving: Serving,
     /// The tables as they were read, for --print-config.
     layers: print_config::Layers,
+}
+
+impl Resolved {
+    /// The instrumentation modules the host is given (sections 6.15 and
+    /// 11.6): tracing's own module first when tracing is on, so its
+    /// request middleware is the outermost wrapper, then the listed ones.
+    fn host_instrumentation(&self) -> Vec<muru_config::Instrumentation> {
+        self.tracing_entry
+            .iter()
+            .chain(&self.instrumentation)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -2019,6 +2039,17 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         .collect();
     muru_config::check_instrumentation(&instrumentation)
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    // Section 11.6: tracing is set up by a module of Muru's own, at the
+    // head of the list the host is given.
+
+    let tracing_entry = muru_config::tracing_instrumentation(
+        table.tracing.as_ref(),
+        table.tracing_middleware,
+        &table.mounts,
+        &instrumentation,
+    )
+    .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     let layers = print_config::Layers::new(&table, &run_table, &local_run);
     let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
@@ -2179,6 +2210,9 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
             .unwrap_or(muru_config::Preload::Auto),
         hooks: args.hooks.clone().or(table.hooks),
         instrumentation,
+        tracing: table.tracing,
+        tracing_middleware: table.tracing_middleware,
+        tracing_entry,
         project,
         source,
         groups: table.groups,
@@ -2816,12 +2850,14 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
 
     // Section 6.15: the instrumentation modules, as the host is given them.
 
-    if resolved.instrumentation.is_empty() {
+    let instrumentation = resolved.host_instrumentation();
+
+    if instrumentation.is_empty() {
         command.env_remove(muru_controller::host::INSTRUMENTATION_VARIABLE);
     } else {
         command.env(
             muru_controller::host::INSTRUMENTATION_VARIABLE,
-            serde_json::to_string(&resolved.instrumentation)?,
+            serde_json::to_string(&instrumentation)?,
         );
     }
 
@@ -3345,7 +3381,7 @@ async fn run_with(
         concurrency: resolved.concurrency,
         preload: resolved.preload,
         hooks: resolved.hooks.clone(),
-        instrumentation: resolved.instrumentation.clone(),
+        instrumentation: resolved.host_instrumentation(),
         chdir: Some(resolved.project.clone()),
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
         single: args.single,

@@ -434,6 +434,12 @@ pub struct Mount {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "the worker group's, else the release's"))]
     pub max_body_size: Option<String>,
+    /// Wrap the mount's application in wrapture's request middleware when
+    /// tracing is on, so each request records as one tree. For an
+    /// application no framework instrumentation records requests for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub tracing_middleware: Option<bool>,
 }
 
 /// Check a name against section 3.2: lowercase letters, digits and
@@ -4030,6 +4036,126 @@ pub fn check_instrumentation(entries: &[Instrumentation]) -> Result<(), String> 
     Ok(())
 }
 
+/// The module that sets tracing up (section 11.6), put at the head of a
+/// release's instrumentation list when tracing is on.
+pub const TRACING_MODULE: &str = "muru._tracing";
+
+/// Whether and how a release is traced with wrapture (section 11.6):
+/// `tracing = true`, or a `[tracing]` table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum Tracing {
+    /// `true` to trace with the configuration wrapture finds itself:
+    /// `WRAPTURE_CONFIG`, else `wrapture.toml`, else a `[tool.wrapture]`
+    /// table in `pyproject.toml`, in the project's directory.
+    Enabled(bool),
+    /// Tracing on, with its settings.
+    Settings(TracingSettings),
+}
+
+/// Tracing turned on with its settings, in place of `tracing = true`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TracingSettings {
+    /// The wrapture configuration: a `wrapture.toml`, or a
+    /// `pyproject.toml` with a `[tool.wrapture]` table, relative to the
+    /// project's directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "found by wrapture"))]
+    pub config: Option<String>,
+}
+
+impl Tracing {
+    /// Whether tracing is on.
+    pub fn enabled(&self) -> bool {
+        !matches!(self, Tracing::Enabled(false))
+    }
+}
+
+impl<'de> Deserialize<'de> for Tracing {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Tracing;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("true, false or a table")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Tracing, E> {
+                Ok(Tracing::Enabled(value))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Tracing, A::Error> {
+                let settings = TracingSettings::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+
+                Ok(Tracing::Settings(settings))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// The instrumentation entry that sets tracing up (section 11.6), or
+/// None when tracing is off. Its settings carry the configuration file
+/// and which entry points are wrapped in the request middleware: the
+/// entrypoint when `entrypoint_middleware` says so, and each mount whose
+/// `tracing_middleware` does. A middleware asked for with tracing off,
+/// or the module listed by hand, is refused.
+pub fn tracing_instrumentation(
+    tracing: Option<&Tracing>,
+    entrypoint_middleware: Option<bool>,
+    mounts: &BTreeMap<String, Mount>,
+    listed: &[Instrumentation],
+) -> Result<Option<Instrumentation>, String> {
+    if listed.iter().any(|entry| entry.module == TRACING_MODULE) {
+        return Err(format!(
+            "instrumentation module {TRACING_MODULE} is set up by the tracing key, not listed"
+        ));
+    }
+
+    let wrapped_mounts: Vec<&String> = mounts
+        .iter()
+        .filter(|(_, mount)| mount.tracing_middleware == Some(true))
+        .map(|(name, _)| name)
+        .collect();
+    let wrapped_entrypoint = entrypoint_middleware == Some(true);
+
+    let Some(tracing) = tracing.filter(|tracing| tracing.enabled()) else {
+        if wrapped_entrypoint || !wrapped_mounts.is_empty() {
+            return Err("tracing_middleware needs tracing to be on".to_owned());
+        }
+
+        return Ok(None);
+    };
+
+    let mut settings = BTreeMap::new();
+
+    if let Tracing::Settings(TracingSettings {
+        config: Some(config),
+    }) = tracing
+    {
+        settings.insert("config".to_owned(), serde_json::json!(config));
+    }
+
+    settings.insert(
+        "middleware".to_owned(),
+        serde_json::json!({
+            "entrypoint": wrapped_entrypoint,
+            "mounts": wrapped_mounts,
+        }),
+    );
+
+    Ok(Some(Instrumentation {
+        module: TRACING_MODULE.to_owned(),
+        settings,
+    }))
+}
+
 /// Check an application's static directories (section 4.9): each path
 /// is a prefix below `/`, no two share one, each names a directory, and
 /// the settings parse.
@@ -5611,6 +5737,18 @@ pub struct ToolMuru {
     /// its settings, imported before anything of the application.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instrumentation: Vec<Instrumentation>,
+    /// Trace the application with wrapture (section 11.6): `true` to use
+    /// the configuration wrapture finds itself, or a table naming the
+    /// file. The project's environment needs the wrapture package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub tracing: Option<Tracing>,
+    /// Wrap the entrypoint's application in wrapture's request middleware
+    /// when tracing is on, so each request records as one tree. For an
+    /// application no framework instrumentation records requests for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub tracing_middleware: Option<bool>,
     /// The interpreter: a path, or a request in uv's syntax such as
     /// "3.13", "3.14t" or ">=3.12" (section 8.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6880,6 +7018,76 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(bad("slow = 'soon'").starts_with("slow:"));
         assert!(bad("access_log = 'terminal'").contains("not on, errors or off"));
         assert!(bad("dashboard = 'yes'").contains("127.0.0.1:8081, or off"));
+    }
+
+    #[test]
+    fn tracing_is_a_flag_or_a_table() {
+        let on = parse_muru_toml("tracing = true\n").unwrap();
+        assert_eq!(on.tracing, Some(Tracing::Enabled(true)));
+
+        let table = parse_muru_toml("[tracing]\nconfig = 'tracing/wrapture.toml'\n").unwrap();
+        assert_eq!(
+            table.tracing,
+            Some(Tracing::Settings(TracingSettings {
+                config: Some("tracing/wrapture.toml".to_owned())
+            }))
+        );
+
+        let error = parse_muru_toml("tracing = 'yes'\n").unwrap_err();
+        assert!(error.contains("true, false or a table"), "{error}");
+
+        assert!(parse_muru_toml("[tracing]\nconfg = 'x'\n").is_err());
+    }
+
+    #[test]
+    fn tracing_puts_its_module_at_the_head_with_the_wrapped_entry_points() {
+        let table = parse_muru_toml(
+            "entrypoint = 'shop:app'\ntracing = true\ntracing_middleware = true\n\
+             [mounts.raw]\npath = '/raw'\nentrypoint = 'raw:app'\ntracing_middleware = true\n\
+             [mounts.api]\npath = '/api'\nentrypoint = 'api:app'\n",
+        )
+        .unwrap();
+
+        let entry = tracing_instrumentation(
+            table.tracing.as_ref(),
+            table.tracing_middleware,
+            &table.mounts,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(entry.module, TRACING_MODULE);
+        assert_eq!(
+            entry.settings["middleware"],
+            serde_json::json!({"entrypoint": true, "mounts": ["raw"]})
+        );
+        assert!(!entry.settings.contains_key("config"));
+    }
+
+    #[test]
+    fn tracing_off_refuses_a_middleware_and_the_module_is_not_listed_by_hand() {
+        let off = parse_muru_toml("tracing = false\n").unwrap();
+        assert_eq!(
+            tracing_instrumentation(off.tracing.as_ref(), None, &off.mounts, &[]).unwrap(),
+            None
+        );
+
+        let error = tracing_instrumentation(None, Some(true), &BTreeMap::new(), &[]).unwrap_err();
+        assert_eq!(error, "tracing_middleware needs tracing to be on");
+
+        let listed = [Instrumentation {
+            module: TRACING_MODULE.to_owned(),
+            settings: BTreeMap::new(),
+        }];
+        let error = tracing_instrumentation(
+            Some(&Tracing::Enabled(true)),
+            None,
+            &BTreeMap::new(),
+            &listed,
+        )
+        .unwrap_err();
+        assert!(error.contains("set up by the tracing key"), "{error}");
     }
 
     #[test]

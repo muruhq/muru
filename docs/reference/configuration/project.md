@@ -49,6 +49,8 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `sync_threads` | integer | `8` | Threads for synchronous code called from an ASGI application. |
 | `threads` | integer | `4` | Application threads per worker. |
 | `timeouts` | table, {ref}`[tool.muru.timeouts] <config-project-tool-muru-timeouts>` |  | The timeouts the host enforces on its workers, and those of a request the release serves, which the edge enforces. |
+| `tracing` | boolean or table, {ref}`[tool.muru.tracing] <config-project-tool-muru-tracing>` | `false` | Trace the application with wrapture: `true` to use the configuration wrapture finds itself, or a table naming the file. The project's environment needs the wrapture package. |
+| `tracing_middleware` | boolean | `false` | Wrap the entrypoint's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for. |
 
 (config-project-tool-muru-build)=
 ## `[tool.muru.build]`
@@ -247,6 +249,7 @@ A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` ta
 | `sendfile_header` | string | the release's | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
 | `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. |
 | `threads` | integer or table, {ref}`[tool.muru.mounts.NAME.threads] <config-project-tool-muru-mounts-name-threads>` |  | Threads of the mount's own, for a WSGI or gRPC mount; it shares the worker's pool when absent. |
+| `tracing_middleware` | boolean | `false` | Wrap the mount's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for. |
 
 (config-project-tool-muru-mounts-name-threads)=
 ## `[tool.muru.mounts.NAME.threads]`
@@ -403,3 +406,12 @@ The same keys apply at `[tool.muru.groups.NAME.timeouts]`.
 | `shutdown_timeout` | string | `"5s"` | How long a worker told to stop is given before it is killed, counted from when its WebSockets are closed. |
 | `soft_timeout` | string |  | How long a request may run in a worker before it is interrupted by raising `muru.RequestTimeout` in its thread, for example 30s; off when absent. |
 | `websocket_drain_grace` | string | `"0s"` | How long a worker told to stop keeps its open WebSockets before it closes them with 1001. |
+
+(config-project-tool-muru-tracing)=
+## `[tool.muru.tracing]`
+
+Tracing turned on with its settings, in place of `tracing = true`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `config` | string | found by wrapture | The wrapture configuration: a `wrapture.toml`, or a `pyproject.toml` with a `[tool.wrapture]` table, relative to the project's directory. |
