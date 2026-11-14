@@ -65,9 +65,12 @@ def wrapture(monkeypatch: pytest.MonkeyPatch) -> Iterator[types.SimpleNamespace]
     module.load_config = load_config  # type: ignore[attr-defined]
     module.WSGIMiddleware = Middleware  # type: ignore[attr-defined]
     module.ASGIMiddleware = Middleware  # type: ignore[attr-defined]
+    module.Sink = type("Sink", (), {})  # type: ignore[attr-defined]
+    module.add_sink = lambda sink: sink  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "wrapture", module)
     monkeypatch.setattr(_tracing, "_applied", None)
+    monkeypatch.setattr(_tracing, "_toolbar", False)
 
     yield types.SimpleNamespace(applied=applied, loaded=loaded, held=held, module=module)
 

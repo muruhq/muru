@@ -295,7 +295,12 @@ Muru's own extensions add panels of their own after these, drawn the
 same way in the toolbar, on the dashboard and by `muructl debug
 request`: values, tables and spans on the request's clock. Each such
 panel keeps a limited number of entries for a request, and says how many
-were past the limit and not kept.
+were past the limit and not kept. With [tracing](tracing.md#in-the-toolbar)
+on, they are **Trace**, the request's tree of calls, queries and template
+renders; **SQL**, its queries grouped by statement, which shows an N+1
+pattern as one statement run many times; and **Exceptions**, the
+exceptions that escaped or were handled. Each request the page view
+lists opens to its own panels.
 
 The dashboard's recent requests link to each request's page, and
 `/v1/requests/ID` on the dashboard's address gives the record as JSON.

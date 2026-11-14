@@ -93,6 +93,40 @@ off for those. A gRPC entry point is not wrapped. While tracing is off,
 `tracing_middleware` has no effect, so a project can say which entry
 points to wrap and leave tracing itself to each developer.
 
+## In the toolbar
+
+Under `muructl run`, each request's record in the [development
+toolbar](toolbar.md) gains three panels from what wrapture recorded while
+the request was served:
+
+- **Trace:** the request's tree, from the request down to each call,
+  query and template render beneath it, each with when it started and
+  how long it took on the request's clock, after the time it waited for
+  a worker.
+
+- **SQL:** the request's queries, grouped by statement with how many
+  times each ran and their total time, the most run first, then each
+  query in order. A statement run once per row of an earlier query, the
+  N+1 pattern, shows as one statement run many times. Statements that
+  differ only in the values written into them group together. The
+  statement is shown when the instrumentation records it, as the sqlite3
+  and SQLAlchemy instrumentations do with `statement = true`, and
+  otherwise the operation's name.
+
+- **Exceptions:** the exceptions that escaped an operation, and those
+  noted against one as handled, with where they happened.
+
+What a request's panels keep is limited: at most 400 operations of a
+request's tree, with the rest counted and the panel saying how many were
+not kept, and long names and statements are cut. Work on a thread the
+application starts without copying the request's context is not part of
+any request and is not shown. While wrapture records a request, a WSGI
+response's body passes through its middleware, so a file the application
+returns with `wsgi.file_wrapper` is sent by the worker rather than by the
+edge for that request. The daemon and `muructl serve` add nothing for the
+toolbar, so tracing costs there only what the wrapture configuration's
+own sinks do.
+
 ## Tracing on one machine
 
 `tracing` in a project's `muru.local.toml` takes the place of the

@@ -29,10 +29,11 @@ from __future__ import annotations
 import re
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from muru import logging as muru_logging
 from muru._context import request_id
 
 __all__ = [
@@ -40,10 +41,13 @@ __all__ = [
     "REQUEST_LIMIT",
     "Panel",
     "Span",
+    "add_dropped",
     "add_row",
     "add_span",
     "add_value",
+    "at",
     "now",
+    "on_first_record",
     "panel",
     "recording",
 ]
@@ -214,6 +218,57 @@ def now() -> float:
     return (time.perf_counter() - kept.started) * 1000.0
 
 
+def at(seconds: float) -> float:
+    """Return a ``time.perf_counter()`` reading on the record's clock.
+
+    Milliseconds since the worker took the request being served, as
+    ``now()`` gives them; 0 outside a recorded request.
+    """
+
+    kept = _current()
+
+    if kept is None:
+        return 0.0
+
+    return (seconds - kept.started) * 1000.0
+
+
+def add_dropped(declared: Panel, count: int) -> None:
+    """Count entries the panel's own code left out of the request being served.
+
+    For an extension that cuts what it adds to fit, so the panel says
+    how many were not kept, with those past its caps.
+    """
+
+    kept = _current()
+
+    if kept is None or count <= 0:
+        return
+
+    with kept.lock:
+        kept.entries(declared).dropped += count
+
+
+_first: list[Callable[[], None]] = []
+_first_started = False
+
+
+def on_first_record(callback: Callable[[], None]) -> None:
+    """Run `callback` once, as the worker starts recording its first request.
+
+    The edge asks a worker for records only in a development run, so this
+    is how an extension sets up what only the toolbar needs, such as a
+    sink, without costing anything elsewhere. After the first record has
+    started, the callback runs at once.
+    """
+
+    if _first_started:
+        callback()
+        return
+
+    _first.append(callback)
+
+
 def add_span(declared: Panel, span: Span) -> bool:
     """Add a span, with those beneath it, to a spans panel of the request being served.
 
@@ -301,6 +356,19 @@ def _check(declared: Panel, shape: str) -> None:
 
 def _start(request: str) -> None:
     """Start keeping a request's panels, from now on its clock."""
+
+    global _first_started
+
+    if not _first_started:
+        _first_started = True
+
+        for callback in _first:
+            try:
+                callback()
+            except Exception as error:
+                muru_logging._report(error, "a panel's setup for the first record failed")
+
+        _first.clear()
 
     _requests[request] = _Request(time.perf_counter())
 
