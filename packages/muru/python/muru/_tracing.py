@@ -20,6 +20,11 @@ no sink, thread or open file of wrapture's when it forks:
   release, after the fork. What the host did while it loaded is not
   traced.
 
+In each worker the events also reach the development toolbar's Trace,
+SQL and Exceptions panels (``muru._trace_panels``), through a sink added
+only once the worker records its first request, which happens in a
+development run alone.
+
 ``wrap_application`` wraps the entry points the project asked for
 (``tracing_middleware``) in wrapture's request middleware, so each
 request records as one tree. The others are left to a framework's own
@@ -88,14 +93,34 @@ def load_started(context: Any) -> None:
     _applied = wrapture.load_config(source).apply(start=False)
 
     if context.worker_id is not None:
-        _applied.start()
+        _start(wrapture)
 
 
 def worker_started(context: Any) -> None:
     """Start the outputs in a worker, after the fork, if the load has not."""
 
     if _applied is not None:
-        _applied.start()
+        _start(_wrapture())
+
+
+_toolbar = False
+
+
+def _start(wrapture: Any) -> None:
+    # The configuration's outputs, and once in the worker the sink that
+    # turns its events into the toolbar's panels (issue 640), which is
+    # added only when the worker records its first request.
+
+    global _toolbar
+
+    _applied.start()
+
+    if not _toolbar:
+        _toolbar = True
+
+        from muru import _trace_panels
+
+        _trace_panels.install(wrapture)
 
 
 def wrap_application(context: Any, target: Any, application: Any, interface: str) -> Any:

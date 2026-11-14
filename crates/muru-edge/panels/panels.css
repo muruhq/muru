@@ -2,12 +2,29 @@
 .panel table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
 .panel th, .panel td { text-align: left; padding: 0.25rem 0.6rem; border-bottom: 1px solid rgba(127, 127, 127, 0.25); vertical-align: top; }
 .panel table.values th { width: 12rem; font-weight: 600; color: #627d98; white-space: nowrap; }
-.panel td { overflow-wrap: anywhere; }
+/* Cells wrap, whatever the page around the panel says, so a long name or
+   statement does not push the table sideways. */
+.panel td { overflow-wrap: anywhere; white-space: normal; }
 .panel .num { text-align: right; white-space: nowrap; }
 .panel table.logs td:not(:last-child) { white-space: nowrap; overflow-wrap: normal; }
 .panel .mono, .panel pre, .panel code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; }
 .panel .mono pre, .panel .mono code, .panel pre code { font-size: inherit; }
 .panel pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* A text panel's text: plain, with its line breaks, or drawn from markdown. */
+.panel .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.panel .markdown { overflow-wrap: anywhere; line-height: 1.45; }
+/* Prose keeps a reading width however wide the page; tables do not. */
+.panel p, .panel .text, .panel .markdown li, .panel .markdown blockquote { max-width: 48rem; }
+.panel .markdown p, .panel .markdown ul, .panel .markdown ol, .panel .markdown pre { margin: 0 0 0.6rem; }
+.panel .markdown h3, .panel .markdown h4 { margin: 0.9rem 0 0.4rem; }
+.panel .markdown pre { padding: 0.5rem 0.6rem; background: rgba(127, 127, 127, 0.1); }
+.panel .markdown blockquote { margin: 0 0 0.6rem; padding-left: 0.8rem; border-left: 3px solid rgba(127, 127, 127, 0.4); color: #627d98; }
+.panel .markdown hr { border: 0; border-top: 1px solid rgba(127, 127, 127, 0.35); margin: 0.8rem 0; }
+.panel .markdown table { width: auto; margin: 0 0 0.6rem; }
+.panel .markdown th { font-weight: 600; }
+.panel .markdown .align-left { text-align: left; }
+.panel .markdown .align-center { text-align: center; }
+.panel .markdown .align-right { text-align: right; }
 .panel .muted { color: #627d98; }
 .panel .warning { color: #946200; }
 .panel .error { color: #b42318; }

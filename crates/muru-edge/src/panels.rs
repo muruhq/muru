@@ -4,7 +4,8 @@
 //! from a minijinja template when it is asked for, and passes the output
 //! through the ammonia sanitiser, whose allowlist the built-in panels
 //! (Timing, Where, Response and Connection, embedded here) meet as any
-//! other panel must. No panel carries script.
+//! other panel must. A text panel's text is drawn here too, markdown
+//! included (issue 680). No panel carries script.
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,14 +25,56 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("logs", include_str!("../panels/logs.html")),
     ("errors", include_str!("../panels/errors.html")),
     ("connection", include_str!("../panels/connection.html")),
+    (GENERIC, include_str!("../panels/panel.html")),
 ];
 
-/// The elements a panel may use: text, tables, lists, code, details,
-/// meters, progress bars, times and abbreviations.
+/// The template of a panel with none of its own, such as one Muru's
+/// extensions add in the worker (issue 677).
+const GENERIC: &str = "panel";
+
+/// The elements a panel may use: text, quotes, rules, tables, lists,
+/// code, details, meters, progress bars, times and abbreviations.
 const TAGS: &[&str] = &[
-    "p", "div", "span", "br", "strong", "em", "b", "i", "small", "sub", "sup", "h3", "h4", "a",
-    "table", "caption", "thead", "tbody", "tfoot", "tr", "th", "td", "colgroup", "col", "ul", "ol",
-    "li", "dl", "dt", "dd", "code", "pre", "details", "summary", "meter", "progress", "time",
+    "p",
+    "div",
+    "span",
+    "br",
+    "strong",
+    "em",
+    "b",
+    "i",
+    "del",
+    "small",
+    "sub",
+    "sup",
+    "h3",
+    "h4",
+    "a",
+    "blockquote",
+    "hr",
+    "table",
+    "caption",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "th",
+    "td",
+    "colgroup",
+    "col",
+    "ul",
+    "ol",
+    "li",
+    "dl",
+    "dt",
+    "dd",
+    "code",
+    "pre",
+    "details",
+    "summary",
+    "meter",
+    "progress",
+    "time",
     "abbr",
 ];
 
@@ -55,6 +98,7 @@ pub const RESERVED_PREFIX: &str = "/_muru/";
 pub struct Renderer {
     templates: Environment<'static>,
     sanitiser: ammonia::Builder<'static>,
+    markdown: ammonia::Builder<'static>,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -75,51 +119,26 @@ impl Renderer {
                 .expect("a built-in panel template parses");
         }
 
-        let mut sanitiser = ammonia::Builder::empty();
-        sanitiser
-            .tags(TAGS.iter().copied().collect())
-            .generic_attributes(HashSet::from(["class"]))
-            .tag_attributes(
-                ATTRIBUTES
-                    .iter()
-                    .map(|(tag, attributes)| (*tag, attributes.iter().copied().collect()))
-                    .collect::<HashMap<_, _>>(),
-            )
-            .url_schemes(HashSet::from(["http", "https"]))
-            .url_relative(ammonia::UrlRelative::PassThrough)
-            .link_rel(Some("noopener"))
-            .strip_comments(true);
-
-        // Section 11.7: links only to the reserved prefix or the
-        // dashboard.
-
-        let dashboard = dashboard.map(str::to_owned);
-        sanitiser.attribute_filter(move |element, attribute, value| {
-            if element == "a" && attribute == "href" {
-                let allowed = value.starts_with(RESERVED_PREFIX)
-                    || dashboard
-                        .as_deref()
-                        .is_some_and(|dashboard| value.starts_with(dashboard));
-                return allowed.then(|| value.into());
-            }
-
-            Some(value.into())
-        });
-
         Self {
             templates,
-            sanitiser,
+            sanitiser: sanitiser(dashboard, false),
+            markdown: sanitiser(dashboard, true),
         }
     }
 
-    /// Draw a panel, sanitised. A panel without a template, or whose
-    /// template fails, is drawn as a sentence saying so.
+    /// Draw a panel, sanitised: by its own template, else the generic
+    /// one, with a text panel's text first. A panel whose template fails
+    /// is drawn as a sentence saying so.
     pub fn render(&self, panel: &admin::Panel) -> String {
         let drawn = self
             .templates
             .get_template(&format!("{}.html", panel.name))
+            .or_else(|_| self.templates.get_template(&format!("{GENERIC}.html")))
             .and_then(|template| {
-                template.render(context! { panel => minijinja::value::Serde(panel) })
+                template.render(context! {
+                    panel => minijinja::value::Serde(panel),
+                    numeric => numeric_columns(panel),
+                })
             });
 
         let html = match drawn {
@@ -131,13 +150,152 @@ impl Renderer {
             ),
         };
 
-        self.sanitise(&html)
+        let mut drawn = self.text(panel);
+        drawn.push_str(&self.sanitise(&html));
+        drawn
     }
 
     /// HTML as the sanitiser leaves it.
     pub fn sanitise(&self, html: &str) -> String {
         self.sanitiser.clean(html).to_string()
     }
+
+    /// A text panel's text (issue 680): plain text with its line breaks
+    /// kept, or markdown drawn as HTML and sanitised on its own, the one
+    /// place a panel may link outside Muru.
+    fn text(&self, panel: &admin::Panel) -> String {
+        if panel.text.is_empty() {
+            return String::new();
+        }
+
+        if panel.markdown {
+            return self.markdown.clean(&markdown(&panel.text)).to_string();
+        }
+
+        self.sanitise(&format!(
+            "<div class=\"text\">{}</div>",
+            escape(&panel.text)
+        ))
+    }
+}
+
+/// The sanitiser for what panels draw. Links go only to the reserved
+/// prefix or the dashboard (section 11.7), except in markdown, whose
+/// links may also go to outside `http` and `https` addresses and open in
+/// a new tab, telling the page opened nothing of the one it came from.
+fn sanitiser(dashboard: Option<&str>, markdown: bool) -> ammonia::Builder<'static> {
+    let mut sanitiser = ammonia::Builder::empty();
+    sanitiser
+        .tags(TAGS.iter().copied().collect())
+        .generic_attributes(HashSet::from(["class"]))
+        .tag_attributes(
+            ATTRIBUTES
+                .iter()
+                .map(|(tag, attributes)| (*tag, attributes.iter().copied().collect()))
+                .collect::<HashMap<_, _>>(),
+        )
+        .url_schemes(HashSet::from(["http", "https"]))
+        .url_relative(ammonia::UrlRelative::PassThrough)
+        .strip_comments(true);
+
+    if markdown {
+        sanitiser
+            .link_rel(Some("noopener noreferrer"))
+            .set_tag_attribute_value("a", "target", "_blank");
+    } else {
+        sanitiser.link_rel(Some("noopener"));
+    }
+
+    let dashboard = dashboard.map(str::to_owned);
+    sanitiser.attribute_filter(move |element, attribute, value| {
+        if element == "a" && attribute == "href" {
+            let allowed = value.starts_with(RESERVED_PREFIX)
+                || dashboard
+                    .as_deref()
+                    .is_some_and(|dashboard| value.starts_with(dashboard))
+                || (markdown && (value.starts_with("http://") || value.starts_with("https://")));
+            return allowed.then(|| value.into());
+        }
+
+        Some(value.into())
+    });
+
+    sanitiser
+}
+
+/// Markdown as HTML, before it is sanitised: CommonMark with tables and
+/// strikethrough, headings moved to the levels panels use, a table
+/// column's alignment as a class, and HTML written into the markdown
+/// shown as the text it is.
+fn markdown(text: &str) -> String {
+    use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
+
+    let moved = |level: HeadingLevel| {
+        if level == HeadingLevel::H1 {
+            HeadingLevel::H3
+        } else {
+            HeadingLevel::H4
+        }
+    };
+
+    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
+    let events = Parser::new_ext(text, options).map(|event| match event {
+        Event::Start(Tag::Heading {
+            level,
+            id,
+            classes,
+            attrs,
+        }) => Event::Start(Tag::Heading {
+            level: moved(level),
+            id,
+            classes,
+            attrs,
+        }),
+        Event::End(TagEnd::Heading(level)) => Event::End(TagEnd::Heading(moved(level))),
+        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+        other => other,
+    });
+
+    let mut drawn = String::from("<div class=\"markdown\">");
+    html::push_html(&mut drawn, events);
+    drawn.push_str("</div>");
+
+    // pulldown-cmark aligns a column with a style attribute, which the
+    // sanitiser removes. Only it can write these exact tags, since text,
+    // code and HTML in the markdown come out escaped.
+
+    for cell in ["th", "td"] {
+        for align in ["left", "center", "right"] {
+            drawn = drawn.replace(
+                &format!("<{cell} style=\"text-align: {align}\">"),
+                &format!("<{cell} class=\"align-{align}\">"),
+            );
+        }
+    }
+
+    drawn
+}
+
+/// For each of a panel's tables, which of its columns hold only numbers,
+/// so the generic template keeps them on one line, aligned right. A
+/// column with no rows is not numeric.
+fn numeric_columns(panel: &admin::Panel) -> Vec<Vec<bool>> {
+    panel
+        .tables
+        .iter()
+        .map(|table| {
+            (0..table.columns.len())
+                .map(|column| {
+                    !table.rows.is_empty()
+                        && table.rows.iter().all(|row| {
+                            row.cells
+                                .get(column)
+                                .is_some_and(|cell| cell.trim().parse::<f64>().is_ok())
+                        })
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn escape(text: &str) -> String {
@@ -145,6 +303,41 @@ fn escape(text: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// A record's panels, in the order they are shown: the built-in ones,
+/// then those code in the worker added (issue 677), whose
+/// spans move from the worker's clock to the request's. One that takes a
+/// built-in panel's name is left out.
+pub fn all(record: &admin::RequestRecord) -> Vec<admin::Panel> {
+    let mut panels = builtin(record);
+
+    let added = record
+        .from_worker
+        .as_ref()
+        .map(|worker| worker.panels.as_slice())
+        .unwrap_or_default();
+
+    for panel in added {
+        if panels.iter().any(|shown| shown.name == panel.name) {
+            continue;
+        }
+
+        let mut panel = panel.clone();
+        shift(&mut panel.spans, record.queue_ms);
+        panels.push(panel);
+    }
+
+    panels
+}
+
+/// Spans moved from the worker's clock, which starts as the queue ends,
+/// to the request's.
+fn shift(spans: &mut [admin::PanelSpan], by: f64) {
+    for span in spans {
+        span.start_ms += by;
+        shift(&mut span.children, by);
+    }
 }
 
 /// The built-in panels of a record, in the order they are shown.
@@ -325,6 +518,7 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
             .filter(|table| !table.rows.is_empty())
             .into_iter()
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -984,15 +1178,189 @@ mod tests {
     }
 
     #[test]
-    fn a_panel_with_no_template_says_so() {
+    fn a_panel_with_no_template_of_its_own_is_drawn_by_the_generic_one() {
         let renderer = Renderer::new(None);
+
+        let empty = renderer.render(&admin::Panel {
+            name: "nothing".to_owned(),
+            ..Default::default()
+        });
+        assert!(empty.contains("Nothing was added to this panel"), "{empty}");
+
         let html = renderer.render(&admin::Panel {
-            name: "<nothing>".to_owned(),
+            name: "library".to_owned(),
+            title: "Library".to_owned(),
+            values: vec![value("books", "7")],
+            tables: vec![admin::PanelTable {
+                caption: "Queries".to_owned(),
+                columns: vec!["statement".to_owned(), "times".to_owned()],
+                rows: vec![
+                    admin::PanelRow {
+                        cells: vec![
+                            "SELECT name FROM author WHERE id = ?".to_owned(),
+                            "7".to_owned(),
+                        ],
+                    },
+                    admin::PanelRow {
+                        cells: vec!["SELECT 1".to_owned(), "0.125".to_owned()],
+                    },
+                ],
+            }],
+            spans: vec![admin::PanelSpan {
+                name: "books()".to_owned(),
+                start_ms: 1.0,
+                duration_ms: 3.0,
+                category: "view".to_owned(),
+                children: vec![admin::PanelSpan {
+                    name: "<script>".to_owned(),
+                    start_ms: 2.0,
+                    duration_ms: 0.5,
+                    category: "database".to_owned(),
+                    children: Vec::new(),
+                }],
+            }],
+            dropped: 2,
+            ..Default::default()
+        });
+
+        assert!(html.contains("<th>books</th>"), "{html}");
+        assert!(html.contains("<caption>Queries</caption>"), "{html}");
+        assert!(html.contains("WHERE id = ?"), "{html}");
+        assert!(
+            html.contains("<th>statement</th><th class=\"num\">times</th>"),
+            "{html}"
+        );
+        assert!(html.contains("<td class=\"mono num\">0.125</td>"), "{html}");
+        assert!(html.contains("<td class=\"mono\">SELECT 1</td>"), "{html}");
+        assert!(
+            html.contains("books()") && html.contains("depth-2"),
+            "{html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;") && !html.contains("<script>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("2 entries were past the panel's limits"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_text_panel_is_drawn_plain_or_from_markdown_with_its_own_links() {
+        let renderer = Renderer::new(None);
+
+        let plain = renderer.render(&admin::Panel {
+            name: "notes".to_owned(),
+            text: "one <b>\ntwo".to_owned(),
             ..Default::default()
         });
         assert!(
-            html.contains("The &lt;nothing&gt; panel could not be drawn"),
-            "{html}"
+            plain.contains("<div class=\"text\">one &lt;b&gt;\ntwo</div>"),
+            "{plain}"
         );
+        assert!(!plain.contains("Nothing was added"), "{plain}");
+
+        let markdown = renderer.render(&admin::Panel {
+            name: "analysis".to_owned(),
+            text:
+                "# Queries\n\n| statement | times |\n|---|---:|\n| SELECT 1 | 7 |\n\n\
+                   > ~~slow~~ quoted\n\n## Detail\n\n**3** ran. See [the guide](https://example.com/guide) \
+                   or [a record](/_muru/requests/A1.json).\n\n<script>alert(1)</script>\n\n\
+                   [bad](javascript:alert(1))"
+                    .to_owned(),
+            markdown: true,
+            ..Default::default()
+        });
+
+        assert!(markdown.contains("<h3>Queries</h3>"), "{markdown}");
+        assert!(markdown.contains("<h4>Detail</h4>"), "{markdown}");
+        assert!(markdown.contains("<strong>3</strong>"), "{markdown}");
+        assert!(
+            markdown.contains("<table>")
+                && markdown.contains("<th>statement</th>")
+                && markdown.contains("<th class=\"align-right\">times</th>")
+                && markdown.contains("<td class=\"align-right\">7</td>"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("<blockquote>") && markdown.contains("<del>slow</del>"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(
+                "<a href=\"https://example.com/guide\" target=\"_blank\" rel=\"noopener noreferrer\">"
+            ),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("href=\"/_muru/requests/A1.json\""),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("&lt;script&gt;") && !markdown.contains("<script>"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("javascript"), "{markdown}");
+
+        // Outside markdown, an outside link is not kept.
+
+        let elsewhere = renderer.sanitise("<a href=\"https://example.com/guide\">guide</a>");
+        assert_eq!(elsewhere, "<a rel=\"noopener\">guide</a>");
+    }
+
+    #[test]
+    fn an_extensions_panels_follow_the_built_in_ones_on_the_requests_clock() {
+        let mut record = admin::RequestRecord {
+            status: 200,
+            queue_ms: 4.0,
+            total_ms: 10.0,
+            ..Default::default()
+        };
+        record.from_worker = Some(admin::WorkerPart {
+            panels: vec![
+                admin::Panel {
+                    name: "trace".to_owned(),
+                    title: "Trace".to_owned(),
+                    spans: vec![admin::PanelSpan {
+                        name: "view".to_owned(),
+                        start_ms: 1.0,
+                        duration_ms: 2.0,
+                        children: vec![admin::PanelSpan {
+                            name: "query".to_owned(),
+                            start_ms: 1.5,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                admin::Panel {
+                    name: "timing".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let panels = all(&record);
+        let names: Vec<&str> = panels.iter().map(|panel| panel.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            [
+                "timing",
+                "where",
+                "response",
+                "logs",
+                "errors",
+                "connection",
+                "trace"
+            ]
+        );
+
+        let trace = &panels[6];
+        assert_eq!(trace.spans[0].start_ms, 5.0);
+        assert_eq!(trace.spans[0].children[0].start_ms, 5.5);
     }
 }

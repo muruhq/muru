@@ -33,6 +33,7 @@ multer = { workspace = true }
 muru-proto = { workspace = true }
 percent-encoding = { workspace = true }
 prost = { workspace = true }
+pulldown-cmark = { workspace = true }
 regex = { workspace = true }
 ring = { workspace = true }
 rustls = { workspace = true }

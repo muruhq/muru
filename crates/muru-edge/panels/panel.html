@@ -1,0 +1,59 @@
+{#- A panel with no template of its own, such as one code in the worker
+    adds with muru.panels (issue 677): its values, its tables, with a column of
+    numbers kept on one line and aligned right, and its spans, each span
+    drawn as a bar on the request's clock, and what it could not keep. A
+    text panel's text is drawn before it by the renderer (issue 680). -#}
+{%- if panel["values"] %}
+<table class="values">
+<tbody>
+{%- for value in panel["values"] %}
+<tr><th>{{ value.name }}</th><td class="mono">{{ value.value }}</td></tr>
+{%- endfor %}
+</tbody>
+</table>
+{%- endif %}
+{%- for table in panel.tables %}
+{%- set numbers = numeric[loop.index0] %}
+<table>
+<caption>{{ table.caption }}</caption>
+<thead><tr>{% for column in table.columns %}<th{% if numbers[loop.index0] %} class="num"{% endif %}>{{ column }}</th>{% endfor %}</tr></thead>
+<tbody>
+{%- for row in table.rows %}
+<tr>{% for cell in row.cells %}<td class="mono{% if numbers[loop.index0] %} num{% endif %}">{{ cell }}</td>{% endfor %}</tr>
+{%- endfor %}
+</tbody>
+</table>
+{%- if not table.rows %}
+<p class="muted">Nothing was added to this table for this request.</p>
+{%- endif %}
+{%- endfor %}
+{%- if panel.spans %}
+{%- set ns = namespace(total=0) -%}
+{%- for span in panel.spans %}{% if span.start_ms + span.duration_ms > ns.total %}{% set ns.total = span.start_ms + span.duration_ms %}{% endif %}{% endfor -%}
+{%- set total = ns.total -%}
+{%- macro bar(span) -%}
+{%- set from = [[(span.start_ms * 100 / total)|round|int, 0]|max, 100]|min if total > 0 else 0 -%}
+{%- set width = [[(span.duration_ms * 100 / total)|round|int, 0]|max, 100 - from]|min if total > 0 else 0 -%}
+<span class="track" title="{{ span.start_ms|round(2) }} ms to {{ (span.start_ms + span.duration_ms)|round(2) }} ms"><span class="bar from-{{ from }} for-{{ width }}"></span></span>
+{%- endmacro %}
+<table class="spans">
+<thead><tr><th>Name</th><th class="num">Starts</th><th class="num">Takes</th><th>On the request's clock</th></tr></thead>
+<tbody>
+{%- for span in panel.spans recursive %}
+<tr class="{{ span.category }}">
+<td class="depth-{{ loop.depth }}">{{ span.name }}</td>
+<td class="num">{{ span.start_ms|round(2) }} ms</td>
+<td class="num">{{ span.duration_ms|round(2) }} ms</td>
+<td>{{ bar(span) }}</td>
+</tr>
+{%- if span.children %}{{ loop(span.children) }}{% endif %}
+{%- endfor %}
+</tbody>
+</table>
+{%- endif %}
+{%- if not panel["values"] and not panel.tables and not panel.spans and not panel.text %}
+<p class="muted">Nothing was added to this panel for this request.</p>
+{%- endif %}
+{%- if panel.dropped %}
+<p class="warning">{{ panel.dropped }} {{ "entry was" if panel.dropped == 1 else "entries were" }} past the panel's limits and not kept.</p>
+{%- endif %}

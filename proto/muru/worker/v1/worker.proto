@@ -216,6 +216,44 @@ message WorkerRecord {
   repeated GcDuring gc = 20;        // collections that ended during the request, by generation
   double loop_lag = 21;             // the longest stretch of the request with the event loop held
   double loop_lag_at = 22;          // when that stretch began
+  repeated RecordPanel panels = 23; // panels code in the worker added during the request (issue 677)
+}
+
+// A panel code in the worker added to a request's record (issue 677), in the
+// shapes of ADR 0063. Span times are milliseconds from when the worker
+// took the request.
+message RecordPanel {
+  string name = 1;
+  string title = 2;
+  repeated RecordSpan spans = 3;
+  repeated RecordValue values = 4;
+  repeated RecordTable tables = 5;
+  uint32 dropped = 6;               // entries past the panel's or the request's cap
+  string text = 7;                  // a text panel's text (issue 680)
+  bool markdown = 8;                // the text is markdown, drawn by the edge
+}
+
+message RecordSpan {
+  string name = 1;
+  double start = 2;                 // milliseconds from when the worker took the request
+  double duration = 3;
+  string category = 4;
+  repeated RecordSpan children = 5;
+}
+
+message RecordValue {
+  string name = 1;
+  string value = 2;
+}
+
+message RecordTable {
+  string caption = 1;
+  repeated string columns = 2;
+  repeated RecordRow rows = 3;
+}
+
+message RecordRow {
+  repeated string cells = 1;
 }
 
 // The garbage collections of one generation that ended during a request

@@ -2985,6 +2985,27 @@ fn request_text(record: &pb::RequestRecord) -> String {
                 }
             }
         }
+
+        // Issue 680: a text panel's text, as written, markdown included.
+
+        for line in panel.text.lines() {
+            let _ = writeln!(text, "  {line}");
+        }
+
+        // Issue 677: what a panel from the worker could not keep.
+
+        if panel.dropped > 0 {
+            let entries = if panel.dropped == 1 {
+                "entry"
+            } else {
+                "entries"
+            };
+            let _ = writeln!(
+                text,
+                "  {} {entries} past the panel's limits not kept",
+                panel.dropped
+            );
+        }
     }
 
     text

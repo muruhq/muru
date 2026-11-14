@@ -187,6 +187,32 @@ says how they are set):
 | `JsonFormatter` | The `json` format: one object per record with `time`, `level`, `logger`, `message`, `app`, `release`, `group`, `worker`, and `exception` and `stack` when present |
 | `STANDARD_FORMAT` | The `standard` format string, `%(levelname)s %(name)s: %(message)s` |
 
+## `muru.panels`
+
+Panels the application adds to the [development toolbar](../howto/toolbar.md)
+for the requests a development run records ([adding panels](../howto/panels.md)
+says how). Outside such a request every panel keeps nothing.
+
+| Name | Purpose |
+| --- | --- |
+| `ValuesPanel(name, title)` | Declares a panel of names with values |
+| `TablesPanel(name, title, *, tables)` | Declares a panel of tables, `tables` mapping each caption to its columns |
+| `SpansPanel(name, title)` | Declares a panel of spans on the request's clock |
+| `TextPanel(name, title, *, markdown=False)` | Declares a panel of text, plain or markdown |
+| `panel.current()` | The declared panel for the request being served: a `Values`, `Tables`, `Spans` or `Text` |
+| `Values`: `values[name] = value` | Sets a value, shown as text |
+| `Tables.table(caption)` | The table with that caption, a `Table`; `ValueError` for a caption the panel does not have |
+| `Table.add_row(cells)` | Adds a row, each cell shown as text, and returns whether it was kept |
+| `Spans.add(span)` | Adds a `Span` with those beneath it, and returns whether it was kept |
+| `Spans.span(name, category="")` | A context manager timing its block as a span, beneath an enclosing block's of the same panel |
+| `Text.write(text)` | Adds a block of text, after a blank line, and returns whether it was kept |
+| `active` | On every panel: whether it keeps anything for the request being served |
+| `now()`, `at(reading)` | On every panel: milliseconds on the request's clock, now or for a `time.perf_counter()` reading; 0 when it keeps nothing |
+| `add_dropped(count)` | On every panel: counts entries the code left out, shown with those past the limits |
+| `Span(name, start, duration, category="", children=[])` | A span, its times in milliseconds on the request's clock |
+| `on_first_record(callback)` | Runs `callback` once, as the worker starts recording its first request |
+| `PANEL_LIMIT`, `REQUEST_LIMIT`, `TEXT_LIMIT` | 500 entries a panel keeps for a request, 2,000 a request keeps, 65,536 characters a text panel keeps |
+
 ## `muru.__version__`
 
 The installed version of the runtime library, as a string, or `0+unknown`

@@ -588,6 +588,8 @@ fn json(problem: &Problem, title: &str, request_id: &str, detail: Option<&str>) 
 const PAGE_STYLES: &str = "\
 body { margin: 0; padding: 3rem 1.5rem; font: 16px/1.5 system-ui, sans-serif; color: #1f2933; background: #f5f7fa; }\n\
 main { max-width: 44rem; margin: 0 auto; }\n\
+main.wide { max-width: none; }\n\
+main.wide > :not(pre) { max-width: 44rem; margin-left: auto; margin-right: auto; }\n\
 h1 { font-size: 1.75rem; margin: 0 0 1rem; }\n\
 h1 span { color: #9aa5b1; font-weight: normal; margin-right: 0.5rem; }\n\
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 1.5rem 0; }\n\
@@ -617,10 +619,19 @@ fn html(
         format!("<style>\n{PAGE_STYLES}</style>\n")
     };
 
+    // A page with a traceback lets the traceback take the window's width
+    // (issue 650), the rest staying at its reading width.
+
+    let main = if detail.is_some() {
+        "<main class=\"wide\">"
+    } else {
+        "<main>"
+    };
+
     let mut body = format!(
         "<!doctype html>\n<html lang=\"en\"{marker}>\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <title>{status} {title}</title>\n{styles}</head>\n<body>\n<main>\n\
+         <title>{status} {title}</title>\n{styles}</head>\n<body>\n{main}\n\
          <h1><span>{status}</span>{}</h1>\n<p>{}</p>\n\
          <dl><dt>Reason</dt><dd>{}</dd><dt>Request id</dt><dd>{}</dd></dl>\n",
         escape(title),
@@ -851,6 +862,22 @@ mod tests {
         assert!(plain.starts_with("<!doctype html>\n<html lang=\"en\">"));
         assert_eq!(plain.matches("<style>").count(), 1);
         assert!(!plain.contains("occasion"));
+
+        // Issue 650: a page with a traceback lets it take the window's
+        // width, and one without keeps its column. A theme that replaces
+        // the stylesheet and sets the column's width does the same.
+
+        assert!(plain.contains("<main class=\"wide\">"), "{plain}");
+        let bare = html(&problem, "Internal Server Error", "id", None, None);
+        assert!(bare.contains("<main>\n"), "{bare}");
+
+        for occasion in occasions::OCCASIONS {
+            let page = page(occasion.id);
+
+            if occasion.mode == Mode::Replace && page.contains("main { max-width") {
+                assert!(page.contains("main.wide {"), "{}", occasion.id);
+            }
+        }
     }
 
     #[tokio::test]
