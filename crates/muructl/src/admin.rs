@@ -2992,7 +2992,7 @@ fn request_text(record: &pb::RequestRecord) -> String {
             let _ = writeln!(text, "  {line}");
         }
 
-        // Issue 677: what an extension's panel could not keep.
+        // Issue 677: what a panel from the worker could not keep.
 
         if panel.dropped > 0 {
             let entries = if panel.dropped == 1 {

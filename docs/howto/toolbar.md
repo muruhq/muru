@@ -291,12 +291,13 @@ The page shows the record as panels:
   whether Muru closed the connection after this response because it had
   served its share of requests.
 
-Muru's own extensions add panels of their own after these, drawn the
-same way in the toolbar, on the dashboard and by `muructl debug
-request`: values, tables and spans on the request's clock. Each such
-panel keeps a limited number of entries for a request, and says how many
-were past the limit and not kept. With [tracing](tracing.md#in-the-toolbar)
-on, they are **Trace**, the request's tree of calls, queries and template
+Panels from the worker follow these, drawn the same way in the toolbar,
+on the dashboard and by `muructl debug request`: values, tables, spans
+on the request's clock, and text. Each such panel keeps a limited number
+of entries for a request, and says how many were past the limit and not
+kept. The application can add its own, as [adding
+panels](panels.md) shows. With [tracing](tracing.md#in-the-toolbar)
+on, Muru adds **Trace**, the request's tree of calls, queries and template
 renders; **SQL**, its queries grouped by statement, which shows an N+1
 pattern as one statement run many times; and **Exceptions**, the
 exceptions that escaped or were handled. Each request the page view

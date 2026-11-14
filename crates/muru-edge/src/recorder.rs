@@ -420,7 +420,7 @@ pub fn worker(record: &mut admin::RequestRecord, part: muru_proto::worker::v1::W
     });
 }
 
-/// A panel an extension added in the worker (issue 677), as the record
+/// A panel code in the worker added (issue 677), as the record
 /// keeps it: its spans still on the worker's clock.
 fn panel(panel: muru_proto::worker::v1::RecordPanel) -> admin::Panel {
     fn span(taken: muru_proto::worker::v1::RecordSpan) -> admin::PanelSpan {

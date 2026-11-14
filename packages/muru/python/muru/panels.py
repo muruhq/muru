@@ -1,11 +1,11 @@
-"""Panels Muru's extensions add to a request's record (issues 677, 679, 680, ADR 0063).
+"""Panels code in the worker adds to the development toolbar (issues 677, 679 to 681, ADR 0063).
 
 A development run keeps a record of each request it serves (section 11.7),
 drawn as panels in the toolbar, on the dashboard's request page and by
 ``muructl debug request``. The built-in panels are worked out by the edge
 from the record; this module lets code in the worker add panels of its
-own, as data in the shapes the edge draws, each declared once by a class
-of its own:
+own, the application's or a library's, as data in the shapes the edge
+draws, each declared once by a class of its own:
 
 - ``SpansPanel``: named intervals on the record's clock that may nest.
 - ``TablesPanel``: rows under captioned columns, in one or more tables.
@@ -31,8 +31,8 @@ characters.
 The worker starts keeping a request's panels when it takes the request
 and takes them with the worker's part of its record, by the request's id,
 as it does the request's log records. A handle kept past that keeps
-nothing. The API is Muru's own for now: third-party panels are not
-offered.
+nothing. A panel is data only: it supplies no template or script of its
+own.
 """
 
 from __future__ import annotations
@@ -77,9 +77,28 @@ TEXT_LIMIT = 65536
 """The most characters one text panel of a request keeps."""
 
 # The built-in panels' names, and the page view's tab, which a declared
-# panel may not take.
+# panel may not take, and the names of Muru's own panels from tracing,
+# which only Muru declares, within _own().
 
 RESERVED = frozenset({"timing", "where", "response", "logs", "errors", "connection", "page"})
+OWN = frozenset({"trace", "sql", "exceptions"})
+
+_owning = False
+
+
+@contextlib.contextmanager
+def _own() -> Iterator[None]:
+    # Muru's own panels are declared within this.
+
+    global _owning
+
+    _owning = True
+
+    try:
+        yield
+    finally:
+        _owning = False
+
 
 _NAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
@@ -189,7 +208,7 @@ class Panel:
         tables: tuple[tuple[str, tuple[str, ...]], ...] = (),
         markdown: bool = False,
     ) -> None:
-        if not _NAME.match(name) or name in RESERVED:
+        if not _NAME.match(name) or name in RESERVED or (name in OWN and not _owning):
             raise ValueError(f"{name!r} cannot name a panel")
 
         self.name = name
@@ -530,7 +549,7 @@ def on_first_record(callback: Callable[[], None]) -> None:
     """Run `callback` once, as the worker starts recording its first request.
 
     The edge asks a worker for records only in a development run, so this
-    is how an extension sets up what only the toolbar needs, such as a
+    is how code sets up what only the toolbar needs, such as a
     sink, without costing anything elsewhere. After the first record has
     started, the callback runs at once.
     """

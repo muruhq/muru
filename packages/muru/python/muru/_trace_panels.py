@@ -2,7 +2,7 @@
 
 When tracing is on (section 11.6), a sink of Muru's own hears every event
 wrapture records in a worker and turns each request's tree into panels of
-the request's record (issue 677), drawn by the toolbar after the built-in
+the request's record (``muru.panels``), drawn by the toolbar after the built-in
 panels:
 
 - **Trace:** the request's tree as spans on the record's clock, coloured
@@ -38,7 +38,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from muru import _panels
+from muru import panels
 
 __all__ = ["install"]
 
@@ -53,37 +53,41 @@ NAME_LIMIT = 200
 
 KINDS = frozenset({"call", "request", "block"})
 
-TRACE = _panels.SpansPanel("trace", "Trace")
-SQL = _panels.TablesPanel(
-    "sql",
-    "SQL",
-    tables={
-        "By statement": ["statement", "times", "total ms"],
-        "Each query": ["at ms", "ms", "statement"],
-    },
-)
-EXCEPTIONS = _panels.TablesPanel(
-    "exceptions", "Exceptions", tables={"Exceptions": ["in", "exception"]}
-)
+# Muru's own panels, whose names no other code may declare.
+
+with panels._own():
+    TRACE = panels.SpansPanel("trace", "Trace")
+    SQL = panels.TablesPanel(
+        "sql",
+        "SQL",
+        tables={
+            "By statement": ["statement", "times", "total ms"],
+            "Each query": ["at ms", "ms", "statement"],
+        },
+    )
+    EXCEPTIONS = panels.TablesPanel(
+        "exceptions", "Exceptions", tables={"Exceptions": ["in", "exception"]}
+    )
 
 
 @dataclass
-class _Panels:
-    # The request's panels a tree is added to, taken as its root begins.
+class _Handles:
+    # The handles of the request's panels a tree is added to, taken as its
+    # root begins.
 
-    trace: _panels.Spans
-    sql: _panels.Tables
-    exceptions: _panels.Tables
+    trace: panels.Spans
+    sql: panels.Tables
+    exceptions: panels.Tables
 
 
 @dataclass
 class _Node:
     # One open or closed operation of a request's tree. The root holds
-    # the request's panels.
+    # the handles of the request's panels.
 
     root: _Node | None
     event: Any
-    panels: _Panels | None = None
+    handles: _Handles | None = None
     children: list[_Node] = field(default_factory=list)
     closed: bool = False
     size: int = 1
@@ -124,10 +128,10 @@ class _Trees:
         if not trace.active:
             return
 
-        panels = _Panels(trace, SQL.current(), EXCEPTIONS.current())
+        handles = _Handles(trace, SQL.current(), EXCEPTIONS.current())
 
         with self.lock:
-            self.open[event.seq] = _Node(None, event, panels)
+            self.open[event.seq] = _Node(None, event, handles)
 
     def closed(self, event: Any) -> None:
         with self.lock:
@@ -143,16 +147,16 @@ class _Trees:
 
         # The root has closed: the tree is done.
 
-        if node.panels is not None:
-            _add(node, node.panels)
+        if node.handles is not None:
+            _add(node, node.handles)
 
 
-def _add(root: _Node, panels: _Panels) -> None:
+def _add(root: _Node, handles: _Handles) -> None:
     # The finished tree, as the three panels of its request.
 
     # Times go onto the record's clock through the trace's handle.
 
-    trace = panels.trace
+    trace = handles.trace
     trace.add(_span(root, trace))
     trace.add_dropped(root.dropped)
 
@@ -165,28 +169,28 @@ def _add(root: _Node, panels: _Panels) -> None:
     for _, took, statement in queries:
         grouped.setdefault(_normalised(statement), []).append(took)
 
-    by_statement = panels.sql.table("By statement")
+    by_statement = handles.sql.table("By statement")
 
     for statement, times in sorted(grouped.items(), key=lambda item: -len(item[1])):
         by_statement.add_row([statement, len(times), f"{sum(times):.3f}"])
 
-    each_query = panels.sql.table("Each query")
+    each_query = handles.sql.table("Each query")
 
     for started, took, statement in queries:
         each_query.add_row([f"{started:.3f}", f"{took:.3f}", statement])
 
-    exceptions = panels.exceptions.table("Exceptions")
+    exceptions = handles.exceptions.table("Exceptions")
 
     for where, what in failures:
         exceptions.add_row([where, what])
 
 
-def _span(node: _Node, clock: _panels.Spans) -> _panels.Span:
+def _span(node: _Node, clock: panels.Spans) -> panels.Span:
     event = node.event
     started = clock.at(event.started) if event.started is not None else 0.0
     duration = (event.duration or 0.0) * 1000.0
 
-    return _panels.Span(
+    return panels.Span(
         _name(event),
         started,
         duration,
@@ -197,7 +201,7 @@ def _span(node: _Node, clock: _panels.Spans) -> _panels.Span:
 
 def _collect(
     node: _Node,
-    clock: _panels.Spans,
+    clock: panels.Spans,
     queries: list[tuple[float, float, str]],
     failures: list[tuple[str, str]],
 ) -> None:
@@ -308,4 +312,4 @@ def install(wrapture: Any) -> None:
         def on_error(self, event: Any) -> None:
             trees.closed(event)
 
-    _panels.on_first_record(lambda: wrapture.add_sink(ToolbarSink()))
+    panels.on_first_record(lambda: wrapture.add_sink(ToolbarSink()))

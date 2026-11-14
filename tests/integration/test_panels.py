@@ -1,4 +1,4 @@
-"""Panels an extension adds in the worker reach the request's record (issue 677)."""
+"""Panels code in the worker adds with muru.panels reach the request's record."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ from pathlib import Path
 from support import server as support
 
 APP = """
-from muru import _panels
+from muru import panels
 
-LIBRARY = _panels.ValuesPanel("library", "Library")
-TRACE = _panels.SpansPanel("trace", "Trace")
-ANALYSIS = _panels.TextPanel("analysis", "Analysis", markdown=True)
+LIBRARY = panels.ValuesPanel("library", "Library")
+STEPS = panels.SpansPanel("steps", "Steps")
+ANALYSIS = panels.TextPanel("analysis", "Analysis", markdown=True)
 
 
 def application(environ, start_response):
@@ -21,8 +21,8 @@ def application(environ, start_response):
     library["recording"] = library.active
     library["books"] = 7
 
-    with TRACE.current().span("view", category="view"):
-        with TRACE.current().span("query", category="database"):
+    with STEPS.current().span("view", category="view"):
+        with STEPS.current().span("query", category="database"):
             pass
 
     ANALYSIS.current().write("# Queries\\n\\nSee [the guide](https://example.com/guide).")
@@ -57,16 +57,16 @@ def test_a_panel_added_in_the_worker_is_in_the_record_and_drawn(tmp_path: Path) 
         # After the built-in panels, with the values set and the spans on
         # the request's clock, after the queue.
 
-        assert list(panels)[-3:] == ["library", "trace", "analysis"], list(panels)
+        assert list(panels)[-3:] == ["library", "steps", "analysis"], list(panels)
         assert panels["library"]["values"] == [
             {"name": "recording", "value": "True"},
             {"name": "books", "value": "7"},
         ]
-        view = panels["trace"]["spans"][0]
+        view = panels["steps"]["spans"][0]
         assert view["name"] == "view" and view["children"][0]["name"] == "query"
         assert view["start_ms"] >= found["queue_ms"]
 
-        drawn = server.get(f"/_muru/requests/{request_id}/panels/trace.html").body.decode()
+        drawn = server.get(f"/_muru/requests/{request_id}/panels/steps.html").body.decode()
         assert "view" in drawn and "query" in drawn and "depth-2" in drawn, drawn
 
         # A markdown panel is drawn by the edge, its outside link opening

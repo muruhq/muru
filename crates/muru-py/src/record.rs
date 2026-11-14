@@ -22,7 +22,7 @@ use pyo3::sync::PyOnceLock;
 use crate::wsgi::Outgoing;
 
 /// The runtime library's functions that keep a request's log records,
-/// and those that keep the panels Muru's extensions add (issue 677):
+/// and those that keep the panels code in the worker adds (issue 677):
 /// each start and take.
 static CAPTURE: PyOnceLock<Capture> = PyOnceLock::new();
 
@@ -322,8 +322,8 @@ fn gc_during(before: &[(u64, u64); 4], after: &[(u64, u64); 4]) -> Vec<pb::GcDur
 
 /// What the runtime library kept of a request for its record: its log
 /// records, each one's time on the wall clock, level, logger and message,
-/// with how many were past the limit; and the panels Muru's extensions
-/// added (issue 677).
+/// with how many were past the limit; and the panels code in the
+/// worker added (issue 677).
 #[derive(Debug, Default)]
 pub struct Logs {
     kept: Vec<(f64, String, String, String)>,
@@ -334,7 +334,7 @@ pub struct Logs {
 fn capture(py: Python<'_>) -> PyResult<&Capture> {
     CAPTURE.get_or_try_init(py, || {
         let logging = py.import("muru.logging")?;
-        let panels = py.import("muru._panels")?;
+        let panels = py.import("muru.panels")?;
 
         Ok(Capture {
             logs_start: logging.getattr("_capture_start")?.unbind(),
@@ -389,7 +389,7 @@ pub fn take_logs(request_id: &str) -> Logs {
     })
 }
 
-/// One panel as `muru._panels._take` gives it: its name, title, spans,
+/// One panel as `muru.panels._take` gives it: its name, title, spans,
 /// values, tables (caption, columns, rows), how many entries it dropped,
 /// and its text with whether that is markdown.
 type TakenPanel<'py> = (
@@ -403,7 +403,7 @@ type TakenPanel<'py> = (
     bool,
 );
 
-/// The panels as `muru._panels._take` gives them.
+/// The panels as `muru.panels._take` gives them.
 fn panels(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordPanel>> {
     let mut panels = Vec::new();
 
@@ -440,7 +440,7 @@ fn panels(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordPanel>> {
     Ok(panels)
 }
 
-/// Spans as `muru._panels._span` gives them: name, start, duration,
+/// Spans as `muru.panels._span` gives them: name, start, duration,
 /// category and the spans beneath, which may nest.
 fn spans(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordSpan>> {
     let mut spans = Vec::new();

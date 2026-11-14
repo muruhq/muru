@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from muru import _panels, _trace_panels
+from muru import _trace_panels, panels
 from muru._context import _request_id
 
 _seq = itertools.count(1)
@@ -43,14 +43,14 @@ class Caught:
 
 @pytest.fixture
 def recorded() -> Iterator[str]:
-    _panels._start("T1")
+    panels._start("T1")
     token = _request_id.set("T1")
 
     try:
         yield "T1"
     finally:
         _request_id.reset(token)
-        _panels._requests.pop("T1", None)
+        panels._requests.pop("T1", None)
 
 
 def run(trees: Any, event: Event, *children: tuple[Event, tuple[Any, ...]]) -> Event:
@@ -69,7 +69,7 @@ def run(trees: Any, event: Event, *children: tuple[Event, tuple[Any, ...]]) -> E
 
 
 def taken(request: str) -> dict[str, tuple[Any, ...]]:
-    return {panel[0]: panel for panel in _panels._take(request)}
+    return {panel[0]: panel for panel in panels._take(request)}
 
 
 def test_a_requests_tree_becomes_its_trace_sql_and_exceptions(recorded: str) -> None:
@@ -104,7 +104,7 @@ def test_events_of_a_request_not_recorded_are_left_alone() -> None:
     run(trees, Event("call", "outside"))
 
     assert trees.open == {}
-    assert _panels._take("T1") == []
+    assert panels._take("T1") == []
 
 
 def test_a_tree_closing_outside_its_requests_context_is_still_its_requests(

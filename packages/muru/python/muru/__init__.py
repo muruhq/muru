@@ -9,7 +9,8 @@ which request it serves, ``muru.logging`` holds the platform logging
 defaults, ``muru.RequestTimeout`` is what the soft timeout raises,
 ``muru.is_internal()`` tells a request that arrived by internal
 redirect, ``muru.uploads`` reaches the files the edge stored for an
-upload route, and ``muru.loop()`` and ``muru.asgi`` serve requests
+upload route, ``muru.panels`` adds panels to the development
+toolbar, and ``muru.loop()`` and ``muru.asgi`` serve requests
 handed between WSGI and ASGI (section 6.14 of the design
 specification).
 """
@@ -21,7 +22,7 @@ from collections.abc import Mapping
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
-from muru import asgi, logging, uploads
+from muru import asgi, logging, panels, uploads
 from muru._context import Context, context, request_id
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "is_internal",
     "logging",
     "loop",
+    "panels",
     "request_id",
     "uploads",
 ]

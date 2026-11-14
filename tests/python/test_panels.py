@@ -1,4 +1,4 @@
-"""Unit tests for the panels Muru's extensions add to a request's record (issues 677, 679, 680)."""
+"""Unit tests for muru.panels: panels code in the worker adds to a request's record."""
 
 from __future__ import annotations
 
@@ -7,35 +7,35 @@ from typing import Any
 
 import pytest
 
-from muru import _panels
+from muru import panels
 from muru._context import _request_id
-from muru._panels import Span, SpansPanel, TablesPanel, TextPanel, ValuesPanel
+from muru.panels import Span, SpansPanel, TablesPanel, TextPanel, ValuesPanel
 
 
 @pytest.fixture(autouse=True)
 def declared(monkeypatch: pytest.MonkeyPatch) -> None:
     # Each test declares its panels afresh.
 
-    monkeypatch.setattr(_panels, "_declared", {})
+    monkeypatch.setattr(panels, "_declared", {})
 
 
 @pytest.fixture
 def recorded() -> Iterator[str]:
     # A request the edge asked to record, being served in this context.
 
-    _panels._start("R1")
+    panels._start("R1")
     token = _request_id.set("R1")
 
     try:
         yield "R1"
     finally:
         _request_id.reset(token)
-        _panels._requests.pop("R1", None)
+        panels._requests.pop("R1", None)
 
 
 def test_outside_a_recorded_request_a_panel_keeps_nothing_and_says_so() -> None:
     values = ValuesPanel("library", "Library").current()
-    spans = SpansPanel("trace", "Trace").current()
+    spans = SpansPanel("steps", "Steps").current()
     tables = TablesPanel("queries", "Queries", tables={"Queries": ["statement"]}).current()
     text = TextPanel("analysis", "Analysis").current()
 
@@ -64,7 +64,7 @@ def test_a_requests_panels_are_taken_in_the_shapes_the_edge_draws(recorded: str)
     queries = TablesPanel(
         "queries", "Queries", tables={"By statement": ["statement", "times"]}
     ).current()
-    trace = SpansPanel("trace", "Trace").current()
+    trace = SpansPanel("steps", "Steps").current()
 
     assert values.active and trace.now() >= 0.0
 
@@ -73,7 +73,7 @@ def test_a_requests_panels_are_taken_in_the_shapes_the_edge_draws(recorded: str)
     assert queries.table("By statement").add_row(["SELECT 1", 3])
     assert trace.add(Span("view", 1.0, 2.0, "view", [Span("query", 1.5, 0.5)]))
 
-    taken = _panels._take(recorded)
+    taken = panels._take(recorded)
 
     assert taken == [
         ("library", "Library", [], [("books", "8")], [], 0, "", False),
@@ -88,8 +88,8 @@ def test_a_requests_panels_are_taken_in_the_shapes_the_edge_draws(recorded: str)
             False,
         ),
         (
-            "trace",
-            "Trace",
+            "steps",
+            "Steps",
             [("view", 1.0, 2.0, "view", [("query", 1.5, 0.5, "", [])])],
             [],
             [],
@@ -103,7 +103,7 @@ def test_a_requests_panels_are_taken_in_the_shapes_the_edge_draws(recorded: str)
 def test_a_text_panels_blocks_are_joined_and_kept_within_its_limit(
     recorded: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(_panels, "TEXT_LIMIT", 20)
+    monkeypatch.setattr(panels, "TEXT_LIMIT", 20)
     analysis = TextPanel("analysis", "Analysis", markdown=True).current()
     notes = TextPanel("notes", "Notes").current()
 
@@ -112,7 +112,7 @@ def test_a_text_panels_blocks_are_joined_and_kept_within_its_limit(
     assert not analysis.write("past the panel's limit")
     assert notes.write("one\ntwo")
 
-    taken = {panel[0]: panel for panel in _panels._take(recorded)}
+    taken = {panel[0]: panel for panel in panels._take(recorded)}
 
     assert taken["analysis"][5:] == (1, "# Queries\n\n*3* ran", True)
     assert taken["notes"][5:] == (0, "one\ntwo", False)
@@ -121,18 +121,18 @@ def test_a_text_panels_blocks_are_joined_and_kept_within_its_limit(
 def test_a_handle_kept_past_its_request_keeps_nothing(recorded: str) -> None:
     values = ValuesPanel("library", "Library").current()
     values["books"] = 1
-    _panels._take(recorded)
+    panels._take(recorded)
 
     assert not values.active
 
     values["authors"] = 2
     values.add_dropped(4)
 
-    assert _panels._take(recorded) == []
+    assert panels._take(recorded) == []
 
 
 def test_timed_blocks_nest_as_spans_and_are_added_as_they_end(recorded: str) -> None:
-    trace = SpansPanel("trace", "Trace").current()
+    trace = SpansPanel("steps", "Steps").current()
     other = SpansPanel("other", "Other").current()
 
     with trace.span("view", category="view"):
@@ -147,9 +147,9 @@ def test_timed_blocks_nest_as_spans_and_are_added_as_they_end(recorded: str) -> 
     with pytest.raises(RuntimeError), trace.span("broken"):
         raise RuntimeError("the block raised")
 
-    taken = {panel[0]: panel for panel in _panels._take(recorded)}
+    taken = {panel[0]: panel for panel in panels._take(recorded)}
 
-    view, broken = taken["trace"][2]
+    view, broken = taken["steps"][2]
     assert view[0] == "view" and view[3] == "view" and view[2] >= view[4][0][2]
     assert [child[0] for child in view[4]] == ["query"]
     assert broken[0] == "broken"
@@ -159,9 +159,9 @@ def test_timed_blocks_nest_as_spans_and_are_added_as_they_end(recorded: str) -> 
 def test_entries_past_a_panels_cap_or_the_requests_are_counted(
     recorded: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(_panels, "PANEL_LIMIT", 3)
-    monkeypatch.setattr(_panels, "REQUEST_LIMIT", 4)
-    trace = SpansPanel("trace", "Trace").current()
+    monkeypatch.setattr(panels, "PANEL_LIMIT", 3)
+    monkeypatch.setattr(panels, "REQUEST_LIMIT", 4)
+    trace = SpansPanel("steps", "Steps").current()
     values = ValuesPanel("library", "Library").current()
 
     # A span counts for itself and those beneath it.
@@ -176,9 +176,9 @@ def test_entries_past_a_panels_cap_or_the_requests_are_counted(
 
     trace.add_dropped(5)
 
-    taken = {panel[0]: panel for panel in _panels._take(recorded)}
+    taken = {panel[0]: panel for panel in panels._take(recorded)}
 
-    assert len(taken["trace"][2]) == 2 and taken["trace"][5] == 7
+    assert len(taken["steps"][2]) == 2 and taken["steps"][5] == 7
     assert taken["library"][3] == [("books", "1")] and taken["library"][5] == 1
 
 
@@ -192,7 +192,7 @@ def test_a_panel_is_declared_once_and_not_as_a_built_in() -> None:
     with pytest.raises(ValueError, match="already declared otherwise"):
         SpansPanel("library", "Library")
 
-    for name in ("timing", "logs", "page", "Library", "a b"):
+    for name in ("timing", "logs", "page", "trace", "sql", "Library", "a b"):
         with pytest.raises(ValueError, match="cannot name a panel"):
             ValuesPanel(name, "X")
 
@@ -220,7 +220,7 @@ def test_concurrent_requests_keep_their_own_entries() -> None:
     together = threading.Barrier(requests)
 
     def serve(index: int) -> None:
-        _panels._start(f"C{index}")
+        panels._start(f"C{index}")
         _request_id.set(f"C{index}")
         together.wait()
 
@@ -228,7 +228,7 @@ def test_concurrent_requests_keep_their_own_entries() -> None:
             values.current()["page"] = f"/page/{index}"
             rows.current().table("Queries").add_row([index, n])
 
-        taken[index] = _panels._take(f"C{index}")
+        taken[index] = panels._take(f"C{index}")
 
     threads = [
         threading.Thread(target=contextvars.copy_context().run, args=(serve, index))
@@ -247,4 +247,4 @@ def test_concurrent_requests_keep_their_own_entries() -> None:
         kept = found["queries"][4][0][2]
         assert len(kept) == rounds and all(row[0] == str(index) for row in kept)
 
-    assert not [request for request in _panels._requests if request.startswith("C")]
+    assert not [request for request in panels._requests if request.startswith("C")]

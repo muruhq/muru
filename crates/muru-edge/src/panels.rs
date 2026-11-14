@@ -306,7 +306,7 @@ fn escape(text: &str) -> String {
 }
 
 /// A record's panels, in the order they are shown: the built-in ones,
-/// then those Muru's extensions added in the worker (issue 677), whose
+/// then those code in the worker added (issue 677), whose
 /// spans move from the worker's clock to the request's. One that takes a
 /// built-in panel's name is left out.
 pub fn all(record: &admin::RequestRecord) -> Vec<admin::Panel> {
