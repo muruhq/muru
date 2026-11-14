@@ -63,7 +63,7 @@ from muru import RequestTimeout, _asgi, _inspect, _outside, preload
 from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
-from muru._instrumentation import Entry, InstrumentationError, Instruments
+from muru._instrumentation import Entry, InstrumentationError, Instruments, Target
 from muru.hooks import Hooks
 
 WSGIApplication = Callable[..., Any]
@@ -1580,6 +1580,31 @@ class Host:
                 for mount in mounts
             ]
             limits = {mount.name: mount.limits for mount in mounts}
+
+            # Section 6.15: each entry point's application, created here or
+            # in the host, goes to the instrumentation modules to wrap
+            # before the loop and lifespan start, so lifespan goes through
+            # the wrapper. The interface was settled before, and is not
+            # detected again from what a wrapper returns.
+
+            instruments = release.instruments
+            app = instruments.wrap(
+                context, Target("entrypoint", "", release.spec), app, release.resolved or "wsgi"
+            )
+            realised = [
+                (
+                    name,
+                    instruments.wrap(
+                        context,
+                        Target("mount", name, mounted.spec),
+                        mounted_app,
+                        mounted.resolved or "wsgi",
+                    ),
+                    mounted,
+                    own,
+                )
+                for name, mounted_app, mounted, own in realised
+            ]
 
             for name, _, mounted, _ in realised:
                 if name not in known_mounts and mounted.resolved is not None:

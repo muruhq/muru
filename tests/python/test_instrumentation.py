@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from muru import check
-from muru._instrumentation import ENVIRONMENT, Entry, InstrumentationError, Instruments
+from muru._instrumentation import ENVIRONMENT, Entry, InstrumentationError, Instruments, Target
 
 FIXTURE_APPS = Path(__file__).resolve().parents[1] / "fixtures" / "apps"
 
@@ -137,3 +137,53 @@ def test_check_imports_the_modules_before_the_application(
     assert status == 1
     assert report["entrypoints"] == []
     assert "cannot import instrumentation module missing_tool" in report["errors"][0]["error"]
+
+
+WRAPPING = """
+import instrumented_order as order
+
+
+def wrap_application(context, target, application, interface):
+    order.CALLS.append(("wrap", __name__, target.kind, target.name, interface))
+
+    if application == "server":
+        return "another server"
+
+    return f"{__name__}({application})"
+"""
+
+
+def test_the_first_module_listed_wraps_outermost(modules: Path) -> None:
+    (modules / "first_tool.py").write_text(WRAPPING)
+    (modules / "second_tool.py").write_text(WRAPPING)
+    (modules / "odd_tool.py").write_text("def wrap_application(*args):\n    return None\n")
+    instruments = Instruments([Entry("first_tool"), Entry("odd_tool"), Entry("second_tool")])
+    instruments.load()
+    target = Target("mount", "api", "shop.api:app")
+
+    assert instruments.wrap(None, target, "app", "asgi") == "first_tool(second_tool(app))"
+    assert calls() == [
+        ("wrap", "second_tool", "mount", "api", "asgi"),
+        ("wrap", "first_tool", "mount", "api", "asgi"),
+    ]
+
+
+def test_a_failing_wrapper_or_a_grpc_server_leaves_the_application_as_it_was(
+    modules: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (modules / "broken_tool.py").write_text(
+        "def wrap_application(context, target, application, interface):\n"
+        "    raise RuntimeError('cannot wrap')\n"
+    )
+    (modules / "second_tool.py").write_text(WRAPPING)
+    instruments = Instruments([Entry("second_tool"), Entry("broken_tool")])
+    instruments.load()
+    entrypoint = Target("entrypoint", "", "shop.wsgi:application")
+
+    assert instruments.wrap(None, entrypoint, "app", "wsgi") == "second_tool(app)"
+    assert "so shop.wsgi:application is served as it was" in caplog.text
+
+    # A gRPC server is still handed over, but what comes back is not served.
+
+    assert instruments.wrap(None, entrypoint, "server", "grpc") == "server"
+    assert "returned another object for the gRPC entry point" in caplog.text

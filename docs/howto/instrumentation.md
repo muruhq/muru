@@ -59,6 +59,7 @@ them by name; nothing in the configuration says which a module has.
 | Function | Called |
 | --- | --- |
 | `configure(settings)` | Once, straight after the module is imported, with a `dict` of its entry's settings, empty when the entry has none |
+| `wrap_application(context, target, application, interface)` | In each worker, once for each entry point, with its application, before the worker serves; what it returns is served in place of the application |
 
 A module sees only its own settings, and the application sees none of
 them.
@@ -72,6 +73,53 @@ def configure(settings):
     global output
     output = settings.get("output", "import-times.json")
 ```
+
+## Wrapping an entry point's application
+
+`wrap_application` receives each entry point's application once in
+each worker: the entrypoint's, and each mount's. It runs after a
+factory has been called, wherever the factory runs, so it always gets
+the application itself, and before the event loop and ASGI lifespan
+start, so lifespan goes through the wrapper too.
+
+```python
+# apm_setup.py
+import someapm
+
+
+def wrap_application(context, target, application, interface):
+    if interface == "wsgi":
+        return someapm.WSGIMiddleware(application)
+
+    if interface == "asgi":
+        return someapm.ASGIMiddleware(application)
+
+    return None  # served unchanged
+```
+
+- **target** says which entry point: `target.kind` is `entrypoint` or
+  `mount`, `target.name` is the mount's name (empty for the
+  entrypoint), and `target.spec` is its `module:callable`.
+
+- **interface** is `wsgi`, `asgi` or `grpc`, as Muru settled it for that
+  entry point. `context.interface` describes only the entrypoint, so a
+  wrapper for a mount goes by `interface`.
+
+- **The interface stays.** Muru does not look at the wrapper to decide
+  the interface again, so a wrapper for an ASGI application has to be
+  an ASGI application, and one for WSGI a WSGI callable.
+
+- **Several modules.** The last module listed wraps first, so the first
+  listed is outermost.
+
+- **None or an exception.** Returning `None` serves the application
+  unchanged. An exception is logged, and the application is served as
+  it was before that module's call.
+
+- **gRPC.** For a gRPC entry point, `application` is Muru's gRPC server
+  with the services registered, which is not a callable. The call is
+  still made, so a tool hears of every entry point, but anything other
+  than `None` or the same object is logged and not served.
 
 ## When the modules are imported
 

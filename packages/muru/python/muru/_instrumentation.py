@@ -29,13 +29,21 @@ from typing import Any, ClassVar
 
 from muru import logging as muru_logging
 
-__all__ = ["CALLBACKS", "ENVIRONMENT", "Entry", "Instrument", "InstrumentationError", "Instruments"]
+__all__ = [
+    "CALLBACKS",
+    "ENVIRONMENT",
+    "Entry",
+    "Instrument",
+    "InstrumentationError",
+    "Instruments",
+    "Target",
+]
 
 ENVIRONMENT = "MURU_INSTRUMENTATION"
 
 # The callbacks a module may define, in the order of a release's life.
 
-CALLBACKS = ("configure",)
+CALLBACKS = ("configure", "wrap_application")
 
 
 class InstrumentationError(Exception):
@@ -95,6 +103,20 @@ class Entry:
         return json.dumps(
             [{"module": entry.module, "settings": entry.settings} for entry in entries]
         )
+
+
+@dataclass(frozen=True)
+class Target:
+    """What a callback is about: the hooks module, the entrypoint or a mount.
+
+    `kind` is ``hooks``, ``entrypoint`` or ``mount``; `name` is a mount's
+    name, empty for the others; `spec` is the module, or ``module:callable``
+    for an entry point.
+    """
+
+    kind: str
+    name: str
+    spec: str
 
 
 @dataclass
@@ -186,6 +208,47 @@ class Instruments:
 
         for instrument in reversed(self.loaded):
             instrument.call(callback, *args)
+
+    def wrap(self, context: Any, target: Target, application: Any, interface: str) -> Any:
+        """Give an entry point's application to each module's wrap_application.
+
+        The last listed wraps first, so the first listed is outermost. A
+        callback that returns None, or raises, leaves the application as
+        it was. A gRPC entry point's server is not a callable, so a
+        different object returned for it is logged and not served.
+        """
+
+        for instrument in reversed(self.loaded):
+            function = instrument.functions.get("wrap_application")
+
+            if function is None:
+                continue
+
+            try:
+                wrapped = function(context, target, application, interface)
+            except Exception as error:
+                muru_logging._report(
+                    error,
+                    f"the wrap_application callback of instrumentation module "
+                    f"{instrument.name} failed, so {target.spec} is served as it was",
+                )
+                continue
+
+            if wrapped is None or wrapped is application:
+                continue
+
+            if interface == "grpc":
+                logging.getLogger("muru").warning(
+                    "instrumentation module %s: wrap_application returned another object for "
+                    "the gRPC entry point %s, which is served unchanged",
+                    instrument.name,
+                    target.spec,
+                )
+                continue
+
+            application = wrapped
+
+        return application
 
     def defined(self) -> dict[str, list[str]]:
         """Return each loaded module's callbacks, by module, for a check's report."""

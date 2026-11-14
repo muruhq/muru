@@ -60,6 +60,11 @@ and an exception from one is logged and otherwise ignored.
 | Callback | Where and when |
 | --- | --- |
 | `configure(settings)` | Wherever the module is imported, once, straight after the import, with a `dict` of its entry's settings |
+| `wrap_application(context, target, application, interface)` | In each worker, once for each entry point, after any factory and before the event loop and lifespan start; a return value other than `None` is served in place of `application` |
+
+`target` has `kind` (`entrypoint` or `mount`), `name` (a mount's name,
+empty for the entrypoint) and `spec` (`module:callable`). `interface`
+is `wsgi`, `asgi` or `grpc`.
 
 ## `muru.is_internal()`
 

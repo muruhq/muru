@@ -243,6 +243,115 @@ def test_instrumentation_modules_listed_in_the_project_run_before_the_applicatio
         server.stop()
 
 
+WRAP_TOOL = """
+import os, sys
+
+
+def wrap_application(context, target, application, interface):
+    print(f"WRAP {target.kind} {target.name or '-'} {interface} pid={os.getpid()}",
+          file=sys.stderr, flush=True)
+
+    if interface == "wsgi":
+        def wrapped(environ, start_response):
+            def starting(status, headers, exc_info=None):
+                return start_response(status, [*headers, ("X-Wrapped", "wsgi")], exc_info)
+
+            return application(environ, starting)
+
+        return wrapped
+
+    async def wrapped_asgi(scope, receive, send):
+        if scope["type"] == "lifespan":
+            print("WRAP lifespan", file=sys.stderr, flush=True)
+            return await application(scope, receive, send)
+
+        async def sending(message):
+            if message["type"] == "http.response.start":
+                headers = [*message.get("headers", []), (b"x-wrapped", b"asgi")]
+                message = {**message, "headers": headers}
+
+            await send(message)
+
+        return await application(scope, receive, sending)
+
+    return wrapped_asgi
+"""
+
+WRAPPED_APP = """
+def make():
+    def application(environ, start_response):
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"plain"]
+
+    return application
+
+
+async def api(scope, receive, send):
+    if scope["type"] == "lifespan":
+        while True:
+            message = await receive()
+
+            if message["type"] == "lifespan.startup":
+                await send({"type": "lifespan.startup.complete"})
+            else:
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    await send({"type": "http.response.body", "body": b"api"})
+"""
+
+
+def wrap_lines(server: support.Server) -> list[str]:
+    return [line[line.find("WRAP ") :] for line in server.log().splitlines() if "WRAP " in line]
+
+
+def test_wrap_application_wraps_every_entry_point_in_each_worker(tmp_path: Path) -> None:
+    # Section 6.15: a host-phase factory and an ASGI mount, preloaded,
+    # then a worker-phase factory imported in each worker; each entry
+    # point's application is wrapped in the worker, lifespan included.
+
+    (tmp_path / "wrap_tool.py").write_text(WRAP_TOOL)
+    (tmp_path / "wrapped_app.py").write_text(WRAPPED_APP)
+    project = (
+        "[tool.muru]\nentrypoint = 'wrapped_app:make'\nfactory = true\n"
+        "factory_phase = '{phase}'\npreload = '{preload}'\n{mount}"
+        "[[tool.muru.instrumentation]]\nmodule = 'wrap_tool'\n"
+    )
+    mount = (
+        "[tool.muru.mounts.api]\npath = '/api'\nentrypoint = 'wrapped_app:api'\n"
+        "interface = 'asgi'\n"
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        project.format(phase="host", preload="auto", mount=mount)
+    )
+    server = support.start(None, chdir=tmp_path, workers=WORKERS)
+
+    try:
+        assert server.get("/").header("X-Wrapped") == "wsgi"
+        assert server.get("/api/").header("X-Wrapped") == "asgi"
+        lines = wrap_lines(server)
+        workers = {f"pid={pid}" for pid in server.worker_pids().values()}
+        entrypoints = [line for line in lines if line.startswith("WRAP entrypoint - wsgi")]
+        mounts = [line for line in lines if line.startswith("WRAP mount api asgi")]
+        assert {line.split()[-1] for line in entrypoints} == workers, lines
+        assert {line.split()[-1] for line in mounts} == workers, lines
+        assert lines.count("WRAP lifespan") == WORKERS, lines
+    finally:
+        server.stop()
+
+    (tmp_path / "pyproject.toml").write_text(
+        project.format(phase="worker", preload="false", mount="")
+    )
+    server = support.start(None, chdir=tmp_path, workers=1)
+
+    try:
+        assert server.get("/").header("X-Wrapped") == "wsgi"
+        assert wrap_lines(server) == [f"WRAP entrypoint - wsgi pid={server.worker_pids()[0]}"]
+    finally:
+        server.stop()
+
+
 def test_failing_on_load_hook_stops_the_host(tmp_path: os.PathLike[str]) -> None:
     with pytest.raises(RuntimeError) as excinfo:
         support.start("preload_wsgi:application", args=["--hooks", "hooks_failing_load"])
