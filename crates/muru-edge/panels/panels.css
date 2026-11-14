@@ -16,6 +16,10 @@
 .panel .markdown p, .panel .markdown ul, .panel .markdown ol, .panel .markdown pre { margin: 0 0 0.6rem; }
 .panel .markdown h3, .panel .markdown h4 { margin: 0.9rem 0 0.4rem; }
 .panel .markdown pre { padding: 0.5rem 0.6rem; background: rgba(127, 127, 127, 0.1); }
+.panel .markdown blockquote { margin: 0 0 0.6rem; padding-left: 0.8rem; border-left: 3px solid rgba(127, 127, 127, 0.4); color: #627d98; }
+.panel .markdown hr { border: 0; border-top: 1px solid rgba(127, 127, 127, 0.35); margin: 0.8rem 0; }
+.panel .markdown table { width: auto; margin: 0 0 0.6rem; }
+.panel .markdown th { font-weight: 600; }
 .panel .muted { color: #627d98; }
 .panel .warning { color: #946200; }
 .panel .error { color: #b42318; }

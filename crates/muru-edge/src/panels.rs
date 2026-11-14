@@ -32,12 +32,49 @@ const TEMPLATES: &[(&str, &str)] = &[
 /// extensions add in the worker (issue 677).
 const GENERIC: &str = "panel";
 
-/// The elements a panel may use: text, tables, lists, code, details,
-/// meters, progress bars, times and abbreviations.
+/// The elements a panel may use: text, quotes, rules, tables, lists,
+/// code, details, meters, progress bars, times and abbreviations.
 const TAGS: &[&str] = &[
-    "p", "div", "span", "br", "strong", "em", "b", "i", "small", "sub", "sup", "h3", "h4", "a",
-    "table", "caption", "thead", "tbody", "tfoot", "tr", "th", "td", "colgroup", "col", "ul", "ol",
-    "li", "dl", "dt", "dd", "code", "pre", "details", "summary", "meter", "progress", "time",
+    "p",
+    "div",
+    "span",
+    "br",
+    "strong",
+    "em",
+    "b",
+    "i",
+    "del",
+    "small",
+    "sub",
+    "sup",
+    "h3",
+    "h4",
+    "a",
+    "blockquote",
+    "hr",
+    "table",
+    "caption",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "th",
+    "td",
+    "colgroup",
+    "col",
+    "ul",
+    "ol",
+    "li",
+    "dl",
+    "dt",
+    "dd",
+    "code",
+    "pre",
+    "details",
+    "summary",
+    "meter",
+    "progress",
+    "time",
     "abbr",
 ];
 
@@ -186,10 +223,11 @@ fn sanitiser(dashboard: Option<&str>, markdown: bool) -> ammonia::Builder<'stati
     sanitiser
 }
 
-/// Markdown as HTML, before it is sanitised: headings moved to the levels
-/// panels use, and HTML written into the markdown shown as the text it is.
+/// Markdown as HTML, before it is sanitised: CommonMark with tables and
+/// strikethrough, headings moved to the levels panels use, and HTML
+/// written into the markdown shown as the text it is.
 fn markdown(text: &str) -> String {
-    use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd, html};
+    use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
 
     let moved = |level: HeadingLevel| {
         if level == HeadingLevel::H1 {
@@ -199,7 +237,8 @@ fn markdown(text: &str) -> String {
         }
     };
 
-    let events = Parser::new(text).map(|event| match event {
+    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
+    let events = Parser::new_ext(text, options).map(|event| match event {
         Event::Start(Tag::Heading {
             level,
             id,
@@ -1210,7 +1249,8 @@ mod tests {
         let markdown = renderer.render(&admin::Panel {
             name: "analysis".to_owned(),
             text:
-                "# Queries\n\n## Detail\n\n**3** ran. See [the guide](https://example.com/guide) \
+                "# Queries\n\n| statement | times |\n|---|---:|\n| SELECT 1 | 7 |\n\n\
+                   > ~~slow~~ quoted\n\n## Detail\n\n**3** ran. See [the guide](https://example.com/guide) \
                    or [a record](/_muru/requests/A1.json).\n\n<script>alert(1)</script>\n\n\
                    [bad](javascript:alert(1))"
                     .to_owned(),
@@ -1221,6 +1261,16 @@ mod tests {
         assert!(markdown.contains("<h3>Queries</h3>"), "{markdown}");
         assert!(markdown.contains("<h4>Detail</h4>"), "{markdown}");
         assert!(markdown.contains("<strong>3</strong>"), "{markdown}");
+        assert!(
+            markdown.contains("<table>")
+                && markdown.contains("<th>statement</th>")
+                && markdown.contains("<td>7</td>"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("<blockquote>") && markdown.contains("<del>slow</del>"),
+            "{markdown}"
+        );
         assert!(
             markdown.contains(
                 "<a href=\"https://example.com/guide\" target=\"_blank\" rel=\"noopener noreferrer\">"
