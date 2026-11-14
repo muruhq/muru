@@ -125,7 +125,10 @@ impl Renderer {
             .get_template(&format!("{}.html", panel.name))
             .or_else(|_| self.templates.get_template(&format!("{GENERIC}.html")))
             .and_then(|template| {
-                template.render(context! { panel => minijinja::value::Serde(panel) })
+                template.render(context! {
+                    panel => minijinja::value::Serde(panel),
+                    numeric => numeric_columns(panel),
+                })
             });
 
         let html = match drawn {
@@ -144,6 +147,28 @@ impl Renderer {
     pub fn sanitise(&self, html: &str) -> String {
         self.sanitiser.clean(html).to_string()
     }
+}
+
+/// For each of a panel's tables, which of its columns hold only numbers,
+/// so the generic template keeps them on one line, aligned right. A
+/// column with no rows is not numeric.
+fn numeric_columns(panel: &admin::Panel) -> Vec<Vec<bool>> {
+    panel
+        .tables
+        .iter()
+        .map(|table| {
+            (0..table.columns.len())
+                .map(|column| {
+                    !table.rows.is_empty()
+                        && table.rows.iter().all(|row| {
+                            row.cells
+                                .get(column)
+                                .is_some_and(|cell| cell.trim().parse::<f64>().is_ok())
+                        })
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn escape(text: &str) -> String {
@@ -1042,12 +1067,17 @@ mod tests {
             tables: vec![admin::PanelTable {
                 caption: "Queries".to_owned(),
                 columns: vec!["statement".to_owned(), "times".to_owned()],
-                rows: vec![admin::PanelRow {
-                    cells: vec![
-                        "SELECT name FROM author WHERE id = ?".to_owned(),
-                        "7".to_owned(),
-                    ],
-                }],
+                rows: vec![
+                    admin::PanelRow {
+                        cells: vec![
+                            "SELECT name FROM author WHERE id = ?".to_owned(),
+                            "7".to_owned(),
+                        ],
+                    },
+                    admin::PanelRow {
+                        cells: vec!["SELECT 1".to_owned(), "0.125".to_owned()],
+                    },
+                ],
             }],
             spans: vec![admin::PanelSpan {
                 name: "books()".to_owned(),
@@ -1068,6 +1098,12 @@ mod tests {
         assert!(html.contains("<th>books</th>"), "{html}");
         assert!(html.contains("<caption>Queries</caption>"), "{html}");
         assert!(html.contains("WHERE id = ?"), "{html}");
+        assert!(
+            html.contains("<th>statement</th><th class=\"num\">times</th>"),
+            "{html}"
+        );
+        assert!(html.contains("<td class=\"mono num\">0.125</td>"), "{html}");
+        assert!(html.contains("<td class=\"mono\">SELECT 1</td>"), "{html}");
         assert!(
             html.contains("books()") && html.contains("depth-2"),
             "{html}"

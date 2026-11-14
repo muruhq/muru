@@ -1,6 +1,7 @@
 {#- A panel with no template of its own, such as one Muru's extensions add
-    in the worker (issue 677): its values, its tables and its spans, each
-    span drawn as a bar on the request's clock, and what it could not keep. -#}
+    in the worker (issue 677): its values, its tables, with a column of
+    numbers kept on one line and aligned right, and its spans, each span
+    drawn as a bar on the request's clock, and what it could not keep. -#}
 {%- if panel["values"] %}
 <table class="values">
 <tbody>
@@ -11,12 +12,13 @@
 </table>
 {%- endif %}
 {%- for table in panel.tables %}
+{%- set numbers = numeric[loop.index0] %}
 <table>
 <caption>{{ table.caption }}</caption>
-<thead><tr>{% for column in table.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead>
+<thead><tr>{% for column in table.columns %}<th{% if numbers[loop.index0] %} class="num"{% endif %}>{{ column }}</th>{% endfor %}</tr></thead>
 <tbody>
 {%- for row in table.rows %}
-<tr>{% for cell in row.cells %}<td class="mono">{{ cell }}</td>{% endfor %}</tr>
+<tr>{% for cell in row.cells %}<td class="mono{% if numbers[loop.index0] %} num{% endif %}">{{ cell }}</td>{% endfor %}</tr>
 {%- endfor %}
 </tbody>
 </table>
