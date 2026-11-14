@@ -1,6 +1,8 @@
 <style>
 body { margin: 0; padding: 3rem 1.5rem; font: 16px/1.5 system-ui, sans-serif; color: #1f2933; background: #f5f7fa; text-transform: uppercase; letter-spacing: 0.02em; }
 main { max-width: 44rem; margin: 0 auto; }
+main.wide { max-width: none; }
+main.wide > :not(pre) { max-width: 44rem; margin-left: auto; margin-right: auto; }
 h1 { font-size: 1.75rem; margin: 0 0 1rem; }
 h1 span { color: #9aa5b1; font-weight: normal; margin-right: 0.5rem; }
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 1.5rem 0; }

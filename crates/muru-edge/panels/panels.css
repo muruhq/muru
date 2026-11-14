@@ -13,6 +13,8 @@
 /* A text panel's text: plain, with its line breaks, or drawn from markdown. */
 .panel .text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .panel .markdown { overflow-wrap: anywhere; line-height: 1.45; }
+/* Prose keeps a reading width however wide the page; tables do not. */
+.panel p, .panel .text, .panel .markdown li, .panel .markdown blockquote { max-width: 48rem; }
 .panel .markdown p, .panel .markdown ul, .panel .markdown ol, .panel .markdown pre { margin: 0 0 0.6rem; }
 .panel .markdown h3, .panel .markdown h4 { margin: 0.9rem 0 0.4rem; }
 .panel .markdown pre { padding: 0.5rem 0.6rem; background: rgba(127, 127, 127, 0.1); }
