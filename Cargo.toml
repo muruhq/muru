@@ -52,6 +52,7 @@ signal-hook-registry = "1.4"
 mime_guess = "2"
 minijinja = { version = "3.1", features = ["serde"] }
 multer = "3.1"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 muru-common = { path = "crates/muru-common" }
 muru-dashboard = { path = "crates/muru-dashboard" }
 muru-config = { path = "crates/muru-config" }

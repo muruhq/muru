@@ -13,6 +13,7 @@ from muru import _panels
 
 LIBRARY = _panels.ValuesPanel("library", "Library")
 TRACE = _panels.SpansPanel("trace", "Trace")
+ANALYSIS = _panels.TextPanel("analysis", "Analysis", markdown=True)
 
 
 def application(environ, start_response):
@@ -24,6 +25,7 @@ def application(environ, start_response):
         with TRACE.current().span("query", category="database"):
             pass
 
+    ANALYSIS.current().write("# Queries\\n\\nSee [the guide](https://example.com/guide).")
     start_response("200 OK", [("Content-Type", "text/plain")])
     return [b"listed"]
 """
@@ -55,7 +57,7 @@ def test_a_panel_added_in_the_worker_is_in_the_record_and_drawn(tmp_path: Path) 
         # After the built-in panels, with the values set and the spans on
         # the request's clock, after the queue.
 
-        assert list(panels)[-2:] == ["library", "trace"], list(panels)
+        assert list(panels)[-3:] == ["library", "trace", "analysis"], list(panels)
         assert panels["library"]["values"] == [
             {"name": "recording", "value": "True"},
             {"name": "books", "value": "7"},
@@ -66,5 +68,13 @@ def test_a_panel_added_in_the_worker_is_in_the_record_and_drawn(tmp_path: Path) 
 
         drawn = server.get(f"/_muru/requests/{request_id}/panels/trace.html").body.decode()
         assert "view" in drawn and "query" in drawn and "depth-2" in drawn, drawn
+
+        # A markdown panel is drawn by the edge, its outside link opening
+        # in a new tab.
+
+        assert panels["analysis"]["markdown"] is True
+        drawn = server.get(f"/_muru/requests/{request_id}/panels/analysis.html").body.decode()
+        assert "<h3>Queries</h3>" in drawn, drawn
+        assert 'href="https://example.com/guide"' in drawn and 'target="_blank"' in drawn, drawn
     finally:
         server.stop()

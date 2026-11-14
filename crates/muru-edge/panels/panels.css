@@ -10,6 +10,12 @@
 .panel .mono, .panel pre, .panel code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; }
 .panel .mono pre, .panel .mono code, .panel pre code { font-size: inherit; }
 .panel pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* A text panel's text: plain, with its line breaks, or drawn from markdown. */
+.panel .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.panel .markdown { overflow-wrap: anywhere; line-height: 1.45; }
+.panel .markdown p, .panel .markdown ul, .panel .markdown ol, .panel .markdown pre { margin: 0 0 0.6rem; }
+.panel .markdown h3, .panel .markdown h4 { margin: 0.9rem 0 0.4rem; }
+.panel .markdown pre { padding: 0.5rem 0.6rem; background: rgba(127, 127, 127, 0.1); }
 .panel .muted { color: #627d98; }
 .panel .warning { color: #946200; }
 .panel .error { color: #b42318; }

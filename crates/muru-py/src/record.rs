@@ -390,7 +390,8 @@ pub fn take_logs(request_id: &str) -> Logs {
 }
 
 /// One panel as `muru._panels._take` gives it: its name, title, spans,
-/// values, tables (caption, columns, rows) and how many entries it dropped.
+/// values, tables (caption, columns, rows), how many entries it dropped,
+/// and its text with whether that is markdown.
 type TakenPanel<'py> = (
     String,
     String,
@@ -398,6 +399,8 @@ type TakenPanel<'py> = (
     Vec<(String, String)>,
     Vec<(String, Vec<String>, Vec<Vec<String>>)>,
     u32,
+    String,
+    bool,
 );
 
 /// The panels as `muru._panels._take` gives them.
@@ -406,7 +409,8 @@ fn panels(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordPanel>> {
 
     for item in taken.try_iter()? {
         let item = item?;
-        let (name, title, spans, values, tables, dropped): TakenPanel<'_> = item.extract()?;
+        let (name, title, spans, values, tables, dropped, text, markdown): TakenPanel<'_> =
+            item.extract()?;
 
         panels.push(pb::RecordPanel {
             name,
@@ -428,6 +432,8 @@ fn panels(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordPanel>> {
                 })
                 .collect(),
             dropped,
+            text,
+            markdown,
         });
     }
 

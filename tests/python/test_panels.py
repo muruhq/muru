@@ -1,4 +1,4 @@
-"""Unit tests for the panels Muru's extensions add to a request's record (issues 677, 679)."""
+"""Unit tests for the panels Muru's extensions add to a request's record (issues 677, 679, 680)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import pytest
 
 from muru import _panels
 from muru._context import _request_id
-from muru._panels import Span, SpansPanel, TablesPanel, ValuesPanel
+from muru._panels import Span, SpansPanel, TablesPanel, TextPanel, ValuesPanel
 
 
 @pytest.fixture(autouse=True)
@@ -37,8 +37,10 @@ def test_outside_a_recorded_request_a_panel_keeps_nothing_and_says_so() -> None:
     values = ValuesPanel("library", "Library").current()
     spans = SpansPanel("trace", "Trace").current()
     tables = TablesPanel("queries", "Queries", tables={"Queries": ["statement"]}).current()
+    text = TextPanel("analysis", "Analysis").current()
 
-    assert not values.active and not spans.active and not tables.active
+    assert not values.active and not spans.active and not tables.active and not text.active
+    assert not text.write("nothing keeps this")
     assert spans.now() == 0.0 and spans.at(123.0) == 0.0
 
     values["books"] = 7
@@ -74,7 +76,7 @@ def test_a_requests_panels_are_taken_in_the_shapes_the_edge_draws(recorded: str)
     taken = _panels._take(recorded)
 
     assert taken == [
-        ("library", "Library", [], [("books", "8")], [], 0),
+        ("library", "Library", [], [("books", "8")], [], 0, "", False),
         (
             "queries",
             "Queries",
@@ -82,6 +84,8 @@ def test_a_requests_panels_are_taken_in_the_shapes_the_edge_draws(recorded: str)
             [],
             [("By statement", ["statement", "times"], [["SELECT 1", "3"]])],
             0,
+            "",
+            False,
         ),
         (
             "trace",
@@ -90,8 +94,28 @@ def test_a_requests_panels_are_taken_in_the_shapes_the_edge_draws(recorded: str)
             [],
             [],
             0,
+            "",
+            False,
         ),
     ]
+
+
+def test_a_text_panels_blocks_are_joined_and_kept_within_its_limit(
+    recorded: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_panels, "TEXT_LIMIT", 20)
+    analysis = TextPanel("analysis", "Analysis", markdown=True).current()
+    notes = TextPanel("notes", "Notes").current()
+
+    assert analysis.write("# Queries")
+    assert analysis.write("*3* ran")
+    assert not analysis.write("past the panel's limit")
+    assert notes.write("one\ntwo")
+
+    taken = {panel[0]: panel for panel in _panels._take(recorded)}
+
+    assert taken["analysis"][5:] == (1, "# Queries\n\n*3* ran", True)
+    assert taken["notes"][5:] == (0, "one\ntwo", False)
 
 
 def test_a_handle_kept_past_its_request_keeps_nothing(recorded: str) -> None:
@@ -174,6 +198,11 @@ def test_a_panel_is_declared_once_and_not_as_a_built_in() -> None:
 
     with pytest.raises(ValueError, match="names its tables"):
         TablesPanel("odd", "Odd", tables={})
+
+    TextPanel("analysis", "Analysis", markdown=True)
+
+    with pytest.raises(ValueError, match="already declared otherwise"):
+        TextPanel("analysis", "Analysis")
 
 
 def test_concurrent_requests_keep_their_own_entries() -> None:

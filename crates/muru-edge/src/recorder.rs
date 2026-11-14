@@ -459,6 +459,8 @@ fn panel(panel: muru_proto::worker::v1::RecordPanel) -> admin::Panel {
             })
             .collect(),
         dropped: panel.dropped,
+        text: panel.text,
+        markdown: panel.markdown,
     }
 }
 

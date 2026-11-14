@@ -2986,6 +2986,12 @@ fn request_text(record: &pb::RequestRecord) -> String {
             }
         }
 
+        // Issue 680: a text panel's text, as written, markdown included.
+
+        for line in panel.text.lines() {
+            let _ = writeln!(text, "  {line}");
+        }
+
         // Issue 677: what an extension's panel could not keep.
 
         if panel.dropped > 0 {

@@ -229,6 +229,8 @@ message RecordPanel {
   repeated RecordValue values = 4;
   repeated RecordTable tables = 5;
   uint32 dropped = 6;               // entries past the panel's or the request's cap
+  string text = 7;                  // a text panel's text (issue 680)
+  bool markdown = 8;                // the text is markdown, drawn by the edge
 }
 
 message RecordSpan {

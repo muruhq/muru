@@ -4,7 +4,8 @@
 //! from a minijinja template when it is asked for, and passes the output
 //! through the ammonia sanitiser, whose allowlist the built-in panels
 //! (Timing, Where, Response and Connection, embedded here) meet as any
-//! other panel must. No panel carries script.
+//! other panel must. A text panel's text is drawn here too, markdown
+//! included (issue 680). No panel carries script.
 
 use std::collections::{HashMap, HashSet};
 
@@ -60,6 +61,7 @@ pub const RESERVED_PREFIX: &str = "/_muru/";
 pub struct Renderer {
     templates: Environment<'static>,
     sanitiser: ammonia::Builder<'static>,
+    markdown: ammonia::Builder<'static>,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -80,45 +82,16 @@ impl Renderer {
                 .expect("a built-in panel template parses");
         }
 
-        let mut sanitiser = ammonia::Builder::empty();
-        sanitiser
-            .tags(TAGS.iter().copied().collect())
-            .generic_attributes(HashSet::from(["class"]))
-            .tag_attributes(
-                ATTRIBUTES
-                    .iter()
-                    .map(|(tag, attributes)| (*tag, attributes.iter().copied().collect()))
-                    .collect::<HashMap<_, _>>(),
-            )
-            .url_schemes(HashSet::from(["http", "https"]))
-            .url_relative(ammonia::UrlRelative::PassThrough)
-            .link_rel(Some("noopener"))
-            .strip_comments(true);
-
-        // Section 11.7: links only to the reserved prefix or the
-        // dashboard.
-
-        let dashboard = dashboard.map(str::to_owned);
-        sanitiser.attribute_filter(move |element, attribute, value| {
-            if element == "a" && attribute == "href" {
-                let allowed = value.starts_with(RESERVED_PREFIX)
-                    || dashboard
-                        .as_deref()
-                        .is_some_and(|dashboard| value.starts_with(dashboard));
-                return allowed.then(|| value.into());
-            }
-
-            Some(value.into())
-        });
-
         Self {
             templates,
-            sanitiser,
+            sanitiser: sanitiser(dashboard, false),
+            markdown: sanitiser(dashboard, true),
         }
     }
 
     /// Draw a panel, sanitised: by its own template, else the generic
-    /// one. A panel whose template fails is drawn as a sentence saying so.
+    /// one, with a text panel's text first. A panel whose template fails
+    /// is drawn as a sentence saying so.
     pub fn render(&self, panel: &admin::Panel) -> String {
         let drawn = self
             .templates
@@ -140,13 +113,113 @@ impl Renderer {
             ),
         };
 
-        self.sanitise(&html)
+        let mut drawn = self.text(panel);
+        drawn.push_str(&self.sanitise(&html));
+        drawn
     }
 
     /// HTML as the sanitiser leaves it.
     pub fn sanitise(&self, html: &str) -> String {
         self.sanitiser.clean(html).to_string()
     }
+
+    /// A text panel's text (issue 680): plain text with its line breaks
+    /// kept, or markdown drawn as HTML and sanitised on its own, the one
+    /// place a panel may link outside Muru.
+    fn text(&self, panel: &admin::Panel) -> String {
+        if panel.text.is_empty() {
+            return String::new();
+        }
+
+        if panel.markdown {
+            return self.markdown.clean(&markdown(&panel.text)).to_string();
+        }
+
+        self.sanitise(&format!(
+            "<div class=\"text\">{}</div>",
+            escape(&panel.text)
+        ))
+    }
+}
+
+/// The sanitiser for what panels draw. Links go only to the reserved
+/// prefix or the dashboard (section 11.7), except in markdown, whose
+/// links may also go to outside `http` and `https` addresses and open in
+/// a new tab, telling the page opened nothing of the one it came from.
+fn sanitiser(dashboard: Option<&str>, markdown: bool) -> ammonia::Builder<'static> {
+    let mut sanitiser = ammonia::Builder::empty();
+    sanitiser
+        .tags(TAGS.iter().copied().collect())
+        .generic_attributes(HashSet::from(["class"]))
+        .tag_attributes(
+            ATTRIBUTES
+                .iter()
+                .map(|(tag, attributes)| (*tag, attributes.iter().copied().collect()))
+                .collect::<HashMap<_, _>>(),
+        )
+        .url_schemes(HashSet::from(["http", "https"]))
+        .url_relative(ammonia::UrlRelative::PassThrough)
+        .strip_comments(true);
+
+    if markdown {
+        sanitiser
+            .link_rel(Some("noopener noreferrer"))
+            .set_tag_attribute_value("a", "target", "_blank");
+    } else {
+        sanitiser.link_rel(Some("noopener"));
+    }
+
+    let dashboard = dashboard.map(str::to_owned);
+    sanitiser.attribute_filter(move |element, attribute, value| {
+        if element == "a" && attribute == "href" {
+            let allowed = value.starts_with(RESERVED_PREFIX)
+                || dashboard
+                    .as_deref()
+                    .is_some_and(|dashboard| value.starts_with(dashboard))
+                || (markdown && (value.starts_with("http://") || value.starts_with("https://")));
+            return allowed.then(|| value.into());
+        }
+
+        Some(value.into())
+    });
+
+    sanitiser
+}
+
+/// Markdown as HTML, before it is sanitised: headings moved to the levels
+/// panels use, and HTML written into the markdown shown as the text it is.
+fn markdown(text: &str) -> String {
+    use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd, html};
+
+    let moved = |level: HeadingLevel| {
+        if level == HeadingLevel::H1 {
+            HeadingLevel::H3
+        } else {
+            HeadingLevel::H4
+        }
+    };
+
+    let events = Parser::new(text).map(|event| match event {
+        Event::Start(Tag::Heading {
+            level,
+            id,
+            classes,
+            attrs,
+        }) => Event::Start(Tag::Heading {
+            level: moved(level),
+            id,
+            classes,
+            attrs,
+        }),
+        Event::End(TagEnd::Heading(level)) => Event::End(TagEnd::Heading(moved(level))),
+        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+        other => other,
+    });
+
+    let mut drawn = String::from("<div class=\"markdown\">");
+    html::push_html(&mut drawn, events);
+    drawn.push_str("</div>");
+    drawn
 }
 
 /// For each of a panel's tables, which of its columns hold only numbers,
@@ -391,7 +464,7 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
             .filter(|table| !table.rows.is_empty())
             .into_iter()
             .collect(),
-        dropped: 0,
+        ..Default::default()
     }
 }
 
@@ -1093,6 +1166,7 @@ mod tests {
                 }],
             }],
             dropped: 2,
+            ..Default::default()
         });
 
         assert!(html.contains("<th>books</th>"), "{html}");
@@ -1116,6 +1190,57 @@ mod tests {
             html.contains("2 entries were past the panel's limits"),
             "{html}"
         );
+    }
+
+    #[test]
+    fn a_text_panel_is_drawn_plain_or_from_markdown_with_its_own_links() {
+        let renderer = Renderer::new(None);
+
+        let plain = renderer.render(&admin::Panel {
+            name: "notes".to_owned(),
+            text: "one <b>\ntwo".to_owned(),
+            ..Default::default()
+        });
+        assert!(
+            plain.contains("<div class=\"text\">one &lt;b&gt;\ntwo</div>"),
+            "{plain}"
+        );
+        assert!(!plain.contains("Nothing was added"), "{plain}");
+
+        let markdown = renderer.render(&admin::Panel {
+            name: "analysis".to_owned(),
+            text:
+                "# Queries\n\n## Detail\n\n**3** ran. See [the guide](https://example.com/guide) \
+                   or [a record](/_muru/requests/A1.json).\n\n<script>alert(1)</script>\n\n\
+                   [bad](javascript:alert(1))"
+                    .to_owned(),
+            markdown: true,
+            ..Default::default()
+        });
+
+        assert!(markdown.contains("<h3>Queries</h3>"), "{markdown}");
+        assert!(markdown.contains("<h4>Detail</h4>"), "{markdown}");
+        assert!(markdown.contains("<strong>3</strong>"), "{markdown}");
+        assert!(
+            markdown.contains(
+                "<a href=\"https://example.com/guide\" target=\"_blank\" rel=\"noopener noreferrer\">"
+            ),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("href=\"/_muru/requests/A1.json\""),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("&lt;script&gt;") && !markdown.contains("<script>"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("javascript"), "{markdown}");
+
+        // Outside markdown, an outside link is not kept.
+
+        let elsewhere = renderer.sanitise("<a href=\"https://example.com/guide\">guide</a>");
+        assert_eq!(elsewhere, "<a rel=\"noopener\">guide</a>");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-"""Panels Muru's extensions add to a request's record (issues 677, 679, ADR 0063).
+"""Panels Muru's extensions add to a request's record (issues 677, 679, 680, ADR 0063).
 
 A development run keeps a record of each request it serves (section 11.7),
 drawn as panels in the toolbar, on the dashboard's request page and by
@@ -10,6 +10,7 @@ of its own:
 - ``SpansPanel``: named intervals on the record's clock that may nest.
 - ``TablesPanel``: rows under captioned columns, in one or more tables.
 - ``ValuesPanel``: names with values.
+- ``TextPanel``: text, plain or markdown, which the edge draws.
 
 A panel with no template of its own is drawn by the edge's generic one.
 
@@ -23,7 +24,9 @@ work only to feed a panel.
 
 Each panel keeps at most ``PANEL_LIMIT`` entries and a request
 ``REQUEST_LIMIT`` across its panels; what is past them is counted and
-shown. A span counts once for itself and once for each span beneath it.
+shown. A span counts once for itself and once for each span beneath it,
+and a block of text once, a text panel keeping at most ``TEXT_LIMIT``
+characters.
 
 The worker starts keeping a request's panels when it takes the request
 and takes them with the worker's part of its record, by the request's id,
@@ -49,6 +52,7 @@ from muru._context import request_id
 __all__ = [
     "PANEL_LIMIT",
     "REQUEST_LIMIT",
+    "TEXT_LIMIT",
     "Panel",
     "Span",
     "Spans",
@@ -56,6 +60,8 @@ __all__ = [
     "Table",
     "Tables",
     "TablesPanel",
+    "Text",
+    "TextPanel",
     "Values",
     "ValuesPanel",
     "on_first_record",
@@ -66,6 +72,9 @@ PANEL_LIMIT = 500
 
 REQUEST_LIMIT = 2000
 """The most entries a request keeps across its panels."""
+
+TEXT_LIMIT = 65536
+"""The most characters one text panel of a request keeps."""
 
 # The built-in panels' names, and the page view's tab, which a declared
 # panel may not take.
@@ -105,6 +114,8 @@ class _Entries:
     spans: list[Span] = field(default_factory=list)
     values: dict[str, str] = field(default_factory=dict)
     rows: dict[str, list[list[str]]] = field(default_factory=dict)
+    text: list[str] = field(default_factory=list)
+    characters: int = 0
     kept: int = 0
     dropped: int = 0
 
@@ -169,10 +180,14 @@ class Panel:
 
     shape: ClassVar[str] = ""
 
-    __slots__ = ("_idle", "name", "tables", "title")
+    __slots__ = ("_idle", "markdown", "name", "tables", "title")
 
     def __init__(
-        self, name: str, title: str, tables: tuple[tuple[str, tuple[str, ...]], ...] = ()
+        self,
+        name: str,
+        title: str,
+        tables: tuple[tuple[str, tuple[str, ...]], ...] = (),
+        markdown: bool = False,
     ) -> None:
         if not _NAME.match(name) or name in RESERVED:
             raise ValueError(f"{name!r} cannot name a panel")
@@ -180,6 +195,7 @@ class Panel:
         self.name = name
         self.title = title
         self.tables = tables
+        self.markdown = markdown
 
         with _declaring:
             existing = _declared.setdefault(name, self)
@@ -191,10 +207,13 @@ class Panel:
         if type(other) is not type(self) or not isinstance(other, Panel):
             return NotImplemented
 
-        return (self.name, self.title, self.tables) == (other.name, other.title, other.tables)
+        return self._key() == other._key()
 
     def __hash__(self) -> int:
-        return hash((type(self), self.name, self.title, self.tables))
+        return hash((type(self), *self._key()))
+
+    def _key(self) -> tuple[Any, ...]:
+        return (self.name, self.title, self.tables, self.markdown)
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.name!r}, {self.title!r})"
@@ -253,6 +272,27 @@ class ValuesPanel(Panel):
 
         kept = _current()
         return self._idle if kept is None else Values(self, kept)
+
+
+class TextPanel(Panel):
+    """A panel of text, plain or markdown, which the edge draws.
+
+    Plain text keeps its line breaks. Markdown is drawn as HTML, sanitised
+    as every panel is, and its links may go to outside addresses, which
+    open in a new tab.
+    """
+
+    shape = "text"
+
+    def __init__(self, name: str, title: str, *, markdown: bool = False) -> None:
+        super().__init__(name, title, markdown=markdown)
+        self._idle = Text(self, None)
+
+    def current(self) -> Text:
+        """Return the panel for the request being served."""
+
+        kept = _current()
+        return self._idle if kept is None else Text(self, kept)
 
 
 # The handles.
@@ -444,6 +484,42 @@ class Values(_Handle):
             entries.values[name] = str(value)
 
 
+class Text(_Handle):
+    """A text panel for the request being served."""
+
+    __slots__ = ()
+
+    def write(self, text: str) -> bool:
+        """Add a block of text, after a blank line if any came before.
+
+        Returns whether it was kept: a block past the panel's caps, or
+        past ``TEXT_LIMIT`` characters in all, is not.
+        """
+
+        kept = self._kept
+
+        if kept is None:
+            return False
+
+        with kept.lock:
+            if kept.taken:
+                return False
+
+            entries = kept.entries(self._panel)
+
+            if entries.characters + len(text) > TEXT_LIMIT:
+                entries.dropped += 1
+                return False
+
+            if not kept.admit(entries, 1):
+                return False
+
+            entries.text.append(text)
+            entries.characters += len(text)
+
+        return True
+
+
 # Setting up for the first record.
 
 _first: list[Callable[[], None]] = []
@@ -492,7 +568,9 @@ def _start(request: str) -> None:
 def _take(request: str) -> list[tuple[Any, ...]]:
     """Stop keeping a request's panels, and return them for the runtime to send.
 
-    They come in their order of first use, as plain tuples.
+    They come in their order of first use, as plain tuples: name, title,
+    spans, values, tables, how many entries were not kept, the text, and
+    whether it is markdown.
     """
 
     kept = _requests.pop(request, None)
@@ -514,6 +592,8 @@ def _take(request: str) -> list[tuple[Any, ...]]:
                     for caption, columns in declared.tables
                 ],
                 entries.dropped,
+                "\n\n".join(entries.text),
+                declared.markdown,
             )
             for declared, entries in kept.panels.values()
         ]

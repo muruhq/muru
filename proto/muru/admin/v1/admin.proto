@@ -444,6 +444,8 @@ message Panel {
   repeated PanelValue values = 4;
   repeated PanelTable tables = 5;
   uint32 dropped = 6;               // entries an extension's panel could not keep, past its caps
+  string text = 7;                  // a text panel's text (issue 680)
+  bool markdown = 8;                // the text is markdown, drawn by the edge
 }
 
 message PanelSpan {
