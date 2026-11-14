@@ -42,6 +42,11 @@ pub struct Worker {
     pub size: u64,
     /// The measure `size` is in: `uss`, `pss` or `rss`.
     pub measure: &'static str,
+    /// Whether its host is replacing it for memory, by its own limits or
+    /// the guard's ask, and its successor has not yet taken its place.
+    /// Such a replacement is the guard's one at a time (issue 662), and
+    /// the worker is otherwise left out of the guard's reckoning.
+    pub replacing: bool,
 }
 
 /// What the guard asks for after a check.
@@ -133,9 +138,12 @@ impl Guard {
         self.check_at(memory, workers, hosts, Instant::now())
     }
 
-    fn check_at(&mut self, memory: Memory, workers: &[Worker], hosts: u64, now: Instant) -> Action {
+    fn check_at(&mut self, memory: Memory, all: &[Worker], hosts: u64, now: Instant) -> Action {
         let left = memory.left();
         let headroom = memory.headroom();
+        let (replacing, workers): (Vec<Worker>, Vec<Worker>) =
+            all.iter().cloned().partition(|worker| worker.replacing);
+        let workers = &workers[..];
 
         // A replacement in hand is waited for: the next worker is chosen
         // once the old one has gone and its successor has reported. One
@@ -161,6 +169,16 @@ impl Guard {
                         && worker.index == *index
                         && worker.size > 0
                 });
+
+            // The worker chosen still serves while another is replaced for
+            // memory: its host refused, since that replacement is the one
+            // at a time (issue 662), and the guard judges again once it
+            // has finished.
+
+            if !gone && replacing.iter().any(|worker| worker.pid != *pid) {
+                self.state = State::Watching;
+                return Action::Nothing;
+            }
 
             if !(gone && succeeded) && now.duration_since(*since) < REPLACEMENT_WAIT {
                 return Action::Nothing;
@@ -190,6 +208,14 @@ impl Guard {
         }
 
         if matches!(self.state, State::Holding(_)) {
+            return Action::Nothing;
+        }
+
+        // A worker being replaced for memory, by its own limits or an
+        // earlier ask, is the one at a time (issue 662): the next is
+        // chosen once its successor has taken its place.
+
+        if !replacing.is_empty() {
             return Action::Nothing;
         }
 
@@ -480,6 +506,14 @@ mod tests {
             pid,
             size,
             measure: "uss",
+            replacing: false,
+        }
+    }
+
+    fn being_replaced(index: u32, pid: u32) -> Worker {
+        Worker {
+            replacing: true,
+            ..worker(index, pid, 0)
         }
     }
 
@@ -684,6 +718,51 @@ mod tests {
         let gone = [worker(1, 11, 280 * MB)];
         let action = guard.check_at(reading(600 * MB), &gone, 250 * MB, start + REPLACEMENT_WAIT);
         assert_eq!(action, Action::Nothing);
+        assert_eq!(guard.state().0, "watching");
+    }
+
+    #[test]
+    fn a_worker_being_replaced_for_memory_is_the_one_at_a_time() {
+        let mut guard = Guard::default();
+
+        // Worker 1 is being replaced for its hard limit: no second.
+
+        let workers = [worker(0, 10, 379 * MB), being_replaced(1, 11)];
+        assert_eq!(
+            guard.check(reading(GB - 122 * MB), &workers, 100 * MB),
+            Action::Nothing
+        );
+        assert_eq!(guard.state().0, "watching");
+
+        // Its successor has taken its place: the guard acts again.
+
+        let replaced = [worker(0, 10, 379 * MB), worker(1, 20, 15 * MB)];
+        assert!(matches!(
+            guard.check(reading(GB - 122 * MB), &replaced, 100 * MB),
+            Action::Replace { index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn a_choice_the_host_refused_is_dropped() {
+        let mut guard = Guard::default();
+        let start = Instant::now();
+        let workers = [worker(0, 10, 379 * MB), worker(1, 11, 300 * MB)];
+
+        assert!(matches!(
+            guard.check_at(reading(GB - 122 * MB), &workers, 100 * MB, start),
+            Action::Replace { index: 0, .. }
+        ));
+
+        // Worker 1 went over its hard limit at the same check, so the
+        // host refused: worker 0 still serves.
+
+        let refused = [worker(0, 10, 379 * MB), being_replaced(1, 11)];
+        let later = start + Duration::from_secs(5);
+        assert_eq!(
+            guard.check_at(reading(GB - 122 * MB), &refused, 100 * MB, later),
+            Action::Nothing
+        );
         assert_eq!(guard.state().0, "watching");
     }
 

@@ -217,12 +217,12 @@ def test_a_request_past_its_deadline_is_one_event_until_it_ends(tmp_path: Path) 
 
 
 def replacing_host(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spawned: int = 5001
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spawned: int = 5001, workers: int = 1
 ) -> tuple[host.Host, host.WorkerState, list[dict[str, Any]], list[host.Pending]]:
-    """A host with one worker, nothing forked, and every ask held for the test to answer."""
+    """A host with its first worker, nothing forked, and every ask held for the test to answer."""
 
     release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
-    instance = host.Host(release, str(tmp_path), workers=1, threads=1)
+    instance = host.Host(release, str(tmp_path), workers=workers, threads=1)
     sent: list[dict[str, Any]] = []
     asked: list[host.Pending] = []
 
@@ -450,6 +450,58 @@ def test_the_memory_guard_has_a_worker_recycled_and_stopped_first(
     replacement = instance.replacing[0]
     assert replacement.kind == "worker.recycled" and replacement.cause == "container_memory"
     assert replacement.stop_first and replacement.new_pid is None
+
+
+def test_replacements_for_memory_never_leave_a_group_with_no_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue 662: the memory guard and a worker's hard limit act at the
+    # same check, with 120 left under the limit and workers of 300.
+
+    container_memory(tmp_path, used=880, limit=1000)
+    instance, first, sent, _asked = replacing_host(tmp_path, monkeypatch, workers=2)
+    second = host.WorkerState(1, 4243, 0, "w1.sock", time.monotonic(), -1)
+    instance.states[second.pid] = second
+    instance.workers[second.pid] = second.index
+    instance.cgroup = str(tmp_path)
+    instance.own_memory = dict  # type: ignore[method-assign]
+
+    for state in (first, second):
+        state.ready = True
+        state.memory = {"uss": 300}
+        instance.routed[state.index] = state.path
+
+    # The guard's choice stops first, and is listed for the guard.
+
+    reason = {"reason": "short", "cause": "container_memory"}
+    instance.recycle_worker(8, 0, "0", {"pid": 4242, **reason})
+    assert instance.replacing[0].stop_first and instance.routed[0] is None
+    instance.send_status()
+    assert sent[-1]["memory_replacements"] == [{"index": 0, "group": "default", "pid": 4242}]
+
+    # Worker 1, over its hard limit, is the last in routing: its
+    # replacement waits, and it keeps serving.
+
+    over = "uss 300B is over the hard limit of 250B"
+    assert not instance.replace(second, over, "worker.recycled", "memory", hard=True)
+    assert 1 not in instance.replacing and instance.routed[1] == second.path
+
+    # With room for its successor, it is replaced, but stays in routing
+    # until the successor is ready.
+
+    container_memory(tmp_path, used=200, limit=1000)
+    assert instance.replace(second, over, "worker.recycled", "memory", hard=True)
+    assert not instance.replacing[1].stop_first and instance.routed[1] == second.path
+
+    # The guard's next ask, while a replacement for memory is under way,
+    # is refused: that replacement is its one at a time.
+
+    instance.replacing.pop(1)
+    second.replaced = False
+    instance.recycle_worker(9, 1, "1", {"pid": 4243, **reason})
+    assert sent[-1]["error"] == (
+        "worker 0 is being replaced for memory, and workers are replaced for memory one at a time"
+    )
 
 
 def test_arguments_are_checked_against_the_interface(monkeypatch: pytest.MonkeyPatch) -> None:

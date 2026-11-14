@@ -941,6 +941,7 @@ message Release {
   bool host_running = 33;           // whether a host runs for it now; false for a stopped or dormant release
   uint64 disk_bytes = 34;           // what its environment, bytecode and logs take; set when asked for
   uint64 disk_freed_bytes = 35;     // what removing it would give back, less than disk_bytes when files are hard-linked elsewhere
+  repeated string instrumentation = 36; // its instrumentation modules, in order (section 6.15)
 }
 
 // An instance of an http release's command.

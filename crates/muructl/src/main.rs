@@ -1861,6 +1861,9 @@ struct Resolved {
     concurrency: usize,
     preload: muru_config::Preload,
     hooks: Option<String>,
+    /// The instrumentation modules (section 6.15): muru.local.toml's,
+    /// then the table's.
+    instrumentation: Vec<muru_config::Instrumentation>,
     /// The directory the host runs in.
     project: PathBuf,
     /// The file the table came from, when there was one.
@@ -2002,10 +2005,20 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         None => muru_config::load_local(&project, source.as_deref())?,
     };
 
-    let (local, local_run, local_build_when) = match local_file {
-        Some((path, file)) => (Some(path), file.run, file.build_when),
-        None => (None, muru_config::RunSettings::default(), None),
+    let (local, local_run, local_build_when, local_instrumentation) = match local_file {
+        Some((path, file)) => (Some(path), file.run, file.build_when, file.instrumentation),
+        None => (None, muru_config::RunSettings::default(), None, Vec::new()),
     };
+
+    // Section 6.15: this machine's instrumentation modules come before the
+    // project's, so a tool one developer adds measures the others too.
+
+    let instrumentation: Vec<muru_config::Instrumentation> = local_instrumentation
+        .into_iter()
+        .chain(table.instrumentation.iter().cloned())
+        .collect();
+    muru_config::check_instrumentation(&instrumentation)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     let layers = print_config::Layers::new(&table, &run_table, &local_run);
     let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
@@ -2165,6 +2178,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
             .or(table.preload)
             .unwrap_or(muru_config::Preload::Auto),
         hooks: args.hooks.clone().or(table.hooks),
+        instrumentation,
         project,
         source,
         groups: table.groups,
@@ -2661,9 +2675,20 @@ struct CheckReport {
     #[serde(default)]
     hooks: Vec<String>,
     #[serde(default)]
+    instrumentation: Vec<CheckInstrument>,
+    #[serde(default)]
     findings: Vec<CheckFinding>,
     #[serde(default)]
     errors: Vec<CheckError>,
+}
+
+/// An instrumentation module the check imported (section 6.15), with the
+/// callbacks it defines.
+#[derive(Debug, serde::Deserialize)]
+struct CheckInstrument {
+    module: String,
+    #[serde(default)]
+    callbacks: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2789,6 +2814,17 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
         command.arg("--hooks").arg(hooks);
     }
 
+    // Section 6.15: the instrumentation modules, as the host is given them.
+
+    if resolved.instrumentation.is_empty() {
+        command.env_remove(muru_controller::host::INSTRUMENTATION_VARIABLE);
+    } else {
+        command.env(
+            muru_controller::host::INSTRUMENTATION_VARIABLE,
+            serde_json::to_string(&resolved.instrumentation)?,
+        );
+    }
+
     for (name, mount) in &resolved.mounts {
         command.arg("--mount").arg(format!(
             "{name}={}={}",
@@ -2848,6 +2884,21 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
             "muru: check: warning: the interpreter imported muru {} where {} was provided",
             report.muru, library.version
         );
+    }
+
+    for instrument in &report.instrumentation {
+        if instrument.callbacks.is_empty() {
+            println!(
+                "muru: check: instrumentation module {} defines no callbacks",
+                instrument.module
+            );
+        } else {
+            println!(
+                "muru: check: instrumentation module {} defines {}",
+                instrument.module,
+                instrument.callbacks.join(", ")
+            );
+        }
     }
 
     for entrypoint in &report.entrypoints {
@@ -3294,6 +3345,7 @@ async fn run_with(
         concurrency: resolved.concurrency,
         preload: resolved.preload,
         hooks: resolved.hooks.clone(),
+        instrumentation: resolved.instrumentation.clone(),
         chdir: Some(resolved.project.clone()),
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
         single: args.single,
@@ -3698,6 +3750,7 @@ async fn run_with(
     );
     limits_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_workers: Vec<muru_controller::host::WorkerStatus> = Vec::new();
+    let mut last_replacing: Vec<muru_controller::host::MemoryReplacement> = Vec::new();
 
     if let Some(scaling) = &scaling {
         let _ = run_processes.scaling.set(Arc::clone(scaling));
@@ -4029,6 +4082,15 @@ async fn run_with(
 
                         let release = format!("r{}", current.release);
                         let kept = pools.current().kept(&label, &release);
+
+                        // Section 13.9 (issue 662): a group with no worker in
+                        // routing for a moment, its last stopping before its
+                        // replacement starts, holds requests until one is
+                        // back, up to the queue timeout, as the daemon's do.
+
+                        let waiting: Vec<String> = std::iter::once(muru_edge::routing::DEFAULT_GROUP.to_owned())
+                            .chain(groups.iter().map(|(name, _)| name.clone()))
+                            .collect();
                         let connected = muru_edge::routing::AppPools::connect(
                             &label,
                             &release,
@@ -4045,6 +4107,7 @@ async fn run_with(
                                 .with_sendfile(Arc::clone(&sendfile))
                                 .with_grpc_web(&resolved.grpc_web_origins)
                                 .with_static_dirs(static_paths.clone())
+                                .with_waking(&waiting)
                         });
 
                         match connected {
@@ -4069,7 +4132,7 @@ async fn run_with(
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);
                     }
-                    muru_controller::host::HostMessage::Status { workers, host_rss } => {
+                    muru_controller::host::HostMessage::Status { workers, host_rss, memory_replacements } => {
                         // The relay may have been started again since.
 
                         run_processes.host(current.pid(), current.relay_pid());
@@ -4077,6 +4140,7 @@ async fn run_with(
                         if let Some(watch) = &mut limits_watch {
                             watch.host(host_rss);
                             last_workers.clone_from(&workers);
+                            last_replacing = memory_replacements;
                         }
 
                         if let Some(scaling) = &scaling {
@@ -4092,7 +4156,7 @@ async fn run_with(
                     continue;
                 };
 
-                match watch.check(&last_workers) {
+                match watch.check(&last_workers, &last_replacing) {
                     muru_controller::guard::Action::Replace { group, index, pid, reason, .. } => {
                         // Section 13.9: a group with a policy above its
                         // fewest workers is scaled in by the worker.

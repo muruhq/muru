@@ -27,6 +27,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `grpc_web_origins` | array of strings |  | The origins whose pages may call the gRPC methods through gRPC-Web, or `*`. |
 | `handoff` | string |  | The interface the entrypoint's requests may be handed to. `asgi`: Continue the request as an ASGI application on the event loop. `wsgi`: Continue the request as a WSGI callable on the thread pool. |
 | `hooks` | string |  | The module providing the lifecycle hooks. |
+| `instrumentation` | array of tables, {ref}`[[tool.muru.instrumentation]] <config-project-tool-muru-instrumentation>` |  | The instrumentation modules, in order, each with its settings, imported before anything of the application. |
 | `interface` | string | `"auto"` | The interface the entrypoint speaks. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `logging` | table, {ref}`[tool.muru.logging] <config-project-tool-muru-logging>` |  | How Python logging is set up in the workers. |
 | `maintenance` | table, {ref}`[tool.muru.maintenance] <config-project-tool-muru-maintenance>` |  | What maintenance mode lets through. |
@@ -164,6 +165,16 @@ The requests a worker group takes for its paths: every list given must name the 
 | `client_class` | array of strings |  | Client classes. |
 | `host` | array of strings |  | Hosts: a virtual host's name or a name it answers to, or under `muructl run` the name the request carries. |
 | `method` | array of strings |  | Methods, compared in upper case. |
+
+(config-project-tool-muru-instrumentation)=
+## `[[tool.muru.instrumentation]]`
+
+One instrumentation module of a release: a tool such as an import timer or an APM agent, imported before the application and set up apart from it, with settings that only it is given.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `module` | string | required | The module, as a dotted Python module name. |
+| `settings` | table |  | The settings its `configure` function is given, as a table of any values. |
 
 (config-project-tool-muru-logging)=
 ## `[tool.muru.logging]`

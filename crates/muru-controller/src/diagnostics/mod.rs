@@ -39,6 +39,9 @@ pub struct ReleaseFacts {
     /// The application as `module:callable`; empty for a development
     /// run, which is asked for it with its settings.
     pub entrypoint: String,
+    /// Its instrumentation modules (section 6.15), whose names the
+    /// report replaces as it does the entry point's.
+    pub instrumentation: Vec<String>,
     /// The interface as declared: auto, wsgi, asgi or grpc.
     pub interface: String,
     /// The interface its host settled on, empty until one is known.
@@ -94,6 +97,7 @@ impl ReleaseFacts {
                 release.kind.clone()
             },
             entrypoint: release.entrypoint.clone(),
+            instrumentation: release.instrumentation.clone(),
             interface: release.interface.clone(),
             detected_interface: release.detected_interface.clone(),
             frameworks: Vec::new(),

@@ -80,6 +80,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `handoff` | string |  | The interface the default mount's requests may be handed to; none when absent. `asgi`: Continue the request as an ASGI application on the event loop. `wsgi`: Continue the request as a WSGI callable on the thread pool. |
 | `hooks` | string |  | The module holding the lifecycle hooks, as a Python module name. |
 | `instances` | integer | `1` | How many instances of the command an `http` release runs. |
+| `instrumentation` | array of tables, {ref}`[[app.NAME.release.ID.instrumentation]] <config-daemon-app-name-release-id-instrumentation>` |  | The instrumentation modules, in order; when given, they replace the list in the source's `[tool.muru]` table. |
 | `interface` | string | `"auto"` | The interface, when declared rather than detected. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `kind` | string | `"workers"` | What the release runs: `workers` from an entrypoint, the default, or `http`, an HTTP server started from `command`. `workers`: Muru's own workers, from an entrypoint. `http`: An HTTP server Muru starts and supervises, from a command. |
 | `logging` | table, {ref}`[logging] <config-daemon-logging>` |  | How Python logging is set up in the workers. |
@@ -198,6 +199,16 @@ The requests a worker group takes for its paths: every list given must name the 
 | `client_class` | array of strings |  | Client classes. |
 | `host` | array of strings |  | Hosts: a virtual host's name or a name it answers to, or under `muructl run` the name the request carries. |
 | `method` | array of strings |  | Methods, compared in upper case. |
+
+(config-daemon-app-name-release-id-instrumentation)=
+## `[[app.NAME.release.ID.instrumentation]]`
+
+One instrumentation module of a release: a tool such as an import timer or an APM agent, imported before the application and set up apart from it, with settings that only it is given.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `module` | string | required | The module, as a dotted Python module name. |
+| `settings` | table |  | The settings its `configure` function is given, as a table of any values. |
 
 (config-daemon-app-name-release-id-memory)=
 ## `[app.NAME.release.ID.memory]`

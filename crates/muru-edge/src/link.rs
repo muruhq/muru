@@ -607,6 +607,10 @@ pub struct LinkPool {
     /// Section 7.4: for a pool with no workers, the group a request waits
     /// to be woken, when it can be.
     wake: Option<crate::wake::Key>,
+    /// Whether the pool is a release's group's, rather than the one an
+    /// edge has before any release, so a request refused for want of a
+    /// worker is logged with the right reason.
+    connected: bool,
 }
 
 /// One request's place in the queue for a slot, given back when it gets
@@ -692,6 +696,7 @@ impl LinkPool {
             waiting: AtomicUsize::new(0),
             grpc,
             wake: None,
+            connected: true,
         })
     }
 
@@ -759,6 +764,7 @@ impl LinkPool {
             waiting: AtomicUsize::new(0),
             grpc: Vec::new(),
             wake: None,
+            connected: false,
         }
     }
 
@@ -809,7 +815,13 @@ impl LinkPool {
     ) -> io::Result<Lease> {
         if self.workers.is_empty() {
             let Some(key) = &self.wake else {
-                return Err(io::Error::other("no release is serving"));
+                return Err(io::Error::other(if !self.connected {
+                    "no release is serving"
+                } else if self.unreachable.is_empty() {
+                    "the group has no worker in routing"
+                } else {
+                    "none of the group's workers could be connected to"
+                }));
             };
 
             // The request counts as waiting here, where the metrics see
@@ -3805,5 +3817,38 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
         assert!(!Arc::ptr_eq(&first.workers[0], &third.workers[0]));
+    }
+
+    #[tokio::test]
+    async fn a_group_between_workers_holds_a_request_until_one_is_back() {
+        // Issue 662: the group's last worker stopped first, so its
+        // routing has none; a request waits rather than being refused.
+
+        let key = ("between".to_owned(), "r1".to_owned(), "default".to_owned());
+        let empty = LinkPool::connect(&[], &Kept::default()).await.unwrap();
+        let error = empty.acquire("").await.err().unwrap();
+        assert_eq!(error.to_string(), "the group has no worker in routing");
+
+        let waiting = LinkPool::waking(key.clone());
+        assert!(waits(&waiting, "").await);
+
+        // The replacement is announced: the request is handed its pool.
+
+        let dir = tempfile::tempdir().unwrap();
+        let hello = pb::Hello {
+            protocol_version: pb::PROTOCOL_VERSION.to_owned(),
+            worker_type: "wsgi".to_owned(),
+            slots: 1,
+            ..Default::default()
+        };
+        let back = Arc::new(pool_of(dir.path(), hello).await);
+        let request =
+            tokio::spawn(
+                async move { waiting.acquire("").await.map(|lease| lease.woken.is_some()) },
+            );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        crate::wake::wakes().publish(&[(key, back)]);
+
+        assert!(request.await.unwrap().unwrap());
     }
 }

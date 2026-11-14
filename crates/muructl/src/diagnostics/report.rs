@@ -378,11 +378,19 @@ impl Report {
         for release in collected.releases.iter().flatten() {
             redactor.app(&release.app);
             redactor.know_module(&release.entrypoint);
+
+            for module in &release.instrumentation {
+                redactor.know_module(module);
+            }
         }
 
         for setting in collected.settings.iter().flatten() {
             if MODULE_SETTINGS.contains(&setting_key(setting)) {
                 redactor.know_module(&setting.value);
+            } else if setting_key(setting) == "instrumentation" {
+                for module in instrumentation_modules(&setting.value) {
+                    redactor.know_module(&module);
+                }
             }
         }
 
@@ -828,6 +836,18 @@ fn release_row(release: &ReleaseFacts, redactor: &mut Redactor) -> ReleaseRow {
 }
 
 /// A setting's key less the `run.` or `serve.` of a command's own table.
+/// The modules a run's `instrumentation` setting names, from its value
+/// as a TOML array of entries (section 6.15).
+fn instrumentation_modules(value: &str) -> Vec<String> {
+    toml::from_str::<toml::Table>(&format!("entries = {value}"))
+        .ok()
+        .and_then(|table| table.get("entries")?.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| Some(entry.get("module")?.as_str()?.to_owned()))
+        .collect()
+}
+
 fn setting_key(setting: &Setting) -> &str {
     setting
         .key
@@ -1148,6 +1168,7 @@ mod tests {
                 "acme.old.wsgi:application"
             }
             .to_owned(),
+            instrumentation: Vec::new(),
             interface: "auto".to_owned(),
             detected_interface: if serving { "wsgi" } else { "" }.to_owned(),
             frameworks: if serving {
@@ -1288,6 +1309,29 @@ mod tests {
             )],
             now_unix_ms: 1_800_000_000_000 + 60_000,
         }
+    }
+
+    #[test]
+    fn an_instrumentation_module_is_replaced_where_an_event_names_it() {
+        let mut collected = collected();
+
+        if let Ok(releases) = &mut collected.releases {
+            releases[0].instrumentation = vec!["acme_timer".to_owned()];
+        }
+
+        if let Ok(events) = &mut collected.events {
+            events.push(event(
+                5,
+                "release.failed",
+                "error",
+                "release acme-shop@r5 failed on web1: cannot import instrumentation module \
+                 acme_timer: ModuleNotFoundError",
+            ));
+        }
+
+        let text = Report::build(collected).text();
+        assert!(!text.contains("acme_timer"), "{text}");
+        assert!(text.contains("instrumentation module <module"), "{text}");
     }
 
     #[test]

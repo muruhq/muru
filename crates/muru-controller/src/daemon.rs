@@ -1079,6 +1079,9 @@ struct Running {
     control: Option<HostControl>,
     /// What the workers last reported, for metrics.
     status: Vec<crate::host::WorkerStatus>,
+    /// The workers the host is replacing for memory, for the memory
+    /// guard (section 13.9).
+    memory_replacements: Vec<crate::host::MemoryReplacement>,
     /// Section 11.1: workers the host replaced, by group and reason, and
     /// workers that exited, likewise, since the release started.
     recycles: BTreeMap<(String, String), u64>,
@@ -4327,6 +4330,7 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        memory_replacements: Vec::new(),
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
                         signals_from: None,
@@ -4418,6 +4422,7 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        memory_replacements: Vec::new(),
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
                         signals_from: None,
@@ -5366,6 +5371,7 @@ impl Daemon {
             concurrency: spec.concurrency as usize,
             preload: spec.preload,
             hooks: spec.hooks.clone(),
+            instrumentation: spec.instrumentation.clone(),
             chdir: Some(spec.source.clone()),
             tcp_base_port: None,
             single: false,
@@ -5543,6 +5549,7 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                memory_replacements: Vec::new(),
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
                 signals_from: None,
@@ -5749,6 +5756,7 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                memory_replacements: Vec::new(),
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
                 signals_from: None,
@@ -8296,6 +8304,26 @@ impl Daemon {
                     pid: worker.pid,
                     size: size.unwrap_or(0),
                     measure,
+                    replacing: false,
+                });
+            }
+
+            // Issue 662: a worker being replaced for memory is the guard's
+            // one at a time.
+
+            for replacement in &running.memory_replacements {
+                let name =
+                    muru_common::worker::WorkerName::new(&replacement.group, replacement.index);
+
+                workers.push(crate::guard::Worker {
+                    owner: format!("{app}@{id}"),
+                    group: name.group.clone(),
+                    index: replacement.index,
+                    name: name.to_string(),
+                    pid: replacement.pid,
+                    size: 0,
+                    measure: "",
+                    replacing: true,
                 });
             }
         }
@@ -8347,7 +8375,7 @@ impl Daemon {
         let key = (app.to_owned(), id.to_owned());
         let current = workers
             .iter()
-            .filter(|worker| worker.owner == owner && worker.group == group)
+            .filter(|worker| worker.owner == owner && worker.group == group && !worker.replacing)
             .count() as u32;
         let mut shrunk = None;
 
@@ -9394,7 +9422,11 @@ impl Daemon {
                     control.acknowledge(version);
                 }
             }
-            HostMessage::Status { workers, .. } => {
+            HostMessage::Status {
+                workers,
+                memory_replacements,
+                ..
+            } => {
                 if let Some(running) = self.running.get_mut(&key) {
                     // Section 7.3: the workers' own signals, from what
                     // grew since a report at least a few seconds older,
@@ -9448,6 +9480,7 @@ impl Daemon {
                     }
 
                     running.status = workers;
+                    running.memory_replacements = memory_replacements;
                 }
             }
             HostMessage::Response { id, workers, error } => {

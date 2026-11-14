@@ -1007,6 +1007,10 @@ pub struct Release {
     /// The module holding the lifecycle hooks, as a Python module name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<String>,
+    /// The instrumentation modules, in order (section 6.15); when given,
+    /// they replace the list in the source's `[tool.muru]` table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instrumentation: Option<Vec<Instrumentation>>,
     /// Worker groups by name (section 7.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub groups: BTreeMap<String, Group>,
@@ -3976,6 +3980,56 @@ pub struct StaticDir {
     pub case: Option<String>,
 }
 
+/// One instrumentation module of a release (section 6.15): a tool such
+/// as an import timer or an APM agent, imported before the application
+/// and set up apart from it, with settings that only it is given.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Instrumentation {
+    /// The module, as a dotted Python module name.
+    pub module: String,
+    /// The settings its `configure` function is given, as a table of any
+    /// values.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settings: BTreeMap<String, serde_json::Value>,
+}
+
+/// Check a release's instrumentation list (section 6.15): every module a
+/// dotted Python name, and none named twice.
+pub fn check_instrumentation(entries: &[Instrumentation]) -> Result<(), String> {
+    let mut seen: Vec<&str> = Vec::new();
+
+    for entry in entries {
+        let dotted = !entry.module.is_empty()
+            && entry.module.split('.').all(|part| {
+                let mut chars = part.chars();
+
+                chars
+                    .next()
+                    .is_some_and(|first| first.is_alphabetic() || first == '_')
+                    && chars.all(|rest| rest.is_alphanumeric() || rest == '_')
+            });
+
+        if !dotted {
+            return Err(format!(
+                "instrumentation module {:?} is not a dotted Python module name",
+                entry.module
+            ));
+        }
+
+        if seen.contains(&entry.module.as_str()) {
+            return Err(format!(
+                "instrumentation module {} is listed twice",
+                entry.module
+            ));
+        }
+
+        seen.push(&entry.module);
+    }
+
+    Ok(())
+}
+
 /// Check an application's static directories (section 4.9): each path
 /// is a prefix below `/`, no two share one, each names a directory, and
 /// the settings parse.
@@ -4490,7 +4544,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
     }
 
     let timeouts = table.timeouts.as_ref();
-    let worker_keys: [(&str, bool); 23] = [
+    let worker_keys: [(&str, bool); 24] = [
         ("entrypoint", !table.entrypoint.is_empty()),
         ("interface", table.interface.is_some()),
         ("handoff", table.handoff.is_some()),
@@ -4504,6 +4558,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
         ("scaling", table.scaling.is_some()),
         ("preload", table.preload.is_some()),
         ("hooks", table.hooks.is_some()),
+        ("instrumentation", table.instrumentation.is_some()),
         ("groups", !table.groups.is_empty()),
         ("mounts", !table.mounts.is_empty()),
         ("logging", table.logging.is_some()),
@@ -5165,6 +5220,9 @@ pub struct LocalFile {
     pub run: RunSettings,
     /// `when` from the `[build]` table, if given.
     pub build_when: Option<BuildWhen>,
+    /// The `[[instrumentation]]` entries, which come before the
+    /// project's (section 6.15).
+    pub instrumentation: Vec<Instrumentation>,
 }
 
 /// The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a
@@ -5549,6 +5607,10 @@ pub struct ToolMuru {
     /// The module providing the lifecycle hooks (section 6.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<String>,
+    /// The instrumentation modules, in order (section 6.15), each with
+    /// its settings, imported before anything of the application.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instrumentation: Vec<Instrumentation>,
     /// The interpreter: a path, or a request in uv's syntax such as
     /// "3.13", "3.14t" or ">=3.12" (section 8.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5890,10 +5952,10 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
 
     if let Some(key) = document
         .keys()
-        .find(|key| !matches!(key.as_str(), "run" | "build"))
+        .find(|key| !matches!(key.as_str(), "run" | "build" | "instrumentation"))
     {
         return Err(format!(
-            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table and the when key of [build]; the application's settings belong in {there}"
+            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table, the when key of [build] and [[instrumentation]]; the application's settings belong in {there}"
         ));
     }
 
@@ -5932,7 +5994,21 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
         None => None,
     };
 
-    Ok(LocalFile { run, build_when })
+    let instrumentation = match document.get("instrumentation") {
+        Some(entries) => entries
+            .clone()
+            .try_into::<Vec<Instrumentation>>()
+            .map_err(|error| format!("[[instrumentation]] {error}"))?,
+        None => Vec::new(),
+    };
+
+    check_instrumentation(&instrumentation)?;
+
+    Ok(LocalFile {
+        run,
+        build_when,
+        instrumentation,
+    })
 }
 
 /// Parse a muru.toml: the `[tool.muru]` keys at the top level.
@@ -6804,6 +6880,35 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(bad("slow = 'soon'").starts_with("slow:"));
         assert!(bad("access_log = 'terminal'").contains("not on, errors or off"));
         assert!(bad("dashboard = 'yes'").contains("127.0.0.1:8081, or off"));
+    }
+
+    #[test]
+    fn instrumentation_entries_are_read_in_order_and_checked() {
+        let local = parse_local(
+            "[[instrumentation]]\nmodule = 'timer'\n[instrumentation.settings]\ntop = 5\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(local.instrumentation[0].module, "timer");
+        assert_eq!(local.instrumentation[0].settings["top"], 5);
+
+        let table = parse_muru_toml(
+            "[[instrumentation]]\nmodule = 'a.b'\n[[instrumentation]]\nmodule = 'c'\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = table
+            .instrumentation
+            .iter()
+            .map(|entry| entry.module.as_str())
+            .collect();
+        assert_eq!(names, ["a.b", "c"]);
+
+        let error = parse_local("[[instrumentation]]\nmodule = 'my-tool'\n", None).unwrap_err();
+        assert!(
+            error.contains("is not a dotted Python module name"),
+            "{error}"
+        );
+        assert!(parse_muru_toml("[[instrumentation]]\nmodule = 'x'\nextra = 1\n").is_err());
     }
 
     #[test]

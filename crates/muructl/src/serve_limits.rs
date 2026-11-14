@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use muru_controller::cgroup::Limits;
 use muru_controller::guard::{self, Action, Asked, Guard};
-use muru_controller::host::{HostSpec, WorkerStatus};
+use muru_controller::host::{HostSpec, MemoryReplacement, WorkerStatus};
 use muru_proto::admin::v1 as pb;
 
 /// What `muructl status` and `/status` show of the limits, shared with
@@ -68,7 +68,7 @@ impl Watch {
             spool,
             report,
         };
-        watch.refresh(&[]);
+        watch.refresh(&[], &[]);
         watch
     }
 
@@ -124,8 +124,9 @@ impl Watch {
     }
 
     /// One memory check: the limits read again, a change said, and the
-    /// guard's decision on the workers' last reports.
-    pub fn check(&mut self, workers: &[WorkerStatus]) -> Action {
+    /// guard's decision on the workers' last reports and the
+    /// replacements for memory under way.
+    pub fn check(&mut self, workers: &[WorkerStatus], replacing: &[MemoryReplacement]) -> Action {
         let now = self.limits.again();
         let changes = now.changes(&self.limits);
 
@@ -147,14 +148,30 @@ impl Watch {
             }
         }
 
-        self.refresh(workers)
+        self.refresh(workers, replacing)
     }
 
     /// Read what is used, run the guard when there is a memory limit,
     /// and update the report.
-    fn refresh(&mut self, workers: &[WorkerStatus]) -> Action {
+    fn refresh(&mut self, workers: &[WorkerStatus], replacing: &[MemoryReplacement]) -> Action {
         let memory = self.limits.memory();
-        let workers = self.workers(workers);
+        let mut workers = self.workers(workers);
+
+        workers.extend(replacing.iter().map(|replacement| {
+            let name = muru_common::worker::WorkerName::new(&replacement.group, replacement.index);
+
+            guard::Worker {
+                owner: self.owner.clone(),
+                group: name.group.clone(),
+                index: replacement.index,
+                name: name.to_string(),
+                pid: replacement.pid,
+                size: 0,
+                measure: "",
+                replacing: true,
+            }
+        }));
+
         let hosts = self.host_rss.unwrap_or(0);
 
         let action = match memory {
@@ -201,6 +218,7 @@ impl Watch {
                     pid: worker.pid,
                     size: size.unwrap_or(0),
                     measure,
+                    replacing: false,
                 }
             })
             .collect()

@@ -49,6 +49,30 @@ no fork, so `pre_fork` does not run.
 [Preload and fork safety](../explanation/preload.md) explains what the
 hooks are for.
 
+## Instrumentation callbacks
+
+An instrumentation module, listed in `[[tool.muru.instrumentation]]`,
+may define any of these module-level functions; see
+[Instrumentation modules](../howto/instrumentation.md) for where they
+are listed and when they are imported. Their return values are ignored,
+and an exception from one is logged and otherwise ignored.
+
+| Callback | Where and when |
+| --- | --- |
+| `configure(settings)` | Wherever the module is imported, once, straight after the import, with a `dict` of its entry's settings |
+| `load_started(context)` | Straight after `configure`, before the next module is imported |
+| `before_import(context, target)` | Before the hooks module, the entrypoint and each mount is imported, in listed order |
+| `after_import(context, target)` | After each of those imports, in reverse order, with `target.error` set when it failed |
+| `load_finished(context, outcome)` | Once the load is done or has failed, in reverse order; `outcome` is `fork`, `serve`, `fallback`, `refused`, `failed` or `check` |
+| `worker_started(context)` | In each worker, in listed order, just before the `post_fork` hook |
+| `wrap_application(context, target, application, interface)` | In each worker, once for each entry point, after any factory and before the event loop and lifespan start; a return value other than `None` is served in place of `application` |
+| `worker_stopped(context)` | In each worker that ran `worker_started`, in reverse order, as the last thing it does, after `on_exit`, the `atexit` callbacks and the event loop stopping, also when it failed to start or to serve |
+
+`target` has `kind` (`hooks`, `entrypoint` or `mount`), `name` (a
+mount's name, empty for the others), `spec` (the module, or
+`module:callable`) and `error` (what a failed import raised, for
+`after_import`). `interface` is `wsgi`, `asgi` or `grpc`.
+
 ## `muru.is_internal()`
 
 `muru.is_internal(environ_or_scope)` returns whether the request arrived

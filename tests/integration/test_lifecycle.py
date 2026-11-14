@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import sysconfig
 import time
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from support import server as support
@@ -176,6 +178,199 @@ def test_preload_false_imports_in_each_worker() -> None:
     try:
         assert "preloaded" not in server.log()
         assert import_pids(server, WORKERS * 8) == set(server.worker_pids().values())
+    finally:
+        server.stop()
+
+
+INSTRUMENT = """
+import json, os, sys
+
+
+def configure(settings):
+    print(f"INSTRUMENT configure {__name__} pid={os.getpid()} {json.dumps(settings)}",
+          file=sys.stderr, flush=True)
+
+
+def before_import(context, target):
+    print(f"INSTRUMENT before {__name__} {target.kind}", file=sys.stderr, flush=True)
+
+
+def load_finished(context, outcome):
+    print(f"INSTRUMENT finished {__name__} {outcome}", file=sys.stderr, flush=True)
+"""
+
+SEES = """
+import json, os
+
+
+def application(environ, start_response):
+    body = json.dumps({"listed": "MURU_INSTRUMENTATION" in os.environ}).encode()
+    start_response("200 OK", [("Content-Type", "application/json")])
+    return [body]
+"""
+
+
+def test_instrumentation_modules_listed_in_the_project_run_before_the_application(
+    tmp_path: Path,
+) -> None:
+    # Section 6.15: muru.local.toml's module first, then the project's,
+    # each configured with its own settings in the host, before the hooks
+    # module; the application never sees the list.
+
+    (tmp_path / "local_tool.py").write_text(INSTRUMENT)
+    (tmp_path / "project_tool.py").write_text(INSTRUMENT)
+    (tmp_path / "sees.py").write_text(SEES)
+    shutil.copy(support.FIXTURES / "hooks_log.py", tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.muru]\n"
+        "entrypoint = 'sees:application'\n"
+        "hooks = 'hooks_log'\n\n"
+        "[[tool.muru.instrumentation]]\n"
+        "module = 'project_tool'\n"
+        "settings = { output = 'times.json', top = 5 }\n"
+    )
+    (tmp_path / "muru.local.toml").write_text("[[instrumentation]]\nmodule = 'local_tool'\n")
+    server = support.start(None, chdir=tmp_path, workers=WORKERS)
+
+    try:
+        host = server.host_pid()
+        lines = [
+            line[line.find("INSTRUMENT ") :]
+            if "INSTRUMENT " in line
+            else line[line.find("HOOK ") :]
+            for line in server.log().splitlines()
+            if "INSTRUMENT " in line or "HOOK on_load" in line
+        ]
+        assert lines[:9] == [
+            f"INSTRUMENT configure local_tool pid={host} {{}}",
+            f'INSTRUMENT configure project_tool pid={host} {{"output": "times.json", "top": 5}}',
+            "INSTRUMENT before local_tool hooks",
+            "INSTRUMENT before project_tool hooks",
+            "INSTRUMENT before local_tool entrypoint",
+            "INSTRUMENT before project_tool entrypoint",
+            f"HOOK on_load pid={host} worker=None app=sees",
+            "INSTRUMENT finished project_tool fork",
+            "INSTRUMENT finished local_tool fork",
+        ], server.log()
+        assert json.loads(server.get("/").body) == {"listed": False}
+    finally:
+        server.stop()
+
+
+WRAP_TOOL = """
+import os, sys
+
+
+def wrap_application(context, target, application, interface):
+    print(f"WRAP {target.kind} {target.name or '-'} {interface} pid={os.getpid()}",
+          file=sys.stderr, flush=True)
+
+    if interface == "wsgi":
+        def wrapped(environ, start_response):
+            def starting(status, headers, exc_info=None):
+                return start_response(status, [*headers, ("X-Wrapped", "wsgi")], exc_info)
+
+            return application(environ, starting)
+
+        return wrapped
+
+    async def wrapped_asgi(scope, receive, send):
+        if scope["type"] == "lifespan":
+            print("WRAP lifespan", file=sys.stderr, flush=True)
+            return await application(scope, receive, send)
+
+        async def sending(message):
+            if message["type"] == "http.response.start":
+                headers = [*message.get("headers", []), (b"x-wrapped", b"asgi")]
+                message = {**message, "headers": headers}
+
+            await send(message)
+
+        return await application(scope, receive, sending)
+
+    return wrapped_asgi
+
+
+def load_finished(context, outcome):
+    print(f"WRAP load_finished {outcome} pid={os.getpid()}", file=sys.stderr, flush=True)
+"""
+
+WRAPPED_APP = """
+def make():
+    def application(environ, start_response):
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"plain"]
+
+    return application
+
+
+async def api(scope, receive, send):
+    if scope["type"] == "lifespan":
+        while True:
+            message = await receive()
+
+            if message["type"] == "lifespan.startup":
+                await send({"type": "lifespan.startup.complete"})
+            else:
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    await send({"type": "http.response.body", "body": b"api"})
+"""
+
+
+def wrap_lines(server: support.Server) -> list[str]:
+    return [line[line.find("WRAP ") :] for line in server.log().splitlines() if "WRAP " in line]
+
+
+def test_wrap_application_wraps_every_entry_point_in_each_worker(tmp_path: Path) -> None:
+    # Section 6.15: a host-phase factory and an ASGI mount, preloaded,
+    # then a worker-phase factory imported in each worker; each entry
+    # point's application is wrapped in the worker, lifespan included.
+
+    (tmp_path / "wrap_tool.py").write_text(WRAP_TOOL)
+    (tmp_path / "wrapped_app.py").write_text(WRAPPED_APP)
+    project = (
+        "[tool.muru]\nentrypoint = 'wrapped_app:make'\nfactory = true\n"
+        "factory_phase = '{phase}'\npreload = '{preload}'\n{mount}"
+        "[[tool.muru.instrumentation]]\nmodule = 'wrap_tool'\n"
+    )
+    mount = (
+        "[tool.muru.mounts.api]\npath = '/api'\nentrypoint = 'wrapped_app:api'\n"
+        "interface = 'asgi'\n"
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        project.format(phase="host", preload="auto", mount=mount)
+    )
+    server = support.start(None, chdir=tmp_path, workers=WORKERS)
+
+    try:
+        assert server.get("/").header("X-Wrapped") == "wsgi"
+        assert server.get("/api/").header("X-Wrapped") == "asgi"
+        lines = wrap_lines(server)
+        workers = {f"pid={pid}" for pid in server.worker_pids().values()}
+        entrypoints = [line for line in lines if line.startswith("WRAP entrypoint - wsgi")]
+        mounts = [line for line in lines if line.startswith("WRAP mount api asgi")]
+        assert {line.split()[-1] for line in entrypoints} == workers, lines
+        assert {line.split()[-1] for line in mounts} == workers, lines
+        assert lines.count("WRAP lifespan") == WORKERS, lines
+        assert lines[0] == f"WRAP load_finished fork pid={server.host_pid()}", lines
+    finally:
+        server.stop()
+
+    (tmp_path / "pyproject.toml").write_text(
+        project.format(phase="worker", preload="false", mount="")
+    )
+    server = support.start(None, chdir=tmp_path, workers=1)
+
+    try:
+        assert server.get("/").header("X-Wrapped") == "wsgi"
+        worker = server.worker_pids()[0]
+        assert wrap_lines(server) == [
+            f"WRAP load_finished serve pid={worker}",
+            f"WRAP entrypoint - wsgi pid={worker}",
+        ]
     finally:
         server.stop()
 
