@@ -224,8 +224,9 @@ fn sanitiser(dashboard: Option<&str>, markdown: bool) -> ammonia::Builder<'stati
 }
 
 /// Markdown as HTML, before it is sanitised: CommonMark with tables and
-/// strikethrough, headings moved to the levels panels use, and HTML
-/// written into the markdown shown as the text it is.
+/// strikethrough, headings moved to the levels panels use, a table
+/// column's alignment as a class, and HTML written into the markdown
+/// shown as the text it is.
 fn markdown(text: &str) -> String {
     use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
 
@@ -258,6 +259,20 @@ fn markdown(text: &str) -> String {
     let mut drawn = String::from("<div class=\"markdown\">");
     html::push_html(&mut drawn, events);
     drawn.push_str("</div>");
+
+    // pulldown-cmark aligns a column with a style attribute, which the
+    // sanitiser removes. Only it can write these exact tags, since text,
+    // code and HTML in the markdown come out escaped.
+
+    for cell in ["th", "td"] {
+        for align in ["left", "center", "right"] {
+            drawn = drawn.replace(
+                &format!("<{cell} style=\"text-align: {align}\">"),
+                &format!("<{cell} class=\"align-{align}\">"),
+            );
+        }
+    }
+
     drawn
 }
 
@@ -1264,7 +1279,8 @@ mod tests {
         assert!(
             markdown.contains("<table>")
                 && markdown.contains("<th>statement</th>")
-                && markdown.contains("<td>7</td>"),
+                && markdown.contains("<th class=\"align-right\">times</th>")
+                && markdown.contains("<td class=\"align-right\">7</td>"),
             "{markdown}"
         );
         assert!(
