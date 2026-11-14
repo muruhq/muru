@@ -73,7 +73,7 @@ Hooks live in a module named by the hooks setting. Each receives a context objec
 | on_exit | worker, after lifespan shutdown, before its `atexit` callbacks | clean up |
 | on_reopen_logs | worker, on SIGUSR1 | reopen application-owned log files |
 
-An exception from on_load, pre_fork, post_fork or on_ready fails the host or the worker it runs in; one from on_drain, on_exit or on_reopen_logs is logged. Before every fork the host checks that it is still single-threaded and logs a warning naming the thread count otherwise, since threads do not exist in the child.
+An exception from on_load, pre_fork, post_fork or on_ready fails the host or the worker it runs in; one from on_drain, on_exit or on_reopen_logs is logged. Tools set up apart from the application, such as an import timer or an APM agent, are instrumentation modules (section 6.15), a separate layer with callbacks of their own, not hooks. Before every fork the host checks that it is still single-threaded and logs a warning naming the thread count otherwise, since threads do not exist in the child.
 
 A worker stops in this order: SIGTERM, on_drain, its requests finish (section 7.6), lifespan shutdown, on_exit, the callbacks registered with `atexit` on the main thread, the loop stops, the output streams are flushed, and `os._exit`. A forked child ends with `os._exit` rather than interpreter finalization: it must not unwind through the host's frames, `Py_Finalize` would dirty preloaded pages, and there is no wait on non-daemon threads, whose join has no time limit. So the worker runs the `atexit` callbacks itself, before the loop stops so that one still needing the loop can use it, and a callback can stop and join a thread of its own. `atexit._run_exitfuncs()` clears the list, so a worker that fails to start runs them too and a `--single` run, which does finalize, does not run them twice. Callbacks inherited from preload run in every worker, as Python offers no way to tell them from those registered after the fork, so what they clean up is cleaned up by the first worker to exit. They come out of the worker's stop budget.
 
@@ -324,3 +324,34 @@ async def app(scope, receive, send):
 **The WebSocket adapter.** `muru.asgi.websocket.Handler(handler, subprotocol=None, headers=None, executor=None)` is an ordinary ASGI application. It accepts the socket, with the subprotocol only when the client offered it, and calls `handler.on_connect(ws)`, `handler.on_receive(ws, message)` for each message (str for text, bytes for binary) and `handler.on_disconnect(ws, code, reason)`, each on a thread, one at a time per socket and in order, every call inside one contextvars context created at accept, so values set in on_connect are visible in later calls whichever thread runs them. Different sockets run concurrently. The `Socket` passed to the callbacks has `send(data)`, usable from any thread and blocking with the interpreter released only when the client is slow, `close(code=1000, reason="")`, and `subprotocol`; `send` raises `ConnectionClosed` once the peer has gone. An exception from a callback closes the socket with 1011. A handler must not block waiting for a message on its own socket, since the next message is not delivered until the current call returns. Under Muru the executor defaults to the loop's pool for synchronous code (section 6.6), whatever the interface of the worker's default mount, so the callbacks take none of the application threads that WSGI requests are counted against (section 5.1), and a thread running one is counted and named with its socket's request as any call on that pool is (section 11.7); under any other ASGI server it defaults to a thread pool of its own, and the adapter runs unchanged, so it can also be mounted directly from Starlette or called from a Channels router. Applications that already have a Channels consumer or a Starlette endpoint hand those off instead and never see the adapter. Broadcast is the application's concern: it keeps its own registry of sockets and calls send() on them. On worker drain every socket is closed with 1001.
 
 **What is not provided.** A form that holds the WSGI thread for the life of a socket was considered and not offered (ADR 0023); the adapter gives the same programming model without the thread. Generic sync_to_async and async_to_sync helpers are asgiref's (section 20.9).
+
+## 6.15 Instrumentation modules
+
+Instrumentation is set up apart from the application ([ADR 0064](../adr/0064-instrumentation-is-a-layer-apart-from-the-hooks.md), issue 500). An operator adds a tool, such as an import timer or an APM agent, to a release without changing the application's code or its hooks module (section 6.3), which is imported as part of loading the application and so too late for a tool that must be in place before the first application import. A release takes an ordered list of instrumentation modules, each with settings of its own:
+
+```toml
+[tool.muru]
+hooks = "shop.hooks"
+
+[[tool.muru.instrumentation]]
+module = "importtimer"
+
+[tool.muru.instrumentation.settings]
+output = "/tmp/import-times.json"
+
+[[tool.muru.instrumentation]]
+module = "newrelic_setup"
+settings = { app_name = "shop", shutdown_timeout = 3 }
+```
+
+- **Where it is set.** `[[tool.muru.instrumentation]]` in `pyproject.toml`, `[[instrumentation]]` in `muru.toml` and `muru.local.toml`, and `instrumentation` in a declared release's table, which replaces the source's list when it gives one. The list is a table, so a deploy takes it from the source, never from the release before it (section 3.3). Entries of `muru.local.toml` come before the project's, so a timer one developer adds also measures the other modules; the daemon and `muructl serve` read no local file. Each entry has `module`, a dotted Python module name, and optional `settings`, a table of any values. A module named twice is refused. The release record keeps the list, and exports, dry runs and `--print-config` show it.
+
+- **Callbacks.** Optional module-level functions, found by name as the hooks module's are; nothing in the configuration says which a module has. An attribute with a callback's name that is not callable is logged and left out.
+
+- **configure(settings).** Called once, straight after the module is imported, with a dict of that entry's settings alone, empty when it has none. A module never sees another's settings, and the application never sees any: the host is given the list in a variable of its own environment, `MURU_INSTRUMENTATION`, which it removes before importing anything.
+
+- **Order.** Each module is imported, configured and started before the next is imported, so an earlier module can measure a later one's import. Callbacks that start something run in listed order, and those that stop something in reverse.
+
+- **Where they run.** The modules are imported wherever the application is: in the host under preload, before the import check takes its baseline (section 6.2) and before the hooks module, and with per-worker imports in each worker before the application. After the fallback to per-worker imports, they have been imported once in the host and are imported again in each worker. `muructl check` imports and configures them as the host does and reports the callbacks each defines.
+
+- **Failures.** A module that cannot be imported stops the release, as an entrypoint that cannot be imported does: in the host the release fails to start, and with per-worker imports the worker fails to start. An exception from any callback, `configure` included, is logged with its traceback and the release carries on, so a problem in an agent cannot stop workers from starting.

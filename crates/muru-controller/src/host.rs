@@ -118,6 +118,10 @@ pub struct MemoryReplacement {
     pub pid: u32,
 }
 
+/// The variable that gives the host its instrumentation list, as JSON
+/// (section 6.15).
+pub const INSTRUMENTATION_VARIABLE: &str = "MURU_INSTRUMENTATION";
+
 /// What one worker last reported to its host (sections 7.6 and 7.7).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkerStatus {
@@ -532,6 +536,9 @@ pub struct HostSpec {
     pub preload: muru_config::Preload,
     /// The hooks module, if any.
     pub hooks: Option<String>,
+    /// The instrumentation modules, in order (section 6.15), given to the
+    /// host in `MURU_INSTRUMENTATION`.
+    pub instrumentation: Vec<muru_config::Instrumentation>,
     /// The directory to run the host in.
     pub chdir: Option<PathBuf>,
     /// Loopback TCP instead of Unix sockets for the link, from this port.
@@ -1189,6 +1196,19 @@ impl HostProcess {
         }
 
         command.envs(spec.env.iter().map(|(name, value)| (name, value)));
+
+        // Section 6.15: the instrumentation list, which the host takes out
+        // of its environment before it imports anything.
+
+        if spec.instrumentation.is_empty() {
+            command.env_remove(INSTRUMENTATION_VARIABLE);
+        } else {
+            command.env(
+                INSTRUMENTATION_VARIABLE,
+                serde_json::to_string(&spec.instrumentation)
+                    .context("the instrumentation list could not be written")?,
+            );
+        }
 
         // Section 11.7: the release's variables whose values debug
         // inspect shows, beside Muru's own and the interpreter's.

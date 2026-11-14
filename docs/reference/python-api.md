@@ -49,6 +49,18 @@ no fork, so `pre_fork` does not run.
 [Preload and fork safety](../explanation/preload.md) explains what the
 hooks are for.
 
+## Instrumentation callbacks
+
+An instrumentation module, listed in `[[tool.muru.instrumentation]]`,
+may define any of these module-level functions; see
+[Instrumentation modules](../howto/instrumentation.md) for where they
+are listed and when they are imported. Their return values are ignored,
+and an exception from one is logged and otherwise ignored.
+
+| Callback | Where and when |
+| --- | --- |
+| `configure(settings)` | Wherever the module is imported, once, straight after the import, with a `dict` of its entry's settings |
+
 ## `muru.is_internal()`
 
 `muru.is_internal(environ_or_scope)` returns whether the request arrived

@@ -3703,6 +3703,12 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         message: release.message,
         source: release.spec.source.display().to_string(),
         entrypoint: release.spec.entrypoint,
+        instrumentation: release
+            .spec
+            .instrumentation
+            .iter()
+            .map(|entry| entry.module.clone())
+            .collect(),
         interface: release.spec.interface.as_str().to_owned(),
         python: release.spec.python.display().to_string(),
         python_version: release

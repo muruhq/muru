@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import sysconfig
 import time
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from support import server as support
@@ -176,6 +178,67 @@ def test_preload_false_imports_in_each_worker() -> None:
     try:
         assert "preloaded" not in server.log()
         assert import_pids(server, WORKERS * 8) == set(server.worker_pids().values())
+    finally:
+        server.stop()
+
+
+INSTRUMENT = """
+import json, os, sys
+
+
+def configure(settings):
+    print(f"INSTRUMENT configure {__name__} pid={os.getpid()} {json.dumps(settings)}",
+          file=sys.stderr, flush=True)
+"""
+
+SEES = """
+import json, os
+
+
+def application(environ, start_response):
+    body = json.dumps({"listed": "MURU_INSTRUMENTATION" in os.environ}).encode()
+    start_response("200 OK", [("Content-Type", "application/json")])
+    return [body]
+"""
+
+
+def test_instrumentation_modules_listed_in_the_project_run_before_the_application(
+    tmp_path: Path,
+) -> None:
+    # Section 6.15: muru.local.toml's module first, then the project's,
+    # each configured with its own settings in the host, before the hooks
+    # module; the application never sees the list.
+
+    (tmp_path / "local_tool.py").write_text(INSTRUMENT)
+    (tmp_path / "project_tool.py").write_text(INSTRUMENT)
+    (tmp_path / "sees.py").write_text(SEES)
+    shutil.copy(support.FIXTURES / "hooks_log.py", tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.muru]\n"
+        "entrypoint = 'sees:application'\n"
+        "hooks = 'hooks_log'\n\n"
+        "[[tool.muru.instrumentation]]\n"
+        "module = 'project_tool'\n"
+        "settings = { output = 'times.json', top = 5 }\n"
+    )
+    (tmp_path / "muru.local.toml").write_text("[[instrumentation]]\nmodule = 'local_tool'\n")
+    server = support.start(None, chdir=tmp_path, workers=WORKERS)
+
+    try:
+        host = server.host_pid()
+        lines = [
+            line[line.find("INSTRUMENT ") :]
+            if "INSTRUMENT " in line
+            else line[line.find("HOOK ") :]
+            for line in server.log().splitlines()
+            if "INSTRUMENT " in line or "HOOK on_load" in line
+        ]
+        assert lines[:3] == [
+            f"INSTRUMENT configure local_tool pid={host} {{}}",
+            f'INSTRUMENT configure project_tool pid={host} {{"output": "times.json", "top": 5}}',
+            f"HOOK on_load pid={host} worker=None app=sees",
+        ], server.log()
+        assert json.loads(server.get("/").body) == {"listed": False}
     finally:
         server.stop()
 

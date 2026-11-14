@@ -5371,6 +5371,7 @@ impl Daemon {
             concurrency: spec.concurrency as usize,
             preload: spec.preload,
             hooks: spec.hooks.clone(),
+            instrumentation: spec.instrumentation.clone(),
             chdir: Some(spec.source.clone()),
             tcp_base_port: None,
             single: false,

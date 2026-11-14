@@ -2,7 +2,7 @@
 
 # muru.local.toml
 
-A developer's own settings for `muructl run`, in `muru.local.toml` beside the project, which is not committed. Its `[run]` table holds the keys of `[tool.muru.run]` and takes precedence over them; lists add to the project's.
+A developer's own settings for `muructl run`, in `muru.local.toml` beside the project, which is not committed. Its `[run]` table holds the keys of `[tool.muru.run]` and takes precedence over them; lists add to the project's. Its `[[instrumentation]]` entries come before the project's.
 
 The JSON Schema of the same keys, for an editor that checks TOML against one, is `https://docs.muruhq.dev/en/latest/schema/local.schema.json`.
 
@@ -12,6 +12,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `build` | table, {ref}`[build] <config-local-build>` |  | When `muructl run` builds the environment. |
+| `instrumentation` | array of tables, {ref}`[[instrumentation]] <config-local-instrumentation>` |  | Instrumentation modules for this machine's runs, before the project's own. |
 | `run` | table, {ref}`[run] <config-local-run>` |  | How `muructl run` serves the project, over `[tool.muru.run]`. |
 
 (config-local-build)=
@@ -22,6 +23,16 @@ The `[build]` table of muru.local.toml.
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `when` | string |  | When the environment is built before the application starts. `auto`: Build a missing environment; leave an existing one alone at start, and under `muructl run` build when the lock changes. `always`: Build before every start too. `never`: Build nothing. |
+
+(config-local-instrumentation)=
+## `[[instrumentation]]`
+
+One instrumentation module of a release: a tool such as an import timer or an APM agent, imported before the application and set up apart from it, with settings that only it is given.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `module` | string | required | The module, as a dotted Python module name. |
+| `settings` | table |  | The settings its `configure` function is given, as a table of any values. |
 
 (config-local-run)=
 ## `[run]`

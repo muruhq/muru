@@ -111,6 +111,9 @@ Recipes for specific tasks, assuming you already know the basics. The
 - [Inspecting requests in development](toolbar.md): the debug toolbar
   on each page, timings in the browser, and a record of each request a
   development run serves.
+- [Instrumentation modules](instrumentation.md): tools such as import
+  timers and APM agents, set up for a release apart from the
+  application.
 
 ## Coding agents
 
@@ -167,5 +170,6 @@ events
 dashboard
 debugging
 toolbar
+instrumentation
 coding-agents
 ```

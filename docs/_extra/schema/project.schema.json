@@ -415,6 +415,25 @@
         }
       ]
     },
+    "Instrumentation": {
+      "additionalProperties": false,
+      "description": "One instrumentation module of a release: a tool such as an import timer or an APM agent, imported before the application and set up apart from it, with settings that only it is given.",
+      "properties": {
+        "module": {
+          "description": "The module, as a dotted Python module name.",
+          "type": "string"
+        },
+        "settings": {
+          "additionalProperties": true,
+          "description": "The settings its `configure` function is given, as a table of any values.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "module"
+      ],
+      "type": "object"
+    },
     "Interface": {
       "description": "The interface an entrypoint speaks.",
       "oneOf": [
@@ -1419,6 +1438,13 @@
     "hooks": {
       "description": "The module providing the lifecycle hooks.",
       "type": "string"
+    },
+    "instrumentation": {
+      "description": "The instrumentation modules, in order, each with its settings, imported before anything of the application.",
+      "items": {
+        "$ref": "#/$defs/Instrumentation"
+      },
+      "type": "array"
     },
     "interface": {
       "$ref": "#/$defs/Interface",

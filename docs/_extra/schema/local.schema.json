@@ -20,6 +20,25 @@
         }
       ]
     },
+    "Instrumentation": {
+      "additionalProperties": false,
+      "description": "One instrumentation module of a release: a tool such as an import timer or an APM agent, imported before the application and set up apart from it, with settings that only it is given.",
+      "properties": {
+        "module": {
+          "description": "The module, as a dotted Python module name.",
+          "type": "string"
+        },
+        "settings": {
+          "additionalProperties": true,
+          "description": "The settings its `configure` function is given, as a table of any values.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "module"
+      ],
+      "type": "object"
+    },
     "LocalBuild": {
       "additionalProperties": false,
       "description": "The `[build]` table of muru.local.toml.",
@@ -169,6 +188,13 @@
     "build": {
       "$ref": "#/$defs/LocalBuild",
       "description": "When `muructl run` builds the environment."
+    },
+    "instrumentation": {
+      "description": "Instrumentation modules for this machine's runs, before the project's own.",
+      "items": {
+        "$ref": "#/$defs/Instrumentation"
+      },
+      "type": "array"
     },
     "run": {
       "$ref": "#/$defs/RunSettings",

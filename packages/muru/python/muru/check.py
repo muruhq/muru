@@ -2,7 +2,9 @@
 
 ``muructl check`` runs this module in the application's interpreter
 (design specification section 6.8): the hooks module and the entrypoint
-are imported under the import check of section 6.2, the entrypoint is
+are imported under the import check of section 6.2, after the
+instrumentation modules of section 6.15 are imported and configured as
+the host does, the entrypoint is
 settled as WSGI, ASGI or gRPC with the signature rules the host applies,
 and the mounts are loaded the same way. The on_load and pre_fork hooks
 run where the host runs them, before the check. Nothing is served and
@@ -20,6 +22,7 @@ from typing import Any
 
 from muru import __version__, host, preload
 from muru._context import Context
+from muru._instrumentation import Entry, Instruments
 from muru.hooks import Hooks
 
 __all__ = ["main"]
@@ -89,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
         "muru": __version__,
         "entrypoints": [],
         "hooks": [],
+        "instrumentation": [],
         "findings": [],
         "errors": [],
     }
@@ -105,25 +109,42 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
 
+    # Section 6.15: the instrumentation modules come first, before the
+    # import check's baseline, as in the host.
+
+    instruments = Instruments()
+
+    try:
+        instruments = Instruments(Entry.take())
+        instruments.load()
+    except Exception as error:
+        failed(error)
+
+    report["instrumentation"] = [
+        {"module": module, "callbacks": callbacks}
+        for module, callbacks in instruments.defined().items()
+    ]
+
     with preload.ImportRecorder() as recorder:
-        try:
-            if args.hooks:
-                recorder.import_module(args.hooks)
-                hooks = Hooks.load(args.hooks)
-                report["hooks"] = sorted(hooks.functions)
+        if report["ok"]:
+            try:
+                if args.hooks:
+                    recorder.import_module(args.hooks)
+                    hooks = Hooks.load(args.hooks)
+                    report["hooks"] = sorted(hooks.functions)
 
-            report["entrypoints"].append(
-                load(args.app, args.interface, args.factory, args.factory_phase, recorder)
-            )
+                report["entrypoints"].append(
+                    load(args.app, args.interface, args.factory, args.factory_phase, recorder)
+                )
 
-            for name, entrypoint, interface in args.mount:
-                loaded = load(entrypoint, interface, False, "worker", recorder)
-                loaded["mount"] = name
-                report["entrypoints"].append(loaded)
+                for name, entrypoint, interface in args.mount:
+                    loaded = load(entrypoint, interface, False, "worker", recorder)
+                    loaded["mount"] = name
+                    report["entrypoints"].append(loaded)
 
-            hooks.call("on_load", context)
-        except Exception as error:
-            failed(error)
+                hooks.call("on_load", context)
+            except Exception as error:
+                failed(error)
 
     # Section 6.2: the host runs pre_fork before its import check, so
     # what pre_fork closes is not a finding here either.

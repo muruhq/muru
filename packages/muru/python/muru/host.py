@@ -63,6 +63,7 @@ from muru import RequestTimeout, _asgi, _inspect, _outside, preload
 from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
+from muru._instrumentation import Entry, InstrumentationError, Instruments
 from muru.hooks import Hooks
 
 WSGIApplication = Callable[..., Any]
@@ -480,6 +481,11 @@ class Release:
     hooks: Hooks | None = None
     resolved: str | None = None
     """The interface the application is served with, once it is known."""
+
+    # Section 6.15: the instrumentation modules, imported before the
+    # hooks module.
+
+    instruments: Instruments = field(default_factory=Instruments)
 
     @property
     def preloaded(self) -> bool:
@@ -1521,9 +1527,11 @@ class Host:
             if release.preloaded:
                 hooks = release.hooks or Hooks()
             else:
-                # Per-worker imports: everything the host would have done.
+                # Per-worker imports: everything the host would have done,
+                # the instrumentation modules first (section 6.15).
 
                 started = time.monotonic()
+                release.instruments.load()
                 hooks = release.load()
                 for mount in mounts:
                     mount.release.load()
@@ -4897,6 +4905,15 @@ def main(argv: list[str] | None = None) -> int:
         print("--processes must be at least 1", file=sys.stderr)
         return 2
 
+    # Section 6.15: the instrumentation list leaves the environment before
+    # anything else is imported, so the application never sees it.
+
+    try:
+        instrumentation = Entry.take()
+    except ValueError as error:
+        print(f"cannot read the instrumentation list: {error}", file=sys.stderr)
+        return 2
+
     context = Context(
         app=args.name or app_name(args.app),
         release=args.release or "dev",
@@ -4911,6 +4928,7 @@ def main(argv: list[str] | None = None) -> int:
         interface=args.interface,
         factory=args.factory,
         factory_phase=args.factory_phase,
+        instruments=Instruments(instrumentation),
     )
 
     try:
@@ -4951,6 +4969,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.preload != "false":
         started = time.monotonic()
+
+        # Section 6.15: the instrumentation modules are in place before the
+        # import check takes its baseline and before anything of the
+        # application is imported.
+
+        try:
+            release.instruments.load()
+        except InstrumentationError as error:
+            log(str(error))
+            return 1
 
         with preload.ImportRecorder() as recorder:
             try:
@@ -5002,6 +5030,13 @@ def main(argv: list[str] | None = None) -> int:
                 "replacement and no shared memory; set preload to false to silence this"
             )
             flush_streams()
+
+            # The instrumentation list goes back in the environment, so
+            # the host started again gives it to each worker.
+
+            if instrumentation:
+                os.environ[Entry.ENVIRONMENT] = Entry.encode(instrumentation)
+
             os.execv(
                 sys.executable,
                 [

@@ -1861,6 +1861,9 @@ struct Resolved {
     concurrency: usize,
     preload: muru_config::Preload,
     hooks: Option<String>,
+    /// The instrumentation modules (section 6.15): muru.local.toml's,
+    /// then the table's.
+    instrumentation: Vec<muru_config::Instrumentation>,
     /// The directory the host runs in.
     project: PathBuf,
     /// The file the table came from, when there was one.
@@ -2002,10 +2005,20 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         None => muru_config::load_local(&project, source.as_deref())?,
     };
 
-    let (local, local_run, local_build_when) = match local_file {
-        Some((path, file)) => (Some(path), file.run, file.build_when),
-        None => (None, muru_config::RunSettings::default(), None),
+    let (local, local_run, local_build_when, local_instrumentation) = match local_file {
+        Some((path, file)) => (Some(path), file.run, file.build_when, file.instrumentation),
+        None => (None, muru_config::RunSettings::default(), None, Vec::new()),
     };
+
+    // Section 6.15: this machine's instrumentation modules come before the
+    // project's, so a tool one developer adds measures the others too.
+
+    let instrumentation: Vec<muru_config::Instrumentation> = local_instrumentation
+        .into_iter()
+        .chain(table.instrumentation.iter().cloned())
+        .collect();
+    muru_config::check_instrumentation(&instrumentation)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     let layers = print_config::Layers::new(&table, &run_table, &local_run);
     let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
@@ -2165,6 +2178,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
             .or(table.preload)
             .unwrap_or(muru_config::Preload::Auto),
         hooks: args.hooks.clone().or(table.hooks),
+        instrumentation,
         project,
         source,
         groups: table.groups,
@@ -2661,9 +2675,20 @@ struct CheckReport {
     #[serde(default)]
     hooks: Vec<String>,
     #[serde(default)]
+    instrumentation: Vec<CheckInstrument>,
+    #[serde(default)]
     findings: Vec<CheckFinding>,
     #[serde(default)]
     errors: Vec<CheckError>,
+}
+
+/// An instrumentation module the check imported (section 6.15), with the
+/// callbacks it defines.
+#[derive(Debug, serde::Deserialize)]
+struct CheckInstrument {
+    module: String,
+    #[serde(default)]
+    callbacks: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2789,6 +2814,17 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
         command.arg("--hooks").arg(hooks);
     }
 
+    // Section 6.15: the instrumentation modules, as the host is given them.
+
+    if resolved.instrumentation.is_empty() {
+        command.env_remove(muru_controller::host::INSTRUMENTATION_VARIABLE);
+    } else {
+        command.env(
+            muru_controller::host::INSTRUMENTATION_VARIABLE,
+            serde_json::to_string(&resolved.instrumentation)?,
+        );
+    }
+
     for (name, mount) in &resolved.mounts {
         command.arg("--mount").arg(format!(
             "{name}={}={}",
@@ -2848,6 +2884,21 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
             "muru: check: warning: the interpreter imported muru {} where {} was provided",
             report.muru, library.version
         );
+    }
+
+    for instrument in &report.instrumentation {
+        if instrument.callbacks.is_empty() {
+            println!(
+                "muru: check: instrumentation module {} defines no callbacks",
+                instrument.module
+            );
+        } else {
+            println!(
+                "muru: check: instrumentation module {} defines {}",
+                instrument.module,
+                instrument.callbacks.join(", ")
+            );
+        }
     }
 
     for entrypoint in &report.entrypoints {
@@ -3294,6 +3345,7 @@ async fn run_with(
         concurrency: resolved.concurrency,
         preload: resolved.preload,
         hooks: resolved.hooks.clone(),
+        instrumentation: resolved.instrumentation.clone(),
         chdir: Some(resolved.project.clone()),
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
         single: args.single,
