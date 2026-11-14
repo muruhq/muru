@@ -4,8 +4,8 @@ A release lists instrumentation modules apart from its hooks module: tools
 such as an import timer or an APM agent, set up by someone who need not
 change the application. They are imported wherever the application is, in
 the host under preload and in each worker with per-worker imports, and
-before anything of it. Each is imported and configured before the next is
-imported, so an earlier one can measure a later one's import.
+before anything of it. Each is imported, configured and started before the
+next is imported, so an earlier one can measure a later one's import.
 
 A module defines any of the callbacks in ``CALLBACKS`` at module level,
 found by name. A module that cannot be imported stops the release; an

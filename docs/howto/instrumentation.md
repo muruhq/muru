@@ -62,7 +62,7 @@ them by name; nothing in the configuration says which a module has.
 | `load_started(context)` | Straight after `configure`, before the next module is imported and before anything of the application |
 | `before_import(context, target)` | Before the application's hooks module, its entrypoint and each mount is imported |
 | `after_import(context, target)` | After each of those imports, with `target.error` set when it failed |
-| `load_finished(context, outcome)` | Once the application is loaded, or its load has failed, before any worker is forked |
+| `load_finished(context, outcome)` | Once the application's load is done or has failed, before the host forks the workers, or before a worker that imported it serves |
 | `worker_started(context)` | In each worker, just before its `post_fork` hook |
 | `wrap_application(context, target, application, interface)` | In each worker, once for each entry point, with its application, before the worker serves; what it returns is served in place of the application |
 | `worker_stopped(context)` | In each worker that ran `worker_started`, as the last thing it does |
@@ -279,8 +279,9 @@ fork and before `worker_started`, with `load_finished` told `serve`.
 
 ## When the modules are imported
 
-Each module is imported and configured before the next one is
-imported, so an earlier module can measure a later one's import.
+Each module is imported, configured and started with `load_started`
+before the next one is imported, so an earlier module can measure a
+later one's import.
 
 - **Preload.** The host imports the modules before the application's
   hooks module and entrypoint, and before the import check takes its
@@ -315,8 +316,8 @@ imported, so an earlier module can measure a later one's import.
   package of its own is imported alone.
 
 - **Install its packages through a dependency group.** Put the tool's
-  packages in a dependency group of the project and
-  name the group in `[tool.muru.build]`:
+  packages in a dependency group of the project and name the group in
+  `[tool.muru.build]`:
 
   ```toml
   [dependency-groups]
