@@ -193,7 +193,7 @@ impl Recorder {
             (record.request_id == request_id).then(|| record.clone())
         })?;
 
-        record.panels = crate::panels::builtin(&record);
+        record.panels = crate::panels::all(&record);
         Some(record)
     }
 
@@ -416,7 +416,50 @@ pub fn worker(record: &mut admin::RequestRecord, part: muru_proto::worker::v1::W
             .collect(),
         loop_lag: part.loop_lag,
         loop_lag_at: part.loop_lag_at,
+        panels: part.panels.into_iter().map(panel).collect(),
     });
+}
+
+/// A panel an extension added in the worker (issue 677), as the record
+/// keeps it: its spans still on the worker's clock.
+fn panel(panel: muru_proto::worker::v1::RecordPanel) -> admin::Panel {
+    fn span(taken: muru_proto::worker::v1::RecordSpan) -> admin::PanelSpan {
+        admin::PanelSpan {
+            name: taken.name,
+            start_ms: taken.start,
+            duration_ms: taken.duration.max(0.0),
+            category: taken.category,
+            children: taken.children.into_iter().map(span).collect(),
+        }
+    }
+
+    admin::Panel {
+        name: panel.name,
+        title: panel.title,
+        spans: panel.spans.into_iter().map(span).collect(),
+        values: panel
+            .values
+            .into_iter()
+            .map(|value| admin::PanelValue {
+                name: value.name,
+                value: value.value,
+            })
+            .collect(),
+        tables: panel
+            .tables
+            .into_iter()
+            .map(|table| admin::PanelTable {
+                caption: table.caption,
+                columns: table.columns,
+                rows: table
+                    .rows
+                    .into_iter()
+                    .map(|row| admin::PanelRow { cells: row.cells })
+                    .collect(),
+            })
+            .collect(),
+        dropped: panel.dropped,
+    }
 }
 
 /// Mark a record's worker part as never arriving.

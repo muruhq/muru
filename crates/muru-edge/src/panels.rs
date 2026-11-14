@@ -24,7 +24,12 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("logs", include_str!("../panels/logs.html")),
     ("errors", include_str!("../panels/errors.html")),
     ("connection", include_str!("../panels/connection.html")),
+    (GENERIC, include_str!("../panels/panel.html")),
 ];
+
+/// The template of a panel with none of its own, such as one Muru's
+/// extensions add in the worker (issue 677).
+const GENERIC: &str = "panel";
 
 /// The elements a panel may use: text, tables, lists, code, details,
 /// meters, progress bars, times and abbreviations.
@@ -112,12 +117,13 @@ impl Renderer {
         }
     }
 
-    /// Draw a panel, sanitised. A panel without a template, or whose
-    /// template fails, is drawn as a sentence saying so.
+    /// Draw a panel, sanitised: by its own template, else the generic
+    /// one. A panel whose template fails is drawn as a sentence saying so.
     pub fn render(&self, panel: &admin::Panel) -> String {
         let drawn = self
             .templates
             .get_template(&format!("{}.html", panel.name))
+            .or_else(|_| self.templates.get_template(&format!("{GENERIC}.html")))
             .and_then(|template| {
                 template.render(context! { panel => minijinja::value::Serde(panel) })
             });
@@ -145,6 +151,41 @@ fn escape(text: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// A record's panels, in the order they are shown: the built-in ones,
+/// then those Muru's extensions added in the worker (issue 677), whose
+/// spans move from the worker's clock to the request's. One that takes a
+/// built-in panel's name is left out.
+pub fn all(record: &admin::RequestRecord) -> Vec<admin::Panel> {
+    let mut panels = builtin(record);
+
+    let added = record
+        .from_worker
+        .as_ref()
+        .map(|worker| worker.panels.as_slice())
+        .unwrap_or_default();
+
+    for panel in added {
+        if panels.iter().any(|shown| shown.name == panel.name) {
+            continue;
+        }
+
+        let mut panel = panel.clone();
+        shift(&mut panel.spans, record.queue_ms);
+        panels.push(panel);
+    }
+
+    panels
+}
+
+/// Spans moved from the worker's clock, which starts as the queue ends,
+/// to the request's.
+fn shift(spans: &mut [admin::PanelSpan], by: f64) {
+    for span in spans {
+        span.start_ms += by;
+        shift(&mut span.children, by);
+    }
 }
 
 /// The built-in panels of a record, in the order they are shown.
@@ -325,6 +366,7 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
             .filter(|table| !table.rows.is_empty())
             .into_iter()
             .collect(),
+        dropped: 0,
     }
 }
 
@@ -984,15 +1026,114 @@ mod tests {
     }
 
     #[test]
-    fn a_panel_with_no_template_says_so() {
+    fn a_panel_with_no_template_of_its_own_is_drawn_by_the_generic_one() {
         let renderer = Renderer::new(None);
-        let html = renderer.render(&admin::Panel {
-            name: "<nothing>".to_owned(),
+
+        let empty = renderer.render(&admin::Panel {
+            name: "nothing".to_owned(),
             ..Default::default()
         });
+        assert!(empty.contains("Nothing was added to this panel"), "{empty}");
+
+        let html = renderer.render(&admin::Panel {
+            name: "library".to_owned(),
+            title: "Library".to_owned(),
+            values: vec![value("books", "7")],
+            tables: vec![admin::PanelTable {
+                caption: "Queries".to_owned(),
+                columns: vec!["statement".to_owned(), "times".to_owned()],
+                rows: vec![admin::PanelRow {
+                    cells: vec![
+                        "SELECT name FROM author WHERE id = ?".to_owned(),
+                        "7".to_owned(),
+                    ],
+                }],
+            }],
+            spans: vec![admin::PanelSpan {
+                name: "books()".to_owned(),
+                start_ms: 1.0,
+                duration_ms: 3.0,
+                category: "view".to_owned(),
+                children: vec![admin::PanelSpan {
+                    name: "<script>".to_owned(),
+                    start_ms: 2.0,
+                    duration_ms: 0.5,
+                    category: "database".to_owned(),
+                    children: Vec::new(),
+                }],
+            }],
+            dropped: 2,
+        });
+
+        assert!(html.contains("<th>books</th>"), "{html}");
+        assert!(html.contains("<caption>Queries</caption>"), "{html}");
+        assert!(html.contains("WHERE id = ?"), "{html}");
         assert!(
-            html.contains("The &lt;nothing&gt; panel could not be drawn"),
+            html.contains("books()") && html.contains("depth-2"),
             "{html}"
         );
+        assert!(
+            html.contains("&lt;script&gt;") && !html.contains("<script>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("2 entries were past the panel's limits"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn an_extensions_panels_follow_the_built_in_ones_on_the_requests_clock() {
+        let mut record = admin::RequestRecord {
+            status: 200,
+            queue_ms: 4.0,
+            total_ms: 10.0,
+            ..Default::default()
+        };
+        record.from_worker = Some(admin::WorkerPart {
+            panels: vec![
+                admin::Panel {
+                    name: "trace".to_owned(),
+                    title: "Trace".to_owned(),
+                    spans: vec![admin::PanelSpan {
+                        name: "view".to_owned(),
+                        start_ms: 1.0,
+                        duration_ms: 2.0,
+                        children: vec![admin::PanelSpan {
+                            name: "query".to_owned(),
+                            start_ms: 1.5,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                admin::Panel {
+                    name: "timing".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let panels = all(&record);
+        let names: Vec<&str> = panels.iter().map(|panel| panel.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            [
+                "timing",
+                "where",
+                "response",
+                "logs",
+                "errors",
+                "connection",
+                "trace"
+            ]
+        );
+
+        let trace = &panels[6];
+        assert_eq!(trace.spans[0].start_ms, 5.0);
+        assert_eq!(trace.spans[0].children[0].start_ms, 5.5);
     }
 }

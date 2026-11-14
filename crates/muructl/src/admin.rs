@@ -2985,6 +2985,21 @@ fn request_text(record: &pb::RequestRecord) -> String {
                 }
             }
         }
+
+        // Issue 677: what an extension's panel could not keep.
+
+        if panel.dropped > 0 {
+            let entries = if panel.dropped == 1 {
+                "entry"
+            } else {
+                "entries"
+            };
+            let _ = writeln!(
+                text,
+                "  {} {entries} past the panel's limits not kept",
+                panel.dropped
+            );
+        }
     }
 
     text

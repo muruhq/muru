@@ -21,8 +21,17 @@ use pyo3::sync::PyOnceLock;
 
 use crate::wsgi::Outgoing;
 
-/// The runtime library's functions that keep a request's log records.
-static CAPTURE: PyOnceLock<(Py<PyAny>, Py<PyAny>)> = PyOnceLock::new();
+/// The runtime library's functions that keep a request's log records,
+/// and those that keep the panels Muru's extensions add (issue 677):
+/// each start and take.
+static CAPTURE: PyOnceLock<Capture> = PyOnceLock::new();
+
+struct Capture {
+    logs_start: Py<PyAny>,
+    logs_take: Py<PyAny>,
+    panels_start: Py<PyAny>,
+    panels_take: Py<PyAny>,
+}
 
 /// Set once the edge has asked for a record, which it does only in a
 /// development run: until then the pool and the event loop's heartbeat
@@ -283,6 +292,7 @@ impl Trace {
                 .unwrap_or_default(),
             logs: lines,
             logs_dropped: logs.dropped,
+            panels: logs.panels,
             thread_wait: millis(state.thread_wait),
             gil_wait: millis(Some(state.gil_wait)),
             gil_waits: state.gil_waits,
@@ -310,43 +320,145 @@ fn gc_during(before: &[(u64, u64); 4], after: &[(u64, u64); 4]) -> Vec<pb::GcDur
         .collect()
 }
 
-/// A request's log records as the runtime library kept them: each one's
-/// time on the wall clock, level, logger and message, and how many were
-/// past the limit.
+/// What the runtime library kept of a request for its record: its log
+/// records, each one's time on the wall clock, level, logger and message,
+/// with how many were past the limit; and the panels Muru's extensions
+/// added (issue 677).
 #[derive(Debug, Default)]
 pub struct Logs {
     kept: Vec<(f64, String, String, String)>,
     dropped: u32,
+    panels: Vec<pb::RecordPanel>,
 }
 
-fn capture(py: Python<'_>) -> PyResult<&(Py<PyAny>, Py<PyAny>)> {
+fn capture(py: Python<'_>) -> PyResult<&Capture> {
     CAPTURE.get_or_try_init(py, || {
-        let module = py.import("muru.logging")?;
-        Ok((
-            module.getattr("_capture_start")?.unbind(),
-            module.getattr("_capture_take")?.unbind(),
-        ))
+        let logging = py.import("muru.logging")?;
+        let panels = py.import("muru._panels")?;
+
+        Ok(Capture {
+            logs_start: logging.getattr("_capture_start")?.unbind(),
+            logs_take: logging.getattr("_capture_take")?.unbind(),
+            panels_start: panels.getattr("_start")?.unbind(),
+            panels_take: panels.getattr("_take")?.unbind(),
+        })
     })
 }
 
-/// Start keeping a request's log records.
+/// Start keeping a request's log records and panels.
 pub fn start_logs(request_id: &str) {
     Python::attach(|py| {
-        if let Err(error) = capture(py).and_then(|(start, _)| start.call1(py, (request_id,))) {
+        let started = capture(py).and_then(|capture| {
+            capture.logs_start.call1(py, (request_id,))?;
+            capture.panels_start.call1(py, (request_id,))
+        });
+
+        if let Err(error) = started {
             tracing::debug!(%error, "the request's log records cannot be kept");
         }
     });
 }
 
-/// Stop keeping a request's log records, and take them.
+/// Stop keeping a request's log records and panels, and take them.
 pub fn take_logs(request_id: &str) -> Logs {
     Python::attach(|py| {
-        capture(py)
-            .and_then(|(_, take)| take.call1(py, (request_id,)))
+        let Ok(capture) = capture(py) else {
+            return Logs::default();
+        };
+
+        let (kept, dropped) = capture
+            .logs_take
+            .call1(py, (request_id,))
             .and_then(|taken| taken.extract::<(Vec<(f64, String, String, String)>, u32)>(py))
-            .map(|(kept, dropped)| Logs { kept, dropped })
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        let panels = capture
+            .panels_take
+            .call1(py, (request_id,))
+            .and_then(|taken| panels(taken.bind(py)))
+            .unwrap_or_else(|error| {
+                tracing::debug!(%error, "the request's panels cannot be taken");
+                Vec::new()
+            });
+
+        Logs {
+            kept,
+            dropped,
+            panels,
+        }
     })
+}
+
+/// One panel as `muru._panels._take` gives it: its name, title, spans,
+/// values, tables (caption, columns, rows) and how many entries it dropped.
+type TakenPanel<'py> = (
+    String,
+    String,
+    Bound<'py, PyAny>,
+    Vec<(String, String)>,
+    Vec<(String, Vec<String>, Vec<Vec<String>>)>,
+    u32,
+);
+
+/// The panels as `muru._panels._take` gives them.
+fn panels(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordPanel>> {
+    let mut panels = Vec::new();
+
+    for item in taken.try_iter()? {
+        let item = item?;
+        let (name, title, spans, values, tables, dropped): TakenPanel<'_> = item.extract()?;
+
+        panels.push(pb::RecordPanel {
+            name,
+            title,
+            spans: self::spans(&spans)?,
+            values: values
+                .into_iter()
+                .map(|(name, value)| pb::RecordValue { name, value })
+                .collect(),
+            tables: tables
+                .into_iter()
+                .map(|(caption, columns, rows)| pb::RecordTable {
+                    caption,
+                    columns,
+                    rows: rows
+                        .into_iter()
+                        .map(|cells| pb::RecordRow { cells })
+                        .collect(),
+                })
+                .collect(),
+            dropped,
+        });
+    }
+
+    Ok(panels)
+}
+
+/// Spans as `muru._panels._span` gives them: name, start, duration,
+/// category and the spans beneath, which may nest.
+fn spans(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordSpan>> {
+    let mut spans = Vec::new();
+
+    for item in taken.try_iter()? {
+        let item = item?;
+        let (name, start, duration, category, children): (
+            String,
+            f64,
+            f64,
+            String,
+            Bound<'_, PyAny>,
+        ) = item.extract()?;
+
+        spans.push(pb::RecordSpan {
+            name,
+            start,
+            duration,
+            category,
+            children: self::spans(&children)?,
+        });
+    }
+
+    Ok(spans)
 }
 
 #[cfg(test)]
@@ -485,6 +597,7 @@ mod tests {
                 "low stock".to_owned(),
             )],
             dropped: 3,
+            panels: Vec::new(),
         };
         let record = trace.to_message(false, logs);
         assert_eq!(record.logs.len(), 1);
