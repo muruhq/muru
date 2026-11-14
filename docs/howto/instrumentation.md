@@ -59,6 +59,10 @@ them by name; nothing in the configuration says which a module has.
 | Function | Called |
 | --- | --- |
 | `configure(settings)` | Once, straight after the module is imported, with a `dict` of its entry's settings, empty when the entry has none |
+| `load_started(context)` | Straight after `configure`, before the next module is imported and before anything of the application |
+| `before_import(context, target)` | Before the application's hooks module, its entrypoint and each mount is imported |
+| `after_import(context, target)` | After each of those imports, with `target.error` set when it failed |
+| `load_finished(context, outcome)` | Once the application is loaded, or its load has failed, before any worker is forked |
 | `wrap_application(context, target, application, interface)` | In each worker, once for each entry point, with its application, before the worker serves; what it returns is served in place of the application |
 
 A module sees only its own settings, and the application sees none of
@@ -73,6 +77,90 @@ def configure(settings):
     global output
     output = settings.get("output", "import-times.json")
 ```
+
+## Timing the load
+
+`load_started`, `before_import`, `after_import` and `load_finished` let
+a tool follow the application's load, for example to time its imports:
+
+```python
+# importtimer.py
+import json
+import os
+import sys
+import time
+
+timings = {}
+current = None
+
+
+class Timer:
+    def find_spec(self, name, path, target=None):
+        ...  # time each module's load, charged to `current`
+
+
+def load_started(context):
+    sys.meta_path.insert(0, Timer())
+
+
+def before_import(context, target):
+    global current
+    current = target.name or target.kind
+
+
+def after_import(context, target):
+    global current
+    current = None
+
+
+def load_finished(context, outcome):
+    sys.meta_path[:] = [finder for finder in sys.meta_path if not isinstance(finder, Timer)]
+
+    with open(f"import-times-{os.getpid()}.json", "w") as output:
+        json.dump(timings, output)
+```
+
+- **Where the load runs.** Under preload the host runs the sequence
+  once, before any worker is forked. With per-worker imports each worker
+  runs it before its `post_fork` hook, loading only its own group's
+  mounts. After the fallback to per-worker imports, it runs once in the
+  host and again in each worker. `muructl check` runs it too, which
+  gives import timings without serving anything.
+
+- **What each pair covers.** `before_import` and `after_import` bracket
+  the hooks module (`target.kind` is `hooks`), the entrypoint
+  (`entrypoint`) and each mount (`mount`, with `target.name`), and a
+  factory the host calls falls inside the entrypoint's pair. What
+  `on_load` and `pre_fork` import falls outside any pair. `before_import`
+  runs in listed order and `after_import` in reverse, so the pairs of
+  several modules nest.
+
+- **load_finished.** It runs in reverse order after `pre_fork` and the
+  import check, once on every way out, and `outcome` says which:
+
+  | `outcome` | What happens next |
+  | --- | --- |
+  | `fork` | The host forks the workers from what it loaded |
+  | `serve` | This process serves what it loaded: a worker with per-worker imports, or `--single` |
+  | `fallback` | The host starts again with per-worker imports |
+  | `refused` | `preload = true` refused what the import check found, and the release fails |
+  | `failed` | An import, a factory the host calls, `on_load` or `pre_fork` failed, or an instrumentation module could not be imported |
+  | `check` | `muructl check` is done |
+
+  Nothing is turned off for a module there: a timer removes itself, and
+  an agent can leave its import hooks in place for the workers to
+  inherit.
+
+- **Writing an import timer.** Wrap `sys.meta_path` or the loaders, not
+  `builtins.__import__`: the entrypoint, the hooks module and the first
+  load of `from pkg import sub` are imported through
+  `importlib.import_module`, which does not call `__import__`. A module
+  that several entry points use is charged to the first one that loads
+  it, and modules Muru's host imported before the application cost
+  nothing. A file a timer writes needs a name that is unique to its
+  process, since the host and each worker may write one. Under preload
+  the import check also does a little work around each first import,
+  which shows in the importing module's own time.
 
 ## Wrapping an entry point's application
 

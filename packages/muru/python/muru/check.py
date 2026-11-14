@@ -20,9 +20,9 @@ import sys
 import traceback
 from typing import Any
 
-from muru import __version__, host, preload
+from muru import __version__, _instrumentation, host, preload
 from muru._context import Context
-from muru._instrumentation import Entry, Instruments
+from muru._instrumentation import Entry, Instruments, Target
 from muru.hooks import Hooks
 
 __all__ = ["main"]
@@ -116,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         instruments = Instruments(Entry.take())
-        instruments.load()
+        instruments.load(context)
     except Exception as error:
         failed(error)
 
@@ -129,16 +129,21 @@ def main(argv: list[str] | None = None) -> int:
         if report["ok"]:
             try:
                 if args.hooks:
-                    recorder.import_module(args.hooks)
-                    hooks = Hooks.load(args.hooks)
+                    with instruments.importing(context, Target("hooks", "", args.hooks)):
+                        recorder.import_module(args.hooks)
+                        hooks = Hooks.load(args.hooks)
+
                     report["hooks"] = sorted(hooks.functions)
 
-                report["entrypoints"].append(
-                    load(args.app, args.interface, args.factory, args.factory_phase, recorder)
-                )
+                with instruments.importing(context, Target("entrypoint", "", args.app)):
+                    report["entrypoints"].append(
+                        load(args.app, args.interface, args.factory, args.factory_phase, recorder)
+                    )
 
                 for name, entrypoint, interface in args.mount:
-                    loaded = load(entrypoint, interface, False, "worker", recorder)
+                    with instruments.importing(context, Target("mount", name, entrypoint)):
+                        loaded = load(entrypoint, interface, False, "worker", recorder)
+
                     loaded["mount"] = name
                     report["entrypoints"].append(loaded)
 
@@ -155,6 +160,15 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as error:
             failed(error)
 
+    findings = recorder.findings()
+
+    # Section 6.15: the instrumentation modules hear the load is done, as
+    # the host's do, once the findings are known.
+
+    instruments.finished(
+        context, _instrumentation.CHECK if report["ok"] else _instrumentation.FAILED
+    )
+
     report["findings"] = [
         {
             "kind": finding.kind,
@@ -163,7 +177,7 @@ def main(argv: list[str] | None = None) -> int:
             "description": finding.describe(),
             "advice": finding.advice,
         }
-        for finding in recorder.findings()
+        for finding in findings
     ]
     json.dump(report, sys.stdout)
     sys.stdout.write("\n")

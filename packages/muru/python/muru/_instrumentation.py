@@ -22,8 +22,9 @@ import importlib
 import json
 import logging
 import os
-from collections.abc import Callable, Iterable, MutableMapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Iterator, MutableMapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any, ClassVar
 
@@ -43,7 +44,27 @@ ENVIRONMENT = "MURU_INSTRUMENTATION"
 
 # The callbacks a module may define, in the order of a release's life.
 
-CALLBACKS = ("configure", "wrap_application")
+CALLBACKS = (
+    "configure",
+    "load_started",
+    "before_import",
+    "after_import",
+    "load_finished",
+    "wrap_application",
+)
+
+# How a load ended, as load_finished is told (section 6.15): the host
+# forks the workers from what it loaded; this process serves what it
+# loaded (a worker with per-worker imports, or --single); the host starts
+# again with per-worker imports; preload = true refused what the import
+# check found; something failed; or muructl check is done.
+
+FORK = "fork"
+SERVE = "serve"
+FALLBACK = "fallback"
+REFUSED = "refused"
+FAILED = "failed"
+CHECK = "check"
 
 
 class InstrumentationError(Exception):
@@ -111,12 +132,14 @@ class Target:
 
     `kind` is ``hooks``, ``entrypoint`` or ``mount``; `name` is a mount's
     name, empty for the others; `spec` is the module, or ``module:callable``
-    for an entry point.
+    for an entry point. `error` is what an import raised, given to
+    after_import when it failed.
     """
 
     kind: str
     name: str
     spec: str
+    error: BaseException | None = None
 
 
 @dataclass
@@ -179,9 +202,14 @@ class Instruments:
     def __init__(self, entries: Iterable[Entry] = ()) -> None:
         self.entries = list(entries)
         self.loaded: list[Instrument] = []
+        self.outcome: str | None = None
 
-    def load(self, import_module: Callable[[str], ModuleType] = importlib.import_module) -> None:
-        """Import each module and configure it before the next is imported.
+    def load(
+        self,
+        context: Any = None,
+        import_module: Callable[[str], ModuleType] = importlib.import_module,
+    ) -> None:
+        """Import each module, configure it and start it before the next is imported.
 
         A module that cannot be imported raises InstrumentationError,
         since that stops the release.
@@ -196,6 +224,35 @@ class Instruments:
             instrument = Instrument.found(entry.module, module)
             self.loaded.append(instrument)
             instrument.call("configure", dict(entry.settings))
+            instrument.call("load_started", context)
+
+    @contextmanager
+    def importing(self, context: Any, target: Target) -> Iterator[None]:
+        """Bracket the import of the hooks module, the entrypoint or a mount.
+
+        before_import runs in listed order and after_import in reverse,
+        given what the import raised when it failed; a host-phase factory
+        called inside falls inside the pair.
+        """
+
+        self.call("before_import", context, target)
+
+        try:
+            yield
+        except BaseException as error:
+            self.call_reversed("after_import", context, replace(target, error=error))
+            raise
+
+        self.call_reversed("after_import", context, target)
+
+    def finished(self, context: Any, outcome: str) -> None:
+        """Run load_finished in reverse order, once, saying how the load ended."""
+
+        if self.outcome is not None:
+            return
+
+        self.outcome = outcome
+        self.call_reversed("load_finished", context, outcome)
 
     def call(self, callback: str, *args: Any) -> None:
         """Run a callback of every module that defines it, in listed order."""

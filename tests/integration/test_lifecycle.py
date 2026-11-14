@@ -189,6 +189,14 @@ import json, os, sys
 def configure(settings):
     print(f"INSTRUMENT configure {__name__} pid={os.getpid()} {json.dumps(settings)}",
           file=sys.stderr, flush=True)
+
+
+def before_import(context, target):
+    print(f"INSTRUMENT before {__name__} {target.kind}", file=sys.stderr, flush=True)
+
+
+def load_finished(context, outcome):
+    print(f"INSTRUMENT finished {__name__} {outcome}", file=sys.stderr, flush=True)
 """
 
 SEES = """
@@ -233,10 +241,16 @@ def test_instrumentation_modules_listed_in_the_project_run_before_the_applicatio
             for line in server.log().splitlines()
             if "INSTRUMENT " in line or "HOOK on_load" in line
         ]
-        assert lines[:3] == [
+        assert lines[:9] == [
             f"INSTRUMENT configure local_tool pid={host} {{}}",
             f'INSTRUMENT configure project_tool pid={host} {{"output": "times.json", "top": 5}}',
+            "INSTRUMENT before local_tool hooks",
+            "INSTRUMENT before project_tool hooks",
+            "INSTRUMENT before local_tool entrypoint",
+            "INSTRUMENT before project_tool entrypoint",
             f"HOOK on_load pid={host} worker=None app=sees",
+            "INSTRUMENT finished project_tool fork",
+            "INSTRUMENT finished local_tool fork",
         ], server.log()
         assert json.loads(server.get("/").body) == {"listed": False}
     finally:
@@ -275,6 +289,10 @@ def wrap_application(context, target, application, interface):
         return await application(scope, receive, sending)
 
     return wrapped_asgi
+
+
+def load_finished(context, outcome):
+    print(f"WRAP load_finished {outcome} pid={os.getpid()}", file=sys.stderr, flush=True)
 """
 
 WRAPPED_APP = """
@@ -337,6 +355,7 @@ def test_wrap_application_wraps_every_entry_point_in_each_worker(tmp_path: Path)
         assert {line.split()[-1] for line in entrypoints} == workers, lines
         assert {line.split()[-1] for line in mounts} == workers, lines
         assert lines.count("WRAP lifespan") == WORKERS, lines
+        assert lines[0] == f"WRAP load_finished fork pid={server.host_pid()}", lines
     finally:
         server.stop()
 
@@ -347,7 +366,11 @@ def test_wrap_application_wraps_every_entry_point_in_each_worker(tmp_path: Path)
 
     try:
         assert server.get("/").header("X-Wrapped") == "wsgi"
-        assert wrap_lines(server) == [f"WRAP entrypoint - wsgi pid={server.worker_pids()[0]}"]
+        worker = server.worker_pids()[0]
+        assert wrap_lines(server) == [
+            f"WRAP load_finished serve pid={worker}",
+            f"WRAP entrypoint - wsgi pid={worker}",
+        ]
     finally:
         server.stop()
 

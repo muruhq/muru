@@ -59,7 +59,7 @@ from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any
 
-from muru import RequestTimeout, _asgi, _inspect, _outside, preload
+from muru import RequestTimeout, _asgi, _inspect, _instrumentation, _outside, preload
 from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
@@ -493,23 +493,47 @@ class Release:
 
         return self.target is not None
 
-    def load(self, recorder: preload.ImportRecorder | None = None) -> Hooks:
+    def load(
+        self,
+        recorder: preload.ImportRecorder | None = None,
+        *,
+        instruments: Instruments | None = None,
+        context: Context | None = None,
+        mount: str | None = None,
+    ) -> Hooks:
         """Import the hooks module and the entrypoint, in that order.
 
         A factory with factory_phase ``host`` is called here (section 6.8);
-        one with phase ``worker`` waits for `realise` in each worker.
+        one with phase ``worker`` waits for `realise` in each worker. The
+        instrumentation modules' before_import and after_import bracket
+        each import (section 6.15), the factory call inside the
+        entrypoint's; `mount` names the mount this is the entry point of.
         """
 
         import_module = recorder.import_module if recorder else importlib.import_module
-        if self.hooks_module:
-            import_module(self.hooks_module)
-        self.hooks = Hooks.load(self.hooks_module)
-        self.target = resolve_app(self.spec, import_module)
+        instruments = instruments or Instruments()
+        context = context or self.context
 
-        if not self.factory:
-            self.accept(self.target)
-        elif self.factory_phase == "host":
-            self.accept(self.target())
+        if self.hooks_module:
+            with instruments.importing(context, Target("hooks", "", self.hooks_module)):
+                import_module(self.hooks_module)
+                self.hooks = Hooks.load(self.hooks_module)
+        else:
+            self.hooks = Hooks.load(None)
+
+        target = (
+            Target("entrypoint", "", self.spec)
+            if mount is None
+            else Target("mount", mount, self.spec)
+        )
+
+        with instruments.importing(context, target):
+            self.target = resolve_app(self.spec, import_module)
+
+            if not self.factory:
+                self.accept(self.target)
+            elif self.factory_phase == "host":
+                self.accept(self.target())
 
         return self.hooks
 
@@ -1528,19 +1552,32 @@ class Host:
                 hooks = release.hooks or Hooks()
             else:
                 # Per-worker imports: everything the host would have done,
-                # the instrumentation modules first (section 6.15).
+                # the instrumentation modules first, their load_finished
+                # last (section 6.15).
 
                 started = time.monotonic()
-                release.instruments.load()
-                hooks = release.load()
-                for mount in mounts:
-                    mount.release.load()
-                log(
-                    f"worker {self.worker_name(index)} "
-                    f"imported {release.spec} in {elapsed_ms(started)} ms"
-                )
-                hooks.call("on_load", context)
-                hooks.call("pre_fork", context)
+                instruments = release.instruments
+
+                try:
+                    instruments.load(context)
+                    hooks = release.load(instruments=instruments, context=context)
+
+                    for mount in mounts:
+                        mount.release.load(
+                            instruments=instruments, context=context, mount=mount.name
+                        )
+
+                    log(
+                        f"worker {self.worker_name(index)} "
+                        f"imported {release.spec} in {elapsed_ms(started)} ms"
+                    )
+                    hooks.call("on_load", context)
+                    hooks.call("pre_fork", context)
+                except BaseException:
+                    instruments.finished(context, _instrumentation.FAILED)
+                    raise
+
+                instruments.finished(context, _instrumentation.SERVE)
 
             hooks.call("post_fork", context)
 
@@ -4999,22 +5036,30 @@ def main(argv: list[str] | None = None) -> int:
         # import check takes its baseline and before anything of the
         # application is imported.
 
+        instruments = release.instruments
+
         try:
-            release.instruments.load()
+            instruments.load(context)
         except InstrumentationError as error:
             log(str(error))
+            instruments.finished(context, _instrumentation.FAILED)
             return 1
 
         with preload.ImportRecorder() as recorder:
             try:
-                hooks = release.load(recorder)
+                hooks = release.load(recorder, instruments=instruments, context=context)
+
                 for mount in mounts:
-                    mount.release.load(recorder)
+                    mount.release.load(
+                        recorder, instruments=instruments, context=context, mount=mount.name
+                    )
             except Exception as error:
                 log(f"cannot load {args.app}: {error.__class__.__name__}: {error}")
+                instruments.finished(context, _instrumentation.FAILED)
                 return 1
 
             if not hooks.call_logged("on_load", context):
+                instruments.finished(context, _instrumentation.FAILED)
                 return 1
 
         log(f"preloaded {args.app} in {elapsed_ms(started)} ms")
@@ -5038,6 +5083,7 @@ def main(argv: list[str] | None = None) -> int:
         # --single nothing forks, so it has no occasion.
 
         if not args.single and not hooks.call_logged("pre_fork", context):
+            instruments.finished(context, _instrumentation.FAILED)
             return 1
 
         findings = recorder.findings()
@@ -5048,12 +5094,14 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.preload == "true":
                 log("preload is true, so the import check failing stops the release")
+                instruments.finished(context, _instrumentation.REFUSED)
                 return 1
 
             log(
                 "preload: falling back to per-worker imports, which costs slower worker "
                 "replacement and no shared memory; set preload to false to silence this"
             )
+            instruments.finished(context, _instrumentation.FALLBACK)
             flush_streams()
 
             # The instrumentation list goes back in the environment, so
@@ -5073,6 +5121,13 @@ def main(argv: list[str] | None = None) -> int:
                     "false",
                 ],
             )
+
+        # Section 6.15: the load is done, after pre_fork and the import
+        # check, and before the collection and the first fork.
+
+        instruments.finished(
+            context, _instrumentation.SERVE if args.single else _instrumentation.FORK
+        )
 
         if args.preload_gc_collect:
             gc.collect()

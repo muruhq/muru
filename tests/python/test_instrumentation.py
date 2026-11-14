@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 
-from muru import check
+from muru import check, host
 from muru._instrumentation import ENVIRONMENT, Entry, InstrumentationError, Instruments, Target
 
 FIXTURE_APPS = Path(__file__).resolve().parents[1] / "fixtures" / "apps"
@@ -187,3 +188,156 @@ def test_a_failing_wrapper_or_a_grpc_server_leaves_the_application_as_it_was(
 
     assert instruments.wrap(None, entrypoint, "server", "grpc") == "server"
     assert "returned another object for the gRPC entry point" in caplog.text
+
+
+LIFECYCLE = """
+import instrumented_order as order
+
+
+def load_started(context):
+    order.CALLS.append(("load_started", __name__))
+
+
+def before_import(context, target):
+    order.CALLS.append(("before", __name__, target.kind, target.spec))
+
+
+def after_import(context, target):
+    error = type(target.error).__name__ if target.error is not None else None
+    order.CALLS.append(("after", __name__, target.kind, error))
+
+
+def load_finished(context, outcome):
+    order.CALLS.append(("finished", __name__, outcome))
+"""
+
+
+@pytest.fixture
+def host_main(
+    modules: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[Callable[..., int]]:
+    """Run the host's main up to the fork, with two recording modules listed."""
+
+    (modules / "first_tool.py").write_text(LIFECYCLE)
+    (modules / "second_tool.py").write_text(LIFECYCLE)
+    (modules / "plain_app.py").write_text("def application(environ, start_response): ...\n")
+    (modules / "leaky_app.py").write_text(
+        "import socket\nLEFT_OPEN = socket.socketpair()\n"
+        "def application(environ, start_response): ...\n"
+    )
+    (modules / "failing_hooks.py").write_text(
+        "def on_load(context):\n    raise RuntimeError('load-boom')\n"
+    )
+
+    def run(app: str, *args: str) -> int:
+        monkeypatch.setenv(ENVIRONMENT, Entry.encode([Entry("first_tool"), Entry("second_tool")]))
+        socket_dir = str(tmp_path / "sockets")
+        return host.main(["--app", app, "--socket-dir", socket_dir, *args])
+
+    yield run
+
+    gc.enable()
+    leaky = sys.modules.pop("leaky_app", None)
+
+    if leaky is not None:
+        for end in leaky.LEFT_OPEN:
+            end.close()
+
+    for name in ("plain_app", "failing_hooks", "missing_app"):
+        sys.modules.pop(name, None)
+
+
+def bracket(kind: str, spec: str, error: str | None = None) -> list[tuple[object, ...]]:
+    return [
+        ("before", "first_tool", kind, spec),
+        ("before", "second_tool", kind, spec),
+        ("after", "second_tool", kind, error),
+        ("after", "first_tool", kind, error),
+    ]
+
+
+def finished(outcome: str) -> list[tuple[object, ...]]:
+    return [("finished", "second_tool", outcome), ("finished", "first_tool", outcome)]
+
+
+STARTED = [("load_started", "first_tool"), ("load_started", "second_tool")]
+
+
+def test_a_failed_import_or_on_load_ends_the_load_as_failed(
+    host_main: Callable[..., int],
+) -> None:
+    assert host_main("missing_app:application") == 1
+    assert calls() == [
+        *STARTED,
+        *bracket("entrypoint", "missing_app:application", "ModuleNotFoundError"),
+        *finished("failed"),
+    ]
+
+    sys.modules["instrumented_order"].CALLS.clear()
+    sys.modules.pop("first_tool")
+    sys.modules.pop("second_tool")
+    assert host_main("plain_app:application", "--hooks", "failing_hooks") == 1
+    assert calls() == [
+        *STARTED,
+        *bracket("hooks", "failing_hooks"),
+        *bracket("entrypoint", "plain_app:application"),
+        *finished("failed"),
+    ]
+
+
+def test_what_the_import_check_finds_is_refused_or_falls_back(
+    host_main: Callable[..., int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert host_main("leaky_app:application", "--preload", "true") == 1
+    assert calls() == [
+        *STARTED,
+        *bracket("entrypoint", "leaky_app:application"),
+        *finished("refused"),
+    ]
+
+    # The fallback hears of it before the host starts again, and the list
+    # goes back in the environment for the host started again.
+
+    class Restarted(Exception):
+        pass
+
+    def execv(path: str, argv: list[str]) -> None:
+        raise Restarted(os.environ.get(ENVIRONMENT))
+
+    monkeypatch.setattr(os, "execv", execv)
+
+    for name in ("first_tool", "second_tool", "leaky_app"):
+        leaky = sys.modules.pop(name)
+
+    for end in leaky.LEFT_OPEN:
+        end.close()
+
+    sys.modules["instrumented_order"].CALLS.clear()
+
+    with pytest.raises(Restarted) as restarted:
+        host_main("leaky_app:application")
+
+    assert calls()[-2:] == finished("fallback")
+    assert [entry.module for entry in Entry.parse(str(restarted.value))] == [
+        "first_tool",
+        "second_tool",
+    ]
+
+
+def test_check_runs_the_load_callbacks_as_the_host_does(
+    modules: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (modules / "first_tool.py").write_text(LIFECYCLE)
+    monkeypatch.setenv(ENVIRONMENT, Entry.encode([Entry("first_tool")]))
+    monkeypatch.chdir(FIXTURE_APPS)
+
+    status = check.main(["--app", "plain_wsgi:application", "--chdir", str(FIXTURE_APPS)])
+    capsys.readouterr()
+
+    assert status == 0
+    assert calls() == [
+        ("load_started", "first_tool"),
+        ("before", "first_tool", "entrypoint", "plain_wsgi:application"),
+        ("after", "first_tool", "entrypoint", None),
+        ("finished", "first_tool", "check"),
+    ]
