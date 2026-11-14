@@ -151,6 +151,8 @@ class Instrument:
     name: str
     module: ModuleType
     functions: dict[str, Callable[..., Any]] = field(default_factory=dict)
+    failures: list[tuple[str, BaseException]] = field(default_factory=list)
+    """The callbacks that raised, with what they raised, for a check's report."""
 
     @classmethod
     def found(cls, name: str, module: ModuleType) -> Instrument:
@@ -190,6 +192,7 @@ class Instrument:
         try:
             function(*args)
         except Exception as error:
+            self.failures.append((callback, error))
             muru_logging._report(
                 error, f"the {callback} callback of instrumentation module {self.name} failed"
             )

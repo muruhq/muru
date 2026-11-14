@@ -169,6 +169,22 @@ def main(argv: list[str] | None = None) -> int:
         context, _instrumentation.CHECK if report["ok"] else _instrumentation.FAILED
     )
 
+    # A callback that raised is logged and the release carries on, but
+    # the module did not do its job, so the check reports it and fails.
+
+    for instrument in instruments.loaded:
+        for callback, raised in instrument.failures:
+            report["ok"] = False
+            report["errors"].append(
+                {
+                    "error": (
+                        f"the {callback} callback of instrumentation module "
+                        f"{instrument.name} failed: {raised.__class__.__name__}: {raised}"
+                    ),
+                    "traceback": "".join(traceback.format_exception(raised)),
+                }
+            )
+
     report["findings"] = [
         {
             "kind": finding.kind,
