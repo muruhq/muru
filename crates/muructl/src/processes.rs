@@ -942,10 +942,22 @@ mod tests {
             Known {
                 app: "blog".to_owned(),
                 release: "r3".to_owned(),
-                index: Some(0),
-                ..known(4401, 4242, "server", "blog@r3 instance 0")
+                ..known(4400, 4242, "relay", "blog@r3 output to apps/blog/r3.log")
             },
             4242,
+            "blog",
+            day,
+            0.0,
+            7.0,
+        );
+        example.add(
+            Known {
+                app: "blog".to_owned(),
+                release: "r3".to_owned(),
+                index: Some(0),
+                ..known(4401, 4400, "server", "blog@r3 instance 0")
+            },
+            4400,
             "blog",
             day,
             0.8,

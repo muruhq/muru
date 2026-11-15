@@ -102,19 +102,22 @@ async fn truncate_logs(
         })
         .await
         .map_err(|_| Status::unavailable(STOPPING))?;
-    let in_place = done_rx
+    done_rx
         .await
         .map_err(|_| Status::unavailable(STOPPING))?
         .map_err(Status::failed_precondition)?;
 
+    // Under the daemon every writer reopens its file, so a cut swaps the
+    // kept part in rather than cutting the file in place.
+
     let targets: Vec<Target> = selected
         .iter()
-        .zip(paths.iter().zip(in_place))
-        .map(|(log, (path, in_place))| Target {
+        .zip(&paths)
+        .map(|(log, path)| Target {
             path: path.clone(),
             name: log.name.clone(),
             keep,
-            in_place,
+            in_place: false,
         })
         .collect();
     let sizes: std::collections::HashMap<String, (u64, u64)> = selected

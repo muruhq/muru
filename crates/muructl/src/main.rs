@@ -351,6 +351,34 @@ struct RelayRunArgs {
     /// The release, as app@release, for the process title.
     #[arg(long, value_name = "APP@RELEASE")]
     release: Option<String>,
+
+    /// Where to record the process the relay starts, in place of connecting to a host.
+    #[arg(long, value_name = "PATH", requires = "program")]
+    record: Option<PathBuf>,
+
+    /// What each line of the process's standard error starts with.
+    #[arg(long, value_name = "TEXT", default_value = "")]
+    tag: String,
+
+    /// What each line of the process's standard output starts with.
+    #[arg(long, value_name = "TEXT", default_value = "")]
+    stdout_tag: String,
+
+    /// What the relay's own lines call the process.
+    #[arg(long, value_name = "WORDS", default_value = "the process")]
+    name: String,
+
+    /// The signal SIGTERM to the relay sends the process, by number.
+    #[arg(long, value_name = "NUMBER", default_value_t = libc::SIGTERM)]
+    stop_signal: i32,
+
+    /// Send the stop signal to the process's whole group.
+    #[arg(long)]
+    stop_group: bool,
+
+    /// The program for the relay to start and carry the output of, and its arguments.
+    #[arg(last = true, value_name = "PROGRAM")]
+    program: Vec<String>,
 }
 
 /// What `serve-static` takes.
@@ -1045,6 +1073,15 @@ fn main() -> anyhow::Result<()> {
                 queue: args.queue,
                 overflow: args.on_overflow,
                 release: args.release,
+                exec: args.record.map(|record| muru_controller::relay::Exec {
+                    argv: args.program,
+                    record,
+                    tag: args.tag,
+                    stdout_tag: args.stdout_tag,
+                    name: args.name,
+                    stop_signal: args.stop_signal,
+                    stop_group: args.stop_group,
+                }),
             });
         }
         other => other,

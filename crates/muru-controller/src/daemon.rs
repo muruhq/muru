@@ -563,7 +563,7 @@ pub enum Command {
         /// The files, in order.
         paths: Vec<PathBuf>,
         /// Where the answer goes.
-        done: oneshot::Sender<Result<Vec<bool>, String>>,
+        done: oneshot::Sender<Result<(), String>>,
     },
     /// Let rotation consider these log files again.
     ReleaseLogs {
@@ -980,17 +980,25 @@ impl Backend {
         }
     }
 
-    /// Have the release's log relay open the release log again by name,
+    /// Have the release's log relays open the release log again by name,
     /// and with `workers` the host's workers run their on_reopen_logs
-    /// hook once it has. A managed server's instances write to the
-    /// release's log file themselves, on a descriptor they were started
-    /// with, and cannot be told to reopen it, so that file is rotated in
-    /// place. When the relay was told, gives what changes once it has
-    /// reopened the file.
-    fn reopen_log(&self, workers: bool) -> Option<tokio::sync::watch::Receiver<u64>> {
+    /// hook once its relay has: the host's relay, or the relay of each of
+    /// a managed server's instances. Gives, for each relay told, what
+    /// changes once it has reopened the file.
+    fn reopen_log(&self, workers: bool) -> Vec<tokio::sync::watch::Receiver<u64>> {
         match self {
-            Self::Host(host) => host.reopen_log(workers),
-            Self::Servers(_) | Self::Dormant => None,
+            Self::Host(host) => host.reopen_log(workers).into_iter().collect(),
+            Self::Servers(servers) => servers.reopen_log(),
+            Self::Dormant => Vec::new(),
+        }
+    }
+
+    /// Lines of the release's output its relays have dropped so far.
+    fn output_dropped(&self) -> Option<u64> {
+        match self {
+            Self::Host(host) => Some(host.output_dropped()),
+            Self::Servers(servers) => Some(servers.output_dropped()),
+            Self::Dormant => None,
         }
     }
 
@@ -4104,11 +4112,11 @@ impl Daemon {
 
             // Section 11.3: output the release's relay could not keep.
 
-            if let Some(host) = running.backend.host() {
+            if let Some(dropped) = running.backend.output_dropped() {
                 samples.push(muru_edge::metrics::Sample::new(
                     "muru_app_output_dropped_total",
                     &[("app", app.as_str()), ("release", id.as_str())],
-                    host.output_dropped() as f64,
+                    dropped as f64,
                 ));
             }
 
@@ -4391,6 +4399,15 @@ impl Daemon {
                 }
             };
         let env = self.server_environment(env, app, id, &release.spec, identity);
+
+        let relays = match self.server_relays(&subject) {
+            Ok(relays) => relays,
+            Err(error) => {
+                tracing::info!(%error, "release {subject} could not be re-adopted");
+                return false;
+            }
+        };
+
         let adopted = Servers::adopt(
             &http,
             &run_dir.join("r1"),
@@ -4398,6 +4415,7 @@ impl Daemon {
             env,
             identity,
             &self.host_log(app, id),
+            Some(relays),
             record,
         )
         .await;
@@ -5706,6 +5724,7 @@ impl Daemon {
         let subject = format!("{app}@{id}");
         let log = self.host_log(app, id);
         let grace = Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms);
+        let relays = self.server_relays(&subject)?;
         let spawned = Servers::start(
             http,
             &run_dir.join("r1"),
@@ -5713,6 +5732,7 @@ impl Daemon {
             env,
             identity,
             &log,
+            Some(relays),
             grace,
         )
         .await;
@@ -9085,7 +9105,7 @@ impl Daemon {
             // again where they crash; the release stays up.
 
             if let Backend::Servers(servers) = &mut running.backend {
-                let changes = servers.check();
+                let changes = servers.check().await;
 
                 if !changes.is_empty() {
                     let run_dir = self
@@ -9173,6 +9193,18 @@ impl Daemon {
 
     /// A managed server's whole environment: its release's variables over
     /// the clean base, with the release's interpreter first on PATH.
+    /// How a managed server's instances' log relays are started, from
+    /// this program, with their events under the release.
+    fn server_relays(&self, subject: &str) -> Result<crate::servers::Relays, String> {
+        Ok(crate::servers::Relays {
+            executable: running_executable()
+                .map_err(|error| format!("finding the executable to start relays from: {error}"))?,
+            settings: self.relay_settings,
+            release: subject.to_owned(),
+            watcher: self.relay_watcher(subject),
+        })
+    }
+
     fn server_environment(
         &self,
         env: Vec<(String, String)>,
@@ -9884,14 +9916,38 @@ impl Daemon {
                     }
                 }
                 Backend::Servers(servers) => {
+                    let log = self.locations.release_log(app, id);
+                    let shown = log
+                        .strip_prefix(&self.locations.logs.path)
+                        .unwrap_or(&log)
+                        .display()
+                        .to_string();
+
                     for instance in servers.record().instances {
                         if instance.pid == 0 {
                             continue;
                         }
 
+                        // Issue 492: each instance's relay is its parent.
+
+                        let parent = if instance.relay_pid == 0 {
+                            daemon
+                        } else {
+                            known.push(Known {
+                                pid: instance.relay_pid,
+                                parent: daemon,
+                                role: "relay",
+                                what: format!("{subject} output to {shown}"),
+                                app: app.clone(),
+                                release: id.clone(),
+                                ..Known::default()
+                            });
+                            instance.relay_pid
+                        };
+
                         known.push(Known {
                             pid: instance.pid,
-                            parent: daemon,
+                            parent,
                             role: "server",
                             what: format!("{subject} instance {}", instance.index),
                             app: app.clone(),
@@ -9976,20 +10032,15 @@ impl Daemon {
         (word.to_owned(), phrase)
     }
 
-    /// The log files the daemon's writers keep, each with whether its
-    /// writers cannot be told to reopen it: the access log, the edge's own
-    /// log and the files virtual hosts name, which the edge reopens; the
-    /// daemon's own, when it was started in the background; and each
-    /// running release's log, which its host reopens, unless a managed
-    /// HTTP server's instances write it themselves (section 9.9).
-    fn log_writers(&self) -> Vec<(PathBuf, bool)> {
-        let mut writers = vec![
-            (self.locations.access_log(), false),
-            (self.locations.edge_log(), false),
-        ];
+    /// The log files the daemon's writers keep: the access log, the
+    /// edge's own log and the files virtual hosts name, which the edge
+    /// reopens; the daemon's own, when it was started in the background;
+    /// and each running release's log, which its relays reopen.
+    fn log_writers(&self) -> Vec<PathBuf> {
+        let mut writers = vec![self.locations.access_log(), self.locations.edge_log()];
 
         if self.owns_log {
-            writers.push((self.locations.daemon_log(), false));
+            writers.push(self.locations.daemon_log());
         }
 
         let mut own: Vec<String> = self
@@ -10003,14 +10054,11 @@ impl Daemon {
         own.dedup();
         writers.extend(
             own.into_iter()
-                .map(|file| (self.locations.logs.path.join(file), false)),
+                .map(|file| self.locations.logs.path.join(file)),
         );
 
-        for ((app, id), running) in &self.running {
-            writers.push((
-                self.locations.release_log(app, id),
-                running.backend.servers().is_some(),
-            ));
+        for (app, id) in self.running.keys() {
+            writers.push(self.locations.release_log(app, id));
         }
 
         writers
@@ -10031,8 +10079,7 @@ impl Daemon {
         let paths: Vec<PathBuf> = self
             .log_writers()
             .into_iter()
-            .filter(|(path, in_place)| !in_place && !self.claimed_logs.contains(path))
-            .map(|(path, _)| path)
+            .filter(|path| !self.claimed_logs.contains(path))
             .collect();
         let renamed = self.renames.check(&paths);
 
@@ -10073,9 +10120,9 @@ impl Daemon {
         // rotated, so a daemon started after a crash does not rotate a
         // file a second time.
 
-        let due: Vec<(PathBuf, bool)> = candidates
+        let due: Vec<PathBuf> = candidates
             .into_iter()
-            .filter(|(path, _)| {
+            .filter(|path| {
                 !self.claimed_logs.contains(path) && path.is_file() && rotator.due(path, now)
             })
             .collect();
@@ -10089,14 +10136,8 @@ impl Daemon {
 
         let mut rotated = Vec::new();
 
-        for (path, in_place) in due {
-            let outcome = if in_place {
-                rotator.rotate_in_place(&path, now)
-            } else {
-                rotator.rotate(&path, now)
-            };
-
-            match outcome {
+        for path in due {
+            match rotator.rotate(&path, now) {
                 Ok(archive) => rotated.push(archive),
                 Err(error) => {
                     tracing::warn!(%error, path = %path.display(), "rotating a log failed");
@@ -10165,16 +10206,10 @@ impl Daemon {
             let archive = if self.claimed_logs.contains(&path) {
                 Err("it is being cut by another command".to_owned())
             } else {
-                let in_place = self.cannot_reopen(&path);
                 let rotator = self.rotation.as_ref().expect("checked above");
 
-                let outcome = if in_place {
-                    rotator.rotate_in_place(&path, now)
-                } else {
-                    rotator.rotate(&path, now)
-                };
-
-                outcome
+                rotator
+                    .rotate(&path, now)
                     .map(|archive| {
                         let relative = archive
                             .strip_prefix(&self.locations.logs.path)
@@ -10194,17 +10229,8 @@ impl Daemon {
         Ok(rotated)
     }
 
-    /// Whether a log's writers cannot be told to reopen it: the
-    /// instances of a managed HTTP server.
-    fn cannot_reopen(&self, path: &Path) -> bool {
-        self.running.iter().any(|((app, id), running)| {
-            running.backend.servers().is_some() && self.locations.release_log(app, id) == path
-        })
-    }
-
-    /// Hold log files against rotation, saying of each whether its
-    /// writers cannot reopen it: the instances of a managed HTTP server.
-    fn claim_logs(&mut self, paths: Vec<PathBuf>) -> Result<Vec<bool>, String> {
+    /// Hold log files against rotation while a command cuts them.
+    fn claim_logs(&mut self, paths: Vec<PathBuf>) -> Result<(), String> {
         if let Some(path) = paths.iter().find(|path| self.claimed_logs.contains(*path)) {
             return Err(format!(
                 "{} is being cut by another command",
@@ -10212,10 +10238,8 @@ impl Daemon {
             ));
         }
 
-        let in_place = paths.iter().map(|path| self.cannot_reopen(path)).collect();
-
         self.claimed_logs.extend(paths);
-        Ok(in_place)
+        Ok(())
     }
 
     /// What hears a release's relay: its stalls become events under the
@@ -10341,9 +10365,11 @@ impl Daemon {
         // release log, so what their hooks write goes to the new file.
 
         for running in self.running.values() {
-            if let Some(reopened) = running.backend.reopen_log(workers) {
+            let reopened = running.backend.reopen_log(workers);
+
+            if !reopened.is_empty() {
                 hosts += 1;
-                relays.push(reopened);
+                relays.extend(reopened);
             }
         }
 
@@ -10768,6 +10794,8 @@ mod tests {
                     started_unix_ms: 0,
                     quick_exits: 0,
                     start_time: 0,
+                    relay_pid: 0,
+                    relay_start_time: 0,
                 })
                 .collect(),
         };

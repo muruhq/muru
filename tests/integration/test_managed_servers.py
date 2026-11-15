@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -646,6 +648,97 @@ def test_a_daemon_restart_adopts_the_instances_still_there_and_starts_the_rest(
     # The shutdown stops them both: the survivor was not left behind.
 
     wait_for(lambda: not alive(survivor) and not alive(replacement))
+
+
+def test_instance_lines_are_timed_tagged_and_kept_through_a_rotation(tmp_path: Path) -> None:
+    daemon = start_daemon(
+        tmp_path,
+        listeners=[(support.free_port(), False)],
+        config_extra="[logs]\ncompress = 'off'\n",
+    )
+    logs = tmp_path / "logs" / "apps" / "legacy"
+
+    try:
+        deploy_server(daemon, "legacy", "--instances", "2")
+
+        # Requests go on while the release's log is rotated; the server
+        # prints a line on standard output for each.
+
+        stop = threading.Event()
+        served: list[str] = []
+
+        def requests() -> None:
+            n = 0
+
+            while not stop.is_set():
+                path = f"/n/{n}"
+
+                if daemon.request(path).status == 200:
+                    served.append(path)
+
+                n += 1
+
+        load = threading.Thread(target=requests)
+        load.start()
+
+        try:
+            wait_for(lambda: len(served) > 20)
+            answer = json.loads(daemon.muructl("logs", "rotate", "legacy@r1", "--json").stdout)
+            assert answer["logs"][0]["error"] == ""
+            rotated_at = len(served)
+            wait_for(lambda: len(served) > rotated_at + 20)
+        finally:
+            stop.set()
+            load.join()
+
+        # Every request's line is in the log or its archive, with the time
+        # in front and its instance and stream named.
+
+        def written() -> str:
+            return "".join(path.read_text() for path in sorted(logs.glob("r1.log*")))
+
+        def logged(path: str) -> bool:
+            return f'"GET {path} HTTP' in written()
+
+        wait_for(lambda: all(logged(path) for path in served))
+        assert len(list(logs.glob("r1.log.*"))) == 1
+        pattern = re.compile(
+            r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z muru\.instance\[[01]\]\.stdout: legacy: "
+        )
+        lines = [line for line in written().splitlines() if "legacy: " in line]
+        assert lines and all(pattern.match(line) for line in lines), lines[:5]
+        tagged = {line.split(" ", 2)[1] for line in lines}
+        assert tagged == {"muru.instance[0].stdout:", "muru.instance[1].stdout:"}
+    finally:
+        daemon.stop()
+
+
+def test_an_instance_that_exits_while_no_daemon_runs_is_reported_with_its_status(
+    tmp_path: Path,
+) -> None:
+    first = start_daemon(tmp_path)
+    second = None
+
+    try:
+        deploy_server(first, "legacy", "--bind", "port")
+        pid = instances(first, "legacy@r1")[0]["pid"]
+
+        # The daemon detaches, and the instance exits with status 3 while
+        # none is there; its relay records how.
+
+        assert "detached" in first.muructl("daemon", "stop").stdout
+        first.process.wait(timeout=30)
+        assert report(first, "/crash")["pid"] == pid
+        wait_for(lambda: not alive(pid))
+
+        second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+        wait_for(lambda: "instance 0 exited with exit status: 3" in second.muructl("events").stdout)
+        wait_for(lambda: instances(second, "legacy@r1")[0]["pid"] not in (0, pid), 20)
+    finally:
+        if second is None:
+            second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+
+        second.stop(shutdown=True)
 
 
 def test_a_recorded_pid_that_another_process_has_is_not_adopted(tmp_path: Path) -> None:

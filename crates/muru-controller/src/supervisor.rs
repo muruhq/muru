@@ -7,17 +7,29 @@
 //! what is HTTP's (addresses, profiles, readiness probes) stays with
 //! them in `servers.rs`. Time is tokio's throughout, so the tests run
 //! under a paused clock and advance it instead of sleeping.
+//!
+//! Under the daemon each instance is started by a log relay of its own
+//! (issue 492, ADR 0059), `muructl relay run` as the instance's parent:
+//! the relay starts the process, carries its output to the log, sends
+//! it the signals the supervisor asks for and records how it ended. The
+//! supervisor signals the relay, never the instance, while the relay
+//! runs. Without a relay, as in the tests here, the instance is started
+//! directly with its output appended to the log.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
+use tokio::io::AsyncBufReadExt as _;
 use tokio::process::{Child, Command};
 use tokio::time::Instant;
 
 use crate::host::{Identity, alive, leads_group, signal_group, signal_process, start_time};
+use crate::relay::ProcessRecord;
 
 /// How often a process that is not a child of this daemon is looked at
 /// while it is waited for.
@@ -54,9 +66,12 @@ pub struct Spec {
     pub env: Vec<(String, String)>,
     /// Whom the instances run as, when not as the daemon.
     pub identity: Option<Identity>,
-    /// The file each instance's standard output and error are appended
-    /// to, by the instance itself: the daemon is not in the path.
+    /// The file each instance's standard output and error go to: through
+    /// its relay, or appended to by the instance itself without one.
     pub log: PathBuf,
+    /// How each instance's log relay is started; none starts the
+    /// instances directly.
+    pub relay: Option<RelaySpec>,
     /// The signal that asks an instance to stop.
     pub stop_signal: i32,
     /// Whether the stop signal goes to the instance's whole process
@@ -65,6 +80,49 @@ pub struct Spec {
     pub stop_group: bool,
     /// The event types to report under.
     pub events: EventNames,
+}
+
+/// How the log relay of each instance is started, and what hears it.
+#[derive(Clone)]
+pub struct RelaySpec {
+    /// The executable to run `relay run` from: this program.
+    pub executable: PathBuf,
+    /// The directory each relay's control socket and record are in.
+    pub run_dir: PathBuf,
+    /// What each relay queues and does when full.
+    pub settings: crate::host::RelaySettings,
+    /// The release, as app@release, for the relay's process title.
+    pub release: String,
+    /// What an instance is called in its lines' tags: `instance` gives
+    /// `muru.instance[0]:`.
+    pub kind: &'static str,
+    /// Hears what the relays report.
+    pub watcher: crate::host::RelayWatcher,
+    /// Lines the relays have dropped, across every relay, so the count
+    /// never goes back when one is replaced.
+    pub dropped: Arc<AtomicU64>,
+}
+
+impl fmt::Debug for RelaySpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelaySpec")
+            .field("run_dir", &self.run_dir)
+            .field("release", &self.release)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RelaySpec {
+    /// The control socket of the relay of the instance with `index`.
+    fn control(&self, index: u32) -> PathBuf {
+        self.run_dir.join(format!("relay-{index}.sock"))
+    }
+
+    /// The record the relay of the instance with `index` keeps.
+    fn record(&self, index: u32) -> PathBuf {
+        self.run_dir.join(format!("relay-{index}.toml"))
+    }
 }
 
 /// What differs from one instance to the next.
@@ -133,6 +191,9 @@ pub enum Exit {
     /// A process adopted from a previous daemon, which has no status to
     /// give: it can only be seen to be gone.
     Gone,
+    /// The process's relay exited without recording its end: whatever
+    /// was left of the process was killed.
+    RelayLost,
 }
 
 impl fmt::Display for Exit {
@@ -140,8 +201,210 @@ impl fmt::Display for Exit {
         match self {
             Self::Status(status) => write!(formatter, "exited with {status}"),
             Self::Gone => formatter.write_str("is gone"),
+            Self::RelayLost => formatter.write_str("lost its log relay and was stopped"),
         }
     }
+}
+
+/// The relay an instance runs under.
+enum RelayProcess {
+    /// One this daemon started.
+    Child(Child),
+    /// One a previous daemon started.
+    Adopted,
+}
+
+/// An instance that runs under a log relay, which is its parent: the
+/// relay's pid and start time name the relay, and the instance's name
+/// the instance and its group.
+struct Relayed {
+    relay: RelayProcess,
+    relay_pid: u32,
+    relay_start_time: u64,
+    pid: u32,
+    start_time: u64,
+    /// The record the relay keeps, with how the instance ended.
+    record: PathBuf,
+    /// Counts the reopens the relay has reported.
+    reopens: tokio::sync::watch::Sender<u64>,
+    /// The task reading the relay's reports, ended with it.
+    reports: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Relayed {
+    fn drop(&mut self) {
+        self.reports.abort();
+    }
+}
+
+impl Relayed {
+    /// Take over the relay a previous daemon started, from what it
+    /// recorded, and read its reports.
+    fn adopt(relay: &RelaySpec, recorded: &InstanceRecord) -> Self {
+        let reopens = tokio::sync::watch::channel(0).0;
+        let reports = watch_relay(relay, recorded.index, &reopens);
+
+        Self {
+            relay: RelayProcess::Adopted,
+            relay_pid: recorded.relay_pid,
+            relay_start_time: recorded.relay_start_time,
+            pid: recorded.pid,
+            start_time: recorded.start_time,
+            record: relay.record(recorded.index),
+            reopens,
+            reports,
+        }
+    }
+
+    /// Whether the relay is still running.
+    fn relay_running(&mut self) -> std::io::Result<bool> {
+        match &mut self.relay {
+            RelayProcess::Child(child) => Ok(child.try_wait()?.is_none()),
+            RelayProcess::Adopted => Ok(still_running(self.relay_pid, self.relay_start_time)),
+        }
+    }
+
+    /// The pid to signal the relay by, while it is the relay.
+    fn relay_pid(&self) -> Option<u32> {
+        match &self.relay {
+            RelayProcess::Child(child) => child.id(),
+            RelayProcess::Adopted => {
+                still_running(self.relay_pid, self.relay_start_time).then_some(self.relay_pid)
+            }
+        }
+    }
+
+    /// How the instance ended, once its relay has gone: the status the
+    /// relay recorded, or, when it recorded none, the relay was lost and
+    /// whatever is left of the instance is killed.
+    fn ended(&self) -> Exit {
+        let recorded = ProcessRecord::read(&self.record)
+            .filter(|record| record.pid == self.pid && record.relay_pid == self.relay_pid);
+
+        if let Some(status) = recorded.and_then(|record| record.status) {
+            use std::os::unix::process::ExitStatusExt as _;
+
+            return Exit::Status(ExitStatus::from_raw(status));
+        }
+
+        if still_running(self.pid, self.start_time) {
+            if leads_group(self.pid) {
+                signal_group(self.pid, libc::SIGKILL);
+            }
+
+            signal_process(self.pid, libc::SIGKILL);
+        }
+
+        Exit::RelayLost
+    }
+
+    /// Whether the relay has exited, without waiting, and how the
+    /// instance ended if it has.
+    fn try_exited(&mut self) -> std::io::Result<Option<Exit>> {
+        if self.relay_running()? {
+            return Ok(None);
+        }
+
+        Ok(Some(self.ended()))
+    }
+
+    /// Ask the relay to pass the stop signal on; the relay knows which.
+    fn stop(&self) {
+        if let Some(pid) = self.relay_pid() {
+            signal_process(pid, libc::SIGTERM);
+        }
+    }
+
+    /// Whether the relay exits by the deadline, waiting for it until then.
+    async fn exits_by(&mut self, deadline: Instant) -> bool {
+        match &mut self.relay {
+            RelayProcess::Child(child) => tokio::time::timeout_at(deadline, child.wait())
+                .await
+                .is_ok(),
+            RelayProcess::Adopted => {
+                while still_running(self.relay_pid, self.relay_start_time)
+                    && Instant::now() < deadline
+                {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+
+                !still_running(self.relay_pid, self.relay_start_time)
+            }
+        }
+    }
+
+    /// Kill the instance and its group: the relay does it, and a relay
+    /// that does not go is killed, with what is left of the instance.
+    async fn kill(&mut self) {
+        if let Some(pid) = self.relay_pid() {
+            signal_process(pid, libc::SIGUSR2);
+        }
+
+        if self.exits_by(Instant::now() + LEFTOVER_GRACE).await {
+            return;
+        }
+
+        if let Some(pid) = self.relay_pid() {
+            signal_process(pid, libc::SIGKILL);
+        }
+
+        let _ = self.exits_by(Instant::now() + LEFTOVER_GRACE).await;
+        let _ = self.ended();
+    }
+
+    /// Have the relay open its log again by name; gives what changes once
+    /// it says it has, when it was told.
+    fn reopen(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        let answer = self.reopens.subscribe();
+        let pid = self.relay_pid()?;
+
+        signal_process(pid, libc::SIGUSR1).then_some(answer)
+    }
+}
+
+/// How long a relay that was started has to say how the start went.
+const RELAY_START_WAIT: Duration = Duration::from_secs(10);
+
+/// Read a relay's reports from its control socket: its counts into the
+/// release's total, its events to the watcher, its reopens into
+/// `reopens`. A relay just started is given a moment to bind the socket.
+fn watch_relay(
+    relay: &RelaySpec,
+    index: u32,
+    reopens: &tokio::sync::watch::Sender<u64>,
+) -> tokio::task::JoinHandle<()> {
+    let socket = relay.control(index);
+    let watcher = Arc::clone(&relay.watcher);
+    let total = Arc::clone(&relay.dropped);
+    let reopens = reopens.clone();
+
+    tokio::spawn(async move {
+        let mut counted = 0u64;
+
+        for _ in 0..100 {
+            let result = crate::relay::watch_reports(&socket, |report| match report {
+                crate::relay::Report::Status(status) => {
+                    let more = status.dropped.saturating_sub(counted);
+                    counted = counted.max(status.dropped);
+                    let sum = total.fetch_add(more, Ordering::Relaxed) + more;
+                    watcher(crate::host::RelayNews::Dropped(sum));
+                }
+                crate::relay::Report::Event(event) => watcher(crate::host::RelayNews::Event {
+                    kind: event.kind,
+                    level: event.level,
+                    message: event.message,
+                }),
+                crate::relay::Report::Reopened => reopens.send_modify(|count| *count += 1),
+            })
+            .await;
+
+            if result.is_ok() {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
 }
 
 /// A process this daemon started, or one it adopted from a previous
@@ -164,6 +427,8 @@ enum Process {
     },
     /// A process a previous daemon started.
     Adopted { pid: u32, start_time: u64 },
+    /// A process its log relay started, and the relay.
+    Relayed(Box<Relayed>),
 }
 
 /// Whether the process recorded with this pid and start time is still
@@ -182,6 +447,7 @@ impl Process {
     fn pid(&self) -> u32 {
         match self {
             Self::Child { pid, .. } | Self::Adopted { pid, .. } => *pid,
+            Self::Relayed(relayed) => relayed.pid,
         }
     }
 
@@ -189,6 +455,15 @@ impl Process {
     fn start_time(&self) -> u64 {
         match self {
             Self::Child { start_time, .. } | Self::Adopted { start_time, .. } => *start_time,
+            Self::Relayed(relayed) => relayed.start_time,
+        }
+    }
+
+    /// The relay's pid and start time, for a process that has one.
+    fn relay(&self) -> (u32, u64) {
+        match self {
+            Self::Relayed(relayed) => (relayed.relay_pid, relayed.relay_start_time),
+            Self::Child { .. } | Self::Adopted { .. } => (0, 0),
         }
     }
 
@@ -200,6 +475,9 @@ impl Process {
         match self {
             Self::Child { child, .. } => child.id(),
             Self::Adopted { pid, start_time } => still_running(*pid, *start_time).then_some(*pid),
+            Self::Relayed(relayed) => {
+                still_running(relayed.pid, relayed.start_time).then_some(relayed.pid)
+            }
         }
     }
 
@@ -210,13 +488,17 @@ impl Process {
             Self::Adopted { pid, start_time } => {
                 Ok((!still_running(*pid, *start_time)).then_some(Exit::Gone))
             }
+            Self::Relayed(relayed) => relayed.try_exited(),
         }
     }
 
     /// Ask the process to stop: the signal to the process alone, or to
-    /// its whole group.
+    /// its whole group. A relayed process is asked through its relay,
+    /// which was started with the signal and where it goes.
     fn stop(&self, signal: i32, group: bool) {
-        if group && self.group_is_own() {
+        if let Self::Relayed(relayed) = self {
+            relayed.stop();
+        } else if group && self.group_is_own() {
             signal_group(self.pid(), signal);
         } else if let Some(pid) = self.own_pid() {
             signal_process(pid, signal);
@@ -237,6 +519,7 @@ impl Process {
 
                 !still_running(*pid, *start_time)
             }
+            Self::Relayed(relayed) => relayed.exits_by(deadline).await,
         }
     }
 
@@ -269,6 +552,7 @@ impl Process {
                     tokio::time::sleep(GROUP_POLL_INTERVAL).await;
                 }
             }
+            Self::Relayed(relayed) => relayed.kill().await,
         }
     }
 
@@ -287,6 +571,9 @@ impl Process {
         match self {
             Self::Child { .. } => true,
             Self::Adopted { pid, start_time } => !alive(*pid) || still_running(*pid, *start_time),
+            Self::Relayed(relayed) => {
+                !alive(relayed.pid) || still_running(relayed.pid, relayed.start_time)
+            }
         }
     }
 
@@ -357,6 +644,9 @@ pub struct Instance {
     due: Option<Instant>,
     /// What the process that exited left running, until it has gone.
     leftover: Option<Leftover>,
+    /// How a process that ended while no daemon looked did, as its relay
+    /// recorded it, for the first check to report.
+    ended: Option<Exit>,
 }
 
 impl Instance {
@@ -370,6 +660,7 @@ impl Instance {
             quick_exits: 0,
             due: None,
             leftover: None,
+            ended: None,
         }
     }
 
@@ -403,6 +694,8 @@ impl Instance {
             },
             quick_exits: self.quick_exits,
             start_time: self.process.as_ref().map_or(0, Process::start_time),
+            relay_pid: self.process.as_ref().map_or(0, |process| process.relay().0),
+            relay_start_time: self.process.as_ref().map_or(0, |process| process.relay().1),
         }
     }
 }
@@ -445,6 +738,13 @@ pub struct InstanceRecord {
     /// read, or the record was written before it was kept.
     #[serde(default)]
     pub start_time: u64,
+    /// The pid of the log relay the process runs under; 0 for a process
+    /// started without one.
+    #[serde(default)]
+    pub relay_pid: u32,
+    /// The relay's start time, which with its pid names it.
+    #[serde(default)]
+    pub relay_start_time: u64,
 }
 
 /// The instances of one supervised program.
@@ -476,7 +776,7 @@ impl Supervisor {
         };
 
         for position in 0..supervisor.instances.len() {
-            if let Err(error) = supervisor.spawn(position) {
+            if let Err(error) = supervisor.spawn(position).await {
                 supervisor.stop_until(Instant::now() + stop_within).await;
                 return Err(error);
             }
@@ -534,6 +834,34 @@ impl Supervisor {
                     ..Instance::new(recorded.index, instance)
                 };
 
+                // A process under a relay is the relay's to report on: one
+                // that ended while no daemon looked is reported by the
+                // first check, with the status the relay recorded.
+
+                if let Some(relay) = spec.relay.as_ref().filter(|_| recorded.relay_pid != 0) {
+                    let mut relayed = Relayed::adopt(relay, recorded);
+                    let running = relayed.relay_running().unwrap_or(false);
+
+                    if !running {
+                        return Instance {
+                            ended: Some(relayed.ended()),
+                            ..instance
+                        };
+                    }
+
+                    let run = match recorded.started_unix_ms {
+                        0 => Duration::ZERO,
+                        started => Duration::from_millis(now_unix_ms.saturating_sub(started)),
+                    };
+
+                    return Instance {
+                        process: Some(Process::Relayed(Box::new(relayed))),
+                        started: now.checked_sub(run).unwrap_or(now),
+                        started_unix_ms: recorded.started_unix_ms,
+                        ..instance
+                    };
+                }
+
                 if still_running(recorded.pid, recorded.start_time) {
                     // How long it has run, by the wall clock; a record
                     // that does not say when it started gives none.
@@ -568,8 +896,9 @@ impl Supervisor {
         })
     }
 
-    /// Start one instance's process.
-    fn spawn(&mut self, position: usize) -> anyhow::Result<()> {
+    /// Start one instance's process, under its relay when the spec has
+    /// one.
+    async fn spawn(&mut self, position: usize) -> anyhow::Result<()> {
         let instance = &self.instances[position];
 
         // An instance that crashed leaves its files behind, a socket it
@@ -590,9 +919,18 @@ impl Supervisor {
             program.to_path_buf()
         };
 
-        // Output goes to the log file itself, not through this daemon,
-        // so a daemon that detaches or upgrades leaves the instance
-        // writing; the file is rotated in place (section 11.3).
+        if let Some(relay) = self.spec.relay.clone() {
+            let process = self.spawn_relayed(position, &relay, &program).await?;
+            let instance = &mut self.instances[position];
+            instance.process = Some(Process::Relayed(Box::new(process)));
+            instance.started = Instant::now();
+            instance.started_unix_ms = crate::model::now_unix_ms();
+            instance.due = None;
+            return Ok(());
+        }
+
+        // Without a relay, output goes to the log file itself, not
+        // through this process.
 
         let log = std::fs::OpenOptions::new()
             .create(true)
@@ -628,6 +966,121 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Start the relay of the instance at `position`, which starts the
+    /// instance's `program`, and wait for it to say how that went. The
+    /// relay runs in a session of its own, as whom the instance runs as,
+    /// with the instance's environment and working directory, and its own
+    /// failure to start goes to the log.
+    async fn spawn_relayed(
+        &self,
+        position: usize,
+        relay: &RelaySpec,
+        program: &Path,
+    ) -> anyhow::Result<Relayed> {
+        let instance = &self.instances[position];
+        let index = instance.index;
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.spec.log)
+            .with_context(|| format!("opening {}", self.spec.log.display()))?;
+        let record = relay.record(index);
+        let _ = std::fs::remove_file(&record);
+
+        let mut command = Command::new(&relay.executable);
+        command
+            .arg("relay")
+            .arg("run")
+            .arg("--control")
+            .arg(relay.control(index))
+            .arg("--record")
+            .arg(&record)
+            .arg("--log-file")
+            .arg(&self.spec.log)
+            .arg("--queue")
+            .arg(relay.settings.queue.to_string())
+            .arg("--on-overflow")
+            .arg(relay.settings.overflow.as_str())
+            .arg("--release")
+            .arg(&relay.release)
+            .arg("--tag")
+            .arg(format!("muru.{}[{index}]: ", relay.kind))
+            .arg("--stdout-tag")
+            .arg(format!("muru.{}[{index}].stdout: ", relay.kind))
+            .arg("--name")
+            .arg(format!("{} {index}", relay.kind))
+            .arg("--stop-signal")
+            .arg(self.spec.stop_signal.to_string());
+
+        if self.spec.stop_group {
+            command.arg("--stop-group");
+        }
+
+        command
+            .arg("--")
+            .arg(program)
+            .args(&instance.spec.command[1..])
+            .current_dir(&self.spec.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(log)
+            .env_clear()
+            .envs(self.spec.env.iter().cloned())
+            .envs(instance.spec.env.iter().cloned());
+        crate::host::own_session(&mut command, self.spec.identity);
+
+        let mut child = command.spawn().context("running muructl relay")?;
+        let relay_pid = child.id().unwrap_or(0);
+
+        // The relay says, in one line, what it started or why it could
+        // not; a relay that says nothing in time is killed.
+
+        let mut line = String::new();
+
+        let said = match child.stdout.take() {
+            Some(out) => {
+                let mut out = tokio::io::BufReader::new(out);
+                tokio::time::timeout(RELAY_START_WAIT, out.read_line(&mut line)).await
+            }
+            None => Ok(Ok(0)),
+        };
+
+        let started = match said {
+            Ok(Ok(_)) => serde_json::from_str::<ProcessRecord>(line.trim_end()).ok(),
+            _ => None,
+        };
+
+        let Some(started) = started.filter(|started| started.error.is_none() && started.pid != 0)
+        else {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            anyhow::bail!(
+                "{}",
+                serde_json::from_str::<ProcessRecord>(line.trim_end())
+                    .ok()
+                    .and_then(|started| started.error)
+                    .unwrap_or_else(|| format!(
+                        "starting {}: its log relay did not start it",
+                        program.display()
+                    ))
+            );
+        };
+
+        let reopens = tokio::sync::watch::channel(0).0;
+        let reports = watch_relay(relay, index, &reopens);
+
+        Ok(Relayed {
+            relay: RelayProcess::Child(child),
+            relay_pid,
+            relay_start_time: started.relay_start_time,
+            pid: started.pid,
+            start_time: started.start_time,
+            record,
+            reopens,
+            reports,
+        })
+    }
+
     /// Whether the process of the instance at `position` has exited,
     /// without waiting, and how. An instance with no process has not.
     pub fn try_exited(&mut self, position: usize) -> std::io::Result<Option<Exit>> {
@@ -645,12 +1098,14 @@ impl Supervisor {
     /// are sent the stop signal when the exit is seen, and have the wait
     /// before the next start to go in. Any still there when the wait
     /// ends are killed, and the start is put off to the next check.
-    pub fn check(&mut self) -> Vec<Report> {
+    pub async fn check(&mut self) -> Vec<Report> {
         let now = Instant::now();
         let mut reports = Vec::new();
 
         for position in 0..self.instances.len() {
-            if let Ok(Some(exit)) = self.try_exited(position) {
+            let ended = self.instances[position].ended.take();
+
+            if let Some(exit) = ended.or_else(|| self.try_exited(position).ok().flatten()) {
                 let instance = &mut self.instances[position];
                 let left_behind = instance
                     .process
@@ -729,7 +1184,7 @@ impl Supervisor {
             instance.leftover = None;
             let index = instance.index;
 
-            match self.spawn(position) {
+            match self.spawn(position).await {
                 Ok(()) => reports.push(Report {
                     kind: self.spec.events.started,
                     level: "info",
@@ -769,6 +1224,18 @@ impl Supervisor {
             .iter()
             .filter(|instance| instance.process.is_some())
             .count()
+    }
+
+    /// Have every instance's relay open its log again by name; gives, for
+    /// each relay told, what changes once it says it has.
+    pub fn reopen(&self) -> Vec<tokio::sync::watch::Receiver<u64>> {
+        self.instances
+            .iter()
+            .filter_map(|instance| match &instance.process {
+                Some(Process::Relayed(relayed)) => relayed.reopen(),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The instances as a record for the next daemon.
@@ -816,11 +1283,24 @@ impl Supervisor {
     /// start the instance beside it.
     pub fn release(self) {
         for instance in self.instances {
-            if let Some(Process::Child { mut child, .. }) = instance.process {
-                // The child must not be killed when its handle drops.
+            match instance.process {
+                // A child must not be killed when its handle drops.
+                Some(Process::Child { mut child, .. }) => {
+                    let _ = child.try_wait();
+                    std::mem::forget(child);
+                }
+                Some(Process::Relayed(mut relayed)) => {
+                    if let RelayProcess::Child(child) = &mut relayed.relay {
+                        let _ = child.try_wait();
+                    }
 
-                let _ = child.try_wait();
-                std::mem::forget(child);
+                    let relay = std::mem::replace(&mut relayed.relay, RelayProcess::Adopted);
+
+                    if let RelayProcess::Child(child) = relay {
+                        std::mem::forget(child);
+                    }
+                }
+                _ => {}
             }
 
             if let Some(leftover) = instance.leftover {
@@ -850,6 +1330,7 @@ mod tests {
             env: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
             identity: None,
             log: dir.join("output.log"),
+            relay: None,
             stop_signal: libc::SIGTERM,
             stop_group: false,
             events: EVENTS,
@@ -879,15 +1360,23 @@ mod tests {
         }
     }
 
-    /// Check until there is something to report.
-    fn reports(supervisor: &mut Supervisor) -> Vec<String> {
-        wait_for("a report", || {
-            let reports = supervisor.check();
-            (!reports.is_empty()).then_some(reports)
-        })
-        .into_iter()
-        .map(|report| format!("{} {}: {}", report.kind, report.level, report.message))
-        .collect()
+    /// Check, in real time, until there is something to report.
+    async fn reports(supervisor: &mut Supervisor) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+
+        loop {
+            let reports = supervisor.check().await;
+
+            if !reports.is_empty() {
+                return reports
+                    .into_iter()
+                    .map(|report| format!("{} {}: {}", report.kind, report.level, report.message))
+                    .collect();
+            }
+
+            assert!(std::time::Instant::now() < deadline, "a report never came");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn pids(supervisor: &Supervisor) -> Vec<u32> {
@@ -1006,7 +1495,7 @@ mod tests {
 
         for wait in [1, 2, 4] {
             assert_eq!(
-                reports(&mut supervisor),
+                reports(&mut supervisor).await,
                 [format!(
                     "thing.exited warning: instance 0 exited with exit status: 3; \
                      starting it again in {wait}s"
@@ -1017,9 +1506,9 @@ mod tests {
             // Nothing happens until the whole wait has passed.
 
             tokio::time::advance(Duration::from_secs(wait) - Duration::from_millis(1)).await;
-            assert!(supervisor.check().is_empty());
+            assert!(supervisor.check().await.is_empty());
             tokio::time::advance(Duration::from_millis(1)).await;
-            let started = reports(&mut supervisor);
+            let started = reports(&mut supervisor).await;
             assert_eq!(
                 started,
                 [format!(
@@ -1048,13 +1537,13 @@ mod tests {
 
         for wait in [1, 2] {
             kill(pids(&supervisor)[0]);
-            let exited = reports(&mut supervisor);
+            let exited = reports(&mut supervisor).await;
             assert!(
                 exited[0].ends_with(&format!("starting it again in {wait}s")),
                 "{exited:?}"
             );
             tokio::time::advance(Duration::from_secs(wait)).await;
-            assert!(reports(&mut supervisor)[0].starts_with("thing.started"));
+            assert!(reports(&mut supervisor).await[0].starts_with("thing.started"));
         }
 
         // A run of a minute is a recovery, and the exit after it waits
@@ -1062,7 +1551,7 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(60)).await;
         kill(pids(&supervisor)[0]);
-        let exited = reports(&mut supervisor);
+        let exited = reports(&mut supervisor).await;
         assert!(exited[0].ends_with("starting it again in 1s"), "{exited:?}");
 
         supervisor.stop_until(Instant::now()).await;
@@ -1087,9 +1576,9 @@ mod tests {
 
         std::fs::remove_file(dir.path().join("bin/sleep")).unwrap();
         kill(pids(&supervisor)[0]);
-        assert!(reports(&mut supervisor)[0].starts_with("thing.exited"));
+        assert!(reports(&mut supervisor).await[0].starts_with("thing.exited"));
         tokio::time::advance(Duration::from_secs(1)).await;
-        let failed = reports(&mut supervisor);
+        let failed = reports(&mut supervisor).await;
         assert!(
             failed[0].starts_with("thing.failed error: instance 0 could not be started: starting "),
             "{failed:?}"
@@ -1100,7 +1589,7 @@ mod tests {
 
         std::os::unix::fs::symlink("/bin/sleep", dir.path().join("bin/sleep")).unwrap();
         tokio::time::advance(Duration::from_secs(2)).await;
-        assert!(reports(&mut supervisor)[0].starts_with("thing.started"));
+        assert!(reports(&mut supervisor).await[0].starts_with("thing.started"));
 
         supervisor.stop_until(Instant::now()).await;
     }
@@ -1150,7 +1639,7 @@ mod tests {
         // time, and the other is as it was.
 
         kill(started[1]);
-        reports(&mut supervisor);
+        reports(&mut supervisor).await;
         let record = supervisor.record();
         assert_eq!(
             (record.instances[0].index, record.instances[0].pid),
@@ -1282,7 +1771,7 @@ mod tests {
 
         kill(pid);
         assert_eq!(
-            reports(&mut supervisor),
+            reports(&mut supervisor).await,
             [
                 "thing.exited warning: instance 0 exited with signal: 9 (SIGKILL), \
               leaving processes behind that are being stopped; starting it again in 1s"
@@ -1294,13 +1783,13 @@ mod tests {
         // killed, and the instance is not started beside it.
 
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(supervisor.check().is_empty());
+        assert!(supervisor.check().await.is_empty());
         assert_eq!(supervisor.running(), 0);
         wait_for("the group to empty", || (!group_exists(pid)).then_some(()));
 
         // With nothing left, the next check starts the instance.
 
-        let started = supervisor.check();
+        let started = supervisor.check().await;
         assert_eq!(started.len(), 1);
         assert_eq!(started[0].kind, "thing.started");
         assert_eq!(supervisor.running(), 1);
@@ -1321,7 +1810,7 @@ mod tests {
         )
         .await;
         kill(pid);
-        reports(&mut supervisor);
+        reports(&mut supervisor).await;
         assert!(group_exists(pid));
 
         supervisor.stop_until(Instant::now()).await;
@@ -1342,7 +1831,7 @@ mod tests {
         )
         .await;
         kill(pid);
-        reports(&mut supervisor);
+        reports(&mut supervisor).await;
         assert!(group_exists(pid));
 
         // The child is killed as the instances are let go. Should it be
@@ -1408,6 +1897,8 @@ mod tests {
                     started_unix_ms: if *pid == 0 { 0 } else { now },
                     quick_exits: 2,
                     start_time: start_time(*pid).unwrap_or(0),
+                    relay_pid: 0,
+                    relay_start_time: 0,
                 })
                 .collect(),
         }
@@ -1464,7 +1955,7 @@ mod tests {
         // The first check starts the two that were not there, and
         // leaves the survivor alone.
 
-        let started = supervisor.check();
+        let started = supervisor.check().await;
         let started: Vec<&str> = started
             .iter()
             .map(|report| report.message.as_str())
@@ -1485,7 +1976,7 @@ mod tests {
 
         kill(now[1]);
         assert_eq!(
-            reports(&mut supervisor),
+            reports(&mut supervisor).await,
             [
                 "thing.exited warning: instance 1 exited with signal: 9 (SIGKILL); \
               starting it again in 4s"
@@ -1498,11 +1989,11 @@ mod tests {
         survivor.kill().unwrap();
         survivor.wait().unwrap();
         assert_eq!(
-            reports(&mut supervisor),
+            reports(&mut supervisor).await,
             ["thing.exited warning: instance 0 is gone; starting it again in 4s"]
         );
         tokio::time::advance(Duration::from_secs(4)).await;
-        assert_eq!(supervisor.check().len(), 2);
+        assert_eq!(supervisor.check().await.len(), 2);
         assert_eq!(supervisor.running(), 3);
         assert!(!pids(&supervisor).contains(&survivor.id()));
 
@@ -1532,7 +2023,7 @@ mod tests {
         lasting.kill().unwrap();
         lasting.wait().unwrap();
         assert_eq!(
-            reports(&mut supervisor),
+            reports(&mut supervisor).await,
             ["thing.exited warning: instance 0 is gone; starting it again in 1s"]
         );
 
@@ -1564,7 +2055,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(supervisor.running(), 0);
-        assert_eq!(supervisor.check().len(), 1);
+        assert_eq!(supervisor.check().await.len(), 1);
         assert_eq!(supervisor.running(), 1);
 
         supervisor.stop_until(Instant::now()).await;
@@ -1592,7 +2083,7 @@ mod tests {
         // The instance has no process, and the first check starts one.
 
         assert_eq!(pids(&supervisor), [0]);
-        assert_eq!(supervisor.check().len(), 1);
+        assert_eq!(supervisor.check().await.len(), 1);
         assert_ne!(pids(&supervisor), [bystander.id()]);
 
         // Stopping the instance leaves the bystander running.
@@ -1631,7 +2122,7 @@ mod tests {
         // signals nothing: the bystander runs on.
 
         assert_eq!(
-            reports(&mut supervisor),
+            reports(&mut supervisor).await,
             ["thing.exited warning: instance 0 is gone; starting it again in 4s"]
         );
         supervisor.stop_until(Instant::now()).await;
