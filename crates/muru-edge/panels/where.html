@@ -1,0 +1,8 @@
+{#- The Where panel: where routing sent the request. -#}
+<table class="values">
+<tbody>
+{%- for value in panel.values %}
+<tr><th>{{ value.name }}</th><td class="mono">{{ value.value }}</td></tr>
+{%- endfor %}
+</tbody>
+</table>

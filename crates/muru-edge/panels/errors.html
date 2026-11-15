@@ -1,0 +1,16 @@
+{#- The Errors panel: the unhandled exception, or the edge's reason. -#}
+{%- if panel.values %}
+<table class="values">
+<tbody>
+{%- for value in panel.values %}
+{%- if value.name == "traceback" %}
+<tr><th>{{ value.name }}</th><td><pre class="error">{{ value.value }}</pre></td></tr>
+{%- else %}
+<tr><th>{{ value.name }}</th><td>{{ value.value }}</td></tr>
+{%- endif %}
+{%- endfor %}
+</tbody>
+</table>
+{%- else %}
+<p class="muted">No errors.</p>
+{%- endif %}

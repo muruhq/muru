@@ -80,6 +80,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `handoff` | string |  | The interface the default mount's requests may be handed to; none when absent. `asgi`: Continue the request as an ASGI application on the event loop. `wsgi`: Continue the request as a WSGI callable on the thread pool. |
 | `hooks` | string |  | The module holding the lifecycle hooks, as a Python module name. |
 | `instances` | integer | `1` | How many instances of the command an `http` release runs. |
+| `instrumentation` | array of tables, {ref}`[[app.NAME.release.ID.instrumentation]] <config-daemon-app-name-release-id-instrumentation>` |  | The instrumentation modules, in order; when given, they replace the list in the source's `[tool.muru]` table. |
 | `interface` | string | `"auto"` | The interface, when declared rather than detected. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `kind` | string | `"workers"` | What the release runs: `workers` from an entrypoint, the default, or `http`, an HTTP server started from `command`. `workers`: Muru's own workers, from an entrypoint. `http`: An HTTP server Muru starts and supervises, from a command. |
 | `logging` | table, {ref}`[logging] <config-daemon-logging>` |  | How Python logging is set up in the workers. |
@@ -199,6 +200,16 @@ The requests a worker group takes for its paths: every list given must name the 
 | `host` | array of strings |  | Hosts: a virtual host's name or a name it answers to, or under `muructl run` the name the request carries. |
 | `method` | array of strings |  | Methods, compared in upper case. |
 
+(config-daemon-app-name-release-id-instrumentation)=
+## `[[app.NAME.release.ID.instrumentation]]`
+
+One instrumentation module of a release: a tool such as an import timer or an APM agent, imported before the application and set up apart from it, with settings that only it is given.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `module` | string | required | The module, as a dotted Python module name. |
+| `settings` | table |  | The settings its `configure` function is given, as a table of any values. |
+
 (config-daemon-app-name-release-id-memory)=
 ## `[app.NAME.release.ID.memory]`
 
@@ -236,6 +247,7 @@ A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` ta
 | `sendfile_header` | string | the release's | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
 | `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. |
 | `threads` | integer or table, {ref}`[app.NAME.release.ID.mounts.NAME.threads] <config-daemon-app-name-release-id-mounts-name-threads>` |  | Threads of the mount's own, for a WSGI or gRPC mount; it shares the worker's pool when absent. |
+| `tracing_middleware` | boolean | `false` | Wrap the mount's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for. |
 
 (config-daemon-app-name-release-id-mounts-name-threads)=
 ## `[app.NAME.release.ID.mounts.NAME.threads]`
@@ -469,6 +481,7 @@ A virtual host, the `[host.NAME]` table.
 | `access_log_exclude` | array of strings |  | Paths whose requests the access log leaves out, besides those the `[logs]` table leaves out. |
 | `access_log_file` | string |  | A file in the daemon's log directory that takes the host's records in place of `access.log`, for example `shop.log`. |
 | `access_log_format` | string | `access_log_format` in `[logs]` | How the host's records are written: `json` or `combined`. |
+| `access_log_query` | string | `access_log_query` in `[logs]` | What the host's records keep of the query string: `keep`, `mask` or `drop`. |
 | `canonical` | string |  | The name the host is known by, for `use_canonical_name`. |
 | `canonical_redirect` | boolean | `false` | Redirect requests for the host's other names to the canonical name. |
 | `compression` | table, {ref}`[compression] <config-daemon-compression>` |  | How responses to the host's requests are compressed, each key replacing the daemon's `[compression]` value. A route's own replace them. |
@@ -649,6 +662,7 @@ The `[logs]` table of the daemon's file: how the daemon rotates the log files it
 | `access_log` | string | `"on"` | Which requests the access log writes: `on` (the default), `errors` (4xx and 5xx responses, requests at least `slow`, and WebSockets that closed other than normally or going away) or `off`. Requests not written are still counted in the metrics and shown on the dashboard. |
 | `access_log_exclude` | array of strings |  | Paths whose requests the access log leaves out: `*` matches any run of characters and `?` one, for example `/static/*`. |
 | `access_log_format` | string | `"json"` | How the access log's records are written: `json` (the default), one object a line, or `combined`, the combined log format of Apache and nginx. |
+| `access_log_query` | string | `"keep"` | What the access log's records keep of each request's query string, in the target and the internal redirects, in either format: `keep` (the default) writes it as it came, `mask` writes the values of secret parameters, such as `token` or `password`, as `***`, and `drop` writes the path alone. |
 | `compress` | string | `"zstd"` | How archives are compressed: `zstd` (the default), `gzip` or `off`. |
 | `every` | string | `"daily"` | Rotate by the clock: `off`, `hourly`, `daily` (the default) or `weekly`, at the period's start in UTC. |
 | `keep` | integer | `14` | Archives kept per log. |

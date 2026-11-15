@@ -49,6 +49,66 @@ no fork, so `pre_fork` does not run.
 [Preload and fork safety](../explanation/preload.md) explains what the
 hooks are for.
 
+## Signals Muru keeps
+
+Muru handles some signals itself in the host and in each worker, from the
+moment the process starts, before the instrumentation modules or the
+application are imported:
+
+| Process | Signals |
+| --- | --- |
+| The host | SIGTERM, SIGINT, SIGCHLD, SIGUSR1, SIGUSR2 |
+| A worker | SIGTERM, SIGINT, SIGUSR1, SIGUSR2, SIGQUIT |
+
+- **A stop while loading.** SIGTERM or SIGINT while the host preloads the
+  application ends the host cleanly: the import is abandoned, the
+  instrumentation modules' `load_finished` is told `stopped`, and the
+  host says it was stopped. In a worker that has not started serving,
+  through its imports, `post_fork`, lifespan startup and `on_ready`, the
+  start is abandoned, and what had started shuts down as a stop would:
+  lifespan shutdown, `on_exit`, the `atexit` callbacks and the
+  instrumentation modules' `worker_stopped`. Once the worker serves, a
+  stop drains its requests as usual.
+
+- **A reopen or reclaim while loading.** SIGUSR1 and SIGUSR2 do not end
+  a process that is still loading. A worker acts on them once it serves:
+  `on_reopen_logs` runs then.
+
+- **Other code cannot take them.** `signal.signal()` for one of these
+  signals is refused in that process: the handler is not installed, a
+  warning in the log names the signal and the module and line the call
+  came from, and the call returns the handler in force, so the code goes
+  on. This covers the application, its hooks and the instrumentation
+  modules, and `loop.add_signal_handler()`, which calls
+  `signal.signal()`. Other signals are installed as usual. A C extension
+  that calls `sigaction` itself, or `faulthandler.register()`, is not
+  checked. To act when a worker stops or reopens its logs, use the
+  `on_drain`, `on_exit` and `on_reopen_logs` hooks.
+
+## Instrumentation callbacks
+
+An instrumentation module, listed in `[[tool.muru.instrumentation]]`,
+may define any of these module-level functions; see
+[Instrumentation modules](../howto/instrumentation.md) for where they
+are listed and when they are imported. Their return values are ignored,
+and an exception from one is logged and otherwise ignored.
+
+| Callback | Where and when |
+| --- | --- |
+| `configure(settings)` | Wherever the module is imported, once, straight after the import, with a `dict` of its entry's settings |
+| `load_started(context)` | Straight after `configure`, before the next module is imported |
+| `before_import(context, target)` | Before the hooks module, the entrypoint and each mount is imported, in listed order |
+| `after_import(context, target)` | After each of those imports, in reverse order, with `target.error` set when it failed |
+| `load_finished(context, outcome)` | Once the load is done or has failed, in reverse order; `outcome` is `fork`, `serve`, `fallback`, `refused`, `failed` or `check` |
+| `worker_started(context)` | In each worker, in listed order, just before the `post_fork` hook |
+| `wrap_application(context, target, application, interface)` | In each worker, once for each entry point, after any factory and before the event loop and lifespan start; a return value other than `None` is served in place of `application` |
+| `worker_stopped(context)` | In each worker that ran `worker_started`, in reverse order, as the last thing it does, after `on_exit`, the `atexit` callbacks and the event loop stopping, also when it failed to start or to serve |
+
+`target` has `kind` (`hooks`, `entrypoint` or `mount`), `name` (a
+mount's name, empty for the others), `spec` (the module, or
+`module:callable`) and `error` (what a failed import raised, for
+`after_import`). `interface` is `wsgi`, `asgi` or `grpc`.
+
 ## `muru.is_internal()`
 
 `muru.is_internal(environ_or_scope)` returns whether the request arrived
@@ -126,6 +186,32 @@ says how they are set):
 | `formatter(format)` | The `logging.Formatter` for a format name: `standard`, `json`, or a format string |
 | `JsonFormatter` | The `json` format: one object per record with `time`, `level`, `logger`, `message`, `app`, `release`, `group`, `worker`, and `exception` and `stack` when present |
 | `STANDARD_FORMAT` | The `standard` format string, `%(levelname)s %(name)s: %(message)s` |
+
+## `muru.panels`
+
+Panels the application adds to the [development toolbar](../howto/toolbar.md)
+for the requests a development run records ([adding panels](../howto/panels.md)
+says how). Outside such a request every panel keeps nothing.
+
+| Name | Purpose |
+| --- | --- |
+| `ValuesPanel(name, title)` | Declares a panel of names with values |
+| `TablesPanel(name, title, *, tables)` | Declares a panel of tables, `tables` mapping each caption to its columns |
+| `SpansPanel(name, title)` | Declares a panel of spans on the request's clock |
+| `TextPanel(name, title, *, markdown=False)` | Declares a panel of text, plain or markdown |
+| `panel.current()` | The declared panel for the request being served: a `Values`, `Tables`, `Spans` or `Text` |
+| `Values`: `values[name] = value` | Sets a value, shown as text |
+| `Tables.table(caption)` | The table with that caption, a `Table`; `ValueError` for a caption the panel does not have |
+| `Table.add_row(cells)` | Adds a row, each cell shown as text, and returns whether it was kept |
+| `Spans.add(span)` | Adds a `Span` with those beneath it, and returns whether it was kept |
+| `Spans.span(name, category="")` | A context manager timing its block as a span, beneath an enclosing block's of the same panel |
+| `Text.write(text)` | Adds a block of text, after a blank line, and returns whether it was kept |
+| `active` | On every panel: whether it keeps anything for the request being served |
+| `now()`, `at(reading)` | On every panel: milliseconds on the request's clock, now or for a `time.perf_counter()` reading; 0 when it keeps nothing |
+| `add_dropped(count)` | On every panel: counts entries the code left out, shown with those past the limits |
+| `Span(name, start, duration, category="", children=[])` | A span, its times in milliseconds on the request's clock |
+| `on_first_record(callback)` | Runs `callback` once, as the worker starts recording its first request |
+| `PANEL_LIMIT`, `REQUEST_LIMIT`, `TEXT_LIMIT` | 500 entries a panel keeps for a request, 2,000 a request keeps, 65,536 characters a text panel keeps |
 
 ## `muru.__version__`
 

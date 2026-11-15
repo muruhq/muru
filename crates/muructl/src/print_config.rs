@@ -335,6 +335,45 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
         top.push(Row::new("hooks", hooks, app(args.hooks.is_some(), "hooks")));
     }
 
+    // Section 6.15: muru.local.toml's instrumentation entries come before
+    // the project's, so the row names both when both give some.
+
+    if !resolved.instrumentation.is_empty() {
+        let from_table = layers.table["instrumentation"]
+            .as_array()
+            .map_or(0, Vec::len);
+
+        let source = match (&serving.local, from_table) {
+            (Some(path), 0) => format!("[[instrumentation]] in {}", path.display()),
+            (Some(path), _) if resolved.instrumentation.len() > from_table => {
+                format!("[[instrumentation]] in {}, then {project}", path.display())
+            }
+            _ => project.clone(),
+        };
+
+        top.push(Row::new(
+            "instrumentation",
+            &resolved.instrumentation,
+            source,
+        ));
+    }
+
+    // Section 11.6: tracing, from muru.local.toml or the project, and the
+    // entrypoint's request middleware.
+
+    if let Some(tracing) = &resolved.tracing {
+        let source = match &resolved.tracing_from_local {
+            Some(path) => path.display().to_string(),
+            None => project.clone(),
+        };
+
+        top.push(Row::new("tracing", tracing, source));
+    }
+
+    if let Some(middleware) = resolved.tracing_middleware {
+        top.push(Row::new("tracing_middleware", middleware, project.clone()));
+    }
+
     if let Some(python) = args.python.as_ref().or(resolved.python.as_ref()) {
         top.push(Row::new(
             "python",
@@ -487,6 +526,12 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
     }
 
     rows.push(Row::new(
+        "access_log_query",
+        serving.access_log_query.as_str(),
+        run(args.access_log_query.is_some(), "access_log_query"),
+    ));
+
+    rows.push(Row::new(
         "slow",
         muru_config::format_duration(serving.slow),
         run(args.slow.is_some(), "slow"),
@@ -504,6 +549,11 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
         "compression",
         serving.compression,
         run(args.no_compression, "compression"),
+    ));
+    rows.push(Row::new(
+        "toolbar",
+        serving.toolbar,
+        run(args.toolbar || args.no_toolbar, "toolbar"),
     ));
     rows.push(Row::new(
         "timestamps",
@@ -624,6 +674,22 @@ pub fn serve_settings(resolved: &crate::Resolved, serve: Serve) -> Settings {
 
     if let Some(hooks) = &resolved.hooks {
         top.push(Row::new("hooks", hooks, app("hooks")));
+    }
+
+    if !resolved.instrumentation.is_empty() {
+        top.push(Row::new(
+            "instrumentation",
+            &resolved.instrumentation,
+            project.clone(),
+        ));
+    }
+
+    if let Some(tracing) = &resolved.tracing {
+        top.push(Row::new("tracing", tracing, project.clone()));
+    }
+
+    if let Some(middleware) = resolved.tracing_middleware {
+        top.push(Row::new("tracing_middleware", middleware, project.clone()));
     }
 
     if let Some(requests) = resolved.max_requests {

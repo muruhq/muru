@@ -83,6 +83,31 @@ def test_an_entrypoint_that_does_not_resolve_fails_with_the_error(tmp_path: Path
     assert "the check failed" in completed.stderr
 
 
+def test_an_instrumentation_callback_that_raises_fails_the_check(tmp_path: Path) -> None:
+    # Section 6.15: under a run the failure is logged and the release
+    # carries on; the check names the module and the callback, and fails.
+
+    directory = tmp_path / "project"
+    directory.mkdir()
+    shutil.copy(support.FIXTURES / "plain_wsgi.py", directory / "app.py")
+    (directory / "faulty_tool.py").write_text(
+        "def configure(settings):\n"
+        "    raise ValueError('no such setting: ' + ', '.join(settings))\n"
+    )
+    (directory / "pyproject.toml").write_text(
+        "[tool.muru]\nentrypoint = 'app:application'\n"
+        "[[tool.muru.instrumentation]]\nmodule = 'faulty_tool'\nsettings = { colour = 1 }\n"
+    )
+    completed = check(str(directory))
+
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert (
+        "muru: check: error: the configure callback of instrumentation module faulty_tool "
+        "failed: ValueError: no such setting: colour"
+    ) in completed.stdout, completed.stdout
+    assert "raise ValueError" in completed.stderr, completed.stderr
+
+
 def test_the_import_check_warns_and_strict_fails(tmp_path: Path) -> None:
     completed = check("unsafe_import_wsgi:application", "--chdir", str(support.FIXTURES))
 

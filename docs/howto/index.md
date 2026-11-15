@@ -103,11 +103,21 @@ Recipes for specific tasks, assuming you already know the basics. The
   workers.
 - [Events and webhooks](events.md): every change of state, and sinks
   that receive them.
-- [The dashboard](dashboard.md): charts, workers and actions in a
-  browser.
+- [The dashboard](dashboard.md): charts, workers, requests and logs in
+  a browser, read-only.
 - [Inspecting workers](debugging.md): stacks, profiles, memory and a
   debugger in running workers, a report to attach to a bug report, and
   a bundle of a whole system for triage.
+- [Inspecting requests in development](toolbar.md): the debug toolbar
+  on each page, timings in the browser, and a record of each request a
+  development run serves.
+- [Adding panels to the toolbar](panels.md): the application's own
+  panels of values, tables, spans or text in the debug toolbar.
+- [Instrumentation modules](instrumentation.md): tools such as import
+  timers and APM agents, set up for a release apart from the
+  application.
+- [Tracing with wrapture](tracing.md): each request's calls, queries
+  and renders recorded as a tree, with no change to the application.
 
 ## Coding agents
 
@@ -163,5 +173,9 @@ metrics
 events
 dashboard
 debugging
+toolbar
+panels
+instrumentation
+tracing
 coding-agents
 ```

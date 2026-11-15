@@ -87,6 +87,8 @@ struct WorkerSlots {
     worker_type: String,
     /// Whether its default mount accepts websocket scopes (section 5.6).
     websockets: bool,
+    /// It sends its part of a request's record when asked (section 11.7).
+    records: bool,
     /// The named mounts that accept websocket scopes (section 6.14).
     websocket_mounts: Vec<String>,
     /// Its default mount runs on the event loop.
@@ -178,6 +180,7 @@ impl WorkerSlots {
             event_loop,
             worker_type: hello.worker_type,
             websockets: hello.websockets,
+            records: hello.records,
             websocket_mounts: hello.websocket_mounts,
             mounts,
             grpc: hello.grpc_methods,
@@ -604,6 +607,10 @@ pub struct LinkPool {
     /// Section 7.4: for a pool with no workers, the group a request waits
     /// to be woken, when it can be.
     wake: Option<crate::wake::Key>,
+    /// Whether the pool is a release's group's, rather than the one an
+    /// edge has before any release, so a request refused for want of a
+    /// worker is logged with the right reason.
+    connected: bool,
 }
 
 /// One request's place in the queue for a slot, given back when it gets
@@ -633,6 +640,9 @@ pub(crate) struct Lease {
     pub(crate) on_loop: bool,
     /// Whether the worker accepts websocket scopes.
     websockets: bool,
+    /// Whether the worker sends its part of a request's record when asked
+    /// (section 11.7).
+    records: bool,
     /// The pool the connection came from, when it is not the one asked:
     /// a woken group's (section 7.4).
     pub(crate) woken: Option<Arc<LinkPool>>,
@@ -686,6 +696,7 @@ impl LinkPool {
             waiting: AtomicUsize::new(0),
             grpc,
             wake: None,
+            connected: true,
         })
     }
 
@@ -753,6 +764,7 @@ impl LinkPool {
             waiting: AtomicUsize::new(0),
             grpc: Vec::new(),
             wake: None,
+            connected: false,
         }
     }
 
@@ -803,7 +815,13 @@ impl LinkPool {
     ) -> io::Result<Lease> {
         if self.workers.is_empty() {
             let Some(key) = &self.wake else {
-                return Err(io::Error::other("no release is serving"));
+                return Err(io::Error::other(if !self.connected {
+                    "no release is serving"
+                } else if self.unreachable.is_empty() {
+                    "the group has no worker in routing"
+                } else {
+                    "none of the group's workers could be connected to"
+                }));
             };
 
             // The request counts as waiting here, where the metrics see
@@ -877,6 +895,7 @@ impl LinkPool {
                 borrowed,
                 on_loop: worker.on_loop(mount),
                 websockets: worker.accepts_websockets(mount),
+                records: worker.records,
                 woken: None,
             });
         }
@@ -953,6 +972,37 @@ async fn handshake(path: &PathBuf) -> io::Result<(Conn, pb::Hello)> {
     Ok((Conn { reader, writer }, hello))
 }
 
+/// How long the edge waits after a response for the worker's part of
+/// its record (section 11.7). The worker sends it once the application
+/// has finished, which with a declared Content-Length can come after the
+/// last byte, while close() runs.
+const RECORD_WAIT: Duration = Duration::from_secs(10);
+
+/// Read the RECORD frame that follows a response and hand it to the
+/// request's record. The reader comes back when the frame did, to go back
+/// to the pool; anything else leaves the connection to be closed.
+async fn read_record(mut reader: Reader, noted: &crate::development::Request) -> Option<Reader> {
+    let read = tokio::time::timeout(RECORD_WAIT, frame::read(&mut reader)).await;
+
+    let record = match read {
+        Ok(Ok(Some(next))) if next.kind == kind::RECORD => {
+            pb::WorkerRecord::decode(next.payload).ok()
+        }
+        _ => None,
+    };
+
+    match record {
+        Some(record) => {
+            noted.worker_part(record);
+            Some(reader)
+        }
+        None => {
+            noted.worker_missing();
+            None
+        }
+    }
+}
+
 /// Collects the two halves of a leased connection as each direction
 /// finishes, and returns the connection to the pool when both are back
 /// intact. A half reported as broken closes the connection instead.
@@ -973,6 +1023,10 @@ pub(crate) struct Return {
     ended: AtomicBool,
     /// The request's stored uploads (section 4.11), dropped with it.
     uploads: Mutex<Option<crate::uploads::Received>>,
+    /// Where the worker's part of the request's record goes, when the
+    /// request head asked for it (section 11.7): the RECORD frame that
+    /// follows the response is read before the connection goes back.
+    record: Mutex<Option<Arc<crate::development::Request>>>,
     /// How the request body ended: None while the body pump is sending
     /// it on, then whether it was read to its end.
     settled: watch::Sender<Option<bool>>,
@@ -1004,8 +1058,16 @@ impl Return {
             client_stalled: AtomicBool::new(false),
             ended: AtomicBool::new(false),
             uploads: Mutex::new(None),
+            record: Mutex::new(None),
             settled: watch::Sender::new(Some(true)),
         })
+    }
+
+    /// The worker will send its part of the request's record after the
+    /// response, for `noted`.
+    fn expect_record(&self, noted: Arc<crate::development::Request>) {
+        noted.expect_worker();
+        *self.record.lock().expect("record poisoned") = Some(noted);
     }
 
     /// Keep the request's stored uploads until the request ends.
@@ -1048,8 +1110,34 @@ impl Return {
         self.proceed.notify_one();
     }
 
-    pub(crate) fn give_reader(&self, reader: Option<Reader>) {
+    pub(crate) fn give_reader(self: &Arc<Self>, reader: Option<Reader>) {
         self.ended.store(true, Ordering::Relaxed);
+        let expected = self.record.lock().expect("record poisoned").take();
+
+        // Section 11.7: the RECORD frame comes before the connection is
+        // idle, so it is read first; the connection is closed when it does
+        // not come.
+
+        match (reader, expected) {
+            (Some(reader), Some(noted)) => {
+                let back = Arc::clone(self);
+
+                tokio::spawn(async move {
+                    let reader = read_record(reader, &noted).await;
+                    back.reader_back(reader);
+                });
+            }
+            (reader, expected) => {
+                if let Some(noted) = expected {
+                    noted.worker_missing();
+                }
+
+                self.reader_back(reader);
+            }
+        }
+    }
+
+    fn reader_back(&self, reader: Option<Reader>) {
         let mut state = self.state.lock().expect("return state poisoned");
         state.reader = reader;
         self.report(&mut state);
@@ -1236,6 +1324,13 @@ pub struct Context<'a> {
     /// The bytes of the request's body read so far and not yet taken by
     /// an access record (section 11.1).
     pub received: Arc<std::sync::atomic::AtomicU64>,
+    /// What a development run notes of the request for its response
+    /// (section 4.20); none outside development mode.
+    pub noted: Option<Arc<crate::development::Request>>,
+    /// The connection the request arrived on (section 11.7).
+    pub connection: Arc<crate::development::Connection>,
+    /// The request's position on it, 1 for the first.
+    pub connection_request: u64,
 }
 
 impl<'a> Context<'a> {
@@ -1284,6 +1379,9 @@ impl<'a> Context<'a> {
             client_class: Arc::clone(&self.client_class),
             mode: None,
             received: Arc::clone(&self.received),
+            noted: self.noted.clone(),
+            connection: Arc::clone(&self.connection),
+            connection_request: self.connection_request,
         }
     }
 }
@@ -1388,6 +1486,8 @@ pub(crate) struct Recording {
     /// The request body's bytes read so far, which the record takes when
     /// it is written.
     received: Arc<std::sync::atomic::AtomicU64>,
+    /// Where a development run notes the times for the response.
+    noted: Option<Arc<crate::development::Request>>,
 }
 
 /// Record a response the edge produced itself, such as a static file,
@@ -1466,6 +1566,8 @@ impl Recording {
             client_class: context.client_class.to_string(),
             websocket: None,
             handoff: None,
+            connection: context.connection.id.clone(),
+            connection_requests: context.connection_request,
         };
 
         Self {
@@ -1475,6 +1577,24 @@ impl Recording {
             record,
             started: Instant::now(),
             received: Arc::clone(&context.received),
+            noted: context.noted.clone(),
+        }
+    }
+
+    /// The response head arrived from a worker or an upstream after
+    /// `application`: the record takes the time, and a development run
+    /// notes it with the queue's for the response (section 4.20), unless
+    /// this hop is a sub-request of the edge's own.
+    pub(crate) fn head_arrived(&mut self, application: Duration) {
+        self.record.application = application;
+
+        if let Some(noted) = &self.noted
+            && !self.silent
+        {
+            noted.note(crate::development::Timing {
+                queue: self.record.queue,
+                application,
+            });
         }
     }
 
@@ -1502,6 +1622,11 @@ impl Recording {
         self.record.total = self.started.elapsed();
         let opened = self.record.clone();
         let log = Arc::clone(&self.log);
+
+        if let Some(noted) = &self.noted {
+            noted.logged(&self.record);
+        }
+
         log.record(self.record);
         log.open_websocket(opened)
     }
@@ -1520,6 +1645,13 @@ impl Recording {
         if self.silent {
             self.log.record_hop(&self.record);
         } else {
+            // Section 11.7: a development run's record of the request
+            // takes the access log's.
+
+            if let Some(noted) = &self.noted {
+                noted.logged(&self.record);
+            }
+
             self.log.record(self.record);
         }
     }
@@ -1961,6 +2093,7 @@ async fn handle_inner(
             borrowed,
             on_loop,
             websockets,
+            records,
             woken,
         } = lease;
         head.borrowed = borrowed;
@@ -1984,6 +2117,17 @@ async fn handle_inner(
         } else {
             pb::Scope::Http as i32
         };
+
+        // Section 11.7: a development run that keeps records asks the
+        // worker for its part of the record of a client's request, sent
+        // after the response; not for a sub-request of the edge's own.
+
+        let noted = context
+            .noted
+            .as_ref()
+            .filter(|noted| noted.recorded())
+            .filter(|_| records && !upgrading && !precheck && context.handler.is_none());
+        head.record = noted.is_some();
 
         let end = upgrading
             || buffered.as_ref().map_or_else(
@@ -2013,13 +2157,13 @@ async fn handle_inner(
 
         match written {
             Ok(()) => {
-                break (
-                    Return::new(Arc::clone(&pool), worker, permit),
-                    reader,
-                    writer,
-                    end,
-                    upgrading,
-                );
+                let back = Return::new(Arc::clone(&pool), worker, permit);
+
+                if let Some(noted) = noted {
+                    back.expect_record(Arc::clone(noted));
+                }
+
+                break (back, reader, writer, end, upgrading);
             }
             Err(error) if !retried => {
                 tracing::debug!(%error, worker, "the worker closed its connection before reading the request; sending it again");
@@ -2164,7 +2308,7 @@ async fn handle_inner(
     let mut recording = failing.recording.lock().expect("recording poisoned").take();
 
     if let Some(recording) = recording.as_mut() {
-        recording.record.application = dispatched.elapsed();
+        recording.head_arrived(dispatched.elapsed());
         recording.record.status = u16::try_from(head.status).unwrap_or(500);
 
         // Section 11.7: a response flushed as it goes streams, for as long
@@ -2484,6 +2628,8 @@ pub(crate) async fn serve_hint(
                 recording.complete(status, "", bytes);
             }
 
+            let mut response = response;
+            response.extensions_mut().insert(crate::toolbar::EdgeFile);
             response
         }
         Ok(_) => {
@@ -3671,5 +3817,38 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
         assert!(!Arc::ptr_eq(&first.workers[0], &third.workers[0]));
+    }
+
+    #[tokio::test]
+    async fn a_group_between_workers_holds_a_request_until_one_is_back() {
+        // Issue 662: the group's last worker stopped first, so its
+        // routing has none; a request waits rather than being refused.
+
+        let key = ("between".to_owned(), "r1".to_owned(), "default".to_owned());
+        let empty = LinkPool::connect(&[], &Kept::default()).await.unwrap();
+        let error = empty.acquire("").await.err().unwrap();
+        assert_eq!(error.to_string(), "the group has no worker in routing");
+
+        let waiting = LinkPool::waking(key.clone());
+        assert!(waits(&waiting, "").await);
+
+        // The replacement is announced: the request is handed its pool.
+
+        let dir = tempfile::tempdir().unwrap();
+        let hello = pb::Hello {
+            protocol_version: pb::PROTOCOL_VERSION.to_owned(),
+            worker_type: "wsgi".to_owned(),
+            slots: 1,
+            ..Default::default()
+        };
+        let back = Arc::new(pool_of(dir.path(), hello).await);
+        let request =
+            tokio::spawn(
+                async move { waiting.acquire("").await.map(|lease| lease.woken.is_some()) },
+            );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        crate::wake::wakes().publish(&[(key, back)]);
+
+        assert!(request.await.unwrap().unwrap());
     }
 }

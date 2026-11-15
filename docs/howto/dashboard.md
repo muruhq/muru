@@ -28,6 +28,13 @@ relay and the workers as [`muructl status
 asked for. `/metrics` on the same address is the Prometheus exposition
 the [metrics guide](metrics.md) describes.
 
+Each recent request links to its page, `request/ID`, which shows the
+run's record of it: its timing, where it was routed, its response and
+headers, with secret values masked, and its connection. `/v1/requests/ID`
+gives the same record as JSON, as `muructl debug request ID --json`
+prints it. [Inspecting requests in development](toolbar.md) describes
+the record.
+
 ## Under the daemon
 
 The daemon serves its dashboard when `--dashboard ADDRESS` on `muructl

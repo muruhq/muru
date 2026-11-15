@@ -46,7 +46,10 @@ The check looks for:
   when it can be read, which catches database connections, Redis clients,
   message queue consumers and the pipes of helper processes;
 - threads started during the import, which catches schedulers, metrics
-  exporters and connection pool reapers started at module level;
+  exporters and connection pool reapers started at module level, each
+  Python thread named as `threading` has it and with the module its code
+  is in, and a thread running an instrumentation module's code put down
+  to that module rather than to the application;
 - child processes, which catches anything launched with `subprocess` or a
   multiprocessing pool at import time.
 

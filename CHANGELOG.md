@@ -9,6 +9,154 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a27 (2026-11-15)
+
+### Added
+
+- Added instrumentation modules: an ordered list in
+  `[[tool.muru.instrumentation]]`, `[[instrumentation]]` in `muru.toml`
+  and `muru.local.toml`, or a declared release, each a module and its
+  settings. Muru imports them before anything of the application and
+  calls each one's `configure(settings)` with its own settings. A module
+  that cannot be imported stops the release; an exception from a callback
+  is logged. ([#501](https://github.com/muruhq/muru/issues/501))
+- Added the load callbacks of instrumentation modules: `load_started`
+  before anything of the application is imported, `before_import` and
+  `after_import` around the hooks module, the entrypoint and each mount,
+  and `load_finished` with how the load ended, in the host under preload,
+  in each worker with per-worker imports, and under `muructl check`, so an
+  import timer can measure each entry point's imports. ([#502](https://github.com/muruhq/muru/issues/502))
+- Added the `worker_started` and `worker_stopped` callbacks of
+  instrumentation modules: `worker_started` just before the `post_fork`
+  hook in each worker, and `worker_stopped` as the last thing a worker
+  does, after lifespan shutdown, `on_exit` and the `atexit` callbacks,
+  also when the worker failed to start or to serve. ([#503](https://github.com/muruhq/muru/issues/503))
+- Added the `wrap_application(context, target, application, interface)`
+  callback of instrumentation modules, which receives each entry point's
+  application in each worker, after any factory and before lifespan
+  starts, and returns a wrapper to serve in its place, so an APM agent can
+  wrap a plain WSGI or ASGI application without a change to its code. ([#504](https://github.com/muruhq/muru/issues/504))
+- Every response of `muructl run` in development mode carries
+  `Server-Timing`, with the time the request waited for a worker as
+  `queue`, the time to the response head as `app` and the request's ID as
+  `muru`, so the browser's Network tab shows them, and `Muru-Request-Link`
+  with the address of the request's page on the dashboard. ([#633](https://github.com/muruhq/muru/issues/633))
+- `muructl run` in development mode keeps a record of each of its last
+  1000 requests: the access log's record, the connection it arrived on,
+  its request and response headers with secret values masked, and whether
+  the response was compressed and why not. `muructl debug request ID`
+  prints it, with `--json` for the whole record, the MCP server's `debug`
+  tool reads it as `request`, and the dashboard shows it as panels at
+  `/request/ID`, with `/v1/requests/ID` as JSON, each recent request
+  linking to its page. The access log's JSON lines name the connection as
+  `connection` and the request's position on it as `connection_requests`,
+  in every mode. ([#634](https://github.com/muruhq/muru/issues/634))
+- A development run's record of a request has the worker's part: the
+  thread that ran it, the times to `start_response`, the first and last
+  body bytes and the application's end, the body's size and source, the
+  outcome with the unhandled exception and its traceback, and the
+  request's log records and warnings. The dashboard's request page and
+  `muructl debug request` show them in new Logs and Errors panels and on
+  the Timing panel. ([#635](https://github.com/muruhq/muru/issues/635))
+- `muructl run --toolbar`, or `toolbar = true` in the run table or
+  `muru.local.toml`, puts a debug toolbar on the application's HTML pages:
+  a badge with the request's status, times, worker and its log and error
+  counts, opening to the panels of its record. Muru inserts the toolbar's
+  tag itself, honouring the page's content security policy, and answers
+  its files and each record's JSON and panels under `/_muru/` on the
+  application's own address. ([#636](https://github.com/muruhq/muru/issues/636))
+- The debug toolbar has a "This page" tab: every request the page made,
+  from the browser's own timings, as a waterfall with each request's queue
+  time, worker, log and error counts and connection from its record.
+  Clicking a row opens that request's record in the toolbar, and
+  `/_muru/requests?ids=` gives the same figures for several requests at
+  once. ([#637](https://github.com/muruhq/muru/issues/637))
+- A development run's record of a request says what held it up while the
+  worker had it: the wait for an application thread, the waits for the
+  GIL, the garbage collections that ran meanwhile and the longest stretch
+  the event loop was held. The Timing panel marks them on the request's
+  timeline and lists them under "During the request". ([#638](https://github.com/muruhq/muru/issues/638))
+- With tracing on, the development toolbar shows three more panels for each
+  request from what wrapture recorded: Trace, the request's tree of calls,
+  queries and template renders on its clock; SQL, its queries grouped by
+  statement, which shows an N+1 pattern as one statement run many times;
+  and Exceptions, the exceptions that escaped or were handled. ([#640](https://github.com/muruhq/muru/issues/640))
+- Added the `tracing` setting, which traces an application with wrapture in
+  every mode, applying its configuration before the application is imported
+  and starting its outputs in each worker, and `tracing_middleware`, which
+  wraps the entrypoint or a mount in wrapture's request middleware. A
+  developer's `muru.local.toml` can set `tracing` for their own runs. ([#674](https://github.com/muruhq/muru/issues/674))
+- Added `access_log_query`, in the `[logs]` table and on a virtual host,
+  which keeps (the default), masks or drops the query string of the access
+  log's targets and redirects in either format: `mask` writes the values
+  of secret parameters such as `token` as `***`, and `drop` writes the
+  path alone. `muructl run` and `muructl serve` take it as
+  `--access-log-query` or `access_log_query` in their tables. ([#675](https://github.com/muruhq/muru/issues/675))
+- The development request record can hold panels added in the worker, as
+  values, tables, spans on the request's clock or text, drawn after the
+  built-in panels in the toolbar, on the dashboard and by `muructl debug
+  request`, with the entries past a panel's limits counted. ([#677](https://github.com/muruhq/muru/issues/677))
+- `muru.panels` lets an application add its own panels to the development
+  toolbar: values, tables, spans or text, plain or markdown, declared once
+  and added to during a request, keeping nothing outside a development run. ([#681](https://github.com/muruhq/muru/issues/681))
+
+### Changed
+
+- The development request record, shown by the toolbar, the dashboard and
+  `muructl debug request`, now masks secret query parameters such as
+  `token`, `api_key` and `code` in the request's target, its internal
+  redirects and the `Referer` and `Location` headers, as it already masked
+  secret headers. ([#671](https://github.com/muruhq/muru/issues/671))
+- The host and its workers now take their signals as they start, before the
+  application is imported: SIGTERM or SIGINT while the application loads
+  ends the host or the worker cleanly, running `load_finished` with the new
+  `stopped` outcome, lifespan shutdown, `on_exit` and the `atexit`
+  callbacks as far as they apply, and a SIGUSR1 or SIGUSR2 then no longer
+  ends the process and is acted on once the worker serves. `muructl run`
+  and `muructl serve` stop while the workers are coming up rather than once
+  they are ready. `signal.signal()` for one of the signals Muru handles is
+  refused with a warning naming the signal and where the call came from. ([#673](https://github.com/muruhq/muru/issues/673))
+
+### Fixed
+
+- The dashboard's pages take the window's width, so a wide screen shows
+  every column of their tables. ([#649](https://github.com/muruhq/muru/issues/649))
+- The development error page lets a traceback take the window's width, so
+  its lines are shown whole on a wide screen. ([#650](https://github.com/muruhq/muru/issues/650))
+- Under `muructl serve`, the memory guard and a worker's hard limit no
+  longer stop two workers at once and leave a group with none: a worker
+  being replaced for its own limits counts as the guard's one at a time,
+  and a group's last worker in routing is not stopped first while another
+  is away. While a group has no worker in routing, requests wait for one
+  up to the queue timeout instead of being answered 503 `no_workers` at
+  once. ([#662](https://github.com/muruhq/muru/issues/662))
+- The preload import check names each Python thread it finds, with the
+  module its code is in, and puts a thread running an instrumentation
+  module's code, such as a tool's writer started on the first call it
+  traces, down to that module with advice for it, rather than to the
+  application module being imported with advice to use a `post_fork` hook. ([#669](https://github.com/muruhq/muru/issues/669))
+- `muructl check` now fails when an instrumentation module's `configure`,
+  `load_started` or other load callback raises, naming the module, the
+  callback and the exception, where it passed and showed nothing before. ([#670](https://github.com/muruhq/muru/issues/670))
+- What the application's Python code writes in the host, at import under
+  preload or from an `on_load` or `pre_fork` hook, is tagged
+  `muru.host[PID]:` for standard error and `muru.host[PID].stdout:` for
+  standard output, as a worker's output is, and the host's standard output
+  is line-buffered. ([#672](https://github.com/muruhq/muru/issues/672))
+- The preload import check names the module whose import opened a socket
+  on a descriptor number that was in use when the import began, such as
+  one a file closed during the import left free, where it named no module. ([#685](https://github.com/muruhq/muru/issues/685))
+
+### Documentation
+
+- A new guide, "Inspecting requests in development", describes the
+  `Server-Timing` and `Muru-Request-Link` headers of a development run, the
+  record it keeps of each request, the dashboard's request page and
+  `muructl debug request`. ([#632](https://github.com/muruhq/muru/issues/632))
+- The how-to guides' index no longer says that the dashboard has actions;
+  it shows what Muru is doing and changes nothing. ([#646](https://github.com/muruhq/muru/issues/646))
+
+
 ## 0.1.0a26 (2026-11-13)
 
 ### Added

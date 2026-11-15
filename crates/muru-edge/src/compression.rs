@@ -24,6 +24,73 @@ use crate::{BoxError, ResponseBody};
 /// The header an application sets to keep a response uncompressed.
 pub static X_MURU_COMPRESS: HeaderName = HeaderName::from_static("x-muru-compress");
 
+/// Why a response was sent as it came, uncompressed by the edge, which a
+/// development run's request record says (section 11.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Skipped {
+    /// Compression is off for the route.
+    Off,
+    /// The application asked for none, with X-Muru-Compress: off.
+    OptedOut,
+    /// A HEAD request has no body to compress.
+    Head,
+    /// The status carries no body: 1xx, 204 or 304.
+    NoBody,
+    /// The response was already encoded, by the application or as a
+    /// precompressed file.
+    Encoded,
+    /// The response says Cache-Control: no-transform.
+    NoTransform,
+    /// The response has no Content-Type, or one the policy does not list.
+    Type,
+    /// The body is shorter than the policy's min_size.
+    Small,
+    /// The client accepts none of the encodings the policy offers.
+    NotAccepted,
+    /// The encoder could not start.
+    Failed,
+}
+
+impl Skipped {
+    /// The reason's word, as the record's JSON gives it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::OptedOut => "opted_out",
+            Self::Head => "head",
+            Self::NoBody => "no_body",
+            Self::Encoded => "encoded",
+            Self::NoTransform => "no_transform",
+            Self::Type => "type",
+            Self::Small => "small",
+            Self::NotAccepted => "not_accepted",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Why a response was not compressed, from the word a record gives, in
+/// words for a person; the word itself when it is not one of them.
+pub fn describe_skipped(word: &str) -> &str {
+    match word {
+        "off" => "compression is off for the route",
+        "opted_out" => "the application asked for none, with X-Muru-Compress: off",
+        "head" => "a HEAD request has no body",
+        "no_body" => "the status has no body",
+        "encoded" => "the response was already encoded",
+        "no_transform" => "the response says Cache-Control: no-transform",
+        "type" => "its content type is not one compressed",
+        "small" => "the body is under min_size",
+        "not_accepted" => "the client accepts none of the encodings offered",
+        "failed" => "the encoder could not start",
+        other => other,
+    }
+}
+
+/// What compression did with a response: the encoding it applied, or why
+/// it applied none.
+pub type Outcome = Result<Encoding, Skipped>;
+
 /// An encoding the edge can produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
@@ -329,7 +396,7 @@ pub fn apply(
     method: &Method,
     accept: Option<&HeaderValue>,
     mut response: Response<ResponseBody>,
-) -> Response<ResponseBody> {
+) -> (Response<ResponseBody>, Outcome) {
     let opted_out = response
         .headers_mut()
         .remove(&X_MURU_COMPRESS)
@@ -340,23 +407,29 @@ pub fn apply(
                 .unwrap_or(false)
         });
 
-    if !policy.enabled || opted_out || method == Method::HEAD {
-        return response;
-    }
+    let skipped = if !policy.enabled {
+        Some(Skipped::Off)
+    } else if opted_out {
+        Some(Skipped::OptedOut)
+    } else if method == Method::HEAD {
+        Some(Skipped::Head)
+    } else {
+        eligible(policy, response.status(), response.headers()).err()
+    };
 
-    if !eligible(policy, response.status(), response.headers()) {
-        return response;
+    if let Some(skipped) = skipped {
+        return (response, Err(skipped));
     }
 
     let Some(encoding) = policy.choose(accept) else {
-        return response;
+        return (response, Err(Skipped::NotAccepted));
     };
 
     let encoder = match Encoder::new(encoding, policy.level) {
         Ok(encoder) => encoder,
         Err(error) => {
             tracing::warn!(%error, "compression could not start");
-            return response;
+            return (response, Err(Skipped::Failed));
         }
     };
 
@@ -366,7 +439,7 @@ pub fn apply(
         .headers
         .insert(CONTENT_ENCODING, HeaderValue::from_static(encoding.token()));
     add_vary(&mut parts.headers);
-    Response::from_parts(
+    let response = Response::from_parts(
         parts,
         UnsyncBoxBody::new(Compressed {
             inner: body,
@@ -374,21 +447,22 @@ pub fn apply(
             trailers: None,
             done: false,
         }),
-    )
+    );
+    (response, Ok(encoding))
 }
 
-/// Whether a response is one the policy may compress.
-fn eligible(policy: &Compression, status: StatusCode, headers: &HeaderMap) -> bool {
+/// Whether a response is one the policy may compress, and if not, why.
+fn eligible(policy: &Compression, status: StatusCode, headers: &HeaderMap) -> Result<(), Skipped> {
     if status.is_informational()
         || status == StatusCode::NO_CONTENT
         || status == StatusCode::NOT_MODIFIED
         || status == StatusCode::SWITCHING_PROTOCOLS
     {
-        return false;
+        return Err(Skipped::NoBody);
     }
 
     if headers.contains_key(CONTENT_ENCODING) {
-        return false;
+        return Err(Skipped::Encoded);
     }
 
     let no_transform = headers.get_all(CACHE_CONTROL).iter().any(|value| {
@@ -402,18 +476,18 @@ fn eligible(policy: &Compression, status: StatusCode, headers: &HeaderMap) -> bo
     });
 
     if no_transform {
-        return false;
+        return Err(Skipped::NoTransform);
     }
 
     let Some(content_type) = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
     else {
-        return false;
+        return Err(Skipped::Type);
     };
 
     if !policy.compresses_type(content_type) {
-        return false;
+        return Err(Skipped::Type);
     }
 
     let length = headers
@@ -421,7 +495,11 @@ fn eligible(policy: &Compression, status: StatusCode, headers: &HeaderMap) -> bo
         .and_then(|value| value.to_str().ok())
         .and_then(|text| text.parse::<u64>().ok());
 
-    length.is_none_or(|length| length >= policy.min_size)
+    if length.is_some_and(|length| length < policy.min_size) {
+        return Err(Skipped::Small);
+    }
+
+    Ok(())
 }
 
 /// Add Accept-Encoding to Vary, keeping what is there.
@@ -708,7 +786,8 @@ mod tests {
                 Full::new(Bytes::from(large.clone())).map_err(|never| match never {}),
             ))
             .unwrap();
-        let compressed = apply(&policy, &Method::GET, Some(&value("gzip")), response);
+        let (compressed, outcome) = apply(&policy, &Method::GET, Some(&value("gzip")), response);
+        assert_eq!(outcome, Ok(Encoding::Gzip));
         assert_eq!(compressed.headers().get(CONTENT_ENCODING).unwrap(), "gzip");
         assert_eq!(compressed.headers().get(VARY).unwrap(), "Accept-Encoding");
         assert!(compressed.headers().get(CONTENT_LENGTH).is_none());
@@ -726,8 +805,50 @@ mod tests {
                 Full::new(Bytes::from_static(b"hello")).map_err(|never| match never {}),
             ))
             .unwrap();
-        let untouched = apply(&policy, &Method::GET, Some(&value("gzip")), small);
+        let (untouched, outcome) = apply(&policy, &Method::GET, Some(&value("gzip")), small);
         assert!(untouched.headers().get(CONTENT_ENCODING).is_none());
+        assert_eq!(outcome, Err(Skipped::Small));
+
+        // Each other reason a response goes as it came is named.
+
+        let text = || {
+            Response::builder()
+                .header(CONTENT_TYPE, "text/plain")
+                .body(UnsyncBoxBody::new(
+                    Full::new(Bytes::from(large.clone())).map_err(|never| match never {}),
+                ))
+                .unwrap()
+        };
+        let skipped = |policy: &Compression, method: &Method, accept: &str, response| {
+            apply(policy, method, Some(&value(accept)), response).1
+        };
+        let mut encoded = text();
+        encoded
+            .headers_mut()
+            .insert(CONTENT_ENCODING, value("gzip"));
+        let mut image = text();
+        image.headers_mut().insert(CONTENT_TYPE, value("image/png"));
+
+        assert_eq!(
+            skipped(&Compression::off(), &Method::GET, "gzip", text()),
+            Err(Skipped::Off)
+        );
+        assert_eq!(
+            skipped(&policy, &Method::HEAD, "gzip", text()),
+            Err(Skipped::Head)
+        );
+        assert_eq!(
+            skipped(&policy, &Method::GET, "identity", text()),
+            Err(Skipped::NotAccepted)
+        );
+        assert_eq!(
+            skipped(&policy, &Method::GET, "gzip", encoded),
+            Err(Skipped::Encoded)
+        );
+        assert_eq!(
+            skipped(&policy, &Method::GET, "gzip", image),
+            Err(Skipped::Type)
+        );
     }
 
     #[tokio::test]
@@ -740,7 +861,8 @@ mod tests {
                 Full::new(Bytes::from("x".repeat(4096))).map_err(|never| match never {}),
             ))
             .unwrap();
-        let untouched = apply(&policy, &Method::GET, Some(&value("br")), response);
+        let (untouched, outcome) = apply(&policy, &Method::GET, Some(&value("br")), response);
+        assert_eq!(outcome, Err(Skipped::OptedOut));
         assert!(untouched.headers().get(CONTENT_ENCODING).is_none());
         assert!(untouched.headers().get(&X_MURU_COMPRESS).is_none());
     }

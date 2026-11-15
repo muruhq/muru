@@ -89,6 +89,51 @@ impl Format {
     }
 }
 
+/// What a record keeps of its target's query string, and of its
+/// redirects' (section 11.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Query {
+    /// The target as it came.
+    #[default]
+    Keep,
+    /// The values of secret parameters masked, by the rule the
+    /// development request record uses (section 11.7).
+    Mask,
+    /// The path alone.
+    Drop,
+}
+
+impl Query {
+    /// The choice a word names: `keep`, `mask` or `drop`; none for a
+    /// word that names none.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "keep" => Some(Self::Keep),
+            "mask" => Some(Self::Mask),
+            "drop" => Some(Self::Drop),
+            _ => None,
+        }
+    }
+
+    /// The word for the choice.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::Mask => "mask",
+            Self::Drop => "drop",
+        }
+    }
+
+    /// A target as this choice writes it.
+    pub fn apply(self, target: &str) -> String {
+        match self {
+            Self::Keep => target.to_owned(),
+            Self::Mask => crate::recorder::mask_query(target),
+            Self::Drop => target.split('?').next().unwrap_or("").to_owned(),
+        }
+    }
+}
+
 /// Which records are written.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -136,6 +181,8 @@ pub struct Filter {
     pub exclude: Vec<String>,
     /// How records are written to a file.
     pub format: Format,
+    /// What records keep of the query string.
+    pub query: Query,
 }
 
 impl Default for Filter {
@@ -145,6 +192,7 @@ impl Default for Filter {
             slow: Duration::from_secs(1),
             exclude: Vec::new(),
             format: Format::Json,
+            query: Query::Keep,
         }
     }
 }
@@ -157,6 +205,7 @@ impl Filter {
             slow: Duration::from_millis(message.slow_ms),
             exclude: message.exclude.clone(),
             format: Format::parse(&message.format).unwrap_or_default(),
+            query: Query::parse(&message.query).unwrap_or_default(),
         }
     }
 
@@ -167,6 +216,7 @@ impl Filter {
             slow_ms: u64::try_from(self.slow.as_millis()).unwrap_or(u64::MAX),
             exclude: self.exclude.clone(),
             format: self.format.as_str().to_owned(),
+            query: self.query.as_str().to_owned(),
         }
     }
 }
@@ -189,6 +239,9 @@ pub struct Choice {
     /// The file that takes a virtual host's records in place of the
     /// node's, when the host names one.
     pub file: Option<Arc<Path>>,
+    /// What a virtual host's records keep of the query string, when the
+    /// host says.
+    pub query: Option<Query>,
 }
 
 impl Choice {
@@ -200,6 +253,7 @@ impl Choice {
             exclude: message.exclude.clone(),
             format: Format::parse(&message.format),
             file: (!message.file.is_empty()).then(|| Arc::from(Path::new(&message.file))),
+            query: Query::parse(&message.query),
         }
     }
 
@@ -217,6 +271,7 @@ impl Choice {
                 .as_ref()
                 .map(|file| file.display().to_string())
                 .unwrap_or_default(),
+            query: self.query.map_or("", Query::as_str).to_owned(),
         }
     }
 
@@ -442,6 +497,15 @@ impl Filters {
                 .any(|choice| choice.format == Some(Format::Combined))
     }
 
+    /// What a record keeps of the query string: its virtual host's
+    /// choice, else the node's.
+    fn query(&self, record: &Record) -> Query {
+        self.hosts
+            .get(&record.virtual_host)
+            .and_then(|choice| choice.query)
+            .unwrap_or(self.node.query)
+    }
+
     /// How a record is written to a file, and to which: its virtual
     /// host's format and file, else the node's.
     fn target(&self, record: &Record) -> (Format, Option<Arc<Path>>) {
@@ -584,6 +648,11 @@ pub struct Record {
     /// The interface the worker handed the request to, `asgi` or `wsgi`
     /// (section 6.14); none for a request served where it arrived.
     pub handoff: Option<&'static str>,
+    /// The connection the request arrived on, by an ID from the request
+    /// ID generator given when it was accepted (section 11.7).
+    pub connection: String,
+    /// The request's position on its connection, 1 for the first.
+    pub connection_requests: u64,
 }
 
 /// How a WebSocket ended.
@@ -1169,7 +1238,25 @@ impl AccessLog {
 
     /// Write a record where the configuration says and keep it in the
     /// ring, without counting it as a request.
-    fn keep(&self, record: Record) {
+    fn keep(&self, mut record: Record) {
+        // Section 11.2: the query string is kept, masked or dropped from
+        // the record itself, so what is written, followed and kept in
+        // memory are alike.
+
+        let query = self
+            .filters
+            .read()
+            .expect("access log filters poisoned")
+            .query(&record);
+
+        if query != Query::Keep {
+            record.target = query.apply(&record.target);
+
+            for redirect in &mut record.redirects {
+                *redirect = query.apply(redirect);
+            }
+        }
+
         if self.shows(&record) {
             self.write(&record);
         }
@@ -1687,7 +1774,7 @@ pub fn json_line(record: &Record) -> String {
     let mut line = String::with_capacity(320);
     let _ = write!(
         line,
-        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"virtual_host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"retried\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}],\"client_class\":{},\"websocket\":{},\"handoff\":{}}}",
+        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"virtual_host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"retried\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}],\"client_class\":{},\"websocket\":{},\"handoff\":{},\"connection\":{},\"connection_requests\":{}}}",
         json_string(&record.request_id),
         json_string(&record.client.to_string()),
         json_string(&record.app),
@@ -1732,6 +1819,8 @@ pub fn json_line(record: &Record) -> String {
         record
             .handoff
             .map_or_else(|| "null".to_owned(), json_string),
+        json_string(&record.connection),
+        record.connection_requests,
     );
     line.push('\n');
     line
@@ -1983,6 +2072,8 @@ mod tests {
             client_class: "default".to_owned(),
             websocket: None,
             handoff: None,
+            connection: "01JCZ8X4R3T5V6W7Y8Z9A0B1C2".to_owned(),
+            connection_requests: 1,
         }
     }
 
@@ -1995,6 +2086,7 @@ mod tests {
                 slow: Duration::from_millis(500),
                 exclude: vec!["/health*".to_owned()],
                 format: Format::Json,
+                query: Query::Keep,
             },
         })
         .expect("no file to open");
@@ -2133,6 +2225,120 @@ mod tests {
             combined_line(&bare),
             "127.0.0.1 - - [01/Jan/1970:00:00:00 +0000] \"GET / HTTP/1.1\" 304 - \"-\" \"-\"\n"
         );
+    }
+
+    #[test]
+    fn the_query_string_is_kept_masked_or_dropped_in_either_format() {
+        let directory =
+            std::env::temp_dir().join(format!("muru-access-query-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("directory");
+        let node = directory.join("access.log");
+        let log = AccessLog::new(Config {
+            destination: Destination::File(node.clone()),
+            filter: Filter::default(),
+        })
+        .expect("log");
+
+        // The node masks; each host that says otherwise replaces it, in
+        // the format it writes.
+
+        let mut filters = Filters::node(Filter {
+            query: Query::Mask,
+            ..Filter::default()
+        });
+
+        for (host, format, query) in [
+            ("kept", Format::Json, Some(Query::Keep)),
+            ("dropped", Format::Json, Some(Query::Drop)),
+            ("combined-kept", Format::Combined, Some(Query::Keep)),
+            ("combined-masked", Format::Combined, None),
+            ("combined-dropped", Format::Combined, Some(Query::Drop)),
+        ] {
+            filters.hosts.insert(
+                host.to_owned(),
+                Choice {
+                    format: Some(format),
+                    query,
+                    ..Choice::default()
+                },
+            );
+        }
+
+        log.set_filters(filters);
+
+        let target = "/books?token=abc&page=2";
+        let on = |host: &str| Record {
+            virtual_host: host.to_owned(),
+            redirects: vec!["/login?access_token=xyz&next=/".to_owned()],
+            ..record("app", 200, target, Duration::ZERO)
+        };
+
+        for host in [
+            "",
+            "kept",
+            "dropped",
+            "combined-kept",
+            "combined-masked",
+            "combined-dropped",
+        ] {
+            log.record(on(host));
+        }
+
+        assert!(log.flush(Duration::from_secs(5)));
+        let written = std::fs::read_to_string(&node).expect("the node's file");
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(lines.len(), 6, "{written}");
+
+        let json = |line: &str| -> (String, Vec<String>) {
+            let value: serde_json::Value = serde_json::from_str(line).expect("json");
+            let redirects = value["redirects"]
+                .as_array()
+                .expect("redirects")
+                .iter()
+                .map(|redirect| redirect.as_str().expect("redirect").to_owned())
+                .collect();
+            (
+                value["target"].as_str().expect("target").to_owned(),
+                redirects,
+            )
+        };
+
+        assert_eq!(
+            json(lines[0]),
+            (
+                "/books?token=***&page=2".to_owned(),
+                vec!["/login?access_token=***&next=/".to_owned()]
+            )
+        );
+        assert_eq!(
+            json(lines[1]),
+            (
+                target.to_owned(),
+                vec!["/login?access_token=xyz&next=/".to_owned()]
+            )
+        );
+        assert_eq!(
+            json(lines[2]),
+            ("/books".to_owned(), vec!["/login".to_owned()])
+        );
+        assert!(
+            lines[3].contains("\"GET /books?token=abc&page=2 HTTP/1.1\""),
+            "{}",
+            lines[3]
+        );
+        assert!(
+            lines[4].contains("\"GET /books?token=***&page=2 HTTP/1.1\""),
+            "{}",
+            lines[4]
+        );
+        assert!(lines[5].contains("\"GET /books HTTP/1.1\""), "{}", lines[5]);
+
+        // What is kept in memory is what was written.
+
+        assert_eq!(log.recent(1)[0].target, "/books");
+        assert_eq!(log.recent(6)[0].target, "/books?token=***&page=2");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

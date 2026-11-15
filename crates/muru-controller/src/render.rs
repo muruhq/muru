@@ -429,6 +429,7 @@ fn workers(
     writer.whole("error_override", table.error_override.is_some());
     writer.whole("maintenance", table.maintenance.is_some());
     writer.whole("commands", !table.commands.is_empty());
+    writer.whole("instrumentation", !table.instrumentation.is_empty());
 
     ReleaseTable {
         kind: None,
@@ -492,6 +493,7 @@ fn workers(
             Some(muru_config::Preload::Auto),
         ),
         hooks: writer.given("hooks", text(&request.hooks), table.hooks),
+        instrumentation: (!table.instrumentation.is_empty()).then_some(table.instrumentation),
         groups: table.groups,
         mounts: table.mounts,
         static_dirs,

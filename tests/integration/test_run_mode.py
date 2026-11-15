@@ -87,7 +87,10 @@ def test_allow_public_turns_development_behaviours_off() -> None:
         assert "muru: --allow-public: development behaviours are off" in text
         assert "development mode" not in text
         assert "dashboard on" not in text
-        info = json.loads(server.get("/info").body)["environ"]
+        response = server.get("/info")
+        assert response.header("server-timing") is None
+        assert response.header("muru-request-link") is None
+        info = json.loads(response.body)["environ"]
         assert info["muru.max_body_size"] == 10 * 1024 * 1024
         response = server.get("/error", headers={"Accept": "application/json"})
         assert response.status == 500

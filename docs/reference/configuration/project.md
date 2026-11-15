@@ -27,6 +27,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `grpc_web_origins` | array of strings |  | The origins whose pages may call the gRPC methods through gRPC-Web, or `*`. |
 | `handoff` | string |  | The interface the entrypoint's requests may be handed to. `asgi`: Continue the request as an ASGI application on the event loop. `wsgi`: Continue the request as a WSGI callable on the thread pool. |
 | `hooks` | string |  | The module providing the lifecycle hooks. |
+| `instrumentation` | array of tables, {ref}`[[tool.muru.instrumentation]] <config-project-tool-muru-instrumentation>` |  | The instrumentation modules, in order, each with its settings, imported before anything of the application. |
 | `interface` | string | `"auto"` | The interface the entrypoint speaks. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `logging` | table, {ref}`[tool.muru.logging] <config-project-tool-muru-logging>` |  | How Python logging is set up in the workers. |
 | `maintenance` | table, {ref}`[tool.muru.maintenance] <config-project-tool-muru-maintenance>` |  | What maintenance mode lets through. |
@@ -48,6 +49,8 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `sync_threads` | integer | `8` | Threads for synchronous code called from an ASGI application. |
 | `threads` | integer | `4` | Application threads per worker. |
 | `timeouts` | table, {ref}`[tool.muru.timeouts] <config-project-tool-muru-timeouts>` |  | The timeouts the host enforces on its workers, and those of a request the release serves, which the edge enforces. |
+| `tracing` | boolean or table, {ref}`[tool.muru.tracing] <config-project-tool-muru-tracing>` | `false` | Trace the application with wrapture: `true` to use the configuration wrapture finds itself, or a table naming the file. The project's environment needs the wrapture package. |
+| `tracing_middleware` | boolean | `false` | Wrap the entrypoint's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for. |
 
 (config-project-tool-muru-build)=
 ## `[tool.muru.build]`
@@ -165,6 +168,16 @@ The requests a worker group takes for its paths: every list given must name the 
 | `host` | array of strings |  | Hosts: a virtual host's name or a name it answers to, or under `muructl run` the name the request carries. |
 | `method` | array of strings |  | Methods, compared in upper case. |
 
+(config-project-tool-muru-instrumentation)=
+## `[[tool.muru.instrumentation]]`
+
+One instrumentation module of a release: a tool such as an import timer or an APM agent, imported before the application and set up apart from it, with settings that only it is given.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `module` | string | required | The module, as a dotted Python module name. |
+| `settings` | table |  | The settings its `configure` function is given, as a table of any values. |
+
 (config-project-tool-muru-logging)=
 ## `[tool.muru.logging]`
 
@@ -236,6 +249,7 @@ A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` ta
 | `sendfile_header` | string | the release's | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
 | `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. |
 | `threads` | integer or table, {ref}`[tool.muru.mounts.NAME.threads] <config-project-tool-muru-mounts-name-threads>` |  | Threads of the mount's own, for a WSGI or gRPC mount; it shares the worker's pool when absent. |
+| `tracing_middleware` | boolean | `false` | Wrap the mount's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for. |
 
 (config-project-tool-muru-mounts-name-threads)=
 ## `[tool.muru.mounts.NAME.threads]`
@@ -257,6 +271,7 @@ The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a muru.toml and i
 | `access_log` | string | `"on"` | Which requests the access log writes: `on` (the default), `errors` or `off`. |
 | `access_log_exclude` | array of strings |  | Paths left out of the access log. |
 | `access_log_file` | string |  | A file the access log's JSON lines go to in place of the terminal, relative to the project. |
+| `access_log_query` | string | `"keep"` | What the access log keeps of each request's query string: `keep` (the default), `mask` (secret parameters' values as `***`) or `drop` (the path alone). |
 | `compression` | boolean | `true` | Whether responses are compressed; `false` is `--no-compression`. |
 | `dashboard` | string | `127.0.0.1:8081`; off under `--allow-public` | The dashboard's address, or `off`. |
 | `env_file` | string |  | A `.env` file whose variables the run starts with, relative to the project. Its values override `[tool.muru.env]`. None is read unless this names one. |
@@ -273,6 +288,7 @@ The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a muru.toml and i
 | `timestamps` | boolean | `false` | Whether every line on the terminal carries the full UTC time. |
 | `tls_cert` | string |  | A certificate chain to serve, relative to the project. |
 | `tls_key` | string |  | Its private key, relative to the project. |
+| `toolbar` | boolean | `false` | Whether the edge inserts the development toolbar into the run's HTML pages. |
 
 (config-project-tool-muru-scaling)=
 ## `[tool.muru.scaling]`
@@ -310,6 +326,7 @@ The `[tool.muru.serve]` table (`[serve]` in muru.toml, and in the file `muructl 
 | --- | --- | --- | --- |
 | `access_log` | string | `"on"` | The access log: `on` (the default), `errors` or `off`. |
 | `access_log_exclude` | array of strings |  | Paths left out of the access log. |
+| `access_log_query` | string | `"keep"` | What the access log keeps of each request's query string: `keep`, `mask` or `drop`. |
 | `admin_listen` | string | `"0.0.0.0:9090"` | Where the probes and metrics are served, IP:PORT or `off`. |
 | `admin_status` | boolean | `false` | Whether `/status` is served on the admin port. |
 | `compression` | boolean | `true` | Whether responses are compressed. |
@@ -391,3 +408,12 @@ The same keys apply at `[tool.muru.groups.NAME.timeouts]`.
 | `shutdown_timeout` | string | `"5s"` | How long a worker told to stop is given before it is killed, counted from when its WebSockets are closed. |
 | `soft_timeout` | string |  | How long a request may run in a worker before it is interrupted by raising `muru.RequestTimeout` in its thread, for example 30s; off when absent. |
 | `websocket_drain_grace` | string | `"0s"` | How long a worker told to stop keeps its open WebSockets before it closes them with 1001. |
+
+(config-project-tool-muru-tracing)=
+## `[tool.muru.tracing]`
+
+Tracing turned on with its settings, in place of `tracing = true`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `config` | string | found by wrapture | The wrapture configuration: a `wrapture.toml`, or a `pyproject.toml` with a `[tool.wrapture]` table, relative to the project's directory. |

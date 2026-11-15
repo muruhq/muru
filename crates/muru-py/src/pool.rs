@@ -9,6 +9,7 @@
 //! the thread's context variables, so values set during one request are gone
 //! when the next request runs on the same thread.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -128,6 +129,9 @@ pub struct RequestInfo {
     /// Given up: the edge has answered the client, whatever the
     /// application thread still does.
     pub abandoned: bool,
+    /// What the worker sees of the request, when the edge asked for a
+    /// record of it (section 11.7).
+    pub trace: Option<Arc<crate::record::Trace>>,
 }
 
 /// Which of a condemned worker's requests to give up.
@@ -611,9 +615,22 @@ impl Shared {
                     websocket: false,
                     outgoing: None,
                     abandoned: false,
+                    trace: head
+                        .record
+                        .then(|| Arc::new(crate::record::Trace::new(Instant::now(), "iterable"))),
                 },
             );
         (id, interrupt)
+    }
+
+    /// What the worker sees of a request the edge asked for a record of
+    /// (section 11.7); none for any other.
+    pub fn request_trace(&self, id: u64) -> Option<Arc<crate::record::Trace>> {
+        self.active
+            .lock()
+            .expect("active requests poisoned")
+            .get(&id)
+            .and_then(|info| info.trace.clone())
     }
 
     /// Note a request's channel to the edge, for giving it up.
@@ -1417,6 +1434,18 @@ fn thread_main(receiver: Arc<Mutex<mpsc::Receiver<Job>>>) {
     });
 }
 
+thread_local! {
+    /// When this application thread took its job and how long it then
+    /// waited for the GIL, for the job's record (section 11.7).
+    static PICKUP: Cell<Option<(Instant, Duration)>> = const { Cell::new(None) };
+}
+
+/// When the calling application thread took its job, and its wait for
+/// the GIL then, once.
+pub(crate) fn take_pickup() -> Option<(Instant, Duration)> {
+    PICKUP.with(Cell::take)
+}
+
 /// Run jobs until the pool closes.
 fn serve_jobs(py: Python<'_>, receiver: &Mutex<mpsc::Receiver<Job>>) {
     loop {
@@ -1429,7 +1458,12 @@ fn serve_jobs(py: Python<'_>, receiver: &Mutex<mpsc::Receiver<Job>>) {
             let next = receiver.lock().expect("pool receiver poisoned").recv();
             (next, std::time::Instant::now())
         });
-        crate::signals::GIL_WAIT.record(ready.elapsed());
+        let waited = ready.elapsed();
+        crate::signals::GIL_WAIT.record(waited);
+
+        if crate::record::asked() {
+            PICKUP.with(|pickup| pickup.set(Some((ready, waited))));
+        }
 
         match next {
             Ok(job) => run_in_context(py, job),

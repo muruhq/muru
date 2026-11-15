@@ -57,6 +57,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | processes, threads, sync_threads | release, group, mount | 2, 8 for WSGI, 1 loop for ASGI | 6.4 |
 | threads on a mount: a number for a pool of its own, or `{ reserved, max }` to borrow the shared pool's threads beyond the reserved ones | mount (WSGI, and a number on gRPC and on ASGI with handoff = 'wsgi') | the worker's shared pool | 6.7, 6.13, 6.14 |
 | hooks | release | none | 6.3 |
+| instrumentation (an ordered list of entries, each with module and settings) | release, `[[tool.muru.instrumentation]]`, and `[[instrumentation]]` in muru.toml and muru.local.toml, whose entries come first | none | 6.15 |
 | kind, profile, command, cwd, bind, instances, readiness (path, timeout), stop_signal | release | workers, none, none, source, unix, 1, none and 60s, the profile's | 9.9 |
 | paths, mounts, optional | group | none, all mounts, false | 7.1 |
 | match.client_class | group, route | none (every class) | 4.14 |

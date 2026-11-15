@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import sys
 import threading
 import time
 from collections.abc import Callable
@@ -58,7 +57,7 @@ def start(gil_stall: str) -> support.Server:
 
 
 @pytest.mark.skipif(
-    not getattr(sys, "_is_gil_enabled", lambda: True)(),
+    not support.workers_have_a_gil(),
     reason="a free-threaded build has no interpreter lock to hold",
 )
 def test_a_worker_holding_the_gil_is_replaced() -> None:

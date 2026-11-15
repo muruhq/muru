@@ -30,6 +30,7 @@ message Hello {
   repeated MountPool mount_pools = 9; // every named mount: the side it runs on, and its own slots or connections when it has them (section 6.7)
   repeated string websocket_mounts = 10; // the named mounts that accept websocket scopes (section 6.14)
   uint32 worker = 11;               // its index within its group, which the edge names it by in the access log and its reports
+  bool records = 12;                // sends a RECORD frame after a response whose head asked for one (section 11.7)
 }
 
 // A named mount (section 6.7): the side it runs on, whose count its
@@ -93,6 +94,7 @@ message RequestHead {
   string client_class = 28;         // section 4.14: the class the edge assigned, default when no rule matched
   string mode = 29;                 // section 4.15: the route's site mode, as muru.mode; none when empty
   bool borrowed = 30;               // section 6.7: the edge gave the request a shared thread its mount borrows
+  bool record = 31;                 // section 11.7: send a RECORD frame of the worker's part after the response
 }
 
 // What a REQUEST frame opens (sections 5.6 and 6.13). A gRPC call's
@@ -187,6 +189,88 @@ message End {
 // Payload of a CLOSE frame in either direction: the end of a WebSocket
 // (section 5.6). Edge to worker it is websocket.disconnect; worker to edge
 // it is the application closing.
+// The worker's part of a development run's request record (section
+// 11.7), on a RECORD frame after the response when the request head asked
+// for it. Times are milliseconds from when the worker took the request,
+// and 0 for one that did not happen.
+message WorkerRecord {
+  string thread = 1;                // the thread that ran the application
+  double to_start_response = 2;     // start_response called, or http.response.start sent
+  double to_first_byte = 3;         // the first body frame written to the edge
+  double to_last_byte = 4;          // the last body frame written
+  double to_close = 5;              // close() returned, or the application returned
+  uint64 body_bytes = 6;            // body bytes the application produced, before compression
+  string body_source = 7;           // iterable, file_wrapper, write, asgi_body, pathsend or zerocopysend
+  bool sent_by_edge = 8;            // the edge sent a file by its descriptor
+  string outcome = 9;               // completed, client_disconnected, failed or timeout
+  string reason = 10;               // the access log's reason when not completed
+  string error_phase = 11;          // call, iteration or close, when the application failed
+  string error = 12;                // the exception, in a line
+  string traceback = 13;            // its traceback
+  repeated LogLine logs = 14;       // the request's log records and warnings, in order
+  uint32 logs_dropped = 15;         // records past the cap, counted
+  double thread_wait = 16;          // from taking a WSGI request to an application thread having it
+  double gil_wait = 17;             // the request's waits for the GIL, summed; 0 without a GIL
+  uint32 gil_waits = 18;            // how many
+  double gil_wait_first = 19;       // the wait as the request started
+  repeated GcDuring gc = 20;        // collections that ended during the request, by generation
+  double loop_lag = 21;             // the longest stretch of the request with the event loop held
+  double loop_lag_at = 22;          // when that stretch began
+  repeated RecordPanel panels = 23; // panels code in the worker added during the request (issue 677)
+}
+
+// A panel code in the worker added to a request's record (issue 677), in the
+// shapes of ADR 0063. Span times are milliseconds from when the worker
+// took the request.
+message RecordPanel {
+  string name = 1;
+  string title = 2;
+  repeated RecordSpan spans = 3;
+  repeated RecordValue values = 4;
+  repeated RecordTable tables = 5;
+  uint32 dropped = 6;               // entries past the panel's or the request's cap
+  string text = 7;                  // a text panel's text (issue 680)
+  bool markdown = 8;                // the text is markdown, drawn by the edge
+}
+
+message RecordSpan {
+  string name = 1;
+  double start = 2;                 // milliseconds from when the worker took the request
+  double duration = 3;
+  string category = 4;
+  repeated RecordSpan children = 5;
+}
+
+message RecordValue {
+  string name = 1;
+  string value = 2;
+}
+
+message RecordTable {
+  string caption = 1;
+  repeated string columns = 2;
+  repeated RecordRow rows = 3;
+}
+
+message RecordRow {
+  repeated string cells = 1;
+}
+
+// The garbage collections of one generation that ended during a request
+// (section 11.7): 0, 1, 2, or full on a free-threaded build.
+message GcDuring {
+  string generation = 1;
+  uint32 collections = 2;
+  double ms = 3;
+}
+
+message LogLine {
+  double at = 1;                    // milliseconds from when the worker took the request
+  string level = 2;
+  string logger = 3;
+  string message = 4;               // with the exception's traceback when the record has one
+}
+
 message Close {
   uint32 code = 1;                  // a WebSocket close code, 1000 when none was given
   string reason = 2;

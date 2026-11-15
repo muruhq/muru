@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import signal
 import sys
 import types
 from collections.abc import Iterator
@@ -10,6 +11,7 @@ from typing import Any
 import pytest
 
 import muru
+from muru import _signals
 
 
 @pytest.fixture
@@ -33,3 +35,17 @@ def native(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
         yield stand_in
     else:
         yield _native
+
+
+@pytest.fixture(autouse=True)
+def _signals_restored(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Put signal.signal back after a test that ran the host in this process.
+
+    The host and its workers replace it to keep their own signals, which a
+    test calling host.main() would otherwise leave in place for the tests
+    after it.
+    """
+
+    monkeypatch.setattr(signal, "signal", signal.signal)
+    monkeypatch.setattr(_signals, "_kept", _signals._kept)
+    yield

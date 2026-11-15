@@ -8,7 +8,7 @@
     <td>{{ request.method }}</td><td>{{ request.target }}</td>
     <td class="num">{{ request.bytes }}</td><td class="num">{{ request.total }}</td>
     <td class="num">{{ request.queue }}</td><td class="num">{{ request.application }}</td>
-    <td>{{ request.worker }}</td><td>{{ request.request_id }}</td>
+    <td>{{ request.worker }}</td><td>{% if data.records %}<a href="request/{{ request.request_id }}">{{ request.request_id }}</a>{% else %}{{ request.request_id }}{% endif %}</td>
   </tr>
   {% endfor %}
 </table>

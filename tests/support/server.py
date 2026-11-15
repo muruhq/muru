@@ -14,6 +14,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 import tomllib
@@ -47,6 +48,25 @@ def muructl_path() -> Path | None:
 
     candidate = Path(os.environ.get("MURUCTL", ROOT / "target" / "debug" / "muructl"))
     return candidate if candidate.is_file() else None
+
+
+def free_threaded_build() -> bool:
+    """Whether this interpreter is a free-threaded build.
+
+    The build, not the process: `sys._is_gil_enabled()` is the process's
+    state, and importing an extension that does not declare free-threading
+    support, as grpc's does not, turns the lock on for the rest of the run.
+    """
+
+    return sysconfig.get_config_var("Py_GIL_DISABLED") == 1
+
+
+def workers_have_a_gil() -> bool:
+    """Whether the workers a test starts run with an interpreter lock: on a
+    build with one, or on a free-threaded build that PYTHON_GIL=1 turns it
+    on for."""
+
+    return not free_threaded_build() or os.environ.get("PYTHON_GIL") == "1"
 
 
 def extension_available() -> bool:

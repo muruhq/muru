@@ -20,6 +20,25 @@
         }
       ]
     },
+    "Instrumentation": {
+      "additionalProperties": false,
+      "description": "One instrumentation module of a release: a tool such as an import timer or an APM agent, imported before the application and set up apart from it, with settings that only it is given.",
+      "properties": {
+        "module": {
+          "description": "The module, as a dotted Python module name.",
+          "type": "string"
+        },
+        "settings": {
+          "additionalProperties": true,
+          "description": "The settings its `configure` function is given, as a table of any values.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "module"
+      ],
+      "type": "object"
+    },
     "LocalBuild": {
       "additionalProperties": false,
       "description": "The `[build]` table of muru.local.toml.",
@@ -65,6 +84,11 @@
         },
         "access_log_file": {
           "description": "A file the access log's JSON lines go to in place of the terminal, relative to the project.",
+          "type": "string"
+        },
+        "access_log_query": {
+          "default": "keep",
+          "description": "What the access log keeps of each request's query string: `keep` (the default), `mask` (secret parameters' values as `***`) or `drop` (the path alone).",
           "type": "string"
         },
         "compression": {
@@ -151,6 +175,36 @@
         "tls_key": {
           "description": "Its private key, relative to the project.",
           "type": "string"
+        },
+        "toolbar": {
+          "default": false,
+          "description": "Whether the edge inserts the development toolbar into the run's HTML pages.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "Tracing": {
+      "anyOf": [
+        {
+          "description": "`true` to trace with the configuration wrapture finds itself: `WRAPTURE_CONFIG`, else `wrapture.toml`, else a `[tool.wrapture]` table in `pyproject.toml`, in the project's directory.",
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/TracingSettings",
+          "description": "Tracing on, with its settings."
+        }
+      ],
+      "description": "Whether and how a release is traced with wrapture: `tracing = true`, or a `[tracing]` table."
+    },
+    "TracingSettings": {
+      "additionalProperties": false,
+      "description": "Tracing turned on with its settings, in place of `tracing = true`.",
+      "properties": {
+        "config": {
+          "description": "The wrapture configuration: a `wrapture.toml`, or a `pyproject.toml` with a `[tool.wrapture]` table, relative to the project's directory.",
+          "type": "string",
+          "x-default": "found by wrapture"
         }
       },
       "type": "object"
@@ -165,9 +219,20 @@
       "$ref": "#/$defs/LocalBuild",
       "description": "When `muructl run` builds the environment."
     },
+    "instrumentation": {
+      "description": "Instrumentation modules for this machine's runs, before the project's own.",
+      "items": {
+        "$ref": "#/$defs/Instrumentation"
+      },
+      "type": "array"
+    },
     "run": {
       "$ref": "#/$defs/RunSettings",
       "description": "How `muructl run` serves the project, over `[tool.muru.run]`."
+    },
+    "tracing": {
+      "$ref": "#/$defs/Tracing",
+      "description": "Tracing with wrapture for this machine's runs, in place of the project's `tracing`."
     }
   },
   "title": "muru.local.toml",

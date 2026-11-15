@@ -50,6 +50,12 @@ fn release_facts(release: &Release, serving: bool) -> ReleaseFacts {
             "workers".to_owned()
         },
         entrypoint: release.spec.entrypoint.clone(),
+        instrumentation: release
+            .spec
+            .instrumentation
+            .iter()
+            .map(|entry| entry.module.clone())
+            .collect(),
         interface: release.spec.interface.as_str().to_owned(),
         detected_interface: String::new(),
         frameworks: Vec::new(),

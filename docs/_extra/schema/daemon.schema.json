@@ -982,6 +982,11 @@
           "type": "string",
           "x-default": "`access_log_format` in `[logs]`"
         },
+        "access_log_query": {
+          "description": "What the host's records keep of the query string: `keep`, `mask` or `drop`.",
+          "type": "string",
+          "x-default": "`access_log_query` in `[logs]`"
+        },
         "canonical": {
           "description": "The name the host is known by, for `use_canonical_name`.",
           "type": "string"
@@ -1106,6 +1111,25 @@
           "type": "integer"
         }
       },
+      "type": "object"
+    },
+    "Instrumentation": {
+      "additionalProperties": false,
+      "description": "One instrumentation module of a release: a tool such as an import timer or an APM agent, imported before the application and set up apart from it, with settings that only it is given.",
+      "properties": {
+        "module": {
+          "description": "The module, as a dotted Python module name.",
+          "type": "string"
+        },
+        "settings": {
+          "additionalProperties": true,
+          "description": "The settings its `configure` function is given, as a table of any values.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "module"
+      ],
       "type": "object"
     },
     "Interface": {
@@ -1377,6 +1401,11 @@
           "description": "How the access log's records are written: `json` (the default), one object a line, or `combined`, the combined log format of Apache and nginx.",
           "type": "string"
         },
+        "access_log_query": {
+          "default": "keep",
+          "description": "What the access log's records keep of each request's query string, in the target and the internal redirects, in either format: `keep` (the default) writes it as it came, `mask` writes the values of secret parameters, such as `token` or `password`, as `***`, and `drop` writes the path alone.",
+          "type": "string"
+        },
         "compress": {
           "default": "zstd",
           "description": "How archives are compressed: `zstd` (the default), `gzip` or `off`.",
@@ -1624,6 +1653,11 @@
         "threads": {
           "$ref": "#/$defs/MountThreads",
           "description": "Threads of the mount's own, for a WSGI or gRPC mount; it shares the worker's pool when absent."
+        },
+        "tracing_middleware": {
+          "default": false,
+          "description": "Wrap the mount's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -2087,6 +2121,13 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "instrumentation": {
+          "description": "The instrumentation modules, in order; when given, they replace the list in the source's `[tool.muru]` table.",
+          "items": {
+            "$ref": "#/$defs/Instrumentation"
+          },
+          "type": "array"
         },
         "interface": {
           "$ref": "#/$defs/Interface",

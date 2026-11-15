@@ -58,6 +58,9 @@ pub enum HostMessage {
         /// The host's own resident memory, when measured (sections 7.7
         /// and 13.9).
         host_rss: Option<u64>,
+        /// The workers being replaced for memory, which the memory guard
+        /// counts as its one at a time (section 13.9, issue 662).
+        memory_replacements: Vec<MemoryReplacement>,
     },
     /// The workers' answers to a request (section 11.7).
     Response {
@@ -101,6 +104,23 @@ pub struct WorkerReply {
     /// Its answer as JSON text, when it did.
     pub result_json: String,
 }
+
+/// A worker its host is replacing for memory, by the worker's own limits
+/// or the memory guard's ask, until its successor has taken its place
+/// (section 13.9).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryReplacement {
+    /// The worker's group.
+    pub group: String,
+    /// Its index within the group.
+    pub index: u32,
+    /// The pid of the worker being replaced.
+    pub pid: u32,
+}
+
+/// The variable that gives the host its instrumentation list, as JSON
+/// (section 6.15).
+pub const INSTRUMENTATION_VARIABLE: &str = "MURU_INSTRUMENTATION";
 
 /// What one worker last reported to its host (sections 7.6 and 7.7).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -351,6 +371,22 @@ impl HostMessage {
                             .collect()
                     })
                     .unwrap_or_default(),
+                memory_replacements: value["memory_replacements"]
+                    .as_array()
+                    .map(|replacements| {
+                        replacements
+                            .iter()
+                            .map(|replacement| MemoryReplacement {
+                                group: replacement["group"]
+                                    .as_str()
+                                    .unwrap_or("default")
+                                    .to_owned(),
+                                index: replacement["index"].as_u64().unwrap_or(0) as u32,
+                                pid: replacement["pid"].as_u64().unwrap_or(0) as u32,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             _ => None,
         }
@@ -500,6 +536,9 @@ pub struct HostSpec {
     pub preload: muru_config::Preload,
     /// The hooks module, if any.
     pub hooks: Option<String>,
+    /// The instrumentation modules, in order (section 6.15), given to the
+    /// host in `MURU_INSTRUMENTATION`.
+    pub instrumentation: Vec<muru_config::Instrumentation>,
     /// The directory to run the host in.
     pub chdir: Option<PathBuf>,
     /// Loopback TCP instead of Unix sockets for the link, from this port.
@@ -1157,6 +1196,19 @@ impl HostProcess {
         }
 
         command.envs(spec.env.iter().map(|(name, value)| (name, value)));
+
+        // Section 6.15: the instrumentation list, which the host takes out
+        // of its environment before it imports anything.
+
+        if spec.instrumentation.is_empty() {
+            command.env_remove(INSTRUMENTATION_VARIABLE);
+        } else {
+            command.env(
+                INSTRUMENTATION_VARIABLE,
+                serde_json::to_string(&spec.instrumentation)
+                    .context("the instrumentation list could not be written")?,
+            );
+        }
 
         // Section 11.7: the release's variables whose values debug
         // inspect shows, beside Muru's own and the interpreter's.

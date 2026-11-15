@@ -1523,6 +1523,15 @@ impl Admin for Service {
         }))
     }
 
+    async fn get_request(
+        &self,
+        _request: Request<pb::GetRequestRequest>,
+    ) -> Result<Response<pb::RequestRecord>, Status> {
+        Err(Status::failed_precondition(
+            "the daemon keeps no request records: only muructl run in development mode does",
+        ))
+    }
+
     async fn list_requests(
         &self,
         request: Request<pb::ListRequestsRequest>,
@@ -2087,6 +2096,7 @@ impl Admin for Service {
                     maintenance: maintenance.iter().any(|(host, _)| *host == name),
                     access_log_format: host.access_log_format.clone().unwrap_or_default(),
                     access_log_file: host.access_log_file.clone().unwrap_or_default(),
+                    access_log_query: host.access_log_query.clone().unwrap_or_default(),
                     name,
                     names: host.names,
                     listeners: host.listeners,
@@ -3694,6 +3704,12 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         message: release.message,
         source: release.spec.source.display().to_string(),
         entrypoint: release.spec.entrypoint,
+        instrumentation: release
+            .spec
+            .instrumentation
+            .iter()
+            .map(|entry| entry.module.clone())
+            .collect(),
         interface: release.spec.interface.as_str().to_owned(),
         python: release.spec.python.display().to_string(),
         python_version: release

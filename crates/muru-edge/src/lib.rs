@@ -36,6 +36,7 @@ pub mod buckets;
 pub mod classify;
 pub mod compression;
 pub mod connections;
+pub mod development;
 pub mod endpoints;
 pub mod errors;
 pub mod grpc;
@@ -44,12 +45,15 @@ pub mod ja4;
 pub mod link;
 pub mod metrics;
 pub mod occasions;
+pub mod panels;
 pub mod proxy;
 pub mod ratelimit;
+pub mod recorder;
 pub mod requests;
 pub mod routing;
 pub mod static_files;
 pub mod tls;
+pub mod toolbar;
 pub mod uploads;
 pub mod upstream;
 pub mod wake;
@@ -112,6 +116,9 @@ pub struct Config {
     /// other edge processes (section 4.15); the process's own buckets
     /// when absent, or when the table cannot be mapped.
     pub rate_buckets: Option<PathBuf>,
+    /// Where a development run keeps its request records (section 11.7);
+    /// none outside development mode.
+    pub recorder: Option<Arc<recorder::Recorder>>,
 }
 
 /// An HTTPS listener next to the HTTP one (section 13.1 in development).
@@ -556,6 +563,15 @@ struct Shared {
     pools: Arc<Pools>,
     request_ids: errors::RequestIds,
     development: bool,
+    /// Where a development run's responses link to (section 4.20).
+    links: Arc<development::Links>,
+    /// Where a development run keeps its request records (section 11.7).
+    recorder: Option<Arc<recorder::Recorder>>,
+    /// Draws the panels the reserved prefix answers (section 4.20),
+    /// made when first asked for, once the dashboard's address is known.
+    renderer: std::sync::OnceLock<panels::Renderer>,
+    /// The pages whose policy kept the toolbar out, each said once.
+    warned: toolbar::Warned,
     occasions: occasions::Setting,
     access_log: Arc<access::AccessLog>,
     /// The node's limits in force, which a snapshot may replace.
@@ -854,6 +870,10 @@ impl Edge {
                 pools,
                 request_ids: errors::RequestIds::new(),
                 development: config.development,
+                links: Arc::default(),
+                recorder: config.recorder.filter(|_| config.development),
+                renderer: std::sync::OnceLock::new(),
+                warned: toolbar::Warned::default(),
                 occasions: config.occasions,
                 access_log,
                 tuning,
@@ -965,6 +985,12 @@ impl Edge {
             .collect()
     }
 
+    /// Where a development run's responses link to: the dashboard, once
+    /// it is named (section 4.20).
+    pub fn links(&self) -> Arc<development::Links> {
+        Arc::clone(&self.shared.links)
+    }
+
     /// The access log, for the dashboard and the CLI.
     pub fn access_log(&self) -> Arc<access::AccessLog> {
         Arc::clone(&self.shared.access_log)
@@ -1047,6 +1073,7 @@ async fn accept(
             _ = draining.wait_for(|phase| *phase == Phase::Draining) => return Ok(()),
         };
         let _ = stream.set_nodelay(true);
+        let accepted = Instant::now();
         let shared = Arc::clone(&shared);
 
         // Section 4.18: a client over its share is closed at once; a full
@@ -1120,8 +1147,17 @@ async fn accept(
                         return;
                     }
 
+                    // Section 11.7: the connection's ID, from the request ID
+                    // generator.
+
+                    let connection = Arc::new(development::Connection::new(
+                        shared.request_ids.next(),
+                        accepted,
+                        false,
+                    ));
                     serve(
                         stream, peer, local, None, shared, tuning, token, guard, trusted,
+                        connection,
                     )
                     .await;
                 });
@@ -1153,6 +1189,11 @@ async fn accept(
                             metrics.count_tls_handshake(&listener, "completed");
                             let mut info = tls::info(stream.get_ref().1);
                             info.ja4 = ja4.unwrap_or_default();
+                            let connection = Arc::new(development::Connection::new(
+                                shared.request_ids.next(),
+                                accepted,
+                                true,
+                            ));
                             serve(
                                 stream,
                                 peer,
@@ -1163,6 +1204,7 @@ async fn accept(
                                 token,
                                 guard,
                                 trusted,
+                                connection,
                             )
                             .await;
                         }
@@ -1263,6 +1305,7 @@ async fn serve<I>(
     token: Arc<()>,
     guard: connections::Guard,
     trusted: bool,
+    connection: Arc<development::Connection>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1297,14 +1340,43 @@ async fn serve<I>(
         let base_id = shared.request_ids.next();
         let served = Arc::clone(&served);
         let limits = Arc::clone(&limits);
+        let connection = Arc::clone(&connection);
         let _ = first_request.send_replace(true);
         async move {
+            // Section 11.7: the request's place on its connection, and in
+            // a development run that keeps records, its headers as they
+            // arrived, masked.
+
+            let arrival = connection.arrive(shared.development);
+            let request_headers = shared
+                .recorder
+                .as_ref()
+                .map(|_| recorder::headers(request.headers()));
+
             // Section 4.7: forwarding headers from a trusted proxy say who
             // the client is and how it connected; from anyone else they
             // are removed.
 
             let routing = shared.pools.current();
             let (mut parts, body) = request.into_parts();
+
+            // Section 4.20: the reserved prefix is the edge's in a
+            // development run that keeps records, answered from them before
+            // routing, and never recorded.
+
+            if let Some(recorder) = shared.recorder.as_ref()
+                && toolbar::reserved(parts.uri.path())
+            {
+                let renderer = shared
+                    .renderer
+                    .get_or_init(|| panels::Renderer::new(shared.links.dashboard()));
+                return Ok::<_, Infallible>(toolbar::answer(
+                    &parts,
+                    &shared.links,
+                    recorder,
+                    renderer,
+                ));
+            }
             let forwarded = routing.trust_on(&local).resolve(&peer, &mut parts.headers);
             let accept_encoding = parts.headers.get(http::header::ACCEPT_ENCODING).cloned();
             let method = parts.method.clone();
@@ -1375,6 +1447,16 @@ async fn serve<I>(
             let mut handling: Option<Handling> = None;
             let mut checks = 0usize;
             let mut admitted = false;
+
+            // Section 4.20: what a development run tells the browser,
+            // gathered over every hop of the request.
+
+            let noted = shared.development.then(|| {
+                Arc::new(development::Request::new(
+                    shared.recorder.clone(),
+                    Arc::clone(&connection),
+                ))
+            });
 
             // Section 4.6: the limits of the route the client's own
             // request matched, over its host's and the node's, which its
@@ -1466,6 +1548,9 @@ async fn serve<I>(
                     client_class: Arc::clone(&client_class),
                     mode: None,
                     received: Arc::clone(&received),
+                    noted: noted.clone(),
+                    connection: Arc::clone(&connection),
+                    connection_request: arrival.position,
                 };
 
                 // Section 4.15: a client's own request draws from the
@@ -1714,6 +1799,8 @@ async fn serve<I>(
                                 .await
                                 {
                                     link::record(&context, &parts, status, reason, bytes);
+                                    let mut response = response;
+                                    response.extensions_mut().insert(toolbar::EdgeFile);
                                     served = Some(link::Handled::Response(response));
                                 }
                             }
@@ -1850,6 +1937,8 @@ async fn serve<I>(
                                 _,
                             ) => {
                                 link::record(&context, &parts, status, reason, bytes);
+                                let mut response = response;
+                                response.extensions_mut().insert(toolbar::EdgeFile);
                                 link::Handled::Response(response)
                             }
                             (_, Some(selection)) => {
@@ -2069,18 +2158,50 @@ async fn serve<I>(
                 rules.apply(response.headers_mut());
             }
 
+            // Section 4.20: with the toolbar on, a page a browser loads gets
+            // its tag, before compression; a page whose policy would refuse
+            // the tag gets none, and the terminal says why once.
+
+            let mut response = response;
+
+            if shared.links.toolbar_on() && noted.as_ref().is_some_and(|noted| noted.recorded()) {
+                match toolbar::insertable(&method, &parts.headers, &response) {
+                    Ok(nonce) => {
+                        let dashboard = shared.links.request_page(&base_id);
+                        let tag = toolbar::tag(
+                            forwarded.prefix.as_deref().unwrap_or(""),
+                            &base_id,
+                            dashboard.as_deref(),
+                            nonce.as_deref(),
+                        );
+                        response = toolbar::insert(response, tag);
+                    }
+                    Err(toolbar::Skip::Policy) => {
+                        if shared.warned.first(parts.uri.path()) {
+                            muru_common::muru_println!(
+                                "no toolbar on {}: its content security policy allows scripts \
+                                 only by hash or from elsewhere",
+                                parts.uri.path()
+                            );
+                        }
+                    }
+                    Err(toolbar::Skip::NotAPage) => {}
+                }
+            }
+
             // Section 4.17: compressed for the client when the policy and
             // the response allow it.
 
-            let mut response =
+            let (mut response, compressed) =
                 compression::apply(compression, &method, accept_encoding.as_ref(), response);
 
             // Section 4.18: the connection closes after its share of
             // requests.
 
             let count = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let closed_after = max_requests > 0 && count >= max_requests;
 
-            if max_requests > 0 && count >= max_requests {
+            if closed_after {
                 response
                     .headers_mut()
                     .insert(CONNECTION, HeaderValue::from_static("close"));
@@ -2092,6 +2213,18 @@ async fn serve<I>(
                 response
                     .headers_mut()
                     .insert(errors::X_REQUEST_ID.clone(), value);
+            }
+
+            // Section 4.20: a development run's timings and the link to
+            // the request's page.
+
+            if shared.development {
+                development::annotate(
+                    response.headers_mut(),
+                    &base_id,
+                    noted.as_ref(),
+                    &shared.links,
+                );
             }
 
             // Section 9.4: the cookies the release choice issued.
@@ -2112,6 +2245,27 @@ async fn serve<I>(
                     routing::PREVIEW_HEADER,
                     HeaderValue::from_static(routing::PREVIEW_IGNORED),
                 );
+            }
+
+            // Section 11.7: the head of a development run's record of the
+            // request, with the response's headers as the client gets them.
+
+            if let (Some(noted), Some(request_headers)) = (&noted, request_headers)
+                && noted.recorded()
+            {
+                noted.opened(recorder::head(recorder::Head {
+                    request_id: &base_id,
+                    method: method.as_str(),
+                    target: &client_target,
+                    version: parts.version,
+                    client: client.ip(),
+                    request_headers,
+                    response_headers: response.headers(),
+                    compressed,
+                    connection: &connection,
+                    arrival,
+                    closed_after,
+                }));
             }
 
             Ok::<_, Infallible>(response)
@@ -2527,6 +2681,7 @@ mod tests {
             https: None,
             spool: None,
             rate_buckets: None,
+            recorder: None,
         })
         .await
         .expect("binding the edge")

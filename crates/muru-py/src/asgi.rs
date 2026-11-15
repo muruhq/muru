@@ -130,6 +130,9 @@ pub struct Channel {
     /// Set when the client goes away, for the WSGI callable a request
     /// is handed to (section 6.14).
     cancelled: Arc<AtomicBool>,
+    /// What the worker sees of the request for its record, when the edge
+    /// asked for one (section 11.7).
+    trace: Option<Arc<crate::record::Trace>>,
 }
 
 impl Channel {
@@ -144,6 +147,8 @@ impl Channel {
         request: u64,
         runtime: tokio::runtime::Handle,
     ) -> Self {
+        let trace = head.record.then(|| shared.request_trace(request)).flatten();
+
         Self {
             inbox: Mutex::new(Inbox {
                 queue: VecDeque::new(),
@@ -171,6 +176,14 @@ impl Channel {
             task: Mutex::new(None),
             timed_out: AtomicBool::new(false),
             cancelled: Arc::new(AtomicBool::new(false)),
+            trace,
+        }
+    }
+
+    /// The loop waited this long for the GIL on the request's behalf.
+    fn gil_waited(&self, waited: std::time::Duration) {
+        if let Some(trace) = &self.trace {
+            trace.gil(waited);
         }
     }
 
@@ -449,7 +462,9 @@ impl Channel {
         let ready = std::time::Instant::now();
 
         Python::attach(|py| {
-            crate::signals::GIL_WAIT.record(ready.elapsed());
+            let waited = ready.elapsed();
+            crate::signals::GIL_WAIT.record(waited);
+            self.gil_waited(waited);
             let delivered =
                 message_dict(py, message, self.websocket, self.grpc).and_then(|value| {
                     self.event_loop.bind(py).call_method1(
@@ -1627,7 +1642,8 @@ pub fn start(
     let ready = std::time::Instant::now();
 
     Python::attach(|py| {
-        crate::signals::GIL_WAIT.record(ready.elapsed());
+        let waited = ready.elapsed();
+        crate::signals::GIL_WAIT.record(waited);
         let channel = Channel::new(
             py,
             asgi,
@@ -1637,6 +1653,7 @@ pub fn start(
             request,
             tokio::runtime::Handle::current(),
         );
+        channel.gil_waited(waited);
         let channel = Bound::new(py, channel).map_err(|error| error.to_string())?;
         shared.request_channel(request, channel.clone().unbind());
         let scope = build_scope(py, head, uploads).map_err(|error| error.to_string())?;

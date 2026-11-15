@@ -447,6 +447,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         https: None,
         spool: None,
         rate_buckets: None,
+        recorder: None,
     })
     .await
     .map_err(|error| explain_bind_error(error, SocketAddr::new(args.bind.ip, 0)))?;
@@ -572,6 +573,12 @@ struct RunArgs {
     #[arg(long = "access-log-exclude", value_name = "PATTERN")]
     access_log_exclude: Vec<String>,
 
+    /// What the access log keeps of each request's query string: keep (the
+    /// default), mask (the values of secret parameters such as token, as
+    /// ***) or drop (the path alone).
+    #[arg(long, value_name = "WHAT")]
+    access_log_query: Option<String>,
+
     /// Requests at least this slow count as errors for --access-log errors,
     /// for example 500ms or 2s (default 1s).
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
@@ -633,6 +640,18 @@ struct RunArgs {
     /// clients that accept br, zstd or gzip otherwise.
     #[arg(long)]
     no_compression: bool,
+
+    /// Insert the debug toolbar into the application's HTML pages: a
+    /// badge for the request that produced each page, opening to its
+    /// timing, routing, response, logs, errors and connection. Off under
+    /// --allow-public.
+    #[arg(long, conflicts_with = "no_toolbar")]
+    toolbar: bool,
+
+    /// No toolbar for this run, over a run table or muru.local.toml that
+    /// turns it on.
+    #[arg(long)]
+    no_toolbar: bool,
 
     /// Put the full UTC time in front of every line on the terminal.
     /// Access log lines carry the request's time either way.
@@ -1718,10 +1737,15 @@ struct Serving {
     /// relative to the project.
     access_log_file: Option<PathBuf>,
     access_log_exclude: Vec<String>,
+    /// What the access log keeps of the query string.
+    access_log_query: muru_edge::access::Query,
     slow: Duration,
     /// The dashboard's address, off, or none for the default.
     dashboard: Option<String>,
     compression: bool,
+    /// Whether the edge inserts the toolbar into HTML pages, in
+    /// development mode only.
+    toolbar: bool,
     /// Whether every line on the terminal carries the full time.
     timestamps: bool,
     /// The muru.local.toml read, when there was one.
@@ -1766,6 +1790,15 @@ impl Serving {
             (None, None) => Duration::from_secs(1),
         };
 
+        let query = args
+            .access_log_query
+            .as_deref()
+            .or(settings.access_log_query.as_deref())
+            .unwrap_or("keep");
+        let access_log_query = muru_edge::access::Query::parse(query).ok_or_else(|| {
+            anyhow::anyhow!("--access-log-query {query:?} is not keep, mask or drop")
+        })?;
+
         Ok(Self {
             port: port(args.port, &settings.port),
             https: !args.no_https && (args.https || settings.https == Some(true)),
@@ -1804,12 +1837,16 @@ impl Serving {
                 .clone()
                 .or_else(|| settings.access_log_file.as_deref().map(PathBuf::from)),
             access_log_exclude: strings(&settings.access_log_exclude, &args.access_log_exclude),
+            access_log_query,
             slow,
             dashboard: args
                 .dashboard
                 .clone()
                 .or_else(|| settings.dashboard.clone()),
             compression: !args.no_compression && settings.compression != Some(false),
+            toolbar: !args.allow_public
+                && !args.no_toolbar
+                && (args.toolbar || settings.toolbar == Some(true)),
             timestamps: !args.no_timestamps
                 && (args.timestamps || settings.timestamps == Some(true)),
             local,
@@ -1842,6 +1879,19 @@ struct Resolved {
     concurrency: usize,
     preload: muru_config::Preload,
     hooks: Option<String>,
+    /// The instrumentation modules (section 6.15): muru.local.toml's,
+    /// then the table's.
+    instrumentation: Vec<muru_config::Instrumentation>,
+    /// `tracing` (section 11.6) as written: muru.local.toml's, else the
+    /// table's.
+    tracing: Option<muru_config::Tracing>,
+    /// The muru.local.toml `tracing` came from, when it came from one.
+    tracing_from_local: Option<PathBuf>,
+    /// The table's `tracing_middleware` key, for the entrypoint.
+    tracing_middleware: Option<bool>,
+    /// The instrumentation entry that sets tracing up, when it is on;
+    /// the host is given it ahead of the listed modules.
+    tracing_entry: Option<muru_config::Instrumentation>,
     /// The directory the host runs in.
     project: PathBuf,
     /// The file the table came from, when there was one.
@@ -1893,6 +1943,19 @@ struct Resolved {
     serving: Serving,
     /// The tables as they were read, for --print-config.
     layers: print_config::Layers,
+}
+
+impl Resolved {
+    /// The instrumentation modules the host is given (sections 6.15 and
+    /// 11.6): tracing's own module first when tracing is on, so its
+    /// request middleware is the outermost wrapper, then the listed ones.
+    fn host_instrumentation(&self) -> Vec<muru_config::Instrumentation> {
+        self.tracing_entry
+            .iter()
+            .chain(&self.instrumentation)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -1983,10 +2046,48 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         None => muru_config::load_local(&project, source.as_deref())?,
     };
 
-    let (local, local_run, local_build_when) = match local_file {
-        Some((path, file)) => (Some(path), file.run, file.build_when),
-        None => (None, muru_config::RunSettings::default(), None),
-    };
+    let (local, local_run, local_build_when, local_instrumentation, local_tracing) =
+        match local_file {
+            Some((path, file)) => (
+                Some(path),
+                file.run,
+                file.build_when,
+                file.instrumentation,
+                file.tracing,
+            ),
+            None => (
+                None,
+                muru_config::RunSettings::default(),
+                None,
+                Vec::new(),
+                None,
+            ),
+        };
+
+    // Section 6.15: this machine's instrumentation modules come before the
+    // project's, so a tool one developer adds measures the others too.
+
+    let instrumentation: Vec<muru_config::Instrumentation> = local_instrumentation
+        .into_iter()
+        .chain(table.instrumentation.iter().cloned())
+        .collect();
+    muru_config::check_instrumentation(&instrumentation)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    // Section 11.6: tracing is set up by a module of Muru's own, at the
+    // head of the list the host is given. muru.local.toml's tracing takes
+    // the place of the project's, for this machine's runs.
+
+    let tracing_from_local = local_tracing.is_some().then(|| local.clone()).flatten();
+    let tracing = local_tracing.or_else(|| table.tracing.clone());
+
+    let tracing_entry = muru_config::tracing_instrumentation(
+        tracing.as_ref(),
+        table.tracing_middleware,
+        &table.mounts,
+        &instrumentation,
+    )
+    .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     let layers = print_config::Layers::new(&table, &run_table, &local_run);
     let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
@@ -2146,6 +2247,11 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
             .or(table.preload)
             .unwrap_or(muru_config::Preload::Auto),
         hooks: args.hooks.clone().or(table.hooks),
+        instrumentation,
+        tracing,
+        tracing_from_local,
+        tracing_middleware: table.tracing_middleware,
+        tracing_entry,
         project,
         source,
         groups: table.groups,
@@ -2642,9 +2748,20 @@ struct CheckReport {
     #[serde(default)]
     hooks: Vec<String>,
     #[serde(default)]
+    instrumentation: Vec<CheckInstrument>,
+    #[serde(default)]
     findings: Vec<CheckFinding>,
     #[serde(default)]
     errors: Vec<CheckError>,
+}
+
+/// An instrumentation module the check imported (section 6.15), with the
+/// callbacks it defines.
+#[derive(Debug, serde::Deserialize)]
+struct CheckInstrument {
+    module: String,
+    #[serde(default)]
+    callbacks: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2770,6 +2887,19 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
         command.arg("--hooks").arg(hooks);
     }
 
+    // Section 6.15: the instrumentation modules, as the host is given them.
+
+    let instrumentation = resolved.host_instrumentation();
+
+    if instrumentation.is_empty() {
+        command.env_remove(muru_controller::host::INSTRUMENTATION_VARIABLE);
+    } else {
+        command.env(
+            muru_controller::host::INSTRUMENTATION_VARIABLE,
+            serde_json::to_string(&instrumentation)?,
+        );
+    }
+
     for (name, mount) in &resolved.mounts {
         command.arg("--mount").arg(format!(
             "{name}={}={}",
@@ -2829,6 +2959,21 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
             "muru: check: warning: the interpreter imported muru {} where {} was provided",
             report.muru, library.version
         );
+    }
+
+    for instrument in &report.instrumentation {
+        if instrument.callbacks.is_empty() {
+            println!(
+                "muru: check: instrumentation module {} defines no callbacks",
+                instrument.module
+            );
+        } else {
+            println!(
+                "muru: check: instrumentation module {} defines {}",
+                instrument.module,
+                instrument.callbacks.join(", ")
+            );
+        }
     }
 
     for entrypoint in &report.entrypoints {
@@ -3032,6 +3177,7 @@ async fn run_with(
         muru_edge::access::Filter {
             slow: resolved.serving.slow,
             exclude: resolved.serving.access_log_exclude.clone(),
+            query: resolved.serving.access_log_query,
             ..muru_edge::access::Filter::default()
         },
     )?;
@@ -3275,6 +3421,7 @@ async fn run_with(
         concurrency: resolved.concurrency,
         preload: resolved.preload,
         hooks: resolved.hooks.clone(),
+        instrumentation: resolved.host_instrumentation(),
         chdir: Some(resolved.project.clone()),
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
         single: args.single,
@@ -3415,10 +3562,27 @@ async fn run_with(
         relay_watcher(&label, "r1", &run_events),
     )?;
 
-    if let Err(error) = current.wait_ready(START_TIMEOUT).await {
-        current.stop(stop_budget).await;
-        let _ = std::fs::remove_dir_all(&run_dir);
-        return Err(error);
+    // Issue 673: a stop while the workers come up, the application still
+    // loading, stops the run then rather than once they are ready.
+
+    let started = tokio::select! {
+        ready = current.wait_ready(START_TIMEOUT) => Some(ready),
+        _ = interrupt.recv() => None,
+        _ = terminate.recv() => None,
+    };
+
+    match started {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            current.stop(stop_budget).await;
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Err(error);
+        }
+        None => {
+            current.stop(stop_budget).await;
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Ok(());
+        }
     }
 
     let (control, mut host_messages) = host_control(&current).await;
@@ -3452,6 +3616,11 @@ async fn run_with(
         None => None,
     };
 
+    // Section 11.7: a development run keeps a record of each request,
+    // for the dashboard and the admin socket as well as the edge.
+
+    let recorder = development.then(|| Arc::new(muru_edge::recorder::Recorder::default()));
+
     let edge = match muru_edge::Edge::bind(muru_edge::Config {
         listen: http_address,
         app: label.clone(),
@@ -3478,6 +3647,7 @@ async fn run_with(
         https: tls.as_ref().map(|tls| tls.https.clone()),
         spool: spool.clone(),
         rate_buckets: None,
+        recorder: recorder.clone(),
     })
     .await
     {
@@ -3584,6 +3754,22 @@ async fn run_with(
         );
     }
 
+    // Section 4.20: the reserved prefix answers to the run's own names
+    // besides loopback, and with --toolbar the edge inserts the toolbar
+    // into HTML pages, which the start-up says.
+
+    if development && serve.is_none() {
+        edge.links().set_hosts(resolved.serving.hosts.clone());
+
+        if resolved.serving.toolbar {
+            edge.links().set_toolbar();
+            muru_common::muru_println!(
+                "toolbar on: the edge inserts it into HTML pages, with each request's record \
+                 under /_muru/"
+            );
+        }
+    }
+
     if let Some(tls) = &tls {
         match (&tls.development, &resolved.serving.tls_cert) {
             (Some(certificate), _) => {
@@ -3657,6 +3843,7 @@ async fn run_with(
     );
     limits_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_workers: Vec<muru_controller::host::WorkerStatus> = Vec::new();
+    let mut last_replacing: Vec<muru_controller::host::MemoryReplacement> = Vec::new();
 
     if let Some(scaling) = &scaling {
         let _ = run_processes.scaling.set(Arc::clone(scaling));
@@ -3753,12 +3940,26 @@ async fn run_with(
                 access_log: edge.access_log(),
                 logs: logs.clone(),
                 processes: Arc::clone(&run_processes),
+                recorder: recorder.clone(),
             },
         )
         .await
         {
             Ok(address) => {
                 muru_common::muru_println!("dashboard on http://{address}/");
+
+                // Section 4.20: each response of a development run names
+                // its request's page, under the address the dashboard is
+                // reached at, as the login links do.
+
+                if development {
+                    let reached = std::env::var("MURU_DASHBOARD_URL")
+                        .ok()
+                        .filter(|url| !url.trim().is_empty())
+                        .unwrap_or_else(|| format!("http://{address}/"));
+                    edge.links().set_dashboard(reached.trim());
+                }
+
                 dashboard_address = Some(address);
             }
             Err(error) => muru_common::muru_println!("no dashboard: {error:#}"),
@@ -3846,6 +4047,7 @@ async fn run_with(
             events: Arc::clone(&run_events),
             settings: Arc::clone(&settings),
             processes: Arc::clone(&run_processes),
+            recorder: recorder.clone(),
         });
 
         match run_admin::serve(state, admin_stop_rx).await {
@@ -3973,6 +4175,15 @@ async fn run_with(
 
                         let release = format!("r{}", current.release);
                         let kept = pools.current().kept(&label, &release);
+
+                        // Section 13.9 (issue 662): a group with no worker in
+                        // routing for a moment, its last stopping before its
+                        // replacement starts, holds requests until one is
+                        // back, up to the queue timeout, as the daemon's do.
+
+                        let waiting: Vec<String> = std::iter::once(muru_edge::routing::DEFAULT_GROUP.to_owned())
+                            .chain(groups.iter().map(|(name, _)| name.clone()))
+                            .collect();
                         let connected = muru_edge::routing::AppPools::connect(
                             &label,
                             &release,
@@ -3989,6 +4200,7 @@ async fn run_with(
                                 .with_sendfile(Arc::clone(&sendfile))
                                 .with_grpc_web(&resolved.grpc_web_origins)
                                 .with_static_dirs(static_paths.clone())
+                                .with_waking(&waiting)
                         });
 
                         match connected {
@@ -4013,7 +4225,7 @@ async fn run_with(
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);
                     }
-                    muru_controller::host::HostMessage::Status { workers, host_rss } => {
+                    muru_controller::host::HostMessage::Status { workers, host_rss, memory_replacements } => {
                         // The relay may have been started again since.
 
                         run_processes.host(current.pid(), current.relay_pid());
@@ -4021,6 +4233,7 @@ async fn run_with(
                         if let Some(watch) = &mut limits_watch {
                             watch.host(host_rss);
                             last_workers.clone_from(&workers);
+                            last_replacing = memory_replacements;
                         }
 
                         if let Some(scaling) = &scaling {
@@ -4036,7 +4249,7 @@ async fn run_with(
                     continue;
                 };
 
-                match watch.check(&last_workers) {
+                match watch.check(&last_workers, &last_replacing) {
                     muru_controller::guard::Action::Replace { group, index, pid, reason, .. } => {
                         // Section 13.9: a group with a policy above its
                         // fewest workers is scaled in by the worker.

@@ -72,6 +72,12 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
         )
         return [HELLO]
 
+    if path == "/page":
+        # An HTML page, in two pieces, for the development toolbar.
+
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [b"<html><body><h1>Page</h1></bo", b"dy></html>"]
+
     if path == "/info":
         body = json.dumps(
             {

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Muru: request {{ request_id }}</title>
+{% include "style.html" %}
+{% if let Some(view) = view %}<style>
+{{ view.stylesheet|safe }}
+</style>{% endif %}
+</head>
+<body>
+<header>
+  <h1>Muru</h1>
+  <span>{{ app }}</span>
+  <span>request {{ request_id }}</span>
+</header>
+<main>
+  <nav><a href="../">run</a><a href="../v1/requests/{{ request_id }}">JSON</a></nav>
+  {% if let Some(view) = view %}
+  <section>
+    <h2>{{ view.summary }}</h2>
+    {% if view.in_progress %}<p class="note">The response has not ended yet; reload for the rest of the record.</p>{% endif %}
+  </section>
+  {% for panel in view.panels %}
+  <section id="panel-{{ panel.name }}" class="panel">
+    <h2>{{ panel.title }}</h2>
+    {{ panel.html|safe }}
+  </section>
+  {% endfor %}
+  {% else %}
+  <section>
+    <p class="muted">{{ error }}</p>
+  </section>
+  {% endif %}
+</main>
+</body>
+</html>

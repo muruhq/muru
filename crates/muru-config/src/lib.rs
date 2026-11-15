@@ -434,6 +434,12 @@ pub struct Mount {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "the worker group's, else the release's"))]
     pub max_body_size: Option<String>,
+    /// Wrap the mount's application in wrapture's request middleware when
+    /// tracing is on, so each request records as one tree. For an
+    /// application no framework instrumentation records requests for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub tracing_middleware: Option<bool>,
 }
 
 /// Check a name against section 3.2: lowercase letters, digits and
@@ -1007,6 +1013,10 @@ pub struct Release {
     /// The module holding the lifecycle hooks, as a Python module name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<String>,
+    /// The instrumentation modules, in order (section 6.15); when given,
+    /// they replace the list in the source's `[tool.muru]` table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instrumentation: Option<Vec<Instrumentation>>,
     /// Worker groups by name (section 7.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub groups: BTreeMap<String, Group>,
@@ -1327,6 +1337,14 @@ pub struct Logs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "json"))]
     pub access_log_format: Option<String>,
+    /// What the access log's records keep of each request's query
+    /// string, in the target and the internal redirects, in either
+    /// format: `keep` (the default) writes it as it came, `mask` writes
+    /// the values of secret parameters, such as `token` or `password`,
+    /// as `***`, and `drop` writes the path alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "keep"))]
+    pub access_log_query: Option<String>,
 }
 
 /// Check an `access_log_format`: `json` or `combined`.
@@ -1335,6 +1353,16 @@ pub fn check_access_log_format(format: Option<&str>) -> Result<(), String> {
         None | Some("json" | "combined") => Ok(()),
         Some(other) => Err(format!(
             "access_log_format = {other:?} is not json or combined"
+        )),
+    }
+}
+
+/// Check an `access_log_query`: `keep`, `mask` or `drop`.
+pub fn check_access_log_query(query: Option<&str>) -> Result<(), String> {
+    match query {
+        None | Some("keep" | "mask" | "drop") => Ok(()),
+        Some(other) => Err(format!(
+            "access_log_query = {other:?} is not keep, mask or drop"
         )),
     }
 }
@@ -2152,6 +2180,11 @@ pub struct Host {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "`access_log_format` in `[logs]`"))]
     pub access_log_format: Option<String>,
+    /// What the host's records keep of the query string: `keep`, `mask`
+    /// or `drop`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`access_log_query` in `[logs]`"))]
+    pub access_log_query: Option<String>,
     /// A file in the daemon's log directory that takes the host's
     /// records in place of `access.log`, for example `shop.log`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3976,6 +4009,174 @@ pub struct StaticDir {
     pub case: Option<String>,
 }
 
+/// One instrumentation module of a release (section 6.15): a tool such
+/// as an import timer or an APM agent, imported before the application
+/// and set up apart from it, with settings that only it is given.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Instrumentation {
+    /// The module, as a dotted Python module name.
+    pub module: String,
+    /// The settings its `configure` function is given, as a table of any
+    /// values.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settings: BTreeMap<String, serde_json::Value>,
+}
+
+/// Check a release's instrumentation list (section 6.15): every module a
+/// dotted Python name, and none named twice.
+pub fn check_instrumentation(entries: &[Instrumentation]) -> Result<(), String> {
+    let mut seen: Vec<&str> = Vec::new();
+
+    for entry in entries {
+        let dotted = !entry.module.is_empty()
+            && entry.module.split('.').all(|part| {
+                let mut chars = part.chars();
+
+                chars
+                    .next()
+                    .is_some_and(|first| first.is_alphabetic() || first == '_')
+                    && chars.all(|rest| rest.is_alphanumeric() || rest == '_')
+            });
+
+        if !dotted {
+            return Err(format!(
+                "instrumentation module {:?} is not a dotted Python module name",
+                entry.module
+            ));
+        }
+
+        if seen.contains(&entry.module.as_str()) {
+            return Err(format!(
+                "instrumentation module {} is listed twice",
+                entry.module
+            ));
+        }
+
+        seen.push(&entry.module);
+    }
+
+    Ok(())
+}
+
+/// The module that sets tracing up (section 11.6), put at the head of a
+/// release's instrumentation list when tracing is on.
+pub const TRACING_MODULE: &str = "muru._tracing";
+
+/// Whether and how a release is traced with wrapture (section 11.6):
+/// `tracing = true`, or a `[tracing]` table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum Tracing {
+    /// `true` to trace with the configuration wrapture finds itself:
+    /// `WRAPTURE_CONFIG`, else `wrapture.toml`, else a `[tool.wrapture]`
+    /// table in `pyproject.toml`, in the project's directory.
+    Enabled(bool),
+    /// Tracing on, with its settings.
+    Settings(TracingSettings),
+}
+
+/// Tracing turned on with its settings, in place of `tracing = true`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TracingSettings {
+    /// The wrapture configuration: a `wrapture.toml`, or a
+    /// `pyproject.toml` with a `[tool.wrapture]` table, relative to the
+    /// project's directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "found by wrapture"))]
+    pub config: Option<String>,
+}
+
+impl Tracing {
+    /// Whether tracing is on.
+    pub fn enabled(&self) -> bool {
+        !matches!(self, Tracing::Enabled(false))
+    }
+}
+
+impl<'de> Deserialize<'de> for Tracing {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Tracing;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("true, false or a table")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Tracing, E> {
+                Ok(Tracing::Enabled(value))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Tracing, A::Error> {
+                let settings = TracingSettings::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+
+                Ok(Tracing::Settings(settings))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// The instrumentation entry that sets tracing up (section 11.6), or
+/// None when tracing is off. Its settings carry the configuration file
+/// and which entry points are wrapped in the request middleware: the
+/// entrypoint when `entrypoint_middleware` says so, and each mount whose
+/// `tracing_middleware` does. With tracing off the middleware keys are
+/// unused, so a project can say which entry points to wrap and leave
+/// tracing to a developer's muru.local.toml. The module listed by hand
+/// is refused.
+pub fn tracing_instrumentation(
+    tracing: Option<&Tracing>,
+    entrypoint_middleware: Option<bool>,
+    mounts: &BTreeMap<String, Mount>,
+    listed: &[Instrumentation],
+) -> Result<Option<Instrumentation>, String> {
+    if listed.iter().any(|entry| entry.module == TRACING_MODULE) {
+        return Err(format!(
+            "instrumentation module {TRACING_MODULE} is set up by the tracing key, not listed"
+        ));
+    }
+
+    let wrapped_mounts: Vec<&String> = mounts
+        .iter()
+        .filter(|(_, mount)| mount.tracing_middleware == Some(true))
+        .map(|(name, _)| name)
+        .collect();
+    let wrapped_entrypoint = entrypoint_middleware == Some(true);
+
+    let Some(tracing) = tracing.filter(|tracing| tracing.enabled()) else {
+        return Ok(None);
+    };
+
+    let mut settings = BTreeMap::new();
+
+    if let Tracing::Settings(TracingSettings {
+        config: Some(config),
+    }) = tracing
+    {
+        settings.insert("config".to_owned(), serde_json::json!(config));
+    }
+
+    settings.insert(
+        "middleware".to_owned(),
+        serde_json::json!({
+            "entrypoint": wrapped_entrypoint,
+            "mounts": wrapped_mounts,
+        }),
+    );
+
+    Ok(Some(Instrumentation {
+        module: TRACING_MODULE.to_owned(),
+        settings,
+    }))
+}
+
 /// Check an application's static directories (section 4.9): each path
 /// is a prefix below `/`, no two share one, each names a directory, and
 /// the settings parse.
@@ -4490,7 +4691,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
     }
 
     let timeouts = table.timeouts.as_ref();
-    let worker_keys: [(&str, bool); 23] = [
+    let worker_keys: [(&str, bool); 24] = [
         ("entrypoint", !table.entrypoint.is_empty()),
         ("interface", table.interface.is_some()),
         ("handoff", table.handoff.is_some()),
@@ -4504,6 +4705,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
         ("scaling", table.scaling.is_some()),
         ("preload", table.preload.is_some()),
         ("hooks", table.hooks.is_some()),
+        ("instrumentation", table.instrumentation.is_some()),
         ("groups", !table.groups.is_empty()),
         ("mounts", !table.mounts.is_empty()),
         ("logging", table.logging.is_some()),
@@ -5165,6 +5367,12 @@ pub struct LocalFile {
     pub run: RunSettings,
     /// `when` from the `[build]` table, if given.
     pub build_when: Option<BuildWhen>,
+    /// The `[[instrumentation]]` entries, which come before the
+    /// project's (section 6.15).
+    pub instrumentation: Vec<Instrumentation>,
+    /// `tracing` (section 11.6), which takes the place of the project's
+    /// for this machine's runs.
+    pub tracing: Option<Tracing>,
 }
 
 /// The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a
@@ -5227,6 +5435,12 @@ pub struct RunSettings {
     /// Paths left out of the access log.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_log_exclude: Vec<String>,
+    /// What the access log keeps of each request's query string: `keep`
+    /// (the default), `mask` (secret parameters' values as `***`) or
+    /// `drop` (the path alone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "keep"))]
+    pub access_log_query: Option<String>,
     /// How long a request may take before `errors` shows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "1s"))]
@@ -5239,6 +5453,11 @@ pub struct RunSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = true))]
     pub compression: Option<bool>,
+    /// Whether the edge inserts the development toolbar into the run's
+    /// HTML pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub toolbar: Option<bool>,
     /// Whether every line on the terminal carries the full UTC time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
@@ -5276,9 +5495,14 @@ impl RunSettings {
                 .clone()
                 .or_else(|| self.access_log_file.clone()),
             access_log_exclude: join(&self.access_log_exclude, &over.access_log_exclude),
+            access_log_query: over
+                .access_log_query
+                .clone()
+                .or_else(|| self.access_log_query.clone()),
             slow: over.slow.clone().or_else(|| self.slow.clone()),
             dashboard: over.dashboard.clone().or_else(|| self.dashboard.clone()),
             compression: over.compression.or(self.compression),
+            toolbar: over.toolbar.or(self.toolbar),
             timestamps: over.timestamps.or(self.timestamps),
             env_file: over.env_file.clone().or_else(|| self.env_file.clone()),
         }
@@ -5299,6 +5523,7 @@ impl RunSettings {
         }
 
         check_access_log(self.access_log.as_deref(), self.slow.as_deref())?;
+        check_access_log_query(self.access_log_query.as_deref())?;
 
         if let Some(dashboard) = &self.dashboard
             && dashboard != "off"
@@ -5415,6 +5640,11 @@ pub struct ServeSettings {
     /// Paths left out of the access log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_log_exclude: Option<Vec<String>>,
+    /// What the access log keeps of each request's query string: `keep`,
+    /// `mask` or `drop`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "keep"))]
+    pub access_log_query: Option<String>,
     /// How slow a request is to count as an error for `access_log = "errors"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "1s"))]
@@ -5543,6 +5773,22 @@ pub struct ToolMuru {
     /// The module providing the lifecycle hooks (section 6.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<String>,
+    /// The instrumentation modules, in order (section 6.15), each with
+    /// its settings, imported before anything of the application.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instrumentation: Vec<Instrumentation>,
+    /// Trace the application with wrapture (section 11.6): `true` to use
+    /// the configuration wrapture finds itself, or a table naming the
+    /// file. The project's environment needs the wrapture package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub tracing: Option<Tracing>,
+    /// Wrap the entrypoint's application in wrapture's request middleware
+    /// when tracing is on, so each request records as one tree. For an
+    /// application no framework instrumentation records requests for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub tracing_middleware: Option<bool>,
     /// The interpreter: a path, or a request in uv's syntax such as
     /// "3.13", "3.14t" or ">=3.12" (section 8.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5882,12 +6128,14 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
         |path| path.display().to_string(),
     );
 
-    if let Some(key) = document
-        .keys()
-        .find(|key| !matches!(key.as_str(), "run" | "build"))
-    {
+    if let Some(key) = document.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "run" | "build" | "instrumentation" | "tracing"
+        )
+    }) {
         return Err(format!(
-            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table and the when key of [build]; the application's settings belong in {there}"
+            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table, the when key of [build], [[instrumentation]] and tracing; the application's settings belong in {there}"
         ));
     }
 
@@ -5926,7 +6174,32 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
         None => None,
     };
 
-    Ok(LocalFile { run, build_when })
+    let instrumentation = match document.get("instrumentation") {
+        Some(entries) => entries
+            .clone()
+            .try_into::<Vec<Instrumentation>>()
+            .map_err(|error| format!("[[instrumentation]] {error}"))?,
+        None => Vec::new(),
+    };
+
+    check_instrumentation(&instrumentation)?;
+
+    let tracing = match document.get("tracing") {
+        Some(tracing) => Some(
+            tracing
+                .clone()
+                .try_into::<Tracing>()
+                .map_err(|error| format!("tracing: {error}"))?,
+        ),
+        None => None,
+    };
+
+    Ok(LocalFile {
+        run,
+        build_when,
+        instrumentation,
+        tracing,
+    })
 }
 
 /// Parse a muru.toml: the `[tool.muru]` keys at the top level.
@@ -6798,6 +7071,129 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(bad("slow = 'soon'").starts_with("slow:"));
         assert!(bad("access_log = 'terminal'").contains("not on, errors or off"));
         assert!(bad("dashboard = 'yes'").contains("127.0.0.1:8081, or off"));
+    }
+
+    #[test]
+    fn tracing_is_a_flag_or_a_table() {
+        let on = parse_muru_toml("tracing = true\n").unwrap();
+        assert_eq!(on.tracing, Some(Tracing::Enabled(true)));
+
+        let table = parse_muru_toml("[tracing]\nconfig = 'tracing/wrapture.toml'\n").unwrap();
+        assert_eq!(
+            table.tracing,
+            Some(Tracing::Settings(TracingSettings {
+                config: Some("tracing/wrapture.toml".to_owned())
+            }))
+        );
+
+        let error = parse_muru_toml("tracing = 'yes'\n").unwrap_err();
+        assert!(error.contains("true, false or a table"), "{error}");
+
+        assert!(parse_muru_toml("[tracing]\nconfg = 'x'\n").is_err());
+    }
+
+    #[test]
+    fn tracing_puts_its_module_at_the_head_with_the_wrapped_entry_points() {
+        let table = parse_muru_toml(
+            "entrypoint = 'shop:app'\ntracing = true\ntracing_middleware = true\n\
+             [mounts.raw]\npath = '/raw'\nentrypoint = 'raw:app'\ntracing_middleware = true\n\
+             [mounts.api]\npath = '/api'\nentrypoint = 'api:app'\n",
+        )
+        .unwrap();
+
+        let entry = tracing_instrumentation(
+            table.tracing.as_ref(),
+            table.tracing_middleware,
+            &table.mounts,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(entry.module, TRACING_MODULE);
+        assert_eq!(
+            entry.settings["middleware"],
+            serde_json::json!({"entrypoint": true, "mounts": ["raw"]})
+        );
+        assert!(!entry.settings.contains_key("config"));
+    }
+
+    #[test]
+    fn tracing_off_leaves_a_middleware_unused_and_the_module_is_not_listed_by_hand() {
+        let off = parse_muru_toml("tracing = false\n").unwrap();
+        assert_eq!(
+            tracing_instrumentation(off.tracing.as_ref(), None, &off.mounts, &[]).unwrap(),
+            None
+        );
+
+        // A project may say which entry points to wrap and leave tracing
+        // itself to a developer's muru.local.toml.
+
+        assert_eq!(
+            tracing_instrumentation(None, Some(true), &BTreeMap::new(), &[]).unwrap(),
+            None
+        );
+
+        let listed = [Instrumentation {
+            module: TRACING_MODULE.to_owned(),
+            settings: BTreeMap::new(),
+        }];
+        let error = tracing_instrumentation(
+            Some(&Tracing::Enabled(true)),
+            None,
+            &BTreeMap::new(),
+            &listed,
+        )
+        .unwrap_err();
+        assert!(error.contains("set up by the tracing key"), "{error}");
+    }
+
+    #[test]
+    fn the_local_file_takes_tracing() {
+        let local = parse_local("tracing = true\n", None).unwrap();
+        assert_eq!(local.tracing, Some(Tracing::Enabled(true)));
+
+        let local = parse_local("[tracing]\nconfig = 'mine.toml'\n", None).unwrap();
+        assert_eq!(
+            local.tracing,
+            Some(Tracing::Settings(TracingSettings {
+                config: Some("mine.toml".to_owned())
+            }))
+        );
+
+        let error = parse_local("tracing = 'on'\n", None).unwrap_err();
+        assert!(error.starts_with("tracing: "), "{error}");
+
+        assert_eq!(parse_local("", None).unwrap().tracing, None);
+    }
+
+    #[test]
+    fn instrumentation_entries_are_read_in_order_and_checked() {
+        let local = parse_local(
+            "[[instrumentation]]\nmodule = 'timer'\n[instrumentation.settings]\ntop = 5\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(local.instrumentation[0].module, "timer");
+        assert_eq!(local.instrumentation[0].settings["top"], 5);
+
+        let table = parse_muru_toml(
+            "[[instrumentation]]\nmodule = 'a.b'\n[[instrumentation]]\nmodule = 'c'\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = table
+            .instrumentation
+            .iter()
+            .map(|entry| entry.module.as_str())
+            .collect();
+        assert_eq!(names, ["a.b", "c"]);
+
+        let error = parse_local("[[instrumentation]]\nmodule = 'my-tool'\n", None).unwrap_err();
+        assert!(
+            error.contains("is not a dotted Python module name"),
+            "{error}"
+        );
+        assert!(parse_muru_toml("[[instrumentation]]\nmodule = 'x'\nextra = 1\n").is_err());
     }
 
     #[test]

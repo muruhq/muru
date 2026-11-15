@@ -34,7 +34,7 @@ try:
     import grpc
     import grpc_tools  # noqa: F401  (the tests generate their stubs with it)
 except ImportError:
-    if os.environ.get("CI") and getattr(sys, "_is_gil_enabled", lambda: True)():
+    if os.environ.get("CI") and not support.free_threaded_build():
         raise
 
     pytest.skip(

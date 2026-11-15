@@ -4,7 +4,7 @@ body { margin: 0; font: 15px/1.45 system-ui, sans-serif; color: #1f2933; backgro
 header { padding: 1rem 1.5rem; background: #102a43; color: #d9e2ec; display: flex; gap: 1.5rem; align-items: baseline; flex-wrap: wrap; }
 header h1 { font-size: 1.1rem; margin: 0; color: #fff; }
 header span { opacity: 0.8; }
-main { max-width: 72rem; margin: 0 auto; padding: 1rem 1.5rem 3rem; display: grid; gap: 1.25rem; }
+main { margin: 0 auto; padding: 1rem 1.5rem 3rem; display: grid; gap: 1.25rem; }
 section { background: #fff; border: 1px solid #d9e2ec; border-radius: 6px; padding: 1rem 1.25rem; overflow: auto; }
 h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: #627d98; margin: 0 0 0.75rem; }
 h3 { font-size: 0.8rem; color: #627d98; margin: 0.75rem 0 0.25rem; }
@@ -28,6 +28,9 @@ button { font: inherit; font-size: 0.8rem; padding: 0.15rem 0.6rem; }
 h2 button { margin-left: 0.6rem; text-transform: none; letter-spacing: 0; }
 nav { font-size: 0.85rem; } nav a { color: #627d98; } nav a + a::before { content: " / "; }
 p.note { font-size: 0.85rem; color: #627d98; margin: 0.25rem 0 0.75rem; }
+/* The page takes the window's width for its tables and charts; prose
+   keeps a reading width. */
+p.note, p.muted { max-width: 48rem; }
 pre.stack { max-height: none; }
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr)); gap: 1rem; }
 .chart { min-height: 12rem; }

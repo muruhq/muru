@@ -1491,6 +1491,7 @@ pub(crate) mod tests {
             concurrency: 1000,
             preload: Preload::Auto,
             hooks: None,
+            instrumentation: Vec::new(),
             factory: None,
             reflection: false,
             handoff: None,

@@ -150,6 +150,58 @@ def test_thread_is_attributed_to_its_module(modules: Path) -> None:
     assert "post_fork" in findings[0].advice
 
 
+def test_a_thread_an_instrumentation_module_starts_lazily_is_put_down_to_it(
+    modules: Path,
+) -> None:
+    # The tool's writer thread starts on the first event it records, here
+    # during the application's import, and runs code in another module of
+    # the tool's package than the one listed.
+
+    package = modules / "tracer"
+    package.mkdir()
+    write_module(package, "__init__", "")
+    write_module(package, "setup", "")
+    write_module(
+        package,
+        "sinks",
+        "import threading\nSTOP = threading.Event()\nTHREADS = []\n\n"
+        "def _run():\n    STOP.wait()\n\n"
+        "def record():\n"
+        "    thread = threading.Thread(target=_run, name='tracer-writer')\n"
+        "    thread.start()\n    THREADS.append(thread)\n\n"
+        "def cleanup():\n    STOP.set()\n    [thread.join() for thread in THREADS]\n",
+    )
+    write_module(
+        modules,
+        "app_mod",
+        "import threading\nfrom tracer import sinks\nsinks.record()\nSTOP = threading.Event()\n"
+        "THREAD = threading.Thread(target=STOP.wait, name='app-poller')\nTHREAD.start()\n\n"
+        "def cleanup():\n    STOP.set()\n    THREAD.join()\n",
+    )
+
+    with preload.ImportRecorder(["tracer.setup"]) as recorder:
+        recorder.import_module("app_mod")
+
+    findings = {finding.detail: finding for finding in recorder.findings()}
+    assert set(findings) == {
+        "a thread running (tracer-writer, from tracer.sinks)",
+        "a thread running (app-poller)",
+    }
+
+    tool = findings["a thread running (tracer-writer, from tracer.sinks)"]
+    assert tool.instrumentation == "tracer.setup"
+    assert tool.describe() == (
+        "instrumentation module tracer.setup left a thread running "
+        "(tracer-writer, from tracer.sinks) during the import of app_mod"
+    )
+    assert "worker_started" in tool.advice
+
+    application = findings["a thread running (app-poller)"]
+    assert application.instrumentation is None
+    assert application.describe() == "the import of app_mod left a thread running (app-poller)"
+    assert "post_fork" in application.advice
+
+
 def test_child_process_and_its_pipes_are_reported(modules: Path) -> None:
     write_module(
         modules,
@@ -157,7 +209,7 @@ def test_child_process_and_its_pipes_are_reported(modules: Path) -> None:
         "import subprocess, sys\n"
         "CHILD = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],"
         " stdin=subprocess.PIPE)\n\n"
-        "def cleanup():\n    CHILD.kill()\n    CHILD.wait()\n",
+        "def cleanup():\n    CHILD.kill()\n    CHILD.wait()\n    CHILD.stdin.close()\n",
     )
     with preload.ImportRecorder() as recorder:
         recorder.import_module("child_mod")
@@ -216,7 +268,13 @@ def test_descriptor_reuse_is_compared_by_identity(modules: Path) -> None:
     )
     with preload.ImportRecorder() as recorder:
         recorder.import_module("reuse_mod")
-    assert {finding.kind for finding in recorder.findings()} == {"socket"}
+
+    # The socket on the reused number is put down to the import that
+    # opened it, as the other end is.
+
+    findings = recorder.findings()
+    assert {finding.kind for finding in findings} == {"socket"}
+    assert {finding.module for finding in findings} == {"reuse_mod"}
 
 
 def test_peer_name_formats_addresses() -> None:

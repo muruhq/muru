@@ -87,6 +87,7 @@ message AccessLog {
   uint64 slow_ms = 2;                   // a request at least this slow is written under errors
   repeated string exclude = 3;          // path patterns never written, * any run of characters and ? one
   string format = 4;                    // json or combined, for the file; json when empty
+  string query = 5;                     // keep, mask or drop the target's query string; keep when empty
 }
 
 // Section 11.2: a virtual host's or an application's own choice of
@@ -99,6 +100,7 @@ message AccessLogChoice {
   repeated string exclude = 3;          // path patterns never written, besides the levels' beneath
   string format = 4;                    // json or combined; the node's when empty (a virtual host's choice only)
   string file = 5;                      // the file that takes the host's records in place of the node's, as a path; the node's when empty
+  string query = 6;                     // keep, mask or drop the target's query string; the node's when empty (a virtual host's choice only)
 }
 
 // Section 11.2: a change to which access records are written, for a

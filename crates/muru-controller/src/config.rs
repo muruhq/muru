@@ -1311,6 +1311,11 @@ fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: 
             valid = false;
         }
 
+        if let Err(error) = muru_config::check_access_log_query(host.access_log_query.as_deref()) {
+            plan.errors.push(format!("host {name}: {error}"));
+            valid = false;
+        }
+
         if let Some(file) = &host.access_log_file {
             if let Err(error) = muru_config::check_access_log_file(file) {
                 plan.errors.push(format!("host {name}: {error}"));
@@ -3015,6 +3020,8 @@ pub struct Tables<'a> {
     pub maintenance: Option<&'a muru_config::Maintenance>,
     /// Commands (section 9.12).
     pub commands: Option<&'a BTreeMap<String, muru_config::CommandTable>>,
+    /// Instrumentation modules (section 6.15).
+    pub instrumentation: Option<&'a [muru_config::Instrumentation]>,
     /// The release's own limits on the requests it serves (section
     /// 4.6): `max_body_size` and the request timeouts of `timeouts`.
     pub limits: Option<muru_config::RequestLimitSettings>,
@@ -3417,6 +3424,7 @@ pub fn resolve_declared(
         error_override: table.error_override.as_ref(),
         maintenance: table.maintenance.as_ref(),
         commands: (!table.commands.is_empty()).then_some(&table.commands),
+        instrumentation: table.instrumentation.as_deref(),
         declared: true,
     };
 
@@ -4015,6 +4023,36 @@ pub fn resolve_spec(
 
     let commands = resolve_commands(tables.commands.unwrap_or(&table.commands))?;
 
+    // Section 6.15: the instrumentation list is a table, so it comes from
+    // the declaration, else the source, never the release before.
+
+    let mut instrumentation = tables
+        .instrumentation
+        .unwrap_or(&table.instrumentation)
+        .to_vec();
+    muru_config::check_instrumentation(&instrumentation)?;
+
+    // Section 11.6: the source's tracing key puts its module at the head
+    // of the list, with the entry points to wrap. A declaration exported
+    // from a release already carries the entry, and keeps it as it is.
+
+    let carried = instrumentation
+        .iter()
+        .any(|entry| entry.module == muru_config::TRACING_MODULE);
+
+    if !carried {
+        let entry = muru_config::tracing_instrumentation(
+            table.tracing.as_ref(),
+            table.tracing_middleware,
+            mounts,
+            &instrumentation,
+        )?;
+
+        if let Some(entry) = entry {
+            instrumentation.insert(0, entry);
+        }
+    }
+
     let interface = match request.interface.as_str() {
         "" => table
             .interface
@@ -4064,6 +4102,7 @@ pub fn resolve_spec(
             .then(|| request.hooks.clone())
             .or(table.hooks)
             .or_else(|| previous.and_then(|previous| previous.hooks.clone())),
+        instrumentation,
         factory,
         reflection: request
             .reflection
@@ -5242,6 +5281,7 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         scaling: None,
         preload: parse_optional(&request.preload)?,
         hooks: (!request.hooks.is_empty()).then(|| request.hooks.clone()),
+        instrumentation: None,
         groups: BTreeMap::new(),
         mounts: BTreeMap::new(),
         logging: None,
@@ -5336,6 +5376,7 @@ fn resolve_http_spec(
         concurrency: 0,
         preload: muru_config::Preload::Auto,
         hooks: None,
+        instrumentation: Vec::new(),
         factory: None,
         reflection: false,
         handoff: None,
@@ -5946,6 +5987,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         scaling: scaling_table(&spec.scaling),
         preload: Some(spec.preload),
         hooks: spec.hooks.clone(),
+        instrumentation: (!spec.instrumentation.is_empty()).then(|| spec.instrumentation.clone()),
         groups: spec
             .groups
             .iter()
@@ -6005,6 +6047,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         max_connections: mount.max_connections.map(|value| value as usize),
                         handoff: mount.handoff,
                         max_body_size: mount.limits.max_body_size_text(),
+                        tracing_middleware: None,
                     },
                 )
             })
@@ -6232,6 +6275,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "hooks",
         declared.hooks.clone().unwrap_or_default(),
         recorded.hooks.clone().unwrap_or_default(),
+    );
+    compare(
+        "instrumentation",
+        serde_json::to_string(&declared.instrumentation).unwrap_or_default(),
+        serde_json::to_string(&recorded.instrumentation).unwrap_or_default(),
     );
     compare(
         "commands",
@@ -6823,6 +6871,7 @@ mod tests {
                 slow: std::time::Duration::from_millis(250),
                 exclude: vec!["/static/*".to_owned(), "/healthz".to_owned()],
                 format: muru_edge::access::Format::Json,
+                query: muru_edge::access::Query::Keep,
             }
         );
 
@@ -6935,6 +6984,119 @@ mod tests {
                 ("create-host", "host blog".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn a_release_tables_instrumentation_replaces_the_sources_and_is_exported() {
+        let source = std::env::temp_dir().join(format!(
+            "muru-config-instrumentation-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("pyproject.toml"),
+            "[tool.muru]\nentrypoint = 'shop.wsgi:application'\n\
+             [[tool.muru.instrumentation]]\nmodule = 'importtimer'\n\
+             settings = { output = 'times.json' }\n",
+        )
+        .unwrap();
+        let resolve = |keys: &str| {
+            let text = format!(
+                "[app.shop.release.r1]\nsource = '{}'\npython = '/usr/bin/python3'\n{keys}",
+                source.display()
+            );
+            let document = Document::parse(&text).unwrap();
+            resolve_declared(
+                "shop",
+                &document.app["shop"].release["r1"],
+                &source.display().to_string(),
+                &crate::provision::Provisioning::off(),
+            )
+        };
+        let modules = |spec: &ReleaseSpec| {
+            spec.instrumentation
+                .iter()
+                .map(|entry| entry.module.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // The source's list, with its settings, unless the table gives one.
+
+        let spec = resolve("").unwrap();
+        assert_eq!(modules(&spec), ["importtimer"]);
+        assert_eq!(spec.instrumentation[0].settings["output"], "times.json");
+
+        let spec = resolve("[[app.shop.release.r1.instrumentation]]\nmodule = 'apm'\n").unwrap();
+        assert_eq!(modules(&spec), ["apm"]);
+        assert_eq!(table_from(&spec).instrumentation.unwrap()[0].module, "apm");
+
+        // A module named twice is refused.
+
+        let twice = "[[app.shop.release.r1.instrumentation]]\nmodule = 'apm'\n\
+                     [[app.shop.release.r1.instrumentation]]\nmodule = 'apm'\n";
+        assert_eq!(
+            resolve(twice).unwrap_err(),
+            "instrumentation module apm is listed twice"
+        );
+    }
+
+    #[test]
+    fn the_sources_tracing_puts_its_module_first_and_an_export_keeps_it() {
+        let source =
+            std::env::temp_dir().join(format!("muru-config-tracing-{}", std::process::id()));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("pyproject.toml"),
+            "[tool.muru]\nentrypoint = 'shop.wsgi:application'\ntracing = true\n\
+             [[tool.muru.instrumentation]]\nmodule = 'importtimer'\n\
+             [tool.muru.mounts.raw]\npath = '/raw'\nentrypoint = 'raw:app'\n\
+             tracing_middleware = true\n",
+        )
+        .unwrap();
+        let resolve = |keys: &str| {
+            let text = format!(
+                "[app.shop.release.r1]\nsource = '{}'\npython = '/usr/bin/python3'\n{keys}",
+                source.display()
+            );
+            let document = Document::parse(&text).unwrap();
+            resolve_declared(
+                "shop",
+                &document.app["shop"].release["r1"],
+                &source.display().to_string(),
+                &crate::provision::Provisioning::off(),
+            )
+        };
+
+        let spec = resolve("").unwrap();
+        let modules: Vec<&str> = spec
+            .instrumentation
+            .iter()
+            .map(|entry| entry.module.as_str())
+            .collect();
+
+        assert_eq!(modules, [muru_config::TRACING_MODULE, "importtimer"]);
+        assert_eq!(
+            spec.instrumentation[0].settings["middleware"],
+            serde_json::json!({"entrypoint": false, "mounts": ["raw"]})
+        );
+
+        // The exported list carries the entry, and declaring it again
+        // keeps it rather than adding a second.
+
+        let exported = table_from(&spec).instrumentation.unwrap();
+        let declared =
+            toml::to_string(&serde_json::json!({ "instrumentation": exported })).unwrap();
+        let declared = declared.replace(
+            "[[instrumentation]]",
+            "[[app.shop.release.r1.instrumentation]]",
+        );
+        let declared = declared.replace(
+            "[instrumentation.settings",
+            "[app.shop.release.r1.instrumentation.settings",
+        );
+
+        let again = resolve(&declared).unwrap();
+        assert_eq!(again.instrumentation, spec.instrumentation);
     }
 
     #[test]

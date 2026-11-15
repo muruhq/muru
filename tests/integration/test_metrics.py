@@ -253,7 +253,7 @@ app = "asgi"
         # the restarted worker has served something; a free-threaded
         # worker never waits for a GIL.
 
-        if sys._is_gil_enabled():  # type: ignore[attr-defined]
+        if support.workers_have_a_gil():
             wait_for(lambda: f"muru_gil_wait_seconds_count{{{labels}," in exported())
             text = exported()
             assert "# TYPE muru_gil_wait_seconds histogram\n" in text

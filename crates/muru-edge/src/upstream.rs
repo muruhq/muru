@@ -1161,7 +1161,7 @@ pub async fn handle(
     let mut recording = failing.take_recording();
 
     if let Some(recording) = recording.as_mut() {
-        recording.record.application = dispatched.elapsed();
+        recording.head_arrived(dispatched.elapsed());
         recording.record.status = status.as_u16();
         recording.record.mount = address.text.clone();
         recording.record.retried = retried;

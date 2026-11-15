@@ -12,6 +12,7 @@
 //! the next REQUEST may follow. The edge closing the connection cancels
 //! the request.
 
+use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsFd as _, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
@@ -35,6 +36,7 @@ use muru_proto::descriptors::FdReader;
 use crate::asgi;
 use crate::handoff;
 use crate::pool::Shared;
+use crate::record;
 use crate::wsgi::{self, Outgoing};
 
 /// Errors from the link server.
@@ -172,6 +174,11 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
 
         std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))?;
         let mut signals = Signals::new()?;
+
+        // Issue 673: what arrived while the worker was starting is acted
+        // on now that the server's own handling is there.
+
+        crate::startup_signals::replay();
         let mut lifeline = Lifeline::new(lifeline)?;
 
         // The first report says the worker is listening; the rest keep
@@ -364,16 +371,74 @@ fn clock_ms() -> u64 {
 /// How often the event loop beats.
 const LOOP_BEAT_INTERVAL: Duration = Duration::from_millis(500);
 
+/// The last stretches the event loop was held, for a request's record
+/// (section 11.7), each as when it ended and how long it was: a late
+/// beat says the loop was held from when the beat was due until it ran.
+static HELD: Mutex<VecDeque<(Instant, Duration)>> = Mutex::new(VecDeque::new());
+
+/// The most stretches kept.
+const HELD_KEPT: usize = 128;
+
+/// A stretch shorter than this is the timer's own lateness, not a hold.
+const HELD_AT_LEAST: Duration = Duration::from_millis(1);
+
 /// Record that the event loop has run (section 7.6), and how much later
 /// than due it ran (section 7.3).
 pub fn loop_beat() {
     let now = clock_ms().max(1);
     let last = LOOP_BEAT_MS.swap(now, Ordering::Relaxed);
 
-    if last > 0 {
-        let interval = Duration::from_millis(now.saturating_sub(last));
-        crate::signals::LOOP_LAG.record(interval.saturating_sub(LOOP_BEAT_INTERVAL));
+    if last == 0 {
+        return;
     }
+
+    let interval = Duration::from_millis(now.saturating_sub(last));
+    let late = interval.saturating_sub(LOOP_BEAT_INTERVAL);
+    crate::signals::LOOP_LAG.record(late);
+
+    if late >= HELD_AT_LEAST && crate::record::asked() {
+        let mut held = HELD.lock().expect("loop stretches poisoned");
+        held.push_back((Instant::now(), late));
+
+        if held.len() > HELD_KEPT {
+            held.pop_front();
+        }
+    }
+}
+
+/// The longest stretch between `since` and `until` in which the event
+/// loop was held, as when it began after `since` and how long it lasted
+/// within the two, counting one still under way; none in a worker with
+/// no loop, or when the loop was never held.
+pub(crate) fn loop_held(since: Instant, until: Instant) -> Option<(Duration, Duration)> {
+    let last = LOOP_BEAT_MS.load(Ordering::Relaxed);
+
+    if last == 0 {
+        return None;
+    }
+
+    let late =
+        Duration::from_millis(clock_ms().saturating_sub(last)).saturating_sub(LOOP_BEAT_INTERVAL);
+    let running = (late >= HELD_AT_LEAST).then(|| (Instant::now(), late));
+    let held = HELD.lock().expect("loop stretches poisoned");
+    longest_held(held.iter().copied().chain(running), since, until)
+}
+
+/// The longest overlap of the stretches, each as when it ended and how
+/// long it was, with the time from `since` to `until`: when it began
+/// after `since` and its length.
+fn longest_held(
+    stretches: impl Iterator<Item = (Instant, Duration)>,
+    since: Instant,
+    until: Instant,
+) -> Option<(Duration, Duration)> {
+    stretches
+        .filter_map(|(ended, length)| {
+            let from = ended.checked_sub(length).unwrap_or(ended).max(since);
+            let overlap = ended.min(until).checked_duration_since(from)?;
+            (overlap >= HELD_AT_LEAST).then(|| (from.duration_since(since), overlap))
+        })
+        .max_by_key(|(_, overlap)| *overlap)
 }
 
 /// Tell the host, once a stall, when the event loop has gone longer than
@@ -1094,6 +1159,7 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
         mount_pools: shared.mount_pools(),
         websocket_mounts: shared.websocket_mounts(),
         worker: shared.worker,
+        records: true,
     };
 
     if frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into())
@@ -1222,6 +1288,19 @@ async fn handle_request(
             ..Default::default()
         };
         frame::write(writer, kind::END, 0, end.encode_to_vec().into()).await?;
+
+        // Section 11.7: a record asked for is sent, saying what failed.
+
+        if head.record {
+            let record = pb::WorkerRecord {
+                outcome: "failed".to_owned(),
+                reason: end.reason,
+                error: end.error,
+                ..Default::default()
+            };
+            write_record(writer, &record).await?;
+        }
+
         return Ok(None);
     };
 
@@ -1256,6 +1335,16 @@ async fn handle_request(
     let (request_id, interrupt) = shared.request_started(&head);
     shared.request_outgoing(request_id, out_tx.clone());
     let websocket = head.scope == pb::Scope::Websocket as i32;
+
+    // Section 11.7: when the edge asked for a record, the request's log
+    // records are kept from now until the record is sent.
+
+    let trace = shared.request_trace(request_id);
+    let edge_id = head.request_id.clone();
+
+    if trace.is_some() {
+        record::start_logs(&edge_id);
+    }
 
     // Section 6.14: the request may be handed to the event loop, which
     // then finishes it; the slot is how this task learns of it.
@@ -1404,7 +1493,7 @@ async fn handle_request(
         }
     };
     let write_side = async {
-        let result = write_response_after(first, out_rx, writer).await;
+        let result = write_response_after(first, out_rx, writer, trace.as_deref()).await;
 
         if let Some(channel) = slot.channel() {
             channel.complete();
@@ -1426,7 +1515,22 @@ async fn handle_request(
 
     let early = read_result?;
     write_result?;
+
+    // Section 11.7: the worker's part of the record follows the response.
+
+    if let Some(trace) = trace {
+        let logs = record::take_logs(&edge_id);
+        let record = trace.to_message(cancelled.load(Ordering::Relaxed), logs);
+        write_record(writer, &record).await?;
+    }
+
     Ok(early)
+}
+
+/// Send the worker's part of a request's record, on a RECORD frame after
+/// the response (section 11.7).
+async fn write_record(writer: &mut Writer, record: &pb::WorkerRecord) -> io::Result<()> {
+    frame::write(writer, kind::RECORD, 0, record.encode_to_vec().into()).await
 }
 
 /// Run one request as a task on the event loop: body frames become
@@ -1456,6 +1560,18 @@ async fn handle_asgi_request(
     let head = Arc::new(head);
     let (request_id, interrupt) = shared.request_started(&head);
     shared.request_outgoing(request_id, out_tx.clone());
+
+    // Section 11.7: when the edge asked for a record, the request's log
+    // records are kept from before the task starts until it is sent.
+
+    let trace = shared.request_trace(request_id);
+
+    if let Some(trace) = &trace {
+        trace.on_loop();
+        record::start_logs(&head.request_id);
+    }
+
+    let aborted = AtomicBool::new(false);
     let fds: Vec<RawFd> = uploads.iter().map(AsRawFd::as_raw_fd).collect();
     let _uploads = uploads;
     let offer = asgi::Offer {
@@ -1518,6 +1634,7 @@ async fn handle_asgi_request(
                         break;
                     }
                     kind::ABORT => {
+                        aborted.store(true, Ordering::Relaxed);
                         channel.disconnect();
                         break;
                     }
@@ -1537,7 +1654,10 @@ async fn handle_asgi_request(
             match watch_request(reader, &done).await? {
                 Interrupt::Done => return Ok(None),
                 Interrupt::Request(next) => return Ok(Some(next)),
-                Interrupt::Abort => channel.disconnect(),
+                Interrupt::Abort => {
+                    aborted.store(true, Ordering::Relaxed);
+                    channel.disconnect();
+                }
                 Interrupt::Closed => {
                     channel.disconnect();
                     return Err(io::Error::new(
@@ -1549,7 +1669,7 @@ async fn handle_asgi_request(
         }
     };
     let write_side = async {
-        let result = write_response(out_rx, writer).await;
+        let result = write_response_after(None, out_rx, writer, trace.as_deref()).await;
         channel.complete();
         done.notify_one();
         result
@@ -1563,6 +1683,15 @@ async fn handle_asgi_request(
 
     let early = read_result?;
     write_result?;
+
+    // Section 11.7: the worker's part of the record follows the response.
+
+    if let Some(trace) = trace {
+        let logs = record::take_logs(&head.request_id);
+        let record = trace.to_message(aborted.load(Ordering::Relaxed), logs);
+        write_record(writer, &record).await?;
+    }
+
     Ok(early)
 }
 
@@ -1837,7 +1966,7 @@ async fn write_grpc_response(
 
 /// Turn the application's output into frames, coalescing small chunks.
 async fn write_response(rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -> io::Result<()> {
-    write_response_after(None, rx, writer).await
+    write_response_after(None, rx, writer, None).await
 }
 
 /// Write a response whose first item, `first`, has already been taken
@@ -1846,6 +1975,7 @@ async fn write_response_after(
     mut first: Option<Outgoing>,
     mut rx: mpsc::Receiver<Outgoing>,
     writer: &mut Writer,
+    trace: Option<&record::Trace>,
 ) -> io::Result<()> {
     let mut pending_head: Option<Bytes> = None;
     let mut head_written = false;
@@ -1870,6 +2000,13 @@ async fn write_response_after(
             },
             (None, None) => Some(rx.recv().await),
         };
+
+        // Section 11.7: what the writer takes of the response, for the
+        // record when the edge asked for one.
+
+        if let (Some(trace), Some(taken)) = (trace, &item) {
+            trace.observe(taken.as_ref());
+        }
 
         // Section 6.14: a handoff tells the edge which side the request
         // is on now, before anything of the response.
@@ -2227,7 +2364,45 @@ async fn write_body(
 
 #[cfg(test)]
 mod tests {
-    use super::{period_operation, stop_within_request};
+    use std::time::{Duration, Instant};
+
+    use super::{longest_held, period_operation, stop_within_request};
+
+    #[test]
+    fn the_longest_hold_of_the_loop_is_the_part_within_the_request() {
+        let since = Instant::now();
+        let ms = Duration::from_millis;
+
+        // A stretch that began before the request counts from its start;
+        // a short one is the timer's lateness; the longest wins.
+
+        let stretches = [
+            (since + ms(30), ms(50)),
+            (since + ms(100), ms(40)),
+            (since + ms(200), Duration::from_micros(500)),
+        ];
+        let end = since + ms(500);
+        assert_eq!(
+            longest_held(stretches.into_iter(), since, end),
+            Some((ms(60), ms(40)))
+        );
+        assert_eq!(
+            longest_held(stretches[..1].iter().copied(), since, end),
+            Some((ms(0), ms(30)))
+        );
+
+        // One that ended before the request is not part of it, and one
+        // that ran past its end counts until then.
+
+        assert_eq!(
+            longest_held([(since, ms(80))].into_iter(), since + ms(1), end),
+            None
+        );
+        assert_eq!(
+            longest_held([(since + ms(600), ms(300))].into_iter(), since, end),
+            Some((ms(300), ms(200)))
+        );
+    }
 
     #[test]
     fn the_operations_over_a_period_are_told_from_the_rest() {

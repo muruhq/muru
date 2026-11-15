@@ -39,8 +39,21 @@ def dashboard() -> Iterator[tuple[support.Server, int]]:
 
 def test_page_shows_workers_requests_and_logs(dashboard: tuple[support.Server, int]) -> None:
     server, port = dashboard
-    assert server.get("/response/list").status == 200
+    listed = server.get("/response/list")
+    assert listed.status == 200
     assert server.get("/response/raise-first").status == 500
+
+    # A development run's response names its queue and application times
+    # and its request, and links to the request's page on the dashboard.
+
+    request_id = listed.header("x-request-id")
+    timing = listed.header("server-timing")
+    assert timing is not None and request_id is not None
+    assert re.fullmatch(
+        rf'queue;dur=\d+\.\d\d, app;dur=\d+\.\d\d, muru;desc="{request_id}"', timing
+    ), timing
+    link = f"http://127.0.0.1:{port}/request/{request_id}"
+    assert listed.header("muru-request-link") == link
 
     # The traceback reaches muructl through the log relay, after the
     # response can. muructl adds a line to the dashboard before it prints
@@ -88,8 +101,15 @@ def test_dashboard_can_be_off() -> None:
     server = support.start("plain_wsgi:application", workers=1, args=["--dashboard", "off"])
 
     try:
-        assert server.get("/").status == 200
+        response = server.get("/")
+        assert response.status == 200
         assert "dashboard" not in server.log()
+
+        # With no dashboard there is no page to link to, and the timings
+        # are still given.
+
+        assert response.header("muru-request-link") is None
+        assert response.header("server-timing") is not None
     finally:
         server.stop()
 

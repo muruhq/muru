@@ -81,6 +81,9 @@ pub struct Data {
     pub websockets: WebSocketsView,
     /// Recent log lines, oldest first.
     pub logs: Vec<LogLine>,
+    /// Whether the run keeps request records, so each recent request
+    /// links to its page (section 11.7).
+    pub records: bool,
 }
 
 /// A log line with the time it starts with split off (section 11.8):
@@ -267,6 +270,39 @@ pub struct RequestRow {
 
 /// Produces the data for one rendering.
 pub type Source = Arc<dyn Fn() -> Data + Send + Sync>;
+
+/// One request's record, with its panels drawn and sanitised (section
+/// 11.7), for the request page and its JSON.
+#[derive(Debug, Clone)]
+pub struct RequestView {
+    /// The request's ID.
+    pub request_id: String,
+    /// The method, target and status in a line, for the page's heading.
+    pub summary: String,
+    /// The response has not ended yet.
+    pub in_progress: bool,
+    /// The record, as `muructl debug request --json` prints it.
+    pub json: serde_json::Value,
+    /// The panels, in order.
+    pub panels: Vec<PanelView>,
+    /// The classes the panels use.
+    pub stylesheet: &'static str,
+}
+
+/// One panel of a request page, already drawn and sanitised.
+#[derive(Debug, Clone)]
+pub struct PanelView {
+    /// The panel's name, for its element's id.
+    pub name: String,
+    /// The panel's title.
+    pub title: String,
+    /// The panel's HTML, which the sanitiser has passed.
+    pub html: String,
+}
+
+/// Looks a request's record up by its ID: the record, or a sentence
+/// saying why there is none.
+pub type RequestSource = Arc<dyn Fn(&str) -> Result<RequestView, String> + Send + Sync>;
 
 /// A boxed future, as the daemon's sources return.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -589,6 +625,16 @@ struct LogsFragment<'a> {
 }
 
 #[derive(Template)]
+#[template(path = "request.html")]
+struct RequestPage<'a> {
+    app: &'a str,
+    request_id: &'a str,
+    view: Option<&'a RequestView>,
+    /// Why there is no record, when there is none.
+    error: &'a str,
+}
+
+#[derive(Template)]
 #[template(path = "node.html")]
 struct NodePage<'a> {
     data: &'a NodeData,
@@ -687,6 +733,7 @@ pub async fn serve(
     history: Arc<History>,
     debug: DebugSource,
     processes: ProcessesSource,
+    requests: RequestSource,
 ) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
@@ -695,6 +742,7 @@ pub async fn serve(
         let history = Arc::clone(&history);
         let debug = Arc::clone(&debug);
         let processes = Arc::clone(&processes);
+        let requests = Arc::clone(&requests);
         tokio::spawn(async move {
             let service = service_fn(move |request| {
                 let source = Arc::clone(&source);
@@ -702,10 +750,17 @@ pub async fn serve(
                 let history = Arc::clone(&history);
                 let debug = Arc::clone(&debug);
                 let processes = Arc::clone(&processes);
+                let requests = Arc::clone(&requests);
                 async move {
-                    Ok::<_, Infallible>(
-                        respond(&request, &source, &metrics, &history, &debug, &processes).await,
-                    )
+                    let sources = RunSources {
+                        source: &source,
+                        metrics: &metrics,
+                        history: &history,
+                        debug: &debug,
+                        processes: &processes,
+                        requests: &requests,
+                    };
+                    Ok::<_, Infallible>(respond(&request, sources).await)
                 }
             });
             if let Err(error) = http1::Builder::new()
@@ -723,14 +778,26 @@ pub async fn bind(address: SocketAddr) -> anyhow::Result<TcpListener> {
     Ok(TcpListener::bind(address).await?)
 }
 
-async fn respond(
-    request: &Request<Incoming>,
-    source: &Source,
-    metrics: &MetricsSource,
-    history: &Arc<History>,
-    debug: &DebugSource,
-    processes: &ProcessesSource,
-) -> Response<Body> {
+/// What a development run's dashboard reads from.
+struct RunSources<'a> {
+    source: &'a Source,
+    metrics: &'a MetricsSource,
+    history: &'a Arc<History>,
+    debug: &'a DebugSource,
+    processes: &'a ProcessesSource,
+    requests: &'a RequestSource,
+}
+
+async fn respond(request: &Request<Incoming>, sources: RunSources<'_>) -> Response<Body> {
+    let RunSources {
+        source,
+        metrics,
+        history,
+        debug,
+        processes,
+        requests,
+    } = sources;
+
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served\n");
     }
@@ -750,6 +817,10 @@ async fn respond(
     }
 
     if let Some(response) = processes_paths(request.uri().path(), processes, false).await {
+        return response;
+    }
+
+    if let Some(response) = request_paths(request.uri().path(), source, requests) {
         return response;
     }
 
@@ -856,6 +927,45 @@ fn page(rendered: Result<String, askama::Error>) -> Response<Body> {
 
 fn whole(bytes: Bytes) -> Body {
     Full::new(bytes).boxed_unsync()
+}
+
+/// Section 10.7: a development run's request page, `/request/ID`, and
+/// the record as JSON at `/v1/requests/ID`.
+fn request_paths(path: &str, source: &Source, requests: &RequestSource) -> Option<Response<Body>> {
+    if let Some(request_id) = path.strip_prefix("/v1/requests/") {
+        return Some(match requests(request_id) {
+            Ok(view) => json(&view.json),
+            Err(error) => {
+                let mut response = json(&serde_json::json!({ "error": error }));
+                *response.status_mut() = StatusCode::NOT_FOUND;
+                response
+            }
+        });
+    }
+
+    let request_id = path.strip_prefix("/request/")?;
+    let looked_up = requests(request_id);
+
+    let (view, error) = match &looked_up {
+        Ok(view) => (Some(view), ""),
+        Err(error) => (None, error.as_str()),
+    };
+
+    let mut response = page(
+        RequestPage {
+            app: &source().app,
+            request_id,
+            view,
+            error,
+        }
+        .render(),
+    );
+
+    if view.is_none() {
+        *response.status_mut() = StatusCode::NOT_FOUND;
+    }
+
+    Some(response)
 }
 
 fn plain(status: StatusCode, text: &'static str) -> Response<Body> {

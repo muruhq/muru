@@ -19,7 +19,7 @@ default-members = [
 
 [workspace.package]
 # The only place the project version is stated. Change it with `just bump`.
-version = "0.1.0-alpha.26"
+version = "0.1.0-alpha.27"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -28,6 +28,7 @@ authors = ["Graham Dumpleton"]
 publish = false
 
 [workspace.dependencies]
+ammonia = "4.2"
 anyhow = "1"
 base64 = "0.23"
 askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
@@ -47,8 +48,11 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "c
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12", "webpki-tokio"] }
 jiff = "0.2"
 libc = "0.2"
+signal-hook-registry = "1.4"
 mime_guess = "2"
+minijinja = { version = "3.1", features = ["serde"] }
 multer = "3.1"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 muru-common = { path = "crates/muru-common" }
 muru-dashboard = { path = "crates/muru-dashboard" }
 muru-config = { path = "crates/muru-config" }
@@ -59,7 +63,7 @@ muru-provision = { path = "crates/muru-provision" }
 percent-encoding = "2"
 prost = "0.14"
 protoc-bin-vendored = "3"
-pyo3 = { version = "0.30", features = ["extension-module"] }
+pyo3 = "0.30"
 # TLS runs on the ring provider everywhere (ADR 0024): no aws-lc-rs, so no
 # cmake. Keep every rustls-family crate on the same provider features.
 rusqlite = { version = "0.41", features = ["bundled"] }

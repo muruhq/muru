@@ -483,6 +483,9 @@ pub struct ReleaseSpec {
     pub preload: Preload,
     /// The hooks module, if any.
     pub hooks: Option<String>,
+    /// The instrumentation modules, in order (section 6.15).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instrumentation: Vec<muru_config::Instrumentation>,
     /// Whether the entrypoint is a factory, and when it is called.
     pub factory: Option<FactoryPhase>,
     /// The origins whose pages may call it through gRPC-Web, answered
@@ -1439,6 +1442,7 @@ impl AccessLogSpec {
                 .unwrap_or(node.slow),
             exclude,
             format: node.format,
+            query: node.query,
         }
     }
 
@@ -1466,6 +1470,7 @@ impl AccessLogSpec {
             exclude: self.access_log_exclude.clone(),
             format: None,
             file: None,
+            query: None,
         }
     }
 

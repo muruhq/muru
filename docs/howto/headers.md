@@ -106,7 +106,9 @@ them itself:
 A request header whose name contains an underscore cannot be set, since
 the edge passes no such header to an application. Values are printable
 ASCII. The edge puts `X-Request-ID` on every response after the rules
-are applied, so it is always there.
+are applied, so it is always there. A development run adds
+`Server-Timing` and `Muru-Request-Link` after them too, as
+[inspecting requests in development](toolbar.md) describes.
 
 `muructl host list` and `muructl route list` show what each host and
 route removes, sets and adds.

@@ -519,6 +519,17 @@ fn access_log_from(document: &muru_config::Document) -> Result<muru_edge::access
         filter.format = format;
     }
 
+    muru_config::check_access_log_query(logs.access_log_query.as_deref())
+        .map_err(|error| format!("[logs] {error}"))?;
+
+    if let Some(query) = logs
+        .access_log_query
+        .as_deref()
+        .and_then(muru_edge::access::Query::parse)
+    {
+        filter.query = query;
+    }
+
     filter.exclude = logs.access_log_exclude.clone();
     Ok(filter)
 }
@@ -763,7 +774,7 @@ mod tests {
     fn the_logs_table_says_which_records_the_access_log_writes() {
         let settings = settings(
             "[logs]\naccess_log = 'errors'\nslow = '500ms'\naccess_log_exclude = ['/healthz']\n\
-             access_log_format = 'combined'\n",
+             access_log_format = 'combined'\naccess_log_query = 'mask'\n",
         )
         .unwrap();
         assert_eq!(
@@ -773,11 +784,16 @@ mod tests {
                 slow: std::time::Duration::from_millis(500),
                 exclude: vec!["/healthz".to_owned()],
                 format: muru_edge::access::Format::Combined,
+                query: muru_edge::access::Query::Mask,
             }
         );
         assert_eq!(
             super::tests::settings("[logs]\naccess_log_format = 'common'\n").unwrap_err(),
             "[logs] access_log_format = \"common\" is not json or combined"
+        );
+        assert_eq!(
+            super::tests::settings("[logs]\naccess_log_query = 'hide'\n").unwrap_err(),
+            "[logs] access_log_query = \"hide\" is not keep, mask or drop"
         );
     }
 

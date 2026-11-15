@@ -1102,8 +1102,9 @@ file again, checks it whole, and applies what changed:
 - the `[logs]` table: the daemon rotates on the new policy from its
   next check, and a period that changed rotates each file once;
   `reopen_on_rename` turns the check for renamed files on or off at
-  once; the access log's `access_log`, `access_log_exclude` and `slow`
-  go to the edge at once, for the requests completed from then on;
+  once; the access log's `access_log`, `access_log_exclude`, `slow`,
+  `access_log_format` and `access_log_query` go to the edge at once,
+  for the requests completed from then on;
   `on_overflow` and `output_queue` apply to each application at its
   next restart or deploy;
 

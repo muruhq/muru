@@ -83,6 +83,9 @@ jobs:
       - run: uv python install ${{ matrix.python }}
       - run: echo "PYO3_PYTHON=$(uv python find ${{ matrix.python }})" >> "$GITHUB_ENV"
       - run: cargo clippy -p muru-py --all-targets -- -D warnings
+      # The tests link against the interpreter's libpython, outside the
+      # target directory, so the loader is told where it is.
+      - run: LD_LIBRARY_PATH="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')" cargo test -p muru-py
 
   integration:
     # muructl run end to end: preload, fork, the worker link and the WSGI bridge,

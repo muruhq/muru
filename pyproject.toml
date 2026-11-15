@@ -31,6 +31,9 @@ fixtures = [
     "starlette>=0.45",
     "uvicorn>=0.34",
     "websockets>=15",
+    # Tracing (section 11.6) with wrapture, which needs Python 3.12 or later.
+    "wrapture>=1.0.0b5; python_version >= '3.12'",
+    "wrapture-instrumentation>=1.0.0b3; python_version >= '3.12'",
 ]
 # gRPC mounts (section 6.13). grpcio has no free-threaded wheels, so jobs
 # on a free-threaded Python leave this group out with UV_NO_GROUP=grpc.
@@ -56,6 +59,12 @@ docs = [
 [tool.uv]
 package = false
 default-groups = ["dev", "docs", "fixtures", "grpc"]
+
+# The docs are built on a current interpreter. soupsieve, which furo brings
+# in, is past CVE-2026-126190 only from 4.0, which needs Python 3.11.5, so
+# the docs group is not resolved for anything older (#653).
+[tool.uv.dependency-groups]
+docs = { requires-python = ">=3.11.5" }
 
 [tool.ruff]
 line-length = 100

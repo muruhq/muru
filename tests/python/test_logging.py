@@ -203,3 +203,63 @@ def test_warnings_filters_are_applied_in_order_the_last_first() -> None:
         assert "no_such_module" in muru_logging._refused_filters[0]
 
     muru_logging._refused_filters.clear()
+
+
+def test_a_requests_log_records_are_kept_for_its_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A development run keeps the log records of each request it records
+    (section 11.7): those made while the request id is its own, with a
+    traceback, up to a limit, past which they are counted."""
+
+    from muru import _context
+
+    monkeypatch.setattr(muru_logging, "CAPTURE_LIMIT", 2)
+    monkeypatch.setattr(muru_logging, "_captures", {})
+    original = logging.getLogRecordFactory()
+
+    if not getattr(original, "muru_tagging", False):
+        logging.setLogRecordFactory(muru_logging._tagging(original))
+
+    logger = logging.getLogger("demo.capture")
+    muru_logging._capture_start("01KEPT")
+
+    try:
+        token = _context._request_id.set("01KEPT")
+
+        try:
+            logger.warning("stock for order %s is low", 42)
+
+            try:
+                raise KeyError("sku")
+            except KeyError:
+                logger.exception("lookup failed")
+
+            logger.error("past the limit")
+        finally:
+            _context._request_id.reset(token)
+
+        # Another request's records, and those of no request, are not kept.
+
+        other = _context._request_id.set("01OTHER")
+
+        try:
+            logger.warning("not this request")
+        finally:
+            _context._request_id.reset(other)
+
+        logger.warning("no request at all")
+    finally:
+        logging.setLogRecordFactory(original)
+
+    kept, dropped = muru_logging._capture_take("01KEPT")
+    assert [(level, name) for _, level, name, _ in kept] == [
+        ("WARNING", "demo.capture"),
+        ("ERROR", "demo.capture"),
+    ]
+    assert kept[0][3] == "stock for order 42 is low"
+    assert kept[1][3].startswith("lookup failed\nTraceback")
+    assert "KeyError: 'sku'" in kept[1][3]
+    assert dropped == 1
+
+    # Taken, the request is no longer kept, and taking again finds nothing.
+
+    assert muru_logging._capture_take("01KEPT") == ([], 0)

@@ -124,6 +124,10 @@ service Admin {
   // group and listed (section 11.7).
   rpc ListRequests(ListRequestsRequest) returns (RequestList);
 
+  // A development run's record of one request, by its ID (section
+  // 11.7). The daemon and muructl serve keep none.
+  rpc GetRequest(GetRequestRequest) returns (RequestRecord);
+
   // Re-read the daemon's configuration file for what can change while
   // running (section 13.3).
   rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
@@ -323,6 +327,148 @@ message OpenWebSocket {
   uint64 sent = 12;                 // messages to the client
   uint64 received_bytes = 13;
   uint64 sent_bytes = 14;
+}
+
+message GetRequestRequest {
+  string request_id = 1;
+}
+
+// What a development run keeps of one request (section 11.7): the
+// access log's record, the connection, the headers with secret values
+// masked, the compression decision, and the panels drawn from them.
+// Bodies are never kept.
+message RequestRecord {
+  string request_id = 1;
+  bool in_progress = 2;             // the response has not ended yet
+  uint64 started_unix_ms = 3;
+  string client = 4;
+  string app = 5;
+  string release = 6;
+  string host = 7;
+  string virtual_host = 8;
+  string group = 9;
+  string mount = 10;
+  uint64 snapshot = 11;
+  string method = 12;
+  string target = 13;               // the path with its query string
+  string version = 14;
+  string listener = 15;
+  uint32 status = 16;
+  string reason = 17;               // the edge's, when it produced the response
+  uint64 bytes = 18;                // body bytes sent
+  uint64 received = 19;             // body bytes received
+  optional uint32 worker = 20;      // its index within its group
+  bool retried = 21;
+  double queue_ms = 22;
+  double app_ms = 23;
+  double total_ms = 24;
+  repeated string redirects = 25;   // internal redirect targets, in order
+  string client_class = 26;
+  string handoff = 27;              // asgi or wsgi when the worker handed it across
+  RequestConnection connection = 28;
+  repeated RecordedHeader request_headers = 29;
+  repeated RecordedHeader response_headers = 30;
+  RequestCompression compression = 31;
+  repeated Panel panels = 32;
+  string worker_part = 33;          // expected, arrived or missing; empty when the worker was not asked for it
+  WorkerPart from_worker = 34;      // what the worker saw, once it arrived
+}
+
+// The worker's part of a request's record (section 11.7). Times are
+// milliseconds from when the worker took the request, 0 for one that did
+// not happen.
+message WorkerPart {
+  string thread = 1;
+  double to_start_response = 2;
+  double to_first_byte = 3;
+  double to_last_byte = 4;
+  double to_close = 5;
+  uint64 body_bytes = 6;            // before compression
+  string body_source = 7;           // iterable, file_wrapper, write, asgi_body, pathsend or zerocopysend
+  bool sent_by_edge = 8;
+  string outcome = 9;               // completed, client_disconnected, failed or timeout
+  string reason = 10;
+  string error_phase = 11;          // call, iteration or close
+  string error = 12;
+  string traceback = 13;
+  repeated RequestLog logs = 14;
+  uint32 logs_dropped = 15;
+  double thread_wait = 16;          // a WSGI request's wait for an application thread
+  double gil_wait = 17;             // its waits for the GIL, summed; 0 without a GIL
+  uint32 gil_waits = 18;
+  double gil_wait_first = 19;       // the wait as it started
+  repeated RequestGc gc = 20;       // collections that ended during the request, by generation
+  double loop_lag = 21;             // the longest stretch of the request with the event loop held
+  double loop_lag_at = 22;          // when that stretch began
+  repeated Panel panels = 23;       // panels code in the worker added (issue 677), spans on the worker's clock
+}
+
+message RequestGc {
+  string generation = 1;            // 0, 1, 2, or full on a free-threaded build
+  uint32 collections = 2;
+  double ms = 3;
+}
+
+message RequestLog {
+  double at_ms = 1;                 // from when the worker took the request
+  string level = 2;
+  string logger = 3;
+  string message = 4;
+}
+
+message RequestConnection {
+  string id = 1;
+  uint64 position = 2;              // 1 for the connection's first request
+  double idle_ms = 3;               // idle before the request arrived
+  optional double tls_handshake_ms = 4;  // the first request on a TLS connection
+  bool closed_after = 5;            // closed after this response: its share of requests was reached
+}
+
+message RecordedHeader {
+  string name = 1;
+  string value = 2;                 // *** when masked
+}
+
+message RequestCompression {
+  bool compressed = 1;
+  string encoding = 2;              // the encoding sent, or the one the response already had
+  string skipped = 3;               // why not, when not compressed
+}
+
+// One panel of a request's record, as data (ADR 0063): spans on the
+// request's clock, values, and tables, any of them empty.
+message Panel {
+  string name = 1;                  // timing, where, response, logs, errors, connection, or one from the worker
+  string title = 2;
+  repeated PanelSpan spans = 3;
+  repeated PanelValue values = 4;
+  repeated PanelTable tables = 5;
+  uint32 dropped = 6;               // entries a panel from the worker could not keep, past its caps
+  string text = 7;                  // a text panel's text (issue 680)
+  bool markdown = 8;                // the text is markdown, drawn by the edge
+}
+
+message PanelSpan {
+  string name = 1;
+  double start_ms = 2;              // from the request's arrival
+  double duration_ms = 3;
+  string category = 4;
+  repeated PanelSpan children = 5;
+}
+
+message PanelValue {
+  string name = 1;
+  string value = 2;
+}
+
+message PanelTable {
+  string caption = 1;
+  repeated string columns = 2;
+  repeated PanelRow rows = 3;
+}
+
+message PanelRow {
+  repeated string cells = 1;
 }
 
 message ListRequestsRequest {
@@ -799,6 +945,7 @@ message Release {
   bool host_running = 33;           // whether a host runs for it now; false for a stopped or dormant release
   uint64 disk_bytes = 34;           // what its environment, bytecode and logs take; set when asked for
   uint64 disk_freed_bytes = 35;     // what removing it would give back, less than disk_bytes when files are hard-linked elsewhere
+  repeated string instrumentation = 36; // its instrumentation modules, in order (section 6.15)
 }
 
 // An instance of an http release's command.
@@ -1029,6 +1176,7 @@ message Host {
   bool maintenance = 17;              // the edge serves the maintenance page for the host (section 4.12)
   string access_log_format = 18;      // how the host's access records are written, when it says: json or combined
   string access_log_file = 19;        // the file in the log directory that takes the host's access records, when it names one
+  string access_log_query = 20;       // what the host's access records keep of the query string, when it says: keep, mask or drop
 }
 
 message ListRoutesRequest {}

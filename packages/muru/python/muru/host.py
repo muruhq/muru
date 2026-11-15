@@ -43,6 +43,7 @@ import faulthandler
 import gc
 import importlib
 import inspect
+import io
 import json
 import os
 import random
@@ -57,12 +58,14 @@ from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from types import ModuleType
-from typing import Any
+from typing import Any, TextIO
 
-from muru import RequestTimeout, _asgi, _inspect, _outside, preload
+from muru import RequestTimeout, _asgi, _inspect, _instrumentation, _outside, _signals, preload
 from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
+from muru._context import context as muru_context
+from muru._instrumentation import Entry, InstrumentationError, Instruments, Target
 from muru.hooks import Hooks
 
 WSGIApplication = Callable[..., Any]
@@ -195,6 +198,134 @@ def log(message: str) -> None:
         pass
     else:
         _dropped_own = 0
+
+
+class TaggedStream(io.TextIOBase):
+    """Standard output or error of the host, each line tagged as the host's.
+
+    The host's standard output and error are one pipe, which the relay
+    writes as it reads it, since Muru's own lines from the host carry
+    their tag already (section 11.3). What the application writes in the
+    host, at import under preload or from a hook the host runs, goes
+    through these, so it is tagged as a worker's is: ``muru.host[PID]:``
+    for standard error and ``muru.host[PID].stdout:`` for standard output
+    (issue 672). A forked worker's output is tagged by the relay, so a
+    stream still held there, by a logging handler made in the host say,
+    writes through untouched.
+    """
+
+    def __init__(self, stream: TextIO, suffix: str) -> None:
+        self.stream = stream
+        self.pid = os.getpid()
+        self.tag = f"muru.host[{self.pid}]{suffix}: "
+        self.at_line_start = True
+
+    @property
+    def encoding(self) -> str:  # type: ignore[override]
+        """The wrapped stream's encoding."""
+
+        return self.stream.encoding
+
+    @property
+    def errors(self) -> str | None:  # type: ignore[override]
+        """The wrapped stream's error handler."""
+
+        return self.stream.errors
+
+    def fileno(self) -> int:
+        """Return the wrapped stream's descriptor."""
+
+        return self.stream.fileno()
+
+    def isatty(self) -> bool:
+        """Return whether the wrapped stream is a terminal."""
+
+        return self.stream.isatty()
+
+    def writable(self) -> bool:
+        """Return True: the stream is written."""
+
+        return True
+
+    def flush(self) -> None:
+        """Flush the wrapped stream."""
+
+        self.stream.flush()
+
+    def close(self) -> None:
+        """Leave the wrapped stream open, which is not this wrapper's to close.
+
+        The wrapper's own finalizer calls this, and would otherwise flush
+        a stream that may already be closed.
+        """
+
+    @property
+    def closed(self) -> bool:
+        """Return whether the wrapped stream is closed."""
+
+        return self.stream.closed
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.stream, name)
+
+    def write(self, text: str) -> int:
+        """Write ``text``, with the host's tag in front of each line it starts."""
+
+        if _in_worker or os.getpid() != self.pid:
+            return self.stream.write(text)
+
+        pieces: list[str] = []
+        lines = text.split("\n")
+
+        for index, line in enumerate(lines):
+            last = index == len(lines) - 1
+
+            if last and not line:
+                break
+
+            if self.at_line_start:
+                pieces.append(self.tag)
+
+            pieces.append(line)
+
+            if last:
+                self.at_line_start = False
+            else:
+                pieces.append("\n")
+                self.at_line_start = True
+
+        self.stream.write("".join(pieces))
+        return len(text)
+
+
+def tag_host_streams() -> None:
+    """Put the host's tag on what Python writes to standard output and error.
+
+    Standard output is a pipe, which Python block-buffers, so it is made
+    line-buffered, as a worker's is, for its lines to keep their place
+    among standard error's.
+    """
+
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+    except (AttributeError, ValueError):
+        pass
+
+    if not isinstance(sys.stdout, TaggedStream):
+        sys.stdout = TaggedStream(sys.stdout, ".stdout")
+
+    if not isinstance(sys.stderr, TaggedStream):
+        sys.stderr = TaggedStream(sys.stderr, "")
+
+
+def untag_host_streams() -> None:
+    """Put back the streams the host's tagging wraps, in a worker."""
+
+    if isinstance(sys.stdout, TaggedStream):
+        sys.stdout = sys.stdout.stream
+
+    if isinstance(sys.stderr, TaggedStream):
+        sys.stderr = sys.stderr.stream
 
 
 def flush_streams() -> None:
@@ -481,29 +612,58 @@ class Release:
     resolved: str | None = None
     """The interface the application is served with, once it is known."""
 
+    # Section 6.15: the instrumentation modules, imported before the
+    # hooks module.
+
+    instruments: Instruments = field(default_factory=Instruments)
+
     @property
     def preloaded(self) -> bool:
         """Whether the entrypoint was imported in the host."""
 
         return self.target is not None
 
-    def load(self, recorder: preload.ImportRecorder | None = None) -> Hooks:
+    def load(
+        self,
+        recorder: preload.ImportRecorder | None = None,
+        *,
+        instruments: Instruments | None = None,
+        context: Context | None = None,
+        mount: str | None = None,
+    ) -> Hooks:
         """Import the hooks module and the entrypoint, in that order.
 
         A factory with factory_phase ``host`` is called here (section 6.8);
-        one with phase ``worker`` waits for `realise` in each worker.
+        one with phase ``worker`` waits for `realise` in each worker. The
+        instrumentation modules' before_import and after_import bracket
+        each import (section 6.15), the factory call inside the
+        entrypoint's; `mount` names the mount this is the entry point of.
         """
 
         import_module = recorder.import_module if recorder else importlib.import_module
-        if self.hooks_module:
-            import_module(self.hooks_module)
-        self.hooks = Hooks.load(self.hooks_module)
-        self.target = resolve_app(self.spec, import_module)
+        instruments = instruments or Instruments()
+        context = context or self.context
 
-        if not self.factory:
-            self.accept(self.target)
-        elif self.factory_phase == "host":
-            self.accept(self.target())
+        if self.hooks_module:
+            with instruments.importing(context, Target("hooks", "", self.hooks_module)):
+                import_module(self.hooks_module)
+                self.hooks = Hooks.load(self.hooks_module)
+        else:
+            self.hooks = Hooks.load(None)
+
+        target = (
+            Target("entrypoint", "", self.spec)
+            if mount is None
+            else Target("mount", mount, self.spec)
+        )
+
+        with instruments.importing(context, target):
+            self.target = resolve_app(self.spec, import_module)
+
+            if not self.factory:
+                self.accept(self.target)
+            elif self.factory_phase == "host":
+                self.accept(self.target())
 
         return self.hooks
 
@@ -885,6 +1045,12 @@ class WorkerState:
     # and whether the event has been raised.
 
     past_deadline: dict[str, PastDeadline] = field(default_factory=dict)
+
+    # Section 13.9 (issue 662): whether it has been said that this
+    # worker's replacement for memory waits for another of its group to
+    # be back in routing, so it is said once.
+
+    stop_first_held: bool = False
 
 
 @dataclass
@@ -1317,7 +1483,20 @@ class Host:
         # once by each process.
 
         flush_streams()
-        pid = os.fork()
+
+        # Issue 673: the worker gets the stop, reopen and reclaim signals
+        # only once its own handlers are in place.
+
+        _signals.hold()
+
+        try:
+            pid = os.fork()
+        except BaseException:
+            _signals.release()
+            raise
+
+        if pid != 0:
+            _signals.release()
 
         if pid == 0:
             status = 1
@@ -1433,6 +1612,27 @@ class Host:
         path: str | None = None,
         control: int | None = None,
     ) -> int:
+        """Run a worker, then the instrumentation modules' worker_stopped.
+
+        Section 6.15: worker_stopped is the last thing a worker does, after
+        lifespan shutdown, on_exit, the ``atexit`` callbacks and the loop
+        stopping, whether the worker served, failed to start or failed
+        while serving, in every worker that ran worker_started.
+        """
+
+        try:
+            return self.run_worker(index, lifeline, report, path, control)
+        finally:
+            self.release.instruments.stop_worker(muru_context())
+
+    def run_worker(
+        self,
+        index: int,
+        lifeline: int | None = None,
+        report: int | None = None,
+        path: str | None = None,
+        control: int | None = None,
+    ) -> int:
         """Run a worker: enable collection, run the hooks, then serve until the server stops.
 
         `lifeline` is the read end of the host's pipe, which the server
@@ -1444,6 +1644,7 @@ class Host:
 
         global _in_worker
         _in_worker = True
+        untag_host_streams()
         gc.enable()
 
         # Section 11.1: every collection is timed by the runtime, with the
@@ -1472,19 +1673,13 @@ class Host:
                 + (", trimmed the heap" if trimmed else "")
             )
 
-        # The host's handlers and wake-up pipe belong to the host; the native
-        # server installs its own handling of SIGTERM, SIGINT and SIGUSR1.
+        # Issue 673: the worker's own signal handling, before anything of
+        # the application runs here: a stop while it starts unwinds it,
+        # the native server acts on what arrives before it serves, and the
+        # application, its hooks and the instrumentation modules cannot
+        # take these signals.
 
-        signal.set_wakeup_fd(-1)
-
-        for signum in (
-            signal.SIGTERM,
-            signal.SIGINT,
-            signal.SIGCHLD,
-            signal.SIGUSR1,
-            signal.SIGUSR2,
-        ):
-            signal.signal(signum, signal.SIG_DFL)
+        _signals.start_worker()
 
         # Section 7.1: MURU_GROUP and the context identify the group after
         # the fork, and the group's sizes are the worker's.
@@ -1497,6 +1692,8 @@ class Host:
 
         loop: _asgi.Loop | None = None
         lifespan: _asgi.Lifespan | None = None
+        lifespans: list[_asgi.Lifespan] = []
+        hooks = Hooks()
 
         # Section 6.8: an interface not settled in the host, because the
         # workers import the application or a factory makes it, is
@@ -1515,19 +1712,41 @@ class Host:
             if release.preloaded:
                 hooks = release.hooks or Hooks()
             else:
-                # Per-worker imports: everything the host would have done.
+                # Per-worker imports: everything the host would have done,
+                # the instrumentation modules first, their load_finished
+                # last (section 6.15).
 
                 started = time.monotonic()
-                hooks = release.load()
-                for mount in mounts:
-                    mount.release.load()
-                log(
-                    f"worker {self.worker_name(index)} "
-                    f"imported {release.spec} in {elapsed_ms(started)} ms"
-                )
-                hooks.call("on_load", context)
-                hooks.call("pre_fork", context)
+                instruments = release.instruments
 
+                try:
+                    instruments.load(context)
+                    hooks = release.load(instruments=instruments, context=context)
+
+                    for mount in mounts:
+                        mount.release.load(
+                            instruments=instruments, context=context, mount=mount.name
+                        )
+
+                    log(
+                        f"worker {self.worker_name(index)} "
+                        f"imported {release.spec} in {elapsed_ms(started)} ms"
+                    )
+                    hooks.call("on_load", context)
+                    hooks.call("pre_fork", context)
+                except _signals.Stopped:
+                    instruments.finished(context, _instrumentation.STOPPED)
+                    raise
+                except BaseException:
+                    instruments.finished(context, _instrumentation.FAILED)
+                    raise
+
+                instruments.finished(context, _instrumentation.SERVE)
+
+            # Section 6.15: the instrumentation modules start in the worker
+            # just before post_fork, before the loop exists.
+
+            release.instruments.start_worker(context)
             hooks.call("post_fork", context)
 
             # Section 6.8: a factory is called per worker, after post_fork,
@@ -1566,6 +1785,31 @@ class Host:
                 for mount in mounts
             ]
             limits = {mount.name: mount.limits for mount in mounts}
+
+            # Section 6.15: each entry point's application, created here or
+            # in the host, goes to the instrumentation modules to wrap
+            # before the loop and lifespan start, so lifespan goes through
+            # the wrapper. The interface was settled before, and is not
+            # detected again from what a wrapper returns.
+
+            instruments = release.instruments
+            app = instruments.wrap(
+                context, Target("entrypoint", "", release.spec), app, release.resolved or "wsgi"
+            )
+            realised = [
+                (
+                    name,
+                    instruments.wrap(
+                        context,
+                        Target("mount", name, mounted.spec),
+                        mounted_app,
+                        mounted.resolved or "wsgi",
+                    ),
+                    mounted,
+                    own,
+                )
+                for name, mounted_app, mounted, own in realised
+            ]
 
             for name, _, mounted, _ in realised:
                 if name not in known_mounts and mounted.resolved is not None:
@@ -1667,7 +1911,6 @@ class Host:
                 lifespan = _asgi.Lifespan(app, loop, release.spec)
                 lifespan.startup()
 
-            lifespans: list[_asgi.Lifespan] = []
             served_mounts: list[
                 tuple[str, Any, Any, tuple[int, int] | None, tuple[int, int] | None, bool]
             ] = []
@@ -1723,6 +1966,23 @@ class Host:
 
             _asgi.start_registered(loop)
             hooks.call("on_ready", context)
+        except _signals.Stopped as stopped:
+            # Issue 673: told to stop before it served. What started is
+            # shut down as a stop would, within the exit grace, and
+            # worker_stopped follows in worker().
+
+            log(f"worker {self.worker_name(index)} received {stopped.name} while starting")
+            deadline = time.monotonic() + self.exit_grace
+            _asgi.stop_registered(deadline)
+
+            for started_lifespan in [*lifespans, *([lifespan] if lifespan else [])]:
+                started_lifespan.shutdown(deadline)
+
+            hooks.call_logged("on_exit", context)
+            run_exit_callbacks()
+            if loop is not None:
+                loop.stop()
+            return 0
         except Exception as error:
             log(
                 f"worker {self.worker_name(index)} "
@@ -1733,6 +1993,11 @@ class Host:
             if loop is not None:
                 loop.stop()
             return 1
+
+        # Issue 673: started. A stop from here is the native server's,
+        # which drains as any stop does, so it no longer raises.
+
+        _signals.started()
 
         from muru import _native
 
@@ -1881,15 +2146,15 @@ class Host:
         def request_workers_reopen(_signum: int, _frame: Any) -> None:
             self.workers_reopen_requested = True
 
-        signal.signal(signal.SIGTERM, request_stop)
-        signal.signal(signal.SIGINT, request_stop)
-        signal.signal(signal.SIGCHLD, lambda _signum, _frame: None)
+        _signals.install(signal.SIGTERM, request_stop)
+        _signals.install(signal.SIGINT, request_stop)
+        _signals.install(signal.SIGCHLD, lambda _signum, _frame: None)
 
         # The relay owns the release log and reopens it. A handler rather
         # than SIG_IGN, so a worker's own handling starts from the default.
 
-        signal.signal(signal.SIGUSR1, ignore)
-        signal.signal(signal.SIGUSR2, request_workers_reopen)
+        _signals.install(signal.SIGUSR1, ignore)
+        _signals.install(signal.SIGUSR2, request_workers_reopen)
 
         # Section 13.3: a host under the daemon outlives it, so the daemon
         # can be restarted or upgraded and re-adopt it; one under muructl
@@ -2592,6 +2857,11 @@ class Host:
             error = f"worker {asked} is still starting"
         elif state.index in self.replacing:
             error = f"worker {asked} is already being replaced"
+        elif (busy := self.replacing_for_memory()) is not None:
+            error = (
+                f"worker {self.worker_name(busy.index)} is being replaced for memory, "
+                "and workers are replaced for memory one at a time"
+            )
         elif state.debug_sessions:
             error = f"worker {asked} is being debugged"
         elif self.control_listener is None:
@@ -2608,13 +2878,22 @@ class Host:
 
         if args.get("retire"):
             self.retire(state, f"scaled in for memory: {args.get('reason', '')}")
-        else:
-            self.replace(
-                state,
-                str(args.get("reason", "replaced on the supervisor's request")),
-                "worker.recycled",
-                str(args.get("cause", "")),
+        elif not self.replace(
+            state,
+            str(args.get("reason", "replaced on the supervisor's request")),
+            "worker.recycled",
+            str(args.get("cause", "")),
+        ):
+            self.send_to_supervisor(
+                {
+                    "type": "response",
+                    "id": request_id,
+                    "workers": [],
+                    "error": f"worker {asked} would stop first and leave its group "
+                    "with no worker in routing",
+                }
             )
+            return
 
         self.send_to_supervisor(
             {
@@ -3119,7 +3398,12 @@ class Host:
             )
 
     def send_status(self) -> None:
-        """Tell the supervisor what every worker last reported, and what the host holds."""
+        """Tell the supervisor what every worker last reported, and what the host holds.
+
+        It also lists the replacements for memory under way, which the
+        memory guard counts as its one at a time (section 13.9, issue
+        662).
+        """
 
         self.send_to_supervisor(
             {
@@ -3138,6 +3422,11 @@ class Host:
                     }
                     for state in sorted(self.states.values(), key=lambda state: state.index)
                     if not state.replaced
+                ],
+                "memory_replacements": [
+                    {**self.worker_fields(replacement.index), "pid": replacement.old_pid}
+                    for replacement in self.replacing.values()
+                    if replacement.cause in MEMORY_CAUSES
                 ],
             }
         )
@@ -3322,7 +3611,7 @@ class Host:
         cause: str = "",
         hard: bool = False,
         abandon: dict[str, str] | None = None,
-    ) -> None:
+    ) -> bool:
         """Start replacing a worker with a fresh one on a new socket.
 
         `cause` is the reason as one word, for the supervisor's counters.
@@ -3331,11 +3620,11 @@ class Host:
         edge answers now rather than after the grace: the oldest, which is
         the stuck one, or all of them when the whole worker is stalled. A
         worker being debugged is pinned: the policy applies once the last
-        session ends.
+        session ends. Return whether a replacement was started.
         """
 
         if state.debug_sessions:
-            return
+            return False
 
         # A worker condemned twice, by the silence check and then by its
         # own stall event, or by the hard timeout and then a stall, is
@@ -3369,14 +3658,14 @@ class Host:
                 replacement.kill_at = now + STALLED_KILL_SECONDS
                 self.signal(state.pid, signal.SIGTERM)
 
-            return
+            return False
 
         if self.control_listener is None:
             if not getattr(self, "_warned_no_control", False):
                 self._warned_no_control = True
                 log("no control socket, so workers cannot be replaced; the policy is ignored")
 
-            return
+            return False
 
         index = state.index
 
@@ -3384,13 +3673,39 @@ class Host:
         # the worker it was to replace keeps serving.
 
         if self.start_failures.get(index, 0) >= MAX_START_FAILURES:
-            return
+            return False
+
+        # Section 13.9: two large workers alive at once is what the kernel
+        # would kill for, so with no room for a second this one leaves
+        # routing and stops first, and reap() forks its successor. It does
+        # not while it is the last of its group in routing and another of
+        # the group is out of it, being replaced or starting (issue 662):
+        # its replacement waits until that one is back.
+
+        short = self.short_of_memory(state) if cause in MEMORY_CAUSES else None
+        away = self.away_from_group(index) if cause in MEMORY_CAUSES else None
+
+        if short is not None and away is not None:
+            if not state.stop_first_held:
+                state.stop_first_held = True
+                log(
+                    f"worker {self.worker_name(index)} (pid {state.pid}) {reason}; it is "
+                    f"replaced once worker {self.worker_name(away)} is back in routing, since "
+                    "it would stop first and its group would have no worker"
+                )
+
+            return False
 
         state.replaced = True
         self.generation[index] = self.generation.get(index, 0) + 1
         replacement = Replacement(index, state.pid, reason, kind, cause)
         self.replacing[index] = replacement
-        hard = hard or kind == "worker.timeout_killed"
+
+        # A worker over its hard limit leaves routing at once, but not as
+        # its group's last in routing while another is away: it serves
+        # until its successor is ready, as a replacement usually does.
+
+        hard = (hard or kind == "worker.timeout_killed") and away is None
         log(f"worker {self.worker_name(index)} (pid {state.pid}) {reason}; replacing it")
 
         if cause == "memory":
@@ -3419,12 +3734,6 @@ class Host:
                 self.hard_drain_grace if grace is None else grace
             )
 
-        # Section 13.9: two large workers alive at once is what the kernel
-        # would kill for, so with no room for a second this one leaves
-        # routing and stops first, and reap() forks its successor.
-
-        short = self.short_of_memory(state) if cause in MEMORY_CAUSES else None
-
         if short is not None:
             log(
                 f"worker {self.worker_name(index)} (pid {state.pid}) "
@@ -3436,12 +3745,50 @@ class Host:
             self.routed[index] = None
             replacement.announced = self.announce()
             replacement.announced_at = time.monotonic()
-            return
+            return True
 
         replacement.new_pid = self.spawn(index, replacing=True)
 
         if kind == "worker.timeout_killed":
             self.report_timeout_kill(replacement)
+
+        return True
+
+    def away_from_group(self, index: int) -> int | None:
+        """Return another worker of the group out of routing, when it is the group's last in.
+
+        Section 13.9 (issue 662): the other is being replaced or is
+        starting, so a worker that stopped first now would leave its
+        group with no worker in routing. None when another of the group
+        is in routing, or when the group has no other worker.
+        """
+
+        others = [other for other in self.active_indices(self.group_of(index)) if other != index]
+
+        if any(self.routed.get(other) is not None for other in others):
+            return None
+
+        return next(
+            (other for other in others if other in self.replacing or other in self.starting),
+            None,
+        )
+
+    def replacing_for_memory(self) -> Replacement | None:
+        """Return a replacement for memory under way, if there is one.
+
+        Sections 7.7 and 13.9 (issue 662): the memory guard replaces one
+        worker at a time, and a worker's own limits replacing one counts
+        as that one.
+        """
+
+        return next(
+            (
+                replacement
+                for replacement in self.replacing.values()
+                if replacement.cause in MEMORY_CAUSES
+            ),
+            None,
+        )
 
     def short_of_memory(self, state: WorkerState) -> int | None:
         """Return what is left under the cgroup's limit, if less than the worker's size.
@@ -4799,14 +5146,60 @@ def without_preload(argv: list[str]) -> list[str]:
     return kept
 
 
+# The instrumentation modules of the load in progress, and its context,
+# so a stop during the load runs their load_finished (issue 673).
+
+_loading: tuple[Instruments, Context] | None = None
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Run the host: preload, fork, supervise."""
+    """Run the host: preload, fork, supervise.
+
+    The host's signals are taken first (issue 673), so a stop while the
+    application loads ends the host cleanly: the load unwinds, the
+    instrumentation modules hear it was stopped, and the host says so.
+    """
+
+    _signals.start_host()
+
+    try:
+        return _main(argv)
+    except _signals.Stopped as stopped:
+        log(f"received {stopped.name} while loading, stopping")
+
+        if _loading is not None:
+            instruments, context = _loading
+            instruments.finished(context, _instrumentation.STOPPED)
+
+        return 0
+
+
+def _main(argv: list[str] | None) -> int:
+    # The host's start: everything main() does, inside its handling of a
+    # stop.
+
+    global _loading
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(arguments)
 
+    # Section 11.3: what Python writes in the host is tagged as the host's,
+    # from before anything of the application or a logging handler holds
+    # the streams.
+
+    tag_host_streams()
+
     if args.processes < 1:
         print("--processes must be at least 1", file=sys.stderr)
+        return 2
+
+    # Section 6.15: the instrumentation list leaves the environment before
+    # anything else is imported, so the application never sees it.
+
+    try:
+        instrumentation = Entry.take()
+    except ValueError as error:
+        print(f"cannot read the instrumentation list: {error}", file=sys.stderr)
         return 2
 
     context = Context(
@@ -4823,6 +5216,7 @@ def main(argv: list[str] | None = None) -> int:
         interface=args.interface,
         factory=args.factory,
         factory_phase=args.factory_phase,
+        instruments=Instruments(instrumentation),
     )
 
     try:
@@ -4864,16 +5258,37 @@ def main(argv: list[str] | None = None) -> int:
     if args.preload != "false":
         started = time.monotonic()
 
-        with preload.ImportRecorder() as recorder:
+        # Section 6.15: the instrumentation modules are in place before the
+        # import check takes its baseline and before anything of the
+        # application is imported.
+
+        instruments = release.instruments
+        _loading = (instruments, context)
+
+        try:
+            instruments.load(context)
+        except InstrumentationError as error:
+            log(str(error))
+            instruments.finished(context, _instrumentation.FAILED)
+            return 1
+
+        modules = [entry.module for entry in instruments.entries]
+
+        with preload.ImportRecorder(modules) as recorder:
             try:
-                hooks = release.load(recorder)
+                hooks = release.load(recorder, instruments=instruments, context=context)
+
                 for mount in mounts:
-                    mount.release.load(recorder)
+                    mount.release.load(
+                        recorder, instruments=instruments, context=context, mount=mount.name
+                    )
             except Exception as error:
                 log(f"cannot load {args.app}: {error.__class__.__name__}: {error}")
+                instruments.finished(context, _instrumentation.FAILED)
                 return 1
 
             if not hooks.call_logged("on_load", context):
+                instruments.finished(context, _instrumentation.FAILED)
                 return 1
 
         log(f"preloaded {args.app} in {elapsed_ms(started)} ms")
@@ -4897,6 +5312,7 @@ def main(argv: list[str] | None = None) -> int:
         # --single nothing forks, so it has no occasion.
 
         if not args.single and not hooks.call_logged("pre_fork", context):
+            instruments.finished(context, _instrumentation.FAILED)
             return 1
 
         findings = recorder.findings()
@@ -4907,13 +5323,22 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.preload == "true":
                 log("preload is true, so the import check failing stops the release")
+                instruments.finished(context, _instrumentation.REFUSED)
                 return 1
 
             log(
                 "preload: falling back to per-worker imports, which costs slower worker "
                 "replacement and no shared memory; set preload to false to silence this"
             )
+            instruments.finished(context, _instrumentation.FALLBACK)
             flush_streams()
+
+            # The instrumentation list goes back in the environment, so
+            # the host started again gives it to each worker.
+
+            if instrumentation:
+                os.environ[Entry.ENVIRONMENT] = Entry.encode(instrumentation)
+
             os.execv(
                 sys.executable,
                 [
@@ -4925,6 +5350,13 @@ def main(argv: list[str] | None = None) -> int:
                     "false",
                 ],
             )
+
+        # Section 6.15: the load is done, after pre_fork and the import
+        # check, and before the collection and the first fork.
+
+        instruments.finished(
+            context, _instrumentation.SERVE if args.single else _instrumentation.FORK
+        )
 
         if args.preload_gc_collect:
             gc.collect()

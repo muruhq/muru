@@ -142,6 +142,12 @@ Issues: [#146](https://github.com/muruhq/muru/issues/146),
 Features that stand on their own and round out what Muru does. They are
 taken up between the steps of the major goals, in no fixed order.
 
+- **Development:** a debug toolbar in the browser for `muructl run`,
+  showing what Muru knows about the request behind each page, from the
+  edge's queue down to the application's SQL, with the same record on
+  the dashboard, in `muructl` and through the MCP server
+  ([#642](https://github.com/muruhq/muru/issues/642)).
+
 - **Traffic and configuration:** overlays triggered by conditions over
   Muru's own signals
   ([#123](https://github.com/muruhq/muru/issues/123)),

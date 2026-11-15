@@ -139,8 +139,20 @@ pub fn gc_callback(py: Python<'_>, phase: &str, info: &Bound<'_, PyDict>) -> PyR
 }
 
 /// The slot's name in a report: the generation number, or `full`.
-fn name(slot: usize) -> &'static str {
+pub(crate) fn name(slot: usize) -> &'static str {
     ["0", "1", "2", "full"][slot.min(FULL)]
+}
+
+/// Each slot's collections and time collecting in nanoseconds so far,
+/// read twice to find the collections during a request (section 11.7).
+pub(crate) fn totals() -> [(u64, u64); SLOTS] {
+    std::array::from_fn(|slot| {
+        let generation = &GENERATIONS[slot];
+        (
+            generation.collections.load(Ordering::Relaxed),
+            generation.nanos.load(Ordering::Relaxed),
+        )
+    })
 }
 
 /// The generations with a collection so far, each as a JSON object, for

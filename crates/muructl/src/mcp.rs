@@ -796,16 +796,25 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "debug",
-            description: "Look into a release's workers: status (pid, uptime, requests, memory), stacks (each thread's Python stack and the request it serves), tasks (asyncio), memory, or inspect (interpreter, modules, and every environment variable's name, with values only for Muru's own, the interpreter's and the release's).",
+            description: "Look into a release's workers: status (pid, uptime, requests, memory), stacks (each thread's Python stack and the request it serves), tasks (asyncio), memory, or inspect (interpreter, modules, and every environment variable's name, with values only for Muru's own, the interpreter's and the release's); or request, a development run's record of one request by the ID in its X-Request-ID header (timing, routing, response, headers with secrets masked, connection).",
             changes: false,
             properties: json!({
-                "what": {"type": "string", "enum": ["status", "stacks", "tasks", "memory", "inspect"]},
-                "target": {"type": "string", "description": "app, or app@release"},
+                "what": {"type": "string", "enum": ["status", "stacks", "tasks", "memory", "inspect", "request"]},
+                "target": {"type": "string", "description": "app, or app@release; not for request"},
                 "worker": {"type": "string", "description": "One worker: its index within its group, as GROUP/N outside the default group"},
+                "request_id": {"type": "string", "description": "For request: the request's ID, as X-Request-ID gives it"},
             }),
-            required: &["what", "target"],
+            required: &["what"],
             command: |arguments| {
                 let what = needed(arguments, "what")?;
+
+                if what == "request" {
+                    return Ok([
+                        words(&["debug", "request"]),
+                        vec![needed(arguments, "request_id")?],
+                    ]
+                    .concat());
+                }
 
                 if !["status", "stacks", "tasks", "memory", "inspect"].contains(&what.as_str()) {
                     return Err(format!("cannot debug {what}"));
@@ -1581,6 +1590,11 @@ mod tests {
             ])
         );
         assert!(command("debug", json!({"what": "exec", "target": "shop"})).is_err());
+        assert!(command("debug", json!({"what": "stacks"})).is_err());
+        assert_eq!(
+            command("debug", json!({"what": "request", "request_id": "A1"})),
+            Ok(vec!["debug".into(), "request".into(), "A1".into()])
+        );
         assert_eq!(
             command("truncate_logs", json!({"access": true, "keep": "1MB"})),
             Ok(vec![

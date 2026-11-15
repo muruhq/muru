@@ -1,7 +1,8 @@
 #!/bin/bash
 # Runs inside the Linux VM (design specification section 15.6): copies the
 # source tree from the read-only host mount into the VM's own disk, builds
-# muructl and the extension there, and runs the test suites or the benchmarks.
+# muructl and the extension there, and runs the test suites (the Rust unit
+# tests, then the Python ones) or the benchmarks.
 #
 #   vm-run.sh SOURCE test [pytest args]
 #   vm-run.sh SOURCE bench [--baseline REV] [bench args]
@@ -53,6 +54,11 @@ uv sync --only-group dev --only-group fixtures --only-group grpc --python 3.15
 
 case "$action" in
     test)
+        # The Rust unit tests come first, as `just test-rust` runs them:
+        # the workspace, then the extension's own tests against the
+        # virtualenv's libpython. Some behave differently on Linux.
+        command -v cargo-nextest >/dev/null || cargo install cargo-nextest --locked
+        just test-rust
         cargo build -p muructl
         uv run pytest "$@"
         uv run pytest tests/integration tests/conformance "$@"

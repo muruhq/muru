@@ -356,6 +356,254 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
     assert not gone.exists()
 
 
+def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
+    """A development run keeps a record of each request (section 11.7),
+    which `muructl debug request` and the dashboard's request page read
+    by the ID the response names, with secret header values and query
+    parameters masked."""
+
+    port = support.free_port()
+    server = start(runtime, port=port)
+
+    def read(path: str) -> str:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=10) as response:
+            body: bytes = response.read()
+            return body.decode()
+
+    def record(request_id: str) -> dict[str, Any]:
+        answer = muructl(runtime, "debug", "request", request_id, "--json", cwd=support.FIXTURES)
+        assert "hunter2" not in answer.stdout
+        found: dict[str, Any] = json.loads(answer.stdout)
+        return found
+
+    try:
+        response = server.get(
+            "/?token=hunter2&page=2",
+            headers={"Cookie": "session=hunter2", "X-Api-Key": "hunter2"},
+        )
+        assert response.status == 200
+        request_id = response.header("x-request-id")
+        assert request_id is not None
+
+        # The record completes once the response has ended, which can
+        # come a moment after the client has read it.
+
+        deadline = time.monotonic() + 10
+
+        while (found := record(request_id))["in_progress"]:
+            assert time.monotonic() < deadline, found
+            time.sleep(0.05)
+
+        assert (found["method"], found["target"], found["status"]) == (
+            "GET",
+            "/?token=***&page=2",
+            200,
+        )
+        assert found["app"] == "plain-wsgi" and found["worker"] in (0, 1)
+        assert found["connection"]["position"] == 1
+        assert len(found["connection"]["id"]) == 26
+        assert found["connection"]["closed_after"] is False
+        sent = {header["name"]: header["value"] for header in found["request_headers"]}
+        assert sent["cookie"] == "***" and sent["x-api-key"] == "***"
+        answered = {header["name"] for header in found["response_headers"]}
+        assert {"x-request-id", "server-timing", "muru-request-link"} <= answered
+        assert found["compression"]["compressed"] is False
+        assert [panel["name"] for panel in found["panels"]] == [
+            "timing",
+            "where",
+            "response",
+            "logs",
+            "errors",
+            "connection",
+        ]
+
+        # The worker's part follows the response (issue 635): its thread,
+        # its times and where the body came from.
+
+        assert found["worker_part"] == "arrived"
+        worker = found["from_worker"]
+        assert worker["thread"] and worker["body_source"] == "iterable"
+        assert worker["outcome"] == "completed"
+        assert 0 < worker["to_start_response"] <= worker["to_close"]
+
+        # The text form names the request and draws each panel.
+
+        text = muructl(runtime, "debug", "request", request_id, cwd=support.FIXTURES).stdout
+        assert text.startswith("GET /?token=***&page=2 HTTP/1.1  200  "), text
+        assert f"request {request_id}\n" in text
+        assert "\nTiming\n" in text and "    until the response head" in text
+        assert "    cookie: ***" in text
+
+        # The access log's JSON names the connection in every mode.
+
+        logged = muructl(runtime, "logs", "--access", "--json", cwd=support.FIXTURES).stdout
+        line = next(json.loads(row) for row in logged.splitlines() if request_id in row)
+        assert line["connection"] == found["connection"]["id"]
+        assert line["connection_requests"] == 1
+
+        # The dashboard's page holds the same panels, and its JSON is the
+        # record; the recent requests link to the page.
+
+        page = read(f"/request/{request_id}")
+        assert '<section id="panel-timing" class="panel">' in page
+        assert "<h2>Connection</h2>" in page and "hunter2" not in page
+        assert json.loads(read(f"/v1/requests/{request_id}"))["request_id"] == request_id
+        assert f'href="request/{request_id}"' in read("/fragment/requests")
+
+        # A failed request's record has the exception, its traceback and
+        # the log record that reported it.
+
+        failed = server.get("/error")
+        assert failed.status == 500
+        failed_id = failed.header("x-request-id")
+        assert failed_id is not None
+        deadline = time.monotonic() + 10
+
+        while (broken := record(failed_id))["in_progress"]:
+            assert time.monotonic() < deadline, broken
+            time.sleep(0.05)
+
+        worker = broken["from_worker"]
+        assert (worker["outcome"], worker["error_phase"]) == ("failed", "call")
+        assert "RuntimeError: deliberate failure" in worker["traceback"]
+        assert any(line["logger"] == "muru" and line["level"] == "ERROR" for line in worker["logs"])
+
+        # A request the run does not keep is said to be so.
+
+        missing = muructl(
+            runtime, "debug", "request", "NOSUCHREQUEST", cwd=support.FIXTURES, check=False
+        )
+        assert missing.returncode != 0
+        assert "request NOSUCHREQUEST is no longer kept" in missing.stderr
+
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            read("/v1/requests/NOSUCHREQUEST")
+
+        assert refused.value.code == 404
+        assert "no longer kept" in json.loads(refused.value.read())["error"]
+    finally:
+        server.stop()
+
+
+def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) -> None:
+    """With --toolbar the edge inserts the toolbar's tag into an HTML page
+    a browser loads (section 4.20), and answers the reserved prefix from
+    the run's records, to loopback and its own pages only."""
+
+    port = support.free_port()
+    server = start(runtime, port=port, args=["--toolbar"])
+
+    try:
+        assert server.wait_for_log("toolbar on:")
+        page = server.get("/page", headers={"Sec-Fetch-Dest": "document"})
+        request_id = page.header("x-request-id")
+        assert request_id is not None
+        assert page.header("content-length") is None
+        tag = (
+            f'<script src="/_muru/toolbar.js" data-request="{request_id}" '
+            f'data-dashboard="http://127.0.0.1:{port}/request/{request_id}" async></script>'
+        )
+        assert page.body.decode() == f"<html><body><h1>Page</h1>{tag}</body></html>"
+
+        # A fetch from the page is left alone, and a trusted proxy's prefix
+        # goes in front of the script's address.
+
+        fetched = server.get("/page", headers={"Sec-Fetch-Dest": "empty"})
+        assert b"_muru" not in fetched.body
+        proxied = server.get(
+            "/page",
+            headers={"Sec-Fetch-Dest": "document", "X-Forwarded-Prefix": "/proxy/8080"},
+        )
+        assert b'<script src="/proxy/8080/_muru/toolbar.js"' in proxied.body
+
+        # The reserved prefix: the script, the record and a panel, and
+        # nothing for another site's page or an unknown host.
+
+        script = server.get("/_muru/toolbar.js", headers={"Sec-Fetch-Site": "same-origin"})
+        assert script.status == 200
+        assert script.header("content-type") == "text/javascript"
+        deadline = time.monotonic() + 10
+
+        while True:
+            answer = server.get(f"/_muru/requests/{request_id}.json")
+            assert answer.status == 200
+            found = json.loads(answer.body)
+
+            if not found["in_progress"]:
+                break
+
+            assert time.monotonic() < deadline, found
+            time.sleep(0.05)
+
+        assert found["request_id"] == request_id and found["target"] == "/page"
+        panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html")
+        assert panel.status == 200 and "<table" in panel.body.decode()
+        assert server.get("/_muru/requests/NOSUCH.json").status == 404
+
+        # The page view's summaries, several in one answer, and the IDs
+        # no longer kept.
+
+        batch = json.loads(server.get(f"/_muru/requests?ids={request_id},NOSUCH").body)
+        assert [summary["request_id"] for summary in batch["requests"]] == [request_id]
+        assert batch["not_kept"] == ["NOSUCH"]
+        summary = batch["requests"][0]
+        assert (summary["target"], summary["status"], summary["served_by_edge"]) == (
+            "/page",
+            200,
+            False,
+        )
+        assert summary["connection"] == found["connection"]["id"]
+        assert server.get("/_muru/requests").status == 400
+        refused = server.get(
+            f"/_muru/requests/{request_id}.json", headers={"Sec-Fetch-Site": "cross-site"}
+        )
+        assert refused.status == 403
+        rebound = server.get(f"/_muru/requests/{request_id}.json", headers={"Host": "evil.test"})
+        assert rebound.status == 403
+    finally:
+        server.stop()
+
+
+def test_a_blocked_event_loop_is_on_the_requests_record(runtime: Path) -> None:
+    """What held a request up is on its record (section 11.7): an ASGI
+    request that blocks its event loop for longer than the loop's
+    heartbeat shows the loop held, on the Timing panel too."""
+
+    server = support.start("plain_asgi:application", workers=1, env={"MURU_RUN_DIR": str(runtime)})
+
+    try:
+        assert server.wait_for_log("admin socket"), server.log()
+        response = server.get("/block?seconds=1.2")
+        assert response.status == 200
+        request_id = response.header("x-request-id")
+        deadline = time.monotonic() + 10
+
+        while (found := json.loads(server.get(f"/_muru/requests/{request_id}.json").body))[
+            "in_progress"
+        ]:
+            assert time.monotonic() < deadline, found
+            time.sleep(0.05)
+
+        # A heartbeat was due within half a second of the request's start,
+        # so the loop was held for at least the rest of the block.
+
+        worker = found["from_worker"]
+        assert worker["loop_lag"] >= 500, worker
+        assert worker["loop_lag"] + worker["loop_lag_at"] <= worker["to_close"] + 1, worker
+        panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html").body.decode()
+        assert ">event loop held</td>" in panel and "During the request" in panel
+
+        # With a GIL, the request's start on the loop waited for it;
+        # without one, nothing is shown.
+
+        if support.workers_have_a_gil():
+            assert worker["gil_waits"] >= 1, worker
+        else:
+            assert worker["gil_waits"] == 0 and ">waiting for the GIL</td>" not in panel
+    finally:
+        server.stop()
+
+
 def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
     port = support.free_port()
     server = start(runtime, port=port)
