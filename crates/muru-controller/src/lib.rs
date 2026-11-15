@@ -39,6 +39,7 @@ pub mod renames;
 pub mod render;
 pub mod rollouts;
 pub mod rotation;
+pub mod runs;
 pub mod scaling;
 pub mod secrets;
 pub mod servers;

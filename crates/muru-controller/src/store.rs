@@ -12,7 +12,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use muru_config::{ClientClass, Host as VirtualHost, Overlay, RateLimit, Route, Upstream};
 
 use crate::model::{
-    App, CommandRun, Event, OverlayState, Release, ReleaseSpec, ReleaseState, Rollout, now_unix_ms,
+    App, CommandRun, Event, OverlayState, Release, ReleaseSpec, ReleaseState, Rollout, RunRecord,
+    now_unix_ms,
 };
 
 /// Why a store operation failed.
@@ -125,17 +126,31 @@ CREATE TABLE IF NOT EXISTS rate_limits (
     spec TEXT NOT NULL,
     resource_version INTEGER NOT NULL DEFAULT 1
 );
-CREATE TABLE IF NOT EXISTS command_runs (
+DROP TABLE IF EXISTS command_runs;
+CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     app TEXT NOT NULL,
-    command TEXT NOT NULL,
+    name TEXT NOT NULL,
     release TEXT NOT NULL,
+    trigger TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    detached INTEGER NOT NULL,
+    exclusive INTEGER NOT NULL,
+    inputs TEXT NOT NULL,
+    timeout_ms INTEGER NOT NULL,
     started_unix_ms INTEGER NOT NULL,
-    duration_ms INTEGER NOT NULL,
-    exit_code INTEGER NOT NULL,
-    ok INTEGER NOT NULL,
-    message TEXT NOT NULL,
-    PRIMARY KEY (app, command)
+    ended_unix_ms INTEGER NOT NULL DEFAULT 0,
+    exit_code INTEGER NOT NULL DEFAULT 0,
+    ok INTEGER NOT NULL DEFAULT 0,
+    message TEXT NOT NULL DEFAULT '',
+    pid INTEGER NOT NULL DEFAULT 0,
+    start_time INTEGER NOT NULL DEFAULT 0,
+    relay_pid INTEGER NOT NULL DEFAULT 0,
+    relay_start_time INTEGER NOT NULL DEFAULT 0,
+    stopping TEXT NOT NULL DEFAULT '',
+    secrets TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS runs_by_command ON runs (app, name, ended_unix_ms);
 CREATE TABLE IF NOT EXISTS log_periods (
     path TEXT PRIMARY KEY,
     period TEXT NOT NULL
@@ -151,7 +166,7 @@ CREATE TABLE IF NOT EXISTS log_files_seen (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// The store.
 pub struct Store {
@@ -184,8 +199,9 @@ impl Store {
         // maintenance mode (section 4.12), version 13 the period each log
         // file was last seen in (section 11.3), and version 14 whether
         // applied files declare a release (section 9.1), added to an older
-        // table here, and version 15 the file last seen at each log's path
-        // (section 11.3).
+        // table here, version 15 the file last seen at each log's path
+        // (section 11.3), and version 16 the runs of commands kept in
+        // place of each command's last run (issue 688).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -496,7 +512,7 @@ impl Store {
             connection.execute("DELETE FROM rollouts WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM scale_pins WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM maintenance WHERE app = ?1", [name])?;
-            connection.execute("DELETE FROM command_runs WHERE app = ?1", [name])?;
+            connection.execute("DELETE FROM runs WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM apps WHERE name = ?1", [name])?;
             Ok(())
         })
@@ -1029,50 +1045,196 @@ impl Store {
         })
     }
 
-    /// Record a run of an application's command, replacing the one
-    /// before (section 9.12).
-    pub fn record_command_run(
+    /// Record a run as it starts and give it its id. A run of an
+    /// exclusive command is refused while another run of that command
+    /// holds the application's claim, and the answer is then the id of
+    /// that run instead: the check and the record are made together, so
+    /// two runs can never both hold the claim (section 9.12).
+    pub fn begin_run(&self, run: &RunRecord) -> Result<Result<u64, u64>, StoreError> {
+        self.with(|connection| {
+            if run.exclusive {
+                let holder: Option<i64> = connection
+                    .query_row(
+                        "SELECT id FROM runs WHERE app = ?1 AND name = ?2 AND exclusive = 1 \
+                         AND ended_unix_ms = 0 ORDER BY id LIMIT 1",
+                        params![run.app, run.name],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+
+                if let Some(holder) = holder {
+                    return Ok(Err(holder as u64));
+                }
+            }
+
+            connection.execute(
+                "INSERT INTO runs (app, name, release, trigger, requested_by, detached, \
+                 exclusive, inputs, timeout_ms, started_unix_ms, secrets) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    run.app,
+                    run.name,
+                    run.release,
+                    run.trigger,
+                    run.requested_by,
+                    run.detached,
+                    run.exclusive,
+                    run.inputs,
+                    run.timeout_ms as i64,
+                    run.started_unix_ms as i64,
+                    run.secrets,
+                ],
+            )?;
+            Ok(Ok(connection.last_insert_rowid() as u64))
+        })
+    }
+
+    /// Record the process a run runs as, and the relay of a detached one.
+    pub fn set_run_process(
         &self,
-        app: &str,
-        command: &str,
-        run: &CommandRun,
+        id: u64,
+        pid: u32,
+        start_time: u64,
+        relay_pid: u32,
+        relay_start_time: u64,
     ) -> Result<(), StoreError> {
         self.with(|connection| {
             connection.execute(
-                "INSERT INTO command_runs (app, command, release, started_unix_ms, duration_ms, \
-                 exit_code, ok, message) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-                 ON CONFLICT(app, command) DO UPDATE SET release = excluded.release, \
-                 started_unix_ms = excluded.started_unix_ms, duration_ms = excluded.duration_ms, \
-                 exit_code = excluded.exit_code, ok = excluded.ok, message = excluded.message",
+                "UPDATE runs SET pid = ?2, start_time = ?3, relay_pid = ?4, \
+                 relay_start_time = ?5 WHERE id = ?1",
                 params![
-                    app,
-                    command,
-                    run.release,
-                    run.started_unix_ms as i64,
-                    run.duration_ms as i64,
-                    run.exit_code,
-                    run.ok,
-                    run.message
+                    id as i64,
+                    pid,
+                    start_time as i64,
+                    relay_pid,
+                    relay_start_time as i64
                 ],
             )?;
             Ok(())
         })
     }
 
-    /// The last run of each of an application's commands, by name.
+    /// Record why a run is being stopped.
+    pub fn set_run_stopping(&self, id: u64, why: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "UPDATE runs SET stopping = ?2 WHERE id = ?1 AND stopping = ''",
+                params![id as i64, why],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record how a run ended, which gives up its claim.
+    pub fn end_run(
+        &self,
+        id: u64,
+        ended_unix_ms: u64,
+        exit_code: i32,
+        ok: bool,
+        message: &str,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "UPDATE runs SET ended_unix_ms = ?2, exit_code = ?3, ok = ?4, message = ?5 \
+                 WHERE id = ?1",
+                params![
+                    id as i64,
+                    ended_unix_ms.max(1) as i64,
+                    exit_code,
+                    ok,
+                    message
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// One run, by its id.
+    pub fn run(&self, id: u64) -> Result<RunRecord, StoreError> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    &format!("SELECT {RUN_COLUMNS} FROM runs WHERE id = ?1"),
+                    [id as i64],
+                    run_from_row,
+                )
+                .optional()?
+                .ok_or_else(|| StoreError::NotFound(format!("run {id}")))
+        })
+    }
+
+    /// An application's runs, or one command's: those under way first,
+    /// then the newest first.
+    pub fn runs(&self, app: &str, name: Option<&str>) -> Result<Vec<RunRecord>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {RUN_COLUMNS} FROM runs WHERE app = ?1 AND (?2 IS NULL OR name = ?2) \
+                 ORDER BY ended_unix_ms != 0, id DESC"
+            ))?;
+            let rows = statement.query_map(params![app, name], run_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Every run under way, the oldest first: what a daemon that starts
+    /// takes over.
+    pub fn runs_under_way(&self) -> Result<Vec<RunRecord>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {RUN_COLUMNS} FROM runs WHERE ended_unix_ms = 0 ORDER BY id"
+            ))?;
+            let rows = statement.query_map([], run_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Forget the ended runs of a command beyond the newest `keep`,
+    /// giving those forgotten, whose output the caller removes.
+    pub fn prune_runs(
+        &self,
+        app: &str,
+        name: &str,
+        keep: usize,
+    ) -> Result<Vec<RunRecord>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {RUN_COLUMNS} FROM runs WHERE app = ?1 AND name = ?2 \
+                 AND ended_unix_ms != 0 ORDER BY id DESC LIMIT -1 OFFSET ?3"
+            ))?;
+            let old = statement
+                .query_map(params![app, name, keep as i64], run_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for run in &old {
+                connection.execute("DELETE FROM runs WHERE id = ?1", [run.id as i64])?;
+            }
+
+            Ok(old)
+        })
+    }
+
+    /// The last run of each of an application's commands that has ended,
+    /// by name.
     pub fn command_runs(&self, app: &str) -> Result<Vec<(String, CommandRun)>, StoreError> {
         self.with(|connection| {
             let mut statement = connection.prepare(
-                "SELECT command, release, started_unix_ms, duration_ms, exit_code, ok, message \
-                 FROM command_runs WHERE app = ?1 ORDER BY command",
+                "SELECT name, release, started_unix_ms, ended_unix_ms, exit_code, ok, message \
+                 FROM runs WHERE id IN (SELECT max(id) FROM runs WHERE app = ?1 \
+                 AND ended_unix_ms != 0 GROUP BY name) ORDER BY name",
             )?;
             let rows = statement.query_map(params![app], |row| {
+                let started = row.get::<_, i64>(2)? as u64;
+                let ended = row.get::<_, i64>(3)? as u64;
+
                 Ok((
                     row.get::<_, String>(0)?,
                     CommandRun {
                         release: row.get(1)?,
-                        started_unix_ms: row.get::<_, i64>(2)? as u64,
-                        duration_ms: row.get::<_, i64>(3)? as u64,
+                        started_unix_ms: started,
+                        duration_ms: ended.saturating_sub(started),
                         exit_code: row.get(4)?,
                         ok: row.get(5)?,
                         message: row.get(6)?,
@@ -1229,6 +1391,38 @@ fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
         "releases",
         &[("declared", "INTEGER NOT NULL DEFAULT 0")],
     )
+}
+
+/// The columns a run is read from, in `run_from_row`'s order.
+const RUN_COLUMNS: &str = "id, app, name, release, trigger, requested_by, detached, exclusive, \
+     inputs, timeout_ms, started_unix_ms, ended_unix_ms, exit_code, ok, message, pid, start_time, \
+     relay_pid, relay_start_time, stopping, secrets";
+
+/// A run from a row of `RUN_COLUMNS`.
+fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
+    Ok(RunRecord {
+        id: row.get::<_, i64>(0)? as u64,
+        app: row.get(1)?,
+        name: row.get(2)?,
+        release: row.get(3)?,
+        trigger: row.get(4)?,
+        requested_by: row.get(5)?,
+        detached: row.get(6)?,
+        exclusive: row.get(7)?,
+        inputs: row.get(8)?,
+        timeout_ms: row.get::<_, i64>(9)? as u64,
+        started_unix_ms: row.get::<_, i64>(10)? as u64,
+        ended_unix_ms: row.get::<_, i64>(11)? as u64,
+        exit_code: row.get(12)?,
+        ok: row.get(13)?,
+        message: row.get(14)?,
+        pid: row.get(15)?,
+        start_time: row.get::<_, i64>(16)? as u64,
+        relay_pid: row.get(17)?,
+        relay_start_time: row.get::<_, i64>(18)? as u64,
+        stopping: row.get(19)?,
+        secrets: row.get(20)?,
+    })
 }
 
 /// Add to `table` each of `columns` an older store lacks.
@@ -1605,44 +1799,156 @@ pub(crate) mod tests {
         assert_eq!(store.log_periods().unwrap(), vec![record("/a.log", "d2")]);
     }
 
-    #[test]
-    fn the_last_run_of_each_command_is_kept() {
-        let store = Store::in_memory().unwrap();
-        let run = |release: &str, exit_code: i32| CommandRun {
-            release: release.to_owned(),
+    /// A run of `name` for `app` as it starts.
+    fn starting(app: &str, name: &str, exclusive: bool) -> RunRecord {
+        RunRecord {
+            app: app.to_owned(),
+            name: name.to_owned(),
+            release: "r1".to_owned(),
+            trigger: "manual".to_owned(),
+            requested_by: "you".to_owned(),
+            exclusive,
             started_unix_ms: 1_000,
-            duration_ms: 20,
-            exit_code,
-            ok: exit_code == 0,
-            message: format!("exited with status {exit_code} after 20ms"),
-        };
+            ..RunRecord::default()
+        }
+    }
 
-        store
-            .record_command_run("shop", "migrate", &run("r1", 1))
+    #[test]
+    fn runs_are_kept_from_their_start_to_their_end_and_listed_under_way_first() {
+        let store = Store::in_memory().unwrap();
+        let first = store
+            .begin_run(&starting("shop", "migrate", false))
+            .unwrap()
+            .unwrap();
+        let second = store
+            .begin_run(&starting("shop", "migrate", false))
+            .unwrap()
+            .unwrap();
+        let other = store
+            .begin_run(&starting("shop", "backup", false))
+            .unwrap()
             .unwrap();
         store
-            .record_command_run("shop", "migrate", &run("r2", 0))
-            .unwrap();
-        store
-            .record_command_run("shop", "backup", &run("r2", 0))
-            .unwrap();
-        store
-            .record_command_run("blog", "migrate", &run("r1", 0))
+            .begin_run(&starting("blog", "migrate", false))
+            .unwrap()
             .unwrap();
 
-        let runs = store.command_runs("shop").unwrap();
+        store.set_run_process(first, 4242, 77, 4241, 76).unwrap();
+        store
+            .end_run(first, 1_020, 1, false, "exited with status 1 after 20ms")
+            .unwrap();
+        store
+            .end_run(other, 1_050, 0, true, "exited with status 0 after 50ms")
+            .unwrap();
+
+        let listed: Vec<(u64, bool)> = store
+            .runs("shop", None)
+            .unwrap()
+            .iter()
+            .map(|run| (run.id, run.under_way()))
+            .collect();
+        assert_eq!(listed, [(second, true), (other, false), (first, false)]);
+        assert_eq!(store.runs("shop", Some("backup")).unwrap().len(), 1);
+
+        let ended = store.run(first).unwrap();
         assert_eq!(
-            runs,
-            vec![
-                ("backup".to_owned(), run("r2", 0)),
-                ("migrate".to_owned(), run("r2", 0))
-            ]
+            (ended.pid, ended.start_time, ended.relay_pid),
+            (4242, 77, 4241)
         );
+        assert_eq!((ended.exit_code, ended.ok), (1, false));
+
+        // The last run of each command is the newest that has ended.
+
+        let last: Vec<(String, i32, u64)> = store
+            .command_runs("shop")
+            .unwrap()
+            .into_iter()
+            .map(|(name, run)| (name, run.exit_code, run.duration_ms))
+            .collect();
+        assert_eq!(
+            last,
+            [("backup".to_owned(), 0, 50), ("migrate".to_owned(), 1, 20)]
+        );
+        assert_eq!(store.runs_under_way().unwrap().len(), 2);
 
         store.ensure_app("shop").unwrap();
         store.delete_app("shop").unwrap();
-        assert!(store.command_runs("shop").unwrap().is_empty());
-        assert_eq!(store.command_runs("blog").unwrap().len(), 1);
+        assert!(store.runs("shop", None).unwrap().is_empty());
+        assert_eq!(store.runs("blog", None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_exclusive_command_is_claimed_by_one_run_until_it_ends() {
+        let store = Store::in_memory().unwrap();
+        let holder = store
+            .begin_run(&starting("shop", "backup", true))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            store.begin_run(&starting("shop", "backup", true)).unwrap(),
+            Err(holder)
+        );
+
+        // Another command, or another application's, is not held back.
+
+        assert!(
+            store
+                .begin_run(&starting("shop", "migrate", true))
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            store
+                .begin_run(&starting("blog", "backup", true))
+                .unwrap()
+                .is_ok()
+        );
+
+        store
+            .end_run(holder, 2_000, 0, true, "exited with status 0 after 1s")
+            .unwrap();
+        assert!(
+            store
+                .begin_run(&starting("shop", "backup", true))
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn only_the_newest_ended_runs_of_a_command_are_kept() {
+        let store = Store::in_memory().unwrap();
+        let ids: Vec<u64> = (0..5)
+            .map(|_| {
+                store
+                    .begin_run(&starting("shop", "migrate", false))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+
+        for id in &ids[..4] {
+            store.end_run(*id, 2_000, 0, true, "done").unwrap();
+        }
+
+        // The run under way is never forgotten, whatever its age.
+
+        let forgotten: Vec<u64> = store
+            .prune_runs("shop", "migrate", 2)
+            .unwrap()
+            .iter()
+            .map(|run| run.id)
+            .collect();
+        assert_eq!(forgotten, [ids[1], ids[0]]);
+
+        let kept: Vec<u64> = store
+            .runs("shop", None)
+            .unwrap()
+            .iter()
+            .map(|run| run.id)
+            .collect();
+        assert_eq!(kept, [ids[4], ids[3], ids[2]]);
     }
 
     #[test]

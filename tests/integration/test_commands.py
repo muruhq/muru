@@ -46,6 +46,12 @@ timeout = "2s"
 
 [tool.muru.commands.hold]
 run = ["python", "-c", "import time; print('up', flush=True); time.sleep(60)"]
+
+[tool.muru.commands.long]
+run = [
+    "python", "-c",
+    "import sys, time; print('first', flush=True); time.sleep(6); print('last'); sys.exit(3)",
+]
 """
 
 APP = """
@@ -111,8 +117,9 @@ def test_declared_commands_run_with_their_inputs(tmp_path: Path) -> None:
         assert '"Bob" does not match [a-z]+' in bad.stderr, bad.stderr
 
         unknown = daemon.muructl("command", "run", "ops", "nothing", check=False)
-        assert "ops@r1 has no command named nothing; it declares backup, greet, hold, slow" in (
-            unknown.stderr
+        assert (
+            "ops@r1 has no command named nothing; it declares backup, greet, hold, long, slow"
+            in (unknown.stderr)
         )
 
         # A value can come from standard input, or from a secret store
@@ -197,7 +204,7 @@ def test_exclusive_commands_run_one_at_a_time_and_time_out(tmp_path: Path) -> No
         assert first.stdout.readline().strip() == "up"
 
         second = daemon.muructl("command", "run", "ops", "slow", check=False)
-        assert "slow runs one at a time for ops, and a run is under way" in second.stderr, second
+        assert "slow runs one at a time for ops, and run " in second.stderr, second
 
         # The first runs past its timeout and is stopped; then the
         # command may run again.
@@ -234,5 +241,52 @@ def test_exclusive_commands_run_one_at_a_time_and_time_out(tmp_path: Path) -> No
         _, stderr = held.communicate(timeout=30)
         assert held.returncode == 143, (held.returncode, stderr)
         assert "stopped because the daemon shut down" in stderr, stderr
+    finally:
+        daemon.stop()
+
+
+def test_a_detached_run_outlives_its_caller_and_a_daemon_restart(tmp_path: Path) -> None:
+    daemon = deployed(tmp_path)
+
+    try:
+        started = daemon.muructl("command", "run", "ops", "long", "--detach").stdout
+        run = int(started.split("started run ")[1].split(";")[0])
+        listed = json.loads(daemon.muructl("command", "runs", "ops", "long", "--json").stdout)
+        assert [(r["run"], r["under_way"], r["detached"]) for r in listed["runs"]] == [
+            (run, True, True)
+        ]
+
+        # The daemon detaches and a new one takes the run over while it
+        # is still under way.
+
+        daemon.stop(shutdown=False)
+        daemon = start_daemon(
+            tmp_path / "daemon",
+            run_dir=daemon.run_dir,
+            listeners=daemon.listeners,
+            config_extra="[secrets.store.local]\nkind = 'file'\n",
+        )
+        status = json.loads(daemon.muructl("command", "status", str(run), "--json").stdout)
+        assert status["under_way"], status
+
+        # Its end is recorded with its exit status, and its output is in
+        # its own file with the time on every line.
+
+        deadline = time.monotonic() + 30
+
+        while status["under_way"]:
+            assert time.monotonic() < deadline, status
+            time.sleep(0.5)
+            status = json.loads(daemon.muructl("command", "status", str(run), "--json").stdout)
+
+        assert (status["exit_code"], status["ok"], status["trigger"]) == (3, False, "manual")
+        assert status["message"].startswith("exited with status 3 after "), status
+        output = daemon.muructl("command", "logs", str(run)).stdout.splitlines()
+        assert [line.split(" ", 1)[1] for line in output[:2]] == [
+            "[command long] first",
+            "[command long] last",
+        ], output
+        assert all(line[:4].isdigit() and line[23] == "Z" for line in output), output
+        assert "[command long] first" in daemon.muructl("logs", "ops").stdout
     finally:
         daemon.stop()

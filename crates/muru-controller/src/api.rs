@@ -1152,7 +1152,9 @@ impl Admin for Service {
         &self,
         request: Request<pb::RunCommandRequest>,
     ) -> Result<Response<CommandStream>, Status> {
+        let requested_by = requested_by(&request);
         let request = request.into_inner();
+        let detach = request.detach;
         let app = request.app.clone();
         let release = self.current_release(&app, &request.release)?;
         let command = crate::commands::CommandRequest::from_message(request)
@@ -1178,20 +1180,166 @@ impl Admin for Service {
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
 
+        // Issue 688: a detached run is started under a relay of its own
+        // and answered with its id at once.
+
+        if detach {
+            let executable = crate::daemon::running_executable().map_err(internal)?;
+            let release = prepared.release.clone();
+            let run = self
+                .handle
+                .runs
+                .start_detached(prepared, crate::runs::MANUAL, &requested_by, &executable)
+                .await
+                .map_err(Status::failed_precondition)?;
+            let started = pb::CommandOutput {
+                release,
+                run,
+                detached: true,
+                message: format!("started as run {run}"),
+                ok: true,
+                ..Default::default()
+            };
+            let stream = tokio_stream::once(Ok(started));
+            return Ok(Response::new(Box::pin(stream)));
+        }
+
         let output = self
             .handle
             .underway
             .run(
                 prepared,
-                std::sync::Arc::new(crate::commands::Recorded {
-                    events: self.handle.events.clone(),
-                    store: self.handle.store.clone(),
-                }),
+                std::sync::Arc::new(
+                    self.handle
+                        .runs
+                        .recorded(crate::runs::MANUAL, &requested_by),
+                ),
             )
             .map_err(Status::failed_precondition)?;
         let stream =
             tokio_stream::StreamExt::map(tokio_stream::wrappers::ReceiverStream::new(output), Ok);
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn list_command_runs(
+        &self,
+        request: Request<pb::ListCommandRunsRequest>,
+    ) -> Result<Response<pb::ListCommandRunsResponse>, Status> {
+        let request = request.into_inner();
+        self.handle.store.app(&request.app).map_err(not_found)?;
+        let name = (!request.name.is_empty()).then_some(request.name.as_str());
+        let runs = self
+            .handle
+            .store
+            .runs(&request.app, name)
+            .map_err(internal)?
+            .iter()
+            .map(run_message)
+            .collect();
+
+        Ok(Response::new(pb::ListCommandRunsResponse { runs }))
+    }
+
+    async fn get_command_run(
+        &self,
+        request: Request<pb::GetCommandRunRequest>,
+    ) -> Result<Response<pb::CommandRunRecord>, Status> {
+        let run = self
+            .handle
+            .store
+            .run(request.into_inner().run)
+            .map_err(not_found)?;
+        Ok(Response::new(run_message(&run)))
+    }
+
+    type TailCommandRunStream = LogStream;
+
+    async fn tail_command_run(
+        &self,
+        request: Request<pb::TailCommandRunRequest>,
+    ) -> Result<Response<LogStream>, Status> {
+        let request = request.into_inner();
+        let run = self.handle.store.run(request.run).map_err(not_found)?;
+        let path = self.handle.runs.log_path(&run.app, &run.name, run.id);
+
+        if !path.exists() {
+            return Err(Status::not_found(crate::logs::missing(&path)));
+        }
+
+        // Followed, the lines come until the run has ended and its last
+        // line has been read.
+
+        let follow = request.follow && run.under_way();
+        let mut lines = crate::logs::tail(path, request.lines as usize, follow);
+        let (sender, receiver) = tokio::sync::mpsc::channel(256);
+        let store = std::sync::Arc::clone(&self.handle.store);
+        let (app, release) = (run.app.clone(), run.release.clone());
+
+        tokio::spawn(async move {
+            let mut ended_at: Option<tokio::time::Instant> = None;
+            let mut check = tokio::time::interval(std::time::Duration::from_millis(250));
+
+            loop {
+                tokio::select! {
+                    line = tokio_stream::StreamExt::next(&mut lines) => {
+                        let Some(line) = line else {
+                            return;
+                        };
+
+                        let message = pb::LogLine {
+                            app: app.clone(),
+                            release: release.clone(),
+                            line,
+                        };
+
+                        if sender.send(Ok(message)).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ = check.tick(), if follow => {
+                        if let Some(at) = ended_at {
+                            if at.elapsed() >= std::time::Duration::from_secs(1) {
+                                return;
+                            }
+                        } else if store.run(run.id).map(|run| !run.under_way()).unwrap_or(true) {
+                            ended_at = Some(tokio::time::Instant::now());
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        )))
+    }
+
+    async fn stop_command_run(
+        &self,
+        request: Request<pb::StopCommandRunRequest>,
+    ) -> Result<Response<pb::CommandRunRecord>, Status> {
+        let requested_by = requested_by(&request);
+        let id = request.into_inner().run;
+        let run = self.handle.store.run(id).map_err(not_found)?;
+
+        if !run.under_way() {
+            return Err(Status::failed_precondition(format!(
+                "run {id} has ended: it {}",
+                run.message
+            )));
+        }
+
+        let why = format!("{requested_by} stopped it");
+        let told = self.handle.runs.stop(id, &why) || self.handle.underway.stop_run(id, &why);
+
+        if !told {
+            return Err(Status::failed_precondition(format!(
+                "run {id} is not one this daemon is running"
+            )));
+        }
+
+        let run = self.handle.store.run(id).map_err(not_found)?;
+        Ok(Response::new(run_message(&run)))
     }
 
     async fn list_commands(
@@ -3835,6 +3983,48 @@ fn event_message(event: Event) -> pb::Event {
         subject: event.subject,
         level: event.level.to_owned(),
         message: event.message,
+    }
+}
+
+/// Who sent a request over the admin socket: the user its peer runs as,
+/// or `unknown` when the socket does not say.
+fn requested_by<T>(request: &Request<T>) -> String {
+    request
+        .extensions()
+        .get::<tonic::transport::server::UdsConnectInfo>()
+        .and_then(|info| info.peer_cred)
+        .map_or_else(
+            || "unknown".to_owned(),
+            |credentials| crate::processes::user_name(credentials.uid()),
+        )
+}
+
+/// A run as the admin API gives it.
+fn run_message(run: &crate::model::RunRecord) -> pb::CommandRunRecord {
+    pb::CommandRunRecord {
+        run: run.id,
+        app: run.app.clone(),
+        release: run.release.clone(),
+        name: run.name.clone(),
+        trigger: run.trigger.clone(),
+        requested_by: run.requested_by.clone(),
+        detached: run.detached,
+        inputs: run.inputs.clone(),
+        started_unix_ms: run.started_unix_ms,
+        ended_unix_ms: run.ended_unix_ms,
+        under_way: run.under_way(),
+        exit_code: run.exit_code,
+        ok: run.ok,
+        message: run.message.clone(),
+        log: crate::runs::Runs::log_name(&run.app, &run.name, run.id)
+            .display()
+            .to_string(),
+        pid: if run.under_way() { run.pid } else { 0 },
+        stopping: if run.under_way() {
+            run.stopping.clone()
+        } else {
+            String::new()
+        },
     }
 }
 

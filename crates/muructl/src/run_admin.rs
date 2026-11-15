@@ -1128,6 +1128,10 @@ macro_rules! needs_the_daemon {
     };
 }
 
+/// Why a run, or muructl serve, refuses what only the daemon keeps.
+const NO_RUNS: &str = "detached runs and the records of runs are kept by the daemon; \
+                       here a command runs while its caller waits";
+
 #[tonic::async_trait]
 impl Admin for Service {
     type WatchEventsStream = EventStream;
@@ -1261,6 +1265,11 @@ impl Admin for Service {
         request: Request<pb::RunCommandRequest>,
     ) -> Result<Response<CommandStream>, Status> {
         let request = request.into_inner();
+
+        if request.detach {
+            return Err(Status::failed_precondition(NO_RUNS));
+        }
+
         let state = &self.state;
         let release = state
             .target(&request.app, &request.release)
@@ -1280,6 +1289,36 @@ impl Admin for Service {
         let stream =
             tokio_stream::StreamExt::map(tokio_stream::wrappers::ReceiverStream::new(output), Ok);
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn list_command_runs(
+        &self,
+        _request: Request<pb::ListCommandRunsRequest>,
+    ) -> Result<Response<pb::ListCommandRunsResponse>, Status> {
+        Err(Status::failed_precondition(NO_RUNS))
+    }
+
+    async fn get_command_run(
+        &self,
+        _request: Request<pb::GetCommandRunRequest>,
+    ) -> Result<Response<pb::CommandRunRecord>, Status> {
+        Err(Status::failed_precondition(NO_RUNS))
+    }
+
+    type TailCommandRunStream = LogStream;
+
+    async fn tail_command_run(
+        &self,
+        _request: Request<pb::TailCommandRunRequest>,
+    ) -> Result<Response<LogStream>, Status> {
+        Err(Status::failed_precondition(NO_RUNS))
+    }
+
+    async fn stop_command_run(
+        &self,
+        _request: Request<pb::StopCommandRunRequest>,
+    ) -> Result<Response<pb::CommandRunRecord>, Status> {
+        Err(Status::failed_precondition(NO_RUNS))
     }
 
     /// The commands the project declares, as its file has them now. A

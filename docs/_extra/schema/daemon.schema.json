@@ -617,6 +617,13 @@
           "description": "Allow `muructl debug exec`, which runs code in a worker; off unless set.",
           "type": "boolean"
         },
+        "keep_command_runs": {
+          "default": 20,
+          "description": "How many runs of each of an application's commands are kept, with their output, once they have ended; at least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "pass_env": {
           "description": "Variables of the daemon's own environment passed to a release's host, workers, commands and managed servers, beside `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TZ` and `TMPDIR`. Each is a name, or a name with a `*` suffix such as `AWS_*`. A release's own variables override them.",
           "items": {

@@ -340,6 +340,10 @@ struct RelayRunArgs {
     #[arg(long, value_name = "PATH")]
     log_file: Option<PathBuf>,
 
+    /// A second file every line is written to as well, reopened with the first.
+    #[arg(long, value_name = "PATH", requires = "log_file")]
+    also_log_file: Option<PathBuf>,
+
     /// Each worker's queue, in bytes.
     #[arg(long, value_name = "BYTES", default_value_t = muru_controller::relay::DEFAULT_QUEUE)]
     queue: usize,
@@ -1070,6 +1074,7 @@ fn main() -> anyhow::Result<()> {
                 control: args.control,
                 host_output_fd: args.host_output_fd,
                 log_file: args.log_file,
+                also_log_file: args.also_log_file,
                 queue: args.queue,
                 overflow: args.on_overflow,
                 release: args.release,
@@ -1269,6 +1274,18 @@ fn main() -> anyhow::Result<()> {
         Command::Commands {
             command: admin::CommandCommand::Run(args),
         } => exit_with(runtime, admin::command_run(*args)),
+        Command::Commands {
+            command: admin::CommandCommand::Runs(args),
+        } => runtime.block_on(admin::command_runs(*args)),
+        Command::Commands {
+            command: admin::CommandCommand::Status(args),
+        } => runtime.block_on(admin::command_status(*args)),
+        Command::Commands {
+            command: admin::CommandCommand::Logs(args),
+        } => runtime.block_on(admin::command_logs(*args)),
+        Command::Commands {
+            command: admin::CommandCommand::Stop(args),
+        } => runtime.block_on(admin::command_stop(*args)),
         Command::Edge {
             command: edge::EdgeCommand::Run(args),
         } => runtime.block_on(edge::run(*args)),

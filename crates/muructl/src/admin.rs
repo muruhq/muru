@@ -7349,6 +7349,11 @@ pub struct RunExecArgs {
     #[arg(long)]
     json: bool,
 
+    /// Start the run and print its id, without waiting: it runs on under
+    /// the daemon, its output in its own file and the release's log.
+    #[arg(long, requires = "target")]
+    detach: bool,
+
     #[command(flatten)]
     socket: SocketArgs,
 
@@ -7365,6 +7370,7 @@ pub async fn exec(args: RunExecArgs) -> anyhow::Result<i32> {
         app,
         release,
         argv: args.command,
+        detach: args.detach,
         ..Default::default()
     };
 
@@ -7472,6 +7478,263 @@ pub enum CommandCommand {
     /// project in the current directory.
     #[command(allow_missing_positional = true)]
     Run(Box<CommandRunArgs>),
+
+    /// List the runs the daemon keeps of an application's commands, or of
+    /// one command: those under way first, then the newest.
+    Runs(Box<CommandRunsArgs>),
+
+    /// Show one run: what started it, and how it ended or that it is
+    /// still under way.
+    Status(Box<RunIdArgs>),
+
+    /// Show a run's output, from its own file, or follow it until the run
+    /// ends.
+    Logs(Box<CommandLogsArgs>),
+
+    /// Stop a run under way, as at its timeout: SIGTERM to its session,
+    /// and SIGKILL ten seconds later.
+    Stop(Box<RunIdArgs>),
+}
+
+/// What `muructl command runs` takes.
+#[derive(Args)]
+pub struct CommandRunsArgs {
+    /// The application.
+    app: String,
+
+    /// Only this command's runs; `exec` for one-off commands.
+    name: Option<String>,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// What `muructl command status` and `muructl command stop` take.
+#[derive(Args)]
+pub struct RunIdArgs {
+    /// The run's id, as `muructl command runs` lists it.
+    run: u64,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// What `muructl command logs` takes.
+#[derive(Args)]
+pub struct CommandLogsArgs {
+    /// The run's id, as `muructl command runs` lists it.
+    run: u64,
+
+    /// Keep printing lines as they are written, until the run ends.
+    #[arg(long, short)]
+    follow: bool,
+
+    /// How many recent lines to show first.
+    #[arg(long, short = 'n', default_value = "100", value_name = "COUNT")]
+    lines: u32,
+
+    /// Leave the time off each line.
+    #[arg(long)]
+    no_timestamps: bool,
+
+    /// Print each line as JSON, as the admin API's log lines.
+    #[arg(long)]
+    json: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+}
+
+/// List the runs of an application's commands.
+pub async fn command_runs(args: CommandRunsArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.socket()?).await?;
+    let answer = client
+        .list_command_runs(pb::ListCommandRunsRequest {
+            app: args.app.clone(),
+            name: args.name.clone().unwrap_or_default(),
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if args.output.json {
+        return print_answer(&answer);
+    }
+
+    if answer.runs.is_empty() {
+        println!(
+            "no runs of {} are kept",
+            args.name.as_deref().unwrap_or("its commands")
+        );
+        return Ok(());
+    }
+
+    let width = answer
+        .runs
+        .iter()
+        .map(|run| run.name.len())
+        .max()
+        .unwrap_or(0)
+        .max("COMMAND".len());
+    println!(
+        "{:<6} {:<width$} {:<8} {:<20} {:<20} STATE",
+        "RUN", "COMMAND", "RELEASE", "TRIGGER", "STARTED"
+    );
+
+    for run in &answer.runs {
+        println!(
+            "{:<6} {:<width$} {:<8} {:<20} {:<20} {}",
+            run.run,
+            run.name,
+            run.release,
+            run.trigger,
+            format_time(run.started_unix_ms),
+            run_state(run)
+        );
+    }
+
+    Ok(())
+}
+
+/// A run's state, as a phrase.
+fn run_state(run: &pb::CommandRunRecord) -> String {
+    if !run.under_way {
+        return run.message.clone();
+    }
+
+    let mut notes = Vec::new();
+
+    if run.detached {
+        notes.push("detached".to_owned());
+    }
+
+    if run.pid != 0 {
+        notes.push(format!("pid {}", run.pid));
+    }
+
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", notes.join(", "))
+    };
+
+    if run.stopping.is_empty() {
+        format!("under way{notes}")
+    } else {
+        format!("stopping because {}{notes}", run.stopping)
+    }
+}
+
+/// Show one run.
+pub async fn command_status(args: RunIdArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.socket()?).await?;
+    let run = client
+        .get_command_run(pb::GetCommandRunRequest { run: args.run })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if args.output.json {
+        return print_answer(&run);
+    }
+
+    print_run(&run);
+    Ok(())
+}
+
+/// A run, a field a line.
+fn print_run(run: &pb::CommandRunRecord) {
+    println!(
+        "run {} of {} for {}@{}",
+        run.run, run.name, run.app, run.release
+    );
+    println!(
+        "  started    {} by {}, {}{}",
+        format_time(run.started_unix_ms),
+        run.requested_by,
+        run.trigger,
+        if run.detached { ", detached" } else { "" }
+    );
+
+    if !run.inputs.is_empty() {
+        println!("  inputs     {}", run.inputs);
+    }
+
+    if run.under_way {
+        println!("  state      {}", run_state(run));
+    } else {
+        println!(
+            "  ended      {}: it {}",
+            format_time(run.ended_unix_ms),
+            run.message
+        );
+        println!(
+            "  exit       {}{}",
+            run.exit_code,
+            if run.ok { "" } else { ", failed" }
+        );
+    }
+
+    println!("  output     {}", run.log);
+}
+
+/// Show or follow a run's output.
+pub async fn command_logs(args: CommandLogsArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut lines = client
+        .tail_command_run(pb::TailCommandRunRequest {
+            run: args.run,
+            lines: args.lines,
+            follow: args.follow,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    while let Some(line) = lines.next().await {
+        let line = line.map_err(explain)?;
+
+        if args.json {
+            println!("{}", serde_json::to_string(&line)?);
+            continue;
+        }
+
+        let line = line.line;
+
+        // Each line starts with the full UTC time, then a space.
+
+        let shown = if args.no_timestamps {
+            line.split_once(' ').map_or(line.as_str(), |(_, rest)| rest)
+        } else {
+            line.as_str()
+        };
+        println!("{shown}");
+    }
+
+    Ok(())
+}
+
+/// Stop a run.
+pub async fn command_stop(args: RunIdArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.socket()?).await?;
+    let run = client
+        .stop_command_run(pb::StopCommandRunRequest { run: args.run })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if args.output.json {
+        return print_answer(&run);
+    }
+
+    println!("muru: stopping run {} of {}", run.run, run.name);
+    Ok(())
 }
 
 /// What `muructl command list` takes.
@@ -7522,6 +7785,11 @@ pub struct CommandRunArgs {
     /// lines of the admin API's command output.
     #[arg(long)]
     json: bool,
+
+    /// Start the run and print its id, without waiting: it runs on under
+    /// the daemon, its output in its own file and the release's log.
+    #[arg(long, requires = "target")]
+    detach: bool,
 
     #[command(flatten)]
     socket: SocketArgs,
@@ -7690,6 +7958,7 @@ pub async fn command_run(args: CommandRunArgs) -> anyhow::Result<i32> {
         name: args.name,
         inputs,
         secret_inputs,
+        detach: args.detach,
         ..Default::default()
     };
 
@@ -7784,6 +8053,12 @@ fn show_output(output: &pb::CommandOutput, json: bool) -> anyhow::Result<Option<
 
     if json {
         writeln!(stdout, "{}", serde_json::to_string(output)?)?;
+    } else if output.detached {
+        writeln!(
+            stdout,
+            "muru: started run {}; muructl command logs {} --follow follows it",
+            output.run, output.run
+        )?;
     } else if output.finished {
         if !output.ok {
             writeln!(std::io::stderr(), "muru: the command {}", output.message)?;
@@ -7797,6 +8072,11 @@ fn show_output(output: &pb::CommandOutput, json: bool) -> anyhow::Result<Option<
     if output.finished {
         stdout.flush()?;
         return Ok(Some(exit_status(output)));
+    }
+
+    if output.detached {
+        stdout.flush()?;
+        return Ok(Some(0));
     }
 
     Ok(None)

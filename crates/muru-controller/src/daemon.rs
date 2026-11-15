@@ -747,6 +747,9 @@ pub struct Handle {
     /// The commands running for the API's callers, which the daemon stops
     /// and waits for before it exits.
     pub underway: crate::commands::Underway,
+    /// The runs the daemon keeps, and the detached ones it watches (issue
+    /// 688).
+    pub runs: crate::runs::Runs,
 }
 
 /// Section 13.10: the daemon's processes as ListProcesses answers, which
@@ -1285,6 +1288,10 @@ struct Daemon {
     service: Option<crate::host::Identity>,
     /// Whether `muructl debug exec` may run code in workers.
     debug_exec: bool,
+    /// The runs the daemon keeps (issue 688), and how many of each
+    /// command's it keeps.
+    runs: crate::runs::Runs,
+    keep_command_runs: usize,
     /// The listeners' h2c policies, for every snapshot (section 6.13).
     h2c: Vec<pb::H2cPolicy>,
     /// The listeners' own limits, for every snapshot (section 4.18).
@@ -1523,12 +1530,19 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         cgroup_limits: std::sync::Mutex::new(None),
     });
     let underway = crate::commands::Underway::default();
+    let runs = crate::runs::Runs::new(
+        Arc::clone(&store),
+        events.clone(),
+        locations.logs.path.clone(),
+        settings.keep_command_runs,
+    );
     let handle = Handle {
         store: Arc::clone(&store),
         events: events.clone(),
         commands,
         info: Arc::clone(&info),
         underway: underway.clone(),
+        runs: runs.clone(),
     };
 
     // The metrics listener (section 11.1), on an internal address.
@@ -1690,6 +1704,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         shutdown: settings.shutdown.clone(),
         service,
         debug_exec: settings.debug_exec,
+        runs: runs.clone(),
+        keep_command_runs: settings.keep_command_runs,
         h2c: settings.h2c.clone(),
         listener_limits: settings.listener_limits.clone(),
         listener_proxies: settings.listener_proxies.clone(),
@@ -1913,8 +1929,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let policy = daemon.shutdown.clone();
         let started = Instant::now();
         let deadline = started + policy.budget;
+        let runs = daemon.runs.clone();
+        let stopping_runs =
+            tokio::spawn(
+                async move { runs.stop_all("the daemon shut down", deadline.into()).await },
+            );
         daemon.drain_edge(&policy, deadline).await;
         daemon.stop_all_until(deadline).await;
+        let _ = stopping_runs.await;
         daemon
             .edge
             .stop_within(deadline.saturating_duration_since(Instant::now()))
@@ -1932,14 +1954,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         );
     } else if upgrade_to.is_none() {
         daemon.detach();
+        daemon.runs.release();
         daemon.events.emit(
             "daemon.detached",
             "daemon",
             "info",
-            "detached; hosts and the edge keep serving",
+            "detached; hosts, the edge and detached command runs keep running",
         );
     } else {
         daemon.detach();
+        daemon.runs.release();
     }
 
     // The API answers the Shutdown call that brought the daemon here
@@ -3093,6 +3117,14 @@ impl Daemon {
             report.unchanged("[daemon] pass_env");
         }
 
+        if self.keep_command_runs != settings.keep_command_runs {
+            self.keep_command_runs = settings.keep_command_runs;
+            self.runs.set_keep(settings.keep_command_runs);
+            report.changed("[daemon] keep_command_runs", "as each run ends");
+        } else {
+            report.unchanged("[daemon] keep_command_runs");
+        }
+
         // Section 11.5: sinks start, stop and restart on their cursors.
 
         let sink_changes = self.sinks.reconcile(settings.sinks);
@@ -4147,6 +4179,10 @@ impl Daemon {
     /// Re-adopt the hosts a previous daemon left running (section 10.2),
     /// and start again the release that served if its host is gone.
     async fn restore(&mut self) {
+        // Issue 688: the runs a previous daemon left under way.
+
+        self.runs.adopt();
+
         self.maintenance = self
             .store
             .maintenance()
@@ -5107,8 +5143,14 @@ impl Daemon {
 
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
         let identity = self.resolve_identity(app, &subject)?;
+
+        // Its name is this daemon's start and a count, so that a detached
+        // run's, which outlives the daemon, is never another run's.
+
         let run = COMMAND_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let secrets = run_dir.join("commands").join(run.to_string());
+        let secrets = run_dir
+            .join("commands")
+            .join(format!("{}-{run}", self.info.started_unix_ms));
 
         let env = match resolve_env(&self.secrets, &spec.env, &secrets).await {
             Ok(env) => env,
@@ -9034,6 +9076,19 @@ impl Daemon {
             return Some(format!(
                 "a rollout of {app} to {} is under way; promote or abort it first",
                 rollout.candidate
+            ));
+        }
+
+        if let Some(run) = self
+            .store
+            .runs(app, None)
+            .unwrap_or_default()
+            .into_iter()
+            .find(crate::model::RunRecord::under_way)
+        {
+            return Some(format!(
+                "run {} of {} is under way; stop it with muructl command stop {} first",
+                run.id, run.name, run.id
             ));
         }
 

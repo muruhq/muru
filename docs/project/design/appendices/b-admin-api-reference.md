@@ -56,8 +56,12 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | SetScale | POST /v1/apps/{app}/releases/{release}:scale | sizes, bounds, temporary floors |
 | GetScaleStatus | GET /v1/apps/{app}/releases/{release}/scale | signals, decisions, churn |
 | SetMaintenance | POST /v1/apps/{app}:maintenance | maintenance mode |
-| RunCommand | POST /v1/apps/{app}/releases/{release}:exec | a declared command by name with its inputs (secret ones optionally as STORE/KEY), or a one-off command, run with the release (9.12), output streamed and the exit status last |
+| RunCommand | POST /v1/apps/{app}/releases/{release}:exec | a declared command by name with its inputs (secret ones optionally as STORE/KEY), or a one-off command, run with the release (9.12), output streamed and the exit status last; with `detach`, started under its own log relay and answered with its run's id at once |
 | ListCommands | GET /v1/apps/{app}/releases/{release}/commands | the release's declared commands, their inputs and each one's last run |
+| ListCommandRuns | GET /v1/apps/{app}/runs | the runs the daemon keeps of the application's commands, or of one by `name`, those under way first (9.12) |
+| GetCommandRun | GET /v1/runs/{run} | one run (9.12) |
+| TailCommandRun | GET /v1/runs/{run}/output | a run's output from its own file, followed until it ends when asked (9.12) |
+| StopCommandRun | POST /v1/runs/{run}:stop | stop a run under way, as at its timeout (9.12) |
 | TailLogs | GET /v1/apps/{app}/releases/{release}/logs | stream logs |
 | ReopenLogs | POST /v1/logs:reopen | reopen log files, optionally in workers |
 | RotateLogs | POST /v1/logs:rotate | rotate named logs now on the policy in force; refused when rotation is external |

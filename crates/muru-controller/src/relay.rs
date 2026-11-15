@@ -214,6 +214,9 @@ pub struct RelayArgs {
     /// The release log to write, opened again by name on SIGUSR1; none
     /// writes to standard error.
     pub log_file: Option<PathBuf>,
+    /// A second file every line is written to as well, opened again with
+    /// the first: a command run's own output file.
+    pub also_log_file: Option<PathBuf>,
     /// Each queue's bound in bytes.
     pub queue: usize,
     /// What a full queue does.
@@ -782,44 +785,75 @@ fn turn_order(state: &State) -> Vec<Source> {
 
 /// Where the writer writes.
 enum Destination {
-    /// The release log, opened again by name on SIGUSR1.
-    File { path: PathBuf, file: std::fs::File },
+    /// The release log, opened again by name on SIGUSR1, and a second
+    /// file written beside it.
+    File {
+        path: PathBuf,
+        file: std::fs::File,
+        also: Option<(PathBuf, std::fs::File)>,
+    },
     /// Standard error: muructl's pipe under `muructl run` and `serve`.
     Stderr,
 }
 
 impl Destination {
-    fn open(log_file: Option<&Path>) -> anyhow::Result<Self> {
+    fn open(log_file: Option<&Path>, also: Option<&Path>) -> anyhow::Result<Self> {
+        let opened = |path: &Path| {
+            open_log(path)
+                .map(|file| (path.to_owned(), file))
+                .with_context(|| format!("opening {}", path.display()))
+        };
+
         match log_file {
-            Some(path) => Ok(Self::File {
-                path: path.to_owned(),
-                file: open_log(path).with_context(|| format!("opening {}", path.display()))?,
-            }),
+            Some(path) => {
+                let (path, file) = opened(path)?;
+
+                Ok(Self::File {
+                    path,
+                    file,
+                    also: also.map(opened).transpose()?,
+                })
+            }
             None => Ok(Self::Stderr),
         }
     }
 
+    /// Write to the destination. What the second file cannot take is
+    /// lost there alone.
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         match self {
-            Self::File { file, .. } => file.write_all(bytes),
+            Self::File { file, also, .. } => {
+                if let Some((_, also)) = also {
+                    let _ = also.write_all(bytes);
+                }
+
+                file.write_all(bytes)
+            }
             Self::Stderr => std::io::stderr().lock().write_all(bytes),
         }
     }
 
-    /// Open the file again by name, saying so in the new file. A file
+    /// Open the files again by name, saying so in the new file. A file
     /// that cannot be opened keeps the old one, and the failure is
     /// written there.
     fn reopen(&mut self, shared: &Shared) {
-        let Self::File { path, file } = self else {
+        let Self::File { path, file, also } = self else {
             return;
         };
 
-        match open_log(path) {
-            Ok(opened) => {
-                *file = opened;
-                shared.note(&format!("reopened {}", path.display()));
+        let files =
+            std::iter::once((&*path, file)).chain(also.as_mut().map(|(path, file)| (&*path, file)));
+
+        for (path, file) in files {
+            match open_log(path) {
+                Ok(opened) => {
+                    *file = opened;
+                    shared.note(&format!("reopened {}", path.display()));
+                }
+                Err(error) => {
+                    shared.note(&format!("could not reopen {}: {error}", path.display()));
+                }
             }
-            Err(error) => shared.note(&format!("could not reopen {}: {error}", path.display())),
         }
     }
 }
@@ -905,7 +939,7 @@ pub fn run(args: RelayArgs) -> anyhow::Result<()> {
     }
 
     let shared = Arc::new(Shared::new(args.queue, args.overflow));
-    let destination = Destination::open(args.log_file.as_deref())?;
+    let destination = Destination::open(args.log_file.as_deref(), args.also_log_file.as_deref())?;
 
     let writer = {
         let shared = Arc::clone(&shared);
@@ -1808,6 +1842,7 @@ mod tests {
             control: dir.path().join(CONTROL_SOCKET),
             host_output_fd: None,
             log_file: Some(log.clone()),
+            also_log_file: None,
             queue: DEFAULT_QUEUE,
             overflow: Overflow::DropOldest,
             release: None,
@@ -1869,6 +1904,7 @@ mod tests {
             control: dir.path().join("relay-0.sock"),
             host_output_fd: None,
             log_file: Some(log.clone()),
+            also_log_file: None,
             queue: DEFAULT_QUEUE,
             overflow: Overflow::DropOldest,
             release: None,
@@ -1919,6 +1955,7 @@ mod tests {
             control: dir.path().join("relay-0.sock"),
             host_output_fd: None,
             log_file: Some(dir.path().join("release.log")),
+            also_log_file: None,
             queue: DEFAULT_QUEUE,
             overflow: Overflow::DropOldest,
             release: None,

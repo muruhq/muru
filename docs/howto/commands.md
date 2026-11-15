@@ -195,9 +195,8 @@ through the daemon, `muructl run` or `muructl serve` when that shuts down,
 inside its shutdown budget when it has one. A second Ctrl-C or SIGTERM to
 a `muructl run` in development, while it waits for them, kills those
 commands at once. Something it started that has left its session, as a
-daemon does, is not stopped. Run a long command where the session will
-last, under `nohup`, `tmux` or a CI job, so a dropped connection does not
-stop it halfway.
+daemon does, is not stopped. A long command that should not depend on the
+session is run [detached](#running-a-long-command-detached).
 
 When `muructl` runs the command itself, because nothing serves the
 project, Ctrl-C, SIGTERM or the SIGHUP of its terminal closing stops the
@@ -216,6 +215,59 @@ A second Ctrl-C, SIGTERM or SIGHUP kills the command, and anything it
 started, at once. Output that `muructl` can no longer write, as when it
 is piped to `head`, stops the command the same way: `muructl` waits for
 it to end and exits with 1, saying why.
+
+## Running a long command detached
+
+`--detach` starts a run under the daemon and returns at once, printing
+the run's id:
+
+```console
+$ muructl command run shop backup --detach
+muru: started run 42; muructl command logs 42 --follow follows it
+$ muructl exec shop --detach -- python manage.py rebuild_index
+muru: started run 43; muructl command logs 43 --follow follows it
+```
+
+A detached run does not depend on the session that started it: closing
+the terminal or dropping the SSH connection leaves it running. It also
+outlives the daemon when the daemon stops without `--shutdown` or
+upgrades itself, as the hosts do, and the next daemon takes it over. A
+shutdown, `muructl daemon stop --shutdown`, stops it with the rest,
+inside the shutdown's budget. Its `timeout` applies as to any run.
+
+Follow a run's output with `muructl command logs`, which reads the run's
+own file and with `--follow` keeps printing until the run ends:
+
+```console
+$ muructl command logs 42 --follow
+2026-11-02T10:02:13.511Z [command backup] backing up 12,000 orders to s3://backups/shop
+2026-11-02T10:14:40.902Z [command backup] done
+2026-11-02T10:14:40.913Z [command backup] exited with status 0 after 12m27s
+```
+
+`--lines N` changes how many lines come first and `--no-timestamps`
+leaves the times off. `muructl command stop 42` stops a run under way as
+its timeout would: SIGTERM, then SIGKILL ten seconds later. It stops a
+run whose caller is waiting for it as well.
+
+`muructl command runs shop` lists the runs of the application's commands
+that the daemon keeps, those under way first, and `muructl command runs
+shop backup` those of one command; `exec` names the one-off commands'.
+`muructl command status 42` shows one:
+
+```console
+$ muructl command runs shop
+RUN    COMMAND  RELEASE  TRIGGER              STARTED              STATE
+43     exec     r7       manual               2026-11-02T10:05:01Z under way (detached, pid 52140)
+42     backup   r7       manual               2026-11-02T10:02:13Z exited with status 0 after 12m27s
+$ muructl command status 42
+run 42 of backup for shop@r7
+  started    2026-11-02T10:02:13Z by deploy, manual, detached
+  inputs     target=s3://backups/shop
+  ended      2026-11-02T10:14:40Z: it exited with status 0 after 12m27s
+  exit       0
+  output     apps/shop/commands/backup/42.log
+```
 
 ## What is recorded
 
@@ -241,6 +293,29 @@ $ muructl events
 A command that exits with a status other than 0, or is stopped, is a
 `command.failed` event. `muructl command list` shows each declared
 command's last run.
+
+The daemon keeps a record of every run, whether its caller waits for it
+or it runs detached: the command, the release, who asked and how
+(`manual` for `muructl command run` and `muructl exec`), the inputs with
+a secret's value as `***`, when it started and how it ended. Each run's
+output also goes to a file of its own, `apps/APP/commands/NAME/RUN.log`
+in the log directory, with the full UTC time on every line, which
+`muructl command logs RUN` reads. The last 20 runs of each command are
+kept, with their files; `keep_command_runs` in the daemon's `[daemon]`
+table changes how many, taking effect as each run ends:
+
+```toml
+[daemon]
+keep_command_runs = 50
+```
+
+An exclusive command's claim is kept with the runs: while a run of it
+has not ended, another is refused, naming the run under way, even after
+the daemon that started it has stopped. A run that a waiting caller
+started ends with the daemon that ran it, and if that daemon stopped
+without stopping it, the next daemon kills what is left of the run and
+records that it was stopped. An application with a run under way cannot
+be removed until the run ends.
 
 ## Which releases run commands
 
@@ -313,7 +388,8 @@ What differs by where a command runs:
 | `exclusive = true` | One run at a time for the application | One run at a time for that process | Not checked: one run at a time is up to what starts it, such as a Job with `parallelism: 1`, a Helm hook or the migration tool's own lock |
 | `--secret-input` | Read from the daemon's secret stores | Refused; give the value with `--input-stdin` | Refused; give the value with `--input-stdin` |
 | Output and events | The release's log and the events | That process's output | Standard output and standard error |
-| The last run in `muructl command list` | Kept | Not kept | Not kept |
+| The last run in `muructl command list`, and every run's record and output file | Kept | Not kept | Not kept |
+| `--detach` | Runs on under the daemon | Refused | Refused |
 
 A project whose `[tool.muru.env]` takes a value from a secret store is
 served by the daemon alone, and its commands are run there too. The

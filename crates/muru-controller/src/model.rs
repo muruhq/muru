@@ -634,6 +634,66 @@ pub struct CommandRun {
     pub message: String,
 }
 
+/// Section 9.12 (issue 688): a run of a command as the store keeps it,
+/// from its start, with the process it runs as, to how it ended.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunRecord {
+    /// Its id, which the store gives it.
+    pub id: u64,
+    /// The application.
+    pub app: String,
+    /// The release it runs with.
+    pub release: String,
+    /// The declared command's name, or `exec` for a one-off command.
+    pub name: String,
+    /// What started it: `manual`, `schedule`, `gate:before_fork` or
+    /// `gate:before_promote`.
+    pub trigger: String,
+    /// Who asked for it: a user, or `daemon` for a trigger of the daemon's
+    /// own.
+    pub requested_by: String,
+    /// Whether it was started detached, outliving its caller.
+    pub detached: bool,
+    /// Whether it holds the application's claim on its command, which
+    /// lasts until it has ended.
+    pub exclusive: bool,
+    /// Its inputs as its events show them, a secret's value as `***`.
+    pub inputs: String,
+    /// How long it may run, in milliseconds; 0 for no limit.
+    pub timeout_ms: u64,
+    /// When it started.
+    pub started_unix_ms: u64,
+    /// When it ended; 0 while it is under way.
+    pub ended_unix_ms: u64,
+    /// Its exit status, or 128 plus the signal that killed it.
+    pub exit_code: i32,
+    /// Whether it succeeded.
+    pub ok: bool,
+    /// How it ended.
+    pub message: String,
+    /// Its process, and that process's start time, which together name
+    /// it; 0 while not known.
+    pub pid: u32,
+    /// The process's start time.
+    pub start_time: u64,
+    /// The log relay a detached run runs under, and its start time; 0
+    /// for a run its caller's stream carries.
+    pub relay_pid: u32,
+    /// The relay's start time.
+    pub relay_start_time: u64,
+    /// Why it is being stopped, once a stop has been asked for.
+    pub stopping: String,
+    /// The directory of its own secret files, removed when it ends.
+    pub secrets: String,
+}
+
+impl RunRecord {
+    /// Whether it is still under way.
+    pub fn under_way(&self) -> bool {
+        self.ended_unix_ms == 0
+    }
+}
+
 /// Section 9.12: an input a command takes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandInputSpec {

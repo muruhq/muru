@@ -1458,6 +1458,11 @@ pub struct Daemon {
     /// variables override them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pass_env: Vec<String>,
+    /// How many runs of each of an application's commands are kept, with
+    /// their output, once they have ended; at least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 20))]
+    pub keep_command_runs: Option<u32>,
 }
 
 /// The `[tools]` table of the daemon's file (section 8.4): uv, and how
