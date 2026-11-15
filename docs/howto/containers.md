@@ -285,6 +285,7 @@ setting over it.
 | `--python PATH` | as above | the interpreter |
 | `--access-log WHAT` | `on` | `on`, `errors` (4xx and 5xx responses and requests slower than `--slow`) or `off` |
 | `--access-log-exclude PATTERN` | | paths left out of the access log, repeatable |
+| `--access-log-query WHAT` | `keep` | what the access log keeps of each [query string](logging.md#the-query-string): `keep`, `mask` or `drop` |
 | `--log-format FORMAT` | `text` | `text`, or `json` for a log collector |
 | `--timestamps` | off | the full UTC time in front of every line |
 | `--run-dir DIR` | `/run/muru` | where everything written at run time goes (also `MURU_RUN_DIR`) |

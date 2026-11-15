@@ -45,6 +45,7 @@ The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a muru.toml and i
 | `access_log` | string | `"on"` | Which requests the access log writes: `on` (the default), `errors` or `off`. |
 | `access_log_exclude` | array of strings |  | Paths left out of the access log. |
 | `access_log_file` | string |  | A file the access log's JSON lines go to in place of the terminal, relative to the project. |
+| `access_log_query` | string | `"keep"` | What the access log keeps of each request's query string: `keep` (the default), `mask` (secret parameters' values as `***`) or `drop` (the path alone). |
 | `compression` | boolean | `true` | Whether responses are compressed; `false` is `--no-compression`. |
 | `dashboard` | string | `127.0.0.1:8081`; off under `--allow-public` | The dashboard's address, or `off`. |
 | `env_file` | string |  | A `.env` file whose variables the run starts with, relative to the project. Its values override `[tool.muru.env]`. None is read unless this names one. |

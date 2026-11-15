@@ -573,6 +573,12 @@ struct RunArgs {
     #[arg(long = "access-log-exclude", value_name = "PATTERN")]
     access_log_exclude: Vec<String>,
 
+    /// What the access log keeps of each request's query string: keep (the
+    /// default), mask (the values of secret parameters such as token, as
+    /// ***) or drop (the path alone).
+    #[arg(long, value_name = "WHAT")]
+    access_log_query: Option<String>,
+
     /// Requests at least this slow count as errors for --access-log errors,
     /// for example 500ms or 2s (default 1s).
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
@@ -1731,6 +1737,8 @@ struct Serving {
     /// relative to the project.
     access_log_file: Option<PathBuf>,
     access_log_exclude: Vec<String>,
+    /// What the access log keeps of the query string.
+    access_log_query: muru_edge::access::Query,
     slow: Duration,
     /// The dashboard's address, off, or none for the default.
     dashboard: Option<String>,
@@ -1782,6 +1790,15 @@ impl Serving {
             (None, None) => Duration::from_secs(1),
         };
 
+        let query = args
+            .access_log_query
+            .as_deref()
+            .or(settings.access_log_query.as_deref())
+            .unwrap_or("keep");
+        let access_log_query = muru_edge::access::Query::parse(query).ok_or_else(|| {
+            anyhow::anyhow!("--access-log-query {query:?} is not keep, mask or drop")
+        })?;
+
         Ok(Self {
             port: port(args.port, &settings.port),
             https: !args.no_https && (args.https || settings.https == Some(true)),
@@ -1820,6 +1837,7 @@ impl Serving {
                 .clone()
                 .or_else(|| settings.access_log_file.as_deref().map(PathBuf::from)),
             access_log_exclude: strings(&settings.access_log_exclude, &args.access_log_exclude),
+            access_log_query,
             slow,
             dashboard: args
                 .dashboard
@@ -3159,6 +3177,7 @@ async fn run_with(
         muru_edge::access::Filter {
             slow: resolved.serving.slow,
             exclude: resolved.serving.access_log_exclude.clone(),
+            query: resolved.serving.access_log_query,
             ..muru_edge::access::Filter::default()
         },
     )?;

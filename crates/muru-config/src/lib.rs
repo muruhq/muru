@@ -1337,6 +1337,14 @@ pub struct Logs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "json"))]
     pub access_log_format: Option<String>,
+    /// What the access log's records keep of each request's query
+    /// string, in the target and the internal redirects, in either
+    /// format: `keep` (the default) writes it as it came, `mask` writes
+    /// the values of secret parameters, such as `token` or `password`,
+    /// as `***`, and `drop` writes the path alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "keep"))]
+    pub access_log_query: Option<String>,
 }
 
 /// Check an `access_log_format`: `json` or `combined`.
@@ -1345,6 +1353,16 @@ pub fn check_access_log_format(format: Option<&str>) -> Result<(), String> {
         None | Some("json" | "combined") => Ok(()),
         Some(other) => Err(format!(
             "access_log_format = {other:?} is not json or combined"
+        )),
+    }
+}
+
+/// Check an `access_log_query`: `keep`, `mask` or `drop`.
+pub fn check_access_log_query(query: Option<&str>) -> Result<(), String> {
+    match query {
+        None | Some("keep" | "mask" | "drop") => Ok(()),
+        Some(other) => Err(format!(
+            "access_log_query = {other:?} is not keep, mask or drop"
         )),
     }
 }
@@ -2162,6 +2180,11 @@ pub struct Host {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "`access_log_format` in `[logs]`"))]
     pub access_log_format: Option<String>,
+    /// What the host's records keep of the query string: `keep`, `mask`
+    /// or `drop`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`access_log_query` in `[logs]`"))]
+    pub access_log_query: Option<String>,
     /// A file in the daemon's log directory that takes the host's
     /// records in place of `access.log`, for example `shop.log`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5412,6 +5435,12 @@ pub struct RunSettings {
     /// Paths left out of the access log.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_log_exclude: Vec<String>,
+    /// What the access log keeps of each request's query string: `keep`
+    /// (the default), `mask` (secret parameters' values as `***`) or
+    /// `drop` (the path alone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "keep"))]
+    pub access_log_query: Option<String>,
     /// How long a request may take before `errors` shows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "1s"))]
@@ -5466,6 +5495,10 @@ impl RunSettings {
                 .clone()
                 .or_else(|| self.access_log_file.clone()),
             access_log_exclude: join(&self.access_log_exclude, &over.access_log_exclude),
+            access_log_query: over
+                .access_log_query
+                .clone()
+                .or_else(|| self.access_log_query.clone()),
             slow: over.slow.clone().or_else(|| self.slow.clone()),
             dashboard: over.dashboard.clone().or_else(|| self.dashboard.clone()),
             compression: over.compression.or(self.compression),
@@ -5490,6 +5523,7 @@ impl RunSettings {
         }
 
         check_access_log(self.access_log.as_deref(), self.slow.as_deref())?;
+        check_access_log_query(self.access_log_query.as_deref())?;
 
         if let Some(dashboard) = &self.dashboard
             && dashboard != "off"
@@ -5606,6 +5640,11 @@ pub struct ServeSettings {
     /// Paths left out of the access log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_log_exclude: Option<Vec<String>>,
+    /// What the access log keeps of each request's query string: `keep`,
+    /// `mask` or `drop`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "keep"))]
+    pub access_log_query: Option<String>,
     /// How slow a request is to count as an error for `access_log = "errors"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "1s"))]

@@ -5725,6 +5725,10 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             names.push_str(&format!(" [access records {own}]"));
         }
 
+        if !host.access_log_query.is_empty() {
+            names.push_str(&format!(" [access query {}]", host.access_log_query));
+        }
+
         if !host.compression.is_empty() {
             names.push_str(&format!(" [compression {}]", host.compression));
         }

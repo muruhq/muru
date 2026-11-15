@@ -1311,6 +1311,11 @@ fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: 
             valid = false;
         }
 
+        if let Err(error) = muru_config::check_access_log_query(host.access_log_query.as_deref()) {
+            plan.errors.push(format!("host {name}: {error}"));
+            valid = false;
+        }
+
         if let Some(file) = &host.access_log_file {
             if let Err(error) = muru_config::check_access_log_file(file) {
                 plan.errors.push(format!("host {name}: {error}"));
@@ -6866,6 +6871,7 @@ mod tests {
                 slow: std::time::Duration::from_millis(250),
                 exclude: vec!["/static/*".to_owned(), "/healthz".to_owned()],
                 format: muru_edge::access::Format::Json,
+                query: muru_edge::access::Query::Keep,
             }
         );
 

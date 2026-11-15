@@ -1176,6 +1176,7 @@ message Host {
   bool maintenance = 17;              // the edge serves the maintenance page for the host (section 4.12)
   string access_log_format = 18;      // how the host's access records are written, when it says: json or combined
   string access_log_file = 19;        // the file in the log directory that takes the host's access records, when it names one
+  string access_log_query = 20;       // what the host's access records keep of the query string, when it says: keep, mask or drop
 }
 
 message ListRoutesRequest {}

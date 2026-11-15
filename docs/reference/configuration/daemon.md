@@ -481,6 +481,7 @@ A virtual host, the `[host.NAME]` table.
 | `access_log_exclude` | array of strings |  | Paths whose requests the access log leaves out, besides those the `[logs]` table leaves out. |
 | `access_log_file` | string |  | A file in the daemon's log directory that takes the host's records in place of `access.log`, for example `shop.log`. |
 | `access_log_format` | string | `access_log_format` in `[logs]` | How the host's records are written: `json` or `combined`. |
+| `access_log_query` | string | `access_log_query` in `[logs]` | What the host's records keep of the query string: `keep`, `mask` or `drop`. |
 | `canonical` | string |  | The name the host is known by, for `use_canonical_name`. |
 | `canonical_redirect` | boolean | `false` | Redirect requests for the host's other names to the canonical name. |
 | `compression` | table, {ref}`[compression] <config-daemon-compression>` |  | How responses to the host's requests are compressed, each key replacing the daemon's `[compression]` value. A route's own replace them. |
@@ -661,6 +662,7 @@ The `[logs]` table of the daemon's file: how the daemon rotates the log files it
 | `access_log` | string | `"on"` | Which requests the access log writes: `on` (the default), `errors` (4xx and 5xx responses, requests at least `slow`, and WebSockets that closed other than normally or going away) or `off`. Requests not written are still counted in the metrics and shown on the dashboard. |
 | `access_log_exclude` | array of strings |  | Paths whose requests the access log leaves out: `*` matches any run of characters and `?` one, for example `/static/*`. |
 | `access_log_format` | string | `"json"` | How the access log's records are written: `json` (the default), one object a line, or `combined`, the combined log format of Apache and nginx. |
+| `access_log_query` | string | `"keep"` | What the access log's records keep of each request's query string, in the target and the internal redirects, in either format: `keep` (the default) writes it as it came, `mask` writes the values of secret parameters, such as `token` or `password`, as `***`, and `drop` writes the path alone. |
 | `compress` | string | `"zstd"` | How archives are compressed: `zstd` (the default), `gzip` or `off`. |
 | `every` | string | `"daily"` | Rotate by the clock: `off`, `hourly`, `daily` (the default) or `weekly`, at the period's start in UTC. |
 | `keep` | integer | `14` | Archives kept per log. |

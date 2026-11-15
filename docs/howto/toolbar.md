@@ -340,7 +340,8 @@ one name. These names are secrets: `password`, `passwd`, `pwd`,
 `phpsessid`, `sig`, `signature`, `X-Amz-Signature`,
 `X-Amz-Security-Token` and `X-Goog-Signature`, and any name ending in
 `token`, `secret`, `password` or `passwd`, such as `csrf_token`. The
-access log writes the query as it came.
+access log writes the query as it came unless
+[`access_log_query`](logging.md#the-query-string) masks or drops it.
 
 ## From the command line
 

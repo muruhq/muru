@@ -86,6 +86,11 @@
           "description": "A file the access log's JSON lines go to in place of the terminal, relative to the project.",
           "type": "string"
         },
+        "access_log_query": {
+          "default": "keep",
+          "description": "What the access log keeps of each request's query string: `keep` (the default), `mask` (secret parameters' values as `***`) or `drop` (the path alone).",
+          "type": "string"
+        },
         "compression": {
           "default": true,
           "description": "Whether responses are compressed; `false` is `--no-compression`.",
