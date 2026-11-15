@@ -648,6 +648,8 @@ follows the same rule: once a file is renamed away, its writer opens it
 again by name, so lines go to a new file and the renamed one is
 complete. The edge reopens the access log, the files virtual hosts name
 and its own `edge.log`, each release's log relay its release's file,
+each [detached command run](commands.md#running-a-long-command-detached)'s
+relay its release's file and its own output file,
 and a background daemon its own log. Lines written between the rename
 and the reopen
 land in the renamed file, and none are lost.
@@ -679,7 +681,7 @@ seconds after the rename, and without it logrotate compresses the
 renamed file at once and deletes it, so the lines written in those
 seconds are lost. A `postrotate` that runs `muructl logs reopen` makes
 the reopen immediate, and then `delaycompress` can go: the command
-returns once the edge and every release's log relay have opened their
+returns once the edge and every release's and detached run's log relay have opened their
 files again, so the renamed files are complete when logrotate
 compresses them. A writer that has not answered within five seconds no
 longer holds the command up.
@@ -739,15 +741,24 @@ longer exists. `--json` prints the same for scripts:
 $ muructl logs list
 LOG                                           SIZE           ARCHIVES     TOTAL
 access.log                                  5.2GB          3 (61.0MB)     5.3GB
+apps/shop/commands/backup/                      -     20 runs (1.2GB)     1.2GB
 apps/shop/r3.log                           12.0MB                   -    12.0MB
 apps/shop/r1.log                          570.0MB           1 (9.0MB)   579.0MB  orphaned
 edge.log                                    4.0KB                   -     4.0KB
-total 5.9GB, in /var/log/muru
+total 7.1GB, in /var/log/muru
 ```
 
+The output of each [command run](commands.md#what-is-recorded) is a file
+of its own, and a command's files are listed together on one line, by
+the command's directory, with how many runs they are and what they take.
+They are the run's records: the daemon keeps the last
+`keep_command_runs` runs of each command with their files, so `muructl
+logs truncate` and `muructl logs rotate` leave them alone.
+
 `--archives` lists each archive on a line of its own under its log,
-oldest first, with its size and when it was last written, in UTC. A log
-whose file is gone and only has archives shows `-` for its size and time:
+oldest first, with its size and when it was last written, in UTC, and
+each run's file under its command, the oldest run first. A log whose
+file is gone and only has archives shows `-` for its size and time:
 
 ```console
 $ muructl logs list --archives
@@ -765,8 +776,8 @@ total 5.9GB, in /var/log/muru
 
 An application, `APP@RELEASE`, `--access` or `--host HOST` narrows the
 list to those logs, with the total of those alone: an application
-lists the logs of all its releases, and `--host HOST` the file the host
-names for its records. A target with no log is refused. The same
+lists the logs of all its releases and its commands' runs' files, and
+`--host HOST` the file the host names for its records. A target with no log is refused. The same
 targets narrow the `--json` output.
 
 ```console
@@ -836,3 +847,9 @@ Remove 3 files, freeing 640.0MB? [y/N]
 `--orphaned` needs the state store, which `--state-dir` names when no
 daemon is running. A release or virtual host that still exists keeps
 its log.
+
+A command's runs' files are left alone by `--keep` and `--older-than`,
+since the daemon keeps its runs by `keep_command_runs`. `--orphaned`
+removes those of an application that no longer exists, and any run's
+file the daemon no longer keeps a record of, which `--archives` marks
+`orphaned`; a command's directory goes with its last file.

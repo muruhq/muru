@@ -125,7 +125,11 @@ log and its own file, and `command.started` and `command.finished` or
 `command.failed` events, with a `release.gate_passed` event when it
 passes. The gates of a stage run one after another, in the order of
 their names. While a `before_fork` gate runs, the release is `warming`,
-and the deploy waits for it.
+and the deploy waits for it. The daemon goes on with everything else
+meanwhile: `muructl status`, deploys of other applications and the
+daemon's own checks answer as usual. A drain of the release cancels its
+start, stopping the gate's run and the host; a scale of it is refused
+until it is ready.
 
 Gates run under the daemon only: `muructl run` and `muructl serve` run
 none. `muructl serve` cannot know how many replicas of its pod there

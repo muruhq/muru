@@ -51,7 +51,7 @@ run = ["python", "-c", "import time; print('up', flush=True); time.sleep(60)"]
 [tool.muru.commands.long]
 run = [
     "python", "-c",
-    "import sys, time; print('first', flush=True); time.sleep(6); print('last'); sys.exit(3)",
+    "import sys, time; print('first', flush=True); time.sleep(8); print('last'); sys.exit(3)",
 ]
 """
 
@@ -270,6 +270,12 @@ def test_a_detached_run_outlives_its_caller_and_a_daemon_restart(tmp_path: Path)
         status = json.loads(daemon.muructl("command", "status", str(run), "--json").stdout)
         assert status["under_way"], status
 
+        # The release's log is rotated while the run writes to it: its
+        # relay opens the new file, so its last line lands there.
+
+        rotated = json.loads(daemon.muructl("logs", "rotate", "ops@r1", "--json").stdout)
+        assert rotated["logs"][0]["error"] == "", rotated
+
         # Its end is recorded with its exit status, and its output is in
         # its own file with the time on every line.
 
@@ -283,12 +289,15 @@ def test_a_detached_run_outlives_its_caller_and_a_daemon_restart(tmp_path: Path)
         assert (status["exit_code"], status["ok"], status["trigger"]) == (3, False, "manual")
         assert status["message"].startswith("exited with status 3 after "), status
         output = daemon.muructl("command", "logs", str(run)).stdout.splitlines()
-        assert [line.split(" ", 1)[1] for line in output[:2]] == [
+        lines = [line.split(" ", 1)[1] for line in output if "muru.relay[" not in line]
+        assert lines[:2] == [
             "[command long] first",
             "[command long] last",
         ], output
         assert all(line[:4].isdigit() and line[23] == "Z" for line in output), output
-        assert "[command long] first" in daemon.muructl("logs", "ops").stdout
+        release_log = daemon.muructl("logs", "ops").stdout
+        assert "[command long] last" in release_log, release_log
+        assert "[command long] first" not in release_log, release_log
 
         # Removing the application takes the runs' output with it.
 

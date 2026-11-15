@@ -80,7 +80,7 @@ def test_rollbacks_under_load(daemon: Daemon) -> None:
 def test_cold_rollback_under_load(daemon: Daemon) -> None:
     daemon.deploy("shop", SHOP)
     daemon.deploy("shop", SHOP, "--retain", "0")
-    assert daemon.releases("shop")[1]["state"] == "stopped"
+    daemon.wait_for_state("shop@r1", "stopped")
 
     # The previous release is stopped, so the rollback starts it again
     # before traffic moves; the release it leaves is retained warm.

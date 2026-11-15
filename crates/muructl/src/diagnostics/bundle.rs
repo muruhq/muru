@@ -1287,6 +1287,12 @@ impl<W: Write> Bundle<'_, W> {
                 continue;
             }
 
+            // A command run's lines are in its release's log too.
+
+            if log.kind == Kind::Commands {
+                continue;
+            }
+
             for found in stretches(&directory, log, self.window) {
                 match found {
                     Ok(stretch) => self.stretch(log, stretch)?,

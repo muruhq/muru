@@ -8696,9 +8696,14 @@ impl LogsListArgs {
         if let Some(target) = &self.target {
             let (app, release) = target.split_once('@').unwrap_or((target, ""));
 
-            return log.kind == "release"
-                && log.app == app
-                && (release.is_empty() || log.release == release);
+            // An application alone lists its commands' runs too, which
+            // belong to no one release.
+
+            return match log.kind.as_str() {
+                "release" => log.app == app && (release.is_empty() || log.release == release),
+                "commands" => log.app == app && release.is_empty(),
+                _ => false,
+            };
         }
 
         if let Some(host) = &self.host {
@@ -9177,7 +9182,16 @@ fn print_logs(report: &pb::ListLogsResponse) {
     );
 
     for log in &report.logs {
-        let archives = if log.archives.is_empty() {
+        // A command's runs' files are listed as its archives are.
+
+        let archives = if log.kind == "commands" {
+            format!(
+                "{} run{} ({})",
+                log.archives.len(),
+                if log.archives.len() == 1 { "" } else { "s" },
+                human_size(log.archives_size)
+            )
+        } else if log.archives.is_empty() {
             "-".to_owned()
         } else {
             format!("{} ({})", log.archives.len(), human_size(log.archives_size))
@@ -9234,10 +9248,11 @@ fn print_archives(report: &pb::ListLogsResponse) {
 
         for archive in &log.archives {
             println!(
-                "{:<width$} {:>9}  {}",
+                "{:<width$} {:>9}  {}{}",
                 format!("  {}", archive.name),
                 human_size(archive.size),
-                format_time(archive.modified_unix_ms)
+                format_time(archive.modified_unix_ms),
+                if archive.orphaned { "  orphaned" } else { "" }
             );
         }
     }

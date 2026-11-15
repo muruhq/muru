@@ -18,6 +18,10 @@ use crate::store::{Store, StoreError};
 pub struct Existing {
     releases: HashSet<(String, String)>,
     hosts: HashMap<String, Vec<String>>,
+    /// The applications, whose command runs' files are theirs.
+    apps: HashSet<String>,
+    /// The runs the store keeps, by id (issue 692).
+    runs: HashSet<u64>,
 }
 
 impl Existing {
@@ -29,8 +33,20 @@ impl Existing {
                 .releases
                 .contains(&(log.app.clone(), log.release.clone())),
             Kind::Host => !self.hosts.contains_key(&log.name),
+            Kind::Commands => !self.apps.contains(&log.app),
             _ => false,
         }
+    }
+
+    /// Whether a run's file has no run the store keeps, on a later
+    /// reading of the store.
+    fn still_orphaned_run(&self, archive: &Archive) -> bool {
+        self.still_orphaned_run_name(&archive.name)
+    }
+
+    /// Whether the run whose file this is has no record in the store.
+    fn still_orphaned_run_name(&self, name: &str) -> bool {
+        run_id(name).is_none_or(|id| !self.runs.contains(&id))
     }
 
     /// The releases and the virtual hosts' files the store records.
@@ -48,8 +64,18 @@ impl Existing {
             }
         }
 
-        Ok(Self { releases, hosts })
+        Ok(Self {
+            releases,
+            hosts,
+            apps: store.apps()?.into_iter().map(|app| app.name).collect(),
+            runs: store.run_ids()?,
+        })
     }
+}
+
+/// A run's id, from its file's name: `apps/APP/commands/NAME/RUN.log`.
+fn run_id(name: &str) -> Option<u64> {
+    name.rsplit('/').next()?.strip_suffix(".log")?.parse().ok()
 }
 
 /// One archive of a log.
@@ -61,6 +87,8 @@ pub struct Archive {
     pub size: u64,
     /// When it was last changed.
     pub modified: SystemTime,
+    /// For a run's file: no run the store keeps has it (issue 692).
+    pub orphaned: bool,
 }
 
 /// What writes a log.
@@ -76,6 +104,9 @@ pub enum Kind {
     Host,
     /// A release's output.
     Release,
+    /// The files of a command's runs, one for each run the daemon keeps
+    /// (issue 692), listed as the log's archives.
+    Commands,
 }
 
 impl Kind {
@@ -87,6 +118,7 @@ impl Kind {
             Kind::Daemon => "daemon",
             Kind::Host => "host",
             Kind::Release => "release",
+            Kind::Commands => "commands",
         }
     }
 }
@@ -164,6 +196,50 @@ pub fn list(directory: &Path, existing: Option<&Existing>) -> io::Result<Vec<Log
             let classify =
                 |base: &str, existing: Option<&Existing>| release_log(&app, base, existing);
             add(&mut logs, &qualified, &metadata, existing, classify);
+        }
+
+        // Issue 692: each command's runs' files, as one log of its own.
+
+        let commands = app_directory.join("commands");
+
+        for command in subdirectories(&commands)? {
+            let mut runs: Vec<Archive> = regular_files(&commands.join(&command))?
+                .into_iter()
+                .filter(|(name, _)| run_id(name).is_some())
+                .map(|(name, metadata)| {
+                    let name = format!("apps/{app}/commands/{command}/{name}");
+
+                    Archive {
+                        orphaned: existing
+                            .is_some_and(|existing| existing.still_orphaned_run_name(&name)),
+                        name,
+                        size: metadata.len(),
+                        modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+                    }
+                })
+                .collect();
+
+            if runs.is_empty() {
+                continue;
+            }
+
+            runs.sort_by_key(|run| run_id(&run.name));
+            let name = format!("apps/{app}/commands/{command}/");
+            logs.insert(
+                name.clone(),
+                LogFile {
+                    name,
+                    kind: Kind::Commands,
+                    app: app.clone(),
+                    release: command,
+                    hosts: Vec::new(),
+                    size: 0,
+                    present: false,
+                    modified: UNIX_EPOCH,
+                    archives: runs,
+                    orphaned: existing.is_some_and(|existing| !existing.apps.contains(&app)),
+                },
+            );
         }
     }
 
@@ -311,6 +387,7 @@ fn add(
             name: name.to_owned(),
             size: metadata.len(),
             modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+            orphaned: false,
         });
         log.archives.sort_by(|a, b| a.name.cmp(&b.name));
     } else {
@@ -352,6 +429,7 @@ fn log_info(log: &LogFile) -> pb::LogInfo {
                 name: archive.name.clone(),
                 size: archive.size,
                 modified_unix_ms: unix_ms(archive.modified),
+                orphaned: archive.orphaned,
             })
             .collect(),
         archives_size: log.archives_size(),
@@ -404,7 +482,13 @@ pub fn select<'a>(logs: &'a [LogFile], target: &pb::LogTarget) -> Result<Vec<&'a
             .ok_or_else(|| format!("no log for {}@{}", target.app, target.release));
     }
 
-    Ok(logs.iter().filter(|log| log.present).collect())
+    // Issue 692: a command's runs' files are each written once and kept
+    // whole as the run's record, so they are never cut or rotated.
+
+    Ok(logs
+        .iter()
+        .filter(|log| log.present && log.kind != Kind::Commands)
+        .collect())
 }
 
 /// What a prune removes: archives by count or age and, with `orphaned`,
@@ -451,6 +535,24 @@ pub fn plan_prune(
             continue;
         }
 
+        // Issue 692: the daemon keeps a command's runs, with their files,
+        // by [daemon] keep_command_runs, so a prune by count or age leaves
+        // them; only a run's file whose run it no longer keeps is orphaned.
+
+        if log.kind == Kind::Commands {
+            if rules.orphaned {
+                removed.extend(
+                    log.archives
+                        .iter()
+                        .filter(|run| run.orphaned)
+                        .filter(|run| latest.is_none_or(|latest| latest.still_orphaned_run(run)))
+                        .map(|run| file(&run.name, run.size, "orphaned")),
+                );
+            }
+
+            continue;
+        }
+
         let by_keep = rules
             .keep
             .map_or(0, |keep| log.archives.len().saturating_sub(keep as usize));
@@ -492,8 +594,20 @@ pub fn carry_out_prune(directory: &Path, planned: &mut [pb::PrunedFile]) {
         }
     }
 
+    // Each directory left empty goes, up to the log directory: a command's
+    // run directory, then its application's `commands`, then the
+    // application's own.
+
     for parent in parents {
-        let _ = std::fs::remove_dir(parent);
+        let mut empty = Some(parent.as_path());
+
+        while let Some(dir) = empty.filter(|dir| *dir != directory) {
+            if std::fs::remove_dir(dir).is_err() {
+                break;
+            }
+
+            empty = dir.parent();
+        }
     }
 }
 
@@ -876,7 +990,96 @@ mod tests {
         Existing {
             releases: HashSet::from([("shop".to_owned(), "r1".to_owned())]),
             hosts: HashMap::from([("own.log".to_owned(), vec!["shop.example".to_owned()])]),
+            apps: HashSet::from(["shop".to_owned()]),
+            runs: HashSet::from([41, 42]),
         }
+    }
+
+    #[test]
+    fn a_commands_runs_list_as_one_log_pruned_only_of_runs_no_longer_kept() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
+
+        write(directory, "apps/shop/r1.log", 6);
+        write(directory, "apps/shop/commands/backup/41.log", 10);
+        write(directory, "apps/shop/commands/backup/42.log", 20);
+        write(directory, "apps/shop/commands/backup/7.log", 5);
+        write(directory, "apps/shop/commands/backup/notes.txt", 1);
+        write(directory, "apps/gone/commands/migrate/3.log", 4);
+
+        let logs = list(directory, Some(&existing())).unwrap();
+        let names: Vec<&str> = logs.iter().map(|log| log.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "apps/gone/commands/migrate/",
+                "apps/shop/commands/backup/",
+                "apps/shop/r1.log"
+            ]
+        );
+
+        // A command's runs are its archives, in the order of their ids,
+        // and count in its total; one the store no longer keeps is marked.
+
+        let backup = &logs[1];
+        assert_eq!(backup.kind, Kind::Commands);
+        assert_eq!(
+            (backup.app.as_str(), backup.release.as_str()),
+            ("shop", "backup")
+        );
+        let runs: Vec<(&str, bool)> = backup
+            .archives
+            .iter()
+            .map(|run| (run.name.as_str(), run.orphaned))
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                ("apps/shop/commands/backup/7.log", true),
+                ("apps/shop/commands/backup/41.log", false),
+                ("apps/shop/commands/backup/42.log", false)
+            ]
+        );
+        assert_eq!(backup.total(), 35);
+        assert!(!backup.orphaned && logs[0].orphaned);
+
+        // Truncating or rotating every log leaves them alone.
+
+        let all = select(&logs, &pb::LogTarget::default()).unwrap();
+        assert_eq!(
+            all.iter().map(|log| log.name.as_str()).collect::<Vec<_>>(),
+            ["apps/shop/r1.log"]
+        );
+
+        // A prune by count or age leaves runs the daemon keeps; one of
+        // orphans removes the gone application's and the forgotten run.
+
+        let old = PruneRules {
+            keep: Some(0),
+            older_than: Some(SystemTime::now() + std::time::Duration::from_secs(60)),
+            orphaned: false,
+        };
+        assert!(plan_prune(&logs, &old, None).is_empty());
+
+        let orphans = PruneRules {
+            orphaned: true,
+            ..PruneRules::default()
+        };
+        let mut removed = plan_prune(&logs, &orphans, Some(&existing()));
+        let names: Vec<&str> = removed.iter().map(|file| file.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "apps/gone/commands/migrate/3.log",
+                "apps/shop/commands/backup/7.log"
+            ]
+        );
+
+        // The gone application's directories go with its last file.
+
+        carry_out_prune(directory, &mut removed);
+        assert!(!directory.join("apps/gone").exists());
+        assert!(directory.join("apps/shop/commands/backup/41.log").exists());
     }
 
     #[test]
