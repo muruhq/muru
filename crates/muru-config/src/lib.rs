@@ -2903,11 +2903,26 @@ pub struct Overlay {
     /// higher. Overlays that would conflict must both set one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
-    /// Once its schedule activates it, it stays active past the window
-    /// until a person ends it.
+    /// Once its schedule or its condition activates it, it stays active,
+    /// past the window or the condition resolving, until a person ends it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub latch: Option<bool>,
+    /// For an overlay its condition activates: the least it stays active,
+    /// however soon the condition resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "5m"))]
+    pub min_active: Option<String>,
+    /// For an overlay its condition activates: how long after it ends its
+    /// condition cannot activate it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10m"))]
+    pub cooldown: Option<String>,
+    /// For an overlay its condition activates: the most activations by
+    /// its condition in an hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 4))]
+    pub max_per_hour: Option<u32>,
     /// Its schedule only raises overlay.would_activate events; it is
     /// activated by hand only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3125,7 +3140,7 @@ impl CapacitySchedule {
             apps: BTreeMap::from([(app.to_owned(), change)]),
             trigger: Some(OverlayTrigger {
                 schedule: Some(schedule),
-                external: None,
+                ..OverlayTrigger::default()
             }),
             warm_up: self.warm_up.clone().map(|lead| WarmUp {
                 lead,
@@ -3171,6 +3186,10 @@ pub struct OverlayTrigger {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub external: Option<bool>,
+    /// A named condition: the overlay is active while it is firing, and
+    /// ends once it has resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
 }
 
 /// A window in time: one-off, from `start` until `end` when it has one,
@@ -3207,6 +3226,10 @@ pub struct Preconditions {
     /// the overlay changes routes of one application only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_ready: Option<String>,
+    /// A path the `release_ready` release must answer with 2xx or 3xx,
+    /// asked through the edge, such as /healthz.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<String>,
 }
 
 /// Check an overlay on its own: its name, the changes, the schedule and
@@ -3249,10 +3272,76 @@ pub fn check_overlay(name: &str, overlay: &Overlay) -> Result<(), String> {
             .map_err(|error| format!("overlay {name}: apps.{app}: {error}"))?;
     }
 
-    if (overlay.latch.is_some() || overlay.advisory.is_some()) && schedule.is_none() {
+    let condition = overlay
+        .trigger
+        .as_ref()
+        .and_then(|trigger| trigger.condition.as_deref());
+
+    if let Some(condition) = condition {
+        if schedule.is_some() {
+            return Err(format!(
+                "overlay {name}: a condition and a schedule do not go together; an overlay has one trigger of its own besides external"
+            ));
+        }
+
+        if !valid_name(condition) {
+            return Err(format!(
+                "overlay {name}: condition {condition:?} is not a condition's name"
+            ));
+        }
+    }
+
+    if overlay.latch.is_some() && schedule.is_none() && condition.is_none() {
         return Err(format!(
-            "overlay {name}: latch and advisory apply to a schedule, and it has none"
+            "overlay {name}: latch applies to a schedule or a condition, and it has neither"
         ));
+    }
+
+    if overlay.advisory.is_some() && schedule.is_none() {
+        return Err(format!(
+            "overlay {name}: advisory applies to a schedule, and it has none; a condition's own events say when it would act"
+        ));
+    }
+
+    for (key, value) in [
+        ("min_active", &overlay.min_active),
+        ("cooldown", &overlay.cooldown),
+    ] {
+        if let Some(text) = value {
+            if condition.is_none() {
+                return Err(format!(
+                    "overlay {name}: {key} applies to an overlay a condition activates"
+                ));
+            }
+
+            parse_duration(text).map_err(|error| format!("overlay {name}: {key}: {error}"))?;
+        }
+    }
+
+    if overlay.max_per_hour.is_some() && condition.is_none() {
+        return Err(format!(
+            "overlay {name}: max_per_hour applies to an overlay a condition activates"
+        ));
+    }
+
+    if overlay.max_per_hour == Some(0) {
+        return Err(format!("overlay {name}: max_per_hour is at least 1"));
+    }
+
+    if let Some(preconditions) = &overlay.preconditions
+        && let Some(probe) = &preconditions.probe
+    {
+        if preconditions.release_ready.is_none() {
+            return Err(format!(
+                "overlay {name}: preconditions.probe needs release_ready, the release it asks"
+            ));
+        }
+
+        if !probe.starts_with('/') {
+            return Err(format!(
+                "overlay {name}: preconditions.probe is a path, such as /healthz"
+            ));
+        }
     }
 
     Ok(())
@@ -6489,7 +6578,27 @@ mod tests {
             ),
             (
                 "apps.shop = { maintenance = true }\nlatch = true",
-                "latch and advisory apply to a schedule",
+                "latch applies to a schedule or a condition",
+            ),
+            (
+                "apps.shop = { maintenance = true }\nadvisory = true\ntrigger = { condition = 'c' }",
+                "advisory applies to a schedule",
+            ),
+            (
+                "apps.shop = { maintenance = true }\ncooldown = '1m'",
+                "cooldown applies to an overlay a condition activates",
+            ),
+            (
+                "apps.shop = { maintenance = true }\ntrigger = { condition = 'c', schedule = { cron = '@daily', duration = '1h' } }",
+                "do not go together",
+            ),
+            (
+                "apps.shop = { maintenance = true }\npreconditions = { probe = '/healthz' }",
+                "probe needs release_ready",
+            ),
+            (
+                "apps.shop = { maintenance = true }\npreconditions = { release_ready = 'r2', probe = 'healthz' }",
+                "is a path",
             ),
             ("apps.shop = {}", "apps.shop: sets nothing"),
             ("apps.shop = { min_workers = 0 }", "at least 1"),

@@ -1906,6 +1906,13 @@ impl Admin for Service {
             .map(|state| (state.name.clone(), state))
             .collect();
         let now = crate::model::now_unix_ms();
+        let conditions = self
+            .handle
+            .info
+            .conditions
+            .lock()
+            .expect("conditions poisoned")
+            .clone();
         let overlays = store
             .overlays()
             .map_err(internal)?
@@ -1913,7 +1920,17 @@ impl Admin for Service {
             .map(|(name, overlay)| {
                 let state = states.get(&name);
                 let window = crate::overlays::window(&overlay, now);
+                let condition = crate::overlays::condition(&overlay)
+                    .unwrap_or_default()
+                    .to_owned();
+                let condition_state = conditions
+                    .iter()
+                    .find(|status| status.name == condition)
+                    .map(|status| status.state.as_str().to_owned())
+                    .unwrap_or_default();
                 pb::OverlayInfo {
+                    condition,
+                    condition_state,
                     active: state.is_some_and(|state| state.active),
                     state: state.map(|state| state.source.clone()).unwrap_or_default(),
                     since_unix_ms: state.map_or(0, |state| state.since_unix_ms),
@@ -2005,8 +2022,45 @@ impl Admin for Service {
             .map(|(app, _)| app)
             .collect();
         let maintenance = crate::overlays::apply_maintenance(&base, &active);
+
+        // Issue 689: the condition it follows, and that condition's terms
+        // now.
+
+        let condition = crate::overlays::condition(&overlay)
+            .unwrap_or_default()
+            .to_owned();
+        let status = self
+            .handle
+            .info
+            .conditions
+            .lock()
+            .expect("conditions poisoned")
+            .iter()
+            .find(|status| status.name == condition)
+            .cloned();
+        let condition_terms = status
+            .as_ref()
+            .map(|status| {
+                status
+                    .terms
+                    .iter()
+                    .map(|(term, value)| match value {
+                        crate::conditions::Value::Known(value) => format!("{term} is {value}"),
+                        crate::conditions::Value::Unknown(why) => {
+                            format!("{term} is unknown: {why}")
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(Response::new(pb::PreviewOverlayResponse {
             changes: crate::overlays::preview(&overlay, &routes, &maintenance),
+            condition_state: status
+                .map(|status| status.state.as_str().to_owned())
+                .unwrap_or_default(),
+            condition,
+            condition_terms,
         }))
     }
 

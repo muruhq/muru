@@ -1375,6 +1375,10 @@ struct Daemon {
     /// by application and command, with the schedule it was worked out
     /// from.
     schedules: HashMap<(String, String), Scheduled>,
+    /// Section 9.10 (issue 689): the overlays whose activation by their
+    /// firing condition was skipped, so the event is raised once while the
+    /// condition keeps firing.
+    condition_skips: BTreeSet<String>,
     /// Whether this daemon started from nothing, with no edge left by a
     /// previous one to take over: its first start, after a reboot or
     /// after a shutdown. Commands with `at_boot` run then.
@@ -1537,6 +1541,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 budget: settings.budget,
                 ..crate::budget::View::default()
             },
+            conditions: settings.conditions.clone(),
             ..client_rules.defined()
         }),
         python_logging: std::sync::RwLock::new(settings.python_logging.clone()),
@@ -1760,6 +1765,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         asked: HashMap::new(),
         last_request: 0,
         schedules: HashMap::new(),
+        condition_skips: BTreeSet::new(),
         booted,
         cgroup: crate::cgroup::Limits::read(),
         guard: crate::guard::Guard::default(),
@@ -3146,6 +3152,7 @@ impl Daemon {
 
         let mut defined = self.client_rules.defined();
         defined.budget = self.budget_view(self.budget_usage());
+        defined.conditions = self.file_conditions.clone();
         *self.info.defined.write().expect("defined names poisoned") = defined;
         let pass_env_was = std::mem::replace(
             &mut *self.info.pass_env.write().expect("pass_env poisoned"),
@@ -3485,7 +3492,7 @@ impl Daemon {
     }
 
     /// Section 9.10: whether an overlay's preconditions hold, or why not.
-    fn overlay_preconditions(&self, overlay: &muru_config::Overlay) -> Result<(), String> {
+    async fn overlay_preconditions(&self, overlay: &muru_config::Overlay) -> Result<(), String> {
         let Some(ready) = overlay
             .preconditions
             .as_ref()
@@ -3509,13 +3516,51 @@ impl Daemon {
 
         match self.store.release(&app, &id) {
             Ok(release)
-                if matches!(release.state, ReleaseState::Ready | ReleaseState::Retained) =>
-            {
-                Ok(())
-            }
-            Ok(release) => Err(format!("{app}@{id} is {}, not ready", release.state)),
-            Err(_) => Err(format!("{app}@{id} does not exist")),
+                if matches!(release.state, ReleaseState::Ready | ReleaseState::Retained) => {}
+            Ok(release) => return Err(format!("{app}@{id} is {}, not ready", release.state)),
+            Err(_) => return Err(format!("{app}@{id} does not exist")),
         }
+
+        // Issue 689: the release answers its probe, asked through the
+        // edge's own listener as a preview of it, at the host of the
+        // first route the overlay changes.
+
+        let Some(path) = overlay
+            .preconditions
+            .as_ref()
+            .and_then(|preconditions| preconditions.probe.as_deref())
+        else {
+            return Ok(());
+        };
+
+        let Some(port) = self
+            .edge
+            .listeners()
+            .into_iter()
+            .find(|(_, tls)| !tls)
+            .map(|(address, _)| address.port())
+        else {
+            return Err("the edge has no plain HTTP listener to probe through".to_owned());
+        };
+
+        let host = self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|route| {
+                route
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| overlay.routes.contains_key(name))
+            })
+            .map(|route| route.host)
+            .filter(|host| !host.is_empty() && !host.contains('*'));
+        let url = format!("http://127.0.0.1:{port}{path}");
+
+        crate::rollouts::probe_host(&self.probe_client, &url, host.as_deref(), &id)
+            .await
+            .map_err(|error| format!("its probe failed: {error}"))
     }
 
     /// Section 9.10: begin and end overlays by their schedules and by the
@@ -3567,7 +3612,7 @@ impl Daemon {
                     changed = true;
                 }
                 crate::overlays::Step::Begin { until } => {
-                    let preconditions = self.overlay_preconditions(overlay);
+                    let preconditions = self.overlay_preconditions(overlay).await;
 
                     // An advisory overlay only says what it would do, once
                     // a window; a skipped one is not retried every second.
@@ -3623,6 +3668,30 @@ impl Daemon {
             }
         }
 
+        // Issue 689: overlays that follow a named condition.
+
+        let conditions: HashMap<String, crate::conditions::Status> = self
+            .conditions
+            .statuses()
+            .into_iter()
+            .map(|status| (status.name.clone(), status))
+            .collect();
+
+        for (name, overlay) in &overlays {
+            if let Some(condition) = crate::overlays::condition(overlay) {
+                changed |= self
+                    .follow_condition(
+                        name,
+                        overlay,
+                        condition,
+                        conditions.get(condition),
+                        states.get(name),
+                        now,
+                    )
+                    .await;
+            }
+        }
+
         let warm_ups = self.warm_ups(&overlays, now);
 
         if warm_ups != self.warm_ups {
@@ -3667,6 +3736,104 @@ impl Daemon {
 
             if let Err(error) = self.push_snapshot().await {
                 tracing::error!(%error, "pushing the snapshot for an overlay failed");
+            }
+        }
+    }
+
+    /// Section 9.10 (issue 689): activate or end an overlay by its named
+    /// condition's state: active while it is firing, ended once it has
+    /// resolved and the overlay has been active for `min_active`, held as
+    /// it is while it is unknown. An activation the cooldown after the
+    /// last end, the cap on activations an hour or a precondition holds
+    /// back is skipped, with one event while the condition keeps firing.
+    /// Gives whether the overlay changed.
+    async fn follow_condition(
+        &mut self,
+        name: &str,
+        overlay: &muru_config::Overlay,
+        condition: &str,
+        status: Option<&crate::conditions::Status>,
+        state: Option<&crate::model::OverlayState>,
+        now: u64,
+    ) -> bool {
+        use crate::conditions::State;
+
+        let subject = format!("overlay {name}");
+        let firing = status.map(|status| status.state);
+        let figures = status
+            .map(crate::overlays::describe_terms)
+            .unwrap_or_default();
+
+        if firing != Some(State::Firing) {
+            self.condition_skips.remove(name);
+        }
+
+        let recent = if state.is_none() && firing == Some(State::Firing) {
+            self.store
+                .overlay_activations_since(name, now.saturating_sub(3_600_000))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let step = match crate::overlays::condition_step(overlay, firing, state, recent, now) {
+            crate::overlays::ConditionStep::Activate => {
+                match self.overlay_preconditions(overlay).await {
+                    Ok(()) => crate::overlays::ConditionStep::Activate,
+                    Err(why) => crate::overlays::ConditionStep::Skip(why),
+                }
+            }
+            step => step,
+        };
+
+        match step {
+            crate::overlays::ConditionStep::Stay => false,
+            crate::overlays::ConditionStep::Skip(why) => {
+                if self.condition_skips.insert(name.to_owned()) {
+                    self.events.emit(
+                        "overlay.skipped",
+                        &subject,
+                        "warning",
+                        &format!("not activated though its condition {condition} is firing: {why}"),
+                    );
+                }
+
+                false
+            }
+            crate::overlays::ConditionStep::End { held_until } => {
+                let held = held_until.map(|until| crate::model::OverlayState {
+                    name: name.to_owned(),
+                    active: false,
+                    source: "cooldown".to_owned(),
+                    since_unix_ms: now,
+                    until_unix_ms: Some(until),
+                });
+                let _ = self.store.set_overlay_state(name, held.as_ref());
+                self.events.emit(
+                    "overlay.ended",
+                    &subject,
+                    "notice",
+                    &format!("ended: its condition {condition} resolved{figures}"),
+                );
+                true
+            }
+            crate::overlays::ConditionStep::Activate => {
+                let state = crate::model::OverlayState {
+                    name: name.to_owned(),
+                    active: true,
+                    source: "condition".to_owned(),
+                    since_unix_ms: now,
+                    until_unix_ms: None,
+                };
+                let _ = self.store.set_overlay_state(name, Some(&state));
+                let _ = self.store.record_overlay_activation(name, now);
+                self.events.emit(
+                    "overlay.activated",
+                    &subject,
+                    "notice",
+                    &format!("activated: its condition {condition} is firing{figures}"),
+                );
+                true
             }
         }
     }
@@ -3827,6 +3994,7 @@ impl Daemon {
                 }
 
                 self.overlay_preconditions(&overlay)
+                    .await
                     .map_err(|why| format!("overlay {name} was not activated: {why}"))?;
                 let state = crate::model::OverlayState {
                     name: name.to_owned(),
@@ -3853,13 +4021,23 @@ impl Daemon {
 
                 let window = crate::overlays::window(&overlay, now)
                     .filter(|(start, end)| now >= *start && end.is_none_or(|end| now < end));
-                let held = window.map(|(_, end)| crate::model::OverlayState {
-                    name: name.to_owned(),
-                    active: false,
-                    source: "ended".to_owned(),
-                    since_unix_ms: now,
-                    until_unix_ms: end,
-                });
+
+                // Issue 689: one its condition activates is held through
+                // its cooldown, so a condition still firing does not
+                // activate it again at once.
+
+                let cooldown = crate::overlays::condition(&overlay)
+                    .map(|_| now + crate::overlays::cooldown(&overlay).as_millis() as u64);
+                let held = window
+                    .map(|(_, end)| end)
+                    .or(cooldown.map(Some))
+                    .map(|until| crate::model::OverlayState {
+                        name: name.to_owned(),
+                        active: false,
+                        source: "ended".to_owned(),
+                        since_unix_ms: now,
+                        until_unix_ms: until,
+                    });
                 self.store
                     .set_overlay_state(name, held.as_ref())
                     .map_err(|error| error.to_string())?;

@@ -724,7 +724,10 @@ An `[overlay.NAME]` table: changes to named routes and to applications, applied 
 | --- | --- | --- | --- |
 | `advisory` | boolean | `false` | Its schedule only raises overlay.would_activate events; it is activated by hand only. |
 | `apps` | table of tables, {ref}`[overlay.NAME.apps.NAME] <config-daemon-overlay-name-apps-name>` |  | Changes to applications, by name. |
-| `latch` | boolean | `false` | Once its schedule activates it, it stays active past the window until a person ends it. |
+| `cooldown` | string | `"10m"` | For an overlay its condition activates: how long after it ends its condition cannot activate it again. |
+| `latch` | boolean | `false` | Once its schedule or its condition activates it, it stays active, past the window or the condition resolving, until a person ends it. |
+| `max_per_hour` | integer | `4` | For an overlay its condition activates: the most activations by its condition in an hour. |
+| `min_active` | string | `"5m"` | For an overlay its condition activates: the least it stays active, however soon the condition resolves. |
 | `preconditions` | table, {ref}`[overlay.NAME.preconditions] <config-daemon-overlay-name-preconditions>` |  | What must hold for the overlay to activate. |
 | `priority` | integer |  | Which of two active overlays setting the same field wins: the higher. Overlays that would conflict must both set one. |
 | `routes` | table of tables, {ref}`[overlay.NAME.routes.NAME] <config-daemon-overlay-name-routes-name>` |  | Changes to routes, by the route's `name`. |
@@ -755,6 +758,7 @@ What must hold for an overlay to activate.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `probe` | string |  | A path the `release_ready` release must answer with 2xx or 3xx, asked through the edge, such as /healthz. |
 | `release_ready` | string |  | A release that must be ready, as app@release, or as release when the overlay changes routes of one application only. |
 
 (config-daemon-overlay-name-routes-name)=
@@ -805,6 +809,7 @@ When an overlay is active on its own.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `condition` | string |  | A named condition: the overlay is active while it is firing, and ends once it has resolved. |
 | `external` | boolean | `false` | Whether the signed webhook of the `[overlay_webhook]` table may activate and end it. |
 | `schedule` | table, {ref}`[overlay.NAME.trigger.schedule] <config-daemon-overlay-name-trigger-schedule>` |  | A window in time. |
 

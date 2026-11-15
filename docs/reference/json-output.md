@@ -75,8 +75,8 @@ $ muructl release show shop@r9 --json
 | `muructl scale` | Each worker group's scaling state after the change: `app`, `release`, `groups` |
 | `muructl scale status` | Each worker group's policy, workers, signals, last decision and churn: `app`, `release`, `groups` |
 | `muructl restart` | `{"release": ..., "workers": [...]}`, each with `index` (within its group), `group`, `pid`, `new_pid`, `forced`, and `served_by` once the new worker serves (`null` with `--no-wait`) |
-| `muructl overlay list` | `{"overlays": [...]}`, each with `name`, `active`, `state`, `trigger`, `changes` and its times |
-| `muructl overlay preview` | `{"changes": [...]}`: what activating the overlay now would change |
+| `muructl overlay list` | `{"overlays": [...]}`, each with `name`, `active`, `state`, `trigger`, `changes`, its times, and for one that follows a condition `condition` and `condition_state` |
+| `muructl overlay preview` | `{"changes": [...]}`: what activating the overlay now would change; for one that follows a condition, `condition`, `condition_state` and `condition_terms`, each term with its figure now |
 | `muructl overlay activate` | The outcome: `message` |
 | `muructl overlay end` | The outcome: `message` |
 | `muructl overlay promote` | The outcome: `message` |

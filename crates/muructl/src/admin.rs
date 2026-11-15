@@ -5516,6 +5516,22 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
                 return print_answer(&preview);
             }
 
+            if !preview.condition.is_empty() {
+                println!(
+                    "condition {} is {}",
+                    preview.condition,
+                    if preview.condition_state.is_empty() {
+                        "not declared"
+                    } else {
+                        preview.condition_state.as_str()
+                    }
+                );
+
+                for term in &preview.condition_terms {
+                    println!("  {term}");
+                }
+            }
+
             if preview.changes.is_empty() {
                 println!("muru: activating overlay {name} would change nothing now");
             }
@@ -5622,11 +5638,17 @@ async fn list_overlays(socket: &SocketArgs, json: bool) -> anyhow::Result<()> {
             state.push_str(&format!(" from {}", format_time(overlay.starts_unix_ms)));
         }
 
+        let trigger = if overlay.condition.is_empty() {
+            overlay.trigger.clone()
+        } else {
+            format!("{}, {}", overlay.trigger, overlay.condition_state)
+        };
+
         println!(
             "{:<24} {:<10} {:<34} {}",
             overlay.name,
             state,
-            overlay.trigger,
+            trigger,
             overlay.changes.join(", ")
         );
     }

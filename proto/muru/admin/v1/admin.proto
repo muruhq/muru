@@ -1085,12 +1085,14 @@ message ListOverlaysResponse {
 message OverlayInfo {
   string name = 1;
   bool active = 2;
-  string state = 3;                 // schedule or manual while active; ended, skipped or promoted while held; empty when idle
+  string state = 3;                 // schedule, condition, manual or external while active; ended, cooldown, skipped or promoted while held; empty when idle
   uint64 since_unix_ms = 4;         // when the state began; 0 when idle
   uint64 until_unix_ms = 5;         // when it ends or the hold lifts; 0 for none
   string trigger = 6;               // its schedule, or "by hand"
   repeated string changes = 7;      // what it changes, as route NAME and app NAME
   uint64 starts_unix_ms = 8;        // when its schedule's window begins, if that is to come; 0 otherwise
+  string condition = 9;             // the named condition it follows, if any
+  string condition_state = 10;      // that condition's state: firing, resolved or unknown
 }
 
 message ControlOverlayRequest {
@@ -1109,6 +1111,9 @@ message PreviewOverlayRequest {
 
 message PreviewOverlayResponse {
   repeated string changes = 1;      // what activating it now would change, one line per field
+  string condition = 2;             // the named condition it follows, if any
+  string condition_state = 3;       // that condition's state: firing, resolved or unknown
+  repeated string condition_terms = 4; // each term of the condition with its figure now, or why it is unknown
 }
 
 message UpgradeDaemonRequest {}

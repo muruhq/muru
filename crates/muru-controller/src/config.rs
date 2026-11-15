@@ -973,6 +973,8 @@ pub struct Defined {
     pub rate_limits: Vec<String>,
     /// The classes of the `[[client_class]]` rules.
     pub client_classes: Vec<String>,
+    /// The `[condition.NAME]` tables (section 9.10).
+    pub conditions: BTreeMap<String, muru_config::Condition>,
     /// The node's budget and what its releases hold.
     pub budget: crate::budget::View,
 }
@@ -986,7 +988,17 @@ impl Defined {
             .extend(document.client_class.iter().map(|class| class.name.clone()));
         all.rate_limits.extend(document.rate_limit.keys().cloned());
 
+        for (name, condition) in &document.condition {
+            all.conditions
+                .entry(name.clone())
+                .or_insert_with(|| condition.clone());
+        }
+
         if !prune {
+            for (name, condition) in store.conditions().unwrap_or_default() {
+                all.conditions.entry(name).or_insert(condition);
+            }
+
             all.client_classes.extend(
                 store
                     .client_classes()
@@ -1989,6 +2001,47 @@ fn plan_conditions(store: &Store, document: &Document, plan: &mut Plan) {
     }
 }
 
+/// Section 9.10 (issue 689): a warning when an overlay sends the traffic of
+/// an application its condition's request signals read elsewhere, a
+/// static snapshot or another target in its place, so the figure goes
+/// unknown and the condition can never resolve the overlay by it.
+fn starved(
+    name: &str,
+    overlay: &Overlay,
+    condition: &str,
+    table: &muru_config::Condition,
+    route_apps: &BTreeMap<String, String>,
+) -> Vec<String> {
+    use muru_config::condition::Kind;
+
+    let read: BTreeSet<String> = std::iter::once(table.when.as_str())
+        .chain(table.clear_when.as_deref())
+        .filter_map(|text| muru_config::condition::parse(text).ok())
+        .flat_map(|expr| {
+            expr.terms()
+                .into_iter()
+                .filter(|term| term.signal.kind != Kind::Gauge)
+                .filter_map(|term| term.label("app").map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    overlay
+        .routes
+        .iter()
+        .filter(|(_, change)| change.target.is_some())
+        .filter_map(|(route, _)| route_apps.get(route))
+        .filter(|app| read.contains(*app))
+        .map(|app| {
+            format!(
+                "overlay {name} takes {app}'s traffic away from what condition {condition} reads, so the condition cannot see the application recover and may never resolve; resolve it on another signal, such as upstream_healthy, or set latch = true and end it by hand"
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// Section 9.10: the overlays a document declares, checked against the
 /// routes, applications, upstreams and rate limits they name, and
 /// against each other.
@@ -2053,6 +2106,23 @@ fn plan_overlays(
 
         if let Err(error) = muru_config::check_overlay(name, overlay) {
             errors.push(error);
+        }
+
+        // Section 9.10 (issue 689): the condition it names, and whether
+        // it takes away the traffic its condition reads.
+
+        if let Some(condition) = overlay
+            .trigger
+            .as_ref()
+            .and_then(|trigger| trigger.condition.as_deref())
+        {
+            match defined.conditions.get(condition) {
+                None => errors.push(format!("overlay {name}: no condition is named {condition}")),
+                Some(table) => {
+                    plan.warnings
+                        .extend(starved(name, overlay, condition, table, &route_names))
+                }
+            }
         }
 
         for (route, change) in &overlay.routes {
