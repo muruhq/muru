@@ -550,6 +550,16 @@
       "additionalProperties": false,
       "description": "A command an application declares, the `[tool.muru.commands.NAME]` or `[app.NAME.release.ID.commands.NAME]` table: a program to run, or a Python callable to call, with the release.",
       "properties": {
+        "before_fork": {
+          "default": false,
+          "description": "A gate: the release's start runs the command once the host has preloaded and before it forks workers, and fails if it fails.",
+          "type": "boolean"
+        },
+        "before_promote": {
+          "default": false,
+          "description": "A gate: a rollout's or blue/green promotion runs the command just before it moves all traffic to the release, and stops if it fails.",
+          "type": "boolean"
+        },
         "call": {
           "description": "A callable as module:function, called with the inputs as keyword arguments, instead of `run`.",
           "type": "string"
@@ -564,6 +574,11 @@
           },
           "description": "Environment variables for this command alone, over the release's, with `{name}` where an input's value goes.",
           "type": "object"
+        },
+        "every_start": {
+          "default": false,
+          "description": "Run a `before_fork` gate at every start of the release's host, not only until it has passed once.",
+          "type": "boolean"
         },
         "exclusive": {
           "default": false,

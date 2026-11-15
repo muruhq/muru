@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import textwrap
 import time
 from pathlib import Path
@@ -367,5 +368,96 @@ def test_schedules_run_at_the_daemons_start_and_skip_a_run_due_while_one_is_unde
         daemon = start_daemon(tmp_path / "daemon", run_dir=daemon.run_dir, port=daemon.port)
         time.sleep(2)
         assert len(runs("warm")) == 1
+    finally:
+        daemon.stop()
+
+
+GATED = """
+[project]
+name = "ops"
+version = "0.1.0"
+
+[tool.muru]
+entrypoint = "app:application"
+processes = 1
+
+[tool.muru.commands.migrate]
+run = [
+    "python", "-c",
+    "import os, sys; print('migrating'); sys.exit(0 if os.path.exists('fork-ok') else 1)",
+]
+timeout = "1m"
+before_fork = true
+
+[tool.muru.commands.contract]
+run = [
+    "python", "-c",
+    "import os, sys; print('contracting'); sys.exit(0 if os.path.exists('promote-ok') else 1)",
+]
+timeout = "1m"
+before_promote = true
+"""
+
+
+def test_gates_run_once_a_release_before_its_fork_and_before_a_promotion(tmp_path: Path) -> None:
+    project = tmp_path / "ops"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(textwrap.dedent(GATED))
+    (project / "app.py").write_text(APP)
+    (tmp_path / "daemon").mkdir()
+    daemon = start_daemon(tmp_path / "daemon")
+
+    def runs(name: str) -> list[dict]:
+        listed = daemon.muructl("command", "runs", "ops", name, "--json").stdout
+        return json.loads(listed).get("runs", [])
+
+    def gates(release: str) -> list[tuple[str, str]]:
+        shown = json.loads(daemon.muructl("release", "show", release, "--json").stdout)
+        return [(gate["name"], gate["stage"]) for gate in shown.get("gates", [])]
+
+    try:
+        # The release's start runs migrate once the host has preloaded,
+        # and records that it passed.
+
+        (project / "fork-ok").touch()
+        assert daemon.deploy("ops", project) == "muru: release ops@r1 is ready and serving"
+        assert gates("ops@r1") == [("migrate", "before_fork")]
+        assert [(r["trigger"], r["ok"]) for r in runs("migrate")] == [("gate:before_fork", True)]
+        assert "[command migrate] migrating" in daemon.muructl("logs", "ops@r1").stdout
+
+        # A held release passes its own before_fork gate; a promotion to it
+        # runs contract first, and stops when contract fails.
+
+        assert daemon.deploy("ops", project, "--hold").startswith("muru: release ops@r2 is ready")
+        refused = daemon.muructl("rollout", "bluegreen", "ops@r2", check=False)
+        assert refused.returncode != 0
+        assert "the before_promote gate contract exited with status 1" in refused.stderr, refused
+        serving = [r["release"] for r in daemon.releases("ops") if r["serving"] == "yes"]
+        assert serving == ["ops@r1"], daemon.releases("ops")
+
+        (project / "promote-ok").touch()
+        daemon.muructl("rollout", "bluegreen", "ops@r2")
+        assert gates("ops@r2") == [("migrate", "before_fork"), ("contract", "before_promote")]
+
+        # A host started again skips a gate its release has passed.
+
+        (project / "fork-ok").unlink()
+        daemon.stop(shutdown=True)
+        daemon = start_daemon(tmp_path / "daemon", run_dir=daemon.run_dir, port=daemon.port)
+        deadline = time.monotonic() + 30
+
+        while daemon.get("/").status != 200:
+            assert time.monotonic() < deadline, daemon.releases("ops")
+            time.sleep(0.2)
+
+        assert len(runs("migrate")) == 2
+
+        # A new release whose gate fails does not start.
+
+        failed = daemon.muructl(
+            "deploy", "ops", str(project), "--python", sys.executable, check=False
+        )
+        assert failed.returncode != 0
+        assert "the before_fork gate migrate exited with status 1" in failed.stderr, failed
     finally:
         daemon.stop()

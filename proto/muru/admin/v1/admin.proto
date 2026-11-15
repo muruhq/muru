@@ -953,6 +953,15 @@ message Release {
   uint64 disk_bytes = 34;           // what its environment, bytecode and logs take; set when asked for
   uint64 disk_freed_bytes = 35;     // what removing it would give back, less than disk_bytes when files are hard-linked elsewhere
   repeated string instrumentation = 36; // its instrumentation modules, in order (section 6.15)
+  repeated GatePassed gates = 37;   // the gates it has passed, in order (section 9.12)
+}
+
+// A gate a release passed: a run of a command at a point in its life.
+message GatePassed {
+  string name = 1;                  // the command
+  string stage = 2;                 // before_fork or before_promote
+  uint64 run = 3;                   // the run that passed it
+  uint64 passed_unix_ms = 4;
 }
 
 // An instance of an http release's command.
@@ -1290,6 +1299,8 @@ message CommandInfo {
   CommandRun last_run = 8;          // the application's last run of it, if any
   string schedule = 9;              // when the daemon runs it by itself, in words; empty for none
   uint64 next_run_unix_ms = 10;     // when its cron schedule is next due; 0 for none
+  repeated string gates = 11;       // before_fork and before_promote, where it is a gate
+  bool every_start = 12;            // a before_fork gate run at every start of the host
 }
 
 message CommandInputInfo {

@@ -4281,6 +4281,34 @@ pub fn resolve_commands(
             .map(|schedule| resolve_schedule(&what, schedule, &inputs, timeout_ms))
             .transpose()?;
 
+        // Section 9.12 (issue 266): a gate runs with no one to give it
+        // inputs, and the release's start or the promotion waits for it,
+        // so it needs a timeout and a value for every required input.
+
+        let before_fork = table.before_fork.unwrap_or(false);
+        let before_promote = table.before_promote.unwrap_or(false);
+        let every_start = table.every_start.unwrap_or(false);
+
+        if every_start && !before_fork {
+            return Err(format!("{what}: every_start is for a before_fork gate"));
+        }
+
+        if before_fork || before_promote {
+            if timeout_ms.is_none() {
+                return Err(format!(
+                    "{what}: a gate needs a timeout, since the release waits for it"
+                ));
+            }
+
+            if let Some(input) = inputs.iter().find(|input| input.required) {
+                return Err(format!(
+                    "{what}: a gate is given no inputs, so the required input {} needs a default \
+                     instead",
+                    input.name
+                ));
+            }
+        }
+
         commands.push(crate::model::CommandSpec {
             name: name.clone(),
             description: table.description.clone().unwrap_or_default(),
@@ -4289,8 +4317,11 @@ pub fn resolve_commands(
             env: table.env.clone().into_iter().collect(),
             inputs,
             timeout_ms,
-            exclusive: table.exclusive.unwrap_or(false),
+            exclusive: table.exclusive.unwrap_or(false) || before_fork || before_promote,
             schedule,
+            before_fork,
+            before_promote,
+            every_start,
         });
     }
 
@@ -4436,6 +4467,9 @@ fn commands_table_from(
                         inputs: schedule.inputs.iter().cloned().collect(),
                         secret_inputs: schedule.secret_inputs.iter().cloned().collect(),
                     }),
+                before_fork: command.before_fork.then_some(true),
+                before_promote: command.before_promote.then_some(true),
+                every_start: command.every_start.then_some(true),
             };
 
             (command.name.clone(), table)
@@ -8428,6 +8462,40 @@ inputs.pw = { secret = true }
                  schedule = { cron = '@daily', inputs = { pw = 'x' } }"
             )
             .contains("pw is secret: give it in secret_inputs")
+        );
+    }
+
+    #[test]
+    fn a_gate_is_exclusive_and_needs_a_timeout_and_no_input_left_to_give() {
+        let table = |text: &str| {
+            toml::from_str::<BTreeMap<String, muru_config::CommandTable>>(text).unwrap()
+        };
+        let refused = |text: &str| resolve_commands(&table(text)).unwrap_err();
+
+        let commands = resolve_commands(&table(
+            "[migrate]\nrun = ['x']\ntimeout = '10m'\nbefore_fork = true\nevery_start = true\n\
+             [contract]\nrun = ['y']\ntimeout = '10m'\nbefore_promote = true",
+        ))
+        .unwrap();
+        assert!(commands.iter().all(|command| command.exclusive));
+        assert!(commands[1].before_fork && commands[1].every_start);
+        assert!(commands[0].before_promote);
+        assert_eq!(
+            resolve_commands(&commands_table_from(&commands)).unwrap(),
+            commands
+        );
+
+        assert!(refused("[m]\nrun = ['x']\nbefore_fork = true").contains("a gate needs a timeout"));
+        assert!(
+            refused(
+                "[m]\nrun = ['x', '{n}']\ntimeout = '1m'\nbefore_promote = true\n\
+                 inputs.n = { required = true }"
+            )
+            .contains("the required input n needs a default")
+        );
+        assert!(
+            refused("[m]\nrun = ['x']\ntimeout = '1m'\nevery_start = true")
+                .contains("every_start is for a before_fork gate")
         );
     }
 

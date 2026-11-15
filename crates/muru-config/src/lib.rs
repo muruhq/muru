@@ -5938,6 +5938,21 @@ pub struct CommandTable {
     /// nothing, or both. A command with a schedule needs a `timeout`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<CommandSchedule>,
+    /// A gate: the release's start runs the command once the host has
+    /// preloaded and before it forks workers, and fails if it fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub before_fork: Option<bool>,
+    /// A gate: a rollout's or blue/green promotion runs the command just
+    /// before it moves all traffic to the release, and stops if it fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub before_promote: Option<bool>,
+    /// Run a `before_fork` gate at every start of the release's host,
+    /// not only until it has passed once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub every_start: Option<bool>,
 }
 
 /// When the daemon runs a command by itself (section 9.12).

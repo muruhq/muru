@@ -3479,6 +3479,7 @@ async fn run_with(
         chdir: Some(resolved.project.clone()),
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
         single: args.single,
+        hold_before_fork: false,
         detach_to: None,
         relay: muru_controller::host::RelaySettings::default(),
         groups,

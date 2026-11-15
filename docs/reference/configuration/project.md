@@ -72,9 +72,12 @@ A command an application declares, the `[tool.muru.commands.NAME]` or `[app.NAME
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `before_fork` | boolean | `false` | A gate: the release's start runs the command once the host has preloaded and before it forks workers, and fails if it fails. |
+| `before_promote` | boolean | `false` | A gate: a rollout's or blue/green promotion runs the command just before it moves all traffic to the release, and stops if it fails. |
 | `call` | string |  | A callable as module:function, called with the inputs as keyword arguments, instead of `run`. |
 | `description` | string |  | What the command does, for `muructl command list`. |
 | `env` | table of strings |  | Environment variables for this command alone, over the release's, with `{name}` where an input's value goes. |
+| `every_start` | boolean | `false` | Run a `before_fork` gate at every start of the release's host, not only until it has passed once. |
 | `exclusive` | boolean | `false` | Run one at a time for the application: a run asked for while one is under way is refused. |
 | `inputs` | table of tables, {ref}`[tool.muru.commands.NAME.inputs.NAME] <config-project-tool-muru-commands-name-inputs-name>` |  | The values the command takes, by name. |
 | `run` | array of strings |  | The program and its arguments, run without a shell, with `{name}` where an input's value goes; `python` is the release's interpreter. |

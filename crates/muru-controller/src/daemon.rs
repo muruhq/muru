@@ -5619,6 +5619,11 @@ impl Daemon {
             &spec.source,
         );
 
+        // Section 9.12 (issue 266): the before_fork gates still to pass
+        // hold the host once it has preloaded.
+
+        let gates = self.gates_due(app, id, &spec.commands, crate::model::Gate::BeforeFork);
+
         let host_spec = HostSpec {
             python,
             pythonpath: None,
@@ -5642,6 +5647,7 @@ impl Daemon {
             chdir: Some(spec.source.clone()),
             tcp_base_port: None,
             single: false,
+            hold_before_fork: !gates.is_empty(),
             detach_to: Some(self.host_log(app, id)),
             relay: self.relay_settings,
             logging: self
@@ -5727,6 +5733,42 @@ impl Daemon {
                 return Err(message);
             }
         };
+
+        if !gates.is_empty() {
+            let held = host
+                .wait_held(START_TIMEOUT)
+                .await
+                .map_err(|error| format!("{error:#}"));
+
+            let passed = match held {
+                Ok(()) => {
+                    self.set_state(
+                        &release,
+                        ReleaseState::Warming,
+                        "preloaded, running its before_fork gates",
+                    );
+                    self.run_gates(app, id, &gates, crate::model::Gate::BeforeFork)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+
+            host.release_gates(passed.is_ok());
+
+            if let Err(error) = passed {
+                let mut message = error;
+                host.stop(release.spec.timeouts.stop_budget()).await;
+
+                if let Some(reason) = crate::logs::start_failure(&log, log_start).await {
+                    message = format!("{message}: {reason}");
+                }
+
+                self.set_state(&release, ReleaseState::Failed, &message);
+                self.events
+                    .emit("release.failed", &subject, "error", &message);
+                return Err(message);
+            }
+        }
 
         self.set_state(&release, ReleaseState::Warming, "waiting for the workers");
 
@@ -7120,8 +7162,24 @@ impl Daemon {
 
         match state {
             RolloutState::Promoted => {
-                self.promote_release(&rollout.app, &rollout.candidate, Retention::default())
-                    .await?;
+                // A promotion a gate stops leaves the rollout paused where
+                // it was, to be promoted or aborted once looked at.
+
+                if let Err(error) = self
+                    .promote_release(&rollout.app, &rollout.candidate, Retention::default())
+                    .await
+                {
+                    rollout.state = RolloutState::Paused;
+                    rollout.message = format!("promotion stopped: {error}");
+                    rollout.updated_unix_ms = now_unix_ms();
+                    self.store
+                        .put_rollout(rollout)
+                        .map_err(|error| error.to_string())?;
+                    self.events
+                        .emit("rollout.paused", &subject, "warning", &rollout.message);
+                    return Err(error);
+                }
+
                 record(rollout, &self.store)?;
                 self.push_snapshot().await?;
                 self.events.emit(
@@ -7180,6 +7238,20 @@ impl Daemon {
 
         self.make_room_for(app, id).await?;
         self.start(app, id).await?;
+
+        // Section 9.12 (issue 266): the before_promote gates run with the
+        // release about to take all the traffic, and one that fails stops
+        // the promotion.
+
+        let commands = self
+            .store
+            .release(app, id)
+            .map(|release| release.spec.commands)
+            .unwrap_or_default();
+        let gates = self.gates_due(app, id, &commands, crate::model::Gate::BeforePromote);
+        self.run_gates(app, id, &gates, crate::model::Gate::BeforePromote)
+            .await?;
+
         self.switch_to(app, id).await;
         self.store
             .set_app_releases(app, Some(id), current.as_deref())
@@ -7196,6 +7268,103 @@ impl Daemon {
         self.store
             .release(app, id)
             .map_err(|error| error.to_string())
+    }
+
+    /// Section 9.12 (issue 266): the commands of a release that are gates
+    /// at `stage` and still to run: those it has not passed, or, before a
+    /// fork, those that run at every start. A managed server's release
+    /// runs no commands, so has no gates.
+    fn gates_due(
+        &self,
+        app: &str,
+        id: &str,
+        commands: &[crate::model::CommandSpec],
+        stage: crate::model::Gate,
+    ) -> Vec<crate::model::CommandSpec> {
+        let passed = self.store.gates_passed(app, id).unwrap_or_default();
+
+        commands
+            .iter()
+            .filter(|command| command.gates(stage))
+            .filter(|command| {
+                (stage == crate::model::Gate::BeforeFork && command.every_start)
+                    || !passed
+                        .iter()
+                        .any(|(name, at, _, _)| *name == command.name && at == stage.as_str())
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Section 9.12 (issue 266): run a release's gates at `stage`, one
+    /// after another in the order of their names, each as a run of its
+    /// command with its inputs' defaults, exclusive, with the trigger
+    /// `gate:STAGE`, and record each that passes. The first that fails
+    /// ends it, with why.
+    async fn run_gates(
+        &mut self,
+        app: &str,
+        id: &str,
+        gates: &[crate::model::CommandSpec],
+        stage: crate::model::Gate,
+    ) -> Result<(), String> {
+        let subject = format!("{app}@{id}");
+
+        for gate in gates {
+            let failed = |why: &str| format!("the {} gate {} {why}", stage.as_str(), gate.name);
+            let request = crate::commands::CommandRequest::Declared {
+                name: gate.name.clone(),
+                inputs: BTreeMap::new(),
+                secret_inputs: BTreeMap::new(),
+            };
+            let mut prepared = self
+                .prepare_command(app, id, request)
+                .await
+                .map_err(|error| failed(&format!("could not be started: {error}")))?;
+            prepared.exclusive = true;
+
+            let recorded = self.runs.recorded(stage.trigger(), crate::runs::DAEMON);
+            let mut running = crate::commands::run(prepared, Arc::new(recorded))
+                .map_err(|error| failed(&format!("could not be started: {error}")))?;
+            let mut ended = None;
+
+            while let Some(message) = running.output.recv().await {
+                if message.finished {
+                    ended = Some(message);
+                    break;
+                }
+            }
+
+            let Some(ended) = ended else {
+                return Err(failed("ended without saying how"));
+            };
+
+            if !ended.ok {
+                return Err(failed(&ended.message));
+            }
+
+            if let Err(error) = self
+                .store
+                .pass_gate(app, id, &gate.name, stage.as_str(), ended.run)
+            {
+                tracing::warn!(%error, "recording the gate {} failed", gate.name);
+            }
+
+            self.events.emit(
+                "release.gate_passed",
+                &subject,
+                "info",
+                &format!(
+                    "the {} gate {} passed: run {} {}",
+                    stage.as_str(),
+                    gate.name,
+                    ended.run,
+                    ended.message
+                ),
+            );
+        }
+
+        Ok(())
     }
 
     /// Section 10.10: start a recorded release held, traffic left where

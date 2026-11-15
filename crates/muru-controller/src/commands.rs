@@ -669,6 +669,15 @@ pub fn info(command: &CommandSpec, last_run: Option<&CommandRun>) -> pb::Command
             .as_ref()
             .and_then(|schedule| schedule.next_after(now_unix_ms()))
             .unwrap_or(0),
+        gates: [
+            crate::model::Gate::BeforeFork,
+            crate::model::Gate::BeforePromote,
+        ]
+        .into_iter()
+        .filter(|gate| command.gates(*gate))
+        .map(|gate| gate.as_str().to_owned())
+        .collect(),
+        every_start: command.every_start,
         last_run: last_run.map(|run| pb::CommandRun {
             release: run.release.clone(),
             started_unix_ms: run.started_unix_ms,
@@ -1785,6 +1794,9 @@ mod tests {
             timeout_ms: None,
             exclusive: false,
             schedule: None,
+            before_fork: false,
+            before_promote: false,
+            every_start: false,
         }
     }
 

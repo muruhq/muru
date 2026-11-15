@@ -617,6 +617,53 @@ pub struct CommandSpec {
     /// When the daemon runs it by itself (issue 268).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleSpec>,
+    /// A gate before the release's host forks its workers (issue 266).
+    #[serde(default)]
+    pub before_fork: bool,
+    /// A gate before a promotion moves all traffic to the release.
+    #[serde(default)]
+    pub before_promote: bool,
+    /// A `before_fork` gate run at every start of the host.
+    #[serde(default)]
+    pub every_start: bool,
+}
+
+impl CommandSpec {
+    /// Whether it is a gate at `stage`.
+    pub fn gates(&self, stage: Gate) -> bool {
+        match stage {
+            Gate::BeforeFork => self.before_fork,
+            Gate::BeforePromote => self.before_promote,
+        }
+    }
+}
+
+/// Section 9.12 (issue 266): a point in a release's life at which its
+/// gates run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// Once the host has preloaded, before it forks its workers.
+    BeforeFork,
+    /// Before a promotion moves all traffic to the release.
+    BeforePromote,
+}
+
+impl Gate {
+    /// The gate as its key and a run's trigger name it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeFork => "before_fork",
+            Self::BeforePromote => "before_promote",
+        }
+    }
+
+    /// The trigger of a run of a gate at this stage.
+    pub fn trigger(self) -> &'static str {
+        match self {
+            Self::BeforeFork => "gate:before_fork",
+            Self::BeforePromote => "gate:before_promote",
+        }
+    }
 }
 
 /// Section 9.12 (issue 268): when the daemon runs a command by itself,

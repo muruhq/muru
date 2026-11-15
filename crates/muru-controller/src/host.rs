@@ -3,7 +3,7 @@
 //! SIGTERM (design specification sections 6.1 and 13.1).
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -545,6 +545,9 @@ pub struct HostSpec {
     pub tcp_base_port: Option<u16>,
     /// Serve in the host process itself, with no fork (section 13.1).
     pub single: bool,
+    /// Wait, once preloaded, for the release's before_fork gates to pass
+    /// before forking workers (issue 266): see `HostProcess::wait_held`.
+    pub hold_before_fork: bool,
     /// Keep running when this process goes away, with the relay writing
     /// output to this file, so a daemon can re-adopt the host after it
     /// restarts (section 13.3). None has the relay write to this process.
@@ -951,6 +954,10 @@ impl HostProcess {
 
         if spec.single {
             command.arg("--single");
+        }
+
+        if spec.hold_before_fork {
+            command.arg("--hold-before-fork");
         }
 
         if spec.reflection {
@@ -1446,6 +1453,47 @@ impl HostProcess {
     /// worker sockets as they change, and events about its workers.
     pub fn control_path(&self) -> PathBuf {
         self.run_dir.join("control.sock")
+    }
+
+    /// Wait for a host started with `hold_before_fork` to have preloaded
+    /// and to wait for its gates, which it says by writing the file
+    /// `gates` in its run directory; or for it to exit first, or the time
+    /// to be up.
+    pub async fn wait_held(&mut self, timeout: Duration) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let held = self.run_dir.join("gates");
+
+        loop {
+            if held.is_file() {
+                return Ok(());
+            }
+
+            if let Some(status) = self.try_exited()? {
+                anyhow::bail!("the host {status} before it had preloaded");
+            }
+
+            anyhow::ensure!(
+                started.elapsed() < timeout,
+                "the host did not preload within {} seconds",
+                timeout.as_secs()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Tell a host waiting for its gates whether they passed: on its
+    /// standard input, `fork` to go on, `stop` to exit.
+    pub fn release_gates(&mut self, passed: bool) {
+        use std::io::Write as _;
+
+        let word: &[u8] = if passed { b"fork\n" } else { b"stop\n" };
+
+        if let Some(stdin) = &self.stdin
+            && let Ok(fd) = stdin.as_fd().try_clone_to_owned()
+        {
+            let mut pipe = std::fs::File::from(fd);
+            let _ = pipe.write_all(word);
+        }
     }
 
     /// Wait until every worker the release needs listens, or the host

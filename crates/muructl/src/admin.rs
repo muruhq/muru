@@ -6554,6 +6554,18 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
         lines.push((format!("mount {}", mount.name), serves));
     }
 
+    for gate in &release.gates {
+        lines.push((
+            format!("gate {}", gate.name),
+            format!(
+                "{} passed {}, run {}",
+                gate.stage,
+                format_time(gate.passed_unix_ms),
+                gate.run
+            ),
+        ));
+    }
+
     lines
 }
 
@@ -7895,6 +7907,18 @@ pub async fn command_list(args: CommandListArgs) -> anyhow::Result<()> {
 
         if !limits.is_empty() {
             println!("  {}", limits.join(", "));
+        }
+
+        if !command.gates.is_empty() {
+            println!(
+                "  gate: {}{}",
+                command.gates.join(", "),
+                if command.every_start {
+                    ", at every start of the host"
+                } else {
+                    ", once a release"
+                }
+            );
         }
 
         if !command.schedule.is_empty() {

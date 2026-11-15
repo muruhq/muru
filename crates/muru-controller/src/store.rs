@@ -151,6 +151,15 @@ CREATE TABLE IF NOT EXISTS runs (
     secrets TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS runs_by_command ON runs (app, name, ended_unix_ms);
+CREATE TABLE IF NOT EXISTS gates (
+    app TEXT NOT NULL,
+    release TEXT NOT NULL,
+    name TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    run INTEGER NOT NULL,
+    passed_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (app, release, name, stage)
+);
 CREATE TABLE IF NOT EXISTS log_periods (
     path TEXT PRIMARY KEY,
     period TEXT NOT NULL
@@ -166,7 +175,7 @@ CREATE TABLE IF NOT EXISTS log_files_seen (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 /// The store.
 pub struct Store {
@@ -200,8 +209,9 @@ impl Store {
         // file was last seen in (section 11.3), and version 14 whether
         // applied files declare a release (section 9.1), added to an older
         // table here, version 15 the file last seen at each log's path
-        // (section 11.3), and version 16 the runs of commands kept in
-        // place of each command's last run (issue 688).
+        // (section 11.3), version 16 the runs of commands kept in place of
+        // each command's last run (issue 688), and version 17 the gates
+        // each release has passed (issue 266).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -466,6 +476,10 @@ impl Store {
                 params![app, id],
             )?;
             connection.execute(
+                "DELETE FROM gates WHERE app = ?1 AND release = ?2",
+                params![app, id],
+            )?;
+            connection.execute(
                 "DELETE FROM releases WHERE app = ?1 AND id = ?2",
                 params![app, id],
             )?;
@@ -513,6 +527,7 @@ impl Store {
             connection.execute("DELETE FROM scale_pins WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM maintenance WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM runs WHERE app = ?1", [name])?;
+            connection.execute("DELETE FROM gates WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM apps WHERE name = ?1", [name])?;
             Ok(())
         })
@@ -1213,6 +1228,51 @@ impl Store {
             }
 
             Ok(old)
+        })
+    }
+
+    /// Record that a release passed a gate at `stage`, by the run `run`
+    /// (issue 266).
+    pub fn pass_gate(
+        &self,
+        app: &str,
+        release: &str,
+        name: &str,
+        stage: &str,
+        run: u64,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "INSERT OR REPLACE INTO gates (app, release, name, stage, run, passed_unix_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![app, release, name, stage, run as i64, now_unix_ms() as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The gates a release has passed: each command's name, stage, run and
+    /// when, in the order they passed.
+    pub fn gates_passed(
+        &self,
+        app: &str,
+        release: &str,
+    ) -> Result<Vec<(String, String, u64, u64)>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT name, stage, run, passed_unix_ms FROM gates \
+                 WHERE app = ?1 AND release = ?2 ORDER BY passed_unix_ms, name",
+            )?;
+            let rows = statement.query_map(params![app, release], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
         })
     }
 

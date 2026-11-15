@@ -3782,6 +3782,18 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         .get(&(release.app.clone(), release.id.clone()))
         .copied()
         .unwrap_or(0) as u32;
+    let gates = handle
+        .store
+        .gates_passed(&release.app, &release.id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, stage, run, passed_unix_ms)| pb::GatePassed {
+            name,
+            stage,
+            run,
+            passed_unix_ms,
+        })
+        .collect();
     let server_instances = handle
         .info
         .servers
@@ -3890,6 +3902,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         environment,
         build_when: release.spec.build.when.as_str().to_owned(),
         bytecode,
+        gates,
         server_instances,
         processes: release.spec.processes,
         threads: release.spec.threads,

@@ -52,6 +52,10 @@ inputs.target = { default = "s3://backups/shop" }
 | `inputs.NAME` | An input the command takes (see below) |
 | `timeout` | How long it may run before it is stopped, such as `10m`; no limit when absent |
 | `exclusive` | `true` to run one at a time for the application: a run asked for while one is under way is refused |
+| `schedule` | When the daemon runs the command by itself: see [schedules](#schedules) |
+| `before_fork` | `true` makes the command a gate the release's start runs once its host has preloaded and before its workers fork: see [gates](migrations.md#gates) |
+| `before_promote` | `true` makes the command a gate run just before a rollout or blue/green promotion moves all traffic to the release |
+| `every_start` | `true` runs a `before_fork` gate at every start of the release's host, not only until it has passed once |
 
 `{name}` in an argument of `run`, or in a value of `env`, is replaced by
 the input's value; `{{` and `}}` are literal braces. A command's name is
