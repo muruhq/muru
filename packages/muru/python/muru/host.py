@@ -5136,7 +5136,9 @@ def _main(argv: list[str] | None) -> int:
             instruments.finished(context, _instrumentation.FAILED)
             return 1
 
-        with preload.ImportRecorder() as recorder:
+        modules = [entry.module for entry in instruments.entries]
+
+        with preload.ImportRecorder(modules) as recorder:
             try:
                 hooks = release.load(recorder, instruments=instruments, context=context)
 

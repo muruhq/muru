@@ -125,7 +125,9 @@ def main(argv: list[str] | None = None) -> int:
         for module, callbacks in instruments.defined().items()
     ]
 
-    with preload.ImportRecorder() as recorder:
+    modules = [entry.module for entry in instruments.entries]
+
+    with preload.ImportRecorder(modules) as recorder:
         if report["ok"]:
             try:
                 if args.hooks:

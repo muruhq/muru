@@ -288,7 +288,12 @@ later one's import.
   hooks module and entrypoint, and before the import check takes its
   baseline, so what a module opens or starts as it is imported is not
   reported by the check. A module that leaves a thread or a socket open
-  in the host has to close it before the workers are forked.
+  in the host has to close it before the workers are forked. A thread a
+  module starts later, such as a writer started on the first call it
+  traces while the application is being imported, is reported by the
+  check against the module, by the thread's name, when the thread runs
+  code of the module or of its package: start such a thread from
+  `worker_started` instead.
 
 - **Per-worker imports.** With `preload = false`, each worker imports
   the modules before the application. After the fallback to per-worker
