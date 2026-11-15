@@ -618,6 +618,30 @@ pub enum Command {
         /// Answered with each worker's reply, or why none could be asked.
         done: oneshot::Sender<Result<Vec<WorkerReply>, String>>,
     },
+    /// Issue 693: a promotion's before_promote gates have run, on a task
+    /// beside the loop.
+    PromoteGated {
+        /// The application.
+        app: String,
+        /// The release being promoted.
+        id: String,
+        /// How long the release that served stays warm.
+        retain: Retention,
+        /// What follows the promotion.
+        then: Box<AfterPromote>,
+        /// Whether the gates passed.
+        outcome: Result<(), String>,
+    },
+    /// Issue 693: a stage of a release's start, which a task beside the
+    /// loop reports.
+    StartStage {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// What the stage gave.
+        stage: Box<StartStage>,
+    },
     /// Resolve what a command runs with from its release (section 9.12).
     PrepareCommand {
         /// The application.
@@ -1235,6 +1259,452 @@ impl Running {
     }
 }
 
+/// Issue 693: a stage of a release's start a task reports to the loop.
+pub enum StartStage {
+    /// The environment is built and the runtime library provided: the
+    /// interpreter and the library, or why not and the event to raise.
+    Built(Result<(PathBuf, muru_provision::Provided), (String, &'static str)>),
+    /// The host has preloaded, passed its gates and has its workers
+    /// listening; or why not, the host stopped and the failure recorded.
+    Host(Result<HostProcess, String>),
+    /// A managed server's instances answer their probes; or why not, the
+    /// instances stopped and the failure recorded.
+    Servers(Result<Servers, String>),
+}
+
+/// Issue 693: what a release's start has resolved for its later stages.
+struct StartPrep {
+    release: Release,
+    env: Vec<(String, String)>,
+    identity: Option<crate::host::Identity>,
+    run_dir: PathBuf,
+    started: Instant,
+    /// Once built: the runtime library the host was started with.
+    library: Option<muru_provision::Provided>,
+}
+
+/// Issue 693: a release's start under way on tasks beside the loop.
+struct Starting {
+    /// What the next stage needs; taken by it.
+    prep: Option<StartPrep>,
+    /// Set to cancel the start: the host, if started, is stopped.
+    cancel: tokio::sync::watch::Sender<bool>,
+    /// Why the start was cancelled, once it has been.
+    cancelled: Option<String>,
+    /// The memory the release is expected to hold, counted against the
+    /// node's budget while it starts.
+    reserved: u64,
+    /// What follows the start, carried out when it has ended.
+    waiters: Vec<AfterStart>,
+}
+
+/// Issue 693: what follows a release's start, carried out in the loop
+/// with how the start went: what each operation that starts a release
+/// did after its start, before the start ran beside the loop.
+enum AfterStart {
+    /// The daemon's restore: the release serves again.
+    Restore { app: String, id: String },
+    /// A deploy: held, or serving with the release before it drained.
+    Deploy {
+        app: String,
+        release: Box<Release>,
+        hold: bool,
+        retain: Retention,
+        done: oneshot::Sender<Result<Release, String>>,
+    },
+    /// A rollout's candidate, whose rollout then begins.
+    StartRollout {
+        app: String,
+        candidate: String,
+        steps: Vec<RolloutStep>,
+        gates: RolloutGates,
+        approve_each_step: bool,
+        done: oneshot::Sender<Result<Rollout, String>>,
+    },
+    /// A promotion: its before_promote gates, then the switch.
+    Promote {
+        app: String,
+        id: String,
+        retain: Retention,
+        then: AfterPromote,
+    },
+    /// An apply's prepare phase: the release runs held.
+    Held {
+        app: String,
+        id: String,
+        done: oneshot::Sender<Result<bool, String>>,
+    },
+    /// A release a traffic policy or a warm-up names.
+    Referenced {
+        app: String,
+        id: String,
+        warming: bool,
+    },
+    /// A host stopped while idle, woken by a request.
+    Wake { app: String, id: String },
+    /// A rollback to the release.
+    Rollback {
+        app: String,
+        previous: String,
+        current: Option<String>,
+        done: oneshot::Sender<Result<Release, String>>,
+    },
+    /// A serving release whose host exited, started again.
+    Restart { app: String, id: String },
+}
+
+/// Issue 693: what follows a promotion once it has switched, or failed.
+pub enum AfterPromote {
+    /// Answer whoever asked.
+    Reply(oneshot::Sender<Result<Release, String>>),
+    /// A rollout's promotion: record its end, and answer whoever asked
+    /// for it, if anyone did.
+    Rollout {
+        /// The rollout.
+        rollout: Box<Rollout>,
+        /// How its end is described.
+        message: String,
+        /// Who asked, if anyone.
+        done: Option<oneshot::Sender<Result<Rollout, String>>>,
+    },
+}
+
+/// Issue 693: what the tasks a release's start runs on beside the loop
+/// share with the daemon: the store, the event stream, what the daemon
+/// publishes and its locations.
+#[derive(Clone)]
+struct StartContext {
+    store: Arc<Store>,
+    events: Events,
+    info: Arc<Info>,
+    locations: Locations,
+}
+
+impl StartContext {
+    fn set_state(&self, release: &Release, state: ReleaseState, message: &str) {
+        if let Err(error) = self
+            .store
+            .set_release_state(&release.app, &release.id, state, message)
+        {
+            tracing::error!(%error, "recording a release state failed");
+        }
+    }
+
+    /// The release's log, its directory made.
+    fn host_log(&self, app: &str, id: &str) -> PathBuf {
+        let path = self.locations.release_log(app, id);
+
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+
+        path
+    }
+
+    /// Section 8.2: build the release's environment when its spec says
+    /// so and it is not there yet (a release started again after a daemon
+    /// restart, or a rollback target, keeps the one it has), as the
+    /// release's user, with uv's lines in the release log tagged [build].
+    /// Returns the interpreter the host runs: the environment's, or the
+    /// spec's when nothing is built.
+    async fn build_environment(
+        &self,
+        app: &str,
+        id: &str,
+        release: &Release,
+        identity: Option<crate::host::Identity>,
+    ) -> Result<PathBuf, String> {
+        let spec = &release.spec;
+
+        if !spec.build.builds {
+            return Ok(spec.python.clone());
+        }
+
+        let environment =
+            crate::provision::Provisioning::environment_dir(&self.locations.state.path, app, id);
+        let python = environment.join("bin").join("python");
+
+        if python.is_file() {
+            return Ok(python);
+        }
+
+        let Some(uv) = self.info.provisioning.uv.clone() else {
+            return Err(
+                "the release needs an environment built and uv was not found; install uv, or                  deploy a source with its environment built"
+                    .to_owned(),
+            );
+        };
+        let subject = format!("{app}@{id}");
+        self.set_state(release, ReleaseState::Building, "building the environment");
+        self.events.emit(
+            "release.building",
+            &subject,
+            "info",
+            &format!("from {}", spec.source.join("uv.lock").display()),
+        );
+
+        // The directories the build writes, owned by the release's user:
+        // the application's environments and a uv cache of its own.
+
+        let user =
+            identity.map_or_else(|| "daemon".to_owned(), |identity| identity.uid.to_string());
+        let cache = self.locations.state.path.join("uv-cache").join(&user);
+        let parent = environment
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.locations.state.path.clone());
+
+        for dir in [&parent, &cache] {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| format!("creating {}: {error}", dir.display()))?;
+
+            if let Some(identity) = identity {
+                std::os::unix::fs::chown(dir, Some(identity.uid), Some(identity.gid))
+                    .map_err(|error| format!("owning {}: {error}", dir.display()))?;
+            }
+        }
+
+        let isolation = self.info.provisioning.build_isolation(cache);
+        let build = muru_provision::Build {
+            project: spec.source.clone(),
+            python: Some(spec.python.display().to_string()),
+            deployment: true,
+            deps_only: false,
+            target: Some(environment.clone()),
+            extras: spec.build.extras.clone(),
+            groups: spec.build.groups.clone(),
+            source_builds: spec.build.source_builds,
+            compile_bytecode: spec.build.compile_bytecode,
+        };
+        let log_path = self.host_log(app, id);
+        let started = std::time::Instant::now();
+        let digest = muru_provision::build::lock_digest(&spec.source).unwrap_or_default();
+        let outcome = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .map_err(|error| format!("opening {}: {error}", log_path.display()))?;
+            let mut command = build.command(&uv, &isolation);
+
+            // The build runs as the release's user, so it has that user's
+            // home too and not the daemon's (section 8.7).
+
+            if let Some(identity) = identity {
+                command.envs(identity.account());
+            }
+
+            crate::host::own_session_std(&mut command, identity);
+
+            // Every line of the release's log has the full time in front,
+            // as the relay puts on the host's and the workers' lines.
+
+            let mut write = |line: &str| {
+                let time = muru_common::log::full(std::time::SystemTime::now());
+                let _ = writeln!(log, "{time} [build] {line}");
+            };
+
+            write(&build.describe());
+            build
+                .run_command(command, &mut write)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+        outcome?;
+        self.events.emit(
+            "release.built",
+            &subject,
+            "info",
+            &format!(
+                "{} in {:.1}s from uv.lock {digest}",
+                environment.display(),
+                started.elapsed().as_secs_f64()
+            ),
+        );
+        Ok(python)
+    }
+
+    /// Section 8.3: the runtime library for an interpreter, from the
+    /// environment, the state directory's runtime directories or a fetch,
+    /// under the `[tools]` table's offline and wheel directory settings.
+    async fn runtime_library(&self, python: &Path) -> Result<muru_provision::Provided, String> {
+        let probe = muru_provision::probe::probe(python).map_err(|error| error.to_string())?;
+        let tools = &self.info.provisioning.tools;
+        let version = muru_provision::runtime::pep440(env!("CARGO_PKG_VERSION"));
+        let root = self.locations.state.path.join("runtime");
+
+        // The `[tools]` table's wheel directory, else the one the
+        // environment names, as `muructl run` takes it.
+
+        let (wheel_dir, named_by) = match tools.wheel_dir.as_deref() {
+            Some(directory) => (Some(PathBuf::from(directory)), "tools.wheel_dir"),
+            None => match muru_provision::runtime::wheel_dir_from_environment() {
+                Some(directory) => (Some(directory), muru_provision::runtime::WHEEL_DIR_VARIABLE),
+                None => (None, "tools.wheel_dir"),
+            },
+        };
+
+        let options = muru_provision::runtime::Options {
+            probe: &probe,
+            version: &version,
+            root: &root,
+            wheel_dir: wheel_dir.as_deref(),
+            offline: tools.offline.unwrap_or(false),
+        };
+
+        muru_provision::runtime::provide(&options, named_by)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Issue 693: how long a stopping daemon waits for the starts it has
+/// cancelled to stop what they started.
+const START_CANCEL_WAIT: Duration = Duration::from_secs(60);
+
+/// Issue 693: wait, on a task beside the loop, for a host just started:
+/// its preload, then the release's before_fork gates, each run to its
+/// end, then its workers listening. A failure stops the host and records
+/// the release failed, with the reason the log gives; a cancel stops the
+/// host and leaves the release to whoever cancelled it.
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_host(
+    context: &StartContext,
+    runs: &crate::runs::Runs,
+    mut host: HostProcess,
+    release: &Release,
+    gates: Vec<crate::commands::Prepared>,
+    log: &Path,
+    log_start: u64,
+    cancelled: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<HostProcess, String> {
+    let subject = format!("{}@{}", release.app, release.id);
+    let cancel = |cancelled: &mut tokio::sync::watch::Receiver<bool>| {
+        let mut cancelled = cancelled.clone();
+        async move {
+            let _ = cancelled.wait_for(|cancelled| *cancelled).await;
+        }
+    };
+
+    let waited: Result<(), String> = async {
+        if !gates.is_empty() {
+            tokio::select! {
+                held = host.wait_held(START_TIMEOUT) => held.map_err(|error| format!("{error:#}"))?,
+                () = cancel(cancelled) => return Err("its start was cancelled".to_owned()),
+            }
+
+            context.set_state(
+                release,
+                ReleaseState::Warming,
+                "preloaded, running its before_fork gates",
+            );
+
+            let passed = tokio::select! {
+                passed = run_gate_commands(context, runs, release, gates, crate::model::Gate::BeforeFork) => passed,
+                () = cancel(cancelled) => Err("its start was cancelled".to_owned()),
+            };
+
+            host.release_gates(passed.is_ok());
+            passed?;
+        }
+
+        context.set_state(release, ReleaseState::Warming, "waiting for the workers");
+
+        tokio::select! {
+            ready = host.wait_ready(START_TIMEOUT) => ready.map_err(|error| format!("{error:#}")),
+            () = cancel(cancelled) => Err("its start was cancelled".to_owned()),
+        }
+    }
+    .await;
+
+    match waited {
+        Ok(()) => Ok(host),
+        Err(mut message) => {
+            host.stop(release.spec.timeouts.stop_budget()).await;
+
+            if *cancelled.borrow() {
+                return Err(message);
+            }
+
+            // Section 9.1: the failure names its cause, wherever it is read.
+
+            if let Some(reason) = crate::logs::start_failure(log, log_start).await {
+                message = format!("{message}: {reason}");
+            }
+
+            context.set_state(release, ReleaseState::Failed, &message);
+            context
+                .events
+                .emit("release.failed", &subject, "error", &message);
+            Err(message)
+        }
+    }
+}
+
+/// Section 9.12 (issue 266): run a release's gates at `stage`, prepared
+/// in the loop, one after another in the order of their names, each as a
+/// run with the trigger `gate:STAGE`, and record each that passes. The
+/// first that fails ends it, with why.
+async fn run_gate_commands(
+    context: &StartContext,
+    runs: &crate::runs::Runs,
+    release: &Release,
+    gates: Vec<crate::commands::Prepared>,
+    stage: crate::model::Gate,
+) -> Result<(), String> {
+    let subject = format!("{}@{}", release.app, release.id);
+
+    for gate in gates {
+        let name = gate.run_name().to_owned();
+        let failed = |why: &str| format!("the {} gate {name} {why}", stage.as_str());
+        let recorded = runs.recorded(stage.trigger(), crate::runs::DAEMON);
+        let mut running = crate::commands::run(gate, Arc::new(recorded))
+            .map_err(|error| failed(&format!("could not be started: {error}")))?;
+        let mut ended = None;
+
+        while let Some(message) = running.output.recv().await {
+            if message.finished {
+                ended = Some(message);
+                break;
+            }
+        }
+
+        let Some(ended) = ended else {
+            return Err(failed("ended without saying how"));
+        };
+
+        if !ended.ok {
+            return Err(failed(&ended.message));
+        }
+
+        if let Err(error) =
+            context
+                .store
+                .pass_gate(&release.app, &release.id, &name, stage.as_str(), ended.run)
+        {
+            tracing::warn!(%error, "recording the gate {name} failed");
+        }
+
+        context.events.emit(
+            "release.gate_passed",
+            &subject,
+            "info",
+            &format!(
+                "the {} gate {name} passed: run {} {}",
+                stage.as_str(),
+                ended.run,
+                ended.message
+            ),
+        );
+    }
+
+    Ok(())
+}
+
 /// The daemon's state while it runs.
 struct Daemon {
     store: Arc<Store>,
@@ -1375,6 +1845,13 @@ struct Daemon {
     /// by application and command, with the schedule it was worked out
     /// from.
     schedules: HashMap<(String, String), Scheduled>,
+    /// Issue 693: the releases being started beside the loop.
+    starting: HashMap<(String, String), Starting>,
+    /// Issue 693: the starts waiting for another of their application's
+    /// to end, in the order they were asked for.
+    start_queue: HashMap<String, std::collections::VecDeque<(String, AfterStart)>>,
+    /// Issue 693: the applications whose rollout is being promoted.
+    promoting: BTreeSet<String>,
     /// Section 9.10 (issue 689): the overlays whose activation by their
     /// firing condition was skipped, so the event is raised once while the
     /// condition keeps firing.
@@ -1766,6 +2243,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         last_request: 0,
         schedules: HashMap::new(),
         condition_skips: BTreeSet::new(),
+        starting: HashMap::new(),
+        start_queue: HashMap::new(),
+        promoting: BTreeSet::new(),
         booted,
         cgroup: crate::cgroup::Limits::read(),
         guard: crate::guard::Guard::default(),
@@ -1934,6 +2414,32 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         crate::notify::notify("RELOADING=1\nSTATUS=upgrading");
     } else {
         crate::notify::stopping();
+    }
+
+    // Issue 693: a host still starting has nothing the next daemon could
+    // adopt, so every start under way is cancelled, whether the daemon
+    // drains, detaches or upgrades, and its report waited for, which
+    // stops what it started. Other commands arriving meanwhile are
+    // dropped, so their callers hear the daemon has gone, and what waited
+    // on a start is told it failed.
+
+    daemon.cancel_starts("the daemon is stopping").await;
+    let deadline = Instant::now() + START_CANCEL_WAIT;
+
+    while !daemon.starting.is_empty() {
+        match tokio::time::timeout_at(deadline.into(), inbox.recv()).await {
+            Ok(Some(Command::StartStage { app, id, stage })) => {
+                daemon.start_stage(&app, &id, *stage).await;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                tracing::warn!(
+                    starts = daemon.starting.len(),
+                    "starts under way did not end before the daemon stopped"
+                );
+                break;
+            }
+        }
     }
 
     // Section 9.12: a command cannot outlive the daemon it runs under, so
@@ -4455,17 +4961,15 @@ impl Daemon {
                 continue;
             }
 
-            match self.start(&app.name, &current).await {
-                Ok(()) => self.switch_to(&app.name, &current).await,
-                Err(error) => {
-                    self.events.emit(
-                        "release.failed",
-                        &format!("{}@{current}", app.name),
-                        "error",
-                        &format!("could not restart after the daemon restarted: {error}"),
-                    );
-                }
-            }
+            self.start_then(
+                &app.name,
+                &current,
+                AfterStart::Restore {
+                    app: app.name.clone(),
+                    id: current.clone(),
+                },
+            )
+            .await;
         }
     }
 
@@ -4994,11 +5498,11 @@ impl Daemon {
                 created,
                 done,
             } => {
-                let outcome = self.deploy(&app, *spec, id, retain, hold, created).await;
-                let _ = done.send(outcome);
+                self.deploy(&app, *spec, id, retain, hold, created, done)
+                    .await;
             }
             Command::Rollback { app, done } => {
-                let _ = done.send(self.rollback(&app).await);
+                self.rollback(&app, done).await;
             }
             Command::StartRollout {
                 app,
@@ -5008,10 +5512,35 @@ impl Daemon {
                 approve_each_step,
                 done,
             } => {
-                let outcome = self
-                    .start_rollout(&app, &release, steps, gates, approve_each_step)
-                    .await;
-                let _ = done.send(outcome);
+                let checked = self.check_rollout(&app, &release, &steps, &gates).await;
+
+                match checked {
+                    Ok(()) => {
+                        self.start_then(
+                            &app,
+                            &release,
+                            AfterStart::StartRollout {
+                                app: app.clone(),
+                                candidate: release.clone(),
+                                steps,
+                                gates,
+                                approve_each_step,
+                                done,
+                            },
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        let _ = done.send(Err(error));
+                    }
+                }
+            }
+            Command::ControlRollout {
+                app,
+                action: RolloutAction::Promote,
+                done,
+            } => {
+                self.promote_rollout_by_hand(&app, done).await;
             }
             Command::ControlRollout { app, action, done } => {
                 let _ = done.send(self.control_rollout(&app, action).await);
@@ -5028,13 +5557,15 @@ impl Daemon {
 
                 let rollout = self.store.active_rollout(&app).ok().flatten();
 
-                let outcome = match crate::rollouts::promotion_refused(rollout.as_ref(), &app, &id)
-                {
-                    Some(why) => Err(why),
-                    None => self.promote_release(&app, &id, retain).await,
-                };
-
-                let _ = done.send(outcome);
+                match crate::rollouts::promotion_refused(rollout.as_ref(), &app, &id) {
+                    Some(why) => {
+                        let _ = done.send(Err(why));
+                    }
+                    None => {
+                        self.promote_release(&app, &id, retain, AfterPromote::Reply(done))
+                            .await;
+                    }
+                }
             }
             Command::SetScale {
                 app,
@@ -5078,7 +5609,7 @@ impl Daemon {
                 let _ = done.send(self.remove_app(&app).await);
             }
             Command::StartHeld { app, id, done } => {
-                let _ = done.send(self.start_held(&app, &id).await);
+                self.start_held(&app, &id, done).await;
             }
             Command::CommitApply {
                 changes,
@@ -5138,6 +5669,23 @@ impl Daemon {
             }
             Command::HostMessage { app, id, message } => {
                 self.host_message(&app, &id, message).await;
+            }
+            Command::StartStage { app, id, stage } => {
+                self.start_stage(&app, &id, *stage).await;
+            }
+            Command::PromoteGated {
+                app,
+                id,
+                retain,
+                then,
+                outcome,
+            } => {
+                let promoted = match outcome {
+                    Ok(()) => self.promote_switch(&app, &id, retain).await,
+                    Err(error) => Err(error),
+                };
+
+                self.promoted(*then, promoted).await;
             }
             Command::PrepareCommand {
                 app,
@@ -5225,6 +5773,9 @@ impl Daemon {
                         control.request(self.last_request, &op, worker.as_ref(), &args);
                         self.asked.insert(self.last_request, done);
                     }
+                    None if self.starting.contains_key(&(app.clone(), id.clone())) => {
+                        let _ = done.send(Err(starting_refusal(&app, &id)));
+                    }
                     None => {
                         let _ = done.send(Err(format!(
                             "release {app}@{id} is not running with a host control connection"
@@ -5259,6 +5810,7 @@ impl Daemon {
 
     /// Blue/green (section 9.2): record the release, start it, move traffic
     /// once it is ready, drain the release that served before.
+    #[allow(clippy::too_many_arguments)]
     async fn deploy(
         &mut self,
         app: &str,
@@ -5267,17 +5819,20 @@ impl Daemon {
         retain: Retention,
         hold: bool,
         created: oneshot::Sender<Result<Release, String>>,
-    ) -> Result<Release, String> {
+        done: oneshot::Sender<Result<Release, String>>,
+    ) {
         // Section 4.3: refused before anything is started.
 
         if !hold && let Some(refusal) = crate::config::second_app_refusal(&self.store, app) {
             let _ = created.send(Err(refusal.clone()));
-            return Err(refusal);
+            let _ = done.send(Err(refusal));
+            return;
         }
 
         if let Err(error) = self.make_room(app, &spec).await {
             let _ = created.send(Err(error.clone()));
-            return Err(error);
+            let _ = done.send(Err(error));
+            return;
         }
 
         let record = self.create(app, spec, id);
@@ -5286,7 +5841,8 @@ impl Daemon {
             Ok(release) => release,
             Err(error) => {
                 let _ = created.send(Err(error.clone()));
-                return Err(error);
+                let _ = done.send(Err(error));
+                return;
             }
         };
 
@@ -5299,11 +5855,33 @@ impl Daemon {
             &format!("from {}", release.spec.source.display()),
         );
 
-        self.start(app, &release.id).await?;
+        let id = release.id.clone();
 
-        // Section 9.2: held, the release runs and can be previewed, and
-        // traffic stays where it is until a rollout or a promotion.
+        self.start_then(
+            app,
+            &id,
+            AfterStart::Deploy {
+                app: app.to_owned(),
+                release: Box::new(release),
+                hold,
+                retain,
+                done,
+            },
+        )
+        .await;
+    }
 
+    /// What follows a deploy's start: section 9.2, held, the release runs
+    /// and can be previewed, and traffic stays where it is until a rollout
+    /// or a promotion; otherwise traffic moves to it and the release that
+    /// served drains.
+    async fn deployed(
+        &mut self,
+        app: &str,
+        release: Release,
+        hold: bool,
+        retain: Retention,
+    ) -> Result<Release, String> {
         if hold {
             if let Some(running) = self.running.get_mut(&(app.to_owned(), release.id.clone())) {
                 running.held = true;
@@ -5376,164 +5954,20 @@ impl Daemon {
             .map_err(|error| error.to_string())
     }
 
-    /// Section 8.2: build the release's environment when its spec says
-    /// so and it is not there yet (a release started again after a daemon
-    /// restart, or a rollback target, keeps the one it has), as the
-    /// release's user, with uv's lines in the release log tagged [build].
-    /// Returns the interpreter the host runs: the environment's, or the
-    /// spec's when nothing is built.
-    async fn build_environment(
-        &self,
-        app: &str,
-        id: &str,
-        release: &Release,
-        identity: Option<crate::host::Identity>,
-    ) -> Result<PathBuf, String> {
-        let spec = &release.spec;
-
-        if !spec.build.builds {
-            return Ok(spec.python.clone());
+    /// What a release's start shares with the tasks it runs (issue 693).
+    fn context(&self) -> StartContext {
+        StartContext {
+            store: Arc::clone(&self.store),
+            events: self.events.clone(),
+            info: Arc::clone(&self.info),
+            locations: self.locations.clone(),
         }
-
-        let environment =
-            crate::provision::Provisioning::environment_dir(&self.locations.state.path, app, id);
-        let python = environment.join("bin").join("python");
-
-        if python.is_file() {
-            return Ok(python);
-        }
-
-        let Some(uv) = self.info.provisioning.uv.clone() else {
-            return Err(
-                "the release needs an environment built and uv was not found; install uv, or                  deploy a source with its environment built"
-                    .to_owned(),
-            );
-        };
-        let subject = format!("{app}@{id}");
-        self.set_state(release, ReleaseState::Building, "building the environment");
-        self.events.emit(
-            "release.building",
-            &subject,
-            "info",
-            &format!("from {}", spec.source.join("uv.lock").display()),
-        );
-
-        // The directories the build writes, owned by the release's user:
-        // the application's environments and a uv cache of its own.
-
-        let user =
-            identity.map_or_else(|| "daemon".to_owned(), |identity| identity.uid.to_string());
-        let cache = self.locations.state.path.join("uv-cache").join(&user);
-        let parent = environment
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.locations.state.path.clone());
-
-        for dir in [&parent, &cache] {
-            std::fs::create_dir_all(dir)
-                .map_err(|error| format!("creating {}: {error}", dir.display()))?;
-
-            if let Some(identity) = identity {
-                std::os::unix::fs::chown(dir, Some(identity.uid), Some(identity.gid))
-                    .map_err(|error| format!("owning {}: {error}", dir.display()))?;
-            }
-        }
-
-        let isolation = self.info.provisioning.build_isolation(cache);
-        let build = muru_provision::Build {
-            project: spec.source.clone(),
-            python: Some(spec.python.display().to_string()),
-            deployment: true,
-            deps_only: false,
-            target: Some(environment.clone()),
-            extras: spec.build.extras.clone(),
-            groups: spec.build.groups.clone(),
-            source_builds: spec.build.source_builds,
-            compile_bytecode: spec.build.compile_bytecode,
-        };
-        let log_path = self.host_log(app, id);
-        let started = std::time::Instant::now();
-        let digest = muru_provision::build::lock_digest(&spec.source).unwrap_or_default();
-        let outcome = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-
-            let mut log = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .map_err(|error| format!("opening {}: {error}", log_path.display()))?;
-            let mut command = build.command(&uv, &isolation);
-
-            // The build runs as the release's user, so it has that user's
-            // home too and not the daemon's (section 8.7).
-
-            if let Some(identity) = identity {
-                command.envs(identity.account());
-            }
-
-            crate::host::own_session_std(&mut command, identity);
-
-            // Every line of the release's log has the full time in front,
-            // as the relay puts on the host's and the workers' lines.
-
-            let mut write = |line: &str| {
-                let time = muru_common::log::full(std::time::SystemTime::now());
-                let _ = writeln!(log, "{time} [build] {line}");
-            };
-
-            write(&build.describe());
-            build
-                .run_command(command, &mut write)
-                .map_err(|error| error.to_string())
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-
-        outcome?;
-        self.events.emit(
-            "release.built",
-            &subject,
-            "info",
-            &format!(
-                "{} in {:.1}s from uv.lock {digest}",
-                environment.display(),
-                started.elapsed().as_secs_f64()
-            ),
-        );
-        Ok(python)
     }
 
-    /// Section 8.3: the runtime library for an interpreter, from the
-    /// environment, the state directory's runtime directories or a fetch,
-    /// under the `[tools]` table's offline and wheel directory settings.
+    /// Section 8.3: the runtime library for an interpreter, as a
+    /// release's start provides it.
     async fn runtime_library(&self, python: &Path) -> Result<muru_provision::Provided, String> {
-        let probe = muru_provision::probe::probe(python).map_err(|error| error.to_string())?;
-        let tools = &self.info.provisioning.tools;
-        let version = muru_provision::runtime::pep440(env!("CARGO_PKG_VERSION"));
-        let root = self.locations.state.path.join("runtime");
-
-        // The `[tools]` table's wheel directory, else the one the
-        // environment names, as `muructl run` takes it.
-
-        let (wheel_dir, named_by) = match tools.wheel_dir.as_deref() {
-            Some(directory) => (Some(PathBuf::from(directory)), "tools.wheel_dir"),
-            None => match muru_provision::runtime::wheel_dir_from_environment() {
-                Some(directory) => (Some(directory), muru_provision::runtime::WHEEL_DIR_VARIABLE),
-                None => (None, "tools.wheel_dir"),
-            },
-        };
-
-        let options = muru_provision::runtime::Options {
-            probe: &probe,
-            version: &version,
-            root: &root,
-            wheel_dir: wheel_dir.as_deref(),
-            offline: tools.offline.unwrap_or(false),
-        };
-
-        muru_provision::runtime::provide(&options, named_by)
-            .await
-            .map_err(|error| error.to_string())
+        self.context().runtime_library(python).await
     }
 
     /// Section 8.2: redirected bytecode goes to a directory of the
@@ -5749,7 +6183,7 @@ impl Daemon {
     /// (pending or stopped to starting and warming; or failed). The
     /// caller marks the release ready once the edge has it, with
     /// `mark_ready`, so a client told it is ready can reach it.
-    async fn start(&mut self, app: &str, id: &str) -> Result<(), String> {
+    async fn begin_start(&mut self, app: &str, id: &str) -> Result<bool, String> {
         let release = self
             .store
             .release(app, id)
@@ -5763,7 +6197,7 @@ impl Daemon {
             running.retained_until = None;
             running.retained_until_unix_ms = 0;
             running.inspected = false;
-            return Ok(());
+            return Ok(true);
         }
 
         self.set_state(
@@ -5824,38 +6258,95 @@ impl Daemon {
 
             return self
                 .start_servers(app, id, &release, &http, env, identity, &run_dir, started)
-                .await;
+                .map(|()| false);
         }
 
-        // Section 8.2: the Building state, for a release whose mode and
-        // source call for an environment of its own, built from the lock
-        // as the release's user into the state directory. A failed build
-        // fails the release before start-up, with uv's last line.
+        // Issue 693: the environment is built and the runtime library
+        // provided on a task of its own, beside the loop, which carries on
+        // in `continue_start` once it reports back.
 
-        let python = match self.build_environment(app, id, &release, identity).await {
-            Ok(python) => python,
-            Err(message) => {
-                self.set_state(&release, ReleaseState::Failed, &message);
-                self.events
-                    .emit("release.build_failed", &subject, "error", &message);
-                return Err(message);
-            }
+        let context = self.context();
+        let commands = self.commands.clone();
+        let (key_app, key_id) = (app.to_owned(), id.to_owned());
+        let building = release.clone();
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+
+        tokio::spawn(async move {
+            let built = tokio::select! {
+                built = async {
+                    let python = context
+                        .build_environment(&key_app, &key_id, &building, identity)
+                        .await
+                        .map_err(|message| (message, "release.build_failed"))?;
+                    let library = context
+                        .runtime_library(&python)
+                        .await
+                        .map_err(|message| (message, "release.failed"))?;
+                    Ok((python, library))
+                } => built,
+                _ = cancelled.wait_for(|cancelled| *cancelled) => {
+                    Err(("its start was cancelled".to_owned(), "release.failed"))
+                }
+            };
+
+            let _ = commands
+                .send(Command::StartStage {
+                    app: key_app,
+                    id: key_id,
+                    stage: Box::new(StartStage::Built(built)),
+                })
+                .await;
+        });
+
+        self.starting.insert(
+            (app.to_owned(), id.to_owned()),
+            Starting {
+                prep: Some(StartPrep {
+                    release,
+                    env,
+                    identity,
+                    run_dir,
+                    started,
+                    library: None,
+                }),
+                cancel,
+                cancelled: None,
+                reserved: 0,
+                waiters: Vec::new(),
+            },
+        );
+        Ok(false)
+    }
+
+    /// Issue 693: the second stage of a release's start, once its
+    /// environment is built and its runtime library provided: the host's
+    /// settings, its before_fork gates prepared, and the host started,
+    /// whose preload, gates and workers a task waits for.
+    async fn continue_start(
+        &mut self,
+        app: &str,
+        id: &str,
+        python: PathBuf,
+        library: muru_provision::Provided,
+    ) -> Result<(), String> {
+        let Some(prep) = self
+            .starting
+            .get_mut(&(app.to_owned(), id.to_owned()))
+            .and_then(|starting| starting.prep.take())
+        else {
+            return Err("its start was cancelled".to_owned());
         };
 
-        // Section 8.3: the runtime library for the release's interpreter,
-        // from the environment when it matches, else the state directory,
-        // else fetched once. A mismatched copy that has to do is a warning
-        // in the release's events; nothing usable fails the release.
-
-        let library = match self.runtime_library(&python).await {
-            Ok(library) => library,
-            Err(message) => {
-                self.set_state(&release, ReleaseState::Failed, &message);
-                self.events
-                    .emit("release.failed", &subject, "error", &message);
-                return Err(message);
-            }
-        };
+        let StartPrep {
+            release,
+            env,
+            identity,
+            run_dir,
+            started,
+            ..
+        } = prep;
+        let subject = format!("{app}@{id}");
+        let spec = &release.spec;
 
         for note in &library.notes {
             let level = if library.how == muru_provision::How::Fallback {
@@ -6003,59 +6494,109 @@ impl Daemon {
             }
         };
 
-        if !gates.is_empty() {
-            let held = host
-                .wait_held(START_TIMEOUT)
-                .await
-                .map_err(|error| format!("{error:#}"));
+        // The gates' runs are prepared here, with the environment the
+        // host has; a gate that cannot be prepared fails the start.
 
-            let passed = match held {
-                Ok(()) => {
-                    self.set_state(
-                        &release,
-                        ReleaseState::Warming,
-                        "preloaded, running its before_fork gates",
-                    );
-                    self.run_gates(app, id, &gates, crate::model::Gate::BeforeFork)
-                        .await
-                }
-                Err(error) => Err(error),
+        let mut prepared = Vec::new();
+
+        for gate in &gates {
+            let request = crate::commands::CommandRequest::Declared {
+                name: gate.name.clone(),
+                inputs: BTreeMap::new(),
+                secret_inputs: BTreeMap::new(),
             };
 
-            host.release_gates(passed.is_ok());
-
-            if let Err(error) = passed {
-                let mut message = error;
-                host.stop(release.spec.timeouts.stop_budget()).await;
-
-                if let Some(reason) = crate::logs::start_failure(&log, log_start).await {
-                    message = format!("{message}: {reason}");
+            match self.prepare_command(app, id, request).await {
+                Ok(mut command) => {
+                    command.exclusive = true;
+                    prepared.push(command);
                 }
-
-                self.set_state(&release, ReleaseState::Failed, &message);
-                self.events
-                    .emit("release.failed", &subject, "error", &message);
-                return Err(message);
+                Err(error) => {
+                    let message = format!(
+                        "the before_fork gate {} could not be started: {error}",
+                        gate.name
+                    );
+                    host.release_gates(false);
+                    host.stop(release.spec.timeouts.stop_budget()).await;
+                    self.set_state(&release, ReleaseState::Failed, &message);
+                    self.events
+                        .emit("release.failed", &subject, "error", &message);
+                    return Err(message);
+                }
             }
         }
 
-        self.set_state(&release, ReleaseState::Warming, "waiting for the workers");
+        let context = self.context();
+        let runs = self.runs.clone();
+        let commands = self.commands.clone();
+        let key = (app.to_owned(), id.to_owned());
 
-        if let Err(error) = host.wait_ready(START_TIMEOUT).await {
-            let mut message = format!("{error:#}");
-            host.stop(release.spec.timeouts.stop_budget()).await;
-
-            // Section 9.1: the failure names its cause, wherever it is read.
-
-            if let Some(reason) = crate::logs::start_failure(&log, log_start).await {
-                message = format!("{message}: {reason}");
+        let mut cancelled = match self.starting.get_mut(&key) {
+            Some(starting) => {
+                starting.prep = Some(StartPrep {
+                    release: release.clone(),
+                    env: Vec::new(),
+                    identity,
+                    run_dir,
+                    started,
+                    library: Some(library),
+                });
+                starting.cancel.subscribe()
             }
+            None => tokio::sync::watch::channel(true).1,
+        };
 
-            self.set_state(&release, ReleaseState::Failed, &message);
-            self.events
-                .emit("release.failed", &subject, "error", &message);
-            return Err(message);
-        }
+        tokio::spawn(async move {
+            let outcome = wait_for_host(
+                &context,
+                &runs,
+                host,
+                &release,
+                prepared,
+                &log,
+                log_start,
+                &mut cancelled,
+            )
+            .await;
+            let _ = commands
+                .send(Command::StartStage {
+                    app: key.0,
+                    id: key.1,
+                    stage: Box::new(StartStage::Host(outcome)),
+                })
+                .await;
+        });
+
+        Ok(())
+    }
+
+    /// Issue 693: the last stage of a release's start, once its workers
+    /// listen: the host recorded for the next daemon, taken into what
+    /// runs, and announced.
+    fn finish_start(&mut self, app: &str, id: &str, host: HostProcess) -> Result<(), String> {
+        let Some(prep) = self
+            .starting
+            .get_mut(&(app.to_owned(), id.to_owned()))
+            .and_then(|starting| starting.prep.take())
+        else {
+            return Err("its start was cancelled".to_owned());
+        };
+
+        let StartPrep {
+            release,
+            run_dir,
+            started,
+            library,
+            ..
+        } = prep;
+        let library = library.unwrap_or_else(|| muru_provision::Provided {
+            pythonpath: None,
+            version: String::new(),
+            how: muru_provision::How::Environment,
+            notes: Vec::new(),
+        });
+        let subject = format!("{app}@{id}");
+        let spec = &release.spec;
 
         let sockets = host.default_sockets();
         let host_sockets = host.sockets.len();
@@ -6270,7 +6811,7 @@ impl Daemon {
     /// Section 9.9: start a managed HTTP release's instances and wait
     /// for their readiness probes, then route to them as an upstream.
     #[allow(clippy::too_many_arguments)]
-    async fn start_servers(
+    fn start_servers(
         &mut self,
         app: &str,
         id: &str,
@@ -6285,40 +6826,124 @@ impl Daemon {
         let log = self.host_log(app, id);
         let grace = Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms);
         let relays = self.server_relays(&subject)?;
-        let spawned = Servers::start(
-            http,
-            &run_dir.join("r1"),
-            &release.spec.source,
-            env,
-            identity,
-            &log,
-            Some(relays),
-            grace,
-        )
-        .await;
 
-        let mut servers = match spawned {
-            Ok(servers) => servers,
-            Err(error) => {
-                let message = format!("the server could not be started: {error:#}");
-                self.set_state(release, ReleaseState::Failed, &message);
-                self.events
-                    .emit("release.failed", &subject, "error", &message);
-                return Err(message);
+        // Issue 693: the instances are started and their probes waited
+        // for on a task beside the loop, which `finish_servers` takes on.
+
+        let context = self.context();
+        let commands = self.commands.clone();
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let (task_release, task_http, task_dir) =
+            (release.clone(), http.clone(), run_dir.to_path_buf());
+        let key = (app.to_owned(), id.to_owned());
+
+        tokio::spawn(async move {
+            let release = task_release;
+            let subject = format!("{}@{}", release.app, release.id);
+
+            let outcome = async {
+                let spawned = Servers::start(
+                    &task_http,
+                    &task_dir.join("r1"),
+                    &release.spec.source,
+                    env,
+                    identity,
+                    &log,
+                    Some(relays),
+                    grace,
+                )
+                .await;
+
+                let mut servers = match spawned {
+                    Ok(servers) => servers,
+                    Err(error) => {
+                        return Err(format!("the server could not be started: {error:#}"));
+                    }
+                };
+
+                context.set_state(&release, ReleaseState::Warming, "waiting for the instances");
+                let timeout = Duration::from_millis(task_http.readiness_timeout_ms);
+
+                let ready = tokio::select! {
+                    ready = servers.wait_ready(timeout) => ready.map_err(|error| format!("{error:#}")),
+                    _ = cancelled.wait_for(|cancelled| *cancelled) => {
+                        Err("its start was cancelled".to_owned())
+                    }
+                };
+
+                match ready {
+                    Ok(()) => Ok(servers),
+                    Err(message) => {
+                        servers.stop(grace).await;
+                        Err(message)
+                    }
+                }
             }
+            .await;
+
+            if let Err(message) = &outcome
+                && !*cancelled.borrow()
+            {
+                context.set_state(&release, ReleaseState::Failed, message);
+                context
+                    .events
+                    .emit("release.failed", &subject, "error", message);
+            }
+
+            let _ = commands
+                .send(Command::StartStage {
+                    app: key.0,
+                    id: key.1,
+                    stage: Box::new(StartStage::Servers(outcome)),
+                })
+                .await;
+        });
+
+        self.starting.insert(
+            (app.to_owned(), id.to_owned()),
+            Starting {
+                prep: Some(StartPrep {
+                    release: release.clone(),
+                    env: Vec::new(),
+                    identity,
+                    run_dir: run_dir.to_path_buf(),
+                    started,
+                    library: None,
+                }),
+                cancel,
+                cancelled: None,
+                reserved: 0,
+                waiters: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Issue 693: a managed server's instances answer their probes: record
+    /// them for the next daemon, take them into what runs, and announce
+    /// them.
+    fn finish_servers(&mut self, app: &str, id: &str, servers: Servers) -> Result<(), String> {
+        let Some(prep) = self
+            .starting
+            .get_mut(&(app.to_owned(), id.to_owned()))
+            .and_then(|starting| starting.prep.take())
+        else {
+            return Err("its start was cancelled".to_owned());
         };
 
-        self.set_state(release, ReleaseState::Warming, "waiting for the instances");
-        let timeout = Duration::from_millis(http.readiness_timeout_ms);
-
-        if let Err(error) = servers.wait_ready(timeout).await {
-            let message = format!("{error:#}");
-            servers.stop(grace).await;
-            self.set_state(release, ReleaseState::Failed, &message);
-            self.events
-                .emit("release.failed", &subject, "error", &message);
-            return Err(message);
-        }
+        let StartPrep {
+            release,
+            run_dir,
+            started,
+            ..
+        } = prep;
+        let subject = format!("{app}@{id}");
+        let describe = release
+            .spec
+            .http
+            .as_ref()
+            .map(crate::model::HttpServerSpec::describe)
+            .unwrap_or_default();
 
         write_record(&run_dir.join("servers.toml"), &servers.record());
         self.running.insert(
@@ -6348,7 +6973,7 @@ impl Daemon {
         );
         self.publish_servers();
         self.set_state(
-            release,
+            &release,
             ReleaseState::Warming,
             "instances ready, waiting for the edge",
         );
@@ -6357,12 +6982,344 @@ impl Daemon {
             &subject,
             "info",
             &format!(
-                "{} ready in {:.1} s",
-                http.describe(),
+                "{describe} ready in {:.1} s",
                 started.elapsed().as_secs_f64()
             ),
         );
         Ok(())
+    }
+
+    /// Issue 693: start a release beside the loop, then carry out `then`
+    /// with how the start went. A release already running needs no start
+    /// and `then` runs at once; one already starting gives `then` the
+    /// same outcome; and a release of an application another of whose
+    /// releases is starting waits its turn, since two would compete for
+    /// the same memory and migrations. Releases of different applications
+    /// start side by side.
+    async fn start_then(&mut self, app: &str, id: &str, then: AfterStart) {
+        let key = (app.to_owned(), id.to_owned());
+
+        // Issue 693: a daemon that is stopping starts nothing.
+
+        if self
+            .info
+            .stopping
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.after_start(then, Err("the daemon is stopping".to_owned()))
+                .await;
+            return;
+        }
+
+        if let Some(starting) = self.starting.get_mut(&key) {
+            starting.waiters.push(then);
+            return;
+        }
+
+        if self.starting.keys().any(|(starting, _)| starting == app) {
+            self.start_queue
+                .entry(app.to_owned())
+                .or_default()
+                .push_back((id.to_owned(), then));
+            return;
+        }
+
+        // The memory the release will hold counts against the budget from
+        // now, so two starts cannot each fit and together overshoot it.
+
+        let reserved = self
+            .store
+            .release(app, id)
+            .ok()
+            .and_then(|release| {
+                self.budget_view(self.budget_usage())
+                    .release_memory(app, &release.spec)
+            })
+            .unwrap_or(0);
+
+        match self.begin_start(app, id).await {
+            Ok(true) => self.after_start(then, Ok(())).await,
+            Ok(false) => {
+                if let Some(starting) = self.starting.get_mut(&key) {
+                    starting.reserved = reserved;
+                    starting.waiters.push(then);
+                }
+            }
+            Err(error) => {
+                self.after_start(then, Err(error)).await;
+                self.start_next(app).await;
+            }
+        }
+    }
+
+    /// Issue 693: carry out what followed a release's start in the
+    /// operation that started it, with how the start went.
+    async fn after_start(&mut self, then: AfterStart, started: Result<(), String>) {
+        match then {
+            AfterStart::Restore { app, id } => match started {
+                Ok(()) => self.switch_to(&app, &id).await,
+                Err(error) => self.events.emit(
+                    "release.failed",
+                    &format!("{app}@{id}"),
+                    "error",
+                    &format!("could not restart after the daemon restarted: {error}"),
+                ),
+            },
+            AfterStart::Deploy {
+                app,
+                release,
+                hold,
+                retain,
+                done,
+            } => {
+                let outcome = match started {
+                    Ok(()) => self.deployed(&app, *release, hold, retain).await,
+                    Err(error) => Err(error),
+                };
+
+                let _ = done.send(outcome);
+            }
+            AfterStart::StartRollout {
+                app,
+                candidate,
+                steps,
+                gates,
+                approve_each_step,
+                done,
+            } => {
+                let outcome = match started {
+                    Ok(()) => {
+                        self.rollout_started(&app, &candidate, steps, gates, approve_each_step)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+
+                let _ = done.send(outcome);
+            }
+            AfterStart::Promote {
+                app,
+                id,
+                retain,
+                then,
+            } => match started {
+                Ok(()) => Box::pin(self.promote_started(&app, &id, retain, then)).await,
+                Err(error) => Box::pin(self.promoted(then, Err(error))).await,
+            },
+            AfterStart::Held { app, id, done } => {
+                let outcome = match started {
+                    Ok(()) => self.held_started(&app, &id).await,
+                    Err(error) => Err(error),
+                };
+
+                let _ = done.send(outcome);
+            }
+            AfterStart::Referenced { app, id, warming } => {
+                self.referenced_started(&app, &id, warming, started).await;
+            }
+            AfterStart::Wake { app, id } => {
+                let subject = format!("{app}@{id}");
+
+                match started {
+                    Ok(()) => {
+                        if let Err(error) = self.push_snapshot().await {
+                            tracing::error!(%error, "pushing the snapshot for a woken release failed");
+                        }
+
+                        self.mark_ready(&app, &id, "woken by a request");
+                        self.make_worker_room(&subject).await;
+                    }
+                    Err(error) => {
+                        self.events
+                            .emit("release.failed", &subject, "error", &error);
+                    }
+                }
+            }
+            AfterStart::Rollback {
+                app,
+                previous,
+                current,
+                done,
+            } => {
+                let outcome = match started {
+                    Ok(()) => Box::pin(self.rolled_back(&app, &previous, current)).await,
+                    Err(error) => Err(error),
+                };
+
+                let _ = done.send(outcome);
+            }
+            AfterStart::Restart { app, id } => {
+                if started.is_ok() {
+                    self.switch_to(&app, &id).await;
+                }
+            }
+        }
+    }
+
+    /// Issue 693: a stage of a release's start has reported: go on to the
+    /// next, or end the start.
+    async fn start_stage(&mut self, app: &str, id: &str, stage: StartStage) {
+        let key = (app.to_owned(), id.to_owned());
+
+        if let Some(why) = self
+            .starting
+            .get(&key)
+            .and_then(|starting| starting.cancelled.clone())
+        {
+            self.start_cancelled(app, id, stage, &why).await;
+            return;
+        }
+
+        let outcome = match stage {
+            StartStage::Built(Ok((python, library))) => {
+                match self.continue_start(app, id, python, library).await {
+                    Ok(()) => return,
+                    Err(error) => Err(error),
+                }
+            }
+            StartStage::Built(Err((message, kind))) => {
+                if let Ok(release) = self.store.release(app, id) {
+                    self.set_state(&release, ReleaseState::Failed, &message);
+                }
+
+                self.events
+                    .emit(kind, &format!("{app}@{id}"), "error", &message);
+                Err(message)
+            }
+            StartStage::Host(Ok(host)) => self.finish_start(app, id, host),
+            StartStage::Servers(Ok(servers)) => self.finish_servers(app, id, servers),
+            StartStage::Host(Err(message)) | StartStage::Servers(Err(message)) => Err(message),
+        };
+
+        self.end_start(app, id, outcome).await;
+    }
+
+    /// Issue 693: a cancelled start has reported: stop what it started, if
+    /// anything, record the release stopped unless whoever cancelled it
+    /// has already, and end the start.
+    async fn start_cancelled(&mut self, app: &str, id: &str, stage: StartStage, why: &str) {
+        let subject = format!("{app}@{id}");
+
+        match stage {
+            StartStage::Host(Ok(host)) => {
+                let grace = self
+                    .store
+                    .release(app, id)
+                    .map_or(Duration::from_secs(10), |release| {
+                        release.spec.timeouts.stop_budget()
+                    });
+                host.stop(grace).await;
+            }
+            StartStage::Servers(Ok(servers)) => {
+                let grace = self
+                    .store
+                    .release(app, id)
+                    .map_or(Duration::from_secs(10), |release| {
+                        Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms)
+                    });
+                servers.stop(grace).await;
+            }
+            _ => {}
+        }
+
+        let message = format!("its start was cancelled: {why}");
+
+        if let Ok(release) = self.store.release(app, id)
+            && (release.state.is_running()
+                || matches!(
+                    release.state,
+                    ReleaseState::Pending | ReleaseState::Building
+                ))
+        {
+            self.set_state(&release, ReleaseState::Stopped, &message);
+            self.events
+                .emit("release.stopped", &subject, "info", &message);
+        }
+
+        self.end_start(app, id, Err(message)).await;
+    }
+
+    /// Issue 693: a release's start has ended: carry out what was waiting
+    /// on it, then the next start of its application.
+    async fn end_start(&mut self, app: &str, id: &str, outcome: Result<(), String>) {
+        let Some(starting) = self.starting.remove(&(app.to_owned(), id.to_owned())) else {
+            return;
+        };
+
+        for then in starting.waiters {
+            self.after_start(then, outcome.clone()).await;
+        }
+
+        self.start_next(app).await;
+    }
+
+    /// Issue 693: the next start of an application waiting for its turn.
+    async fn start_next(&mut self, app: &str) {
+        if self.starting.keys().any(|(starting, _)| starting == app) {
+            return;
+        }
+
+        let next = self
+            .start_queue
+            .get_mut(app)
+            .and_then(std::collections::VecDeque::pop_front);
+
+        if self
+            .start_queue
+            .get(app)
+            .is_some_and(std::collections::VecDeque::is_empty)
+        {
+            self.start_queue.remove(app);
+        }
+
+        if let Some((id, then)) = next {
+            Box::pin(self.start_then(app, &id, then)).await;
+        }
+    }
+
+    /// Issue 693: cancel a release's start under way, which stops its host
+    /// if one has started; what waits on it is told the start failed. A
+    /// start waiting for its turn is dropped, failed the same way. Gives
+    /// whether there was one.
+    async fn cancel_start(&mut self, app: &str, id: &str, why: &str) -> bool {
+        let mut found = false;
+
+        if let Some(starting) = self.starting.get_mut(&(app.to_owned(), id.to_owned())) {
+            let _ = starting.cancel.send(true);
+            starting.cancelled = Some(why.to_owned());
+            found = true;
+        }
+
+        let queued: Vec<AfterStart> = match self.start_queue.get_mut(app) {
+            Some(queue) => {
+                let (dropped, kept): (Vec<_>, Vec<_>) =
+                    queue.drain(..).partition(|(queued, _)| queued == id);
+                queue.extend(kept);
+                dropped.into_iter().map(|(_, then)| then).collect()
+            }
+            None => Vec::new(),
+        };
+
+        for then in queued {
+            found = true;
+            self.after_start(then, Err(format!("its start was cancelled: {why}")))
+                .await;
+        }
+
+        found
+    }
+
+    /// Issue 693: cancel every start under way or waiting for its turn.
+    async fn cancel_starts(&mut self, why: &str) {
+        let mut keys: Vec<(String, String)> = self.starting.keys().cloned().collect();
+
+        for (app, queue) in &self.start_queue {
+            keys.extend(queue.iter().map(|(id, _)| (app.clone(), id.clone())));
+        }
+
+        for (app, id) in keys {
+            self.cancel_start(&app, &id, why).await;
+        }
     }
 
     /// Point the edge at a release's workers: the application's serving
@@ -7120,14 +8077,13 @@ impl Daemon {
     /// Section 9.3: begin a rollout of `candidate` against the release that
     /// serves. The candidate is started if it is not running, takes the
     /// first step's share at once, and the ticks move it along.
-    async fn start_rollout(
+    async fn check_rollout(
         &mut self,
         app: &str,
         candidate: &str,
-        steps: Vec<RolloutStep>,
-        gates: RolloutGates,
-        approve_each_step: bool,
-    ) -> Result<Rollout, String> {
+        steps: &[RolloutStep],
+        gates: &RolloutGates,
+    ) -> Result<(), String> {
         let record = self.store.app(app).map_err(|error| error.to_string())?;
         let Some(baseline) = record.current.clone() else {
             return Err(format!("{app} has no serving release to roll out against"));
@@ -7174,8 +8130,25 @@ impl Daemon {
             }
         }
 
-        self.make_room_for(app, candidate).await?;
-        self.start(app, candidate).await?;
+        self.make_room_for(app, candidate).await
+    }
+
+    /// What follows the start of a rollout's candidate (issue 693): the
+    /// rollout begins at its first step.
+    async fn rollout_started(
+        &mut self,
+        app: &str,
+        candidate: &str,
+        steps: Vec<RolloutStep>,
+        gates: RolloutGates,
+        approve_each_step: bool,
+    ) -> Result<Rollout, String> {
+        let baseline = self
+            .store
+            .app(app)
+            .map_err(|error| error.to_string())?
+            .current
+            .ok_or_else(|| format!("{app} has no serving release to roll out against"))?;
 
         if let Some(running) = self
             .running
@@ -7383,12 +8356,7 @@ impl Daemon {
                 self.begin_rollout_run(&rollout).await;
             }
             RolloutAction::Promote => {
-                self.finish_rollout(
-                    &mut rollout,
-                    RolloutState::Promoted,
-                    &format!("promoted by hand at {percent}%"),
-                )
-                .await?;
+                return Err("a rollout is promoted by promote_rollout_by_hand".to_owned());
             }
             RolloutAction::Abort => {
                 self.finish_rollout(
@@ -7431,32 +8399,7 @@ impl Daemon {
 
         match state {
             RolloutState::Promoted => {
-                // A promotion a gate stops leaves the rollout paused where
-                // it was, to be promoted or aborted once looked at.
-
-                if let Err(error) = self
-                    .promote_release(&rollout.app, &rollout.candidate, Retention::default())
-                    .await
-                {
-                    rollout.state = RolloutState::Paused;
-                    rollout.message = format!("promotion stopped: {error}");
-                    rollout.updated_unix_ms = now_unix_ms();
-                    self.store
-                        .put_rollout(rollout)
-                        .map_err(|error| error.to_string())?;
-                    self.events
-                        .emit("rollout.paused", &subject, "warning", &rollout.message);
-                    return Err(error);
-                }
-
-                record(rollout, &self.store)?;
-                self.push_snapshot().await?;
-                self.events.emit(
-                    "rollout.completed",
-                    &subject,
-                    "notice",
-                    &format!("rollout {}: {message}", rollout.id),
-                );
+                self.promote_rollout(rollout.clone(), message, None).await;
             }
             _ => {
                 record(rollout, &self.store)?;
@@ -7493,33 +8436,140 @@ impl Daemon {
         app: &str,
         id: &str,
         retain: Retention,
-    ) -> Result<Release, String> {
-        let record = self.store.app(app).map_err(|error| error.to_string())?;
-        let current = record.current.clone();
+        then: AfterPromote,
+    ) {
+        let checked = (|| {
+            let record = self.store.app(app).map_err(|error| error.to_string())?;
 
-        if current.as_deref() == Some(id) {
-            return Err(format!("{app}@{id} already serves"));
+            if record.current.as_deref() == Some(id) {
+                return Err(format!("{app}@{id} already serves"));
+            }
+
+            match crate::config::second_app_refusal(&self.store, app) {
+                Some(refusal) => Err(refusal),
+                None => Ok(()),
+            }
+        })();
+
+        let checked = match checked {
+            Ok(()) => self.make_room_for(app, id).await,
+            Err(error) => Err(error),
+        };
+
+        if let Err(error) = checked {
+            self.promoted(then, Err(error)).await;
+            return;
         }
 
-        if let Some(refusal) = crate::config::second_app_refusal(&self.store, app) {
-            return Err(refusal);
-        }
+        self.start_then(
+            app,
+            id,
+            AfterStart::Promote {
+                app: app.to_owned(),
+                id: id.to_owned(),
+                retain,
+                then,
+            },
+        )
+        .await;
+    }
 
-        self.make_room_for(app, id).await?;
-        self.start(app, id).await?;
-
-        // Section 9.12 (issue 266): the before_promote gates run with the
-        // release about to take all the traffic, and one that fails stops
-        // the promotion.
-
+    /// What follows the start of a release being promoted (issue 693):
+    /// section 9.12 (issue 266), its before_promote gates run, prepared
+    /// here and run on a task beside the loop, with the release about to
+    /// take all the traffic; one that fails stops the promotion. With none
+    /// to run, traffic moves at once.
+    async fn promote_started(
+        &mut self,
+        app: &str,
+        id: &str,
+        retain: Retention,
+        then: AfterPromote,
+    ) {
         let commands = self
             .store
             .release(app, id)
             .map(|release| release.spec.commands)
             .unwrap_or_default();
         let gates = self.gates_due(app, id, &commands, crate::model::Gate::BeforePromote);
-        self.run_gates(app, id, &gates, crate::model::Gate::BeforePromote)
-            .await?;
+
+        if gates.is_empty() {
+            let promoted = self.promote_switch(app, id, retain).await;
+            self.promoted(then, promoted).await;
+            return;
+        }
+
+        let mut prepared = Vec::new();
+
+        for gate in &gates {
+            let request = crate::commands::CommandRequest::Declared {
+                name: gate.name.clone(),
+                inputs: BTreeMap::new(),
+                secret_inputs: BTreeMap::new(),
+            };
+
+            match self.prepare_command(app, id, request).await {
+                Ok(mut command) => {
+                    command.exclusive = true;
+                    prepared.push(command);
+                }
+                Err(error) => {
+                    let message = format!(
+                        "the before_promote gate {} could not be started: {error}",
+                        gate.name
+                    );
+                    self.promoted(then, Err(message)).await;
+                    return;
+                }
+            }
+        }
+
+        let Ok(release) = self.store.release(app, id) else {
+            self.promoted(then, Err(format!("{app}@{id} does not exist")))
+                .await;
+            return;
+        };
+
+        let context = self.context();
+        let runs = self.runs.clone();
+        let commands = self.commands.clone();
+
+        tokio::spawn(async move {
+            let outcome = run_gate_commands(
+                &context,
+                &runs,
+                &release,
+                prepared,
+                crate::model::Gate::BeforePromote,
+            )
+            .await;
+            let _ = commands
+                .send(Command::PromoteGated {
+                    app: release.app.clone(),
+                    id: release.id.clone(),
+                    retain,
+                    then: Box::new(then),
+                    outcome,
+                })
+                .await;
+        });
+    }
+
+    /// Blue/green (section 9.2), once the release runs and its gates have
+    /// passed: all of the application's traffic to it, and the release
+    /// that served drains unless a policy names it, kept warm as `retain`
+    /// says.
+    async fn promote_switch(
+        &mut self,
+        app: &str,
+        id: &str,
+        retain: Retention,
+    ) -> Result<Release, String> {
+        let current = self
+            .store
+            .app(app)
+            .map_err(|error| error.to_string())?
+            .current;
 
         self.switch_to(app, id).await;
         self.store
@@ -7537,6 +8587,128 @@ impl Daemon {
         self.store
             .release(app, id)
             .map_err(|error| error.to_string())
+    }
+
+    /// What follows a promotion, once it has switched or failed: the
+    /// answer to whoever asked, or a rollout's end. A rollout whose
+    /// promotion a gate stops is paused where it was, to be promoted or
+    /// aborted once looked at.
+    async fn promoted(&mut self, then: AfterPromote, promoted: Result<Release, String>) {
+        let (mut rollout, message, done) = match then {
+            AfterPromote::Reply(done) => {
+                let _ = done.send(promoted);
+                return;
+            }
+            AfterPromote::Rollout {
+                rollout,
+                message,
+                done,
+            } => (*rollout, message, done),
+        };
+
+        self.promoting.remove(&rollout.app);
+        let subject = format!("{}@{}", rollout.app, rollout.candidate);
+
+        let outcome = match promoted {
+            Ok(_) => {
+                rollout.state = RolloutState::Promoted;
+                rollout.message = message.clone();
+                rollout.updated_unix_ms = now_unix_ms();
+
+                match self.store.put_rollout(&rollout) {
+                    Ok(()) => {
+                        if let Err(error) = self.push_snapshot().await {
+                            tracing::error!(%error, "pushing the snapshot after a promotion failed");
+                        }
+
+                        self.events.emit(
+                            "rollout.completed",
+                            &subject,
+                            "notice",
+                            &format!("rollout {}: {message}", rollout.id),
+                        );
+                        Ok(rollout)
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            Err(error) => {
+                rollout.state = RolloutState::Paused;
+                rollout.message = format!("promotion stopped: {error}");
+                rollout.updated_unix_ms = now_unix_ms();
+                let _ = self.store.put_rollout(&rollout);
+                self.events
+                    .emit("rollout.paused", &subject, "warning", &rollout.message);
+                Err(error)
+            }
+        };
+
+        if let Some(done) = done {
+            let _ = done.send(outcome);
+        } else if let Err(error) = outcome {
+            tracing::error!(%error, "promoting a rollout failed");
+        }
+    }
+
+    /// End a rollout by promoting its candidate (issue 693): the promotion
+    /// runs beside the loop, and the rollout is recorded promoted, or
+    /// paused, once it has. A rollout already being promoted is left to
+    /// that promotion.
+    async fn promote_rollout(
+        &mut self,
+        rollout: Rollout,
+        message: &str,
+        done: Option<oneshot::Sender<Result<Rollout, String>>>,
+    ) {
+        if !self.promoting.insert(rollout.app.clone()) {
+            if let Some(done) = done {
+                let _ = done.send(Err(format!(
+                    "rollout {} is already being promoted",
+                    rollout.id
+                )));
+            }
+
+            return;
+        }
+
+        self.rollout_runs.remove(&rollout.app);
+        self.probed.remove(&rollout.app);
+        let (app, candidate) = (rollout.app.clone(), rollout.candidate.clone());
+
+        self.promote_release(
+            &app,
+            &candidate,
+            Retention::default(),
+            AfterPromote::Rollout {
+                rollout: Box::new(rollout),
+                message: message.to_owned(),
+                done,
+            },
+        )
+        .await;
+    }
+
+    /// `muructl rollout promote`: promote the application's active
+    /// rollout now, answering once the promotion has ended.
+    async fn promote_rollout_by_hand(
+        &mut self,
+        app: &str,
+        done: oneshot::Sender<Result<Rollout, String>>,
+    ) {
+        let rollout = match self.store.active_rollout(app) {
+            Ok(Some(rollout)) => rollout,
+            Ok(None) => {
+                let _ = done.send(Err(format!("{app} has no rollout under way")));
+                return;
+            }
+            Err(error) => {
+                let _ = done.send(Err(error.to_string()));
+                return;
+            }
+        };
+
+        let message = format!("promoted by hand at {}%", rollout.percent());
+        self.promote_rollout(rollout, &message, Some(done)).await;
     }
 
     /// Section 9.12 (issue 266): the commands of a release that are gates
@@ -7565,91 +8737,44 @@ impl Daemon {
             .collect()
     }
 
-    /// Section 9.12 (issue 266): run a release's gates at `stage`, one
-    /// after another in the order of their names, each as a run of its
-    /// command with its inputs' defaults, exclusive, with the trigger
-    /// `gate:STAGE`, and record each that passes. The first that fails
-    /// ends it, with why.
-    async fn run_gates(
-        &mut self,
-        app: &str,
-        id: &str,
-        gates: &[crate::model::CommandSpec],
-        stage: crate::model::Gate,
-    ) -> Result<(), String> {
-        let subject = format!("{app}@{id}");
-
-        for gate in gates {
-            let failed = |why: &str| format!("the {} gate {} {why}", stage.as_str(), gate.name);
-            let request = crate::commands::CommandRequest::Declared {
-                name: gate.name.clone(),
-                inputs: BTreeMap::new(),
-                secret_inputs: BTreeMap::new(),
-            };
-            let mut prepared = self
-                .prepare_command(app, id, request)
-                .await
-                .map_err(|error| failed(&format!("could not be started: {error}")))?;
-            prepared.exclusive = true;
-
-            let recorded = self.runs.recorded(stage.trigger(), crate::runs::DAEMON);
-            let mut running = crate::commands::run(prepared, Arc::new(recorded))
-                .map_err(|error| failed(&format!("could not be started: {error}")))?;
-            let mut ended = None;
-
-            while let Some(message) = running.output.recv().await {
-                if message.finished {
-                    ended = Some(message);
-                    break;
-                }
-            }
-
-            let Some(ended) = ended else {
-                return Err(failed("ended without saying how"));
-            };
-
-            if !ended.ok {
-                return Err(failed(&ended.message));
-            }
-
-            if let Err(error) = self
-                .store
-                .pass_gate(app, id, &gate.name, stage.as_str(), ended.run)
-            {
-                tracing::warn!(%error, "recording the gate {} failed", gate.name);
-            }
-
-            self.events.emit(
-                "release.gate_passed",
-                &subject,
-                "info",
-                &format!(
-                    "the {} gate {} passed: run {} {}",
-                    stage.as_str(),
-                    gate.name,
-                    ended.run,
-                    ended.message
-                ),
-            );
-        }
-
-        Ok(())
-    }
-
     /// Section 10.10: start a recorded release held, traffic left where
     /// it is, for an apply's prepare phase. Answers whether it was
     /// started: false when it ran already.
-    async fn start_held(&mut self, app: &str, id: &str) -> Result<bool, String> {
+    async fn start_held(
+        &mut self,
+        app: &str,
+        id: &str,
+        done: oneshot::Sender<Result<bool, String>>,
+    ) {
         let key = (app.to_owned(), id.to_owned());
 
         if self.running.get(&key).is_some_and(|running| {
             running.retained_until.is_none() && running.sticky_until.is_none()
         }) {
-            return Ok(false);
+            let _ = done.send(Ok(false));
+            return;
         }
 
-        self.make_room_for(app, id).await?;
-        self.start(app, id).await?;
+        if let Err(error) = self.make_room_for(app, id).await {
+            let _ = done.send(Err(error));
+            return;
+        }
+
+        self.start_then(
+            app,
+            id,
+            AfterStart::Held {
+                app: app.to_owned(),
+                id: id.to_owned(),
+                done,
+            },
+        )
+        .await;
+    }
+
+    /// What follows an apply's start of a release held (issue 693).
+    async fn held_started(&mut self, app: &str, id: &str) -> Result<bool, String> {
+        let key = (app.to_owned(), id.to_owned());
 
         if let Some(running) = self.running.get_mut(&key) {
             running.held = true;
@@ -7715,13 +8840,9 @@ impl Daemon {
 
         self.load_conditions();
 
-        let started = self.start_referenced().await;
+        self.start_referenced().await;
         self.refresh_certificates(true);
         committed.snapshot_error = self.push_snapshot().await.err();
-
-        for (app, id) in &started {
-            self.mark_ready(app, id, "");
-        }
 
         for (app, id, previous) in committed.promoted.clone() {
             let subject = format!("{app}@{id}");
@@ -7788,6 +8909,12 @@ impl Daemon {
         };
 
         for mut rollout in running {
+            // Issue 693: a rollout being promoted is left to its promotion.
+
+            if self.promoting.contains(&rollout.app) {
+                continue;
+            }
+
             let app = rollout.app.clone();
 
             if pinned.contains(&app) {
@@ -7872,17 +8999,8 @@ impl Daemon {
             }
 
             if rollout.step + 1 >= rollout.steps.len() {
-                if let Err(error) = self
-                    .finish_rollout(
-                        &mut rollout,
-                        RolloutState::Promoted,
-                        "every step passed its gates",
-                    )
-                    .await
-                {
-                    tracing::error!(%error, "promoting a rollout failed");
-                }
-
+                self.promote_rollout(rollout, "every step passed its gates", None)
+                    .await;
                 continue;
             }
 
@@ -7946,17 +9064,7 @@ impl Daemon {
     /// release that only a policy kept in traffic drains once no policy
     /// names it. Called after the configuration changes and at start.
     async fn reconcile_traffic(&mut self) {
-        let started = self.start_referenced().await;
-
-        if !started.is_empty() {
-            if let Err(error) = self.push_snapshot().await {
-                tracing::error!(%error, "pushing the snapshot for a policy's releases failed");
-            }
-
-            for (app, id) in &started {
-                self.mark_ready(app, id, "");
-            }
-        }
+        self.start_referenced().await;
 
         self.drain_unreferenced().await;
     }
@@ -7976,12 +9084,10 @@ impl Daemon {
         (referenced, warming)
     }
 
-    /// Start the releases a policy or a warm-up names that do not run,
-    /// and return them; the caller pushes the snapshot that gives them
-    /// to the edge, and marks them ready.
-    async fn start_referenced(&mut self) -> Vec<(String, String)> {
+    /// Start the releases a policy or a warm-up names that do not run;
+    /// each is given to the edge, and marked ready, once it has started.
+    async fn start_referenced(&mut self) {
         let (referenced, warming) = self.traffic_referenced();
-        let mut started = Vec::new();
 
         for (app, id) in &referenced {
             let key = (app.clone(), id.clone());
@@ -7999,30 +9105,50 @@ impl Daemon {
                 running.sticky_until = None;
             }
 
-            let started_now = match self.make_room_for(app, id).await {
-                Ok(()) => self.start(app, id).await,
-                Err(error) => Err(error),
+            let then = AfterStart::Referenced {
+                app: app.clone(),
+                id: id.clone(),
+                warming: warming.contains(&key),
             };
 
-            match started_now {
-                Ok(()) => started.push(key),
-                Err(error) => {
-                    let why = if warming.contains(&key) {
-                        "an overlay's warm-up names the release"
-                    } else {
-                        "a traffic policy names the release"
-                    };
-                    self.events.emit(
-                        "traffic_policy.release_unavailable",
-                        &format!("{app}@{id}"),
-                        "warning",
-                        &format!("{why} but it cannot start: {error}"),
-                    );
-                }
+            match self.make_room_for(app, id).await {
+                Ok(()) => self.start_then(app, id, then).await,
+                Err(error) => self.after_start(then, Err(error)).await,
             }
         }
+    }
 
-        started
+    /// What follows the start of a release a policy or a warm-up names
+    /// (issue 693): the edge is given it, or the failure said.
+    async fn referenced_started(
+        &mut self,
+        app: &str,
+        id: &str,
+        warming: bool,
+        started: Result<(), String>,
+    ) {
+        match started {
+            Ok(()) => {
+                if let Err(error) = self.push_snapshot().await {
+                    tracing::error!(%error, "pushing the snapshot for a policy's releases failed");
+                }
+
+                self.mark_ready(app, id, "");
+            }
+            Err(error) => {
+                let why = if warming {
+                    "an overlay's warm-up names the release"
+                } else {
+                    "a traffic policy names the release"
+                };
+                self.events.emit(
+                    "traffic_policy.release_unavailable",
+                    &format!("{app}@{id}"),
+                    "warning",
+                    &format!("{why} but it cannot start: {error}"),
+                );
+            }
+        }
     }
 
     /// Drain the releases that only a policy kept in traffic, once no
@@ -8591,20 +9717,15 @@ impl Daemon {
         self.events
             .emit("release.woken", &subject, "info", &message);
 
-        match self.start(app, id).await {
-            Ok(()) => {
-                if let Err(error) = self.push_snapshot().await {
-                    tracing::error!(%error, "pushing the snapshot for a woken release failed");
-                }
-
-                self.mark_ready(app, id, "woken by a request");
-                self.make_worker_room(&subject).await;
-            }
-            Err(error) => {
-                self.events
-                    .emit("release.failed", &subject, "error", &error);
-            }
-        }
+        self.start_then(
+            app,
+            id,
+            AfterStart::Wake {
+                app: app.to_owned(),
+                id: id.to_owned(),
+            },
+        )
+        .await;
     }
 
     /// Section 7.4: a wake from zero took the node over its workers
@@ -8654,6 +9775,12 @@ impl Daemon {
 
         for running in self.running.values() {
             used.add_usage(&running.usage(fallback));
+        }
+
+        // Issue 693: a release being started holds what it is expected to.
+
+        for starting in self.starting.values() {
+            used.memory += starting.reserved;
         }
 
         used
@@ -9172,6 +10299,11 @@ impl Daemon {
     ) -> Result<Vec<(String, ScaleStatus)>, String> {
         let now = Instant::now();
         let key = (app.to_owned(), id.to_owned());
+
+        if self.starting.contains_key(&key) {
+            return Err(starting_refusal(app, id));
+        }
+
         let Some(running) = self.running.get_mut(&key) else {
             return Err(format!("release {app}@{id} is not running"));
         };
@@ -9422,6 +10554,11 @@ impl Daemon {
     /// The autoscaler's state for each group of a running release.
     fn scale_status(&self, app: &str, id: &str) -> Result<Vec<(String, ScaleStatus)>, String> {
         let now = Instant::now();
+
+        if self.starting.contains_key(&(app.to_owned(), id.to_owned())) {
+            return Err(starting_refusal(app, id));
+        }
+
         let Some(running) = self.running.get(&(app.to_owned(), id.to_owned())) else {
             return Err(format!("release {app}@{id} is not running"));
         };
@@ -9597,18 +10734,50 @@ impl Daemon {
 
     /// Section 9.6: start the previous release again if it is not running,
     /// move traffic to it, and drain the one that served.
-    async fn rollback(&mut self, app: &str) -> Result<Release, String> {
-        let record = self.store.app(app).map_err(|error| error.to_string())?;
-        let Some(previous) = record.previous.clone() else {
-            return Err(format!("{app} has no previous release to roll back to"));
+    async fn rollback(&mut self, app: &str, done: oneshot::Sender<Result<Release, String>>) {
+        let checked = (|| {
+            let record = self.store.app(app).map_err(|error| error.to_string())?;
+            let Some(previous) = record.previous.clone() else {
+                return Err(format!("{app} has no previous release to roll back to"));
+            };
+
+            if let Some(refusal) = crate::config::second_app_refusal(&self.store, app) {
+                return Err(refusal);
+            }
+
+            Ok((previous, record.current.clone()))
+        })();
+
+        let (previous, current) = match checked {
+            Ok(checked) => checked,
+            Err(error) => {
+                let _ = done.send(Err(error));
+                return;
+            }
         };
-        let current = record.current.clone();
 
-        if let Some(refusal) = crate::config::second_app_refusal(&self.store, app) {
-            return Err(refusal);
-        }
+        self.start_then(
+            app,
+            &previous.clone(),
+            AfterStart::Rollback {
+                app: app.to_owned(),
+                previous,
+                current,
+                done,
+            },
+        )
+        .await;
+    }
 
-        self.start(app, &previous).await?;
+    /// What follows the start of the release a rollback returns to (issue
+    /// 693): traffic moves to it, and the release that served drains.
+    async fn rolled_back(
+        &mut self,
+        app: &str,
+        previous: &str,
+        current: Option<String>,
+    ) -> Result<Release, String> {
+        let previous = previous.to_owned();
         self.switch_to(app, &previous).await;
         self.store
             .set_app_releases(app, Some(&previous), current.as_deref())
@@ -9640,6 +10809,12 @@ impl Daemon {
             .release(app, id)
             .map_err(|error| error.to_string())?;
 
+        // Issue 693: a release still starting has its start cancelled,
+        // which stops its host if one has started; it is stopping until
+        // the start has reported, and stopped then.
+
+        let cancelled = self.cancel_start(app, id, "the release was drained").await;
+
         if record.current.as_deref() == Some(id) {
             self.clear_traffic(app).await;
             self.store
@@ -9647,6 +10822,34 @@ impl Daemon {
                 .map_err(|error| error.to_string())?;
             self.events
                 .emit("traffic.switched", app, "notice", "no release serves");
+        }
+
+        if cancelled {
+            let release = self
+                .store
+                .release(app, id)
+                .map_err(|error| error.to_string())?;
+
+            if self.starting.contains_key(&(app.to_owned(), id.to_owned())) {
+                self.set_state(
+                    &release,
+                    ReleaseState::Stopping,
+                    "its start is being cancelled: the release was drained",
+                );
+            } else if !release.state.is_final() {
+                // A start waiting for its turn had started nothing.
+
+                self.set_state(
+                    &release,
+                    ReleaseState::Stopped,
+                    "its start was cancelled: the release was drained",
+                );
+            }
+
+            return self
+                .store
+                .release(app, id)
+                .map_err(|error| error.to_string());
         }
 
         self.drain(
@@ -9689,7 +10892,9 @@ impl Daemon {
             return Err(format!("{app}@{id} cannot be removed: {}", why.describe()));
         }
 
-        if self.running.contains_key(&(app.to_owned(), id.to_owned())) {
+        let key = (app.to_owned(), id.to_owned());
+
+        if self.running.contains_key(&key) || self.starting.contains_key(&key) {
             return Err(format!("{app}@{id} cannot be removed: it is still running"));
         }
 
@@ -9700,7 +10905,8 @@ impl Daemon {
 
     /// Section 9.1: why an application cannot be removed now, if so: a
     /// route still sends it traffic, a rollout is under way, or a release
-    /// of it is being built or waits to be started.
+    /// of it is being built outside a start (a start under way is
+    /// cancelled by the removal instead).
     fn app_removal_refused(&self, app: &str) -> Option<String> {
         let (routes, _) = self.effective();
 
@@ -9745,10 +10951,21 @@ impl Daemon {
             .unwrap_or_default()
             .iter()
             .find(|release| {
-                matches!(
-                    release.state,
-                    ReleaseState::Pending | ReleaseState::Building
-                )
+                // Issue 693: a start under way is cancelled by the
+                // removal, so only a build outside one refuses it.
+
+                let key = (app.to_owned(), release.id.clone());
+                let under_way = self.starting.contains_key(&key)
+                    || self
+                        .start_queue
+                        .get(app)
+                        .is_some_and(|queue| queue.iter().any(|(id, _)| *id == release.id));
+
+                !under_way
+                    && matches!(
+                        release.state,
+                        ReleaseState::Pending | ReleaseState::Building
+                    )
             })
             .map(|release| {
                 format!(
@@ -9868,9 +11085,15 @@ impl Daemon {
                     "starting the release again",
                 );
 
-                if self.start(&app, &id).await.is_ok() {
-                    self.switch_to(&app, &id).await;
-                }
+                self.start_then(
+                    &app,
+                    &id,
+                    AfterStart::Restart {
+                        app: app.clone(),
+                        id: id.clone(),
+                    },
+                )
+                .await;
             }
         }
 
@@ -11127,6 +12350,12 @@ impl Daemon {
             tracing::error!(%error, "recording a release state failed");
         }
     }
+}
+
+/// Why something asked of a release that is starting is refused (issue
+/// 693).
+fn starting_refusal(app: &str, id: &str) -> String {
+    format!("release {app}@{id} is starting; try again when it is ready")
 }
 
 /// An instant ahead as Unix milliseconds, or 0 for none.
