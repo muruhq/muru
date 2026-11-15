@@ -268,7 +268,13 @@ def test_descriptor_reuse_is_compared_by_identity(modules: Path) -> None:
     )
     with preload.ImportRecorder() as recorder:
         recorder.import_module("reuse_mod")
-    assert {finding.kind for finding in recorder.findings()} == {"socket"}
+
+    # The socket on the reused number is put down to the import that
+    # opened it, as the other end is.
+
+    findings = recorder.findings()
+    assert {finding.kind for finding in findings} == {"socket"}
+    assert {finding.module for finding in findings} == {"reuse_mod"}
 
 
 def test_peer_name_formats_addresses() -> None:

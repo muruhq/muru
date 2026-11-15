@@ -221,18 +221,6 @@ def open_fds() -> dict[int, Identity]:
     return found
 
 
-def _fd_numbers() -> set[int]:
-    """Every open descriptor number.
-
-    Listing the descriptor directory opens a descriptor of its own, which
-    is closed again by the time the listing is examined; checking each
-    entry is still open leaves it out, so the number is free to be reused
-    by whatever the import opens next.
-    """
-
-    return set(open_fds())
-
-
 def _format_peer(peer: Any) -> str:
     if isinstance(peer, tuple) and len(peer) >= 2:
         host, port = peer[0], peer[1]
@@ -312,7 +300,7 @@ class ImportRecorder:
         self._threads_before = 0
         self._python_threads_before: set[threading.Thread] = set()
         self._children_before: set[int] = set()
-        self._fd_owner: dict[int, str] = {}
+        self._fd_owner: dict[tuple[int, Identity], str] = {}
         self._thread_owner: dict[threading.Thread, str] = {}
         self._thread_owners: list[tuple[str, int]] = []
         self._original_import: ImportFunction | None = None
@@ -411,15 +399,23 @@ class ImportRecorder:
                     raise
 
     def _record(self, module: str, run: Callable[[], ModuleType]) -> ModuleType:
-        fds_before = _fd_numbers()
+        fds_before = open_fds()
         threads_before = thread_count()
         python_threads_before = set(threading.enumerate())
 
         try:
             return run()
         finally:
-            for fd in _fd_numbers() - fds_before:
-                self._fd_owner.setdefault(fd, module)
+            # A descriptor is the import's when its number is new or now
+            # refers to something else, as when the import closed one and
+            # its number was taken again; an owner is kept by identity, so
+            # a number reused by a later import is that import's (issue 685).
+            # Listing the descriptors opens one of its own, which is
+            # closed again by the time it is examined and so is left out.
+
+            for fd, identity in open_fds().items():
+                if fds_before.get(fd) != identity:
+                    self._fd_owner.setdefault((fd, identity), module)
 
             # A Python thread is charged by name; what grew besides is
             # native threads, charged by count.
@@ -475,7 +471,7 @@ class ImportRecorder:
 
             if classified is not None:
                 kind, detail = classified
-                findings.append(Finding(kind, detail, self._fd_owner.get(fd)))
+                findings.append(Finding(kind, detail, self._fd_owner.get((fd, identity))))
 
         # The Python threads still running are each named, with the module
         # whose code they run; what is left over is native threads.
