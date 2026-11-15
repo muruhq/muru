@@ -43,6 +43,7 @@ import faulthandler
 import gc
 import importlib
 import inspect
+import io
 import json
 import os
 import random
@@ -57,7 +58,7 @@ from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from types import ModuleType
-from typing import Any
+from typing import Any, TextIO
 
 from muru import RequestTimeout, _asgi, _inspect, _instrumentation, _outside, _signals, preload
 from muru import logging as muru_logging
@@ -197,6 +198,134 @@ def log(message: str) -> None:
         pass
     else:
         _dropped_own = 0
+
+
+class TaggedStream(io.TextIOBase):
+    """Standard output or error of the host, each line tagged as the host's.
+
+    The host's standard output and error are one pipe, which the relay
+    writes as it reads it, since Muru's own lines from the host carry
+    their tag already (section 11.3). What the application writes in the
+    host, at import under preload or from a hook the host runs, goes
+    through these, so it is tagged as a worker's is: ``muru.host[PID]:``
+    for standard error and ``muru.host[PID].stdout:`` for standard output
+    (issue 672). A forked worker's output is tagged by the relay, so a
+    stream still held there, by a logging handler made in the host say,
+    writes through untouched.
+    """
+
+    def __init__(self, stream: TextIO, suffix: str) -> None:
+        self.stream = stream
+        self.pid = os.getpid()
+        self.tag = f"muru.host[{self.pid}]{suffix}: "
+        self.at_line_start = True
+
+    @property
+    def encoding(self) -> str:  # type: ignore[override]
+        """The wrapped stream's encoding."""
+
+        return self.stream.encoding
+
+    @property
+    def errors(self) -> str | None:  # type: ignore[override]
+        """The wrapped stream's error handler."""
+
+        return self.stream.errors
+
+    def fileno(self) -> int:
+        """Return the wrapped stream's descriptor."""
+
+        return self.stream.fileno()
+
+    def isatty(self) -> bool:
+        """Return whether the wrapped stream is a terminal."""
+
+        return self.stream.isatty()
+
+    def writable(self) -> bool:
+        """Return True: the stream is written."""
+
+        return True
+
+    def flush(self) -> None:
+        """Flush the wrapped stream."""
+
+        self.stream.flush()
+
+    def close(self) -> None:
+        """Leave the wrapped stream open, which is not this wrapper's to close.
+
+        The wrapper's own finalizer calls this, and would otherwise flush
+        a stream that may already be closed.
+        """
+
+    @property
+    def closed(self) -> bool:
+        """Return whether the wrapped stream is closed."""
+
+        return self.stream.closed
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.stream, name)
+
+    def write(self, text: str) -> int:
+        """Write ``text``, with the host's tag in front of each line it starts."""
+
+        if _in_worker or os.getpid() != self.pid:
+            return self.stream.write(text)
+
+        pieces: list[str] = []
+        lines = text.split("\n")
+
+        for index, line in enumerate(lines):
+            last = index == len(lines) - 1
+
+            if last and not line:
+                break
+
+            if self.at_line_start:
+                pieces.append(self.tag)
+
+            pieces.append(line)
+
+            if last:
+                self.at_line_start = False
+            else:
+                pieces.append("\n")
+                self.at_line_start = True
+
+        self.stream.write("".join(pieces))
+        return len(text)
+
+
+def tag_host_streams() -> None:
+    """Put the host's tag on what Python writes to standard output and error.
+
+    Standard output is a pipe, which Python block-buffers, so it is made
+    line-buffered, as a worker's is, for its lines to keep their place
+    among standard error's.
+    """
+
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+    except (AttributeError, ValueError):
+        pass
+
+    if not isinstance(sys.stdout, TaggedStream):
+        sys.stdout = TaggedStream(sys.stdout, ".stdout")
+
+    if not isinstance(sys.stderr, TaggedStream):
+        sys.stderr = TaggedStream(sys.stderr, "")
+
+
+def untag_host_streams() -> None:
+    """Put back the streams the host's tagging wraps, in a worker."""
+
+    if isinstance(sys.stdout, TaggedStream):
+        sys.stdout = sys.stdout.stream
+
+    if isinstance(sys.stderr, TaggedStream):
+        sys.stderr = sys.stderr.stream
 
 
 def flush_streams() -> None:
@@ -1515,6 +1644,7 @@ class Host:
 
         global _in_worker
         _in_worker = True
+        untag_host_streams()
         gc.enable()
 
         # Section 11.1: every collection is timed by the runtime, with the
@@ -5052,6 +5182,12 @@ def _main(argv: list[str] | None) -> int:
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(arguments)
+
+    # Section 11.3: what Python writes in the host is tagged as the host's,
+    # from before anything of the application or a logging handler holds
+    # the streams.
+
+    tag_host_streams()
 
     if args.processes < 1:
         print("--processes must be at least 1", file=sys.stderr)

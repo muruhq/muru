@@ -29,7 +29,14 @@ muru.worker[reports/0]: report for 2026-11-02 written
 ```
 
 Lines from the host itself carry `muru.host[PID]:`, lines from the relay
-`muru.relay[PID]:`, and lines from muructl start with `muru:`. A line
+`muru.relay[PID]:`, and lines from muructl start with `muru:`. What the
+application's Python code writes in the host, such as a `print()` or a
+warning while it is imported under preload, or the output of an
+`on_load` or `pre_fork` hook, is tagged as the host's in the same way
+as a worker's: `muru.host[PID]:` for standard error and
+`muru.host[PID].stdout:` for standard output. Output written to the
+descriptors directly, by C code or a child process the host starts,
+has no tag. A line
 longer than 64 KiB is cut there, with a marker at the end saying so.
 Python's `logging` goes to standard error by default
 and so arrives tagged; nothing needs configuring. On the terminal these
