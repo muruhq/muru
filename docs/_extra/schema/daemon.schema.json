@@ -511,10 +511,55 @@
       },
       "type": "object"
     },
+    "CommandSchedule": {
+      "additionalProperties": false,
+      "description": "When the daemon runs a command by itself.",
+      "properties": {
+        "at_boot": {
+          "default": false,
+          "description": "Run the command when the daemon starts from nothing: its first start, after a reboot or after a shutdown, but not when it takes over what a daemon left running.",
+          "type": "boolean"
+        },
+        "cron": {
+          "description": "A cron expression, five fields or @daily and the like, as an overlay schedule's, read in `timezone`.",
+          "type": "string"
+        },
+        "inputs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Input values a scheduled run is given, by name; the others take their defaults.",
+          "type": "object"
+        },
+        "secret_inputs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Inputs taken from one of the daemon's secret stores, by name, each as STORE/KEY.",
+          "type": "object"
+        },
+        "timezone": {
+          "description": "The IANA time zone `cron` is read in.",
+          "type": "string",
+          "x-default": "the system's"
+        }
+      },
+      "type": "object"
+    },
     "CommandTable": {
       "additionalProperties": false,
       "description": "A command an application declares, the `[tool.muru.commands.NAME]` or `[app.NAME.release.ID.commands.NAME]` table: a program to run, or a Python callable to call, with the release.",
       "properties": {
+        "before_fork": {
+          "default": false,
+          "description": "A gate: the release's start runs the command once the host has preloaded and before it forks workers, and fails if it fails.",
+          "type": "boolean"
+        },
+        "before_promote": {
+          "default": false,
+          "description": "A gate: a rollout's or blue/green promotion runs the command just before it moves all traffic to the release, and stops if it fails.",
+          "type": "boolean"
+        },
         "call": {
           "description": "A callable as module:function, called with the inputs as keyword arguments, instead of `run`.",
           "type": "string"
@@ -529,6 +574,11 @@
           },
           "description": "Environment variables for this command alone, over the release's, with `{name}` where an input's value goes.",
           "type": "object"
+        },
+        "every_start": {
+          "default": false,
+          "description": "Run a `before_fork` gate at every start of the release's host, not only until it has passed once.",
+          "type": "boolean"
         },
         "exclusive": {
           "default": false,
@@ -548,6 +598,10 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "schedule": {
+          "$ref": "#/$defs/CommandSchedule",
+          "description": "When the daemon runs the command by itself, with the application's current release: by a cron expression, when the daemon starts from nothing, or both. A command with a schedule needs a `timeout`."
         },
         "timeout": {
           "description": "How long it may run before it is stopped, for example 10m; no limit when absent.",
@@ -616,6 +670,13 @@
           "default": false,
           "description": "Allow `muructl debug exec`, which runs code in a worker; off unless set.",
           "type": "boolean"
+        },
+        "keep_command_runs": {
+          "default": 20,
+          "description": "How many runs of each of an application's commands are kept, with their output, once they have ended; at least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
         },
         "pass_env": {
           "description": "Variables of the daemon's own environment passed to a release's host, workers, commands and managed servers, beside `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TZ` and `TMPDIR`. Each is a name, or a name with a `*` suffix such as `AWS_*`. A release's own variables override them.",

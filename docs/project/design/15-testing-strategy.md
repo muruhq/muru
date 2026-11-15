@@ -42,7 +42,7 @@ Most of Muru's value is in behaviour under change and failure (deploys, drains, 
 - Uploads: multipart and raw, prechecks, quotas, crash during upload leaves no files.
 - Virtual hosts with a test certificate authority: SNI, wildcards, 421 cases.
 - Trusted proxies: spoofing attempts, underscore headers, recursive chains.
-- Log rotation by size, time, logrotate rename plus reopen, and copytruncate, asserting no lost lines.
+- Log rotation by size, time and logrotate rename plus reopen, for a workers release and a managed server's instances, asserting no lost lines.
 - Events: every scenario asserts the expected event sequence, and webhook delivery survives a receiver outage.
 - Configuration export, apply and diff round-trip with no changes.
 - Containers (marked requires_docker): container releases, descriptor passing across the boundary, PID 1 reaping, image probe.

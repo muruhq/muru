@@ -72,12 +72,16 @@ A command an application declares, the `[tool.muru.commands.NAME]` or `[app.NAME
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `before_fork` | boolean | `false` | A gate: the release's start runs the command once the host has preloaded and before it forks workers, and fails if it fails. |
+| `before_promote` | boolean | `false` | A gate: a rollout's or blue/green promotion runs the command just before it moves all traffic to the release, and stops if it fails. |
 | `call` | string |  | A callable as module:function, called with the inputs as keyword arguments, instead of `run`. |
 | `description` | string |  | What the command does, for `muructl command list`. |
 | `env` | table of strings |  | Environment variables for this command alone, over the release's, with `{name}` where an input's value goes. |
+| `every_start` | boolean | `false` | Run a `before_fork` gate at every start of the release's host, not only until it has passed once. |
 | `exclusive` | boolean | `false` | Run one at a time for the application: a run asked for while one is under way is refused. |
 | `inputs` | table of tables, {ref}`[tool.muru.commands.NAME.inputs.NAME] <config-project-tool-muru-commands-name-inputs-name>` |  | The values the command takes, by name. |
 | `run` | array of strings |  | The program and its arguments, run without a shell, with `{name}` where an input's value goes; `python` is the release's interpreter. |
+| `schedule` | table, {ref}`[tool.muru.commands.NAME.schedule] <config-project-tool-muru-commands-name-schedule>` |  | When the daemon runs the command by itself, with the application's current release: by a cron expression, when the daemon starts from nothing, or both. A command with a schedule needs a `timeout`. |
 | `timeout` | string |  | How long it may run before it is stopped, for example 10m; no limit when absent. |
 
 (config-project-tool-muru-commands-name-inputs-name)=
@@ -92,6 +96,19 @@ An input a command takes.
 | `pattern` | string |  | A regular expression the whole value must match. |
 | `required` | boolean | `false` | The command refuses to run without it. |
 | `secret` | boolean | `false` | The value is never shown, logged or put in an event, and may only be used in `env`. |
+
+(config-project-tool-muru-commands-name-schedule)=
+## `[tool.muru.commands.NAME.schedule]`
+
+When the daemon runs a command by itself.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `at_boot` | boolean | `false` | Run the command when the daemon starts from nothing: its first start, after a reboot or after a shutdown, but not when it takes over what a daemon left running. |
+| `cron` | string |  | A cron expression, five fields or @daily and the like, as an overlay schedule's, read in `timezone`. |
+| `inputs` | table of strings |  | Input values a scheduled run is given, by name; the others take their defaults. |
+| `secret_inputs` | table of strings |  | Inputs taken from one of the daemon's secret stores, by name, each as STORE/KEY. |
+| `timezone` | string | the system's | The IANA time zone `cron` is read in. |
 
 (config-project-tool-muru-env-name)=
 ## `[tool.muru.env.NAME]`

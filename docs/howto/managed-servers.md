@@ -167,36 +167,53 @@ application's workers. WebSocket upgrades are relayed. The access log
 records each request under the application and release with `http` as
 its group and the instance's address as its mount.
 
-The instances' standard output and error go to the release's log file,
-shown by `muructl logs APP`. Each line is in the file as the server wrote
-it: Muru puts no time in front of it and no tag naming the instance, so a
-time or a process id on a line is whatever the server's own logging puts
-there, and the lines of a release's instances are interleaved in the one
-file. The daemon rotates that file by copying it and truncating it in
-place, since the server cannot be told to reopen it.
+Each instance is started by a log relay of its own, which reads the
+instance's standard output and error and writes them to the release's
+log file, shown by `muructl logs APP`. Every line has the full UTC time
+it was read in front, and a tag naming the instance, by its
+`MURU_INSTANCE`, and the stream: `muru.instance[0]:` for standard
+error and `muru.instance[0].stdout:` for standard output.
+
+```
+2026-11-02T05:42:22.840Z muru.instance[0]: [2026-11-02 05:42:22 +0000] [48213] [INFO] Listening at: unix:/run/muru/apps/shop/r4/r1/server-0.sock
+2026-11-02T05:42:22.851Z muru.instance[1]: [2026-11-02 05:42:22 +0000] [48214] [INFO] Listening at: unix:/run/muru/apps/shop/r4/r1/server-1.sock
+```
+
+The relays hold, cut and drop lines under the `[logs]` settings, and open
+the file again by name when it is rotated or `muructl logs reopen`
+runs, as [the logging guide](logging.md#managed-http-servers) describes,
+so a rotation loses no lines. The stop signal and the kill at the end of
+`shutdown_timeout` are sent by the instance's relay, which is the
+instance's parent. A relay that exits takes its instance with it: what
+is left of the instance is killed, and the instance is started again
+with a new relay, as one that exits is.
 
 A daemon that stops without `--shutdown`, or upgrades itself, leaves
-the instances running, and the next daemon takes them over from the
-record in the release's run directory, one instance at a time. An
-instance that is still running is taken over as it is, with its pid and
-start time. An instance that exited while no daemon was running, or that
-was waiting to be started again when the daemon stopped, is started
-again within a second at the same address, and its waits carry on from
-the exits it had in a row. The release stays `ready`, and its
-`release.adopted` event names the pids taken over and the instances
-started again:
+the instances and their relays running, and the next daemon takes them
+over from the record in the release's run directory, one instance at a
+time. An instance that is still running is taken over as it is, with
+its relay. An instance that was waiting to be started again when the
+daemon stopped is started again within a second at the same address,
+and its waits carry on from the exits it had in a row. An instance that
+exited while no daemon was running is reported by the new daemon's
+first check, with the exit status its relay recorded, as any exit is:
+
+```
+instance 1 exited with exit status: 3; starting it again in 1s
+```
+
+The release stays `ready`, and its `release.adopted` event names the
+pids taken over and the instances started again:
 
 ```
 re-adopted the server instances (pid 48213); instance 1 was gone and is started again
 ```
 
-The record holds each instance's pid together with the time the kernel
-gives for when that process started. An instance counts as still running
-only when the process that has its pid now started at the recorded time.
-A pid that has passed to another process since is not taken over, and
-that process is never signalled: the instance is started again. Where
-the record holds no start time for an instance, the instance is taken
-over only if its address also answers an HTTP request.
+The record holds the pid of each instance and of its relay, each
+together with the time the kernel gives for when that process started.
+A process counts as still running only when the process that has its
+pid now started at the recorded time. A pid that has passed to another
+process since is not taken over, and that process is never signalled.
 
 `muructl release list` shows a
 managed server as its instance count and profile in the workers column.

@@ -240,6 +240,10 @@ treats that as the instance exiting.
 
 - Specification sections 11.2, 11.3, 11.8, 13.3 and 13.4, and appendix C.
 
+- ADR 0060, which settles the two points this record left to issue
+  492: one relay for each instance of a managed server, and the daemon
+  signalling an instance through its relay.
+
 - Issue 167, which builds the relay for Python hosts; issue 492, which
   extends it to managed servers and services; issue 572, the host's
   handling of a failed write, which the relay replaces; issue 573,

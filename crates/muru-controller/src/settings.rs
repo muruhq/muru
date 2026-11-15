@@ -83,6 +83,9 @@ pub struct NodeSettings {
     /// Section 8.7: the variables of the daemon's own environment passed
     /// to a release's processes beside the base, by name or `PREFIX*`.
     pub pass_env: Vec<String>,
+    /// `[daemon] keep_command_runs`: how many ended runs of each command
+    /// are kept (issue 688).
+    pub keep_command_runs: usize,
     /// The node's budget (section 7.4).
     pub budget: crate::budget::Budget,
     /// The `[tools]` table (section 8.4): uv and interpreter installs.
@@ -206,6 +209,7 @@ impl NodeSettings {
                 .or_else(|| daemon.and_then(|table| table.user.clone())),
             debug_exec: daemon.and_then(|table| table.debug_exec).unwrap_or(false),
             pass_env: pass_env_from(daemon)?,
+            keep_command_runs: keep_command_runs_from(daemon)?,
             budget,
             tools: document.tools.clone().unwrap_or_default(),
             proxy,
@@ -532,6 +536,15 @@ fn access_log_from(document: &muru_config::Document) -> Result<muru_edge::access
 
     filter.exclude = logs.access_log_exclude.clone();
     Ok(filter)
+}
+
+/// `[daemon] keep_command_runs`, at least 1.
+fn keep_command_runs_from(daemon: Option<&muru_config::Daemon>) -> Result<usize, String> {
+    match daemon.and_then(|table| table.keep_command_runs) {
+        None => Ok(crate::runs::DEFAULT_KEEP),
+        Some(0) => Err("[daemon] keep_command_runs must be at least 1".to_owned()),
+        Some(keep) => Ok(keep as usize),
+    }
 }
 
 /// The `[daemon] pass_env` entries: variable names, each optionally

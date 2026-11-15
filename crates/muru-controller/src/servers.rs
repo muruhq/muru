@@ -1,9 +1,12 @@
 //! Managed HTTP server releases (design specification section 9.9): the
 //! instances of a release that runs an ordinary HTTP server, which the
 //! daemon starts, probes, supervises and stops, and which the edge
-//! reaches as an upstream named after the release.
+//! reaches as an upstream named after the release. Each instance runs
+//! under a log relay of its own, its parent (issue 492, ADR 0059).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -91,6 +94,12 @@ pub struct InstanceRecord {
     /// names the process; 0 when not known.
     #[serde(default)]
     pub start_time: u64,
+    /// The pid of its log relay; 0 for an instance started without one.
+    #[serde(default)]
+    pub relay_pid: u32,
+    /// The relay's start time, which with its pid names it.
+    #[serde(default)]
+    pub relay_start_time: u64,
 }
 
 impl InstanceRecord {
@@ -102,8 +111,24 @@ impl InstanceRecord {
             started_unix_ms: self.started_unix_ms,
             quick_exits: self.quick_exits,
             start_time: self.start_time,
+            relay_pid: self.relay_pid,
+            relay_start_time: self.relay_start_time,
         }
     }
+}
+
+/// How the daemon has each instance's log relay started: from `executable`,
+/// with its counts and events going to `watcher`.
+#[derive(Clone)]
+pub struct Relays {
+    /// The executable to start relays from: this program.
+    pub executable: PathBuf,
+    /// What each relay queues and does when full.
+    pub settings: crate::host::RelaySettings,
+    /// The release, as app@release.
+    pub release: String,
+    /// Hears what the relays report.
+    pub watcher: crate::host::RelayWatcher,
 }
 
 /// The instances of one managed HTTP release: their processes, which a
@@ -114,14 +139,17 @@ pub struct Servers {
     /// Each instance's address, in the supervisor's order.
     binds: Vec<Bind>,
     supervisor: Supervisor,
+    /// Lines the instances' relays have dropped, across every relay.
+    dropped: Arc<AtomicU64>,
 }
 
 impl Servers {
     /// Start every instance under the run directory, each with its own
     /// address, running `spec.command` in `cwd` with `env`, as
-    /// `identity` when one is set, its output appended to `log`. When
-    /// an instance cannot be started, those started before it are
-    /// stopped, with `grace` to stop in before they are killed.
+    /// `identity` when one is set, its output going to `log` through a
+    /// relay of its own with `relays`, or appended by the instance itself
+    /// without. When an instance cannot be started, those started before
+    /// it are stopped, with `grace` to stop in before they are killed.
     #[allow(clippy::too_many_arguments)]
     pub async fn start(
         spec: &HttpServerSpec,
@@ -130,6 +158,7 @@ impl Servers {
         env: Vec<(String, String)>,
         identity: Option<Identity>,
         log: &Path,
+        relays: Option<Relays>,
         grace: Duration,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(run_dir)
@@ -139,8 +168,9 @@ impl Servers {
             .zip(&binds)
             .map(|(index, bind)| instance_spec(spec, index, bind))
             .collect();
+        let dropped = Arc::new(AtomicU64::new(0));
         let started = Supervisor::start(
-            process_spec(spec, cwd, env, identity, log),
+            process_spec(spec, cwd, env, identity, log, run_dir, relays, &dropped),
             RestartPolicy::default(),
             instances,
             grace,
@@ -160,6 +190,7 @@ impl Servers {
             run_dir: run_dir.to_path_buf(),
             binds,
             supervisor,
+            dropped,
         })
     }
 
@@ -183,6 +214,7 @@ impl Servers {
         env: Vec<(String, String)>,
         identity: Option<Identity>,
         log: &Path,
+        relays: Option<Relays>,
         record: &ServersRecord,
     ) -> anyhow::Result<Self> {
         let mut binds = Vec::new();
@@ -212,7 +244,7 @@ impl Servers {
         };
 
         for (process, bind) in processes.instances.iter_mut().zip(&binds) {
-            let unproven = process.pid != 0 && process.start_time == 0;
+            let unproven = process.pid != 0 && process.start_time == 0 && process.relay_pid == 0;
 
             if unproven
                 && answer(bind, spec.readiness_path.as_deref(), PROBE_TIMEOUT)
@@ -223,8 +255,9 @@ impl Servers {
             }
         }
 
+        let dropped = Arc::new(AtomicU64::new(0));
         let supervisor = Supervisor::adopt(
-            process_spec(spec, cwd, env, identity, log),
+            process_spec(spec, cwd, env, identity, log, run_dir, relays, &dropped),
             RestartPolicy::default(),
             instances,
             &processes,
@@ -235,6 +268,7 @@ impl Servers {
             run_dir: run_dir.to_path_buf(),
             binds,
             supervisor,
+            dropped,
         })
     }
 
@@ -291,8 +325,19 @@ impl Servers {
 
     /// Reap instances that exited and start again those whose wait has
     /// passed, with what happened for the event stream.
-    pub fn check(&mut self) -> Vec<Report> {
-        self.supervisor.check()
+    pub async fn check(&mut self) -> Vec<Report> {
+        self.supervisor.check().await
+    }
+
+    /// Have each instance's relay open the release log again by name;
+    /// gives, for each relay told, what changes once it says it has.
+    pub fn reopen_log(&self) -> Vec<tokio::sync::watch::Receiver<u64>> {
+        self.supervisor.reopen()
+    }
+
+    /// Lines of the instances' output their relays have dropped so far.
+    pub fn output_dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Every instance's address, as the snapshot names them.
@@ -321,6 +366,8 @@ impl Servers {
                     started_unix_ms: process.started_unix_ms,
                     quick_exits: process.quick_exits,
                     start_time: process.start_time,
+                    relay_pid: process.relay_pid,
+                    relay_start_time: process.relay_start_time,
                 })
                 .collect(),
         }
@@ -370,18 +417,31 @@ fn allocate(bind: ServerBind, run_dir: &Path, count: u32) -> anyhow::Result<Vec<
 }
 
 /// What the supervisor needs to know of every instance of a release.
+#[allow(clippy::too_many_arguments)]
 fn process_spec(
     spec: &HttpServerSpec,
     cwd: &Path,
     env: Vec<(String, String)>,
     identity: Option<Identity>,
     log: &Path,
+    run_dir: &Path,
+    relays: Option<Relays>,
+    dropped: &Arc<AtomicU64>,
 ) -> supervisor::Spec {
     supervisor::Spec {
         cwd: cwd.to_path_buf(),
         env,
         identity,
         log: log.to_path_buf(),
+        relay: relays.map(|relays| supervisor::RelaySpec {
+            executable: relays.executable,
+            run_dir: run_dir.to_path_buf(),
+            settings: relays.settings,
+            release: relays.release,
+            kind: "instance",
+            watcher: relays.watcher,
+            dropped: Arc::clone(dropped),
+        }),
         stop_signal: stop_signal(spec),
         stop_group: false,
         events: EVENTS,
@@ -786,6 +846,8 @@ mod tests {
                     started_unix_ms: 0,
                     quick_exits: 0,
                     start_time: 0,
+                    relay_pid: 0,
+                    relay_start_time: 0,
                 }],
             };
             let servers = Servers::adopt(
@@ -795,6 +857,7 @@ mod tests {
                 Vec::new(),
                 None,
                 &dir.path().join("output.log"),
+                None,
                 &record,
             )
             .await

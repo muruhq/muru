@@ -663,6 +663,8 @@ edge  1,284 req/s  3.0 err/s  p50 4.0 ms  p95 38 ms  in flight 41  ws 212  conns
 PID    ROLE           WHAT                                   USER      UP     CPU       RSS   REQ/S    BUSY   QUEUE      P95   GIL/LAG
 4242   daemon         system daemon, state /var/lib/muru     muru    3d2h    0.3%    38.0MB
 4250   ├─ edge        listening on :80, :443                 muru    3d2h    2.1%    61.0MB   1,284
+4400   ├─ relay       blog@r3 output to apps/blog/r3.log     blog    1d0h    0.0%     7.0MB
+4401   │  └─ server   blog@r3 instance 0: gunicorn           blog    1d0h    0.8%    74.0MB
 4330   ├─ host        api@r7 serving                         api     1d4h    0.0%    88.0MB     203    6/64       0    12 ms     48 ms
 4331   │  ├─ relay    api@r7 output to apps/api/r7.log       api     1d4h    0.0%     7.0MB
 4340   │  └─ worker   group default, worker 0                api     1d4h    4.2%   131.0MB     203    6/64            12 ms     48 ms
@@ -672,14 +674,13 @@ PID    ROLE           WHAT                                   USER      UP     CP
 4293   │  ├─ worker   group crawlers, worker 0               shop   5h13m    0.0%   118.0MB
        │  ├─ group    default
 4292   │  └─ worker   group default, worker 0                shop   5h13m    0.0%   131.0MB
-4301   ├─ host        shop@r42 serving                       shop   5h12m    0.0%    92.0MB
-4302   │  ├─ relay    shop@r42 output to apps/shop/r42.log   shop   5h12m    0.1%     7.0MB
-       │  ├─ group    crawlers                                                                   61     4/8       0   120 ms    0.4 ms
-4320   │  ├─ worker   group crawlers, worker 0               shop   5h12m    1.0%   120.0MB      61     4/8           120 ms    0.4 ms
-       │  ├─ group    default                                                                 1,020   27/32       3    41 ms    2.1 ms
-4310   │  ├─ worker   group default, worker 0                shop   5h12m   12.3%   140.0MB     512   14/16            40 ms    2.0 ms
-4311   │  └─ worker   group default, worker 1                shop   2h03m   11.8%   138.0MB     508   13/16            42 ms    2.2 ms
-4401   └─ server      blog@r3 instance 0: gunicorn           blog    1d0h    0.8%    74.0MB
+4301   └─ host        shop@r42 serving                       shop   5h12m    0.0%    92.0MB
+4302      ├─ relay    shop@r42 output to apps/shop/r42.log   shop   5h12m    0.1%     7.0MB
+          ├─ group    crawlers                                                                   61     4/8       0   120 ms    0.4 ms
+4320      ├─ worker   group crawlers, worker 0               shop   5h12m    1.0%   120.0MB      61     4/8           120 ms    0.4 ms
+          ├─ group    default                                                                 1,020   27/32       3    41 ms    2.1 ms
+4310      ├─ worker   group default, worker 0                shop   5h12m   12.3%   140.0MB     512   14/16            40 ms    2.0 ms
+4311      └─ worker   group default, worker 1                shop   2h03m   11.8%   138.0MB     508   13/16            42 ms    2.2 ms
 ```
 
 The first line is the instance's last second: requests and 5xx
@@ -689,8 +690,9 @@ second and the body bytes received and sent per second.
 
 The roles are `daemon`, `edge`, `host` (one per running release),
 `relay` (the release's log relay, which writes its output to the
-release log), `worker`, `server` (a [managed server](managed-servers.md)
-instance) and `command` (a `muructl command run` or `muructl exec`
+release log, or the relay of a managed server's instance, which starts
+the instance and writes its output), `worker`, `server` (a
+[managed server](managed-servers.md) instance) and `command` (a `muructl command run` or `muructl exec`
 while it runs). The tree is the one Muru supervises: a host adopted
 again after the daemon restarted has the init process as its parent
 in `ps`, which its row says.
