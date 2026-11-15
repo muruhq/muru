@@ -1433,13 +1433,14 @@ message LogArchive {
   string name = 1;                  // its path relative to the log directory
   uint64 size = 2;                  // in bytes
   uint64 modified_unix_ms = 3;      // when it was last changed
+  bool orphaned = 4;                // for a run's file: the daemon no longer keeps its run
 }
 
 message LogInfo {
   string name = 1;                  // its path relative to the log directory
-  string kind = 2;                  // access, edge, daemon, host or release
-  string app = 3;                   // the application of a release's log
-  string release = 4;               // the release of a release's log
+  string kind = 2;                  // access, edge, daemon, host, release, or commands for a command's runs' files
+  string app = 3;                   // the application of a release's log or a command's runs
+  string release = 4;               // the release of a release's log; the command, for a command's runs
   repeated string hosts = 5;        // the virtual hosts that name this file
   uint64 size = 6;                  // in bytes, 0 when the file is gone
   bool present = 7;                 // the file itself exists, not only archives of it

@@ -3,7 +3,7 @@
 //! 10.2). Every access goes through one connection behind a mutex; the
 //! store is small and the reconciler is the only writer.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -1253,6 +1253,18 @@ impl Store {
             ))?;
             let rows = statement.query_map(params![app, name], run_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// The id of every run kept (issue 692), for telling which runs'
+    /// files are orphaned.
+    pub fn run_ids(&self) -> Result<HashSet<u64>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare("SELECT id FROM runs")?;
+            let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+            rows.map(|id| id.map(|id| id as u64))
+                .collect::<Result<HashSet<_>, _>>()
                 .map_err(StoreError::from)
         })
     }
