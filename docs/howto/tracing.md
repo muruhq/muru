@@ -102,7 +102,11 @@ the request was served:
 - **Trace:** the request's tree, from the request down to each call,
   query and template render beneath it, each with when it started and
   how long it took on the request's clock, after the time it waited for
-  a worker.
+  a worker. An operation that an exception escaped, or one an exception
+  was noted against with `wrapture.note_exception`, is marked failed:
+  a red outline on its bar and a ✕ beside its name. Flask's and
+  Django's instrumentation note an exception their error handling
+  caught against the request, so the request is the span marked.
 
 - **SQL:** the request's queries, grouped by statement with how many
   times each ran and their total time, the most run first, then each

@@ -7,7 +7,9 @@ panels:
 
 - **Trace:** the request's tree as spans on the record's clock, coloured
   by wrapture's category. A request reads as its method and path, and a
-  query as its statement where the instrumentation records one.
+  query as its statement where the instrumentation records one. A span
+  is marked failed when an exception escaped its operation or was noted
+  against it, as wrapture's ``Event.failed`` says.
 
 - **SQL:** the queries, from events whose category is ``database`` other
   than a connection's open, commit or rollback, in two tables: grouped by
@@ -196,6 +198,7 @@ def _span(node: _Node, clock: panels.Spans) -> panels.Span:
         duration,
         event.category or event.kind,
         [_span(child, clock) for child in node.children],
+        failed=event.exception is not None or bool(event.caught),
     )
 
 

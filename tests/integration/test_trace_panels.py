@@ -104,11 +104,14 @@ def test_a_requests_queries_are_its_trace_and_sql_panels(tmp_path: Path) -> None
     # panel as handled, against the request it was noted in.
 
     assert exceptions(handled_record) == [["GET /handled", "LookupError: no such shelf (handled)"]]
+    assert named(handled_record)["trace"]["spans"][0]["failed"] is True
+    assert request["failed"] is False
 
     # One that escaped is there unmarked, and in the Errors panel's
     # traceback too.
 
     assert exceptions(broken_record) == [["GET /broken", "RuntimeError: the shelf fell"]]
+    assert named(broken_record)["trace"]["spans"][0]["failed"] is True
     assert broken_record["from_worker"]["outcome"] == "failed"
     assert "RuntimeError: the shelf fell" in broken_record["from_worker"]["traceback"]
 

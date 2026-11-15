@@ -1,7 +1,8 @@
 {#- A panel with no template of its own, such as one code in the worker
     adds with muru.panels (issue 677): its values, its tables, with a column of
     numbers kept on one line and aligned right, and its spans, each span
-    drawn as a bar on the request's clock, and what it could not keep. A
+    drawn as a bar on the request's clock, a failed one marked beside its
+    name and outlined, and what it could not keep. A
     text panel's text is drawn before it by the renderer (issue 680). -#}
 {%- if panel["values"] %}
 <table class="values">
@@ -34,14 +35,14 @@
 {%- macro bar(span) -%}
 {%- set from = [[(span.start_ms * 100 / total)|round|int, 0]|max, 100]|min if total > 0 else 0 -%}
 {%- set width = [[(span.duration_ms * 100 / total)|round|int, 0]|max, 100 - from]|min if total > 0 else 0 -%}
-<span class="track" title="{{ span.start_ms|round(2) }} ms to {{ (span.start_ms + span.duration_ms)|round(2) }} ms"><span class="bar from-{{ from }} for-{{ width }}"></span></span>
+<span class="track" title="{{ span.start_ms|round(2) }} ms to {{ (span.start_ms + span.duration_ms)|round(2) }} ms{% if span.failed %}, failed{% endif %}"><span class="bar from-{{ from }} for-{{ width }}"></span></span>
 {%- endmacro %}
 <table class="spans">
 <thead><tr><th>Name</th><th class="num">Starts</th><th class="num">Takes</th><th>On the request's clock</th></tr></thead>
 <tbody>
 {%- for span in panel.spans recursive %}
-<tr class="{{ span.category }}">
-<td class="depth-{{ loop.depth }}">{{ span.name }}</td>
+<tr class="{{ span.category }}{% if span.failed %} failed{% endif %}">
+<td class="depth-{{ loop.depth }}">{% if span.failed %}<span class="failed-mark" title="failed">✕</span> {% endif %}{{ span.name }}</td>
 <td class="num">{{ span.start_ms|round(2) }} ms</td>
 <td class="num">{{ span.duration_ms|round(2) }} ms</td>
 <td>{{ bar(span) }}</td>

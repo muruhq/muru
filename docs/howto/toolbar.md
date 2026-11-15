@@ -300,7 +300,7 @@ of entries for a request, and says how many were past the limit and not
 kept. The application can add its own, as [adding
 panels](panels.md) shows. With [tracing](tracing.md#in-the-toolbar)
 on, Muru adds **Trace**, the request's tree of calls, queries and template
-renders; **SQL**, its queries grouped by statement, which shows an N+1
+renders, with the operations that failed marked; **SQL**, its queries grouped by statement, which shows an N+1
 pattern as one statement run many times; and **Exceptions**, the
 exceptions that escaped or were handled. Each request the page view
 lists opens to its own panels.

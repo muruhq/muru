@@ -372,6 +372,7 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
         duration_ms: duration_ms.max(0.0),
         category: category.to_owned(),
         children: Vec::new(),
+        failed: false,
     };
 
     let mut spans = Vec::new();
@@ -1217,7 +1218,9 @@ mod tests {
                     duration_ms: 0.5,
                     category: "database".to_owned(),
                     children: Vec::new(),
+                    failed: true,
                 }],
+                failed: false,
             }],
             dropped: 2,
             ..Default::default()
@@ -1236,6 +1239,14 @@ mod tests {
             html.contains("books()") && html.contains("depth-2"),
             "{html}"
         );
+
+        // A failed span is marked beside its name and in its tooltip, and
+        // keeps its category's class.
+
+        assert!(html.contains("<tr class=\"view\">"), "{html}");
+        assert!(html.contains("<tr class=\"database failed\">"), "{html}");
+        assert_eq!(html.matches("class=\"failed-mark\"").count(), 1, "{html}");
+        assert!(html.contains("2.5 ms, failed\""), "{html}");
         assert!(
             html.contains("&lt;script&gt;") && !html.contains("<script>"),
             "{html}"

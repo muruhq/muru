@@ -2920,7 +2920,7 @@ fn request_text(record: &pb::RequestRecord) -> String {
         let _ = writeln!(text, "\n{}", panel.title);
 
         // Spans indented by depth, each with where it starts on the
-        // request's clock.
+        // request's clock, and a failed one marked.
 
         let mut spans: Vec<(usize, &pb::PanelSpan)> =
             panel.spans.iter().rev().map(|span| (0, span)).collect();
@@ -2930,9 +2930,10 @@ fn request_text(record: &pb::RequestRecord) -> String {
             lines.push((
                 format!("{}{}", "  ".repeat(depth), span.name),
                 format!(
-                    "{}  from {}",
+                    "{}  from {}{}",
                     millis(span.duration_ms),
-                    millis(span.start_ms)
+                    millis(span.start_ms),
+                    if span.failed { "  failed" } else { "" }
                 ),
             ));
             spans.extend(span.children.iter().rev().map(|child| (depth + 1, child)));
@@ -10774,5 +10775,40 @@ mod logs_list_tests {
             narrowed(&["shop", "--access"]).is_err(),
             "one target at a time"
         );
+    }
+
+    #[test]
+    fn a_records_text_marks_a_failed_span() {
+        let span = |name: &str, failed: bool| pb::PanelSpan {
+            name: name.to_owned(),
+            start_ms: 1.0,
+            duration_ms: 2.0,
+            failed,
+            ..Default::default()
+        };
+        let record = pb::RequestRecord {
+            panels: vec![pb::Panel {
+                title: "Trace".to_owned(),
+                spans: vec![pb::PanelSpan {
+                    children: vec![span("SELECT 1", false), span("lookup", true)],
+                    ..span("GET /books", true)
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let text = super::request_text(&record);
+        let lines: Vec<&str> = text.lines().skip_while(|line| *line != "Trace").collect();
+
+        assert!(
+            lines[1].starts_with("  GET /books") && lines[1].ends_with("  failed"),
+            "{text}"
+        );
+        assert!(
+            lines[2].starts_with("    SELECT 1") && !lines[2].ends_with("failed"),
+            "{text}"
+        );
+        assert!(lines[3].ends_with("from 1.0ms  failed"), "{text}");
     }
 }

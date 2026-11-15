@@ -239,6 +239,7 @@ message RecordSpan {
   double duration = 3;
   string category = 4;
   repeated RecordSpan children = 5;
+  bool failed = 6;                  // the operation failed (issue 705)
 }
 
 message RecordValue {

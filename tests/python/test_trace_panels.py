@@ -82,9 +82,15 @@ def test_a_requests_tree_becomes_its_trace_sql_and_exceptions(recorded: str) -> 
     ]
     connect = Event("call", "connect", category="database", data={"operation": "CONNECT"})
     books = Event("call", "books", label="books", caught=(Caught(failure, 0.0),))
+    lookup = Event("call", "lookup", label="lookup", exception=KeyError("shelf"))
     request = Event("request", "app", data={"method": "GET", "path": "/books"}, category="request")
 
-    run(trees, request, (books, tuple((child, ()) for child in [*queries, connect])))
+    run(
+        trees,
+        request,
+        (books, tuple((child, ()) for child in [*queries, connect])),
+        (lookup, ()),
+    )
 
     panels = taken(recorded)
     traced = panels["trace"][2][0]
@@ -92,11 +98,20 @@ def test_a_requests_tree_becomes_its_trace_sql_and_exceptions(recorded: str) -> 
     assert traced[0] == "GET /books" and traced[3] == "request"
     assert [child[0] for child in traced[4][0][4]] == [query, query, query, "connect"]
 
+    # The span a note was made against is failed, as is one an exception
+    # escaped; the rest are not.
+
+    assert [(child[0], child[5]) for child in traced[4]] == [("books", True), ("lookup", True)]
+    assert not traced[5] and not any(query[5] for query in traced[4][0][4])
+
     by_statement, each = panels["sql"][4]
     assert by_statement[2] == [[query, "3", by_statement[2][0][2]]]
     assert len(each[2]) == 3
 
-    assert panels["exceptions"][4][0][2] == [["books", "ValueError: no such author (handled)"]]
+    assert panels["exceptions"][4][0][2] == [
+        ["books", "ValueError: no such author (handled)"],
+        ["lookup", "KeyError: 'shelf'"],
+    ]
 
 
 def test_events_of_a_request_not_recorded_are_left_alone() -> None:

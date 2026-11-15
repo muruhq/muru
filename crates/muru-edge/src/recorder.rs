@@ -430,6 +430,7 @@ fn panel(panel: muru_proto::worker::v1::RecordPanel) -> admin::Panel {
             duration_ms: taken.duration.max(0.0),
             category: taken.category,
             children: taken.children.into_iter().map(span).collect(),
+            failed: taken.failed,
         }
     }
 

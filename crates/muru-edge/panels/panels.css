@@ -37,6 +37,10 @@
 .panel tr.edge .bar { background: #5b8def; }
 .panel tr.worker .bar { background: #8a63d2; }
 .panel tr.contention .bar { background: #d08a1e; }
+/* A failed span keeps its category's colour, outlined and marked in a red
+   that reads on the light and the dark background alike. */
+.panel tr.failed .bar { outline: 2px solid #e5484d; outline-offset: 1px; }
+.panel .failed-mark { color: #e5484d; font-weight: 700; }
 .panel caption { text-align: left; font-weight: 600; padding: 0.6rem 0 0.25rem; }
 .panel dt { font-weight: 600; }
 .panel dd { margin: 0 0 0.4rem 1.2rem; }

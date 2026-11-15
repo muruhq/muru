@@ -76,7 +76,7 @@ What each kind of panel takes:
 | --- | --- |
 | `ValuesPanel` | `panel[name] = value` sets a value, shown as text; setting it again replaces it |
 | `TablesPanel` | `panel.table(caption).add_row(cells)` adds a row, each cell shown as text |
-| `SpansPanel` | `panel.add(Span(name, start, duration, category, children))` adds a span with those beneath it; `with panel.span(name, category=...)` times a block as one |
+| `SpansPanel` | `panel.add(Span(name, start, duration, category, children, failed))` adds a span with those beneath it; `with panel.span(name, category=...)` times a block as one |
 | `TextPanel` | `panel.write(text)` adds a block of text, after a blank line when there is one before it |
 
 The add methods, `add_row()`, `add()` and `write()`, return whether the
@@ -84,10 +84,12 @@ entry was kept.
 
 ### Spans
 
-A span is a named interval on the request's clock, with a category and
-the spans beneath it. A block timed with `span()` inside another of the
-same panel's, in the same request, goes beneath it, and each is added as
-its block ends, however the block ends:
+A span is a named interval on the request's clock, with a category, the
+spans beneath it, and whether it failed. A block timed with `span()`
+inside another of the same panel's, in the same request, goes beneath
+it, and each is added as its block ends, however the block ends. A block
+that an exception escapes is marked failed, and the exception goes on as
+it would without the block:
 
 ```python
 steps = STEPS.current()
@@ -109,8 +111,14 @@ rows = run_query()
 steps.add(Span("query", start, steps.now() - start, "database"))
 ```
 
+`Span(..., failed=True)` marks a span added this way as failed.
+
 The toolbar draws each span as a bar on the request's timeline, coloured
-by its category, with those beneath it indented under it.
+by its category, with those beneath it indented under it. A failed span
+keeps its category's colour, with a red outline on its bar, a ✕ beside
+its name and "failed" in its bar's tooltip; `muructl debug request`
+writes `failed` at the end of its line, and the record's JSON has
+`"failed": true` on it.
 
 ### Text
 

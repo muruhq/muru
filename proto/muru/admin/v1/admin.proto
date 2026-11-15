@@ -464,6 +464,7 @@ message PanelSpan {
   double duration_ms = 3;
   string category = 4;
   repeated PanelSpan children = 5;
+  bool failed = 6;                  // the operation failed, drawn so it stands out (issue 705)
 }
 
 message PanelValue {

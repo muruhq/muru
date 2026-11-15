@@ -441,18 +441,19 @@ fn panels(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordPanel>> {
 }
 
 /// Spans as `muru.panels._span` gives them: name, start, duration,
-/// category and the spans beneath, which may nest.
+/// category, the spans beneath, which may nest, and whether it failed.
 fn spans(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordSpan>> {
     let mut spans = Vec::new();
 
     for item in taken.try_iter()? {
         let item = item?;
-        let (name, start, duration, category, children): (
+        let (name, start, duration, category, children, failed): (
             String,
             f64,
             f64,
             String,
             Bound<'_, PyAny>,
+            bool,
         ) = item.extract()?;
 
         spans.push(pb::RecordSpan {
@@ -461,6 +462,7 @@ fn spans(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordSpan>> {
             duration,
             category,
             children: self::spans(&children)?,
+            failed,
         });
     }
 
