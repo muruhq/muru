@@ -96,8 +96,8 @@ points to wrap and leave tracing itself to each developer.
 ## In the toolbar
 
 Under `muructl run`, each request's record in the [development
-toolbar](toolbar.md) gains three panels from what wrapture recorded while
-the request was served:
+toolbar](toolbar.md) gains panels from what wrapture recorded while the
+request was served:
 
 - **Trace:** the request's tree, from the request down to each call,
   query and template render beneath it, each with when it started and
@@ -116,6 +116,20 @@ the request was served:
   statement is shown when the instrumentation records it, as the sqlite3
   and SQLAlchemy instrumentations do with `statement = true`, and
   otherwise the operation's name.
+
+- **Outbound:** the request's calls to other services, from the
+  instrumentation of HTTP clients (`requests`, `httpx`, `urllib3`,
+  `aiohttp`'s client, `urllib.request`, `http.client`), `xmlrpc.client`
+  and gRPC clients. They are grouped by method, host and path, with how
+  many times each endpoint was called and their total time, the most
+  called first, so an endpoint called once per row of a query shows as
+  one line called many times; then each call in order, with when it
+  started, how long it took, its method, its URL as the instrumentation
+  records it, without its query, and its status, or the type of the
+  exception it raised. A gRPC call reads as its service and method, with
+  its status code. A client built on another one, such as `requests` on
+  `urllib3`, counts once, as the outer call. The panel is there only for
+  a request that made a call.
 
 - **Exceptions:** the exceptions that escaped an operation, and those
   noted against one as handled, with where they happened.

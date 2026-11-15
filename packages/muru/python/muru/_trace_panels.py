@@ -1,4 +1,4 @@
-"""wrapture's events as toolbar panels: Trace, SQL and Exceptions (issue 640).
+"""wrapture's events as toolbar panels: Trace, SQL, Outbound and Exceptions (issues 640, 707).
 
 When tracing is on (section 11.6), a sink of Muru's own hears every event
 wrapture records in a worker and turns each request's tree into panels of
@@ -15,6 +15,14 @@ panels:
   than a connection's open, commit or rollback, in two tables: grouped by
   normalised statement, the most run first, so an N+1 pattern shows as
   one statement run many times; and each query in order.
+
+- **Outbound:** the calls to other services, from events whose category
+  is ``external``, outermost only, so a client built on another counts
+  once, in two tables: grouped by method, host and path, the most called
+  first, so one endpoint called once per row shows as one line called
+  many times; and each call in order, with its method, URL as recorded
+  (without its query) and status, or the exception's type where it
+  raised. A gRPC call reads as its service and method.
 
 - **Exceptions:** the exceptions that escaped an operation or were noted
   against one with ``note_exception``, where and what they were.
@@ -39,6 +47,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from muru import panels
 
@@ -67,6 +76,14 @@ with panels._own():
             "Each query": ["at ms", "ms", "statement"],
         },
     )
+    OUTBOUND = panels.TablesPanel(
+        "outbound",
+        "Outbound",
+        tables={
+            "By endpoint": ["method", "host", "path", "times", "total ms"],
+            "Each call": ["at ms", "ms", "method", "url", "status"],
+        },
+    )
     EXCEPTIONS = panels.TablesPanel(
         "exceptions", "Exceptions", tables={"Exceptions": ["in", "exception"]}
     )
@@ -79,6 +96,7 @@ class _Handles:
 
     trace: panels.Spans
     sql: panels.Tables
+    outbound: panels.Tables
     exceptions: panels.Tables
 
 
@@ -130,7 +148,7 @@ class _Trees:
         if not trace.active:
             return
 
-        handles = _Handles(trace, SQL.current(), EXCEPTIONS.current())
+        handles = _Handles(trace, SQL.current(), OUTBOUND.current(), EXCEPTIONS.current())
 
         with self.lock:
             self.open[event.seq] = _Node(None, event, handles)
@@ -154,7 +172,7 @@ class _Trees:
 
 
 def _add(root: _Node, handles: _Handles) -> None:
-    # The finished tree, as the three panels of its request.
+    # The finished tree, as the four panels of its request.
 
     # Times go onto the record's clock through the trace's handle.
 
@@ -163,8 +181,9 @@ def _add(root: _Node, handles: _Handles) -> None:
     trace.add_dropped(root.dropped)
 
     queries: list[tuple[float, float, str]] = []
+    calls: list[_Call] = []
     failures: list[tuple[str, str]] = []
-    _collect(root, trace, queries, failures)
+    _collect(root, trace, queries, calls, failures)
 
     grouped: dict[str, list[float]] = {}
 
@@ -180,6 +199,23 @@ def _add(root: _Node, handles: _Handles) -> None:
 
     for started, took, statement in queries:
         each_query.add_row([f"{started:.3f}", f"{took:.3f}", statement])
+
+    endpoints: dict[tuple[str, str, str], list[float]] = {}
+
+    for call in calls:
+        endpoints.setdefault((call.method, call.host, call.path), []).append(call.took)
+
+    by_endpoint = handles.outbound.table("By endpoint")
+
+    for (method, host, path), times in sorted(endpoints.items(), key=lambda item: -len(item[1])):
+        by_endpoint.add_row([method, host, path, len(times), f"{sum(times):.3f}"])
+
+    each_call = handles.outbound.table("Each call")
+
+    for call in calls:
+        each_call.add_row(
+            [f"{call.started:.3f}", f"{call.took:.3f}", call.method, call.url, call.status]
+        )
 
     exceptions = handles.exceptions.table("Exceptions")
 
@@ -202,13 +238,30 @@ def _span(node: _Node, clock: panels.Spans) -> panels.Span:
     )
 
 
+@dataclass
+class _Call:
+    # One call to another service, as the Outbound panel shows it.
+
+    started: float
+    took: float
+    method: str
+    host: str
+    path: str
+    url: str
+    status: str
+
+
 def _collect(
     node: _Node,
     clock: panels.Spans,
     queries: list[tuple[float, float, str]],
+    calls: list[_Call],
     failures: list[tuple[str, str]],
+    outbound: bool = False,
 ) -> None:
-    # The queries and the exceptions of a tree, in the order they began.
+    # The queries, the outermost calls to other services and the
+    # exceptions of a tree, in the order they began. `outbound` says the
+    # node is beneath a call already counted.
 
     event = node.event
 
@@ -218,6 +271,10 @@ def _collect(
             (clock.at(event.started), (event.duration or 0.0) * 1000.0, _cut(str(statement)))
         )
 
+    if event.category == "external" and not outbound and event.started is not None:
+        calls.append(_call(event, clock))
+        outbound = True
+
     if event.exception is not None:
         failures.append((_name(event), _described(event.exception)))
 
@@ -225,7 +282,53 @@ def _collect(
         failures.append((_name(event), f"{_described(caught.exception)} (handled)"))
 
     for child in node.children:
-        _collect(child, clock, queries, failures)
+        _collect(child, clock, queries, calls, failures, outbound)
+
+
+# The ports a URL's scheme implies, left out of the host it is grouped by.
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _call(event: Any, clock: panels.Spans) -> _Call:
+    # A call as wrapture's external contract records it: an HTTP client's
+    # method, URL without its query, host, port, path and status; a gRPC
+    # call's service, operation, host, port and code.
+
+    data = event.data
+    host = str(data.get("host") or "")
+    port = data.get("port")
+
+    if data.get("system") == "grpc":
+        method = "gRPC"
+        path = "/".join(str(part) for part in (data.get("service"), data.get("operation")) if part)
+        url = path
+        status = data.get("code")
+    else:
+        method = str(data.get("method") or "")
+        url = str(data.get("url") or event.label or event.path)
+        path = str(data.get("path") or "") or urlsplit(url).path
+        status = data.get("status")
+        scheme = urlsplit(url).scheme
+
+        if port is not None and _DEFAULT_PORTS.get(scheme) == port:
+            port = None
+
+    if host and port is not None:
+        host = f"{host}:{port}"
+
+    if status is None and event.exception is not None:
+        status = type(event.exception).__name__
+
+    return _Call(
+        clock.at(event.started),
+        (event.duration or 0.0) * 1000.0,
+        method,
+        _cut(host),
+        _cut(path),
+        _cut(url),
+        "" if status is None else str(status),
+    )
 
 
 # What a database event's operation is, by wrapture's contract, when it is

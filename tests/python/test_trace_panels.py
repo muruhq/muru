@@ -165,3 +165,57 @@ def test_statements_group_by_their_shape() -> None:
     )
     assert normalised("INSERT INTO t VALUES (?, ?)") == "INSERT INTO t VALUES (?, ?)"
     assert normalised("SELECT col2 FROM t2") == "SELECT col2 FROM t2"
+
+
+def test_a_requests_calls_to_other_services_are_its_outbound_panel(recorded: str) -> None:
+    trees = _trace_panels._Trees()
+
+    def call(**data: Any) -> Event:
+        return Event("call", "open", category="external", data=data)
+
+    author = {
+        "method": "GET",
+        "url": "http://authors.test:80/authors",
+        "host": "authors.test",
+        "port": 80,
+        "path": "/authors",
+        "status": 200,
+    }
+    calls = [call(**author) for _ in range(3)]
+
+    # A client built on another records twice; only the outer call counts.
+
+    nested = call(**author)
+    inner = call(method="GET", url="http://authors.test/authors", host="authors.test")
+    failed = call(method="POST", url="https://pay.test:8443/charge", host="pay.test", port=8443)
+    failed.exception = ConnectionRefusedError("refused")
+    rpc = call(system="grpc", service="shop.Stock", operation="Count", host="stock", port=50051)
+    rpc.data["code"] = "OK"
+    request = Event("request", "app", data={"method": "GET", "path": "/books"}, category="request")
+
+    run(
+        trees,
+        request,
+        *((child, ()) for child in calls),
+        (nested, ((inner, ()),)),
+        (failed, ()),
+        (rpc, ()),
+    )
+
+    by_endpoint, each = taken(recorded)["outbound"][4]
+    assert [row[:4] for row in by_endpoint[2]] == [
+        ["GET", "authors.test", "/authors", "4"],
+        ["POST", "pay.test:8443", "/charge", "1"],
+        ["gRPC", "stock:50051", "shop.Stock/Count", "1"],
+    ]
+    assert len(each[2]) == 6
+    assert each[2][0][2:] == ["GET", "http://authors.test:80/authors", "200"]
+    assert each[2][4][2:] == ["POST", "https://pay.test:8443/charge", "ConnectionRefusedError"]
+    assert each[2][5][2:] == ["gRPC", "shop.Stock/Count", "OK"]
+
+
+def test_a_request_with_no_calls_has_no_outbound_panel(recorded: str) -> None:
+    trees = _trace_panels._Trees()
+    run(trees, Event("call", "view"))
+
+    assert "outbound" not in taken(recorded)

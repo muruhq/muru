@@ -303,7 +303,9 @@ kept. The application can add its own, as [adding
 panels](panels.md) shows. With [tracing](tracing.md#in-the-toolbar)
 on, Muru adds **Trace**, the request's tree of calls, queries and template
 renders, with the operations that failed marked; **SQL**, its queries grouped by statement, which shows an N+1
-pattern as one statement run many times; and **Exceptions**, the
+pattern as one statement run many times; **Outbound**, its calls to
+other services grouped by endpoint, which shows the same pattern for an
+HTTP or gRPC call made once per row; and **Exceptions**, the
 exceptions that escaped or were handled. Each request the page view
 lists opens to its own panels.
 

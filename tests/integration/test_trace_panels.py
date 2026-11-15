@@ -1,6 +1,6 @@
-"""wrapture's events as the toolbar's Trace, SQL and Exceptions panels
-(issues 640 and 704), with wrapture and its sqlite3 instrumentation,
-through muructl run."""
+"""wrapture's events as the toolbar's Trace, SQL, Outbound and Exceptions
+panels (issues 640, 704 and 707), with wrapture and its sqlite3 and
+urllib.request instrumentation, through muructl run."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ pytestmark = pytest.mark.skipif(
 
 APP = """
 import sqlite3
+import urllib.request
 
 import wrapture
 
@@ -37,6 +38,18 @@ def application(environ, start_response):
 
     if path == "/broken":
         raise RuntimeError("the shelf fell")
+
+    if path == "/outbound":
+        for _ in range(2):
+            address = f"http://{environ['HTTP_HOST']}/handled?shelf=1"
+
+            try:
+                urllib.request.urlopen(address, timeout=10)
+            except urllib.error.HTTPError:
+                pass
+
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"asked"]
 
     connection = sqlite3.connect(":memory:")
     connection.execute("CREATE TABLE book (id INTEGER PRIMARY KEY, title TEXT)")
@@ -58,6 +71,9 @@ tracing_middleware = true
 [[tool.wrapture.instrument]]
 name = "sqlite3"
 statement = true
+
+[[tool.wrapture.instrument]]
+name = "urllib.request"
 """
 
 
@@ -81,6 +97,10 @@ def test_a_requests_queries_are_its_trace_and_sql_panels(tmp_path: Path) -> None
         broken = server.get("/broken")
         assert broken.status == 500
         broken_record = record(server, broken)
+
+        outbound = server.get("/outbound")
+        assert outbound.body == b"asked"
+        outbound_record = record(server, outbound)
     finally:
         server.stop()
 
@@ -114,6 +134,18 @@ def test_a_requests_queries_are_its_trace_and_sql_panels(tmp_path: Path) -> None
     assert named(broken_record)["trace"]["spans"][0]["failed"] is True
     assert broken_record["from_worker"]["outcome"] == "failed"
     assert "RuntimeError: the shelf fell" in broken_record["from_worker"]["traceback"]
+
+    # The application's calls to its own server are one endpoint called
+    # twice, each call with its URL without the query and its status; a
+    # request that made none has no Outbound panel.
+
+    by_endpoint, each_call = named(outbound_record)["outbound"]["tables"]
+    host = f"127.0.0.1:{server.port}"
+    assert [row["cells"][:4] for row in by_endpoint["rows"]] == [["GET", host, "/handled", "2"]]
+    assert [row["cells"][2:] for row in each_call["rows"]] == [
+        ["GET", f"http://{host}/handled", "404"]
+    ] * 2
+    assert "outbound" not in panels
 
 
 def record(server: support.Server, response: support.Response) -> dict[str, Any]:

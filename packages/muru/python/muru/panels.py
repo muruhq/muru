@@ -81,7 +81,7 @@ TEXT_LIMIT = 65536
 # which only Muru declares, within _own().
 
 RESERVED = frozenset({"timing", "where", "response", "logs", "errors", "connection", "page"})
-OWN = frozenset({"trace", "sql", "exceptions"})
+OWN = frozenset({"trace", "sql", "outbound", "exceptions"})
 
 _owning = False
 
