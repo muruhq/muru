@@ -648,6 +648,8 @@ follows the same rule: once a file is renamed away, its writer opens it
 again by name, so lines go to a new file and the renamed one is
 complete. The edge reopens the access log, the files virtual hosts name
 and its own `edge.log`, each release's log relay its release's file,
+each [detached command run](commands.md#running-a-long-command-detached)'s
+relay its release's file and its own output file,
 and a background daemon its own log. Lines written between the rename
 and the reopen
 land in the renamed file, and none are lost.
@@ -679,7 +681,7 @@ seconds after the rename, and without it logrotate compresses the
 renamed file at once and deletes it, so the lines written in those
 seconds are lost. A `postrotate` that runs `muructl logs reopen` makes
 the reopen immediate, and then `delaycompress` can go: the command
-returns once the edge and every release's log relay have opened their
+returns once the edge and every release's and detached run's log relay have opened their
 files again, so the renamed files are complete when logrotate
 compresses them. A writer that has not answered within five seconds no
 longer holds the command up.

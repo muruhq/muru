@@ -10870,6 +10870,8 @@ impl Daemon {
             running.backend.reopen_log(false);
         }
 
+        self.runs.reopen();
+
         let names: Vec<String> = rotated
             .iter()
             .map(|archive| {
@@ -11075,6 +11077,11 @@ impl Daemon {
                 relays.extend(reopened);
             }
         }
+
+        // Issue 698: a detached command run's relay writes the release's
+        // log too.
+
+        relays.extend(self.runs.reopen());
 
         let message = format!(
             "reopened the log files{}: {}{hosts} host{}{}",

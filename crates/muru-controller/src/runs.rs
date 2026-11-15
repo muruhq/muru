@@ -47,6 +47,10 @@ const RELAY_START_WAIT: Duration = Duration::from_secs(10);
 /// How often a relay that is not this daemon's child is looked at.
 const POLL: Duration = Duration::from_millis(200);
 
+/// How long a detached run's relay is given to say it has reopened its
+/// files.
+const REOPEN_WAIT: Duration = Duration::from_secs(5);
+
 /// How long a relay told to kill its run's session gets before it is
 /// killed itself.
 const KILL_WAIT: Duration = Duration::from_secs(2);
@@ -80,6 +84,10 @@ struct Inner {
 struct Watched {
     stop: mpsc::UnboundedSender<String>,
     task: tokio::task::JoinHandle<()>,
+    /// The relay's pid and start time, which name it, and its control
+    /// socket, for telling it to reopen its files (issue 698).
+    relay: (u32, u64),
+    control: Option<PathBuf>,
 }
 
 impl Runs {
@@ -343,6 +351,8 @@ impl Runs {
         let (stop, stops) = mpsc::unbounded_channel();
         let runs = self.clone();
         let id = run.id;
+        let relay_named = (run.relay_pid, run.relay_start_time);
+        let control = run_dir(&run).map(|dir| dir.join(crate::relay::CONTROL_SOCKET));
 
         let task = tokio::spawn(async move {
             let ending = watch_run(&runs, &run, relay, stops).await;
@@ -354,11 +364,61 @@ impl Runs {
                 .remove(&run.id);
         });
 
-        self.0
-            .watched
-            .lock()
-            .expect("runs poisoned")
-            .insert(id, Watched { stop, task });
+        self.0.watched.lock().expect("runs poisoned").insert(
+            id,
+            Watched {
+                stop,
+                task,
+                relay: relay_named,
+                control,
+            },
+        );
+    }
+
+    /// Have every detached run's relay open the release's log and the
+    /// run's own file again by name (issue 698), as a release's relays do
+    /// after a rotation or `muructl logs reopen`. Gives, for each relay,
+    /// what changes once it reports that it has: the relay is connected
+    /// to first and signalled once it answers, so its report is not
+    /// missed, and the connection is given up after `REOPEN_WAIT`.
+    pub fn reopen(&self) -> Vec<tokio::sync::watch::Receiver<u64>> {
+        let watched = self.0.watched.lock().expect("runs poisoned");
+        let mut answers = Vec::new();
+
+        for watched in watched.values() {
+            let (pid, start) = watched.relay;
+
+            let Some(control) = watched.control.clone() else {
+                continue;
+            };
+
+            if !still_running(pid, start) {
+                continue;
+            }
+
+            let (told, answer) = tokio::sync::watch::channel(0);
+            answers.push(answer);
+
+            tokio::spawn(async move {
+                let mut signalled = false;
+
+                let reports = crate::relay::watch_reports(&control, |report| match report {
+                    crate::relay::Report::Status(_) if !signalled => {
+                        signalled = true;
+
+                        if still_running(pid, start) {
+                            signal_process(pid, libc::SIGUSR1);
+                        }
+                    }
+                    crate::relay::Report::Reopened => told.send_modify(|count| *count += 1),
+                    _ => {}
+                });
+
+                let _ = tokio::time::timeout(REOPEN_WAIT, reports).await;
+            });
+        }
+
+        answers
     }
 
     /// Stop the detached run with this id, as at its timeout, because of
