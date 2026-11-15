@@ -286,6 +286,43 @@ Helm pre-upgrade hook runs the same command.
 `muructl exec -- alembic upgrade head` runs a command that is not
 declared, the same way.
 
+## Scheduled commands
+
+`muructl serve` runs no [schedules](commands.md#schedules), since a pod
+cannot know how many replicas of it there are. A CronJob runs the
+command instead, from the same image:
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: shop-clearsessions
+spec:
+  schedule: "30 3 * * *"
+  timeZone: Australia/Sydney
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: clearsessions
+              image: registry.example.com/shop:1.4.2
+              command: ["muructl", "command", "run", "clearsessions"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: {drop: ["ALL"]}
+```
+
+`concurrencyPolicy: Forbid` skips a run due while one is under way, as
+the daemon does. As for a migration's Job, give the CronJob the
+environment variables and secrets the Deployment's containers have.
+
 ## Looking inside a pod
 
 `muructl` in the container reaches `muructl serve` through its run

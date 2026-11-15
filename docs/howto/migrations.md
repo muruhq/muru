@@ -78,6 +78,80 @@ muructl command run shop migrate
 CI job that deploys can stop at a failed migration before it moves any
 traffic.
 
+## Gates
+
+A command can be a gate in a release's life, run by the daemon at that
+point, so a deploy needs no separate step:
+
+```toml
+[tool.muru.commands.migrate]
+description = "Apply database migrations"
+run = ["python", "manage.py", "migrate", "--noinput"]
+timeout = "30m"
+before_fork = true
+
+[tool.muru.commands.contract]
+run = ["python", "manage.py", "migrate", "--noinput", "--database", "contract"]
+timeout = "30m"
+before_promote = true
+```
+
+- `before_fork = true` runs the command when the release starts, once
+  its host has imported the application and before it forks any worker.
+  A gate that fails fails the start, as a failed import does: the
+  release is `failed` with the gate and how it ended in its message, its
+  host stops, and nothing of it ever serves. A canary of the release
+  rolls back on the same path as any start that fails.
+
+- `before_promote = true` runs the command when a rollout's last step or
+  `muructl rollout bluegreen` is about to move all of the application's
+  traffic to the release, with the release already running. A gate that
+  fails stops the promotion: the release that served goes on serving,
+  and a rollout is paused where it was, saying why, to be resumed,
+  promoted or aborted. A deploy that serves at once, with no rollout, is
+  no promotion and runs only the `before_fork` gates.
+
+A gate runs once for each release. The daemon records each gate a
+release passes, `muructl release show` lists them, and a host of the
+release started again, after a crash or a daemon restart, skips a gate
+the release has passed. `every_start = true` runs a `before_fork` gate
+at every start of the host instead.
+
+A gate needs a `timeout`, since the release waits for it, and is given
+no inputs, so a required input needs a default. It is always exclusive.
+Each gate's run is recorded like any other, with the trigger
+`gate:before_fork` or `gate:before_promote`, its output in the release's
+log and its own file, and `command.started` and `command.finished` or
+`command.failed` events, with a `release.gate_passed` event when it
+passes. The gates of a stage run one after another, in the order of
+their names. While a `before_fork` gate runs, the release is `warming`,
+and the deploy waits for it. The daemon goes on with everything else
+meanwhile: `muructl status`, deploys of other applications and the
+daemon's own checks answer as usual. A drain of the release cancels its
+start, stopping the gate's run and the host; a scale of it is refused
+until it is ready.
+
+Gates run under the daemon only: `muructl run` and `muructl serve` run
+none. `muructl serve` cannot know how many replicas of its pod there
+are, so a gate run by each pod would run the migration once a replica.
+Run the migration by name before the new image serves instead: a
+Kubernetes Job or a Helm pre-upgrade hook running `muructl command run
+migrate`, as [the Kubernetes guide](kubernetes.md#migrations) shows, or
+under Docker Compose a one-off service that the application's service
+depends on with `condition: service_completed_successfully`:
+
+```yaml
+services:
+  migrate:
+    image: registry.example.com/shop:1.4.2
+    command: ["muructl", "command", "run", "migrate"]
+  shop:
+    image: registry.example.com/shop:1.4.2
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+```
+
 ## Without the daemon
 
 The same declared command runs for [the project in the current

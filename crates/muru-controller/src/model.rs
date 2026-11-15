@@ -614,6 +614,108 @@ pub struct CommandSpec {
     /// One run at a time for the application.
     #[serde(default)]
     pub exclusive: bool,
+    /// When the daemon runs it by itself (issue 268).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleSpec>,
+    /// A gate before the release's host forks its workers (issue 266).
+    #[serde(default)]
+    pub before_fork: bool,
+    /// A gate before a promotion moves all traffic to the release.
+    #[serde(default)]
+    pub before_promote: bool,
+    /// A `before_fork` gate run at every start of the host.
+    #[serde(default)]
+    pub every_start: bool,
+}
+
+impl CommandSpec {
+    /// Whether it is a gate at `stage`.
+    pub fn gates(&self, stage: Gate) -> bool {
+        match stage {
+            Gate::BeforeFork => self.before_fork,
+            Gate::BeforePromote => self.before_promote,
+        }
+    }
+}
+
+/// Section 9.12 (issue 266): a point in a release's life at which its
+/// gates run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// Once the host has preloaded, before it forks its workers.
+    BeforeFork,
+    /// Before a promotion moves all traffic to the release.
+    BeforePromote,
+}
+
+impl Gate {
+    /// The gate as its key and a run's trigger name it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeFork => "before_fork",
+            Self::BeforePromote => "before_promote",
+        }
+    }
+
+    /// The trigger of a run of a gate at this stage.
+    pub fn trigger(self) -> &'static str {
+        match self {
+            Self::BeforeFork => "gate:before_fork",
+            Self::BeforePromote => "gate:before_promote",
+        }
+    }
+}
+
+/// Section 9.12 (issue 268): when the daemon runs a command by itself,
+/// checked when the release was created.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleSpec {
+    /// The cron expression, as written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// The time zone it is read in; the system's when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// Run it when the daemon starts from nothing.
+    #[serde(default)]
+    pub at_boot: bool,
+    /// Input values a scheduled run is given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<(String, String)>,
+    /// Inputs taken from a secret store, as STORE/KEY.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_inputs: Vec<(String, String)>,
+}
+
+impl ScheduleSpec {
+    /// The next time the cron expression is due after `after_unix_ms`,
+    /// Unix milliseconds; none without one.
+    pub fn next_after(&self, after_unix_ms: u64) -> Option<u64> {
+        muru_config::cron_next(
+            self.cron.as_deref()?,
+            self.timezone.as_deref(),
+            after_unix_ms,
+        )
+    }
+
+    /// The schedule in words: `30 3 * * * in Australia/Sydney, and when
+    /// the daemon starts`.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+
+        if let Some(cron) = &self.cron {
+            parts.push(match &self.timezone {
+                Some(zone) => format!("{cron} in {zone}"),
+                None => cron.clone(),
+            });
+        }
+
+        if self.at_boot {
+            parts.push("when the daemon starts".to_owned());
+        }
+
+        parts.join(", and ")
+    }
 }
 
 /// Section 9.12: how a run of a command went, kept for the last run of
@@ -632,6 +734,66 @@ pub struct CommandRun {
     pub ok: bool,
     /// How it ended.
     pub message: String,
+}
+
+/// Section 9.12 (issue 688): a run of a command as the store keeps it,
+/// from its start, with the process it runs as, to how it ended.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunRecord {
+    /// Its id, which the store gives it.
+    pub id: u64,
+    /// The application.
+    pub app: String,
+    /// The release it runs with.
+    pub release: String,
+    /// The declared command's name, or `exec` for a one-off command.
+    pub name: String,
+    /// What started it: `manual`, `schedule`, `gate:before_fork` or
+    /// `gate:before_promote`.
+    pub trigger: String,
+    /// Who asked for it: a user, or `daemon` for a trigger of the daemon's
+    /// own.
+    pub requested_by: String,
+    /// Whether it was started detached, outliving its caller.
+    pub detached: bool,
+    /// Whether it holds the application's claim on its command, which
+    /// lasts until it has ended.
+    pub exclusive: bool,
+    /// Its inputs as its events show them, a secret's value as `***`.
+    pub inputs: String,
+    /// How long it may run, in milliseconds; 0 for no limit.
+    pub timeout_ms: u64,
+    /// When it started.
+    pub started_unix_ms: u64,
+    /// When it ended; 0 while it is under way.
+    pub ended_unix_ms: u64,
+    /// Its exit status, or 128 plus the signal that killed it.
+    pub exit_code: i32,
+    /// Whether it succeeded.
+    pub ok: bool,
+    /// How it ended.
+    pub message: String,
+    /// Its process, and that process's start time, which together name
+    /// it; 0 while not known.
+    pub pid: u32,
+    /// The process's start time.
+    pub start_time: u64,
+    /// The log relay a detached run runs under, and its start time; 0
+    /// for a run its caller's stream carries.
+    pub relay_pid: u32,
+    /// The relay's start time.
+    pub relay_start_time: u64,
+    /// Why it is being stopped, once a stop has been asked for.
+    pub stopping: String,
+    /// The directory of its own secret files, removed when it ends.
+    pub secrets: String,
+}
+
+impl RunRecord {
+    /// Whether it is still under way.
+    pub fn under_way(&self) -> bool {
+        self.ended_unix_ms == 0
+    }
 }
 
 /// Section 9.12: an input a command takes.

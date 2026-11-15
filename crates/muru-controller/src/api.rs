@@ -102,19 +102,22 @@ async fn truncate_logs(
         })
         .await
         .map_err(|_| Status::unavailable(STOPPING))?;
-    let in_place = done_rx
+    done_rx
         .await
         .map_err(|_| Status::unavailable(STOPPING))?
         .map_err(Status::failed_precondition)?;
 
+    // Under the daemon every writer reopens its file, so a cut swaps the
+    // kept part in rather than cutting the file in place.
+
     let targets: Vec<Target> = selected
         .iter()
-        .zip(paths.iter().zip(in_place))
-        .map(|(log, (path, in_place))| Target {
+        .zip(&paths)
+        .map(|(log, path)| Target {
             path: path.clone(),
             name: log.name.clone(),
             keep,
-            in_place,
+            in_place: false,
         })
         .collect();
     let sizes: std::collections::HashMap<String, (u64, u64)> = selected
@@ -905,6 +908,20 @@ impl Admin for Service {
                 .join("; ");
         }
 
+        // Issue 688: the output of the application's command runs goes
+        // with it, and then its log directory when that is left empty.
+
+        let logs = self
+            .handle
+            .info
+            .locations
+            .logs
+            .path
+            .join("apps")
+            .join(&app.name);
+        let _ = std::fs::remove_dir_all(logs.join("commands"));
+        let _ = std::fs::remove_dir(&logs);
+
         settle_freed(&mut answer);
         Ok(Response::new(answer))
     }
@@ -1149,7 +1166,9 @@ impl Admin for Service {
         &self,
         request: Request<pb::RunCommandRequest>,
     ) -> Result<Response<CommandStream>, Status> {
+        let requested_by = requested_by(&request);
         let request = request.into_inner();
+        let detach = request.detach;
         let app = request.app.clone();
         let release = self.current_release(&app, &request.release)?;
         let command = crate::commands::CommandRequest::from_message(request)
@@ -1175,20 +1194,189 @@ impl Admin for Service {
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
 
+        // Issue 688: a detached run is started under a relay of its own
+        // and answered with its id at once.
+
+        if detach {
+            let executable = crate::daemon::running_executable().map_err(internal)?;
+            let release = prepared.release.clone();
+            let run = self
+                .handle
+                .runs
+                .start_detached(prepared, crate::runs::MANUAL, &requested_by, &executable)
+                .await
+                .map_err(Status::failed_precondition)?;
+            let started = pb::CommandOutput {
+                release,
+                run,
+                detached: true,
+                message: format!("started as run {run}"),
+                ok: true,
+                ..Default::default()
+            };
+            let stream = tokio_stream::once(Ok(started));
+            return Ok(Response::new(Box::pin(stream)));
+        }
+
         let output = self
             .handle
             .underway
             .run(
                 prepared,
-                std::sync::Arc::new(crate::commands::Recorded {
-                    events: self.handle.events.clone(),
-                    store: self.handle.store.clone(),
-                }),
+                std::sync::Arc::new(
+                    self.handle
+                        .runs
+                        .recorded(crate::runs::MANUAL, &requested_by),
+                ),
             )
             .map_err(Status::failed_precondition)?;
         let stream =
             tokio_stream::StreamExt::map(tokio_stream::wrappers::ReceiverStream::new(output), Ok);
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn list_conditions(
+        &self,
+        request: Request<pb::ListConditionsRequest>,
+    ) -> Result<Response<pb::ListConditionsResponse>, Status> {
+        let name = request.into_inner().name;
+        let conditions: Vec<pb::ConditionStatus> = self
+            .handle
+            .info
+            .conditions
+            .lock()
+            .expect("conditions poisoned")
+            .iter()
+            .filter(|status| name.is_empty() || status.name == name)
+            .map(condition_message)
+            .collect();
+
+        if !name.is_empty() && conditions.is_empty() {
+            return Err(Status::not_found(format!("no condition named {name}")));
+        }
+
+        Ok(Response::new(pb::ListConditionsResponse { conditions }))
+    }
+
+    async fn list_command_runs(
+        &self,
+        request: Request<pb::ListCommandRunsRequest>,
+    ) -> Result<Response<pb::ListCommandRunsResponse>, Status> {
+        let request = request.into_inner();
+        self.handle.store.app(&request.app).map_err(not_found)?;
+        let name = (!request.name.is_empty()).then_some(request.name.as_str());
+        let runs = self
+            .handle
+            .store
+            .runs(&request.app, name)
+            .map_err(internal)?
+            .iter()
+            .map(run_message)
+            .collect();
+
+        Ok(Response::new(pb::ListCommandRunsResponse { runs }))
+    }
+
+    async fn get_command_run(
+        &self,
+        request: Request<pb::GetCommandRunRequest>,
+    ) -> Result<Response<pb::CommandRunRecord>, Status> {
+        let run = self
+            .handle
+            .store
+            .run(request.into_inner().run)
+            .map_err(not_found)?;
+        Ok(Response::new(run_message(&run)))
+    }
+
+    type TailCommandRunStream = LogStream;
+
+    async fn tail_command_run(
+        &self,
+        request: Request<pb::TailCommandRunRequest>,
+    ) -> Result<Response<LogStream>, Status> {
+        let request = request.into_inner();
+        let run = self.handle.store.run(request.run).map_err(not_found)?;
+        let path = self.handle.runs.log_path(&run.app, &run.name, run.id);
+
+        if !path.exists() {
+            return Err(Status::not_found(crate::logs::missing(&path)));
+        }
+
+        // Followed, the lines come until the run has ended and its last
+        // line has been read.
+
+        let follow = request.follow && run.under_way();
+        let mut lines = crate::logs::tail(path, request.lines as usize, follow);
+        let (sender, receiver) = tokio::sync::mpsc::channel(256);
+        let store = std::sync::Arc::clone(&self.handle.store);
+        let (app, release) = (run.app.clone(), run.release.clone());
+
+        tokio::spawn(async move {
+            let mut ended_at: Option<tokio::time::Instant> = None;
+            let mut check = tokio::time::interval(std::time::Duration::from_millis(250));
+
+            loop {
+                tokio::select! {
+                    line = tokio_stream::StreamExt::next(&mut lines) => {
+                        let Some(line) = line else {
+                            return;
+                        };
+
+                        let message = pb::LogLine {
+                            app: app.clone(),
+                            release: release.clone(),
+                            line,
+                        };
+
+                        if sender.send(Ok(message)).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ = check.tick(), if follow => {
+                        if let Some(at) = ended_at {
+                            if at.elapsed() >= std::time::Duration::from_secs(1) {
+                                return;
+                            }
+                        } else if store.run(run.id).map(|run| !run.under_way()).unwrap_or(true) {
+                            ended_at = Some(tokio::time::Instant::now());
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        )))
+    }
+
+    async fn stop_command_run(
+        &self,
+        request: Request<pb::StopCommandRunRequest>,
+    ) -> Result<Response<pb::CommandRunRecord>, Status> {
+        let requested_by = requested_by(&request);
+        let id = request.into_inner().run;
+        let run = self.handle.store.run(id).map_err(not_found)?;
+
+        if !run.under_way() {
+            return Err(Status::failed_precondition(format!(
+                "run {id} has ended: it {}",
+                run.message
+            )));
+        }
+
+        let why = format!("{requested_by} stopped it");
+        let told = self.handle.runs.stop(id, &why) || self.handle.underway.stop_run(id, &why);
+
+        if !told {
+            return Err(Status::failed_precondition(format!(
+                "run {id} is not one this daemon is running"
+            )));
+        }
+
+        let run = self.handle.store.run(id).map_err(not_found)?;
+        Ok(Response::new(run_message(&run)))
     }
 
     async fn list_commands(
@@ -1718,6 +1906,13 @@ impl Admin for Service {
             .map(|state| (state.name.clone(), state))
             .collect();
         let now = crate::model::now_unix_ms();
+        let conditions = self
+            .handle
+            .info
+            .conditions
+            .lock()
+            .expect("conditions poisoned")
+            .clone();
         let overlays = store
             .overlays()
             .map_err(internal)?
@@ -1725,7 +1920,17 @@ impl Admin for Service {
             .map(|(name, overlay)| {
                 let state = states.get(&name);
                 let window = crate::overlays::window(&overlay, now);
+                let condition = crate::overlays::condition(&overlay)
+                    .unwrap_or_default()
+                    .to_owned();
+                let condition_state = conditions
+                    .iter()
+                    .find(|status| status.name == condition)
+                    .map(|status| status.state.as_str().to_owned())
+                    .unwrap_or_default();
                 pb::OverlayInfo {
+                    condition,
+                    condition_state,
                     active: state.is_some_and(|state| state.active),
                     state: state.map(|state| state.source.clone()).unwrap_or_default(),
                     since_unix_ms: state.map_or(0, |state| state.since_unix_ms),
@@ -1817,8 +2022,45 @@ impl Admin for Service {
             .map(|(app, _)| app)
             .collect();
         let maintenance = crate::overlays::apply_maintenance(&base, &active);
+
+        // Issue 689: the condition it follows, and that condition's terms
+        // now.
+
+        let condition = crate::overlays::condition(&overlay)
+            .unwrap_or_default()
+            .to_owned();
+        let status = self
+            .handle
+            .info
+            .conditions
+            .lock()
+            .expect("conditions poisoned")
+            .iter()
+            .find(|status| status.name == condition)
+            .cloned();
+        let condition_terms = status
+            .as_ref()
+            .map(|status| {
+                status
+                    .terms
+                    .iter()
+                    .map(|(term, value)| match value {
+                        crate::conditions::Value::Known(value) => format!("{term} is {value}"),
+                        crate::conditions::Value::Unknown(why) => {
+                            format!("{term} is unknown: {why}")
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(Response::new(pb::PreviewOverlayResponse {
             changes: crate::overlays::preview(&overlay, &routes, &maintenance),
+            condition_state: status
+                .map(|status| status.state.as_str().to_owned())
+                .unwrap_or_default(),
+            condition,
+            condition_terms,
         }))
     }
 
@@ -3631,6 +3873,18 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         .get(&(release.app.clone(), release.id.clone()))
         .copied()
         .unwrap_or(0) as u32;
+    let gates = handle
+        .store
+        .gates_passed(&release.app, &release.id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, stage, run, passed_unix_ms)| pb::GatePassed {
+            name,
+            stage,
+            run,
+            passed_unix_ms,
+        })
+        .collect();
     let server_instances = handle
         .info
         .servers
@@ -3739,6 +3993,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         environment,
         build_when: release.spec.build.when.as_str().to_owned(),
         bytecode,
+        gates,
         server_instances,
         processes: release.spec.processes,
         threads: release.spec.threads,
@@ -3832,6 +4087,86 @@ fn event_message(event: Event) -> pb::Event {
         subject: event.subject,
         level: event.level.to_owned(),
         message: event.message,
+    }
+}
+
+/// Who sent a request over the admin socket: the user its peer runs as,
+/// or `unknown` when the socket does not say.
+fn requested_by<T>(request: &Request<T>) -> String {
+    request
+        .extensions()
+        .get::<tonic::transport::server::UdsConnectInfo>()
+        .and_then(|info| info.peer_cred)
+        .map_or_else(
+            || "unknown".to_owned(),
+            |credentials| crate::processes::user_name(credentials.uid()),
+        )
+}
+
+/// A condition's state as the admin API gives it.
+fn condition_message(status: &crate::conditions::Status) -> pb::ConditionStatus {
+    pb::ConditionStatus {
+        name: status.name.clone(),
+        state: status.state.as_str().to_owned(),
+        held: status.held.as_str().to_owned(),
+        since_unix_ms: status.since_unix_ms,
+        source: status.source.to_owned(),
+        when: status.table.when.clone(),
+        r#for: status.table.for_.clone().unwrap_or_default(),
+        clear_when: status.table.clear_when.clone().unwrap_or_default(),
+        clear_for: status.table.clear_for.clone().unwrap_or_default(),
+        min_requests: status
+            .table
+            .min_requests
+            .unwrap_or(muru_config::condition::DEFAULT_MIN_REQUESTS),
+        unknown: status.unknown.clone().unwrap_or_default(),
+        terms: status
+            .terms
+            .iter()
+            .map(|(term, value)| match value {
+                crate::conditions::Value::Known(value) => pb::ConditionTerm {
+                    term: term.clone(),
+                    known: true,
+                    value: *value,
+                    unknown: String::new(),
+                },
+                crate::conditions::Value::Unknown(why) => pb::ConditionTerm {
+                    term: term.clone(),
+                    known: false,
+                    value: 0.0,
+                    unknown: why.clone(),
+                },
+            })
+            .collect(),
+    }
+}
+
+/// A run as the admin API gives it.
+fn run_message(run: &crate::model::RunRecord) -> pb::CommandRunRecord {
+    pb::CommandRunRecord {
+        run: run.id,
+        app: run.app.clone(),
+        release: run.release.clone(),
+        name: run.name.clone(),
+        trigger: run.trigger.clone(),
+        requested_by: run.requested_by.clone(),
+        detached: run.detached,
+        inputs: run.inputs.clone(),
+        started_unix_ms: run.started_unix_ms,
+        ended_unix_ms: run.ended_unix_ms,
+        under_way: run.under_way(),
+        exit_code: run.exit_code,
+        ok: run.ok,
+        message: run.message.clone(),
+        log: crate::runs::Runs::log_name(&run.app, &run.name, run.id)
+            .display()
+            .to_string(),
+        pid: if run.under_way() { run.pid } else { 0 },
+        stopping: if run.under_way() {
+            run.stopping.clone()
+        } else {
+            String::new()
+        },
     }
 }
 

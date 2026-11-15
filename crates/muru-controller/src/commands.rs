@@ -18,10 +18,8 @@ use tokio::io::{AsyncBufReadExt as _, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use crate::events::Events;
 use crate::host::Identity;
 use crate::model::{CommandRun, CommandSpec, now_unix_ms};
-use crate::store::Store;
 
 /// How long a command told to stop, at its timeout or when its caller
 /// goes away, gets before its session is killed.
@@ -38,39 +36,35 @@ const SESSION_CHECK: Duration = Duration::from_millis(50);
 const DRAIN: Duration = Duration::from_secs(1);
 
 /// Where a run of a command is recorded, beyond the stream its caller
-/// reads. The daemon keeps events and each command's last run; a
-/// development run and `muructl serve` write to their own output; a
-/// command muructl runs on its own records nothing.
+/// reads. The daemon keeps events and a record of each run, with its
+/// output in a file of its own (`crate::runs`); a development run and
+/// `muructl serve` write to their own output; a command muructl runs on
+/// its own records nothing.
 pub trait Record: Send + Sync {
+    /// Whether runs are kept here, with an exclusive command's claim
+    /// among them; otherwise the claim is this process's own.
+    fn keeps_runs(&self) -> bool {
+        false
+    }
+
+    /// The run is about to start: give it its id where runs are kept,
+    /// and refuse it while another run holds an exclusive command's
+    /// claim.
+    fn begin(&self, _prepared: &Prepared) -> Result<Option<u64>, String> {
+        Ok(None)
+    }
+
+    /// The run's process started, with this pid.
+    fn started(&self, _run: Option<u64>, _pid: u32) {}
+
     /// A line the command wrote, or the last one saying how it ended.
     fn output(&self, _label: &str, _line: &str, _stderr: bool) {}
 
     /// The run started, finished or failed.
     fn event(&self, _kind: &str, _subject: &str, _level: &'static str, _message: &str) {}
 
-    /// A declared command's run ended.
-    fn ended(&self, _app: &str, _name: &str, _run: &CommandRun) {}
-}
-
-/// The daemon's record: events in the store and on the stream, and the
-/// last run of each declared command.
-pub struct Recorded {
-    /// The event stream.
-    pub events: Events,
-    /// The store.
-    pub store: Arc<Store>,
-}
-
-impl Record for Recorded {
-    fn event(&self, kind: &str, subject: &str, level: &'static str, message: &str) {
-        self.events.emit(kind, subject, level, message);
-    }
-
-    fn ended(&self, app: &str, name: &str, run: &CommandRun) {
-        if let Err(error) = self.store.record_command_run(app, name, run) {
-            tracing::warn!(%error, "recording the run of {name} failed");
-        }
-    }
+    /// The run ended.
+    fn ended(&self, _prepared: &Prepared, _run: Option<u64>, _ended: &CommandRun) {}
 }
 
 /// No record at all: the caller's stream is everything.
@@ -190,8 +184,14 @@ pub struct Prepared {
 
 impl Prepared {
     /// The subject of its events.
-    fn subject(&self) -> String {
+    pub fn subject(&self) -> String {
         format!("{}@{}", self.app, self.release)
+    }
+
+    /// The name its runs are kept under: the declared command's, or
+    /// `exec` for a one-off command.
+    pub fn run_name(&self) -> &str {
+        self.declared.as_deref().unwrap_or("exec")
     }
 }
 
@@ -659,6 +659,25 @@ pub fn info(command: &CommandSpec, last_run: Option<&CommandRun>) -> pb::Command
             .map(|ms| muru_config::format_duration(Duration::from_millis(ms)))
             .unwrap_or_default(),
         exclusive: command.exclusive,
+        schedule: command
+            .schedule
+            .as_ref()
+            .map(crate::model::ScheduleSpec::describe)
+            .unwrap_or_default(),
+        next_run_unix_ms: command
+            .schedule
+            .as_ref()
+            .and_then(|schedule| schedule.next_after(now_unix_ms()))
+            .unwrap_or(0),
+        gates: [
+            crate::model::Gate::BeforeFork,
+            crate::model::Gate::BeforePromote,
+        ]
+        .into_iter()
+        .filter(|gate| command.gates(*gate))
+        .map(|gate| gate.as_str().to_owned())
+        .collect(),
+        every_start: command.every_start,
         last_run: last_run.map(|run| pb::CommandRun {
             release: run.release.clone(),
             started_unix_ms: run.started_unix_ms,
@@ -672,13 +691,13 @@ pub fn info(command: &CommandSpec, last_run: Option<&CommandRun>) -> pb::Command
 
 /// How a command ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Ending {
+pub(crate) struct Ending {
     /// The exit status, or 128 plus the signal that killed it.
-    code: i32,
+    pub(crate) code: i32,
     /// How it ended, as a sentence.
-    message: String,
+    pub(crate) message: String,
     /// Whether it succeeded.
-    ok: bool,
+    pub(crate) ok: bool,
 }
 
 /// A command running now, as `muructl status --processes` lists it
@@ -779,18 +798,24 @@ fn run_with_grace(
     record: Arc<dyn Record>,
     grace: Duration,
 ) -> Result<Running, String> {
-    start(prepared, record, grace).map(|(running, _)| running)
+    start(prepared, record, grace).map(|(running, _, _)| running)
 }
 
-/// `run_with_grace`, and the task that runs the command to its end.
+/// `run_with_grace`, and the task that runs the command to its end, with
+/// the run's id where runs are kept.
 fn start(
     prepared: Prepared,
     record: Arc<dyn Record>,
     grace: Duration,
-) -> Result<(Running, tokio::task::JoinHandle<()>), String> {
+) -> Result<(Running, tokio::task::JoinHandle<()>, Option<u64>), String> {
     let secrets = SecretFiles(prepared.secrets.clone());
+    let run = record.begin(&prepared)?;
+
+    // Where runs are kept, the claim is kept with them (issue 688);
+    // otherwise it is this process's own.
 
     let claim = match (&prepared.declared, prepared.exclusive) {
+        _ if record.keeps_runs() => Claim(None),
         (Some(name), true) => {
             let key = (prepared.app.clone(), name.clone());
 
@@ -814,7 +839,7 @@ fn start(
     let (stopper, requests) = mpsc::unbounded_channel();
 
     let supervised = tokio::spawn(async move {
-        supervise(prepared, record, sender, requests, grace).await;
+        supervise(prepared, record, run, sender, requests, grace).await;
         drop(claim);
         drop(secrets);
     });
@@ -823,7 +848,7 @@ fn start(
         output,
         stopper: Stopper(stopper),
     };
-    Ok((running, supervised))
+    Ok((running, supervised, run))
 }
 
 /// How long `Underway::stop_all` waits for a command whose session it has
@@ -840,8 +865,9 @@ pub struct Underway(Arc<Mutex<Runs>>);
 /// The commands under way, and whether the shutdown has begun.
 #[derive(Default)]
 struct Runs {
-    /// Each command's stopper and the task that runs it to its end.
-    runs: Vec<(Stopper, tokio::task::JoinHandle<()>)>,
+    /// Each command's stopper and the task that runs it to its end, with
+    /// its run's id where runs are kept.
+    runs: Vec<(Stopper, tokio::task::JoinHandle<()>, Option<u64>)>,
     /// The stoppers of the commands `stop_all` is stopping, for
     /// `kill_all`.
     stopping: Vec<Stopper>,
@@ -863,11 +889,30 @@ impl Underway {
             return Err("commands are not started while shutting down".to_owned());
         }
 
-        let (running, supervised) = start(prepared, record, STOP_GRACE)?;
+        let (running, supervised, run) = start(prepared, record, STOP_GRACE)?;
         runs.runs
-            .retain(|(_, supervised)| !supervised.is_finished());
-        runs.runs.push((running.stopper, supervised));
+            .retain(|(_, supervised, _)| !supervised.is_finished());
+        runs.runs.push((running.stopper, supervised, run));
         Ok(running.output)
+    }
+
+    /// Stop the run with this id, as at its timeout, because of `why`;
+    /// false when no run under way here has the id.
+    pub fn stop_run(&self, run: u64, why: &str) -> bool {
+        let underway = self.0.lock().expect("commands under way poisoned");
+
+        let found = underway
+            .runs
+            .iter()
+            .find(|(_, supervised, id)| *id == Some(run) && !supervised.is_finished());
+
+        match found {
+            Some((stopper, _, _)) => {
+                stopper.stop(why);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Stop every command under way because of `why`, such as "muructl
@@ -879,22 +924,22 @@ impl Underway {
             let mut underway = self.0.lock().expect("commands under way poisoned");
             underway.closed = true;
             let runs = std::mem::take(&mut underway.runs);
-            underway.stopping = runs.iter().map(|(stopper, _)| stopper.clone()).collect();
+            underway.stopping = runs.iter().map(|(stopper, _, _)| stopper.clone()).collect();
             runs
         };
 
-        for (stopper, _) in &runs {
+        for (stopper, _, _) in &runs {
             stopper.stop(why);
         }
 
-        for (_, supervised) in &mut runs {
+        for (_, supervised, _) in &mut runs {
             let _ = tokio::time::timeout_at(deadline, supervised).await;
         }
 
         // What is still running at the deadline is killed, and given a
         // moment to end.
 
-        for (stopper, supervised) in &runs {
+        for (stopper, supervised, _) in &runs {
             if !supervised.is_finished() {
                 stopper.kill();
             }
@@ -905,7 +950,7 @@ impl Underway {
 
         let killed_by = tokio::time::Instant::now() + KILLED_WAIT;
 
-        for (_, supervised) in &mut runs {
+        for (_, supervised, _) in &mut runs {
             if !supervised.is_finished() {
                 let _ = tokio::time::timeout_at(killed_by, supervised).await;
             }
@@ -920,7 +965,7 @@ impl Underway {
         for stopper in underway
             .runs
             .iter()
-            .map(|(stopper, _)| stopper)
+            .map(|(stopper, _, _)| stopper)
             .chain(&underway.stopping)
         {
             stopper.kill();
@@ -958,6 +1003,7 @@ fn process(prepared: &Prepared) -> Command {
 async fn supervise(
     prepared: Prepared,
     record: Arc<dyn Record>,
+    run: Option<u64>,
     sender: mpsc::Sender<pb::CommandOutput>,
     mut requests: mpsc::UnboundedReceiver<Request>,
     grace: Duration,
@@ -994,12 +1040,19 @@ async fn supervise(
                 "warning",
                 &format!("{}: {}", prepared.label, ending.message),
             );
-            let _ = sender.send(finished(&prepared, &ending)).await;
+            record.output(&prepared.label, &ending.message, false);
+            record.ended(
+                &prepared,
+                run,
+                &command_run(&prepared, started_unix_ms, Duration::ZERO, &ending),
+            );
+            let _ = sender.send(finished(&prepared, &ending, run)).await;
             return;
         }
     };
 
     let pid = child.id().unwrap_or(0);
+    record.started(run, pid);
     let _listed = Listed::new(RunningCommand {
         pid,
         app: prepared.app.clone(),
@@ -1220,21 +1273,31 @@ async fn supervise(
         &format!("{}: {}", prepared.label, ending.message),
     );
 
-    if let Some(name) = &prepared.declared {
-        let run = CommandRun {
-            release: prepared.release.clone(),
-            started_unix_ms,
-            duration_ms: took.as_millis() as u64,
-            exit_code: ending.code,
-            ok: ending.ok,
-            message: ending.message.clone(),
-        };
-
-        record.ended(&prepared.app, name, &run);
-    }
+    record.ended(
+        &prepared,
+        run,
+        &command_run(&prepared, started_unix_ms, took, &ending),
+    );
 
     if !caller_gone {
-        let _ = sender.send(finished(&prepared, &ending)).await;
+        let _ = sender.send(finished(&prepared, &ending, run)).await;
+    }
+}
+
+/// A run as it ended, for the record.
+fn command_run(
+    prepared: &Prepared,
+    started_unix_ms: u64,
+    took: Duration,
+    ending: &Ending,
+) -> CommandRun {
+    CommandRun {
+        release: prepared.release.clone(),
+        started_unix_ms,
+        duration_ms: took.as_millis() as u64,
+        exit_code: ending.code,
+        ok: ending.ok,
+        message: ending.message.clone(),
     }
 }
 
@@ -1334,7 +1397,7 @@ async fn read_lines(
 
 /// How the command ended, from its exit status and whether it was
 /// stopped, and why.
-fn ending(
+pub(crate) fn ending(
     status: std::io::Result<std::process::ExitStatus>,
     stopped: Option<String>,
     took: Duration,
@@ -1380,14 +1443,16 @@ fn ending(
     }
 }
 
-/// The last message of a command's stream.
-fn finished(prepared: &Prepared, ending: &Ending) -> pb::CommandOutput {
+/// The last message of a command's stream, with its run's id where runs
+/// are kept.
+fn finished(prepared: &Prepared, ending: &Ending, run: Option<u64>) -> pb::CommandOutput {
     pb::CommandOutput {
         release: prepared.release.clone(),
         finished: true,
         exit_code: ending.code,
         message: ending.message.clone(),
         ok: ending.ok,
+        run: run.unwrap_or(0),
         ..Default::default()
     }
 }
@@ -1541,14 +1606,18 @@ mod tests {
 
     fn recorded() -> Arc<dyn Record> {
         let store = store();
-        Arc::new(Recorded {
-            events: Events::new(store.clone()),
-            store,
-        })
+        let logs = std::env::temp_dir().join(format!("muru-runs-{}", std::process::id()));
+        let runs = crate::runs::Runs::new(
+            store.clone(),
+            crate::events::Events::new(store),
+            logs,
+            crate::runs::DEFAULT_KEEP,
+        );
+        Arc::new(runs.recorded(crate::runs::MANUAL, "you"))
     }
 
-    fn store() -> Arc<Store> {
-        Arc::new(Store::in_memory().expect("a store"))
+    fn store() -> Arc<crate::store::Store> {
+        Arc::new(crate::store::Store::in_memory().expect("a store"))
     }
 
     async fn collect(mut receiver: mpsc::Receiver<pb::CommandOutput>) -> Vec<pb::CommandOutput> {
@@ -1724,7 +1793,40 @@ mod tests {
             ],
             timeout_ms: None,
             exclusive: false,
+            schedule: None,
+            before_fork: false,
+            before_promote: false,
+            every_start: false,
         }
+    }
+
+    #[test]
+    fn a_schedule_falls_due_at_its_local_time_across_a_daylight_saving_change() {
+        let schedule = crate::model::ScheduleSpec {
+            cron: Some("30 3 * * *".to_owned()),
+            timezone: Some("Australia/Sydney".to_owned()),
+            ..Default::default()
+        };
+
+        // Daylight saving ended in Sydney at 03:00 on 5 April 2026, AEDT
+        // (UTC+11) becoming AEST (UTC+10): 03:30 on the 4th is 16:30 UTC
+        // on the 3rd, and 03:30 on the 5th, after the change, 17:30 UTC
+        // on the 4th.
+
+        let noon_on_the_3rd_utc = 1775217600000;
+        let before = schedule.next_after(noon_on_the_3rd_utc).unwrap();
+        let after = schedule.next_after(before).unwrap();
+
+        assert_eq!(before, 1775233800000, "2026-04-03T16:30:00Z");
+        assert_eq!(after, 1775323800000, "2026-04-04T17:30:00Z");
+
+        // No cron expression, as for at_boot alone, is never due.
+
+        let at_boot = crate::model::ScheduleSpec {
+            at_boot: true,
+            ..Default::default()
+        };
+        assert_eq!(at_boot.next_after(before), None);
     }
 
     #[test]
@@ -2395,11 +2497,11 @@ mod tests {
                 .push(format!("{kind} {subject}"));
         }
 
-        fn ended(&self, _app: &str, name: &str, run: &CommandRun) {
+        fn ended(&self, prepared: &Prepared, _run: Option<u64>, ended: &CommandRun) {
             self.ended
                 .lock()
                 .expect("ended")
-                .push((name.to_owned(), run.exit_code));
+                .push((prepared.run_name().to_owned(), ended.exit_code));
         }
     }
 

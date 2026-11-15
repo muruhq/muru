@@ -20,6 +20,15 @@
 //! later says how many where they were; under `block` the relay stops
 //! reading a worker whose queue is full. The relay reports its counts
 //! and stalls on `relay.sock`, a control socket of its own.
+//!
+//! In its second mode (issue 492) the relay is the parent of the one
+//! process whose output it carries, a managed server's instance: it
+//! starts the process with pipes for its standard output and error, is
+//! the only holder of their read ends, passes the stop signal on when
+//! sent SIGTERM and kills the process's group on SIGUSR2, and writes
+//! the process's pid, start time and exit status to a record of its own,
+//! for a daemon that adopts it. It exits once the process has ended and
+//! its pipes have.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Write as _;
@@ -113,6 +122,85 @@ impl Overflow {
     }
 }
 
+/// What a relay that is a process's parent starts, and how it tags and
+/// stops it.
+#[derive(Debug, Clone)]
+pub struct Exec {
+    /// The program and its arguments.
+    pub argv: Vec<String>,
+    /// The file the relay records the process in, for the daemon.
+    pub record: PathBuf,
+    /// What each line of the process's standard error starts with, after
+    /// the time: `muru.instance[0]: `.
+    pub tag: String,
+    /// What each line of its standard output starts with.
+    pub stdout_tag: String,
+    /// What the relay's own lines call the process: `instance 0`.
+    pub name: String,
+    /// The signal that SIGTERM to the relay sends the process.
+    pub stop_signal: i32,
+    /// Whether that signal goes to the process's whole group, rather than
+    /// to the process alone.
+    pub stop_group: bool,
+}
+
+/// What a relay that is a process's parent records of it: written once
+/// the process has started, or could not be, and again when it ends.
+/// Pids and start times together name processes, as the kernel's start
+/// time tells a reused pid apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProcessRecord {
+    /// The relay's pid.
+    pub relay_pid: u32,
+    /// The relay's start time, as `host::start_time` gives it.
+    #[serde(default)]
+    pub relay_start_time: u64,
+    /// The process's pid; 0 when it could not be started.
+    #[serde(default)]
+    pub pid: u32,
+    /// The process's start time.
+    #[serde(default)]
+    pub start_time: u64,
+    /// When the process started, Unix milliseconds.
+    #[serde(default)]
+    pub started_unix_ms: u64,
+    /// The wait status the process ended with, as waitpid gives it; none
+    /// while it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<i32>,
+    /// When the process ended, Unix milliseconds; 0 while it runs.
+    #[serde(default)]
+    pub ended_unix_ms: u64,
+    /// Why the process could not be started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ProcessRecord {
+    /// The record at `path`, when there is one that can be read.
+    pub fn read(path: &Path) -> Option<Self> {
+        toml::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    }
+
+    /// Write the record, whole or not at all: a reader never sees half.
+    fn write(&self, path: &Path) {
+        let partial = path.with_extension("toml.partial");
+
+        let written = toml::to_string(self)
+            .map_err(std::io::Error::other)
+            .and_then(|text| std::fs::write(&partial, text))
+            .and_then(|()| std::fs::rename(&partial, path));
+
+        if let Err(error) = written {
+            eprintln!(
+                "muru.relay[{}]: could not record the process in {}: {error}",
+                std::process::id(),
+                path.display()
+            );
+        }
+    }
+}
+
 /// What a relay is started with.
 #[derive(Debug, Clone)]
 pub struct RelayArgs {
@@ -126,12 +214,18 @@ pub struct RelayArgs {
     /// The release log to write, opened again by name on SIGUSR1; none
     /// writes to standard error.
     pub log_file: Option<PathBuf>,
+    /// A second file every line is written to as well, opened again with
+    /// the first: a command run's own output file.
+    pub also_log_file: Option<PathBuf>,
     /// Each queue's bound in bytes.
     pub queue: usize,
     /// What a full queue does.
     pub overflow: Overflow,
     /// The release, as app@release, which the process title names.
     pub release: Option<String>,
+    /// The process to start and be the parent of, in place of a host to
+    /// connect to.
+    pub exec: Option<Exec>,
 }
 
 /// Where a line came from, which is also its queue. The relay's own
@@ -143,6 +237,8 @@ enum Source {
     Relay,
     Host,
     Worker(Arc<str>),
+    /// The process a relay is the parent of, by what its lines call it.
+    Child(Arc<str>),
 }
 
 impl Source {
@@ -152,6 +248,16 @@ impl Source {
             Self::Relay => "the relay's own output".to_owned(),
             Self::Host => "the host's output".to_owned(),
             Self::Worker(index) => format!("worker {index}'s output"),
+            Self::Child(name) => format!("{name}'s output"),
+        }
+    }
+
+    /// The words an event uses for whom the relay holds back.
+    fn who(&self) -> String {
+        match self {
+            Self::Worker(index) => format!("worker {index}"),
+            Self::Child(name) => name.to_string(),
+            Self::Relay | Self::Host => "the host".to_owned(),
         }
     }
 }
@@ -324,10 +430,7 @@ impl Shared {
                 "warning",
                 format!(
                     "{} is held on its output: the log is not keeping up",
-                    match source {
-                        Source::Worker(index) => format!("worker {index}"),
-                        _ => "the host".to_owned(),
-                    }
+                    source.who()
                 ),
             );
             self.publish();
@@ -682,44 +785,75 @@ fn turn_order(state: &State) -> Vec<Source> {
 
 /// Where the writer writes.
 enum Destination {
-    /// The release log, opened again by name on SIGUSR1.
-    File { path: PathBuf, file: std::fs::File },
+    /// The release log, opened again by name on SIGUSR1, and a second
+    /// file written beside it.
+    File {
+        path: PathBuf,
+        file: std::fs::File,
+        also: Option<(PathBuf, std::fs::File)>,
+    },
     /// Standard error: muructl's pipe under `muructl run` and `serve`.
     Stderr,
 }
 
 impl Destination {
-    fn open(log_file: Option<&Path>) -> anyhow::Result<Self> {
+    fn open(log_file: Option<&Path>, also: Option<&Path>) -> anyhow::Result<Self> {
+        let opened = |path: &Path| {
+            open_log(path)
+                .map(|file| (path.to_owned(), file))
+                .with_context(|| format!("opening {}", path.display()))
+        };
+
         match log_file {
-            Some(path) => Ok(Self::File {
-                path: path.to_owned(),
-                file: open_log(path).with_context(|| format!("opening {}", path.display()))?,
-            }),
+            Some(path) => {
+                let (path, file) = opened(path)?;
+
+                Ok(Self::File {
+                    path,
+                    file,
+                    also: also.map(opened).transpose()?,
+                })
+            }
             None => Ok(Self::Stderr),
         }
     }
 
+    /// Write to the destination. What the second file cannot take is
+    /// lost there alone.
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         match self {
-            Self::File { file, .. } => file.write_all(bytes),
+            Self::File { file, also, .. } => {
+                if let Some((_, also)) = also {
+                    let _ = also.write_all(bytes);
+                }
+
+                file.write_all(bytes)
+            }
             Self::Stderr => std::io::stderr().lock().write_all(bytes),
         }
     }
 
-    /// Open the file again by name, saying so in the new file. A file
+    /// Open the files again by name, saying so in the new file. A file
     /// that cannot be opened keeps the old one, and the failure is
     /// written there.
     fn reopen(&mut self, shared: &Shared) {
-        let Self::File { path, file } = self else {
+        let Self::File { path, file, also } = self else {
             return;
         };
 
-        match open_log(path) {
-            Ok(opened) => {
-                *file = opened;
-                shared.note(&format!("reopened {}", path.display()));
+        let files =
+            std::iter::once((&*path, file)).chain(also.as_mut().map(|(path, file)| (&*path, file)));
+
+        for (path, file) in files {
+            match open_log(path) {
+                Ok(opened) => {
+                    *file = opened;
+                    shared.note(&format!("reopened {}", path.display()));
+                }
+                Err(error) => {
+                    shared.note(&format!("could not reopen {}: {error}", path.display()));
+                }
             }
-            Err(error) => shared.note(&format!("could not reopen {}: {error}", path.display())),
         }
     }
 }
@@ -796,11 +930,16 @@ pub fn run(args: RelayArgs) -> anyhow::Result<()> {
     // Section 2.1: the relay says whose output it carries.
 
     if let Some(release) = &args.release {
-        muru_common::title::set(&format!("muru relay {release}"), "muru-relay");
+        let title = match &args.exec {
+            Some(exec) => format!("muru relay {release} {}", exec.name),
+            None => format!("muru relay {release}"),
+        };
+
+        muru_common::title::set(&title, "muru-relay");
     }
 
     let shared = Arc::new(Shared::new(args.queue, args.overflow));
-    let destination = Destination::open(args.log_file.as_deref())?;
+    let destination = Destination::open(args.log_file.as_deref(), args.also_log_file.as_deref())?;
 
     let writer = {
         let shared = Arc::clone(&shared);
@@ -814,7 +953,12 @@ pub fn run(args: RelayArgs) -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("starting the relay's runtime")?;
-    let terminated = runtime.block_on(read_loop(args, Arc::clone(&shared)))?;
+
+    let terminated = match args.exec.clone() {
+        Some(exec) => runtime.block_on(exec_loop(args, exec, Arc::clone(&shared)))?,
+        None => runtime.block_on(read_loop(args, Arc::clone(&shared)))?,
+    };
+
     shared.finish();
 
     // SIGTERM gives the writer a moment; otherwise it writes everything,
@@ -876,7 +1020,15 @@ async fn read_loop(args: RelayArgs, shared: Arc<Shared>) -> anyhow::Result<bool>
     if let Some(fd) = args.host_output_fd {
         let owned = crate::fdpass::take_inherited(fd);
         reading.insert(0);
-        spawn_pipe(&mut tasks, &shared, 0, Source::Host, None, owned, &ended_tx)?;
+        spawn_pipe(
+            &mut tasks,
+            &shared,
+            0,
+            Source::Host,
+            String::new(),
+            owned,
+            &ended_tx,
+        )?;
     }
 
     let inherited = args.host_output_fd.is_some();
@@ -959,8 +1111,9 @@ async fn read_loop(args: RelayArgs, shared: Arc<Shared>) -> anyhow::Result<bool>
                     };
 
                     let stream = (offer.stream != "host").then_some(offer.stream);
+                    let tag = worker_tag(&source, stream.as_deref());
 
-                    if spawn_pipe(&mut tasks, &shared, offer.pipe, source, stream, fd, &ended_tx).is_ok() {
+                    if spawn_pipe(&mut tasks, &shared, offer.pipe, source, tag, fd, &ended_tx).is_ok() {
                         reading.insert(offer.pipe);
                     }
                 }
@@ -972,6 +1125,169 @@ async fn read_loop(args: RelayArgs, shared: Arc<Shared>) -> anyhow::Result<bool>
 
     tasks.abort_all();
     Ok(false)
+}
+
+/// Start the process and carry its output until it has ended and its
+/// pipes have, or have been given their time; true when SIGTERM ended it
+/// instead, which in this mode it never does.
+///
+/// The process is never reaped before its end is recorded, and never
+/// signalled once it has been reaped: until then its pid, which is also
+/// its group's id, is its own. SIGTERM sends it the stop signal and
+/// SIGUSR2 kills its group, every time either comes; SIGINT and SIGHUP
+/// are ignored, so the relay outlives whatever sent them to a group it
+/// was in.
+async fn exec_loop(args: RelayArgs, exec: Exec, shared: Arc<Shared>) -> anyhow::Result<bool> {
+    use std::os::unix::process::ExitStatusExt;
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut term = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+    let mut usr1 = signal(SignalKind::user_defined1()).context("installing the SIGUSR1 handler")?;
+    let mut usr2 = signal(SignalKind::user_defined2()).context("installing the SIGUSR2 handler")?;
+    let _int = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
+    let _hup = signal(SignalKind::hangup()).context("installing the SIGHUP handler")?;
+
+    serve_control(&args.control, &shared)?;
+
+    let relay_pid = std::process::id();
+    let mut record = ProcessRecord {
+        relay_pid,
+        relay_start_time: crate::host::start_time(relay_pid).unwrap_or(0),
+        ..ProcessRecord::default()
+    };
+
+    // The process runs in a session of its own, so its pid is its
+    // group's id, with the relay's environment, working directory and
+    // user, which its starter gave the relay for it.
+
+    let program = exec.argv.first().context("no program to run")?;
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(&exec.argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::host::own_session(&mut command, None);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let message = format!("starting {program}: {error}");
+            shared.note(&format!("{} could not be started: {message}", exec.name));
+            record.error = Some(message);
+            record.write(&exec.record);
+            announce(&record);
+            return Ok(false);
+        }
+    };
+
+    let pid = child.id().unwrap_or(0);
+    record.pid = pid;
+    record.start_time = crate::host::start_time(pid).unwrap_or(0);
+    record.started_unix_ms = crate::model::now_unix_ms();
+    record.write(&exec.record);
+    announce(&record);
+
+    let (ended_tx, mut ended_rx) = mpsc::unbounded_channel::<Ended>();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut reading: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let source = Source::Child(exec.name.as_str().into());
+
+    let pipes = [
+        (
+            1,
+            child.stdout.take().map(|out| out.into_owned_fd()),
+            &exec.stdout_tag,
+        ),
+        (
+            2,
+            child.stderr.take().map(|err| err.into_owned_fd()),
+            &exec.tag,
+        ),
+    ];
+
+    for (number, fd, tag) in pipes {
+        if let Some(Ok(fd)) = fd
+            && spawn_pipe(
+                &mut tasks,
+                &shared,
+                number,
+                source.clone(),
+                tag.clone(),
+                fd,
+                &ended_tx,
+            )
+            .is_ok()
+        {
+            reading.insert(number);
+        }
+    }
+
+    let mut exited_at: Option<Instant> = None;
+
+    loop {
+        // Once the process has ended, its pipes are read to their end, or
+        // for as long as a process it left behind may be given.
+
+        if let Some(exited) = exited_at
+            && (reading.is_empty() || exited.elapsed() >= DRAIN_AFTER_HOST)
+        {
+            break;
+        }
+
+        tokio::select! {
+            _ = term.recv() => {
+                if exited_at.is_none() {
+                    if exec.stop_group {
+                        crate::host::signal_group(pid, exec.stop_signal);
+                    } else {
+                        crate::host::signal_process(pid, exec.stop_signal);
+                    }
+                }
+            }
+            _ = usr2.recv() => {
+                // A group outlives its leader while anything is left in
+                // it, and its id is not given out again until it is empty.
+
+                crate::host::signal_group(pid, libc::SIGKILL);
+
+                if exited_at.is_none() {
+                    crate::host::signal_process(pid, libc::SIGKILL);
+                }
+            }
+            _ = usr1.recv() => {
+                shared.reopen.store(true, Ordering::Relaxed);
+                shared.ready.notify_all();
+            }
+            Some(ended) = ended_rx.recv() => {
+                reading.remove(&ended.pipe);
+            }
+            status = child.wait(), if exited_at.is_none() => {
+                // The end is recorded at once, so a relay killed while it
+                // writes the last lines has still said how it ended.
+
+                record.status = Some(status.map_or(0, ExitStatusExt::into_raw));
+                record.ended_unix_ms = crate::model::now_unix_ms();
+                record.write(&exec.record);
+                exited_at = Some(Instant::now());
+            }
+            () = tokio::time::sleep(Duration::from_millis(100)), if exited_at.is_some() => {}
+        }
+    }
+
+    tasks.abort_all();
+    Ok(false)
+}
+
+/// Tell whoever started the relay how the start went: the record, as a
+/// JSON line on standard output, which the starter reads and closes.
+fn announce(record: &ProcessRecord) {
+    if let Ok(mut line) = serde_json::to_string(record) {
+        line.push('\n');
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(line.as_bytes());
+        let _ = out.flush();
+    }
 }
 
 /// The connection to the host's output socket. Offers are read on a
@@ -1044,23 +1360,28 @@ async fn next_offer(connection: &mut Option<Connection>) -> Option<(Offered, Own
     }
 }
 
-/// Start reading one pipe into `source`'s queue.
+/// The tag a worker's line gets for its stream, as the host tagged it;
+/// the host's own lines carry their tags already.
+fn worker_tag(source: &Source, stream: Option<&str>) -> String {
+    match (source, stream) {
+        (Source::Worker(index), Some("stderr") | None) => format!("muru.worker[{index}]: "),
+        (Source::Worker(index), Some(stream)) => format!("muru.worker[{index}].{stream}: "),
+        _ => String::new(),
+    }
+}
+
+/// Start reading one pipe into `source`'s queue, each line tagged with
+/// `tag`.
 fn spawn_pipe(
     tasks: &mut tokio::task::JoinSet<()>,
     shared: &Arc<Shared>,
     pipe: u64,
     source: Source,
-    stream: Option<String>,
+    tag: String,
     fd: OwnedFd,
     ended: &mpsc::UnboundedSender<Ended>,
 ) -> std::io::Result<()> {
     let receiver = tokio::net::unix::pipe::Receiver::from_owned_fd(fd)?;
-
-    let tag = match (&source, stream.as_deref()) {
-        (Source::Worker(index), Some("stderr") | None) => format!("muru.worker[{index}]: "),
-        (Source::Worker(index), Some(stream)) => format!("muru.worker[{index}].{stream}: "),
-        _ => String::new(),
-    };
 
     let shared = Arc::clone(shared);
     let ended = ended.clone();
@@ -1521,9 +1842,11 @@ mod tests {
             control: dir.path().join(CONTROL_SOCKET),
             host_output_fd: None,
             log_file: Some(log.clone()),
+            also_log_file: None,
             queue: DEFAULT_QUEUE,
             overflow: Overflow::DropOldest,
             release: None,
+            exec: None,
         };
         let relay = std::thread::spawn(move || run(args));
 
@@ -1565,6 +1888,94 @@ mod tests {
         assert!(
             written.ends_with(" muru.worker[crawlers/0]: hello\n"),
             "{written}"
+        );
+    }
+
+    #[test]
+    fn a_relay_that_is_the_parent_tags_both_streams_and_records_the_exit() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("release.log");
+        let record = dir.path().join("relay-0.toml");
+
+        let args = RelayArgs {
+            connect: None,
+            control: dir.path().join("relay-0.sock"),
+            host_output_fd: None,
+            log_file: Some(log.clone()),
+            also_log_file: None,
+            queue: DEFAULT_QUEUE,
+            overflow: Overflow::DropOldest,
+            release: None,
+            exec: Some(Exec {
+                argv: ["/bin/sh", "-c", "echo out; echo err >&2; exit 3"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                record: record.clone(),
+                tag: "muru.instance[0]: ".to_owned(),
+                stdout_tag: "muru.instance[0].stdout: ".to_owned(),
+                name: "instance 0".to_owned(),
+                stop_signal: libc::SIGTERM,
+                stop_group: false,
+            }),
+        };
+        run(args).unwrap();
+
+        // Each line has the time in front and the stream's tag, and the
+        // record names the process and how it ended.
+
+        let written = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = written
+            .lines()
+            .map(|line| line.split_once(' ').unwrap().1)
+            .collect();
+        assert!(lines.contains(&"muru.instance[0].stdout: out"), "{written}");
+        assert!(lines.contains(&"muru.instance[0]: err"), "{written}");
+
+        let recorded = ProcessRecord::read(&record).unwrap();
+        assert_eq!(recorded.relay_pid, std::process::id());
+        assert_ne!(recorded.pid, 0);
+        assert!(recorded.ended_unix_ms >= recorded.started_unix_ms);
+        assert_eq!(
+            recorded
+                .status
+                .map(|status| std::process::ExitStatus::from_raw(status).code()),
+            Some(Some(3))
+        );
+    }
+
+    #[test]
+    fn a_process_that_cannot_be_started_is_recorded_with_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("relay-0.toml");
+
+        let args = RelayArgs {
+            connect: None,
+            control: dir.path().join("relay-0.sock"),
+            host_output_fd: None,
+            log_file: Some(dir.path().join("release.log")),
+            also_log_file: None,
+            queue: DEFAULT_QUEUE,
+            overflow: Overflow::DropOldest,
+            release: None,
+            exec: Some(Exec {
+                argv: vec![dir.path().join("missing").display().to_string()],
+                record: record.clone(),
+                tag: String::new(),
+                stdout_tag: String::new(),
+                name: "instance 0".to_owned(),
+                stop_signal: libc::SIGTERM,
+                stop_group: false,
+            }),
+        };
+        run(args).unwrap();
+
+        let recorded = ProcessRecord::read(&record).unwrap();
+        assert_eq!(recorded.pid, 0);
+        assert!(
+            recorded.error.as_deref().unwrap().starts_with("starting "),
+            "{recorded:?}"
         );
     }
 }

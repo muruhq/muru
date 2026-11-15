@@ -162,6 +162,16 @@ service Admin {
   // Section 9.12: the commands a release declares, with their inputs
   // and the application's last run of each.
   rpc ListCommands(ListCommandsRequest) returns (ListCommandsResponse);
+
+  // Section 9.12: the runs of an application's commands the daemon
+  // keeps, one run, a run's output, and stopping a run (issue 688).
+  rpc ListCommandRuns(ListCommandRunsRequest) returns (ListCommandRunsResponse);
+  rpc GetCommandRun(GetCommandRunRequest) returns (CommandRunRecord);
+  rpc TailCommandRun(TailCommandRunRequest) returns (stream LogLine);
+  rpc StopCommandRun(StopCommandRunRequest) returns (CommandRunRecord);
+
+  // Section 9.10: the named conditions and their states (issue 123).
+  rpc ListConditions(ListConditionsRequest) returns (ListConditionsResponse);
 }
 
 // A probe's question (section 13.9): live, ready or startup, of the
@@ -946,6 +956,15 @@ message Release {
   uint64 disk_bytes = 34;           // what its environment, bytecode and logs take; set when asked for
   uint64 disk_freed_bytes = 35;     // what removing it would give back, less than disk_bytes when files are hard-linked elsewhere
   repeated string instrumentation = 36; // its instrumentation modules, in order (section 6.15)
+  repeated GatePassed gates = 37;   // the gates it has passed, in order (section 9.12)
+}
+
+// A gate a release passed: a run of a command at a point in its life.
+message GatePassed {
+  string name = 1;                  // the command
+  string stage = 2;                 // before_fork or before_promote
+  uint64 run = 3;                   // the run that passed it
+  uint64 passed_unix_ms = 4;
 }
 
 // An instance of an http release's command.
@@ -1066,12 +1085,14 @@ message ListOverlaysResponse {
 message OverlayInfo {
   string name = 1;
   bool active = 2;
-  string state = 3;                 // schedule or manual while active; ended, skipped or promoted while held; empty when idle
+  string state = 3;                 // schedule, condition, manual or external while active; ended, cooldown, skipped or promoted while held; empty when idle
   uint64 since_unix_ms = 4;         // when the state began; 0 when idle
   uint64 until_unix_ms = 5;         // when it ends or the hold lifts; 0 for none
   string trigger = 6;               // its schedule, or "by hand"
   repeated string changes = 7;      // what it changes, as route NAME and app NAME
   uint64 starts_unix_ms = 8;        // when its schedule's window begins, if that is to come; 0 otherwise
+  string condition = 9;             // the named condition it follows, if any
+  string condition_state = 10;      // that condition's state: firing, resolved or unknown
 }
 
 message ControlOverlayRequest {
@@ -1090,6 +1111,9 @@ message PreviewOverlayRequest {
 
 message PreviewOverlayResponse {
   repeated string changes = 1;      // what activating it now would change, one line per field
+  string condition = 2;             // the named condition it follows, if any
+  string condition_state = 3;       // that condition's state: firing, resolved or unknown
+  repeated string condition_terms = 4; // each term of the condition with its figure now, or why it is unknown
 }
 
 message UpgradeDaemonRequest {}
@@ -1257,6 +1281,7 @@ message RunCommandRequest {
   string name = 4;                  // or a command the release declares
   map<string, string> inputs = 5;   // the declared command's inputs, by name
   map<string, string> secret_inputs = 6;  // inputs taken from a secret store, as STORE/KEY
+  bool detach = 7;                  // start the run and answer with its id at once; it outlives the caller
 }
 
 message ListCommandsRequest {
@@ -1280,6 +1305,10 @@ message CommandInfo {
   string timeout = 6;               // empty: no limit
   bool exclusive = 7;               // one run at a time for the application
   CommandRun last_run = 8;          // the application's last run of it, if any
+  string schedule = 9;              // when the daemon runs it by itself, in words; empty for none
+  uint64 next_run_unix_ms = 10;     // when its cron schedule is next due; 0 for none
+  repeated string gates = 11;       // before_fork and before_promote, where it is a gate
+  bool every_start = 12;            // a before_fork gate run at every start of the host
 }
 
 message CommandInputInfo {
@@ -1310,6 +1339,83 @@ message CommandOutput {
   int32 exit_code = 5;              // on the last message: its exit status, 128 + the signal when killed
   string message = 6;               // on the last message: how it ended, as a sentence
   bool ok = 7;                      // on the last message: it exited with 0 and was not stopped
+  uint64 run = 8;                   // the run's id, where runs are kept: on the first message and the last
+  bool detached = 9;                // the run was started detached; this message, with its id, is the only one
+}
+
+message ListConditionsRequest {
+  string name = 1;                  // empty: every condition
+}
+
+message ListConditionsResponse {
+  repeated ConditionStatus conditions = 1;
+}
+
+// A named condition and its state as of the daemon's last evaluation.
+message ConditionStatus {
+  string name = 1;
+  string state = 2;                 // firing, resolved or unknown
+  string held = 3;                  // while unknown, the state it holds
+  uint64 since_unix_ms = 4;         // when it took the state it holds; 0 before its first figure
+  string source = 5;                // file, the daemon's own, or applied
+  string when = 6;
+  string for = 7;
+  string clear_when = 8;
+  string clear_for = 9;
+  uint64 min_requests = 10;
+  string unknown = 11;              // why it is unknown, when it is
+  repeated ConditionTerm terms = 12; // each term of when, then of clear_when
+}
+
+message ConditionTerm {
+  string term = 1;
+  bool known = 2;
+  double value = 3;                 // its figure, in base units, when known
+  string unknown = 4;               // why it has none, when not
+}
+
+message ListCommandRunsRequest {
+  string app = 1;
+  string name = 2;                  // empty: every command's runs
+}
+
+message ListCommandRunsResponse {
+  repeated CommandRunRecord runs = 1;  // those under way first, then the newest first
+}
+
+message GetCommandRunRequest {
+  uint64 run = 1;
+}
+
+message TailCommandRunRequest {
+  uint64 run = 1;
+  uint32 lines = 2;                 // how many recent lines first; 0 for none
+  bool follow = 3;                  // keep sending lines until the run has ended
+}
+
+message StopCommandRunRequest {
+  uint64 run = 1;
+}
+
+// A run of a command, as the daemon keeps it: under way, or how it ended.
+message CommandRunRecord {
+  uint64 run = 1;
+  string app = 2;
+  string release = 3;
+  string name = 4;                  // the declared command, or exec for a one-off one
+  string trigger = 5;               // manual, schedule, gate:before_fork or gate:before_promote
+  string requested_by = 6;          // who asked: a user, or the daemon for a trigger of its own
+  bool detached = 7;                // started detached, outliving its caller
+  string inputs = 8;                // as its events show them, a secret's value as ***
+  uint64 started_unix_ms = 9;
+  uint64 ended_unix_ms = 10;        // 0 while under way
+  bool under_way = 11;
+  int32 exit_code = 12;             // once ended: its exit status, 128 + the signal when killed
+  bool ok = 13;                     // once ended: it exited with 0 and was not stopped
+  string message = 14;              // once ended: how, as a sentence
+  string log = 15;                  // its output's file, relative to the log directory
+  uint32 pid = 16;                  // its process, while under way; 0 when not known
+  string stopping = 17;             // why it is being stopped, while that is under way
 }
 
 message ReopenLogsRequest {
@@ -1327,13 +1433,14 @@ message LogArchive {
   string name = 1;                  // its path relative to the log directory
   uint64 size = 2;                  // in bytes
   uint64 modified_unix_ms = 3;      // when it was last changed
+  bool orphaned = 4;                // for a run's file: the daemon no longer keeps its run
 }
 
 message LogInfo {
   string name = 1;                  // its path relative to the log directory
-  string kind = 2;                  // access, edge, daemon, host or release
-  string app = 3;                   // the application of a release's log
-  string release = 4;               // the release of a release's log
+  string kind = 2;                  // access, edge, daemon, host, release, or commands for a command's runs' files
+  string app = 3;                   // the application of a release's log or a command's runs
+  string release = 4;               // the release of a release's log; the command, for a command's runs
   repeated string hosts = 5;        // the virtual hosts that name this file
   uint64 size = 6;                  // in bytes, 0 when the file is gone
   bool present = 7;                 // the file itself exists, not only archives of it

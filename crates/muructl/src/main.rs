@@ -188,6 +188,13 @@ enum Command {
         command: admin::OverlayCommand,
     },
 
+    /// Named conditions over Muru's own signals: each one's state, or
+    /// one's terms and their figures now.
+    Condition {
+        #[command(subcommand)]
+        command: admin::ConditionCommand,
+    },
+
     /// Serve an application's maintenance page at the edge, or serve it
     /// as usual again.
     Maintenance {
@@ -340,6 +347,10 @@ struct RelayRunArgs {
     #[arg(long, value_name = "PATH")]
     log_file: Option<PathBuf>,
 
+    /// A second file every line is written to as well, reopened with the first.
+    #[arg(long, value_name = "PATH", requires = "log_file")]
+    also_log_file: Option<PathBuf>,
+
     /// Each worker's queue, in bytes.
     #[arg(long, value_name = "BYTES", default_value_t = muru_controller::relay::DEFAULT_QUEUE)]
     queue: usize,
@@ -351,6 +362,34 @@ struct RelayRunArgs {
     /// The release, as app@release, for the process title.
     #[arg(long, value_name = "APP@RELEASE")]
     release: Option<String>,
+
+    /// Where to record the process the relay starts, in place of connecting to a host.
+    #[arg(long, value_name = "PATH", requires = "program")]
+    record: Option<PathBuf>,
+
+    /// What each line of the process's standard error starts with.
+    #[arg(long, value_name = "TEXT", default_value = "")]
+    tag: String,
+
+    /// What each line of the process's standard output starts with.
+    #[arg(long, value_name = "TEXT", default_value = "")]
+    stdout_tag: String,
+
+    /// What the relay's own lines call the process.
+    #[arg(long, value_name = "WORDS", default_value = "the process")]
+    name: String,
+
+    /// The signal SIGTERM to the relay sends the process, by number.
+    #[arg(long, value_name = "NUMBER", default_value_t = libc::SIGTERM)]
+    stop_signal: i32,
+
+    /// Send the stop signal to the process's whole group.
+    #[arg(long)]
+    stop_group: bool,
+
+    /// The program for the relay to start and carry the output of, and its arguments.
+    #[arg(last = true, value_name = "PROGRAM")]
+    program: Vec<String>,
 }
 
 /// What `serve-static` takes.
@@ -1042,9 +1081,19 @@ fn main() -> anyhow::Result<()> {
                 control: args.control,
                 host_output_fd: args.host_output_fd,
                 log_file: args.log_file,
+                also_log_file: args.also_log_file,
                 queue: args.queue,
                 overflow: args.on_overflow,
                 release: args.release,
+                exec: args.record.map(|record| muru_controller::relay::Exec {
+                    argv: args.program,
+                    record,
+                    tag: args.tag,
+                    stdout_tag: args.stdout_tag,
+                    name: args.name,
+                    stop_signal: args.stop_signal,
+                    stop_group: args.stop_group,
+                }),
             });
         }
         other => other,
@@ -1170,6 +1219,7 @@ fn main() -> anyhow::Result<()> {
         Command::Maintenance { command } => runtime.block_on(admin::maintenance(command)),
         Command::Dashboard { command } => runtime.block_on(admin::dashboard(command)),
         Command::Overlay { command } => runtime.block_on(admin::overlay(command)),
+        Command::Condition { command } => runtime.block_on(admin::condition(command)),
         Command::Status {
             socket,
             processes,
@@ -1232,6 +1282,18 @@ fn main() -> anyhow::Result<()> {
         Command::Commands {
             command: admin::CommandCommand::Run(args),
         } => exit_with(runtime, admin::command_run(*args)),
+        Command::Commands {
+            command: admin::CommandCommand::Runs(args),
+        } => runtime.block_on(admin::command_runs(*args)),
+        Command::Commands {
+            command: admin::CommandCommand::Status(args),
+        } => runtime.block_on(admin::command_status(*args)),
+        Command::Commands {
+            command: admin::CommandCommand::Logs(args),
+        } => runtime.block_on(admin::command_logs(*args)),
+        Command::Commands {
+            command: admin::CommandCommand::Stop(args),
+        } => runtime.block_on(admin::command_stop(*args)),
         Command::Edge {
             command: edge::EdgeCommand::Run(args),
         } => runtime.block_on(edge::run(*args)),
@@ -3425,6 +3487,7 @@ async fn run_with(
         chdir: Some(resolved.project.clone()),
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
         single: args.single,
+        hold_before_fork: false,
         detach_to: None,
         relay: muru_controller::host::RelaySettings::default(),
         groups,
@@ -3733,6 +3796,32 @@ async fn run_with(
             entry.prefix.trim_end_matches('/'),
             entry.route.directory.display()
         );
+    }
+
+    // Section 9.12 (issue 268): schedules are the daemon's; a run says
+    // what is scheduled and runs none of it.
+
+    if serve.is_none() {
+        let commands = project_commands::declared(&resolved.project, args.settings_file.as_deref())
+            .unwrap_or_default();
+
+        for command in commands {
+            let Some(schedule) = &command.schedule else {
+                continue;
+            };
+
+            let next = schedule
+                .next_after(admin::now_unix_ms())
+                .map(|at| format!(", next due {}", admin::format_time(at)))
+                .unwrap_or_default();
+            muru_common::muru_println!(
+                "command {} is scheduled ({}{next}); muructl run runs no schedules: \
+                 muructl command run {} runs it now",
+                command.name,
+                schedule.describe(),
+                command.name
+            );
+        }
     }
 
     if serve.is_some() {

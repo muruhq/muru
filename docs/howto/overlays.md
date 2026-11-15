@@ -128,6 +128,73 @@ any are declared the daemon checks every ten minutes that the clock is
 synchronised, and raises a `clock.unsynchronised` warning when it is not
 (and `clock.synchronised` once it is again).
 
+## By a condition
+
+`trigger.condition` names a [condition](conditions.md), and the overlay
+follows it: active while the condition is firing, and ended once it has
+resolved.
+
+```toml
+[overlay.db-outage]
+routes.shop-root = { target = { static = '/srv/shop/snapshot' }, mode = 'degraded' }
+trigger = { condition = 'shop-errors' }
+latch = true
+
+[overlay.crawler-snapshot]
+routes.shop-root.client_routes.ai-crawler = { target = { static = '/srv/shop/snapshot' } }
+trigger = { condition = 'crawler-surge' }
+```
+
+The overlay follows the condition's state, not its events. While the
+condition is `unknown` the overlay is held as it is, active or not. After
+the daemon starts again the overlay is worked out again from the
+condition, and an active one stays active until the condition has a
+figure that says otherwise. An overlay names one condition, and has no
+schedule beside it; combine signals in the condition's expression. It may
+also take `trigger.external = true`, for the webhook.
+
+Three settings on the overlay keep it from flapping:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `min_active` | `5m` | The least the overlay stays active, however soon its condition resolves |
+| `cooldown` | `10m` | How long after it ends its condition cannot activate it again; `0s` for none |
+| `max_per_hour` | `4` | The most activations by its condition in an hour |
+
+An activation the cooldown or the cap holds back is an `overlay.skipped`
+event saying which, once while the condition keeps firing. So is one its
+[preconditions](#preconditions) hold back, which is tried again each
+second while the condition fires. With `latch = true` the overlay stays
+active after its condition resolves, until a person ends it, which suits
+an overlay that answers errors. An overlay activated by hand or by the
+webhook is ended by hand or by the webhook, whatever its condition does.
+Ending by hand an overlay its condition activated holds it through its
+cooldown.
+
+The activation and the end are `overlay.activated` and `overlay.ended`
+events, naming the condition, with each of its terms' figures. `muructl
+overlay list` shows the condition's state beside the trigger, and
+`muructl overlay preview NAME` the condition's terms and their figures
+now:
+
+```console
+$ muructl overlay preview db-outage
+condition shop-errors is firing
+  error_rate{app='shop',reason='app_error'} > 0.2 is 0.31
+  error_rate{app='shop',reason='app_error'} < 0.02 is 0.31
+route shop-root: mode (none) -> degraded
+route shop-root: target app shop -> static /srv/shop/snapshot
+```
+
+An overlay can take away the traffic its own condition reads: a static
+snapshot in place of the application whose error rate fired it leaves
+that application with no requests, its error rate unknown, and the
+overlay can never end by it. `muructl apply` warns about such an overlay.
+Resolve its condition on another signal, such as `upstream_healthy` for a
+database's health check upstream, or set `latch = true` and end the
+overlay by hand once `muructl overlay preview` shows the application
+healthy again.
+
 ## The webhook
 
 Monitoring and alerting systems can activate and end overlays that
@@ -203,6 +270,14 @@ the release when the overlay changes routes of one application. When it
 does not hold, an activation by hand is refused, and a scheduled one is
 skipped for the rest of its window with the event `overlay.skipped`, so a
 timed switch never moves traffic to something broken.
+
+`preconditions.probe` is a path that release must answer with a 2xx or
+3xx response as well, asked through the edge as a preview of the release,
+at the host of the first route the overlay changes:
+
+```toml
+preconditions = { release_ready = 'r43', probe = '/healthz' }
+```
 
 ## Previewing and promoting
 

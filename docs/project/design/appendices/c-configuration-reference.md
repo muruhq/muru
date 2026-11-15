@@ -102,7 +102,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | wsgi_multiprocess, wsgi_multithread | release | auto | 6.5 |
 | logging.python level, format, request_id, capture_warnings, loggers, warnings | global (the daemon's `[logging.python]`, read when a host starts), application, release, merged key by key with `loggers` by name and `warnings` added, the more specific layer's last | WARNING (Python default), standard, false, false, none, none | 11.4 |
 | rotate (size, every, keep, compress, naming), reopen_on_rename | log sinks | daily, 14, zstd, built-in; reopen_on_rename true (checked every 5 s and at start, under the daemon) | 11.3 |
-| on_overflow, output_queue | `[logs]` | drop_oldest, 1MB | 11.3 |
+| on_overflow, output_queue (every release's log relay, a managed server instance's too) | `[logs]` | drop_oldest, 1MB | 11.3 |
 | readiness, liveness (path, timeout, expect, required, interval, failures), checks | mount, release | none (built-in signals only) | 9.11 |
 | compression (enabled, encodings, min_size, types, level) | global, host, route | enabled, br zstd gzip, 1KB, text and JSON types, default | 4.17 |
 | decompress_requests | route | false | 4.17 |

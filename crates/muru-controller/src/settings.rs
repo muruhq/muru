@@ -83,6 +83,9 @@ pub struct NodeSettings {
     /// Section 8.7: the variables of the daemon's own environment passed
     /// to a release's processes beside the base, by name or `PREFIX*`.
     pub pass_env: Vec<String>,
+    /// `[daemon] keep_command_runs`: how many ended runs of each command
+    /// are kept (issue 688).
+    pub keep_command_runs: usize,
     /// The node's budget (section 7.4).
     pub budget: crate::budget::Budget,
     /// The `[tools]` table (section 8.4): uv and interpreter installs.
@@ -99,6 +102,9 @@ pub struct NodeSettings {
     /// The file's client classes and rate limits (sections 4.14 and
     /// 4.15), with the directory their list files are relative to.
     pub client_rules: crate::clients::FileRules,
+    /// Section 9.10 (issue 123): the named conditions the daemon's own
+    /// file declares, checked.
+    pub conditions: std::collections::BTreeMap<String, muru_config::Condition>,
 }
 
 impl NodeSettings {
@@ -206,6 +212,7 @@ impl NodeSettings {
                 .or_else(|| daemon.and_then(|table| table.user.clone())),
             debug_exec: daemon.and_then(|table| table.debug_exec).unwrap_or(false),
             pass_env: pass_env_from(daemon)?,
+            keep_command_runs: keep_command_runs_from(daemon)?,
             budget,
             tools: document.tools.clone().unwrap_or_default(),
             proxy,
@@ -217,6 +224,7 @@ impl NodeSettings {
                 limits: document.rate_limit.clone(),
                 directory: config_directory(path),
             },
+            conditions: checked_conditions(&document.condition)?,
         })
     }
 }
@@ -532,6 +540,28 @@ fn access_log_from(document: &muru_config::Document) -> Result<muru_edge::access
 
     filter.exclude = logs.access_log_exclude.clone();
     Ok(filter)
+}
+
+/// The daemon's own file's conditions, each of which must read.
+fn checked_conditions(
+    conditions: &std::collections::BTreeMap<String, muru_config::Condition>,
+) -> Result<std::collections::BTreeMap<String, muru_config::Condition>, String> {
+    for (name, condition) in conditions {
+        for warning in muru_config::condition::check(name, condition)? {
+            tracing::warn!("{warning}");
+        }
+    }
+
+    Ok(conditions.clone())
+}
+
+/// `[daemon] keep_command_runs`, at least 1.
+fn keep_command_runs_from(daemon: Option<&muru_config::Daemon>) -> Result<usize, String> {
+    match daemon.and_then(|table| table.keep_command_runs) {
+        None => Ok(crate::runs::DEFAULT_KEEP),
+        Some(0) => Err("[daemon] keep_command_runs must be at least 1".to_owned()),
+        Some(keep) => Ok(keep as usize),
+    }
 }
 
 /// The `[daemon] pass_env` entries: variable names, each optionally

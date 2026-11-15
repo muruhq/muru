@@ -15,6 +15,9 @@ ones it names.
 | `list` | reads | `muructl app list`, `release list`, `host list`, `route list`, `upstream list`, `rollout status` or `overlay list` | `what` (apps, releases, hosts, routes, upstreams, rollouts, overlays), `app` |
 | `release` | reads | `muructl release show` | `release` (app@release) |
 | `commands` | reads | `muructl command list` | `target` |
+| `conditions` | reads | `muructl condition list`, or with `name` `muructl condition show` | `name` |
+| `command_runs` | reads | `muructl command runs` | `app`, `name` |
+| `command_run` | reads | `muructl command status`, or with `output` `muructl command logs --lines`, as an array of lines | `run`, `output` (how many of the last lines) |
 | `events` | reads | `muructl events` | `after` (a sequence number) |
 | `logs` | reads | `muructl logs`, the lines returned as an array | `target`, `lines` (default 100, at most 1000), `access` |
 | `cache` | reads | `muructl cache list` | none |
@@ -34,7 +37,8 @@ ones it names.
 | `drain` | changes | `muructl drain` | `release` |
 | `rollout` | changes | `muructl rollout canary`, `pause`, `resume`, `promote` or `abort` | `action`, `release` (canary), `app` (the others), `steps`, `hold` |
 | `scale` | changes | `muructl scale` | `target`, `group`, `processes`, `unpin` |
-| `run_command` | changes | `muructl command run`, the output returned as an array of lines (the last 500) with `exit_code`, `ok` and `message`, as a tool error unless `ok`: the command exited with 0 and was not stopped | `target`, `name`, `inputs` (an object), `secret_inputs` (an object of STORE/KEY references) |
+| `run_command` | changes | `muructl command run`, the output returned as an array of lines (the last 500) with `exit_code`, `ok` and `message`, as a tool error unless `ok`: the command exited with 0 and was not stopped; with `detach`, `muructl command run --detach`, answering with the `run` id at once | `target`, `name`, `inputs` (an object), `secret_inputs` (an object of STORE/KEY references), `detach` |
+| `stop_command_run` | changes | `muructl command stop` | `run` |
 | `restart` | changes | `muructl restart` | `target`, `worker`, `all`, `force` |
 | `overlay` | changes | `muructl overlay activate`, `end` or `promote` | `action`, `name`, `for` |
 | `maintenance` | changes | `muructl maintenance on` or `off` | `app` or `host`, `on` |

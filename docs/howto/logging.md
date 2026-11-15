@@ -84,6 +84,24 @@ an `output.relay_restarting` warning event, and takes over the same
 output. A worker writes on until its pipe is full, then waits for the
 new relay. Nothing else is affected.
 
+### Managed HTTP servers
+
+Each instance of a [managed HTTP server](managed-servers.md) has a log
+relay of its own, which starts the instance and reads its standard
+output and standard error. Its lines are tagged with the instance's
+number, its `MURU_INSTANCE`, and the stream:
+
+```
+2026-11-02T05:42:22.840Z muru.instance[0]: [INFO] Booting worker with pid: 48230
+2026-11-02T05:42:23.102Z muru.instance[1].stdout: request served
+```
+
+These relays queue, cut and drop lines as a release's relay does, under
+the same `[logs]` settings, with the same events and the same
+`muru_app_output_dropped_total`. A relay that exits takes its instance
+with it: the instance is stopped and started again, with a new relay,
+as an instance that exits is.
+
 ## Python logging
 
 Before the application is imported, the host sets the root logger's level
@@ -364,10 +382,6 @@ is when Muru received it, so the access line of a slow request can carry
 an earlier time than lines written before it. An application that puts
 `%(asctime)s` in its own logging format gets two times in a file.
 
-The lines of a [managed HTTP server](managed-servers.md) get no time from
-Muru, in a file or anywhere else: they are written as the server writes
-them.
-
 ## Under the daemon
 
 The daemon writes everything to its log directory (`~/.local/state/muru/logs`
@@ -376,19 +390,15 @@ or `--log-dir`):
 
 | File | Holds |
 | --- | --- |
-| `apps/APP/RELEASE.log` | the release's host output and its workers' lines, tagged as above, or the output of the instances of a [managed HTTP server](managed-servers.md) |
+| `apps/APP/RELEASE.log` | the release's host output and its workers' lines, or the output of the instances of a [managed HTTP server](managed-servers.md), tagged as above |
 | `access.log` | the access log as JSON lines |
 | `edge.log` | the edge process's own output |
 | `daemon.log` | the daemon's output when started with `muructl daemon start` |
 
-Every line in these files starts with the full UTC time, except the
-lines of a managed HTTP server. A panic in the daemon or the edge is
-written as `muru: panic:` lines with the time in front too, one for
-each frame of its backtrace when `RUST_BACKTRACE` is set. Its instances write to the release's file
-themselves, so each line is in the file as the server wrote it: with no
-time in front, unless the server writes one of its own, and no tag naming
-the instance. The lines of a release's instances are interleaved in the
-one file, with nothing to tell which instance wrote a line.
+Every line in these files starts with the full UTC time. A panic in
+the daemon or the edge is written as `muru: panic:` lines with the time
+in front too, one for each frame of its backtrace when `RUST_BACKTRACE`
+is set.
 
 `muructl logs APP` shows the last hundred lines of the application's
 current release, `muructl logs APP@RELEASE` a particular release's, and
@@ -404,8 +414,7 @@ $ muructl logs --access --lines 1
 2026-11-02T05:42:23.101Z 200 GET /catalogue 118B 1.2ms release=shop@r1 host=127.0.0.1 queue=0.1ms app=0.9ms worker=1 id=01M5P6WZBK740HFT2N80MAV4YV
 ```
 
-`--no-timestamps` leaves the times off; a managed HTTP server's lines
-have none to leave off and are shown as they are. The same command against a
+`--no-timestamps` leaves the times off. The same command against a
 development run shows the run's lines with their times as well, and
 there the application can be left out, as `muructl logs` alone, since a
 run serves one; the daemon needs it named unless `--access`, `--edge` or
@@ -639,6 +648,8 @@ follows the same rule: once a file is renamed away, its writer opens it
 again by name, so lines go to a new file and the renamed one is
 complete. The edge reopens the access log, the files virtual hosts name
 and its own `edge.log`, each release's log relay its release's file,
+each [detached command run](commands.md#running-a-long-command-detached)'s
+relay its release's file and its own output file,
 and a background daemon its own log. Lines written between the rename
 and the reopen
 land in the renamed file, and none are lost.
@@ -670,7 +681,7 @@ seconds after the rename, and without it logrotate compresses the
 renamed file at once and deletes it, so the lines written in those
 seconds are lost. A `postrotate` that runs `muructl logs reopen` makes
 the reopen immediate, and then `delaycompress` can go: the command
-returns once the edge and every release's log relay have opened their
+returns once the edge and every release's and detached run's log relay have opened their
 files again, so the renamed files are complete when logrotate
 compresses them. A writer that has not answered within five seconds no
 longer holds the command up.
@@ -701,13 +712,6 @@ to its `muructl` process, opens that file again by name, and the run
 does not notice a rename by itself. SIGUSR1 to a worker runs its
 `on_reopen_logs` hook.
 
-The instances of a [managed HTTP server](managed-servers.md) write to
-their release's file themselves and cannot be told to reopen it, so the
-built-in rotation copies that file to its archive and truncates it in
-place, and lines written while it is copied are lost. With `rotate =
-'external'`, those files are the one exception: give them a logrotate
-entry of their own with `copytruncate`.
-
 ## Reclaiming disk space
 
 `muructl logs` has subcommands that show and reclaim the space logs take.
@@ -737,15 +741,24 @@ longer exists. `--json` prints the same for scripts:
 $ muructl logs list
 LOG                                           SIZE           ARCHIVES     TOTAL
 access.log                                  5.2GB          3 (61.0MB)     5.3GB
+apps/shop/commands/backup/                      -     20 runs (1.2GB)     1.2GB
 apps/shop/r3.log                           12.0MB                   -    12.0MB
 apps/shop/r1.log                          570.0MB           1 (9.0MB)   579.0MB  orphaned
 edge.log                                    4.0KB                   -     4.0KB
-total 5.9GB, in /var/log/muru
+total 7.1GB, in /var/log/muru
 ```
 
+The output of each [command run](commands.md#what-is-recorded) is a file
+of its own, and a command's files are listed together on one line, by
+the command's directory, with how many runs they are and what they take.
+They are the run's records: the daemon keeps the last
+`keep_command_runs` runs of each command with their files, so `muructl
+logs truncate` and `muructl logs rotate` leave them alone.
+
 `--archives` lists each archive on a line of its own under its log,
-oldest first, with its size and when it was last written, in UTC. A log
-whose file is gone and only has archives shows `-` for its size and time:
+oldest first, with its size and when it was last written, in UTC, and
+each run's file under its command, the oldest run first. A log whose
+file is gone and only has archives shows `-` for its size and time:
 
 ```console
 $ muructl logs list --archives
@@ -763,8 +776,8 @@ total 5.9GB, in /var/log/muru
 
 An application, `APP@RELEASE`, `--access` or `--host HOST` narrows the
 list to those logs, with the total of those alone: an application
-lists the logs of all its releases, and `--host HOST` the file the host
-names for its records. A target with no log is refused. The same
+lists the logs of all its releases and its commands' runs' files, and
+`--host HOST` the file the host names for its records. A target with no log is refused. The same
 targets narrow the `--json` output.
 
 ```console
@@ -799,11 +812,9 @@ and without a terminal the command refuses unless given `--yes`.
   added afterwards. No lines are lost, and those few lines can land
   slightly out of order.
 
-The instances of a managed HTTP server cannot be told to reopen a file,
-so their release's log is cut in place: the kept part is written aside,
-the file truncated and the kept part put back, and lines written while
-it is copied are lost. The same applies to every log when no daemon is
-running.
+When no daemon is running, a log is cut in place: the kept part is
+written aside, the file truncated and the kept part put back, and lines
+written while it is copied are lost.
 
 `muructl logs rotate` rotates now, with the compression and `keep` of the
 policy in force, for when there is disk to spare and the history is
@@ -815,9 +826,8 @@ those flagged `orphaned`. A log with no content is left alone. It writes a
 With `rotate = 'external'`, `muructl logs rotate` refuses, since something
 else owns the rotation of those files.
 
-As with truncating, the log of a managed HTTP server's instances is
-rotated in place, and so is every log when no daemon is running: lines
-written while the file is copied are lost.
+As with truncating, every log is rotated in place when no daemon is
+running: lines written while the file is copied are lost.
 
 `muructl logs prune` removes archives, by `--keep N` (the newest N of each
 log) or `--older-than DURATION`, and with `--orphaned` the logs and
@@ -837,3 +847,9 @@ Remove 3 files, freeing 640.0MB? [y/N]
 `--orphaned` needs the state store, which `--state-dir` names when no
 daemon is running. A release or virtual host that still exists keeps
 its log.
+
+A command's runs' files are left alone by `--keep` and `--older-than`,
+since the daemon keeps its runs by `keep_command_runs`. `--orphaned`
+removes those of an application that no longer exists, and any run's
+file the daemon no longer keeps a record of, which `--archives` marks
+`orphaned`; a command's directory goes with its last file.

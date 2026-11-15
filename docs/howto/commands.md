@@ -52,6 +52,10 @@ inputs.target = { default = "s3://backups/shop" }
 | `inputs.NAME` | An input the command takes (see below) |
 | `timeout` | How long it may run before it is stopped, such as `10m`; no limit when absent |
 | `exclusive` | `true` to run one at a time for the application: a run asked for while one is under way is refused |
+| `schedule` | When the daemon runs the command by itself: see [schedules](#schedules) |
+| `before_fork` | `true` makes the command a gate the release's start runs once its host has preloaded and before its workers fork: see [gates](migrations.md#gates) |
+| `before_promote` | `true` makes the command a gate run just before a rollout or blue/green promotion moves all traffic to the release |
+| `every_start` | `true` runs a `before_fork` gate at every start of the release's host, not only until it has passed once |
 
 `{name}` in an argument of `run`, or in a value of `env`, is replaced by
 the input's value; `{{` and `}}` are literal braces. A command's name is
@@ -195,9 +199,8 @@ through the daemon, `muructl run` or `muructl serve` when that shuts down,
 inside its shutdown budget when it has one. A second Ctrl-C or SIGTERM to
 a `muructl run` in development, while it waits for them, kills those
 commands at once. Something it started that has left its session, as a
-daemon does, is not stopped. Run a long command where the session will
-last, under `nohup`, `tmux` or a CI job, so a dropped connection does not
-stop it halfway.
+daemon does, is not stopped. A long command that should not depend on the
+session is run [detached](#running-a-long-command-detached).
 
 When `muructl` runs the command itself, because nothing serves the
 project, Ctrl-C, SIGTERM or the SIGHUP of its terminal closing stops the
@@ -216,6 +219,120 @@ A second Ctrl-C, SIGTERM or SIGHUP kills the command, and anything it
 started, at once. Output that `muructl` can no longer write, as when it
 is piped to `head`, stops the command the same way: `muructl` waits for
 it to end and exits with 1, saying why.
+
+## Running a long command detached
+
+`--detach` starts a run under the daemon and returns at once, printing
+the run's id:
+
+```console
+$ muructl command run shop backup --detach
+muru: started run 42; muructl command logs 42 --follow follows it
+$ muructl exec shop --detach -- python manage.py rebuild_index
+muru: started run 43; muructl command logs 43 --follow follows it
+```
+
+A detached run does not depend on the session that started it: closing
+the terminal or dropping the SSH connection leaves it running. It also
+outlives the daemon when the daemon stops without `--shutdown` or
+upgrades itself, as the hosts do, and the next daemon takes it over. A
+shutdown, `muructl daemon stop --shutdown`, stops it with the rest,
+inside the shutdown's budget. Its `timeout` applies as to any run.
+
+Follow a run's output with `muructl command logs`, which reads the run's
+own file and with `--follow` keeps printing until the run ends:
+
+```console
+$ muructl command logs 42 --follow
+2026-11-02T10:02:13.511Z [command backup] backing up 12,000 orders to s3://backups/shop
+2026-11-02T10:14:40.902Z [command backup] done
+2026-11-02T10:14:40.913Z [command backup] exited with status 0 after 12m27s
+```
+
+`--lines N` changes how many lines come first and `--no-timestamps`
+leaves the times off. `muructl command stop 42` stops a run under way as
+its timeout would: SIGTERM, then SIGKILL ten seconds later. It stops a
+run whose caller is waiting for it as well.
+
+`muructl command runs shop` lists the runs of the application's commands
+that the daemon keeps, those under way first, and `muructl command runs
+shop backup` those of one command; `exec` names the one-off commands'.
+`muructl command status 42` shows one:
+
+```console
+$ muructl command runs shop
+RUN    COMMAND  RELEASE  TRIGGER              STARTED              STATE
+43     exec     r7       manual               2026-11-02T10:05:01Z under way (detached, pid 52140)
+42     backup   r7       manual               2026-11-02T10:02:13Z exited with status 0 after 12m27s
+$ muructl command status 42
+run 42 of backup for shop@r7
+  started    2026-11-02T10:02:13Z by deploy, manual, detached
+  inputs     target=s3://backups/shop
+  ended      2026-11-02T10:14:40Z: it exited with status 0 after 12m27s
+  exit       0
+  output     apps/shop/commands/backup/42.log
+```
+
+## Schedules
+
+A declared command can carry a schedule, and the daemon runs it at those
+times with the application's current release, as `muructl command run`
+would:
+
+```toml
+[tool.muru.commands.clearsessions]
+run = ["python", "manage.py", "clearsessions"]
+timeout = "10m"
+schedule = { cron = "30 3 * * *", timezone = "Australia/Sydney" }
+
+[tool.muru.commands.warm-cache]
+call = "shop.ops:warm_cache"
+timeout = "5m"
+schedule = { at_boot = true }
+```
+
+| Key | What it does |
+| --- | --- |
+| `cron` | A cron expression, five fields or `@hourly`, `@daily`, `@weekly`, `@monthly` and `@yearly`, as an [overlay schedule](overlays.md) takes, read as local times in `timezone`. A time that a daylight saving change skips runs at the next instant that exists, and one it repeats runs once |
+| `timezone` | The IANA time zone `cron` is read in, such as `Australia/Sydney`; the system's without one |
+| `at_boot` | `true` runs the command when the daemon starts from nothing: its first start, after a reboot, or after `muructl daemon stop --shutdown`. It does not run when a daemon takes over what one that stopped without `--shutdown`, or upgraded itself, left running. It may be given with `cron` or alone |
+| `inputs` | Input values a scheduled run is given, by name; the others take their defaults |
+| `secret_inputs` | Inputs taken from one of the daemon's [secret stores](secrets.md), by name, each as `STORE/KEY` |
+
+A command with a schedule must have a `timeout`, so each scheduled run
+ends, and the next run after a deploy uses the new release. A schedule
+on a command whose required input has no default must give that input in
+`inputs` or `secret_inputs`. A deploy or apply that breaks either rule is
+refused.
+
+Each scheduled run is a [detached run](#running-a-long-command-detached)
+with the trigger `schedule`, asked for by `daemon`, so `muructl command
+runs`, `status` and `logs` show it, and it outlives a daemon restart or
+upgrade as any detached run does. `muructl command list` shows each
+command's schedule and when it is next due:
+
+```console
+$ muructl command list shop
+...
+clearsessions
+  run: python manage.py clearsessions
+  timeout 10m
+  schedule: 30 3 * * * in Australia/Sydney; next 2026-11-02T16:30:00Z
+```
+
+A scheduled run due while a run of the same command is under way, from
+the schedule or by hand, is skipped, with a `command.skipped` event
+naming the run under way. `exclusive = true` applies across every
+trigger, so a run asked for by hand while a scheduled run of an exclusive
+command is under way is refused. A run that falls due while no daemon is
+running, or while the application has no release that runs commands, is
+not made up later; the next due time is.
+
+Schedules run under the daemon only. `muructl run` says at start which
+commands are scheduled and when each is next due, and runs none of them;
+run one by hand with `muructl command run NAME`. `muructl serve` runs no
+schedules either: on Kubernetes a CronJob runs the command, as the
+[Kubernetes guide](kubernetes.md#scheduled-commands) shows.
 
 ## What is recorded
 
@@ -241,6 +358,30 @@ $ muructl events
 A command that exits with a status other than 0, or is stopped, is a
 `command.failed` event. `muructl command list` shows each declared
 command's last run.
+
+The daemon keeps a record of every run, whether its caller waits for it
+or it runs detached: the command, the release, who asked and how
+(`manual` for `muructl command run` and `muructl exec`, `schedule` for a
+scheduled run), the inputs with
+a secret's value as `***`, when it started and how it ended. Each run's
+output also goes to a file of its own, `apps/APP/commands/NAME/RUN.log`
+in the log directory, with the full UTC time on every line, which
+`muructl command logs RUN` reads. The last 20 runs of each command are
+kept, with their files; `keep_command_runs` in the daemon's `[daemon]`
+table changes how many, taking effect as each run ends:
+
+```toml
+[daemon]
+keep_command_runs = 50
+```
+
+An exclusive command's claim is kept with the runs: while a run of it
+has not ended, another is refused, naming the run under way, even after
+the daemon that started it has stopped. A run that a waiting caller
+started ends with the daemon that ran it, and if that daemon stopped
+without stopping it, the next daemon kills what is left of the run and
+records that it was stopped. An application with a run under way cannot
+be removed until the run ends.
 
 ## Which releases run commands
 
@@ -313,7 +454,9 @@ What differs by where a command runs:
 | `exclusive = true` | One run at a time for the application | One run at a time for that process | Not checked: one run at a time is up to what starts it, such as a Job with `parallelism: 1`, a Helm hook or the migration tool's own lock |
 | `--secret-input` | Read from the daemon's secret stores | Refused; give the value with `--input-stdin` | Refused; give the value with `--input-stdin` |
 | Output and events | The release's log and the events | That process's output | Standard output and standard error |
-| The last run in `muructl command list` | Kept | Not kept | Not kept |
+| The last run in `muructl command list`, and every run's record and output file | Kept | Not kept | Not kept |
+| `--detach` | Runs on under the daemon | Refused | Refused |
+| `schedule` | Run by the daemon | Listed at start by `muructl run`, not run | Not run; a CronJob runs the command |
 
 A project whose `[tool.muru.env]` takes a value from a secret store is
 served by the daemon alone, and its commands are run there too. The

@@ -328,6 +328,46 @@ def untag_host_streams() -> None:
         sys.stderr = sys.stderr.stream
 
 
+# The file a host held before its fork writes in its run directory, which
+# tells the daemon its before_fork gates may run (issue 266).
+
+GATES_FILE = "gates"
+
+
+def hold_for_gates(run_dir: str) -> bool:
+    """Wait, once preloaded, for the daemon to run the release's gates.
+
+    The host says it is ready by writing the file `gates` in its run
+    directory, whole, and then reads a line from standard input: `fork`
+    goes on to fork the workers, and anything else, or the end of the
+    stream because the daemon went away, stops the host.
+    """
+
+    os.makedirs(run_dir, exist_ok=True)
+    path = os.path.join(run_dir, GATES_FILE)
+    partial = f"{path}.partial"
+
+    with open(partial, "w") as file:
+        file.write(f"{os.getpid()}\n")
+
+    os.rename(partial, path)
+    log("waiting for the release's before_fork gates")
+    flush_streams()
+
+    word = sys.stdin.buffer.readline().strip()
+
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+    if word == b"fork":
+        return True
+
+    log("stopping: the release's before_fork gates did not pass")
+    return False
+
+
 def flush_streams() -> None:
     """Flush standard output and standard error, as before a fork or an exec.
 
@@ -4870,6 +4910,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="keep running when the parent goes away, for a daemon that re-adopts hosts",
     )
     parser.add_argument(
+        "--hold-before-fork",
+        action="store_true",
+        help="once preloaded, wait for fork on standard input before forking workers",
+    )
+    parser.add_argument(
         "--output-socket",
         default=None,
         metavar="PATH",
@@ -5360,6 +5405,12 @@ def _main(argv: list[str] | None) -> int:
 
         if args.preload_gc_collect:
             gc.collect()
+
+    # Section 9.12 (issue 266): the daemon runs the release's before_fork
+    # gates now, with the application imported and nothing forked.
+
+    if args.hold_before_fork and not hold_for_gates(args.socket_dir):
+        return 1
 
     # A socket past the platform's path limit never binds, so the longest
     # a default worker's socket can be is checked once here; a named

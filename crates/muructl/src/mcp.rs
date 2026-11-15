@@ -533,14 +533,19 @@ fn finish(name: &str, arguments: &JsonObject, result: CallToolResult) -> CallToo
         return result;
     };
 
-    let value = match name {
-        "logs" => Value::Array(
+    let lines = || {
+        Value::Array(
             printed
                 .lines()
                 .filter(|line| !line.trim().is_empty())
                 .map(|line| serde_json::from_str(line).unwrap_or_else(|_| json!(line)))
                 .collect(),
-        ),
+        )
+    };
+
+    let value = match name {
+        "logs" => lines(),
+        "command_run" if arguments.contains_key("output") => lines(),
         "metrics" => {
             let Ok(mut answer) = serde_json::from_str::<Value>(&printed) else {
                 return result;
@@ -577,6 +582,20 @@ fn command_result(printed: &str, stderr: &str) -> CallToolResult {
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
+
+    // A detached run answers with its id alone.
+
+    if let Some(started) = messages.first().filter(|first| first["detached"] == true) {
+        let answer = json!({
+            "release": started["release"],
+            "run": started["run"],
+            "detached": true,
+            "message": started["message"],
+        });
+        return CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&answer).unwrap_or_default(),
+        )]);
+    }
 
     let Some(last) = messages.last().filter(|last| last["finished"] == true) else {
         let message = serde_json::from_str::<Value>(printed.trim())
@@ -739,6 +758,59 @@ fn specs() -> Vec<Spec> {
                     vec![needed(arguments, "target")?],
                 ]
                 .concat())
+            },
+        },
+        Spec {
+            name: "conditions",
+            description: "The named conditions over Muru's signals (error rates, request shares, latency, queues, scaling, memory, upstream health): each one's state, firing, resolved or unknown, and since when; with name, one condition's terms and each one's figure now, or why it is unknown.",
+            changes: false,
+            properties: json!({"name": {"type": "string", "description": "One condition, for its terms' figures"}}),
+            required: &[],
+            command: |arguments| match text(arguments, "name") {
+                Some(name) => Ok([words(&["condition", "show"]), vec![name]].concat()),
+                None => Ok(words(&["condition", "list"])),
+            },
+        },
+        Spec {
+            name: "command_runs",
+            description: "The runs the daemon keeps of an application's commands, or of one command, those under way first: each run's id, command, release, trigger (manual, schedule or a gate), start, and how it ended.",
+            changes: false,
+            properties: json!({
+                "app": {"type": "string", "description": "The application"},
+                "name": {"type": "string", "description": "Only this command's runs; exec for one-off commands"},
+            }),
+            required: &["app"],
+            command: |arguments| {
+                let mut command = words(&["command", "runs"]);
+                command.push(needed(arguments, "app")?);
+                command.extend(text(arguments, "name"));
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "command_run",
+            description: "One run of a command by its id: who started it and how, and how it ended or that it is under way; with output, the last lines of its output.",
+            changes: false,
+            properties: json!({
+                "run": {"type": "integer", "description": "The run's id"},
+                "output": {"type": "integer", "description": "How many of the last lines of its output to give instead (at most 1000)"},
+            }),
+            required: &["run"],
+            command: |arguments| {
+                let run = arguments
+                    .get("run")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "give the run's id".to_owned())?
+                    .to_string();
+
+                match arguments.get("output").and_then(Value::as_u64) {
+                    Some(lines) => Ok([
+                        words(&["command", "logs"]),
+                        vec![run, "--lines".to_owned(), lines.min(1000).to_string()],
+                    ]
+                    .concat()),
+                    None => Ok([words(&["command", "status"]), vec![run]].concat()),
+                }
             },
         },
         Spec {
@@ -1081,19 +1153,24 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "run_command",
-            description: "Run a command the application declares, with its inputs, and return its output and exit status. Give a secret input in secret_inputs as STORE/KEY, an entry of one of the daemon's secret stores, never as a value.",
+            description: "Run a command the application declares, with its inputs, and return its output and exit status; or, with detach, start it and return its run id at once, for a long run followed with command_run. Give a secret input in secret_inputs as STORE/KEY, an entry of one of the daemon's secret stores, never as a value.",
             changes: true,
             properties: json!({
                 "target": {"type": "string", "description": "app, or app@release; the current release when only the app is named"},
                 "name": {"type": "string", "description": "The command, as the commands tool lists it"},
                 "inputs": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Input values by name"},
                 "secret_inputs": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Secret inputs by name, each as STORE/KEY"},
+                "detach": {"type": "boolean", "description": "Start the run and return its id without waiting; it runs on under the daemon"},
             }),
             required: &["target", "name"],
             command: |arguments| {
                 let mut command = words(&["command", "run"]);
                 command.push(needed(arguments, "target")?);
                 command.push(needed(arguments, "name")?);
+
+                if flag(arguments, "detach") {
+                    command.push("--detach".to_owned());
+                }
 
                 for (key, option) in [("inputs", "--input"), ("secret_inputs", "--secret-input")] {
                     for (name, value) in pairs(arguments, key)? {
@@ -1103,6 +1180,20 @@ fn specs() -> Vec<Spec> {
                 }
 
                 Ok(command)
+            },
+        },
+        Spec {
+            name: "stop_command_run",
+            description: "Stop a run of a command that is under way, as at its timeout: SIGTERM to its session, and SIGKILL ten seconds later.",
+            changes: true,
+            properties: json!({"run": {"type": "integer", "description": "The run's id"}}),
+            required: &["run"],
+            command: |arguments| {
+                let run = arguments
+                    .get("run")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "give the run's id".to_owned())?;
+                Ok([words(&["command", "stop"]), vec![run.to_string()]].concat())
             },
         },
         Spec {

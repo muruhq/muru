@@ -41,7 +41,7 @@ Names start with `muru_`. Where they apply, labels name the application
 | Metric | Kind | Labels | Holds |
 | --- | --- | --- | --- |
 | `muru_requests_total` | counter | app, release, group, mount, status, reason, client_class | requests completed; `status` is the class (`2xx`), `reason` is present when Muru generated the response, with the values the [error responses](../reference/errors.md) page lists, and `client_class` is the request's [class](client-classes.md) |
-| `muru_request_duration_seconds` | histogram | app, release, phase | time in the `queue` (waiting for a worker slot), in the `application` (until the response head arrived) and in `total`; the first two only for requests a worker served |
+| `muru_request_duration_seconds` | histogram | app, release, group, phase | time in the `queue` (waiting for a worker slot), in the `application` (until the response head arrived) and in `total`; the first two only for requests a worker served |
 | `muru_request_retries_total` | counter | app, release, group | requests sent to a second worker after the first could not be connected to or closed its connection before reading them, as a worker that is stopping does; such a request is marked `retried` in the [access log](logging.md) |
 | `muru_request_bytes_total` | counter | app, release, listener | body bytes received from clients, by the address of the listener they arrived on; a WebSocket's messages are counted when it closes |
 | `muru_response_bytes_total` | counter | app, release, listener | body bytes sent to clients, counted the same way |
