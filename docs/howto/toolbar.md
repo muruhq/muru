@@ -38,7 +38,9 @@ record fills in. The toolbar only shows: it has no forms and changes
 nothing.
 
 The application is not changed. Muru inserts one tag before the page's
-`</body>`:
+`</body>`, or at the end of a page that has none, such as the error
+pages Flask and other Werkzeug applications send, where the browser
+puts it into the page's body all the same:
 
 ```html
 <script src="/_muru/toolbar.js" data-request="01JCZ8X4R3T5V6W7Y8Z9A0B1C2" async></script>
@@ -50,7 +52,7 @@ Muru never changes:
 
 - a response to anything but GET, or one whose status is 204, 206 or
   304;
-- a response that is not `text/html`, or has no `</body>`;
+- a response that is not `text/html`, or has an empty body;
 - a response the application encoded itself (`Content-Encoding`) or
   marked `Cache-Control: no-transform`;
 - a file Muru sends itself, a static file or a file hint.

@@ -451,8 +451,9 @@ pub fn tag(prefix: &str, request_id: &str, dashboard: Option<&str>, nonce: Optio
     Bytes::from(tag)
 }
 
-/// Insert `tag` before the page's first `</body>`, changing the headers
-/// that no longer hold: the length goes, and a strong ETag is made weak.
+/// Insert `tag` before the page's first `</body>`, or at its end when it
+/// has none, changing the headers that no longer hold: the length goes,
+/// and a strong ETag is made weak.
 pub fn insert(response: Response<ResponseBody>, tag: Bytes) -> Response<ResponseBody> {
     let (mut parts, body) = response.into_parts();
     parts.headers.remove(CONTENT_LENGTH);
@@ -473,6 +474,7 @@ pub fn insert(response: Response<ResponseBody>, tag: Bytes) -> Response<Response
             inner: body,
             tag: Some(tag),
             held: BytesMut::new(),
+            passed: false,
             trailers: None,
             ended: false,
         }),
@@ -480,12 +482,17 @@ pub fn insert(response: Response<ResponseBody>, tag: Bytes) -> Response<Response
 }
 
 /// A body that passes the page through with the tag inserted before its
-/// first `</body>`. It holds back only the bytes that could begin the
-/// tag across a chunk boundary, so a streamed page keeps streaming.
+/// first `</body>`, or appended at its end when it has none, as
+/// Werkzeug's error pages do not. It holds back only the bytes that could
+/// begin the tag across a chunk boundary, so a streamed page keeps
+/// streaming.
 struct Inserting {
     inner: ResponseBody,
     tag: Option<Bytes>,
     held: BytesMut,
+    /// Whether any of the body has come through, so an empty body stays
+    /// empty.
+    passed: bool,
     trailers: Option<HeaderMap>,
     ended: bool,
 }
@@ -533,7 +540,15 @@ impl Body for Inserting {
 
         loop {
             if this.ended {
-                // Whatever was held back goes, then the trailers.
+                // Whatever was held back goes, then the trailers. A page
+                // that had no `</body>` gets the tag at its end, which a
+                // browser puts into the document's body.
+
+                if this.passed
+                    && let Some(tag) = this.tag.take()
+                {
+                    this.held.extend_from_slice(&tag);
+                }
 
                 if !this.held.is_empty() {
                     return Poll::Ready(Some(Ok(Frame::data(this.held.split().freeze()))));
@@ -549,6 +564,7 @@ impl Body for Inserting {
             match std::task::ready!(Pin::new(&mut this.inner).poll_frame(context)) {
                 Some(Ok(frame)) => match frame.into_data() {
                     Ok(data) => {
+                        this.passed |= !data.is_empty();
                         this.held.extend_from_slice(&data);
 
                         if let Some(out) = this.release() {
@@ -665,9 +681,21 @@ mod tests {
             "<body>a<TAG></body></body>"
         );
 
-        // A page without one goes out as it came.
+        // A page without one, such as Werkzeug's error pages, gets the
+        // tag at its end, in one chunk or several; an empty body stays
+        // empty.
 
-        assert_eq!(inserted(&["<p>no end", "</bod"]).await, "<p>no end</bod");
+        assert_eq!(
+            inserted(&["<!doctype html>\n<title>500</title>\n<h1>Internal</h1>\n"]).await,
+            "<!doctype html>\n<title>500</title>\n<h1>Internal</h1>\n<TAG>"
+        );
+        assert_eq!(
+            inserted(&["<p>no end", "</bod", "y"]).await,
+            "<p>no end</body<TAG>"
+        );
+        assert_eq!(inserted(&["<html>", "</html>"]).await, "<html></html><TAG>");
+        assert_eq!(inserted(&[]).await, "");
+        assert_eq!(inserted(&[""]).await, "");
     }
 
     #[test]
