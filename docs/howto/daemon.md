@@ -122,10 +122,11 @@ minutes, for its logs and workers to be looked at, and does not take its
 place. `rollback` to a release that was
 stopped starts it again first and moves traffic when it is ready; the
 release it replaces is retained in turn. `drain` takes a release out of
-traffic and stops it; draining the serving release leaves the
-application answering 503 until the next deploy. Releases start beside
-the daemon's other work, so `status`, deploys of other applications and
-the daemon's own checks answer while one starts or runs its gates. A
+traffic and stops it, answering once the release has stopped; draining
+the serving release leaves the application answering 503 until the next
+deploy. Releases start and stop beside the daemon's other work, so
+`status`, deploys of other applications and the daemon's own checks
+answer while one starts, runs its gates or finishes its requests. A
 drain of a release that is still starting cancels its start, and a
 scale of it is refused until it is ready. `deploy --no-wait` returns once the
 release is recorded, and `release wait` waits for a state. `restart`

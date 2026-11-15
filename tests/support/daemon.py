@@ -196,6 +196,27 @@ class Daemon:
             if line.startswith("muru_snapshot_version ")
         )
 
+    def wait_for_state(self, release: str, state: str, timeout: float = 20.0) -> None:
+        """Wait until the release is in the state, as `release list` shows it.
+
+        A release a deploy replaces stops beside the daemon's other work,
+        so it can still be stopping when the deploy has answered.
+        """
+
+        app = release.split("@", 1)[0]
+        deadline = time.monotonic() + timeout
+
+        while True:
+            rows = self.releases(app)
+
+            if any(row["release"] == release and row["state"] == state for row in rows):
+                return
+
+            if time.monotonic() > deadline:
+                raise AssertionError(f"{release} is not {state}: {rows}")
+
+            time.sleep(0.1)
+
     def wait_for_routing(self, app: str, timeout: float = 20.0) -> None:
         """Wait until the host says the edge routes to every worker of the
         application's serving release.

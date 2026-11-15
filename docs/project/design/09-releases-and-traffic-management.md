@@ -111,6 +111,8 @@ sequenceDiagram
   H-->>C: workers exited
 ```
 
+- **Stops beside the loop (issue 699).** The daemon takes a release out of what it routes to and runs in one step of its loop, and the stop of its host or a managed server's instances, with their grace periods and the release log relay's last lines, runs on a task beside the loop, so the loop keeps taking commands and doing its once-a-second work while a release stops. The release is `stopping` until the task reports, and `stopped` then, its run directory and scale pins forgotten and `release.stopped` raised; one whose processes outlast the stop's wait (the drain timeout, or the release's stop budget when that is longer) is recorded stopped all the same, the event saying so. What waits on the stop carries on when it has ended: `muructl drain` is answered, an application's removal drops its records, and a start of the release, such as a rollback to it, begins. A removal of a release that is stopping is refused until it has stopped. A release that stops no longer counts against the node's budget, so a stop that makes room for another release makes it at once. A daemon that stops waits for the stops under way, each for as long as its own wait, since the next daemon has no record to adopt the release by.
+
 ## 9.6 Rollback and deploy freezes
 
 Rollback first scales the retained release back to its previous worker counts (forks from its preloaded host), then restores the previous traffic policy once those workers are ready, so the rollback does not land on a single warm worker. A release outside its retention window is started again first. Schedules with freeze_deploys block new releases and rollouts during their windows unless an explicit override is given, which is audit-logged.

@@ -1,8 +1,8 @@
-"""The daemon's loop goes on while a release starts (issue 693, design
-specification section 9.1): status and another application's deploy
-answer while a release runs its before_fork gate, a drain of a release
-that starts cancels its start, and a scale of it is refused until it is
-ready."""
+"""The daemon's loop goes on while a release starts or stops (issues 693
+and 699, design specification sections 9.1 and 9.5): status and another
+application's deploy answer while a release runs its before_fork gate or
+finishes its requests, a drain of a release that starts cancels its start,
+and a scale of it is refused until it is ready."""
 
 from __future__ import annotations
 
@@ -20,6 +20,32 @@ APP = """
 def application(environ, start_response):
     start_response("200 OK", [("Content-Type", "text/plain")])
     return [b"ok"]
+"""
+
+SLOW_APP = """
+import os
+import time
+
+
+def application(environ, start_response):
+    open("begun", "w").close()
+
+    while not os.path.exists("finish"):
+        time.sleep(0.1)
+
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    return [b"finished"]
+"""
+
+SLOW = """
+[project]
+name = "slow"
+version = "0.1.0"
+
+[tool.muru]
+entrypoint = "app:application"
+processes = 1
+timeouts = { shutdown_timeout = "60s" }
 """
 
 GATED = """
@@ -88,8 +114,10 @@ def answers_at_once(daemon: Daemon, name: str, source: Path) -> None:
     assert daemon.deploy(name, source, "--hold").startswith(f"muru: release {name}@r1 is ready")
 
 
-def test_the_daemon_answers_while_a_release_starts(tmp_path: Path) -> None:
+def test_the_daemon_answers_while_a_release_stops_or_starts(tmp_path: Path) -> None:
+    slow = project(tmp_path, "slow", SLOW, SLOW_APP)
     ops = project(tmp_path, "ops", GATED)
+    web = project(tmp_path, "web", PLAIN.format(name="web"))
     api = project(tmp_path, "api", PLAIN.format(name="api"))
     (tmp_path / "daemon").mkdir()
     daemon = start_daemon(tmp_path / "daemon")
@@ -102,6 +130,26 @@ def test_the_daemon_answers_while_a_release_starts(tmp_path: Path) -> None:
 
     try:
         with ThreadPoolExecutor() as pool:
+            # While slow@r1 finishes a request, its drain waits, and the
+            # daemon answers meanwhile.
+
+            assert daemon.deploy("slow", slow) == "muru: release slow@r1 is ready and serving"
+            request = pool.submit(daemon.get)
+            deadline = time.monotonic() + 30
+
+            while not (slow / "begun").exists():
+                assert time.monotonic() < deadline
+                time.sleep(0.1)
+
+            drained = pool.submit(daemon.muructl, "drain", "slow@r1")
+            wait_until(daemon, "slow@r1", lambda state: state.get("state") == "stopping")
+            answers_at_once(daemon, "web", web)
+            assert not drained.done()
+
+            (slow / "finish").touch()
+            assert request.result().body == b"finished"
+            assert drained.result().stdout.strip() == "muru: release slow@r1 is stopped"
+
             # While ops@r1 runs its before_fork gate, the daemon answers, and
             # refuses to scale the release that starts.
 

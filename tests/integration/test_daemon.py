@@ -581,6 +581,7 @@ def test_superseded_release_is_retained_and_rollback_is_instant(daemon: Daemon) 
 def test_retention_can_be_switched_off_or_shortened(daemon: Daemon) -> None:
     daemon.deploy("shop", SHOP)
     daemon.deploy("shop", SHOP, "--retain", "0")
+    daemon.wait_for_state("shop@r1", "stopped")
     assert daemon.releases("shop")[1] == {"release": "shop@r1", "state": "stopped", "serving": ""}
 
     daemon.deploy("shop", SHOP, "--retain", "1s")
@@ -596,6 +597,7 @@ def test_only_one_release_is_retained_per_application(daemon: Daemon) -> None:
     daemon.deploy("shop", SHOP)
     daemon.deploy("shop", SHOP)
     daemon.deploy("shop", SHOP)
+    daemon.wait_for_state("shop@r1", "stopped")
 
     assert [row["state"] for row in daemon.releases("shop")] == ["ready", "retained", "stopped"]
     assert "superseded again" in daemon.muructl("release", "list", "shop").stdout

@@ -618,6 +618,17 @@ pub enum Command {
         /// Answered with each worker's reply, or why none could be asked.
         done: oneshot::Sender<Result<Vec<WorkerReply>, String>>,
     },
+    /// Issue 699: a release's stop, on a task beside the loop, has ended.
+    Stopped {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// Why it was stopped, for its note.
+        why: String,
+        /// Whether its processes outlasted the wait for them.
+        timed_out: bool,
+    },
     /// Issue 693: a promotion's before_promote gates have run, on a task
     /// beside the loop.
     PromoteGated {
@@ -1298,6 +1309,29 @@ struct Starting {
     waiters: Vec<AfterStart>,
 }
 
+/// Issue 699: a release being stopped beside the loop.
+struct Stop {
+    /// When the stop's task gives up waiting for the processes.
+    until: Instant,
+    /// The release's run directory and the record in it, removed once it
+    /// has stopped.
+    run_dir: PathBuf,
+    record: PathBuf,
+    /// What follows the stop, carried out when it has ended.
+    waiters: Vec<AfterStop>,
+}
+
+/// Issue 699: what follows a release's stop, carried out in the loop once
+/// it has ended.
+enum AfterStop {
+    /// Answer a drain with the release as it is then.
+    Drained(oneshot::Sender<Result<Release, String>>),
+    /// Start the release again.
+    Start(AfterStart),
+    /// Go on with an application's removal.
+    RemoveApp(String, oneshot::Sender<Result<(), String>>),
+}
+
 /// Issue 693: what follows a release's start, carried out in the loop
 /// with how the start went: what each operation that starts a release
 /// did after its start, before the start ran beside the loop.
@@ -1852,6 +1886,8 @@ struct Daemon {
     start_queue: HashMap<String, std::collections::VecDeque<(String, AfterStart)>>,
     /// Issue 693: the applications whose rollout is being promoted.
     promoting: BTreeSet<String>,
+    /// Issue 699: the releases being stopped beside the loop.
+    stops: HashMap<(String, String), Stop>,
     /// Section 9.10 (issue 689): the overlays whose activation by their
     /// firing condition was skipped, so the event is raised once while the
     /// condition keeps firing.
@@ -2246,6 +2282,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         starting: HashMap::new(),
         start_queue: HashMap::new(),
         promoting: BTreeSet::new(),
+        stops: HashMap::new(),
         booted,
         cgroup: crate::cgroup::Limits::read(),
         guard: crate::guard::Guard::default(),
@@ -2419,23 +2456,39 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Issue 693: a host still starting has nothing the next daemon could
     // adopt, so every start under way is cancelled, whether the daemon
     // drains, detaches or upgrades, and its report waited for, which
-    // stops what it started. Other commands arriving meanwhile are
-    // dropped, so their callers hear the daemon has gone, and what waited
-    // on a start is told it failed.
+    // stops what it started. Issue 699: a release being stopped has left
+    // what the next daemon adopts too, so its stop is waited for, each
+    // as long as its own wait for its processes. Other commands arriving
+    // meanwhile are dropped, so their callers hear the daemon has gone;
+    // what waited on a start or a stop is told it failed or carried out
+    // as far as a daemon that stops can.
 
     daemon.cancel_starts("the daemon is stopping").await;
-    let deadline = Instant::now() + START_CANCEL_WAIT;
+    let deadline = daemon
+        .stops
+        .values()
+        .map(|stop| stop.until + Duration::from_secs(1))
+        .fold(Instant::now() + START_CANCEL_WAIT, Instant::max);
 
-    while !daemon.starting.is_empty() {
+    while !daemon.starting.is_empty() || !daemon.stops.is_empty() {
         match tokio::time::timeout_at(deadline.into(), inbox.recv()).await {
             Ok(Some(Command::StartStage { app, id, stage })) => {
                 daemon.start_stage(&app, &id, *stage).await;
+            }
+            Ok(Some(Command::Stopped {
+                app,
+                id,
+                why,
+                timed_out,
+            })) => {
+                daemon.stopped(&app, &id, &why, timed_out).await;
             }
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => {
                 tracing::warn!(
                     starts = daemon.starting.len(),
-                    "starts under way did not end before the daemon stopped"
+                    stops = daemon.stops.len(),
+                    "starts and stops under way did not end before the daemon stopped"
                 );
                 break;
             }
@@ -5594,7 +5647,17 @@ impl Daemon {
                 let _ = done.send(self.override_access_log(change, reset).await);
             }
             Command::Drain { app, id, done } => {
-                let _ = done.send(self.drain_release(&app, &id).await);
+                // Issue 699: a drain is answered once the release's stop has
+                // ended.
+
+                let drained = self.drain_release(&app, &id).await;
+
+                match self.stops.get_mut(&(app, id)) {
+                    Some(stop) if drained.is_ok() => stop.waiters.push(AfterStop::Drained(done)),
+                    _ => {
+                        let _ = done.send(drained);
+                    }
+                }
             }
             Command::ReferencedReleases { done } => {
                 let _ = done.send(self.referenced_releases());
@@ -5606,7 +5669,15 @@ impl Daemon {
                 let _ = done.send(self.app_removal_refused(&app));
             }
             Command::RemoveApp { app, done } => {
-                let _ = done.send(self.remove_app(&app).await);
+                self.remove_app_then(app, done).await;
+            }
+            Command::Stopped {
+                app,
+                id,
+                why,
+                timed_out,
+            } => {
+                self.stopped(&app, &id, &why, timed_out).await;
             }
             Command::StartHeld { app, id, done } => {
                 self.start_held(&app, &id, done).await;
@@ -7011,6 +7082,14 @@ impl Daemon {
             return;
         }
 
+        // Issue 699: a release being stopped is started again once its
+        // stop has ended.
+
+        if let Some(stop) = self.stops.get_mut(&key) {
+            stop.waiters.push(AfterStop::Start(then));
+            return;
+        }
+
         if let Some(starting) = self.starting.get_mut(&key) {
             starting.waiters.push(then);
             return;
@@ -7962,7 +8041,7 @@ impl Daemon {
                 .collect();
 
             for other in older {
-                self.stop_release(app, &other, "superseded again").await;
+                self.stop_release(app, &other, "superseded again");
             }
 
             // Section 9.1: once drained, each group keeps its warm floor;
@@ -8036,11 +8115,13 @@ impl Daemon {
             return;
         }
 
-        self.stop_release(app, id, "").await;
+        self.stop_release(app, id, "");
     }
 
-    /// Stop a release's host and record it stopped.
-    async fn stop_release(&mut self, app: &str, id: &str, why: &str) {
+    /// Stop a release's host and record it stopped. Issue 699: the release
+    /// leaves what runs at once, and its processes are stopped on a task
+    /// beside the loop, which `stopped` takes on when they have.
+    fn stop_release(&mut self, app: &str, id: &str, why: &str) {
         let subject = format!("{app}@{id}");
         let Ok(release) = self.store.release(app, id) else {
             return;
@@ -8061,17 +8142,78 @@ impl Daemon {
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
         let record = running.backend.record_path(&run_dir);
         let grace = release.spec.timeouts.stop_budget();
-        let stopped = tokio::time::timeout(stop_wait(grace), running.backend.stop(grace)).await;
+        let wait = stop_wait(grace);
+        let backend = running.backend;
+        let commands = self.commands.clone();
+        let (task_app, task_id, task_why) = (app.to_owned(), id.to_owned(), why.to_owned());
 
-        if stopped.is_err() {
-            tracing::warn!(%subject, "the host did not stop within the drain timeout");
+        tokio::spawn(async move {
+            let timed_out = tokio::time::timeout(wait, backend.stop(grace))
+                .await
+                .is_err();
+
+            if timed_out {
+                tracing::warn!(%subject, "the host did not stop within the drain timeout");
+            }
+
+            let _ = commands
+                .send(Command::Stopped {
+                    app: task_app,
+                    id: task_id,
+                    why: task_why,
+                    timed_out,
+                })
+                .await;
+        });
+
+        self.stops.insert(
+            (app.to_owned(), id.to_owned()),
+            Stop {
+                until: Instant::now() + wait,
+                run_dir,
+                record,
+                waiters: Vec::new(),
+            },
+        );
+    }
+
+    /// Issue 699: a release's processes have stopped, or outlasted the
+    /// wait for them: forget its run directory, record it stopped, and
+    /// carry out what was waiting on the stop.
+    async fn stopped(&mut self, app: &str, id: &str, why: &str, timed_out: bool) {
+        let subject = format!("{app}@{id}");
+        let Some(stop) = self.stops.remove(&(app.to_owned(), id.to_owned())) else {
+            return;
+        };
+
+        forget_release_dir(&stop.run_dir, &stop.record);
+        let _ = self.store.remove_scale_pins(app, id, None);
+
+        if let Ok(release) = self.store.release(app, id) {
+            self.set_state(&release, ReleaseState::Stopped, why);
+
+            let detail = if timed_out {
+                "stopped; its processes outlasted the wait for them"
+            } else {
+                "stopped"
+            };
+            self.events
+                .emit("release.stopped", &subject, "info", detail);
         }
 
-        forget_release_dir(&run_dir, &record);
-        let _ = self.store.remove_scale_pins(app, id, None);
-        self.set_state(&release, ReleaseState::Stopped, why);
-        self.events
-            .emit("release.stopped", &subject, "info", "stopped");
+        for then in stop.waiters {
+            match then {
+                AfterStop::Drained(done) => {
+                    let _ = done.send(
+                        self.store
+                            .release(app, id)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                AfterStop::Start(then) => Box::pin(self.start_then(app, id, then)).await,
+                AfterStop::RemoveApp(app, done) => Box::pin(self.remove_app_then(app, done)).await,
+            }
+        }
     }
 
     /// Section 9.3: begin a rollout of `candidate` against the release that
@@ -9454,8 +9596,7 @@ impl Daemon {
         }
 
         if let Some((_, _, app, id)) = retained.first() {
-            self.stop_release(app, id, "the node is over its memory budget")
-                .await;
+            self.stop_release(app, id, "the node is over its memory budget");
         }
     }
 
@@ -9634,8 +9775,7 @@ impl Daemon {
                 &format!(
                     "making room in the node's memory budget for {subject}, woken by a request"
                 ),
-            )
-            .await;
+            );
             used = self.budget_usage();
             admitted = crate::budget::admit(&lifted, used, vec![ask.clone()]).remove(0);
         }
@@ -9751,8 +9891,7 @@ impl Daemon {
                 &format!(
                     "making room in the node's worker budget for {subject}, woken by a request"
                 ),
-            )
-            .await;
+            );
         }
     }
 
@@ -9863,8 +10002,7 @@ impl Daemon {
                 &other_app,
                 &other_id,
                 &format!("making room in the node's memory budget for {app}"),
-            )
-            .await;
+            );
         }
 
         Ok(())
@@ -10727,8 +10865,7 @@ impl Daemon {
             .collect();
 
         for (app, id) in expired {
-            self.stop_release(&app, &id, "the retention window passed")
-                .await;
+            self.stop_release(&app, &id, "the retention window passed");
         }
     }
 
@@ -10898,6 +11035,12 @@ impl Daemon {
             return Err(format!("{app}@{id} cannot be removed: it is still running"));
         }
 
+        if self.stops.contains_key(&key) {
+            return Err(format!(
+                "{app}@{id} cannot be removed: it is still stopping; try again when it has stopped"
+            ));
+        }
+
         self.store
             .delete_release(app, id)
             .map_err(|error| error.to_string())
@@ -10975,8 +11118,24 @@ impl Daemon {
             })
     }
 
-    /// Section 9.1: drain whatever an application runs, then drop its
-    /// release records and the application.
+    /// Section 9.1: remove an application, answering once its releases'
+    /// stops have ended (issue 699).
+    async fn remove_app_then(&mut self, app: String, done: oneshot::Sender<Result<(), String>>) {
+        if let Err(error) = self.remove_app(&app).await {
+            let _ = done.send(Err(error));
+            return;
+        }
+
+        match self.stops.iter_mut().find(|((name, _), _)| *name == app) {
+            Some((_, stop)) => stop.waiters.push(AfterStop::RemoveApp(app, done)),
+            None => {
+                let _ = done.send(self.forget_app(&app).await);
+            }
+        }
+    }
+
+    /// Section 9.1: drain whatever an application runs, its removal
+    /// refused if it cannot go now.
     async fn remove_app(&mut self, app: &str) -> Result<(), String> {
         if let Some(why) = self.app_removal_refused(app) {
             return Err(format!("{app} cannot be removed: {why}"));
@@ -10995,6 +11154,12 @@ impl Daemon {
             }
         }
 
+        Ok(())
+    }
+
+    /// Section 9.1: drop an application's release records and the
+    /// application, once nothing of it runs.
+    async fn forget_app(&mut self, app: &str) -> Result<(), String> {
         if let Some(((_, id), _)) = self.running.iter().find(|((name, _), _)| name == app) {
             return Err(format!("{app}@{id} did not stop"));
         }
