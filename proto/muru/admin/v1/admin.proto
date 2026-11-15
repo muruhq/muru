@@ -169,6 +169,9 @@ service Admin {
   rpc GetCommandRun(GetCommandRunRequest) returns (CommandRunRecord);
   rpc TailCommandRun(TailCommandRunRequest) returns (stream LogLine);
   rpc StopCommandRun(StopCommandRunRequest) returns (CommandRunRecord);
+
+  // Section 9.10: the named conditions and their states (issue 123).
+  rpc ListConditions(ListConditionsRequest) returns (ListConditionsResponse);
 }
 
 // A probe's question (section 13.9): live, ready or startup, of the
@@ -1333,6 +1336,37 @@ message CommandOutput {
   bool ok = 7;                      // on the last message: it exited with 0 and was not stopped
   uint64 run = 8;                   // the run's id, where runs are kept: on the first message and the last
   bool detached = 9;                // the run was started detached; this message, with its id, is the only one
+}
+
+message ListConditionsRequest {
+  string name = 1;                  // empty: every condition
+}
+
+message ListConditionsResponse {
+  repeated ConditionStatus conditions = 1;
+}
+
+// A named condition and its state as of the daemon's last evaluation.
+message ConditionStatus {
+  string name = 1;
+  string state = 2;                 // firing, resolved or unknown
+  string held = 3;                  // while unknown, the state it holds
+  uint64 since_unix_ms = 4;         // when it took the state it holds; 0 before its first figure
+  string source = 5;                // file, the daemon's own, or applied
+  string when = 6;
+  string for = 7;
+  string clear_when = 8;
+  string clear_for = 9;
+  uint64 min_requests = 10;
+  string unknown = 11;              // why it is unknown, when it is
+  repeated ConditionTerm terms = 12; // each term of when, then of clear_when
+}
+
+message ConditionTerm {
+  string term = 1;
+  bool known = 2;
+  double value = 3;                 // its figure, in base units, when known
+  string unknown = 4;               // why it has none, when not
 }
 
 message ListCommandRunsRequest {

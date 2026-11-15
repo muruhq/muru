@@ -5267,6 +5267,157 @@ pub async fn app_remove(args: AppRemoveArgs) -> anyhow::Result<()> {
     finish_removal(&answer, args.output.json)
 }
 
+/// The `muructl condition` subcommands (section 9.10).
+#[derive(Subcommand)]
+pub enum ConditionCommand {
+    /// Every condition, its state and since when.
+    List {
+        #[command(flatten)]
+        socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
+    },
+
+    /// One condition: its expressions, its state, and each term's figure
+    /// now, or why it has none.
+    Show {
+        /// The condition.
+        name: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
+    },
+}
+
+/// Run a `muructl condition` subcommand.
+pub async fn condition(command: ConditionCommand) -> anyhow::Result<()> {
+    let (name, socket, json) = match &command {
+        ConditionCommand::List { socket, output } => (String::new(), socket, output.json),
+        ConditionCommand::Show {
+            name,
+            socket,
+            output,
+        } => (name.clone(), socket, output.json),
+    };
+
+    let mut client = client::connect(&socket.socket()?).await?;
+    let answer = client
+        .list_conditions(pb::ListConditionsRequest { name: name.clone() })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if json {
+        return match answer.conditions.first().filter(|_| !name.is_empty()) {
+            Some(condition) => print_answer(condition),
+            None => print_answer(&answer),
+        };
+    }
+
+    if name.is_empty() {
+        if answer.conditions.is_empty() {
+            println!("no conditions are declared");
+            return Ok(());
+        }
+
+        let width = answer
+            .conditions
+            .iter()
+            .map(|condition| condition.name.len())
+            .max()
+            .unwrap_or(0)
+            .max("CONDITION".len());
+        println!(
+            "{:<width$} {:<9} {:<21} WHEN",
+            "CONDITION", "STATE", "SINCE"
+        );
+
+        for condition in &answer.conditions {
+            println!(
+                "{:<width$} {:<9} {:<21} {}",
+                condition.name,
+                condition.state,
+                condition_since(condition),
+                condition.when
+            );
+        }
+
+        return Ok(());
+    }
+
+    for condition in &answer.conditions {
+        println!("condition {} ({})", condition.name, condition.source);
+        println!("  state       {}", condition_state(condition));
+        println!("  when        {}", condition.when);
+
+        if !condition.r#for.is_empty() {
+            println!("  for         {}", condition.r#for);
+        }
+
+        if !condition.clear_when.is_empty() {
+            println!("  clear_when  {}", condition.clear_when);
+        }
+
+        if !condition.clear_for.is_empty() {
+            println!("  clear_for   {}", condition.clear_for);
+        }
+
+        println!("  min         {} requests", condition.min_requests);
+
+        for term in &condition.terms {
+            let figure = if term.known {
+                format!("{}", round_figure(term.value))
+            } else {
+                format!("unknown: {}", term.unknown)
+            };
+            println!("  term        {} is {figure}", term.term);
+        }
+    }
+
+    Ok(())
+}
+
+/// When a condition took its state, or a dash before its first figure.
+fn condition_since(condition: &pb::ConditionStatus) -> String {
+    if condition.since_unix_ms == 0 {
+        "-".to_owned()
+    } else {
+        format_time(condition.since_unix_ms)
+    }
+}
+
+/// A condition's state in words: unknown says why and what it holds.
+fn condition_state(condition: &pb::ConditionStatus) -> String {
+    if condition.state != "unknown" {
+        return format!("{} since {}", condition.state, condition_since(condition));
+    }
+
+    if condition.held == "unknown" {
+        format!("unknown: {}", condition.unknown)
+    } else {
+        format!(
+            "unknown, holding {} since {}: {}",
+            condition.held,
+            condition_since(condition),
+            condition.unknown
+        )
+    }
+}
+
+/// A figure to four significant digits.
+fn round_figure(value: f64) -> f64 {
+    if value == 0.0 || !value.is_finite() {
+        return value;
+    }
+
+    let scale = 10f64.powi(3 - value.abs().log10().floor() as i32);
+    (value * scale).round() / scale
+}
+
 /// The `muructl overlay` subcommands (section 9.10).
 #[derive(Subcommand)]
 pub enum OverlayCommand {

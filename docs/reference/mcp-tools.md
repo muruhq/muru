@@ -15,6 +15,7 @@ ones it names.
 | `list` | reads | `muructl app list`, `release list`, `host list`, `route list`, `upstream list`, `rollout status` or `overlay list` | `what` (apps, releases, hosts, routes, upstreams, rollouts, overlays), `app` |
 | `release` | reads | `muructl release show` | `release` (app@release) |
 | `commands` | reads | `muructl command list` | `target` |
+| `conditions` | reads | `muructl condition list`, or with `name` `muructl condition show` | `name` |
 | `command_runs` | reads | `muructl command runs` | `app`, `name` |
 | `command_run` | reads | `muructl command status`, or with `output` `muructl command logs --lines`, as an array of lines | `run`, `output` (how many of the last lines) |
 | `events` | reads | `muructl events` | `after` (a sequence number) |

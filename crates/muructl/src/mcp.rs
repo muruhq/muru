@@ -761,6 +761,17 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "conditions",
+            description: "The named conditions over Muru's signals (error rates, request shares, latency, queues, scaling, memory, upstream health): each one's state, firing, resolved or unknown, and since when; with name, one condition's terms and each one's figure now, or why it is unknown.",
+            changes: false,
+            properties: json!({"name": {"type": "string", "description": "One condition, for its terms' figures"}}),
+            required: &[],
+            command: |arguments| match text(arguments, "name") {
+                Some(name) => Ok([words(&["condition", "show"]), vec![name]].concat()),
+                None => Ok(words(&["condition", "list"])),
+            },
+        },
+        Spec {
             name: "command_runs",
             description: "The runs the daemon keeps of an application's commands, or of one command, those under way first: each run's id, command, release, trigger (manual, schedule or a gate), start, and how it ended.",
             changes: false,

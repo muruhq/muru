@@ -526,6 +526,9 @@ pub struct Scaler {
     points: VecDeque<Point>,
     queue: VecDeque<(Instant, Buckets)>,
     out_since: Option<Instant>,
+    /// Whether, at the last observation, the signals asked for more
+    /// workers than the ceiling allows.
+    short_at_ceiling: bool,
     last_out: Option<Instant>,
     last_step: u32,
     last_in: Option<Instant>,
@@ -592,6 +595,7 @@ impl Scaler {
             points: VecDeque::new(),
             queue: VecDeque::new(),
             out_since: None,
+            short_at_ceiling: false,
             last_out: None,
             last_step: 1,
             last_in: None,
@@ -677,6 +681,12 @@ impl Scaler {
         if self.pinned.is_none() {
             self.desired = current;
         }
+    }
+
+    /// Whether the count wanted is the most the group may have while its
+    /// signals ask for more, as of the last observation.
+    pub fn at_max_wanting_more(&self) -> bool {
+        self.short_at_ceiling
     }
 
     /// Reaps in the last hour, for the budget and the metrics.
@@ -1097,6 +1107,8 @@ impl Scaler {
             ScalingMode::Static => (false, String::new()),
         };
 
+        self.short_at_ceiling = short && self.desired >= self.ceiling();
+
         if !short || self.desired >= self.ceiling() {
             self.out_since = None;
             return None;
@@ -1345,6 +1357,18 @@ impl GroupScaling {
             hard_limit: None,
             denied: None,
         }
+    }
+
+    /// Whether the group is at its most workers and its signals ask for
+    /// more (issue 123's `scaling_at_max`).
+    pub fn at_max_wanting_more(&self) -> bool {
+        self.scaler.at_max_wanting_more()
+    }
+
+    /// Whether the node's budget refuses a scale-out the group wants (issue
+    /// 123's `scaling_denied`).
+    pub fn denied(&self) -> bool {
+        self.denied.is_some()
     }
 
     /// Take one second's samples for the group of release `app@id`, with

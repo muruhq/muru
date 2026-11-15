@@ -1235,6 +1235,29 @@ impl Admin for Service {
         Ok(Response::new(Box::pin(stream)))
     }
 
+    async fn list_conditions(
+        &self,
+        request: Request<pb::ListConditionsRequest>,
+    ) -> Result<Response<pb::ListConditionsResponse>, Status> {
+        let name = request.into_inner().name;
+        let conditions: Vec<pb::ConditionStatus> = self
+            .handle
+            .info
+            .conditions
+            .lock()
+            .expect("conditions poisoned")
+            .iter()
+            .filter(|status| name.is_empty() || status.name == name)
+            .map(condition_message)
+            .collect();
+
+        if !name.is_empty() && conditions.is_empty() {
+            return Err(Status::not_found(format!("no condition named {name}")));
+        }
+
+        Ok(Response::new(pb::ListConditionsResponse { conditions }))
+    }
+
     async fn list_command_runs(
         &self,
         request: Request<pb::ListCommandRunsRequest>,
@@ -4024,6 +4047,44 @@ fn requested_by<T>(request: &Request<T>) -> String {
             || "unknown".to_owned(),
             |credentials| crate::processes::user_name(credentials.uid()),
         )
+}
+
+/// A condition's state as the admin API gives it.
+fn condition_message(status: &crate::conditions::Status) -> pb::ConditionStatus {
+    pb::ConditionStatus {
+        name: status.name.clone(),
+        state: status.state.as_str().to_owned(),
+        held: status.held.as_str().to_owned(),
+        since_unix_ms: status.since_unix_ms,
+        source: status.source.to_owned(),
+        when: status.table.when.clone(),
+        r#for: status.table.for_.clone().unwrap_or_default(),
+        clear_when: status.table.clear_when.clone().unwrap_or_default(),
+        clear_for: status.table.clear_for.clone().unwrap_or_default(),
+        min_requests: status
+            .table
+            .min_requests
+            .unwrap_or(muru_config::condition::DEFAULT_MIN_REQUESTS),
+        unknown: status.unknown.clone().unwrap_or_default(),
+        terms: status
+            .terms
+            .iter()
+            .map(|(term, value)| match value {
+                crate::conditions::Value::Known(value) => pb::ConditionTerm {
+                    term: term.clone(),
+                    known: true,
+                    value: *value,
+                    unknown: String::new(),
+                },
+                crate::conditions::Value::Unknown(why) => pb::ConditionTerm {
+                    term: term.clone(),
+                    known: false,
+                    value: 0.0,
+                    unknown: why.clone(),
+                },
+            })
+            .collect(),
+    }
 }
 
 /// A run as the admin API gives it.

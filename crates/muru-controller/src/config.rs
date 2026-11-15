@@ -149,6 +149,20 @@ pub enum Action {
         /// The overlay's name.
         name: String,
     },
+    /// Create or replace a named condition (section 9.10).
+    PutCondition {
+        /// The condition's name.
+        name: String,
+        /// Its declaration.
+        condition: Box<muru_config::Condition>,
+        /// Whether it is new rather than changed.
+        new: bool,
+    },
+    /// Drop a named condition (prune).
+    RemoveCondition {
+        /// The condition's name.
+        name: String,
+    },
     /// Create or replace a client class (section 4.14).
     PutClientClass {
         /// Its rule.
@@ -228,6 +242,9 @@ impl Action {
             Action::PutOverlay { new: true, .. } => "create-overlay",
             Action::PutOverlay { new: false, .. } => "update-overlay",
             Action::RemoveOverlay { .. } => "remove-overlay",
+            Action::PutCondition { new: true, .. } => "create-condition",
+            Action::PutCondition { new: false, .. } => "update-condition",
+            Action::RemoveCondition { .. } => "remove-condition",
             Action::PutClientClass { new: true, .. } => "create-client-class",
             Action::PutClientClass { new: false, .. } => "update-client-class",
             Action::RemoveClientClass { .. } => "remove-client-class",
@@ -314,6 +331,9 @@ impl Change {
             }
             Action::PutOverlay { name, .. } | Action::RemoveOverlay { name } => {
                 format!("overlay {name}")
+            }
+            Action::PutCondition { name, .. } | Action::RemoveCondition { name } => {
+                format!("condition {name}")
             }
             Action::PutClientClass { class, .. } => format!("client_class {}", class.name),
             Action::RemoveClientClass { name } => format!("client_class {name}"),
@@ -599,6 +619,7 @@ pub fn plan(
     plan_upstreams(store, document, &mut plan);
     plan_routes(store, document, defined, &mut plan);
     plan_overlays(store, document, defined, prune, &mut plan);
+    plan_conditions(store, document, &mut plan);
     plan.changes.extend(promotions);
     plan_budget(document, defined, &mut plan);
 
@@ -1939,6 +1960,35 @@ fn stored_routes_named(
         .collect()
 }
 
+/// Section 9.10 (issue 123): the named conditions a document declares,
+/// each checked, with a warning for one with no hysteresis.
+fn plan_conditions(store: &Store, document: &Document, plan: &mut Plan) {
+    let stored: BTreeMap<String, muru_config::Condition> =
+        store.conditions().unwrap_or_default().into_iter().collect();
+
+    for (name, condition) in &document.condition {
+        match muru_config::condition::check(name, condition) {
+            Ok(warnings) => plan.warnings.extend(warnings),
+            Err(error) => {
+                plan.errors.push(error);
+                continue;
+            }
+        }
+
+        match stored.get(name) {
+            Some(recorded) if recorded == condition => plan.unchanged += 1,
+            recorded => plan.changes.push(Change {
+                action: Action::PutCondition {
+                    name: name.clone(),
+                    condition: Box::new(condition.clone()),
+                    new: recorded.is_none(),
+                },
+                detail: condition.when.clone(),
+            }),
+        }
+    }
+}
+
 /// Section 9.10: the overlays a document declares, checked against the
 /// routes, applications, upstreams and rate limits they name, and
 /// against each other.
@@ -2408,6 +2458,15 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         }
     }
 
+    for (name, _) in store.conditions().unwrap_or_default() {
+        if !document.condition.contains_key(&name) {
+            plan.changes.push(Change {
+                action: Action::RemoveCondition { name },
+                detail: "not declared".to_owned(),
+            });
+        }
+    }
+
     let (schedules, _) = schedule_overlays(document);
 
     for (name, _) in store.overlays().unwrap_or_default() {
@@ -2663,6 +2722,12 @@ fn write(
             writes.put_overlay(name, overlay).map(|()| made(*new))?
         }
         Action::RemoveOverlay { name } => writes.delete_overlay(name).map(|()| "removed")?,
+        Action::PutCondition {
+            name,
+            condition,
+            new,
+        } => writes.put_condition(name, condition).map(|()| made(*new))?,
+        Action::RemoveCondition { name } => writes.delete_condition(name).map(|()| "removed")?,
         Action::PutClientClass {
             class,
             position,
@@ -2889,6 +2954,13 @@ pub fn export(store: &Store, app: Option<&str>) -> Result<Document, StoreError> 
         if relevant {
             document.overlay.insert(name, overlay);
         }
+    }
+
+    // Named conditions (section 9.10) belong to no application, so come
+    // along whole only when none is asked for.
+
+    if app.is_none() {
+        document.condition = store.conditions()?.into_iter().collect();
     }
 
     Ok(document)

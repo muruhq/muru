@@ -16,6 +16,7 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub mod condition;
 pub mod cron;
 pub mod schema;
 
@@ -1799,6 +1800,36 @@ pub struct Dashboard {
     /// 127.0.0.1:8090; not served when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
+}
+
+/// A named condition over Muru's own signals (section 9.10): when it fires
+/// and when it resolves, evaluated by the daemon every second. Nothing
+/// acts on a condition but what names it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Condition {
+    /// The expression that fires the condition, such as
+    /// `error_rate{app='shop'} > 0.2`.
+    pub when: String,
+    /// How long `when` must hold at every evaluation before the condition
+    /// fires, such as `1m`.
+    #[serde(default, rename = "for", skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "0s"))]
+    pub for_: Option<String>,
+    /// The expression that resolves it; without one, it resolves when
+    /// `when` has not held for `clear_for`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_when: Option<String>,
+    /// How long the condition must be clear at every evaluation before it
+    /// resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "0s"))]
+    pub clear_for: Option<String>,
+    /// The requests a share, error rate or latency needs in its window to
+    /// be a figure; fewer leave the term unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 100))]
+    pub min_requests: Option<u64>,
 }
 
 /// The `[overlay_webhook]` table (section 9.10): where the daemon takes
@@ -5076,6 +5107,10 @@ pub struct Document {
     /// the routes and applications while active.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub overlay: BTreeMap<String, Overlay>,
+    /// Named conditions over Muru's own signals (section 9.10), from the
+    /// daemon's own file or an applied one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub condition: BTreeMap<String, Condition>,
     /// Routes, in the order written.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route: Vec<Route>,
@@ -5122,6 +5157,14 @@ impl Document {
             }
 
             self.overlay.insert(name, overlay);
+        }
+
+        for (name, condition) in other.condition {
+            if self.condition.contains_key(&name) {
+                return Err(format!("condition {name} is declared twice"));
+            }
+
+            self.condition.insert(name, condition);
         }
 
         if other.limits.is_some() {

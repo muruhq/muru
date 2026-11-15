@@ -130,6 +130,10 @@ synchronised, and raises a `clock.unsynchronised` warning when it is not
 
 ## The webhook
 
+A [condition](conditions.md) says when something holds over Muru's own
+figures, such as an error rate or a crawler surge, which is how to watch
+for what an overlay would answer.
+
 Monitoring and alerting systems can activate and end overlays that
 declare `trigger = { external = true }`, beside a schedule or alone,
 through a signed webhook. It is served on its own address, given in the

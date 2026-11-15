@@ -824,6 +824,9 @@ pub struct Info {
     /// The instances of each managed server release (section 9.9), by
     /// application and release, as the daemon last checked them.
     pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceRecord>>>,
+    /// Section 9.10 (issue 123): the conditions and their states, as of the
+    /// last evaluation.
+    pub conditions: std::sync::Mutex<Vec<crate::conditions::Status>>,
     /// What runs for each release now, by application and release, as the
     /// daemon last published it.
     pub live: std::sync::Mutex<HashMap<(String, String), LiveRelease>>,
@@ -1257,6 +1260,10 @@ struct Daemon {
     /// The daemon file's client classes and rate limits (sections 4.14
     /// and 4.15).
     client_rules: crate::clients::FileRules,
+    /// Section 9.10 (issue 123): the conditions the daemon's file
+    /// declares, and the evaluator of those and the applied ones.
+    file_conditions: BTreeMap<String, muru_config::Condition>,
+    conditions: crate::conditions::Engine,
     /// Those with the applied files', for every snapshot, with the list
     /// files they were read from.
     clients: crate::clients::ClientPolicies,
@@ -1542,6 +1549,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         pass_env: std::sync::RwLock::new(settings.pass_env.clone()),
         service,
         servers: std::sync::Mutex::new(HashMap::new()),
+        conditions: std::sync::Mutex::new(Vec::new()),
         provisioning,
         started: std::sync::atomic::AtomicBool::new(false),
         stopping: std::sync::atomic::AtomicBool::new(false),
@@ -1705,6 +1713,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         error_pages,
         error_override,
         client_rules,
+        file_conditions: settings.conditions.clone(),
+        conditions: crate::conditions::Engine::default(),
         clients,
         enforcement: crate::clients::Enforcement::default(),
         maintenance: HashMap::new(),
@@ -1889,6 +1899,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 };
 
                 daemon.sample_history(samples.as_deref()).await;
+                daemon.evaluate_conditions(samples.as_deref());
                 daemon.advance_rollouts(samples.as_deref()).await;
                 daemon.autoscale(samples.as_deref()).await;
                 daemon.guard_memory();
@@ -3113,6 +3124,14 @@ impl Daemon {
         self.client_rules = settings.client_rules;
         self.clients = clients;
 
+        if self.file_conditions != settings.conditions {
+            self.file_conditions = settings.conditions;
+            self.load_conditions();
+            report.changed("[condition]", "at once");
+        } else {
+            report.unchanged("[condition]");
+        }
+
         // Section 7.4: the budget.
 
         if settings.budget != self.budget_table {
@@ -4204,6 +4223,7 @@ impl Daemon {
         // Issue 688: the runs a previous daemon left under way.
 
         self.runs.adopt();
+        self.load_conditions();
 
         self.maintenance = self
             .store
@@ -4518,6 +4538,77 @@ impl Daemon {
                 false
             }
         }
+    }
+
+    /// Section 9.10 (issue 123): give the evaluator the conditions declared
+    /// now, the daemon's file's and the applied files', a name the file
+    /// declares staying the file's, as for rate limits.
+    fn load_conditions(&mut self) {
+        let mut declared: Vec<(String, muru_config::Condition, &'static str)> = self
+            .file_conditions
+            .iter()
+            .map(|(name, condition)| (name.clone(), condition.clone(), "file"))
+            .collect();
+
+        for (name, condition) in self.store.conditions().unwrap_or_default() {
+            if self.file_conditions.contains_key(&name) {
+                tracing::warn!(condition = %name, "the daemon's file declares an applied condition too; its table stands");
+            } else {
+                declared.push((name, condition, "applied"));
+            }
+        }
+
+        for error in self.conditions.set(declared) {
+            tracing::warn!("{error}");
+        }
+
+        self.publish_conditions();
+    }
+
+    /// Section 9.10 (issue 123): evaluate every condition over this
+    /// second's figures, raising its events, and publish their states.
+    fn evaluate_conditions(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
+        if self.conditions.is_empty() {
+            return;
+        }
+
+        let mut scaling = Vec::new();
+
+        for ((app, _), running) in &self.running {
+            for group in &running.scalers {
+                scaling.push((
+                    app.clone(),
+                    group.name.clone(),
+                    group.at_max_wanting_more(),
+                    group.denied(),
+                ));
+            }
+        }
+
+        let budget = self.budget();
+        let figures = crate::conditions::Figures {
+            scaling,
+            node_memory_available: budget
+                .memory
+                .map(|limit| limit.saturating_sub(self.budget_usage().memory) as f64),
+        };
+
+        let events = self.conditions.observe(
+            crate::model::now_unix_ms(),
+            samples.unwrap_or_default(),
+            &figures,
+        );
+
+        for (kind, subject, level, message) in events {
+            self.events.emit(kind, &subject, level, &message);
+        }
+
+        self.publish_conditions();
+    }
+
+    /// The conditions' states, for the admin API.
+    fn publish_conditions(&self) {
+        *self.info.conditions.lock().expect("conditions poisoned") = self.conditions.statuses();
     }
 
     /// Section 9.12 (issue 268): run each command whose cron schedule is
@@ -7434,7 +7525,8 @@ impl Daemon {
             self.events.emit(kind, subject, "notice", message);
         }
 
-        // The applied client classes and limits may have changed.
+        // The applied client classes and limits may have changed, and so
+        // may the conditions.
 
         match self.client_rules.policies(&self.store) {
             Ok(clients) => self.clients = clients,
@@ -7442,6 +7534,8 @@ impl Daemon {
                 tracing::warn!(%error, "the client classes stay as they were");
             }
         }
+
+        self.load_conditions();
 
         let started = self.start_referenced().await;
         self.refresh_certificates(true);

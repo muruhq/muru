@@ -1291,6 +1291,15 @@ impl Admin for Service {
         Ok(Response::new(Box::pin(stream)))
     }
 
+    async fn list_conditions(
+        &self,
+        _request: Request<pb::ListConditionsRequest>,
+    ) -> Result<Response<pb::ListConditionsResponse>, Status> {
+        Err(Status::failed_precondition(
+            "conditions are evaluated by the daemon; a run has none",
+        ))
+    }
+
     async fn list_command_runs(
         &self,
         _request: Request<pb::ListCommandRunsRequest>,

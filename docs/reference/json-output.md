@@ -91,6 +91,8 @@ $ muructl release show shop@r9 --json
 | `muructl secret list` | `{"store": ..., "keys": [...]}`; values are never shown |
 | `muructl events` | `{"events": [...]}`, each with `sequence`, `time_unix_ms`, `type`, `subject`, `level`, `message`; with `--follow`, one event per line |
 | `muructl logs` | One line per log line: a release's output as `{"app", "release", "line"}`, the access log (`--access`) as the records it keeps, the edge's and the daemon's own logs (`--edge`, `--daemon`) as `{"app", "release", "line"}` with `app` and `release` empty |
+| `muructl condition list` | `conditions`, each as `muructl condition show` prints it |
+| `muructl condition show` | The condition: `name`, `state` (`firing`, `resolved` or `unknown`), `held` (the state it holds while unknown), `since_unix_ms` (0 before its first figure), `source` (`file` or `applied`), `when`, `for`, `clear_when`, `clear_for`, `min_requests`, `unknown` (why, when it is), and `terms`, each with `term`, `known`, `value` in base units when known and `unknown` when not |
 | `muructl command list` | `app`, `release` and `commands`, each with `name`, `description`, `run` or `call`, `inputs` (`name`, `description`, `required`, `default`, `pattern`, `secret`), `timeout`, `exclusive`, `schedule` (in words, empty for none) and `next_run_unix_ms`, `gates` (`before_fork`, `before_promote`) and `every_start`, and its `last_run` (`release`, `started_unix_ms`, `duration_ms`, `exit_code`, `ok`, `message`), which only the daemon keeps. `release` is empty for a project's commands listed with nothing serving it |
 | `muructl command logs` | One object per line of the run's output, with `app`, `release` and `line` |
 | `muructl command run` | As `muructl exec` prints it |

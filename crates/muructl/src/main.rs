@@ -188,6 +188,13 @@ enum Command {
         command: admin::OverlayCommand,
     },
 
+    /// Named conditions over Muru's own signals: each one's state, or
+    /// one's terms and their figures now.
+    Condition {
+        #[command(subcommand)]
+        command: admin::ConditionCommand,
+    },
+
     /// Serve an application's maintenance page at the edge, or serve it
     /// as usual again.
     Maintenance {
@@ -1212,6 +1219,7 @@ fn main() -> anyhow::Result<()> {
         Command::Maintenance { command } => runtime.block_on(admin::maintenance(command)),
         Command::Dashboard { command } => runtime.block_on(admin::dashboard(command)),
         Command::Overlay { command } => runtime.block_on(admin::overlay(command)),
+        Command::Condition { command } => runtime.block_on(admin::condition(command)),
         Command::Status {
             socket,
             processes,

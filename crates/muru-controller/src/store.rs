@@ -108,6 +108,11 @@ CREATE TABLE IF NOT EXISTS overlays (
     spec TEXT NOT NULL,
     resource_version INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS conditions (
+    name TEXT PRIMARY KEY,
+    spec TEXT NOT NULL,
+    resource_version INTEGER NOT NULL DEFAULT 1
+);
 CREATE TABLE IF NOT EXISTS overlay_state (
     name TEXT PRIMARY KEY,
     active INTEGER NOT NULL,
@@ -175,7 +180,7 @@ CREATE TABLE IF NOT EXISTS log_files_seen (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 /// The store.
 pub struct Store {
@@ -210,8 +215,9 @@ impl Store {
         // applied files declare a release (section 9.1), added to an older
         // table here, version 15 the file last seen at each log's path
         // (section 11.3), version 16 the runs of commands kept in place of
-        // each command's last run (issue 688), and version 17 the gates
-        // each release has passed (issue 266).
+        // each command's last run (issue 688), version 17 the gates each
+        // release has passed (issue 266), and version 18 the named
+        // conditions of applied files (issue 123).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -720,6 +726,25 @@ impl Store {
     /// Remove a rate limit.
     pub fn delete_rate_limit(&self, name: &str) -> Result<(), StoreError> {
         self.with(|connection| Writes { connection }.delete_rate_limit(name))
+    }
+
+    /// Every condition applied files declare, by name (section 9.10).
+    pub fn conditions(&self) -> Result<Vec<(String, muru_config::Condition)>, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT name, spec FROM conditions ORDER BY name")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut conditions = Vec::new();
+
+            for row in rows {
+                let (name, encoded) = row?;
+                conditions.push((name, decode(&encoded)?));
+            }
+
+            Ok(conditions)
+        })
     }
 
     /// Every overlay declared, by name (section 9.10).
@@ -1663,6 +1688,30 @@ impl Writes<'_> {
                  resource_version = resource_version + 1",
             params![name, encoded],
         )?;
+        Ok(())
+    }
+
+    /// Create or replace a condition's declaration.
+    pub fn put_condition(
+        &self,
+        name: &str,
+        condition: &muru_config::Condition,
+    ) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(condition).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.connection.execute(
+            "INSERT INTO conditions (name, spec) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+            params![name, encoded],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a condition's declaration.
+    pub fn delete_condition(&self, name: &str) -> Result<(), StoreError> {
+        self.connection
+            .execute("DELETE FROM conditions WHERE name = ?1", [name])?;
         Ok(())
     }
 

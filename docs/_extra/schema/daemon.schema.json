@@ -658,6 +658,41 @@
       },
       "type": "object"
     },
+    "Condition": {
+      "additionalProperties": false,
+      "description": "A named condition over Muru's own signals: when it fires and when it resolves, evaluated by the daemon every second. Nothing acts on a condition but what names it.",
+      "properties": {
+        "clear_for": {
+          "default": "0s",
+          "description": "How long the condition must be clear at every evaluation before it resolves.",
+          "type": "string"
+        },
+        "clear_when": {
+          "description": "The expression that resolves it; without one, it resolves when `when` has not held for `clear_for`.",
+          "type": "string"
+        },
+        "for": {
+          "default": "0s",
+          "description": "How long `when` must hold at every evaluation before the condition fires, such as `1m`.",
+          "type": "string"
+        },
+        "min_requests": {
+          "default": 100,
+          "description": "The requests a share, error rate or latency needs in its window to be a figure; fewer leave the term unknown.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "when": {
+          "description": "The expression that fires the condition, such as `error_rate{app='shop'} > 0.2`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "when"
+      ],
+      "type": "object"
+    },
     "Daemon": {
       "additionalProperties": false,
       "description": "The `[daemon]` table of the daemon's file: how the daemon itself runs.",
@@ -3310,6 +3345,13 @@
     "compression": {
       "$ref": "#/$defs/Compression",
       "description": "How responses are compressed."
+    },
+    "condition": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Condition"
+      },
+      "description": "Named conditions over Muru's own signals, from the daemon's own file or an applied one.",
+      "type": "object"
     },
     "daemon": {
       "$ref": "#/$defs/Daemon",
