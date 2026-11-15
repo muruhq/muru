@@ -122,13 +122,35 @@ The browser decides what the list holds, and the tab states its limits:
   started are all listed. The tab says when the browser's list was full.
 
 - Redirects that led to the page are not shown: the document's row is
-  the response that ended them.
+  the response that ended them. The History tab shows them.
 
 - A page that is not a secure context gets no `Server-Timing` from the
   browser, so only the document's own row has its record. `localhost`,
   a loopback address and an HTTPS page are secure contexts; a name given
   with `--host` and served over plain HTTP is not, and is served over
   HTTPS with [`--https`](https.md).
+
+### The pages before this one
+
+The toolbar's History tab lists the run's recent document requests,
+newest first: the pages a browser loaded and the forms it submitted,
+each with when it arrived, its method and target, status, total time,
+time waiting for a worker, the worker, and its log records and errors.
+The entry of the page the toolbar is on is marked "this page".
+
+A redirect is shown with the request it led to, so a form's POST that
+redirects to a page, or a chain of redirects, reads as one entry with
+its steps in order: the POST that did the work, then the GET the
+browser made of its `Location`. A request is taken as following a
+redirect when it is the next document request from the same client, to
+the redirect's `Location`, within 5 seconds of the redirect's response
+ending.
+
+Clicking a step opens its record, with its own panels, as clicking a row
+of "This page" does, so the queries and log records of the POST are a
+click away from the page it led to. The list comes from the records the
+run keeps, its last 1000 requests, so a request whose record is no
+longer kept is not listed, and at most the newest 100 entries are shown.
 
 ### Content security policy
 
@@ -150,11 +172,14 @@ own address, answered by Muru without reaching the application:
 | `/_muru/requests/ID.json` | the record, as `muructl debug request ID --json` prints it |
 | `/_muru/requests/ID/panels/NAME.html` | one panel of the record, drawn |
 | `/_muru/requests?ids=ID,ID` | what the "This page" tab shows of each request named, at most 100 |
+| `/_muru/history` | what the History tab shows: the recent document requests, redirects joined to where they led |
 
 `requests?ids=` answers with `requests`, one entry for each request
 named that is still kept, with its method, target, status, times,
 worker, counts of log records and errors, connection and the address of
 its page on the dashboard, and `not_kept`, the IDs of the rest.
+`history` answers `entries`, newest first, each with its `steps` in
+order, in the same shape.
 
 They answer GET only, with or without `--toolbar`, and only to requests
 for `localhost`, a loopback address or a name the run was given with

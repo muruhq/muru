@@ -565,6 +565,23 @@ def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) 
         assert refused.status == 403
         rebound = server.get(f"/_muru/requests/{request_id}.json", headers={"Host": "evil.test"})
         assert rebound.status == 403
+
+        # Issue 708: a form's POST that redirects, then the page it led
+        # to, are one entry of the history, the newest, with its steps.
+
+        document = {"Sec-Fetch-Dest": "document"}
+        posted = server.request("POST", "/form", body=b"name=x", headers=document)
+        assert posted.status == 303
+        landed = server.get("/page", headers=document)
+        entries = json.loads(server.get("/_muru/history").body)["entries"]
+        assert [(step["method"], step["target"]) for step in entries[0]["steps"]] == [
+            ("POST", "/form"),
+            ("GET", "/page"),
+        ], entries
+        assert entries[0]["steps"][1]["request_id"] == landed.header("x-request-id")
+        assert all(
+            step["target"] != "/_muru/history" for entry in entries for step in entry["steps"]
+        )
     finally:
         server.stop()
 

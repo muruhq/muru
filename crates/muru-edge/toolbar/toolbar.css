@@ -28,6 +28,14 @@
 .page tr.pick { cursor: pointer; }
 .page tr.pick:hover td { background: rgba(47, 111, 222, 0.08); }
 .page tr.shown td { background: rgba(47, 111, 222, 0.16); }
+/* The History tab: each entry a group of steps, the page's own marked. */
+.history tbody.entry { border-top: 2px solid rgba(127, 127, 127, 0.35); }
+.history tbody.entry.here td:first-child { box-shadow: inset 3px 0 0 #2f6fde; }
+.history .badge-here { margin-left: 0.4em; font-size: 0.85em; font-weight: 600; color: #2f6fde; }
+@media (prefers-color-scheme: dark) {
+  .history tbody.entry.here td:first-child { box-shadow: inset 3px 0 0 #7aa7ff; }
+  .history .badge-here { color: #7aa7ff; }
+}
 .panel .page .track { min-width: 10rem; }
 .panel .page .bar.queue { background: #5b8def; }
 .panel .page tr.plain .bar { background: #9fb3c8; }

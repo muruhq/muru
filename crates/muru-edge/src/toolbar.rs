@@ -82,6 +82,7 @@ pub fn answer(
         "toolbar.js" => content("text/javascript", Bytes::from_static(SCRIPT.as_bytes())),
         "toolbar.css" => content("text/css", Bytes::from(stylesheet())),
         "requests" => batch(parts.uri.query(), links, recorder),
+        "history" => history(links, recorder),
         _ => record_path(within, recorder, renderer),
     };
 
@@ -158,6 +159,8 @@ struct Summary {
     connection_position: u64,
     /// The request's page on the dashboard, when the dashboard is on.
     link: Option<String>,
+    /// When the request arrived, in Unix milliseconds.
+    started_unix_ms: u64,
 }
 
 impl Summary {
@@ -197,6 +200,7 @@ impl Summary {
                 .as_ref()
                 .map_or(0, |connection| connection.position),
             link: links.request_page(&record.request_id),
+            started_unix_ms: record.started_unix_ms,
         }
     }
 }
@@ -242,6 +246,140 @@ fn batch(query: Option<&str>, links: &Links, recorder: &Recorder) -> Response<Re
 
     let body = serde_json::json!({ "requests": requests, "not_kept": not_kept });
     content("application/json", Bytes::from(body.to_string()))
+}
+
+/// The most entries the History tab is given, the newest.
+pub const HISTORY_ENTRIES: usize = 100;
+
+/// How long after a redirect's response ended the browser's next document
+/// request from the same client is still taken as following it.
+pub const REDIRECT_WINDOW_MS: u64 = 5_000;
+
+/// One document request, as the History tab joins them.
+#[derive(Debug)]
+struct Document {
+    summary: Summary,
+    client: String,
+    /// When the response ended, or arrived for one still in progress.
+    ended_unix_ms: u64,
+    /// The path and query a redirect's Location names, as the request's
+    /// target would be written.
+    location: Option<String>,
+}
+
+/// One entry of the History tab: a document request, or a chain of
+/// redirects and the request they led to, in order.
+#[derive(Debug, Serialize)]
+struct Entry {
+    steps: Vec<Summary>,
+}
+
+/// `history`: the run's recent document requests, newest first, each
+/// redirect joined to the request it led to (issue 708).
+fn history(links: &Links, recorder: &Recorder) -> Response<ResponseBody> {
+    let documents = recorder.read_all(|record| document(record, links));
+    let entries = joined(documents);
+    let body = serde_json::json!({ "entries": entries, "window_ms": REDIRECT_WINDOW_MS });
+    content("application/json", Bytes::from(body.to_string()))
+}
+
+/// A record as a document request, when a browser made it as one: a
+/// navigation or a form's submission, which say `Sec-Fetch-Dest:
+/// document`.
+fn document(record: &admin::RequestRecord, links: &Links) -> Option<Document> {
+    let header = |name: &str| {
+        record
+            .request_headers
+            .iter()
+            .chain(&record.response_headers)
+            .find(|header| header.name.eq_ignore_ascii_case(name))
+            .map(|header| header.value.as_str())
+    };
+
+    if !header("sec-fetch-dest").is_some_and(|dest| dest.eq_ignore_ascii_case("document")) {
+        return None;
+    }
+
+    let location = (300..400)
+        .contains(&record.status)
+        .then(|| {
+            record
+                .response_headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("location"))
+        })
+        .flatten()
+        .map(|header| resolved(&record.target, &header.value));
+
+    Some(Document {
+        summary: Summary::of(record, links),
+        client: record.client.clone(),
+        ended_unix_ms: record.started_unix_ms + record.total_ms.max(0.0) as u64,
+        location,
+    })
+}
+
+/// A Location as the path and query of the request it leads to: an
+/// absolute URL's own, a path as it is, and a relative reference against
+/// the directory of the target it answered.
+fn resolved(target: &str, location: &str) -> String {
+    if let Some(rest) = location
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .or_else(|| location.strip_prefix("//"))
+    {
+        return rest
+            .find('/')
+            .map_or_else(|| "/".to_owned(), |at| rest[at..].to_owned());
+    }
+
+    if location.starts_with('/') {
+        return location.to_owned();
+    }
+
+    let path = target.split('?').next().unwrap_or(target);
+    let directory = path.rfind('/').map_or("/", |at| &path[..=at]);
+
+    if location.starts_with('?') {
+        return format!("{path}{location}");
+    }
+
+    format!("{directory}{location}")
+}
+
+/// Join each redirect to the document request it led to: the next one
+/// from the same client, to its Location, within the window after its
+/// response ended. Chains come out newest first by their last step.
+fn joined(documents: Vec<Document>) -> Vec<Entry> {
+    let mut chains: Vec<Vec<Document>> = Vec::new();
+
+    for document in documents {
+        let follows = chains.iter().rposition(|chain| {
+            let last = chain.last().expect("a chain has a step");
+
+            last.location.as_deref() == Some(document.summary.target.as_str())
+                && last.client == document.client
+                && document.summary.started_unix_ms + 1 >= last.ended_unix_ms
+                && document.summary.started_unix_ms <= last.ended_unix_ms + REDIRECT_WINDOW_MS
+        });
+
+        match follows {
+            Some(at) => chains[at].push(document),
+            None => chains.push(vec![document]),
+        }
+    }
+
+    chains.sort_by_key(|chain| {
+        std::cmp::Reverse(chain.last().map_or(0, |last| last.summary.started_unix_ms))
+    });
+
+    chains
+        .into_iter()
+        .take(HISTORY_ENTRIES)
+        .map(|chain| Entry {
+            steps: chain.into_iter().map(|step| step.summary).collect(),
+        })
+        .collect()
 }
 
 fn not_kept(request_id: &str) -> Response<ResponseBody> {
@@ -942,5 +1080,95 @@ mod tests {
         );
         assert!(allowed(&headers("127.0.0.1", Some("cross-site")), &hosts).is_err());
         assert!(allowed(&headers("127.0.0.1", Some("same-site")), &hosts).is_err());
+    }
+
+    #[test]
+    fn a_redirect_is_joined_to_the_document_request_it_led_to() {
+        let links = Links::default();
+        let at = |request_id: &str, method: &str, target: &str, status: u32, started: u64| {
+            admin::RequestRecord {
+                request_id: request_id.to_owned(),
+                method: method.to_owned(),
+                target: target.to_owned(),
+                status,
+                client: "127.0.0.1".to_owned(),
+                started_unix_ms: started,
+                total_ms: 10.0,
+                request_headers: vec![admin::RecordedHeader {
+                    name: "sec-fetch-dest".to_owned(),
+                    value: "document".to_owned(),
+                }],
+                ..Default::default()
+            }
+        };
+        let redirect = |request_id: &str, target: &str, location: &str, started: u64| {
+            let mut record = at(request_id, "POST", target, 303, started);
+            record.response_headers.push(admin::RecordedHeader {
+                name: "Location".to_owned(),
+                value: location.to_owned(),
+            });
+            record
+        };
+
+        // A form's POST that redirects twice, then the page it ended on;
+        // a fetch between them is no document request.
+
+        let mut fetched = at("F", "GET", "/api", 200, 1_005);
+        fetched.request_headers[0].value = "empty".to_owned();
+        let mut other_client = at("X", "GET", "/done", 200, 1_030);
+        other_client.client = "127.0.0.2".to_owned();
+
+        let records = [
+            at("P0", "GET", "/form", 200, 900),
+            redirect(
+                "A",
+                "/orders/new",
+                "http://localhost:8080/orders/7?saved=1",
+                1_000,
+            ),
+            fetched,
+            other_client,
+            redirect("B", "/orders/7?saved=1", "done", 1_020),
+            at("C", "GET", "/orders/done", 200, 1_040),
+            // Too late to be the one a redirect led to.
+            redirect("D", "/old", "/new", 2_000),
+            at("E", "GET", "/new", 200, 2_010 + REDIRECT_WINDOW_MS + 1),
+        ];
+
+        let documents = records
+            .iter()
+            .filter_map(|record| document(record, &links))
+            .collect();
+        let entries = joined(documents);
+        let ids: Vec<Vec<&str>> = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .steps
+                    .iter()
+                    .map(|step| step.request_id.as_str())
+                    .collect()
+            })
+            .collect();
+
+        assert_eq!(
+            ids,
+            [
+                vec!["E"],
+                vec!["D"],
+                vec!["A", "B", "C"],
+                vec!["X"],
+                vec!["P0"]
+            ]
+        );
+    }
+
+    #[test]
+    fn a_location_is_read_as_the_target_it_leads_to() {
+        assert_eq!(resolved("/a/b", "http://host:8080/c?d=1"), "/c?d=1");
+        assert_eq!(resolved("/a/b", "//host"), "/");
+        assert_eq!(resolved("/a/b", "/c"), "/c");
+        assert_eq!(resolved("/a/b?x=1", "c"), "/a/c");
+        assert_eq!(resolved("/a/b?x=1", "?y=2"), "/a/b?y=2");
     }
 }

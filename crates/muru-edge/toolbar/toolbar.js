@@ -1,6 +1,7 @@
 // The development toolbar (design specification section 4.20): a badge
 // on the page for the request that produced it, opening to the panels of
-// its record, and a "This page" tab with every request the page made. It
+// its record, a "This page" tab with every request the page made, and a
+// "History" tab with the run's recent document requests. It
 // reads and changes nothing, and runs no panel's script: the panels' HTML
 // comes from the edge, already sanitised, and what the script draws
 // itself goes on the page only as text.
@@ -26,6 +27,7 @@
   // browser's buffer of entries unless the page changed it.
 
   const PAGE = "page";
+  const HISTORY = "history";
   const BATCH = 100;
   const BUFFER = 250;
 
@@ -145,7 +147,9 @@
   const tabbed = () => {
     const page = button("tab", `This page (${rows.size})`, () => choose(PAGE));
     page.dataset.name = PAGE;
-    tabs.replaceChildren(page);
+    const history = button("tab", "History", () => choose(HISTORY));
+    history.dataset.name = HISTORY;
+    tabs.replaceChildren(page, history);
 
     if (shown === own) {
       tabs.append(element("span", "shown muted", "this page's request:"));
@@ -214,6 +218,8 @@
       showing += 1;
       drawPage();
       refresh();
+    } else if (name === HISTORY) {
+      drawHistory();
     } else {
       show(`${recordOf(shown.id)}/panels/${encodeURIComponent(name)}.html`);
     }
@@ -236,7 +242,7 @@
 
     tabbed();
 
-    if (target.found === null && current !== PAGE) {
+    if (target.found === null && current !== PAGE && current !== HISTORY) {
       showing += 1;
       content.replaceChildren(element("p", "muted", "This request's record is no longer kept."));
       return;
@@ -248,9 +254,9 @@
       const panels = panelsOf(target);
 
       if (expanded()) {
-        choose(name === PAGE || panels.some((panel) => panel.name === name) ? name : panels[0] && panels[0].name);
+        choose(name === PAGE || name === HISTORY || panels.some((panel) => panel.name === name) ? name : panels[0] && panels[0].name);
       }
-    } else if (again && current && current !== PAGE) {
+    } else if (again && current && current !== PAGE && current !== HISTORY) {
       choose(current);
     } else if (!current && expanded()) {
       const panels = panelsOf(target);
@@ -629,6 +635,106 @@
     const list = element("ul");
 
     for (const text of LIMITS) {
+      list.append(element("li", "", text));
+    }
+
+    limits.append(element("summary", "", "What is listed"), list);
+    content.append(limits);
+  };
+
+  // The History tab: the run's recent document requests, newest first,
+  // each redirect joined to the request it led to, so a chain reads as one
+  // entry with its steps. The entry the page is on is marked, and a step
+  // opens its record.
+
+  const HISTORY_COLUMNS = [["When"], ["Request"], ["Status", "num"], ["Takes", "num"], ["Queue", "num"], ["Worker"], ["Logs", "num"], ["Errors", "num"]];
+
+  const clockTime = (ms) => new Date(ms).toLocaleTimeString([], { hour12: false });
+
+  const drawHistory = async () => {
+    const asked = ++showing;
+    let found;
+
+    try {
+      const response = await fetch(`${base}history`, { credentials: "same-origin", cache: "no-store" });
+      found = response.ok ? await response.json() : undefined;
+    } catch {
+      found = undefined;
+    }
+
+    if (asked !== showing) {
+      return;
+    }
+
+    if (!found) {
+      content.replaceChildren(element("p", "muted", "The run did not answer."));
+      return;
+    }
+
+    if (!found.entries.length) {
+      content.replaceChildren(element("p", "muted", "No document requests are kept yet."));
+      return;
+    }
+
+    const table = element("table", "page history");
+    const head = table.createTHead().insertRow();
+
+    for (const [name, className] of HISTORY_COLUMNS) {
+      head.append(element("th", className, name));
+    }
+
+    for (const entry of found.entries) {
+      const group = table.createTBody();
+      const here = entry.steps.some((step) => step.request_id === id);
+      group.className = here ? "entry here" : "entry";
+
+      entry.steps.forEach((step, index) => {
+        const line = element("tr", "pick");
+        line.classList.toggle("shown", shown.id === step.request_id);
+        line.append(cell(index === 0 ? clockTime(step.started_unix_ms) : "", "mono"));
+
+        const what = element("td", "what");
+        what.title = `${step.method} ${step.target}`;
+
+        if (index > 0) {
+          what.append(element("span", "muted", "→ "));
+        }
+
+        what.append(element("span", "mono", `${step.method} ${step.target}`));
+
+        if (step.request_id === id) {
+          what.append(element("span", "badge-here", " this page"));
+        }
+
+        line.append(what);
+        line.append(cell(step.status ? String(step.status) : "…", step.status >= 400 ? "num error" : "num"));
+        line.append(cell(step.status ? millis(step.total_ms) : "…", "num"));
+        const worker = step.served_by_edge ? "edge" : step.worker !== null && step.worker !== undefined ? workerName(step.group, step.worker) : "-";
+        line.append(cell(millis(step.queue_ms), "num"), cell(worker, "mono"));
+        line.append(cell(String(step.logs), step.logs ? "num warning" : "num muted"));
+        line.append(cell(String(step.errors), step.errors ? "num error" : "num muted"));
+
+        line.addEventListener("click", () => {
+          if (!targets.has(step.request_id)) {
+            targets.set(step.request_id, { id: step.request_id, label: `${step.method} ${step.target}`, link: step.link });
+          }
+
+          view(targets.get(step.request_id), "timing");
+        });
+
+        group.append(line);
+      });
+    }
+
+    content.replaceChildren(table);
+    const limits = element("details");
+    const list = element("ul");
+
+    for (const text of [
+      "The run's recent requests a browser made as a navigation or a form's submission, newest first, from the records it keeps.",
+      `A redirect is shown with the request it led to: the next document request from the same client to its Location, within ${found.window_ms / 1000} s of its response.`,
+      "A request whose record is no longer kept is left out.",
+    ]) {
       list.append(element("li", "", text));
     }
 

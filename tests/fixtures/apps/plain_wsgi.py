@@ -72,6 +72,13 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
         )
         return [HELLO]
 
+    if path == "/form" and environ["REQUEST_METHOD"] == "POST":
+        # A form's submission that redirects to the page, as post,
+        # redirect, get does, for the toolbar's history.
+
+        start_response("303 See Other", [("Location", "/page"), ("Content-Length", "0")])
+        return [b""]
+
     if path == "/page":
         # An HTML page, in two pieces, for the development toolbar.
 

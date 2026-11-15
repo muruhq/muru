@@ -33,8 +33,8 @@ ANALYSIS = TextPanel("analysis", "Analysis", markdown=True)
 
 A name is lowercase letters, digits and hyphens, starting with a letter,
 at most 32 characters. The built-in panels' names, `timing`, `where`,
-`response`, `logs`, `errors` and `connection`, `page`, the toolbar's
-page view, and `trace`, `sql`, `outbound` and `exceptions`, the panels
+`response`, `logs`, `errors` and `connection`, `page` and `history`, the
+toolbar's own tabs, and `trace`, `sql`, `outbound` and `exceptions`, the panels
 [tracing](tracing.md#in-the-toolbar) adds, cannot be used, and raise
 `ValueError`. Declaring a panel again the same way,
 as a module imported twice does, is allowed; declaring a name again

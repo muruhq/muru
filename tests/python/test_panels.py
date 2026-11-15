@@ -197,7 +197,7 @@ def test_a_panel_is_declared_once_and_not_as_a_built_in() -> None:
     with pytest.raises(ValueError, match="already declared otherwise"):
         SpansPanel("library", "Library")
 
-    for name in ("timing", "logs", "page", "trace", "sql", "Library", "a b"):
+    for name in ("timing", "logs", "page", "history", "trace", "sql", "outbound", "Library", "a b"):
         with pytest.raises(ValueError, match="cannot name a panel"):
             ValuesPanel(name, "X")
 

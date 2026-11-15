@@ -76,11 +76,13 @@ REQUEST_LIMIT = 2000
 TEXT_LIMIT = 65536
 """The most characters one text panel of a request keeps."""
 
-# The built-in panels' names, and the page view's tab, which a declared
-# panel may not take, and the names of Muru's own panels from tracing,
-# which only Muru declares, within _own().
+# The built-in panels' names, and the toolbar's page view and history
+# tabs, which a declared panel may not take, and the names of Muru's own
+# panels from tracing, which only Muru declares, within _own().
 
-RESERVED = frozenset({"timing", "where", "response", "logs", "errors", "connection", "page"})
+RESERVED = frozenset(
+    {"timing", "where", "response", "logs", "errors", "connection", "page", "history"}
+)
 OWN = frozenset({"trace", "sql", "outbound", "exceptions"})
 
 _owning = False

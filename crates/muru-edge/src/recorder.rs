@@ -279,6 +279,17 @@ impl Recorder {
         ids
     }
 
+    /// Read every record kept, oldest first, by what `read` takes from
+    /// each, leaving out those it gives nothing for.
+    pub fn read_all<T>(&self, mut read: impl FnMut(&admin::RequestRecord) -> Option<T>) -> Vec<T> {
+        let ring = self.ring.lock().expect("recorder poisoned");
+
+        ring.kept
+            .iter()
+            .filter_map(|kept| read(&kept.slot.lock().expect("request record poisoned")))
+            .collect()
+    }
+
     /// How many records are kept, and their bytes.
     pub fn usage(&self) -> (usize, usize) {
         let ring = self.ring.lock().expect("recorder poisoned");
