@@ -9,6 +9,85 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a28 (2026-11-15)
+
+### Added
+
+- Added named conditions: `[condition.NAME]` with `when`, `for`, `clear_when`,
+  `clear_for` and `min_requests`, in the daemon's file or an applied file,
+  written in a small PromQL-shaped language over Muru's own figures
+  (`error_rate`, `request_share`, `latency`, `queue_depth` and more). The
+  daemon evaluates each every second and raises `condition.firing` and
+  `condition.resolved` events, and `muructl condition list` and `muructl
+  condition show` give their states and figures. ([#123](https://github.com/muruhq/muru/issues/123))
+- Added gates: `before_fork = true` on a declared command runs it as a release
+  starts, once its host has preloaded and before any worker forks, failing the
+  start if it fails, and `before_promote = true` runs it just before a rollout
+  or blue/green promotion moves all traffic, stopping the promotion if it
+  fails. A gate runs once a release unless `every_start = true`, needs a
+  `timeout`, is always exclusive, runs under the daemon only, and `muructl
+  release show` lists the gates a release has passed. ([#266](https://github.com/muruhq/muru/issues/266))
+- Added schedules for declared commands: `schedule = { cron = "30 3 * * *",
+  timezone = "Australia/Sydney" }` runs the command under the daemon at those
+  times with the application's current release, and `schedule = { at_boot =
+  true }` when the daemon starts from nothing. A scheduled command needs a
+  `timeout`, a run due while one is under way is skipped with a
+  `command.skipped` event, each scheduled run is a detached run with the
+  trigger `schedule`, and `muructl command list` shows each schedule and its
+  next run. ([#268](https://github.com/muruhq/muru/issues/268))
+- Added detached command runs: `muructl command run APP NAME --detach` and
+  `muructl exec APP --detach -- ...` start a run that outlives its caller and
+  a daemon restart or upgrade, and `muructl command runs`, `status`, `logs`
+  (with `--follow`) and `stop` list, show, follow and stop runs. The daemon
+  keeps the last 20 runs of each command (`[daemon] keep_command_runs`), each
+  with its output in a file of its own, and an exclusive command's claim now
+  survives a daemon restart. ([#688](https://github.com/muruhq/muru/issues/688))
+- Added overlays triggered by a named condition: `trigger = { condition =
+  'NAME' }` keeps an overlay active while the condition is firing and ends it
+  once it resolves, held as it is while the condition is unknown, with
+  `min_active`, `cooldown` and `max_per_hour` against flapping, `latch = true`
+  to keep it until ended by hand, and `preconditions.probe`, a path the
+  `release_ready` release must answer before activation. `muructl overlay
+  list` and `preview` show the condition's state and figures. ([#689](https://github.com/muruhq/muru/issues/689))
+
+### Changed
+
+- A managed HTTP server's instances now run under a log relay each, so their
+  lines carry the time and a tag naming the instance and stream
+  (`muru.instance[0]:`, `muru.instance[0].stdout:`), the release's log is
+  rotated and reopened without losing lines (no `copytruncate` is needed under
+  `rotate = 'external'`), and an instance that exits while no daemon runs is
+  reported with its real exit status. ([#492](https://github.com/muruhq/muru/issues/492))
+- `muructl logs list` now shows the output files of each command's runs, one
+  line for each command with how many runs it has and what they take, and
+  `muructl logs prune --orphaned` removes those of an application that no
+  longer exists and of runs the daemon no longer keeps. `truncate`, `rotate`
+  and a prune by `--keep` or `--older-than` leave them alone. ([#692](https://github.com/muruhq/muru/issues/692))
+
+### Fixed
+
+- Fixed the daemon stopping everything else while a release started: a
+  release's build, preload, `before_fork` gates and wait for its workers, and
+  a promotion's `before_promote` gates, now run beside the daemon's loop, so
+  `muructl status`, other applications' deploys and the daemon's own checks go
+  on meanwhile. A drain or removal of a release that is starting cancels its
+  start, and a scale of it is refused until it is ready. ([#693](https://github.com/muruhq/muru/issues/693))
+- Fixed a detached or scheduled command run carrying on writing to the
+  release's renamed log after a rotation or `muructl logs reopen`, which lost
+  its lines once the archive was compressed: its log relay now opens the files
+  again as a release's relays do, and `muructl logs reopen` waits for it. ([#698](https://github.com/muruhq/muru/issues/698))
+- Fixed the daemon stopping everything else while a release stopped: a drain's
+  wait for the release's host or instances to stop, with their grace periods,
+  now runs beside the daemon's loop, so `muructl status`, other applications'
+  deploys and the daemon's own checks go on meanwhile. `muructl drain` still
+  answers once the release has stopped. ([#699](https://github.com/muruhq/muru/issues/699))
+
+### Documentation
+
+- The metrics guide now gives `muru_request_duration_seconds`'s labels as the
+  edge writes them: `app`, `release`, `group` and `phase`. ([#697](https://github.com/muruhq/muru/issues/697))
+
+
 ## 0.1.0a27 (2026-11-15)
 
 ### Added
