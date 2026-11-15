@@ -4275,6 +4275,12 @@ pub fn resolve_commands(
             .map_err(|error| format!("{what}: timeout: {error}"))?
             .map(|timeout| timeout.as_millis() as u64);
 
+        let schedule = table
+            .schedule
+            .as_ref()
+            .map(|schedule| resolve_schedule(&what, schedule, &inputs, timeout_ms))
+            .transpose()?;
+
         commands.push(crate::model::CommandSpec {
             name: name.clone(),
             description: table.description.clone().unwrap_or_default(),
@@ -4284,10 +4290,106 @@ pub fn resolve_commands(
             inputs,
             timeout_ms,
             exclusive: table.exclusive.unwrap_or(false),
+            schedule,
         });
     }
 
     Ok(commands)
+}
+
+/// Section 9.12 (issue 268): a command's schedule, checked. It needs a
+/// `cron` or `at_boot`, and the command a `timeout`, so that each run
+/// ends and the next uses the release current then. Its cron expression
+/// and time zone must read, its inputs be the command's, a secret one
+/// only from a secret store, and every required input without a default
+/// be given, since no one is there to be asked.
+fn resolve_schedule(
+    what: &str,
+    schedule: &muru_config::CommandSchedule,
+    inputs: &[crate::model::CommandInputSpec],
+    timeout_ms: Option<u64>,
+) -> Result<crate::model::ScheduleSpec, String> {
+    let what = format!("{what}.schedule");
+    let at_boot = schedule.at_boot.unwrap_or(false);
+
+    if schedule.cron.is_none() && !at_boot {
+        return Err(format!("{what}: give cron, at_boot = true, or both"));
+    }
+
+    if timeout_ms.is_none() {
+        return Err(format!(
+            "{what}: a command with a schedule needs a timeout, so that each run ends"
+        ));
+    }
+
+    if let Some(cron) = &schedule.cron {
+        muru_config::cron::Cron::parse(cron).map_err(|error| format!("{what}: cron: {error}"))?;
+    }
+
+    muru_config::time_zone(schedule.timezone.as_deref())
+        .map_err(|error| format!("{what}: timezone: {error}"))?;
+
+    for (name, value) in &schedule.inputs {
+        let Some(input) = inputs.iter().find(|input| input.name == *name) else {
+            return Err(format!("{what}.inputs: the command takes no input {name}"));
+        };
+
+        if input.secret {
+            return Err(format!(
+                "{what}.inputs: {name} is secret: give it in secret_inputs as STORE/KEY"
+            ));
+        }
+
+        if let Some(pattern) = &input.pattern
+            && !regex::Regex::new(&format!("^(?:{pattern})$"))
+                .is_ok_and(|anchored| anchored.is_match(value))
+        {
+            return Err(format!(
+                "{what}.inputs: {value:?} does not match the pattern of {name}"
+            ));
+        }
+    }
+
+    for (name, reference) in &schedule.secret_inputs {
+        if !inputs.iter().any(|input| input.name == *name) {
+            return Err(format!(
+                "{what}.secret_inputs: the command takes no input {name}"
+            ));
+        }
+
+        if schedule.inputs.contains_key(name) {
+            return Err(format!("{what}: the input {name} is given twice"));
+        }
+
+        if !reference
+            .split_once('/')
+            .is_some_and(|(store, key)| !store.is_empty() && !key.is_empty())
+        {
+            return Err(format!(
+                "{what}.secret_inputs: {name} names {reference:?}, which is not STORE/KEY"
+            ));
+        }
+    }
+
+    if let Some(input) = inputs.iter().find(|input| {
+        input.required
+            && !schedule.inputs.contains_key(&input.name)
+            && !schedule.secret_inputs.contains_key(&input.name)
+    }) {
+        return Err(format!(
+            "{what}: the required input {} has no default, so a scheduled run needs it in \
+             inputs or secret_inputs",
+            input.name
+        ));
+    }
+
+    Ok(crate::model::ScheduleSpec {
+        cron: schedule.cron.clone(),
+        timezone: schedule.timezone.clone(),
+        at_boot,
+        inputs: schedule.inputs.clone().into_iter().collect(),
+        secret_inputs: schedule.secret_inputs.clone().into_iter().collect(),
+    })
 }
 
 /// Section 9.12: the commands of a release as the tables they came from,
@@ -4324,6 +4426,16 @@ fn commands_table_from(
                     .timeout_ms
                     .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
                 exclusive: command.exclusive.then_some(true),
+                schedule: command
+                    .schedule
+                    .as_ref()
+                    .map(|schedule| muru_config::CommandSchedule {
+                        cron: schedule.cron.clone(),
+                        timezone: schedule.timezone.clone(),
+                        at_boot: schedule.at_boot.then_some(true),
+                        inputs: schedule.inputs.iter().cloned().collect(),
+                        secret_inputs: schedule.secret_inputs.iter().cloned().collect(),
+                    }),
             };
 
             (command.name.clone(), table)
@@ -8221,6 +8333,101 @@ mod tests {
                 1
             )
             .contains("host_idle_timeout needs min_workers = 0")
+        );
+    }
+
+    #[test]
+    fn a_schedule_is_checked_when_its_release_is_made() {
+        let table = |text: &str| {
+            toml::from_str::<BTreeMap<String, muru_config::CommandTable>>(text).unwrap()
+        };
+        let refused = |text: &str| resolve_commands(&table(text)).unwrap_err();
+
+        let commands = resolve_commands(&table(
+            r#"
+            [clearsessions]
+            run = ["python", "manage.py", "clearsessions"]
+            timeout = "10m"
+            schedule = { cron = "30 3 * * *", timezone = "Australia/Sydney", inputs = { who = "ops" } }
+            inputs.who = { required = true }
+
+            [warm]
+            run = ["python", "warm.py"]
+            timeout = "5m"
+            schedule = { at_boot = true }
+            "#,
+        ))
+        .unwrap();
+        let schedule = commands[0].schedule.clone().unwrap();
+        assert_eq!(schedule.describe(), "30 3 * * * in Australia/Sydney");
+        assert_eq!(schedule.inputs, [("who".to_owned(), "ops".to_owned())]);
+        assert_eq!(
+            commands[1].schedule.as_ref().unwrap().describe(),
+            "when the daemon starts"
+        );
+        assert_eq!(
+            resolve_commands(&commands_table_from(&commands)).unwrap(),
+            commands
+        );
+
+        // A schedule with no timeout, or with a required input no one is
+        // there to give, is refused; so is one that names nothing to do.
+
+        assert!(
+            refused(
+                "[m]
+run = ['x']
+schedule = { at_boot = true }"
+            )
+            .contains("a command with a schedule needs a timeout")
+        );
+        assert!(
+            refused(
+                "[m]
+run = ['x', '{n}']
+timeout = '1m'
+inputs.n = { required = true }
+                 schedule = { cron = '@daily' }"
+            )
+            .contains("the required input n has no default")
+        );
+        assert!(
+            refused(
+                "[m]
+run = ['x']
+timeout = '1m'
+schedule = {}"
+            )
+            .contains("give cron, at_boot = true, or both")
+        );
+        assert!(
+            refused(
+                "[m]
+run = ['x']
+timeout = '1m'
+schedule = { cron = 'often' }"
+            )
+            .contains("schedule: cron")
+        );
+        assert!(
+            refused(
+                "[m]
+run = ['x']
+timeout = '1m'
+schedule = { cron = '@daily', timezone = 'Mars' }"
+            )
+            .contains("schedule: timezone")
+        );
+        assert!(
+            refused(
+                "[m]
+run = ['x']
+env = { P = '{pw}' }
+timeout = '1m'
+inputs.pw = { secret = true }
+                 schedule = { cron = '@daily', inputs = { pw = 'x' } }"
+            )
+            .contains("pw is secret: give it in secret_inputs")
         );
     }
 

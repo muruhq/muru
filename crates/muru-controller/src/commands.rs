@@ -659,6 +659,16 @@ pub fn info(command: &CommandSpec, last_run: Option<&CommandRun>) -> pb::Command
             .map(|ms| muru_config::format_duration(Duration::from_millis(ms)))
             .unwrap_or_default(),
         exclusive: command.exclusive,
+        schedule: command
+            .schedule
+            .as_ref()
+            .map(crate::model::ScheduleSpec::describe)
+            .unwrap_or_default(),
+        next_run_unix_ms: command
+            .schedule
+            .as_ref()
+            .and_then(|schedule| schedule.next_after(now_unix_ms()))
+            .unwrap_or(0),
         last_run: last_run.map(|run| pb::CommandRun {
             release: run.release.clone(),
             started_unix_ms: run.started_unix_ms,
@@ -1774,7 +1784,37 @@ mod tests {
             ],
             timeout_ms: None,
             exclusive: false,
+            schedule: None,
         }
+    }
+
+    #[test]
+    fn a_schedule_falls_due_at_its_local_time_across_a_daylight_saving_change() {
+        let schedule = crate::model::ScheduleSpec {
+            cron: Some("30 3 * * *".to_owned()),
+            timezone: Some("Australia/Sydney".to_owned()),
+            ..Default::default()
+        };
+
+        // Daylight saving ended in Sydney at 03:00 on 5 April 2026, AEDT
+        // (UTC+11) becoming AEST (UTC+10): 03:30 on the 4th is 16:30 UTC
+        // on the 3rd, and 03:30 on the 5th, after the change, 17:30 UTC
+        // on the 4th.
+
+        let noon_on_the_3rd_utc = 1775217600000;
+        let before = schedule.next_after(noon_on_the_3rd_utc).unwrap();
+        let after = schedule.next_after(before).unwrap();
+
+        assert_eq!(before, 1775233800000, "2026-04-03T16:30:00Z");
+        assert_eq!(after, 1775323800000, "2026-04-04T17:30:00Z");
+
+        // No cron expression, as for at_boot alone, is never due.
+
+        let at_boot = crate::model::ScheduleSpec {
+            at_boot: true,
+            ..Default::default()
+        };
+        assert_eq!(at_boot.next_after(before), None);
     }
 
     #[test]

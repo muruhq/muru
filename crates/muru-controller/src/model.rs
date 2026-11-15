@@ -614,6 +614,61 @@ pub struct CommandSpec {
     /// One run at a time for the application.
     #[serde(default)]
     pub exclusive: bool,
+    /// When the daemon runs it by itself (issue 268).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleSpec>,
+}
+
+/// Section 9.12 (issue 268): when the daemon runs a command by itself,
+/// checked when the release was created.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleSpec {
+    /// The cron expression, as written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// The time zone it is read in; the system's when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// Run it when the daemon starts from nothing.
+    #[serde(default)]
+    pub at_boot: bool,
+    /// Input values a scheduled run is given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<(String, String)>,
+    /// Inputs taken from a secret store, as STORE/KEY.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_inputs: Vec<(String, String)>,
+}
+
+impl ScheduleSpec {
+    /// The next time the cron expression is due after `after_unix_ms`,
+    /// Unix milliseconds; none without one.
+    pub fn next_after(&self, after_unix_ms: u64) -> Option<u64> {
+        muru_config::cron_next(
+            self.cron.as_deref()?,
+            self.timezone.as_deref(),
+            after_unix_ms,
+        )
+    }
+
+    /// The schedule in words: `30 3 * * * in Australia/Sydney, and when
+    /// the daemon starts`.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+
+        if let Some(cron) = &self.cron {
+            parts.push(match &self.timezone {
+                Some(zone) => format!("{cron} in {zone}"),
+                None => cron.clone(),
+            });
+        }
+
+        if self.at_boot {
+            parts.push("when the daemon starts".to_owned());
+        }
+
+        parts.join(", and ")
+    }
 }
 
 /// Section 9.12: how a run of a command went, kept for the last run of

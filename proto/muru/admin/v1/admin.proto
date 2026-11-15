@@ -1288,6 +1288,8 @@ message CommandInfo {
   string timeout = 6;               // empty: no limit
   bool exclusive = 7;               // one run at a time for the application
   CommandRun last_run = 8;          // the application's last run of it, if any
+  string schedule = 9;              // when the daemon runs it by itself, in words; empty for none
+  uint64 next_run_unix_ms = 10;     // when its cron schedule is next due; 0 for none
 }
 
 message CommandInputInfo {

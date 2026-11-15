@@ -132,6 +132,7 @@ A command an application declares, the `[tool.muru.commands.NAME]` or `[app.NAME
 | `exclusive` | boolean | `false` | Run one at a time for the application: a run asked for while one is under way is refused. |
 | `inputs` | table of tables, {ref}`[app.NAME.release.ID.commands.NAME.inputs.NAME] <config-daemon-app-name-release-id-commands-name-inputs-name>` |  | The values the command takes, by name. |
 | `run` | array of strings |  | The program and its arguments, run without a shell, with `{name}` where an input's value goes; `python` is the release's interpreter. |
+| `schedule` | table, {ref}`[app.NAME.release.ID.commands.NAME.schedule] <config-daemon-app-name-release-id-commands-name-schedule>` |  | When the daemon runs the command by itself, with the application's current release: by a cron expression, when the daemon starts from nothing, or both. A command with a schedule needs a `timeout`. |
 | `timeout` | string |  | How long it may run before it is stopped, for example 10m; no limit when absent. |
 
 (config-daemon-app-name-release-id-commands-name-inputs-name)=
@@ -146,6 +147,19 @@ An input a command takes.
 | `pattern` | string |  | A regular expression the whole value must match. |
 | `required` | boolean | `false` | The command refuses to run without it. |
 | `secret` | boolean | `false` | The value is never shown, logged or put in an event, and may only be used in `env`. |
+
+(config-daemon-app-name-release-id-commands-name-schedule)=
+## `[app.NAME.release.ID.commands.NAME.schedule]`
+
+When the daemon runs a command by itself.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `at_boot` | boolean | `false` | Run the command when the daemon starts from nothing: its first start, after a reboot or after a shutdown, but not when it takes over what a daemon left running. |
+| `cron` | string |  | A cron expression, five fields or @daily and the like, as an overlay schedule's, read in `timezone`. |
+| `inputs` | table of strings |  | Input values a scheduled run is given, by name; the others take their defaults. |
+| `secret_inputs` | table of strings |  | Inputs taken from one of the daemon's secret stores, by name, each as STORE/KEY. |
+| `timezone` | string | the system's | The IANA time zone `cron` is read in. |
 
 (config-daemon-app-name-release-id-env-name)=
 ## `[app.NAME.release.ID.env.NAME]`

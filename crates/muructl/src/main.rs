@@ -3789,6 +3789,32 @@ async fn run_with(
         );
     }
 
+    // Section 9.12 (issue 268): schedules are the daemon's; a run says
+    // what is scheduled and runs none of it.
+
+    if serve.is_none() {
+        let commands = project_commands::declared(&resolved.project, args.settings_file.as_deref())
+            .unwrap_or_default();
+
+        for command in commands {
+            let Some(schedule) = &command.schedule else {
+                continue;
+            };
+
+            let next = schedule
+                .next_after(admin::now_unix_ms())
+                .map(|at| format!(", next due {}", admin::format_time(at)))
+                .unwrap_or_default();
+            muru_common::muru_println!(
+                "command {} is scheduled ({}{next}); muructl run runs no schedules: \
+                 muructl command run {} runs it now",
+                command.name,
+                schedule.describe(),
+                command.name
+            );
+        }
+    }
+
     if serve.is_some() {
         // Section 13.9: a container's production command needs no warning.
     } else if development {

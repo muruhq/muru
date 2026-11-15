@@ -290,3 +290,82 @@ def test_a_detached_run_outlives_its_caller_and_a_daemon_restart(tmp_path: Path)
         assert "[command long] first" in daemon.muructl("logs", "ops").stdout
     finally:
         daemon.stop()
+
+
+SCHEDULED = """
+[project]
+name = "ops"
+version = "0.1.0"
+
+[tool.muru]
+entrypoint = "app:application"
+processes = 1
+
+[tool.muru.commands.warm]
+run = ["python", "-c", "print('warmed')"]
+timeout = "1m"
+schedule = { at_boot = true }
+
+[tool.muru.commands.nightly]
+run = ["python", "-c", "import time; print('up', flush=True); time.sleep(120)"]
+timeout = "3m"
+schedule = { cron = "* * * * *" }
+"""
+
+
+def test_schedules_run_at_the_daemons_start_and_skip_a_run_due_while_one_is_under_way(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "ops"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(textwrap.dedent(SCHEDULED))
+    (project / "app.py").write_text(APP)
+    (tmp_path / "daemon").mkdir()
+    daemon = start_daemon(tmp_path / "daemon")
+
+    def runs(name: str) -> list[dict]:
+        listed = daemon.muructl("command", "runs", "ops", name, "--json").stdout
+        return json.loads(listed).get("runs", [])
+
+    def wait_for(what: str, condition, timeout: float = 90) -> None:  # type: ignore[no-untyped-def]
+        deadline = time.monotonic() + timeout
+
+        while not condition():
+            assert time.monotonic() < deadline, what
+            time.sleep(0.5)
+
+    try:
+        assert daemon.deploy("ops", project) == "muru: release ops@r1 is ready and serving"
+        listed = daemon.muructl("command", "list", "ops").stdout
+        assert "schedule: when the daemon starts" in listed, listed
+        assert "schedule: * * * * *; next " in listed, listed
+
+        # A daemon that starts from nothing, after a shutdown, runs warm
+        # with the trigger schedule.
+
+        daemon.stop(shutdown=True)
+        daemon = start_daemon(tmp_path / "daemon", run_dir=daemon.run_dir, port=daemon.port)
+        wait_for("warm to run", lambda: runs("warm") and not runs("warm")[0]["under_way"], 30)
+        warm = runs("warm")[0]
+        assert (warm["trigger"], warm["requested_by"], warm["ok"]) == ("schedule", "daemon", True)
+
+        # A run of nightly by hand is under way when the schedule is due,
+        # so the scheduled run is skipped, naming it.
+
+        started = daemon.muructl("command", "run", "ops", "nightly", "--detach").stdout
+        held = int(started.split("started run ")[1].split(";")[0])
+        wait_for(
+            "the scheduled run to be skipped",
+            lambda: f"since run {held} is under way" in daemon.muructl("events").stdout,
+        )
+        assert [run["run"] for run in runs("nightly")] == [held]
+        daemon.muructl("command", "stop", str(held))
+
+        # A daemon that takes over from one that detached does not run it.
+
+        daemon.stop(shutdown=False)
+        daemon = start_daemon(tmp_path / "daemon", run_dir=daemon.run_dir, port=daemon.port)
+        time.sleep(2)
+        assert len(runs("warm")) == 1
+    finally:
+        daemon.stop()

@@ -7897,6 +7897,15 @@ pub async fn command_list(args: CommandListArgs) -> anyhow::Result<()> {
             println!("  {}", limits.join(", "));
         }
 
+        if !command.schedule.is_empty() {
+            let next = if command.next_run_unix_ms == 0 {
+                String::new()
+            } else {
+                format!("; next {}", format_time(command.next_run_unix_ms))
+            };
+            println!("  schedule: {}{next}", command.schedule);
+        }
+
         if let Some(run) = &command.last_run {
             println!(
                 "  last run: {} with {}, {}",

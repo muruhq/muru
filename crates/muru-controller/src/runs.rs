@@ -54,6 +54,12 @@ const KILL_WAIT: Duration = Duration::from_secs(2);
 /// What starts a run: someone asking, or the daemon itself.
 pub const MANUAL: &str = "manual";
 
+/// The trigger of a run the daemon starts on a command's schedule.
+pub const SCHEDULE: &str = "schedule";
+
+/// Who asked for a run the daemon starts by itself.
+pub const DAEMON: &str = "daemon";
+
 /// The daemon's runs: their records and output files, and the detached
 /// runs under way.
 #[derive(Clone)]

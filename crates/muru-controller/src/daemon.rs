@@ -947,6 +947,14 @@ pub struct Reopened {
     pub hosts: u32,
 }
 
+/// Section 9.12 (issue 268): when a scheduled command is next due, and the
+/// cron expression and time zone that time was worked out from.
+struct Scheduled {
+    shape: (String, Option<String>),
+    /// Unix milliseconds.
+    next: u64,
+}
+
 /// What runs a release: a host with Muru's workers, the instances of a
 /// managed HTTP server (section 9.9), or nothing for now: a release whose
 /// host stopped once every group had been at zero for its
@@ -1356,6 +1364,14 @@ struct Daemon {
     asked: HashMap<u64, oneshot::Sender<Result<Vec<WorkerReply>, String>>>,
     /// The last request id given out.
     last_request: u64,
+    /// Section 9.12 (issue 268): each scheduled command's next due time,
+    /// by application and command, with the schedule it was worked out
+    /// from.
+    schedules: HashMap<(String, String), Scheduled>,
+    /// Whether this daemon started from nothing, with no edge left by a
+    /// previous one to take over: its first start, after a reboot or
+    /// after a shutdown. Commands with `at_boot` run then.
+    booted: bool,
 }
 
 /// Run the daemon until it is told to stop: bind the edge, serve the admin
@@ -1451,6 +1467,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .ok(),
         None => None,
     };
+
+    let booted = adopted.is_none();
 
     let edge = match adopted {
         Some(edge) => {
@@ -1731,6 +1749,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         commands: handle_commands,
         asked: HashMap::new(),
         last_request: 0,
+        schedules: HashMap::new(),
+        booted,
         cgroup: crate::cgroup::Limits::read(),
         guard: crate::guard::Guard::default(),
         guard_checked: None,
@@ -1751,6 +1771,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     daemon.restore().await;
     daemon.reconcile_traffic().await;
+    daemon.run_at_boot().await;
 
     // The edge has the node's settings, a listener's h2c among them, from
     // the start, whether or not any release runs yet.
@@ -1852,6 +1873,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             _ = tick.tick() => {
                 daemon.check_edge().await;
                 daemon.check_hosts().await;
+                daemon.run_schedules().await;
                 daemon.expire_sticky().await;
                 daemon.expire_retained().await;
                 daemon.rotate_logs();
@@ -4496,6 +4518,191 @@ impl Daemon {
                 false
             }
         }
+    }
+
+    /// Section 9.12 (issue 268): run each command whose cron schedule is
+    /// due, with its application's current release. A schedule first seen,
+    /// at the daemon's start or with a new release, is due from now, so a
+    /// time that passed while no daemon ran, or while the application had
+    /// no release that runs commands, is not caught up.
+    async fn run_schedules(&mut self) {
+        let now = crate::model::now_unix_ms();
+        let mut seen = BTreeSet::new();
+        let mut due = Vec::new();
+
+        for (app, release, command) in self.scheduled_commands() {
+            let Some(schedule) = &command.schedule else {
+                continue;
+            };
+            let Some(cron) = &schedule.cron else {
+                continue;
+            };
+
+            let key = (app.clone(), command.name.clone());
+            let shape = (cron.clone(), schedule.timezone.clone());
+            seen.insert(key.clone());
+
+            match self.schedules.get(&key) {
+                Some(scheduled) if scheduled.shape == shape && now >= scheduled.next => {
+                    due.push((app, release, command.clone(), scheduled.next));
+                }
+                Some(scheduled) if scheduled.shape == shape => continue,
+                _ => {}
+            }
+
+            if let Some(next) = schedule.next_after(now) {
+                self.schedules.insert(key, Scheduled { shape, next });
+            }
+        }
+
+        self.schedules.retain(|key, _| seen.contains(key));
+
+        for (app, release, command, at) in due {
+            self.run_scheduled(&app, &release, &command, Some(at)).await;
+        }
+    }
+
+    /// Section 9.12 (issue 268): run the commands with `at_boot`, once,
+    /// when this daemon started from nothing.
+    async fn run_at_boot(&mut self) {
+        if !self.booted {
+            return;
+        }
+
+        for (app, release, command) in self.scheduled_commands() {
+            if command
+                .schedule
+                .as_ref()
+                .is_some_and(|schedule| schedule.at_boot)
+            {
+                self.run_scheduled(&app, &release, &command, None).await;
+            }
+        }
+    }
+
+    /// Every command with a schedule, with its application and the
+    /// application's current release: only a release that runs commands,
+    /// which a managed server's does not.
+    fn scheduled_commands(&self) -> Vec<(String, String, crate::model::CommandSpec)> {
+        let mut scheduled = Vec::new();
+
+        for app in self.store.apps().unwrap_or_default() {
+            let Some(current) = app.current else {
+                continue;
+            };
+            let Ok(release) = self.store.release(&app.name, &current) else {
+                continue;
+            };
+
+            if release.spec.http.is_some() {
+                continue;
+            }
+
+            for command in release.spec.commands {
+                if command.schedule.is_some() {
+                    scheduled.push((app.name.clone(), current.clone(), command));
+                }
+            }
+        }
+
+        scheduled
+    }
+
+    /// Start a scheduled run of a command, detached, with the trigger
+    /// `schedule`: due at `due` by its cron schedule, or at the daemon's
+    /// start. A run of the command already under way, scheduled or by
+    /// hand, skips this one.
+    async fn run_scheduled(
+        &mut self,
+        app: &str,
+        release: &str,
+        command: &crate::model::CommandSpec,
+        due: Option<u64>,
+    ) {
+        let subject = format!("{app}@{release}");
+
+        let when = match due {
+            Some(at) => format!("the run due at {}", full_time(at)),
+            None => "the run at the daemon's start".to_owned(),
+        };
+
+        if let Some(run) = self
+            .store
+            .runs(app, Some(&command.name))
+            .unwrap_or_default()
+            .into_iter()
+            .find(crate::model::RunRecord::under_way)
+        {
+            self.events.emit(
+                "command.skipped",
+                &subject,
+                "info",
+                &format!(
+                    "{}: {when} was skipped, since run {} is under way",
+                    command.name, run.id
+                ),
+            );
+            return;
+        }
+
+        let Some(schedule) = &command.schedule else {
+            return;
+        };
+
+        let request = crate::commands::CommandRequest::Declared {
+            name: command.name.clone(),
+            inputs: schedule.inputs.iter().cloned().collect(),
+            secret_inputs: schedule.secret_inputs.iter().cloned().collect(),
+        };
+
+        let started = match (
+            self.prepare_command(app, release, request).await,
+            running_executable(),
+        ) {
+            (Ok(prepared), Ok(executable)) => Ok((prepared, executable)),
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(error.to_string()),
+        };
+
+        let (prepared, executable) = match started {
+            Ok(started) => started,
+            Err(error) => {
+                self.events.emit(
+                    "command.failed",
+                    &subject,
+                    "warning",
+                    &format!("{}: {when} could not be started: {error}", command.name),
+                );
+                return;
+            }
+        };
+
+        // The run starts on a task of its own, so the daemon's loop does
+        // not wait for its relay; a run it cannot start records its end.
+
+        let runs = self.runs.clone();
+        let events = self.events.clone();
+        let name = command.name.clone();
+
+        tokio::spawn(async move {
+            if let Err(error) = runs
+                .start_detached(
+                    prepared,
+                    crate::runs::SCHEDULE,
+                    crate::runs::DAEMON,
+                    &executable,
+                )
+                .await
+                && error.contains("runs one at a time")
+            {
+                events.emit(
+                    "command.skipped",
+                    &subject,
+                    "info",
+                    &format!("{name}: {when} was skipped: {error}"),
+                );
+            }
+        });
     }
 
     /// Leave every host and the edge running, for the next daemon.

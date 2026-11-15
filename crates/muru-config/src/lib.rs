@@ -3439,6 +3439,17 @@ pub fn schedule_window(schedule: &OverlaySchedule, now: i64) -> Option<(i64, Opt
     Some((next, Some(next + length)))
 }
 
+/// The first time a cron expression is due after `after_unix_ms`, read in
+/// the time zone named, or the system's: Unix milliseconds, or none when
+/// the expression or the zone does not read or no time is due.
+pub fn cron_next(expression: &str, zone: Option<&str>, after_unix_ms: u64) -> Option<u64> {
+    let cron = cron::Cron::parse(expression).ok()?;
+    let zone = time_zone(zone).ok()?;
+    let after = jiff::Timestamp::from_millisecond(after_unix_ms as i64).ok()?;
+    let next = cron.next(after, &zone)?.as_millisecond();
+    u64::try_from(next).ok()
+}
+
 /// A time zone by its IANA name, or the system's without one.
 pub fn time_zone(name: Option<&str>) -> Result<jiff::tz::TimeZone, String> {
     match name {
@@ -5922,6 +5933,39 @@ pub struct CommandTable {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub exclusive: Option<bool>,
+    /// When the daemon runs the command by itself, with the application's
+    /// current release: by a cron expression, when the daemon starts from
+    /// nothing, or both. A command with a schedule needs a `timeout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<CommandSchedule>,
+}
+
+/// When the daemon runs a command by itself (section 9.12).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CommandSchedule {
+    /// A cron expression, five fields or @daily and the like, as an
+    /// overlay schedule's, read in `timezone`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// The IANA time zone `cron` is read in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the system's"))]
+    pub timezone: Option<String>,
+    /// Run the command when the daemon starts from nothing: its first
+    /// start, after a reboot or after a shutdown, but not when it takes
+    /// over what a daemon left running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub at_boot: Option<bool>,
+    /// Input values a scheduled run is given, by name; the others take
+    /// their defaults.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<String, String>,
+    /// Inputs taken from one of the daemon's secret stores, by name, each
+    /// as STORE/KEY.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_inputs: BTreeMap<String, String>,
 }
 
 /// An input a command takes (section 9.12).
