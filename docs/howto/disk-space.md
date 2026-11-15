@@ -89,7 +89,8 @@ Error: shop@r5 cannot be removed: it serves the application's traffic
 ## Removing an application
 
 `muructl app remove` removes a whole application: it drains whatever is
-running and removes every release, with its environment, bytecode and logs.
+running and removes every release, with its environment, bytecode and logs,
+and the output of its command runs.
 
 ```console
 $ muructl app remove shop
@@ -100,7 +101,8 @@ Remove application shop and its 2 releases, freeing 436.8MB? [y/N]
 
 It asks in the same way, with `--yes` and `--dry-run`. It is refused while
 a route still sends traffic to the application, while a rollout of it is
-under way and while a release of it is being built.
+under way, while a release of it is being built and while a run of one of
+its commands is under way.
 
 `muructl apply -f config/ --prune` removes the releases the files do not
 declare in the same way, logs included.

@@ -289,6 +289,13 @@ def test_a_detached_run_outlives_its_caller_and_a_daemon_restart(tmp_path: Path)
         ], output
         assert all(line[:4].isdigit() and line[23] == "Z" for line in output), output
         assert "[command long] first" in daemon.muructl("logs", "ops").stdout
+
+        # Removing the application takes the runs' output with it.
+
+        logs = tmp_path / "daemon" / "logs" / "apps" / "ops"
+        assert (logs / "commands" / "long" / f"{run}.log").is_file()
+        daemon.muructl("app", "remove", "ops", "--yes")
+        assert not logs.exists(), sorted(logs.rglob("*"))
     finally:
         daemon.stop()
 

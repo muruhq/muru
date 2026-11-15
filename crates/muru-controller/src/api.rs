@@ -908,6 +908,20 @@ impl Admin for Service {
                 .join("; ");
         }
 
+        // Issue 688: the output of the application's command runs goes
+        // with it, and then its log directory when that is left empty.
+
+        let logs = self
+            .handle
+            .info
+            .locations
+            .logs
+            .path
+            .join("apps")
+            .join(&app.name);
+        let _ = std::fs::remove_dir_all(logs.join("commands"));
+        let _ = std::fs::remove_dir(&logs);
+
         settle_freed(&mut answer);
         Ok(Response::new(answer))
     }
