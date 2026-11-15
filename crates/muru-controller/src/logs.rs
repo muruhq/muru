@@ -248,15 +248,22 @@ fn failure_line<'a>(lines: &[&'a str]) -> Option<&'a str> {
 }
 
 /// The exception a traceback's last line names, from its class onwards,
-/// past anything written in front of it; none for any other line.
+/// past anything written in front of it, a tag such as `muru.host[PID]: `
+/// included; none for any other line.
 fn exception(line: &str) -> Option<&str> {
-    let class_end = line.find(": ").unwrap_or(line.len());
-    let class_start = line[..class_end]
-        .rfind(char::is_whitespace)
-        .map_or(0, |at| at + 1);
-    let class = &line[class_start..class_end];
+    let mut ends = line
+        .match_indices(": ")
+        .map(|(at, _)| at)
+        .chain(std::iter::once(line.len()));
 
-    (class.ends_with("Error") || class.ends_with("Exception")).then(|| &line[class_start..])
+    ends.find_map(|class_end| {
+        let class_start = line[..class_end]
+            .rfind(char::is_whitespace)
+            .map_or(0, |at| at + 1);
+        let class = &line[class_start..class_end];
+
+        (class.ends_with("Error") || class.ends_with("Exception")).then(|| &line[class_start..])
+    })
 }
 
 /// The file from `position` to its end as text, and how many bytes that was.
@@ -295,6 +302,13 @@ mod tests {
                 "10:00:00 ModuleNotFoundError: No module named 'markdown'",
             ]),
             Some("ModuleNotFoundError: No module named 'markdown'"),
+        );
+        assert_eq!(
+            failure_line(&[
+                "muru.host[1]: Traceback (most recent call last):",
+                "muru.host[1]: RuntimeError: deliberate failure",
+            ]),
+            Some("RuntimeError: deliberate failure"),
         );
         assert_eq!(failure_line(&["muru.host[1]: starting"]), None);
     }

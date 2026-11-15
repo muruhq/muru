@@ -165,6 +165,12 @@ pub struct ServeArgs {
     #[arg(long = "access-log-exclude", value_name = "PATTERN")]
     access_log_exclude: Vec<String>,
 
+    /// What the access log keeps of each request's query string: keep (the
+    /// default), mask (the values of secret parameters such as token, as
+    /// ***) or drop (the path alone).
+    #[arg(long, value_name = "WHAT")]
+    access_log_query: Option<String>,
+
     /// Requests at least this slow count as errors for --access-log
     /// errors (default 1s).
     #[arg(long, value_name = "DURATION")]
@@ -259,6 +265,7 @@ const KEYS: &[(&str, Kind)] = &[
     ("no_compression", Kind::Flag),
     ("access_log", Kind::Text),
     ("access_log_exclude", Kind::List),
+    ("access_log_query", Kind::Text),
     ("slow", Kind::Text),
     ("log_format", Kind::Text),
     ("timestamps", Kind::Flag),
@@ -356,6 +363,7 @@ fn from_flags(args: &ServeArgs) -> BTreeMap<&'static str, Value> {
         &args.max_requests_per_connection,
     );
     text("access_log", &args.access_log);
+    text("access_log_query", &args.access_log_query);
     text("slow", &args.slow);
     text("log_format", &args.log_format);
     text("python", &args.python);
@@ -948,6 +956,13 @@ fn prepare(
         other => anyhow::bail!("--access-log {other:?} is not on, errors or off"),
     }
 
+    match layered.text("access_log_query").unwrap_or("keep") {
+        what @ ("keep" | "mask" | "drop") => {
+            argv.extend(["--access-log-query".to_owned(), what.to_owned()]);
+        }
+        other => anyhow::bail!("--access-log-query {other:?} is not keep, mask or drop"),
+    }
+
     for (key, flag) in [
         ("timeout", "--timeout"),
         ("memory", "--memory"),
@@ -1021,6 +1036,7 @@ fn report(layered: &Layered, mode: &Mode) -> crate::print_config::Serve {
         ("min_ready", 1.into()),
         ("compression", true.into()),
         ("access_log", "on".into()),
+        ("access_log_query", "keep".into()),
         ("slow", "1s".into()),
         ("log_format", "text".into()),
         ("timestamps", false.into()),

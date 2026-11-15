@@ -6103,6 +6103,10 @@ impl Daemon {
                 .access_log_file
                 .as_ref()
                 .map(|file| Arc::from(self.locations.logs.path.join(file).as_path()));
+            choice.query = host
+                .access_log_query
+                .as_deref()
+                .and_then(muru_edge::access::Query::parse);
             let access_log = (!choice.is_empty()).then(|| choice.to_message());
 
             // Section 4.12: the host's maintenance mode, with its

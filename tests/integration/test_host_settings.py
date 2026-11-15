@@ -503,6 +503,7 @@ access_log_file = "blog.log"
 
 [host.plain]
 names = ["plain.test"]
+access_log_query = "mask"
 
 [[route]]
 host = "shop"
@@ -525,7 +526,7 @@ app = "echo"
 
     assert daemon.request("/text?in-shop", host="shop.test", headers=agent).status == 200
     assert daemon.request("/text?in-blog", host="blog.test").status == 200
-    assert daemon.request("/text?in-plain", host="plain.test").status == 200
+    assert daemon.request("/text?in-plain&token=s3cr3t", host="plain.test").status == 200
     assert daemon.request("/text?in-none", host="none.test").status == 421
 
     def written(name: str, text: str) -> bool:
@@ -549,9 +550,15 @@ app = "echo"
     assert [(record["virtual_host"], record["target"]) for record in blog] == [
         ("blog", "/text?in-blog")
     ]
-    node = [json.loads(line) for line in (logs / "access.log").read_text().splitlines()]
+
+    # The plain host masks the secret in its query, which never reaches
+    # the node's file.
+
+    node_text = (logs / "access.log").read_text()
+    assert "s3cr3t" not in node_text
+    node = [json.loads(line) for line in node_text.splitlines()]
     assert {(record["virtual_host"], record["target"]) for record in node} == {
-        ("plain", "/text?in-plain"),
+        ("plain", "/text?in-plain&token=***"),
         ("", "/text?in-none"),
     }
 
@@ -571,6 +578,7 @@ app = "echo"
     listed = daemon.muructl("host", "list").stdout
     assert "[access records combined in shop.log]" in listed, listed
     assert "[access records blog.log]" in listed, listed
+    assert "[access query mask]" in listed, listed
     unknown = daemon.muructl("logs", "--access", "--host", "nowhere", check=False)
     assert unknown.returncode != 0 and "no virtual host named nowhere" in unknown.stderr
 
@@ -581,6 +589,7 @@ app = "echo"
         ('access_log_file = "access.log"', "is a file the daemon writes itself"),
         ('access_log_file = "../elsewhere.log"', "is not a file name"),
         ('access_log_format = "common"', "is not json or combined"),
+        ('access_log_query = "hide"', "is not keep, mask or drop"),
         ('access_log_file = "shop.log"', "is also host shop's, with another access_log_format"),
     ]:
         broken = tmp_path / "broken.toml"

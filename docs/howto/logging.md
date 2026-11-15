@@ -29,7 +29,14 @@ muru.worker[reports/0]: report for 2026-11-02 written
 ```
 
 Lines from the host itself carry `muru.host[PID]:`, lines from the relay
-`muru.relay[PID]:`, and lines from muructl start with `muru:`. A line
+`muru.relay[PID]:`, and lines from muructl start with `muru:`. What the
+application's Python code writes in the host, such as a `print()` or a
+warning while it is imported under preload, or the output of an
+`on_load` or `pre_fork` hook, is tagged as the host's in the same way
+as a worker's: `muru.host[PID]:` for standard error and
+`muru.host[PID].stdout:` for standard output. Output written to the
+descriptors directly, by C code or a child process the host starts,
+has no tag. A line
 longer than 64 KiB is cut there, with a marker at the end saying so.
 Python's `logging` goes to standard error by default
 and so arrives tagged; nothing needs configuring. On the terminal these
@@ -262,6 +269,11 @@ matches: `*` matches any run of characters and `?` one, so
 assets and probes out of the terminal. Under the daemon the `[logs]`
 table makes the same choices, as [what the daemon's access log
 writes](#what-the-daemons-access-log-writes) describes.
+
+`--access-log-query WHAT`, or `access_log_query` in the run table,
+chooses what each line keeps of the request's query string: `keep` (the
+default), `mask` or `drop`, as [the query
+string](#the-query-string) describes.
 
 Whatever is shown, the last thousand records are kept in memory and the
 per-second counts for the last minute, which is what the dashboard
@@ -520,6 +532,45 @@ are written is chosen as before, by `access_log`, `slow` and
 file, printed as written when the file is in the combined format, or
 else the records in `access.log` whose `virtual_host` is the host.
 `muructl logs --access` alone shows `access.log`.
+
+### The query string
+
+The access log writes each request's target as it came, query string
+included, so a token passed as `?token=abc` is in the log.
+`access_log_query` chooses what the records keep of it, for the node in
+the `[logs]` table or for one virtual host, a host's replacing the
+table's for its records:
+
+```toml
+[logs]
+access_log_query = 'mask'             # keep (the default), mask or drop
+
+[host.intranet]
+names = ['intranet.example.com']
+access_log_query = 'keep'
+```
+
+| Value | A request for `/books?token=abc&page=2` is written as |
+| --- | --- |
+| `keep` (default) | `/books?token=abc&page=2` |
+| `mask` | `/books?token=***&page=2` |
+| `drop` | `/books` |
+
+`mask` writes the value of each parameter whose name marks it as a
+secret as `***`, by the rule the development request record uses, which
+[what is kept](toolbar.md#what-is-kept) lists: names such as `token`,
+`access_token`, `password`, `api_key`, `code` and `signature`, compared
+without their case, `-`, `_` and `.`, and any name ending in `token`,
+`secret`, `password` or `passwd`. The other parameters, and the order of
+all of them, are kept as they came.
+
+The choice applies to the target in both formats, the JSON record's
+`target` and the combined line's request line, and to the targets in
+the JSON record's `redirects`. The records kept in memory, which
+`muructl logs --access` follows and the dashboard shows, are the same.
+`muructl run` takes it as `--access-log-query` or `access_log_query` in
+the run table, and `muructl serve` as `--access-log-query`, `access_log_query`
+in its serve table or `MURU_SERVE_ACCESS_LOG_QUERY`.
 
 ### Changing the access log for a while
 

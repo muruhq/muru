@@ -308,14 +308,20 @@ def test_a_named_env_file_overrides_the_table_and_is_shown_as_a_layer(tmp_path: 
     # The table's file is one layer and a flag's is the one above it, and
     # the report names the variables but never their values.
 
+    # The comments are aligned by the longest key, so the spacing before
+    # them is not compared.
+
+    def setting(output: str, line: str) -> bool:
+        return line in [re.sub(r" {2,}#", " #", each) for each in output.splitlines()]
+
     output = printed()
-    assert f'env_file = "settings.env"    # [tool.muru.run] in {pyproject}' in output, output
+    assert setting(output, f'env_file = "settings.env" # [tool.muru.run] in {pyproject}'), output
     assert "settings.env sets FROM_BOTH, FROM_FILE. Over [tool.muru.env]: FROM_BOTH." in output
     assert "hidden" not in output, output
 
     (directory / "other.env").write_text("FROM_FILE=other\n")
     output = printed("--env-file", "other.env")
-    assert 'env_file = "other.env"    # command line' in output, output
+    assert setting(output, 'env_file = "other.env" # command line'), output
 
     # The run starts with the file over the table, and only a named file
     # is read, so .env beside it changes nothing.

@@ -208,6 +208,7 @@ timeouts = { request_deadline = "120s" }
 | `timeouts` | `queue_timeout`, `request_deadline`, `body_idle_timeout` and `response_idle_timeout`, as [timeouts](timeouts.md#under-the-daemon) describes | replaces it key by key |
 | `access_log`, `slow`, `access_log_exclude` | which requests the [access log](logging.md#what-the-daemons-access-log-writes) writes | |
 | `access_log_format`, `access_log_file` | the [format of the host's records and the file](logging.md#the-format-and-a-file-for-a-host) that takes them | |
+| `access_log_query` | what the host's records keep of the [query string](logging.md#the-query-string) | |
 | `compression` | how [responses are compressed](compression.md) | replaces it key by key |
 | `request_headers`, `response_headers` | the [headers](headers.md) removed, set and added | are applied after them |
 | `error_pages`, `error_override` | the [error pages](error-pages.md) | is consulted first |

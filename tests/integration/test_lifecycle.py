@@ -79,16 +79,44 @@ def test_hooks_run_in_the_host_and_in_each_worker(hooked: support.Server) -> Non
 
 def test_worker_output_is_tagged_with_the_worker(hooked: support.Server) -> None:
     # Section 11.2: a worker's stderr lines carry its index; its stdout
-    # lines name the stream as well. The host's own lines are untagged.
+    # lines name the stream as well. What a hook writes in the host is
+    # tagged as the host's.
 
     assert hooked.wait_for_log("HOOK post_fork ")
     log = hooked.log()
     assert any(line.startswith("muru.worker[0]: HOOK post_fork ") for line in log.splitlines())
     assert any(line.startswith("muru.worker[1]: HOOK post_fork ") for line in log.splitlines())
-    assert any(line.startswith("HOOK on_load ") for line in log.splitlines())
+    host = f"muru.host[{hooked.host_pid()}]: HOOK on_load "
+    assert any(line.startswith(host) for line in log.splitlines())
     hooked.mark_log()
     assert hooked.get("/print").status == 200
     assert hooked.wait_for_log(".stdout: printed by the application")
+
+
+def test_what_the_import_writes_in_the_host_is_tagged_with_the_host(tmp_path: Path) -> None:
+    # Section 11.3: under preload the import runs in the host, and what
+    # it writes is tagged as a worker's is, standard output by name,
+    # without a second tag on the host's own lines.
+
+    (tmp_path / "noisy_wsgi.py").write_text(
+        "import sys\n"
+        "print('to standard output')\n"
+        "print('to standard error', file=sys.stderr)\n"
+        "def application(environ, start_response):\n"
+        "    start_response('200 OK', [])\n"
+        "    return [b'']\n"
+    )
+    server = support.start("noisy_wsgi:application", workers=1, chdir=tmp_path)
+
+    try:
+        tag = f"muru.host[{server.host_pid()}]"
+        lines = server.log().splitlines()
+        assert f"{tag}.stdout: to standard output" in lines
+        assert f"{tag}: to standard error" in lines
+        assert any(line.startswith(f"{tag}: preloaded noisy_wsgi") for line in lines)
+        assert not any(f"{tag}: {tag}" in line for line in lines)
+    finally:
+        server.stop()
 
 
 def test_sigusr1_runs_on_reopen_logs(hooked: support.Server) -> None:

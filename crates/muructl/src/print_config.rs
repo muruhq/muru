@@ -526,6 +526,12 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
     }
 
     rows.push(Row::new(
+        "access_log_query",
+        serving.access_log_query.as_str(),
+        run(args.access_log_query.is_some(), "access_log_query"),
+    ));
+
+    rows.push(Row::new(
         "slow",
         muru_config::format_duration(serving.slow),
         run(args.slow.is_some(), "slow"),

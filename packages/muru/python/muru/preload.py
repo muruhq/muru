@@ -19,7 +19,7 @@ import socket
 import stat
 import sys
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
 from importlib.util import resolve_name
@@ -47,8 +47,15 @@ class Finding:
     module: str | None = None
     """The module whose import created it, when that could be determined."""
 
+    instrumentation: str | None = None
+    """The instrumentation module whose code started it, for a thread that runs its code."""
+
     def describe(self) -> str:
         """One sentence naming the finding and, when known, its module."""
+
+        if self.instrumentation is not None:
+            during = f" during the import of {self.module}" if self.module else ""
+            return f"instrumentation module {self.instrumentation} left {self.detail}{during}"
 
         origin = f"the import of {self.module}" if self.module else "the import"
         return f"{origin} left {self.detail}"
@@ -61,6 +68,12 @@ class Finding:
             return (
                 "close it in a pre_fork hook and reopen it in post_fork, "
                 "or open it lazily on first use"
+            )
+
+        if self.instrumentation is not None:
+            return (
+                "the instrumentation module has to stop it before the workers are forked, "
+                "or start it from worker_started instead"
             )
 
         return "start it from a post_fork hook instead"
@@ -208,18 +221,6 @@ def open_fds() -> dict[int, Identity]:
     return found
 
 
-def _fd_numbers() -> set[int]:
-    """Every open descriptor number.
-
-    Listing the descriptor directory opens a descriptor of its own, which
-    is closed again by the time the listing is examined; checking each
-    entry is still open leaves it out, so the number is free to be reused
-    by whatever the import opens next.
-    """
-
-    return set(open_fds())
-
-
 def _format_peer(peer: Any) -> str:
     if isinstance(peer, tuple) and len(peer) >= 2:
         host, port = peer[0], peer[1]
@@ -285,19 +286,29 @@ class ImportRecorder:
     ``__import__`` is wrapped so that each module's first import is checked
     for new descriptors and threads; ``import_module`` does the same for an
     import made through importlib.
+
+    ``instrumentation`` names the release's instrumentation modules. A
+    Python thread whose code is in one of them, or in the package one of
+    them belongs to, is put down to that module rather than to the import
+    that was running when it started, since a tool may start a thread
+    lazily, on the first call it traces.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, instrumentation: Iterable[str] = ()) -> None:
+        self._instrumentation = list(instrumentation)
         self._fds_before: dict[int, Identity] = {}
         self._threads_before = 0
+        self._python_threads_before: set[threading.Thread] = set()
         self._children_before: set[int] = set()
-        self._fd_owner: dict[int, str] = {}
+        self._fd_owner: dict[tuple[int, Identity], str] = {}
+        self._thread_owner: dict[threading.Thread, str] = {}
         self._thread_owners: list[tuple[str, int]] = []
         self._original_import: ImportFunction | None = None
 
     def __enter__(self) -> ImportRecorder:
         self._fds_before = open_fds()
         self._threads_before = thread_count()
+        self._python_threads_before = set(threading.enumerate())
         self._children_before = child_pids()
         self._original_import = builtins.__import__
         builtins.__import__ = self._import
@@ -388,17 +399,64 @@ class ImportRecorder:
                     raise
 
     def _record(self, module: str, run: Callable[[], ModuleType]) -> ModuleType:
-        fds_before = _fd_numbers()
+        fds_before = open_fds()
         threads_before = thread_count()
+        python_threads_before = set(threading.enumerate())
 
         try:
             return run()
         finally:
-            for fd in _fd_numbers() - fds_before:
-                self._fd_owner.setdefault(fd, module)
-            grown = thread_count() - threads_before
+            # A descriptor is the import's when its number is new or now
+            # refers to something else, as when the import closed one and
+            # its number was taken again; an owner is kept by identity, so
+            # a number reused by a later import is that import's (issue 685).
+            # Listing the descriptors opens one of its own, which is
+            # closed again by the time it is examined and so is left out.
+
+            for fd, identity in open_fds().items():
+                if fds_before.get(fd) != identity:
+                    self._fd_owner.setdefault((fd, identity), module)
+
+            # A Python thread is charged by name; what grew besides is
+            # native threads, charged by count.
+
+            started = set(threading.enumerate()) - python_threads_before
+
+            for thread in started:
+                self._thread_owner.setdefault(thread, module)
+
+            grown = thread_count() - threads_before - len(started)
+
             if grown > 0:
                 self._thread_owners.append((module, grown))
+
+    def _instrumentation_of(self, code: str | None, module: str | None) -> str | None:
+        """Return the instrumentation module that the module ``code`` is part of, if any.
+
+        ``code`` is part of an instrumentation module when it is that
+        module or one of its submodules, or when it is in the same
+        top-level package as long as that is not the package of the
+        import it was charged to: wrapture's writer thread runs code in
+        wrapture.sinks, listed as wrapture.muru.
+        """
+
+        if code is None:
+            return None
+
+        for entry in self._instrumentation:
+            if code == entry or code.startswith(f"{entry}."):
+                return entry
+
+        package = code.partition(".")[0]
+
+        if module is not None and module.partition(".")[0] == package:
+            return None
+
+        for entry in self._instrumentation:
+            if entry.partition(".")[0] == package:
+                return entry
+
+        return None
 
     def findings(self) -> list[Finding]:
         """Return what is still left behind now, compared with before the imports."""
@@ -413,9 +471,25 @@ class ImportRecorder:
 
             if classified is not None:
                 kind, detail = classified
-                findings.append(Finding(kind, detail, self._fd_owner.get(fd)))
+                findings.append(Finding(kind, detail, self._fd_owner.get((fd, identity))))
 
-        extra_threads = thread_count() - self._threads_before
+        # The Python threads still running are each named, with the module
+        # whose code they run; what is left over is native threads.
+
+        started = [
+            thread
+            for thread in threading.enumerate()
+            if thread not in self._python_threads_before and thread.is_alive()
+        ]
+
+        for thread in started:
+            module = self._thread_owner.get(thread)
+            code = _thread_code(thread)
+            instrumentation = self._instrumentation_of(code, module)
+            detail = f"a thread running ({thread.name}" + (f", from {code})" if code else ")")
+            findings.append(Finding("thread", detail, module, instrumentation))
+
+        extra_threads = thread_count() - self._threads_before - len(started)
 
         if extra_threads > 0:
             attributed = 0
@@ -437,3 +511,24 @@ class ImportRecorder:
 
 def _threads(count: int) -> str:
     return "a thread running" if count == 1 else f"{count} threads running"
+
+
+def _thread_code(thread: threading.Thread) -> str | None:
+    """Return the module whose code a Python thread runs: its target's or its class's."""
+
+    target = getattr(thread, "_target", None)
+
+    if target is not None:
+        module = getattr(target, "__module__", None)
+
+        # A functools.partial has no module of its own, its function has.
+
+        if module is None and isinstance(target, partial):
+            module = getattr(target.func, "__module__", None)
+
+    else:
+        module = type(thread).__module__
+
+    # The threading module's own code, as for Event.wait, says nothing.
+
+    return module if isinstance(module, str) and module != "threading" else None

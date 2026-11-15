@@ -1442,6 +1442,7 @@ impl AccessLogSpec {
                 .unwrap_or(node.slow),
             exclude,
             format: node.format,
+            query: node.query,
         }
     }
 
@@ -1469,6 +1470,7 @@ impl AccessLogSpec {
             exclude: self.access_log_exclude.clone(),
             format: None,
             file: None,
+            query: None,
         }
     }
 

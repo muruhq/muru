@@ -2096,6 +2096,7 @@ impl Admin for Service {
                     maintenance: maintenance.iter().any(|(host, _)| *host == name),
                     access_log_format: host.access_log_format.clone().unwrap_or_default(),
                     access_log_file: host.access_log_file.clone().unwrap_or_default(),
+                    access_log_query: host.access_log_query.clone().unwrap_or_default(),
                     name,
                     names: host.names,
                     listeners: host.listeners,

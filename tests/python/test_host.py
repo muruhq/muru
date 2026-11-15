@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import signal
 import subprocess
@@ -719,3 +720,21 @@ def test_a_worker_raises_its_oom_score_and_keeps_a_higher_one(tmp_path: Path) ->
     assert score.read_text() == "800\n"
 
     host.raise_oom_score(str(tmp_path / "missing"))
+
+
+def test_the_hosts_streams_tag_each_line_they_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    written = io.StringIO()
+    stream = host.TaggedStream(written, ".stdout")
+    tag = f"muru.host[{os.getpid()}].stdout: "
+
+    # A line written in pieces is tagged once, and an empty line too.
+
+    stream.write("one, ")
+    stream.write("two\n\nthree\n")
+    assert written.getvalue() == f"{tag}one, two\n{tag}\n{tag}three\n"
+
+    # In a worker the relay tags the line, so the stream writes it as it is.
+
+    monkeypatch.setattr(host, "_in_worker", True)
+    stream.write("four\n")
+    assert written.getvalue().endswith(f"{tag}three\nfour\n")

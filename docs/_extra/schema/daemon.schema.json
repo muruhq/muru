@@ -982,6 +982,11 @@
           "type": "string",
           "x-default": "`access_log_format` in `[logs]`"
         },
+        "access_log_query": {
+          "description": "What the host's records keep of the query string: `keep`, `mask` or `drop`.",
+          "type": "string",
+          "x-default": "`access_log_query` in `[logs]`"
+        },
         "canonical": {
           "description": "The name the host is known by, for `use_canonical_name`.",
           "type": "string"
@@ -1394,6 +1399,11 @@
         "access_log_format": {
           "default": "json",
           "description": "How the access log's records are written: `json` (the default), one object a line, or `combined`, the combined log format of Apache and nginx.",
+          "type": "string"
+        },
+        "access_log_query": {
+          "default": "keep",
+          "description": "What the access log's records keep of each request's query string, in the target and the internal redirects, in either format: `keep` (the default) writes it as it came, `mask` writes the values of secret parameters, such as `token` or `password`, as `***`, and `drop` writes the path alone.",
           "type": "string"
         },
         "compress": {
