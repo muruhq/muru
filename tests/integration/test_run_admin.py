@@ -409,6 +409,7 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
         assert {"x-request-id", "server-timing", "muru-request-link"} <= answered
         assert found["compression"]["compressed"] is False
         assert [panel["name"] for panel in found["panels"]] == [
+            "hints",
             "timing",
             "where",
             "response",

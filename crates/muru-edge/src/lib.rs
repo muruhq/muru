@@ -41,6 +41,7 @@ pub mod endpoints;
 pub mod errors;
 pub mod grpc;
 pub mod headers;
+pub mod hints;
 pub mod ja4;
 pub mod link;
 pub mod metrics;

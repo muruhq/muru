@@ -81,7 +81,7 @@ TEXT_LIMIT = 65536
 # panels from tracing, which only Muru declares, within _own().
 
 RESERVED = frozenset(
-    {"timing", "where", "response", "logs", "errors", "connection", "page", "history"}
+    {"timing", "where", "response", "logs", "errors", "connection", "hints", "page", "history"}
 )
 OWN = frozenset({"trace", "sql", "outbound", "exceptions"})
 

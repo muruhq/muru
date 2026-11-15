@@ -25,6 +25,7 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("logs", include_str!("../panels/logs.html")),
     ("errors", include_str!("../panels/errors.html")),
     ("connection", include_str!("../panels/connection.html")),
+    ("hints", include_str!("../panels/hints.html")),
     (GENERIC, include_str!("../panels/panel.html")),
 ];
 
@@ -305,10 +306,10 @@ fn escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// A record's panels, in the order they are shown: the built-in ones,
-/// then those code in the worker added (issue 677), whose
-/// spans move from the worker's clock to the request's. One that takes a
-/// built-in panel's name is left out.
+/// A record's panels, in the order they are shown: Hints (issue 709),
+/// read from all the others, then the built-in ones, then those code in
+/// the worker added (issue 677), whose spans move from the worker's clock
+/// to the request's. One that takes a built-in panel's name is left out.
 pub fn all(record: &admin::RequestRecord) -> Vec<admin::Panel> {
     let mut panels = builtin(record);
 
@@ -319,7 +320,7 @@ pub fn all(record: &admin::RequestRecord) -> Vec<admin::Panel> {
         .unwrap_or_default();
 
     for panel in added {
-        if panels.iter().any(|shown| shown.name == panel.name) {
+        if panel.name == "hints" || panels.iter().any(|shown| shown.name == panel.name) {
             continue;
         }
 
@@ -328,6 +329,8 @@ pub fn all(record: &admin::RequestRecord) -> Vec<admin::Panel> {
         panels.push(panel);
     }
 
+    let hints = crate::hints::panel(record, &panels);
+    panels.insert(0, hints);
     panels
 }
 
@@ -1479,6 +1482,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "hints",
                 "timing",
                 "where",
                 "response",
@@ -1489,7 +1493,7 @@ mod tests {
             ]
         );
 
-        let trace = &panels[6];
+        let trace = &panels[7];
         assert_eq!(trace.spans[0].start_ms, 5.0);
         assert_eq!(trace.spans[0].children[0].start_ms, 5.5);
     }

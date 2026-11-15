@@ -54,7 +54,7 @@ def application(environ, start_response):
     connection = sqlite3.connect(":memory:")
     connection.execute("CREATE TABLE book (id INTEGER PRIMARY KEY, title TEXT)")
 
-    for book in range(3):
+    for book in range(5):
         connection.execute("SELECT title FROM book WHERE id = ?", (book,)).fetchall()
 
     connection.close()
@@ -112,13 +112,18 @@ def test_a_requests_queries_are_its_trace_and_sql_panels(tmp_path: Path) -> None
     (request,) = panels["trace"]["spans"]
     assert request["name"] == "GET /books" and request["start_ms"] >= found["queue_ms"]
     names = [child["name"] for child in request["children"]]
-    assert names.count("SELECT title FROM book WHERE id = ?") == 3, names
+    assert names.count("SELECT title FROM book WHERE id = ?") == 5, names
 
-    # The same statement three times is one row of three.
+    # The same statement five times is one row of five, which the Hints
+    # panel, the record's first, names as an N+1 pattern (issue 709).
 
     by_statement, each = panels["sql"]["tables"]
-    assert ["SELECT title FROM book WHERE id = ?", "3"] == by_statement["rows"][0]["cells"][:2]
-    assert len(each["rows"]) == 4
+    assert ["SELECT title FROM book WHERE id = ?", "5"] == by_statement["rows"][0]["cells"][:2]
+    assert len(each["rows"]) == 6
+    assert found["panels"][0]["name"] == "hints"
+    (hint,) = panels["hints"]["tables"][0]["rows"]
+    assert hint["cells"][0].startswith("the same statement ran 5 times in one request"), hint
+    assert hint["cells"][1] == "SQL"
 
     # An exception the application caught and noted is in the Exceptions
     # panel as handled, against the request it was noted in.

@@ -7,6 +7,7 @@
 .badge .status { font-weight: 600; color: #8ee4af; }
 .badge .status.error, .badge .count.error { color: #ff9b8f; }
 .badge .count.warning { color: #ffd479; }
+.badge .count.hint { color: #9cc4ff; }
 .badge .muted { color: #9fb3c8; }
 .body { display: flex; flex-direction: column; margin-bottom: 8px; max-height: min(70vh, 40rem); background: #fff; border: 1px solid #d9e2ec; border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2); overflow: hidden; }
 .toolbar { display: flex; flex-direction: column-reverse; align-items: flex-end; }

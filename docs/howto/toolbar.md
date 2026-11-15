@@ -30,7 +30,7 @@ file's setting off for one run.
 
 Each HTML page then has a badge in its bottom right corner with the
 request's status, its total and queue times, the worker that served it,
-and how many log records and errors it had. Clicking the badge opens the
+and how many log records, errors and [hints](#hints) it had. Clicking the badge opens the
 record's panels, the same ones the [dashboard's request
 page](#a-requests-record) shows, as tabs, and "open in dashboard" opens
 that page. A page whose response is still streaming updates as the
@@ -240,7 +240,8 @@ The address is the dashboard's own, or the one in `MURU_DASHBOARD_URL`
 when the run's environment sets it, for a dashboard reached through a
 tunnel or a proxy. With `--dashboard off` the header is not sent.
 
-The page shows the record as panels:
+The page shows the record as panels, the first of them **Hints**, what
+stands out in the rest, which [has a section of its own](#hints):
 
 - **Timing:** the request's phases from its arrival, each with when it
   started, how long it took and a bar placed where it falls in the
@@ -343,6 +344,31 @@ record is complete a moment after the last byte arrives. If the worker
 stopped before sending it, or the edge stopped waiting for it at the
 request's deadline, the Timing, Logs and Errors panels say so in place
 of what the worker would have given, and show the rest.
+
+### Hints
+
+The Hints panel lists what stands out in the request's record, each
+hint saying where it comes from, the panel and the figure, so it is one
+place to look before the others. The badge counts the hints, and the
+toolbar opens on this panel when there are any. Hints read the record
+and change nothing. Each has a threshold, at or past which it is shown:
+
+| Hint | From | Shown when |
+| --- | --- | --- |
+| a statement run many times in one request, the N+1 pattern | SQL | the same statement, after its values are made placeholders, ran 5 times or more |
+| an endpoint called many times in one request | Outbound | the same method, host and path was called 5 times or more |
+| a slow query or call | SQL, Outbound | one query or call took 25% or more of the request's total time, and at least 10 ms |
+| an HTML or JSON response that went out uncompressed | Response | it was 1 KiB or more, and was not compressed because compression is off for the route, the application asked for none, the response says `no-transform`, its type is not one the route compresses, the client accepts none of the encodings offered, or the encoder could not start; the hint gives the reason |
+| the event loop held | Timing, Trace | the worker's event loop was held for 100 ms or more during the request; the hint names the operation the Trace panel shows running in the middle of that stretch, when tracing recorded one |
+| a long wait for a worker | Timing | the request waited 100 ms or more for a worker, which says the run had too few for the page's requests; the hint names `processes` (`--processes`) |
+| a long wait for a thread | Timing | a WSGI request waited 100 ms or more for a thread of its worker; the hint names `threads` (`--threads`) |
+| garbage collection | Timing | collections during the request took 50 ms or more in all, or there were 20 or more of them |
+| an answer of Muru's own | Errors | Muru answered the request itself for a timeout or a size limit, such as 504 `deadline` or 413 `body_too_large`; the hint names the setting, such as `request_deadline` (`--timeout deadline=` for a run) |
+
+At most 3 hints of one kind are shown, the strongest first. The same
+hints are the first panel of the record's JSON, `hints`, and of
+`muructl debug request`, so a coding agent reading the record gets them
+too.
 
 ### Evidence of a timeout or a killed worker
 

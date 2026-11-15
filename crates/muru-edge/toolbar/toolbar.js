@@ -78,6 +78,10 @@
 
   const millis = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms.toFixed(1)}ms`);
   const failed = (found) => (found.from_worker && found.from_worker.outcome && found.from_worker.outcome !== "completed") || found.status >= 500;
+  const hintsOf = (found) => {
+    const panel = found && (found.panels || []).find((one) => one.name === "hints");
+    return panel && panel.tables.length ? panel.tables[0].rows.length : 0;
+  };
   const workerName = (group, worker) => `${group && group !== "default" ? `${group}/` : ""}${worker}`;
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const expanded = () => !bar.classList.contains("collapsed");
@@ -129,6 +133,8 @@
 
     badge.append(element("span", logs ? "count warning" : "count muted", `${logs} log`));
     badge.append(element("span", error ? "count error" : "count muted", `${error ? 1 : 0} error`));
+    const hints = hintsOf(found);
+    badge.append(element("span", hints ? "count hint" : "count muted", `${hints} ${hints === 1 ? "hint" : "hints"}`));
   };
 
   // The record the tabs show: the page's own request at first, or one
@@ -143,6 +149,15 @@
   let showing = 0;
 
   const panelsOf = (target) => (target.found ? target.found.panels : []);
+
+  // The panel a record opens to: Hints when it has any, else the first
+  // after it.
+
+  const firstPanel = (target) => {
+    const panels = panelsOf(target);
+    const first = hintsOf(target.found) ? panels[0] : panels.find((panel) => panel.name !== "hints");
+    return first && first.name;
+  };
 
   const tabbed = () => {
     const page = button("tab", `This page (${rows.size})`, () => choose(PAGE));
@@ -254,13 +269,12 @@
       const panels = panelsOf(target);
 
       if (expanded()) {
-        choose(name === PAGE || name === HISTORY || panels.some((panel) => panel.name === name) ? name : panels[0] && panels[0].name);
+        choose(name === PAGE || name === HISTORY || panels.some((panel) => panel.name === name) ? name : firstPanel(target));
       }
     } else if (again && current && current !== PAGE && current !== HISTORY) {
       choose(current);
     } else if (!current && expanded()) {
-      const panels = panelsOf(target);
-      choose(panels[0] && panels[0].name);
+      choose(firstPanel(target));
     }
   };
 
@@ -353,8 +367,7 @@
     bar.classList.toggle("collapsed");
 
     if (expanded() && !current) {
-      const panels = panelsOf(shown);
-      choose(panels[0] && panels[0].name);
+      choose(firstPanel(shown));
     }
   });
 
