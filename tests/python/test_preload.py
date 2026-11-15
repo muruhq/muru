@@ -209,7 +209,7 @@ def test_child_process_and_its_pipes_are_reported(modules: Path) -> None:
         "import subprocess, sys\n"
         "CHILD = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],"
         " stdin=subprocess.PIPE)\n\n"
-        "def cleanup():\n    CHILD.kill()\n    CHILD.wait()\n",
+        "def cleanup():\n    CHILD.kill()\n    CHILD.wait()\n    CHILD.stdin.close()\n",
     )
     with preload.ImportRecorder() as recorder:
         recorder.import_module("child_mod")
