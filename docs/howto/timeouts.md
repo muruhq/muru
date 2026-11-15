@@ -133,10 +133,11 @@ replaces its worker. Both are off by default.
 
 The host raises the event `request.past_deadline` (warning) once for
 each such request, within a second or two of its deadline, naming the
-worker and the request:
+worker, the request and where its thread was, when the worker answers
+for its stacks within a second:
 
 ```
-request.past_deadline: worker 0 (pid 41213): request 01J9Z3 GET /report is past its deadline, 300.0 s after the worker took it; the client was answered 504 and the request goes on in the worker
+request.past_deadline: worker 0 (pid 41213): request 01J9Z3 GET /report is past its deadline, 300.0 s after the worker took it at report.py line 88 in totals, called from report.py line 40 in report; the client was answered 504 and the request goes on in the worker
 ```
 
 `muructl requests --list` no longer lists a request the client has been
@@ -221,6 +222,10 @@ to stop, and is killed `shutdown_timeout` later if it has not. The stuck
 request cannot finish, so its client is answered at once, `504` with the
 reason `hard_timeout`, rather than when the worker is finally killed, and
 a `worker.timeout_killed` event records what happened.
+
+In a development run, the record of a request that ran past the soft
+timeout or its deadline, or whose worker was killed, holds the stacks
+captured then, in the [toolbar's Errors panel](toolbar.md#evidence-of-a-timeout-or-a-killed-worker).
 
 | Name | Default | Measured | When it fires |
 | --- | --- | --- | --- |

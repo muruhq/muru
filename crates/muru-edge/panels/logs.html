@@ -9,10 +9,10 @@
 {%- endfor %}
 </tbody>
 </table>
-{%- else %}
+{%- elif not panel["values"]|selectattr("name", "eq", "worker's part")|list %}
 <p class="muted">No log records or warnings. Output from print() is not kept.</p>
 {%- endif %}
 {%- endfor %}
-{%- for value in panel.values %}
+{%- for value in panel["values"] %}
 <p class="muted">{{ value.value }}.</p>
 {%- endfor %}

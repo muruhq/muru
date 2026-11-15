@@ -217,6 +217,14 @@ message WorkerRecord {
   double loop_lag = 21;             // the longest stretch of the request with the event loop held
   double loop_lag_at = 22;          // when that stretch began
   repeated RecordPanel panels = 23; // panels code in the worker added during the request (issue 677)
+  repeated RecordCapture captures = 24; // evidence the worker captured, such as the stack at a soft timeout (issue 706)
+}
+
+message RecordCapture {
+  string kind = 1;                  // the event, such as request.soft_timeout
+  uint64 at_unix_ms = 2;
+  string message = 3;
+  string stack = 4;                 // the request's thread's stack, as text
 }
 
 // A panel code in the worker added to a request's record (issue 677), in the

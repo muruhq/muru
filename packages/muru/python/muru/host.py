@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import faulthandler
+import functools
 import gc
 import importlib
 import inspect
@@ -114,6 +115,11 @@ REPORT_INTERVAL_SECONDS = 1.0
 # reporting for this many report intervals is forgotten.
 
 PAST_DEADLINE_FORGET_REPORTS = 3
+
+# Issue 706: the innermost frames of a thread's stack kept in the evidence
+# a capture gives a development run's request records.
+
+STACK_FRAMES = 64
 
 # How long a worker is given to answer a control request before the
 # host answers for it.
@@ -1135,6 +1141,11 @@ class Replacement:
     # stuck request's stack, or its commonest objects), for the event.
 
     capture: str | None = None
+
+    # Issue 706: the same as evidence for the request records of a
+    # development run: the worker, why, and its threads serving requests.
+
+    evidence: dict[str, Any] | None = None
 
     # Section 9.3: a timeout kill is reported at the decision, as soon as
     # the replacement exists and the stacks asked for have been answered.
@@ -2644,6 +2655,7 @@ class Host:
         message: str,
         group: str | None = None,
         reason: str | None = None,
+        evidence: dict[str, Any] | None = None,
     ) -> None:
         """Log a worker event and pass it to the supervisor.
 
@@ -2651,17 +2663,22 @@ class Host:
         as one word, which the supervisor counts (section 11.1); the
         message says the same in words. The line logged is the one line the
         event has in a run's terminal and a release's log, so it names the
-        kind, except for the start-up lines every worker has.
+        kind, except for the start-up lines every worker has. `evidence`
+        names the requests the event is about, with the stacks of the
+        threads serving them, for a development run's records (issue 706).
         """
 
         log(message if kind in UNNAMED_EVENTS else f"{kind}: {message}")
-        event = {"type": "event", "kind": kind, "level": level, "message": message}
+        event: dict[str, Any] = {"type": "event", "kind": kind, "level": level, "message": message}
 
         if group is not None:
             event["group"] = group
 
         if reason is not None:
             event["reason"] = reason
+
+        if evidence is not None:
+            event["evidence"] = evidence
 
         self.send_to_supervisor(event)
 
@@ -3558,22 +3575,86 @@ class Host:
         for request_id, request in list(state.past_deadline.items()):
             if now - request.seen_at > PAST_DEADLINE_FORGET_REPORTS * REPORT_INTERVAL_SECONDS:
                 del state.past_deadline[request_id]
+
+                if request.raised and not state.replaced:
+                    self.past_deadline_ended(state, request_id, request)
+
                 continue
 
             if request.raised:
                 continue
 
             request.raised = True
-            self.emit(
-                "request.past_deadline",
-                "warning",
-                f"worker {self.worker_name(state.index)} (pid {state.pid}): request {request_id} "
-                f"{request.method} {request.path} is past its deadline, "
-                f"{request.age_ms / 1000:.1f} s after the worker took it; the client was "
-                "answered 504 and the request goes on in the worker",
-                group=self.group_of(state.index).name,
-                reason="deadline",
+            self.ask(
+                state,
+                "stacks",
+                {},
+                1.0,
+                functools.partial(self.report_past_deadline, state, request_id, request),
             )
+
+    def report_past_deadline(
+        self, state: WorkerState, request_id: str, request: PastDeadline, pending: Pending
+    ) -> None:
+        """Raise request.past_deadline with where the request was, once the worker answered.
+
+        Section 11.7 (issue 706): the stack of the request's thread goes
+        to the event's evidence for the request's record, and where it
+        was to the message. A worker that does not answer within the
+        second gives neither.
+        """
+
+        answer = pending.answers.get(state.pid, {})
+        threads = answer.get("result", {}).get("threads", []) if answer.get("ok") else []
+        serving = [
+            thread
+            for thread in threads
+            if (thread.get("request") or {}).get("request_id") == request_id
+        ]
+        where = f" at {place(serving[0]['frames'])}" if serving and serving[0].get("frames") else ""
+        self.emit(
+            "request.past_deadline",
+            "warning",
+            f"worker {self.worker_name(state.index)} (pid {state.pid}): request {request_id} "
+            f"{request.method} {request.path} is past its deadline, "
+            f"{request.age_ms / 1000:.1f} s after the worker took it{where}; the client was "
+            "answered 504 and the request goes on in the worker",
+            group=self.group_of(state.index).name,
+            reason="deadline",
+            evidence={
+                "worker": self.worker_name(state.index),
+                "pid": state.pid,
+                "requests": [request_id],
+                "threads": [evidence_thread(thread) for thread in serving],
+            },
+        )
+
+    def past_deadline_ended(
+        self, state: WorkerState, request_id: str, request: PastDeadline
+    ) -> None:
+        """Tell the supervisor that a request past its deadline has ended in its worker.
+
+        Issue 706: this is no event of its own, only evidence for the
+        request's record. The worker stopped reporting the request within
+        the last few reports, so the end is known to that much.
+        """
+
+        self.send_to_supervisor(
+            {
+                "type": "capture",
+                "kind": "request.ended",
+                "message": (
+                    f"request {request_id} {request.method} {request.path} has ended in worker "
+                    f"{self.worker_name(state.index)} (pid {state.pid}); it was last seen running "
+                    f"{request.age_ms / 1000:.1f} s after the worker took it"
+                ),
+                "evidence": {
+                    "worker": self.worker_name(state.index),
+                    "pid": state.pid,
+                    "requests": [request_id],
+                },
+            }
+        )
 
     def tick(self) -> None:
         """Apply the lifetime and hard timeout policies and advance replacements."""
@@ -3870,6 +3951,7 @@ class Host:
             f"{replacement.new_pid}: {replacement.reason}{capture}",
             group=self.group_of(replacement.index).name,
             reason=replacement.cause,
+            evidence=replacement.evidence,
         )
 
     def abandon_requests(self, state: WorkerState, args: dict[str, str]) -> None:
@@ -4086,7 +4168,7 @@ class Host:
                 answer = pending.answers.get(state.pid, {})
                 bookkeeping = answer.get("result", {}) if answer.get("ok") else {}
                 result = _outside.stacks_result(outside, bookkeeping)
-                self.record_capture(state, replacement, result["threads"])
+                self.record_capture(state, replacement, result)
                 settled()
 
             self.ask(state, "bookkeeping", {}, 1.0, read)
@@ -4096,7 +4178,7 @@ class Host:
             answer = pending.answers.get(state.pid, {})
 
             if answer.get("ok"):
-                self.record_capture(state, replacement, answer.get("result", {}).get("threads", []))
+                self.record_capture(state, replacement, answer.get("result", {}))
             else:
                 replacement.capture = "its stacks were written to the log by faulthandler"
 
@@ -4105,9 +4187,16 @@ class Host:
         self.ask(state, "stacks", {}, 1.0, answered)
 
     def record_capture(
-        self, state: WorkerState, replacement: Replacement, threads: list[dict[str, Any]]
+        self, state: WorkerState, replacement: Replacement, result: dict[str, Any]
     ) -> None:
-        """Log a worker's stacks and note where its oldest request was."""
+        """Log a worker's stacks and note where its oldest request was.
+
+        Issue 706: the threads serving requests, and every request in
+        flight, go to the replacement's evidence for the records of a
+        development run.
+        """
+
+        threads: list[dict[str, Any]] = result.get("threads", [])
 
         for thread in threads:
             frames = "".join(
@@ -4126,11 +4215,26 @@ class Host:
         )
 
         if stuck is not None and stuck.get("frames"):
-            innermost = stuck["frames"][-3:][::-1]
-            replacement.capture = "at " + ", called from ".join(
-                f"{os.path.basename(frame['file'])} line {frame['line']} in {frame['function']}"
-                for frame in innermost
-            )
+            replacement.capture = f"at {place(stuck['frames'])}"
+
+        serving = [thread for thread in threads if thread.get("request")]
+        requests = [
+            str(entry["request_id"])
+            for entry in result.get("active", [])
+            if entry.get("request_id")
+        ]
+        requests += [
+            str(thread["request"]["request_id"])
+            for thread in serving
+            if thread["request"].get("request_id")
+        ]
+        replacement.evidence = {
+            "worker": self.worker_name(state.index),
+            "pid": state.pid,
+            "reason": replacement.reason,
+            "requests": list(dict.fromkeys(requests)),
+            "threads": [evidence_thread(thread) for thread in serving],
+        }
 
     def capture_objects(self, state: WorkerState, replacement: Replacement) -> None:
         """Count a worker's commonest objects before it is recycled for memory.
@@ -4298,6 +4402,7 @@ class Host:
                     f"{replacement.reason}{capture}",
                     group=self.group_of(index).name,
                     reason=replacement.cause,
+                    evidence=replacement.evidence,
                 )
                 continue
 
@@ -4819,6 +4924,43 @@ def describe(status: int) -> str:
     if os.WIFSIGNALED(status):
         return f"signal {signal.Signals(os.WTERMSIG(status)).name}"
     return f"status {status}"
+
+
+def place(frames: list[dict[str, Any]]) -> str:
+    """Say where a stack is, by its three innermost frames, as an event's message does."""
+
+    return ", called from ".join(
+        f"{os.path.basename(frame['file'])} line {frame['line']} in {frame['function']}"
+        for frame in frames[-3:][::-1]
+    )
+
+
+def stack_text(frames: list[dict[str, Any]]) -> str:
+    """Write a stack as a traceback does, outermost first, keeping the innermost frames."""
+
+    lines = []
+
+    if len(frames) > STACK_FRAMES:
+        lines.append(f"  ... {len(frames) - STACK_FRAMES} outer frames not shown")
+
+    for frame in frames[-STACK_FRAMES:]:
+        lines.append(f'  File "{frame["file"]}", line {frame["line"]}, in {frame["function"]}')
+
+        if frame.get("text"):
+            lines.append(f"    {str(frame['text']).strip()}")
+
+    return "\n".join(lines)
+
+
+def evidence_thread(thread: dict[str, Any]) -> dict[str, Any]:
+    """Give a thread of a worker's stacks as a capture's evidence has it (issue 706)."""
+
+    request = thread.get("request") or {}
+    return {
+        "name": str(thread.get("name", "")),
+        "request_id": str(request.get("request_id") or ""),
+        "stack": stack_text(thread.get("frames", [])),
+    }
 
 
 def elapsed_ms(since: float) -> str:

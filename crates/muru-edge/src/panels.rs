@@ -352,6 +352,10 @@ pub fn builtin(record: &admin::RequestRecord) -> Vec<admin::Panel> {
     ]
 }
 
+/// What the panels say of a worker's part that did not arrive.
+const WORKER_MISSING: &str = "did not arrive: the worker stopped, its connection failed, \
+     or the edge stopped waiting for it at the request's deadline";
+
 fn value(name: &str, value: impl Into<String>) -> admin::PanelValue {
     admin::PanelValue {
         name: name.to_owned(),
@@ -500,10 +504,7 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
         crate::recorder::WORKER_EXPECTED => {
             values.push(value("worker's part", "still to come"));
         }
-        crate::recorder::WORKER_MISSING => values.push(value(
-            "worker's part",
-            "did not arrive: the worker stopped, or its connection failed",
-        )),
+        crate::recorder::WORKER_MISSING => values.push(value("worker's part", WORKER_MISSING)),
         _ => {}
     }
 
@@ -640,6 +641,13 @@ fn logs(record: &admin::RequestRecord) -> admin::Panel {
         }
     }
 
+    if record.worker_part == crate::recorder::WORKER_MISSING {
+        values.push(value(
+            "worker's part",
+            format!("The worker's part of the record {WORKER_MISSING}, so the request's log records are not here"),
+        ));
+    }
+
     admin::Panel {
         name: "logs".to_owned(),
         title: "Logs".to_owned(),
@@ -656,7 +664,8 @@ fn logs(record: &admin::RequestRecord) -> admin::Panel {
 }
 
 /// The application's unhandled exception, or the edge's reason for an
-/// error it answered itself.
+/// error it answered itself, and the evidence Muru captured of a timeout
+/// or a killed worker (issue 706), each capture a table of its own.
 fn errors(record: &admin::RequestRecord) -> admin::Panel {
     let mut values = Vec::new();
 
@@ -687,11 +696,68 @@ fn errors(record: &admin::RequestRecord) -> admin::Panel {
         values.push(value("edge's reason", record.reason.clone()));
     }
 
+    if record.worker_part == crate::recorder::WORKER_MISSING {
+        values.push(value(
+            "worker's part",
+            format!("{WORKER_MISSING}, so an exception the application raised is not shown"),
+        ));
+    }
+
     admin::Panel {
         name: "errors".to_owned(),
         title: "Errors".to_owned(),
         values,
+        tables: record.captures.iter().map(captured).collect(),
         ..Default::default()
+    }
+}
+
+/// One capture as a table of names and values: what captured it and
+/// when, the worker, the request's stack, the worker's other threads and
+/// the other records the capture reached.
+fn captured(capture: &admin::RequestCapture) -> admin::PanelTable {
+    let at = muru_common::log::clock(
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(capture.at_unix_ms),
+    );
+    let row = |name: &str, value: String| admin::PanelRow {
+        cells: vec![name.to_owned(), value],
+    };
+    let mut rows = vec![row("message", capture.message.clone())];
+
+    if !capture.worker.is_empty() {
+        let pid = if capture.pid > 0 {
+            format!(" (pid {})", capture.pid)
+        } else {
+            String::new()
+        };
+        rows.push(row("worker", format!("{}{pid}", capture.worker)));
+    }
+
+    if !capture.reason.is_empty() {
+        rows.push(row("why", capture.reason.clone()));
+    }
+
+    if !capture.stack.is_empty() {
+        rows.push(row("stack", capture.stack.clone()));
+    }
+
+    for thread in &capture.threads {
+        let name = if thread.request_id.is_empty() {
+            format!("thread {}", thread.name)
+        } else {
+            format!("thread {}, request {}", thread.name, thread.request_id)
+        };
+        rows.push(row(&name, thread.stack.clone()));
+    }
+
+    for other in &capture.related {
+        rows.push(row("also reached", other.clone()));
+    }
+
+    admin::PanelTable {
+        caption: format!("{} at {at}", capture.kind),
+        columns: vec!["name".to_owned(), "value".to_owned()],
+        rows,
     }
 }
 
@@ -1104,6 +1170,59 @@ mod tests {
         fine.from_worker = None;
         let html = Renderer::new(None).render(&errors(&fine));
         assert!(html.contains("No errors."), "{html}");
+    }
+
+    #[test]
+    fn the_errors_and_logs_panels_give_a_capture_and_a_part_that_never_came() {
+        let mut killed = fixture();
+        killed.from_worker = None;
+        killed.worker_part = crate::recorder::WORKER_MISSING.to_owned();
+        killed.captures = vec![admin::RequestCapture {
+            kind: "worker.timeout_killed".to_owned(),
+            at_unix_ms: 1_700_000_000_000,
+            message: "worker 0 (pid 7) replaced by pid 8: past the hard timeout".to_owned(),
+            worker: "0".to_owned(),
+            pid: 7,
+            reason: "hard_timeout".to_owned(),
+            stack: "  File \"shop.py\", line 3, in <view>\n    time.sleep(60)".to_owned(),
+            threads: vec![admin::CaptureThread {
+                name: "muru-app-1".to_owned(),
+                request_id: "B 2".to_owned(),
+                stack: "  File \"shop.py\", line 9, in list".to_owned(),
+            }],
+            related: vec!["B 2".to_owned()],
+        }];
+
+        let html = Renderer::new(None).render(&errors(&killed));
+        assert!(
+            html.contains("<caption>worker.timeout_killed at "),
+            "{html}"
+        );
+        assert!(html.contains("<th>worker</th><td>0 (pid 7)</td>"), "{html}");
+        assert!(html.contains("<th>why</th><td>hard_timeout</td>"), "{html}");
+        assert!(
+            html.contains("<pre class=\"error\">  File \"shop.py\", line 3, in &lt;view&gt;"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<th>thread muru-app-1, request B 2</th>"),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "<a href=\"/_muru/requests/B%202/panels/errors.html\" rel=\"noopener\">B 2</a>"
+            ),
+            "{html}"
+        );
+        assert!(html.contains("the edge stopped waiting for it"), "{html}");
+        assert!(!html.contains("No errors."), "{html}");
+
+        let html = Renderer::new(None).render(&logs(&killed));
+        assert!(
+            html.contains("so the request's log records are not here."),
+            "{html}"
+        );
+        assert!(!html.contains("No log records"), "{html}");
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //! when the next request runs on the same thread.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,25 @@ pub struct Interrupted {
     pub place: Option<String>,
 }
 
+impl Interrupted {
+    /// What the event says of the request, past a soft timeout of `after`.
+    pub fn message(&self, after: Duration) -> String {
+        let place = self
+            .place
+            .as_deref()
+            .map(|place| format!(" at {place}"))
+            .unwrap_or_default();
+
+        format!(
+            "request {} {} {} ran past the soft timeout of {}{place}",
+            self.request_id,
+            self.method,
+            self.path,
+            crate::wsgi::describe_seconds(after)
+        )
+    }
+}
+
 /// A request in flight past the edge's deadline for it (section 7.6),
 /// which the host makes an event.
 pub struct PastDeadline {
@@ -48,6 +67,39 @@ pub struct PastDeadline {
     /// How long the worker has had it, in milliseconds.
     pub age_ms: u64,
 }
+
+/// A thread's whole stack as a traceback writes it, outermost first, with
+/// its source lines (issue 706), keeping the innermost 64 frames.
+fn thread_stack(py: Python<'_>, thread: u64) -> Option<String> {
+    let frame = py
+        .import("sys")
+        .ok()?
+        .call_method0("_current_frames")
+        .ok()?
+        .get_item(thread)
+        .ok()?;
+    let traceback = py.import("traceback").ok()?;
+    let lines = traceback
+        .call_method1("format_stack", (frame,))
+        .ok()?
+        .extract::<Vec<String>>()
+        .ok()?;
+    let skipped = lines.len().saturating_sub(STACK_FRAMES);
+    let mut stack = String::new();
+
+    if skipped > 0 {
+        stack.push_str(&format!("  ... {skipped} outer frames not shown\n"));
+    }
+
+    for line in &lines[skipped..] {
+        stack.push_str(line);
+    }
+
+    Some(stack.trim_end().to_owned())
+}
+
+/// The innermost frames a capture's stack keeps.
+const STACK_FRAMES: usize = 64;
 
 /// The innermost frames of a thread as `file line N in function`,
 /// innermost first, read without opening source files.
@@ -780,8 +832,25 @@ impl Shared {
             .filter_map(|(id, info)| info.thread.map(|thread| (*id, thread)))
             .collect();
         let places: HashMap<u64, String> = overdue
-            .into_iter()
-            .filter_map(|(id, thread)| thread_place(py, thread).map(|place| (id, place)))
+            .iter()
+            .filter_map(|&(id, thread)| thread_place(py, thread).map(|place| (id, place)))
+            .collect();
+
+        // The whole stack, for the record of a request the edge asked for
+        // one of (issue 706).
+
+        let recorded: HashSet<u64> = self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .iter()
+            .filter(|(_, info)| info.trace.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        let stacks: HashMap<u64, String> = overdue
+            .iter()
+            .filter(|(id, _)| recorded.contains(id))
+            .filter_map(|&(id, thread)| thread_stack(py, thread).map(|stack| (id, stack)))
             .collect();
 
         // The injection happens under the lock, so a request that ends
@@ -800,12 +869,26 @@ impl Shared {
             }
 
             info.timed_out = true;
-            interrupted.push(Interrupted {
+            let request = Interrupted {
                 request_id: info.request_id.clone(),
                 method: info.method.clone(),
                 path: info.path.clone(),
                 place: places.get(id).cloned(),
-            });
+            };
+
+            // Issue 706: the request's record takes the event and the
+            // stack before the interruption can end the request, since
+            // the worker sends the record with the request's end.
+
+            if let Some(trace) = &info.trace {
+                trace.capture(
+                    "request.soft_timeout",
+                    &request.message(timeout.after),
+                    stacks.get(id).cloned().unwrap_or_default(),
+                );
+            }
+
+            interrupted.push(request);
 
             if let Some(channel) = &info.channel {
                 channels.push(channel.clone_ref(py));

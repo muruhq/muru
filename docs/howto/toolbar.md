@@ -285,7 +285,9 @@ The page shows the record as panels:
 - **Errors:** the exception the application did not catch, whether it
   was raised calling the application or while producing the body, and
   its traceback, as the development error page shows it; or, for an
-  error Muru answered itself, its reason.
+  error Muru answered itself, its reason. A request that ran past a
+  timeout, or whose worker was killed, has the evidence Muru captured,
+  as [below](#evidence-of-a-timeout-or-a-killed-worker).
 
 - **Connection:** the connection's ID, the request's position on it,
   how long the connection was idle before the request, for the first
@@ -311,7 +313,46 @@ A record still being written, for a response that is still streaming,
 says so; reloading the page shows the rest once the response has ended.
 The worker sends its part of the record just after the response, so a
 record is complete a moment after the last byte arrives. If the worker
-stopped before sending it, the Timing panel says so and shows the rest.
+stopped before sending it, or the edge stopped waiting for it at the
+request's deadline, the Timing, Logs and Errors panels say so in place
+of what the worker would have given, and show the rest.
+
+### Evidence of a timeout or a killed worker
+
+When a request fails because it ran too long, Muru captures where it
+was, and the request's record keeps it in the Errors panel, one table
+for each capture, named by the event and its time:
+
+- `request.soft_timeout`: the request ran past the [soft
+  timeout](timeouts.md#the-soft-timeout). The stack of its thread is
+  taken just before the timeout interrupts it.
+
+- `request.past_deadline`: the request was still running when the edge
+  answered it 504 at its [deadline](timeouts.md#past-the-deadline). The
+  stack is its thread's a second or two after the deadline. If the
+  request later ends while its record is kept, a `request.ended` entry
+  says so, with how long it had been running when it was last seen.
+
+- `worker.timeout_killed`: the request's worker was replaced for the
+  [hard timeout](timeouts.md#the-hard-timeout), a stalled event loop
+  or GIL, or reports that stopped.
+
+- `worker.restarted`: the worker was [restarted with
+  `--force`](recycling.md#restarting-a-worker-by-hand) while it served
+  the request.
+
+Each has the event's message, as `muructl events` shows it, and the
+request's own stack, outermost frame first and its innermost 64 frames
+kept. For a killed worker it also names the worker, its pid and why it
+was killed, gives the stacks of the worker's other threads that were
+serving requests, each with its request, and links to the record of
+each other request in flight on that worker. A capture goes to the
+record of every request it names that is still kept, at most 8 for one
+record. A worker that cannot answer for its stacks, such as one whose
+thread holds the GIL in C, gives none: a request past its deadline has
+the capture without a stack, and a killed worker, which then cannot say
+which requests it was serving, gives its requests' records no capture.
+Its stacks go to the log through `faulthandler`.
 
 The [access log](logging.md)'s JSON lines name the connection too, as
 `connection` and `connection_requests`, in every mode.

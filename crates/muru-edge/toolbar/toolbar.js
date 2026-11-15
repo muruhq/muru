@@ -226,6 +226,8 @@
   const refreshed = (target, again) => {
     if (target === own) {
       summary(own.found);
+    } else if (target.found && target.label === target.id) {
+      target.label = `${target.found.method} ${target.found.target}`;
     }
 
     if (target !== shown) {
@@ -296,8 +298,25 @@
     }
   };
 
-  // A link inside a panel to a record's panel reloads the panel in
-  // place, for sorting and paging; any other link goes where it says.
+  // Another request's record, opened in the toolbar at one of its
+  // panels: labelled by its ID until its record says what it was.
+
+  const open = (requestId, name) => {
+    if (!targets.has(requestId)) {
+      const link = dashboard ? dashboard.replace(/request\/[^/]*$/, `request/${encodeURIComponent(requestId)}`) : undefined;
+      targets.set(requestId, { id: requestId, label: requestId, link });
+    }
+
+    view(targets.get(requestId), name);
+  };
+
+  // A link inside a panel to a record's panel, as the panels write it
+  // under /_muru/ whatever prefix a proxy serves the run under: the shown
+  // record's reloads in place, for sorting and paging, and another's
+  // opens that record, as a capture's links to the other requests it
+  // reached do. Any other link goes where it says.
+
+  const PANEL_LINK = /\/_muru\/requests\/([^/]+)\/panels\/([^/]+)\.html$/;
 
   content.addEventListener("click", (event) => {
     const link = event.target.closest && event.target.closest("a[href]");
@@ -307,10 +326,20 @@
     }
 
     const address = new URL(link.getAttribute("href"), location.href);
+    const linked = address.origin === location.origin && address.pathname.match(PANEL_LINK);
 
-    if (address.origin === location.origin && address.pathname.startsWith(`${prefixPath}requests/`) && address.pathname.includes("/panels/")) {
-      event.preventDefault();
-      show(address.href);
+    if (!linked) {
+      return;
+    }
+
+    event.preventDefault();
+    const requestId = decodeURIComponent(linked[1]);
+    const name = decodeURIComponent(linked[2]);
+
+    if (requestId === shown.id) {
+      show(`${recordOf(requestId)}/panels/${encodeURIComponent(name)}.html${address.search}`);
+    } else {
+      open(requestId, name);
     }
   });
 

@@ -450,6 +450,11 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
         assert json.loads(read(f"/v1/requests/{request_id}"))["request_id"] == request_id
         assert f'href="request/{request_id}"' in read("/fragment/requests")
 
+        # A panel's link to another request's panel, as the toolbar
+        # follows it, goes to that request's page here (issue 706).
+
+        assert "<h2>Errors</h2>" in read(f"/_muru/requests/{request_id}/panels/errors.html")
+
         # A failed request's record has the exception, its traceback and
         # the log record that reported it.
 

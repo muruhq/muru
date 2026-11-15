@@ -11619,12 +11619,16 @@ impl Daemon {
                     });
                 }
             }
+            // Section 11.7: only a development run keeps request records,
+            // so the daemon has nothing to join a capture to.
+            HostMessage::Capture(_) => {}
             HostMessage::Event {
                 kind,
                 level,
                 message,
                 group,
                 reason,
+                ..
             } => {
                 let level = match level.as_str() {
                     "error" => "error",
