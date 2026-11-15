@@ -1098,6 +1098,10 @@ file again, checks it whole, and applies what changed:
 - the `[secrets.store.NAME]` tables, which the next release to start
   resolves its secrets from;
 
+- the `[condition]` tables: a [condition](conditions.md) added starts
+  being evaluated, one dropped stops, and one whose table changed starts
+  again from `unknown`; one left as it was keeps its state;
+
 - the `[logging.python]` table: each application takes the new Python
   logging defaults at its next restart or deploy, since a running host
   keeps those it started with;

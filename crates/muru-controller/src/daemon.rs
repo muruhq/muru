@@ -824,6 +824,9 @@ pub struct Info {
     /// The instances of each managed server release (section 9.9), by
     /// application and release, as the daemon last checked them.
     pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceRecord>>>,
+    /// Section 9.10 (issue 123): the conditions and their states, as of the
+    /// last evaluation.
+    pub conditions: std::sync::Mutex<Vec<crate::conditions::Status>>,
     /// What runs for each release now, by application and release, as the
     /// daemon last published it.
     pub live: std::sync::Mutex<HashMap<(String, String), LiveRelease>>,
@@ -1257,6 +1260,10 @@ struct Daemon {
     /// The daemon file's client classes and rate limits (sections 4.14
     /// and 4.15).
     client_rules: crate::clients::FileRules,
+    /// Section 9.10 (issue 123): the conditions the daemon's file
+    /// declares, and the evaluator of those and the applied ones.
+    file_conditions: BTreeMap<String, muru_config::Condition>,
+    conditions: crate::conditions::Engine,
     /// Those with the applied files', for every snapshot, with the list
     /// files they were read from.
     clients: crate::clients::ClientPolicies,
@@ -1368,6 +1375,10 @@ struct Daemon {
     /// by application and command, with the schedule it was worked out
     /// from.
     schedules: HashMap<(String, String), Scheduled>,
+    /// Section 9.10 (issue 689): the overlays whose activation by their
+    /// firing condition was skipped, so the event is raised once while the
+    /// condition keeps firing.
+    condition_skips: BTreeSet<String>,
     /// Whether this daemon started from nothing, with no edge left by a
     /// previous one to take over: its first start, after a reboot or
     /// after a shutdown. Commands with `at_boot` run then.
@@ -1530,6 +1541,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 budget: settings.budget,
                 ..crate::budget::View::default()
             },
+            conditions: settings.conditions.clone(),
             ..client_rules.defined()
         }),
         python_logging: std::sync::RwLock::new(settings.python_logging.clone()),
@@ -1542,6 +1554,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         pass_env: std::sync::RwLock::new(settings.pass_env.clone()),
         service,
         servers: std::sync::Mutex::new(HashMap::new()),
+        conditions: std::sync::Mutex::new(Vec::new()),
         provisioning,
         started: std::sync::atomic::AtomicBool::new(false),
         stopping: std::sync::atomic::AtomicBool::new(false),
@@ -1705,6 +1718,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         error_pages,
         error_override,
         client_rules,
+        file_conditions: settings.conditions.clone(),
+        conditions: crate::conditions::Engine::default(),
         clients,
         enforcement: crate::clients::Enforcement::default(),
         maintenance: HashMap::new(),
@@ -1750,6 +1765,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         asked: HashMap::new(),
         last_request: 0,
         schedules: HashMap::new(),
+        condition_skips: BTreeSet::new(),
         booted,
         cgroup: crate::cgroup::Limits::read(),
         guard: crate::guard::Guard::default(),
@@ -1889,6 +1905,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 };
 
                 daemon.sample_history(samples.as_deref()).await;
+                daemon.evaluate_conditions(samples.as_deref());
                 daemon.advance_rollouts(samples.as_deref()).await;
                 daemon.autoscale(samples.as_deref()).await;
                 daemon.guard_memory();
@@ -3113,6 +3130,14 @@ impl Daemon {
         self.client_rules = settings.client_rules;
         self.clients = clients;
 
+        if self.file_conditions != settings.conditions {
+            self.file_conditions = settings.conditions;
+            self.load_conditions();
+            report.changed("[condition]", "at once");
+        } else {
+            report.unchanged("[condition]");
+        }
+
         // Section 7.4: the budget.
 
         if settings.budget != self.budget_table {
@@ -3127,6 +3152,7 @@ impl Daemon {
 
         let mut defined = self.client_rules.defined();
         defined.budget = self.budget_view(self.budget_usage());
+        defined.conditions = self.file_conditions.clone();
         *self.info.defined.write().expect("defined names poisoned") = defined;
         let pass_env_was = std::mem::replace(
             &mut *self.info.pass_env.write().expect("pass_env poisoned"),
@@ -3466,7 +3492,7 @@ impl Daemon {
     }
 
     /// Section 9.10: whether an overlay's preconditions hold, or why not.
-    fn overlay_preconditions(&self, overlay: &muru_config::Overlay) -> Result<(), String> {
+    async fn overlay_preconditions(&self, overlay: &muru_config::Overlay) -> Result<(), String> {
         let Some(ready) = overlay
             .preconditions
             .as_ref()
@@ -3490,13 +3516,51 @@ impl Daemon {
 
         match self.store.release(&app, &id) {
             Ok(release)
-                if matches!(release.state, ReleaseState::Ready | ReleaseState::Retained) =>
-            {
-                Ok(())
-            }
-            Ok(release) => Err(format!("{app}@{id} is {}, not ready", release.state)),
-            Err(_) => Err(format!("{app}@{id} does not exist")),
+                if matches!(release.state, ReleaseState::Ready | ReleaseState::Retained) => {}
+            Ok(release) => return Err(format!("{app}@{id} is {}, not ready", release.state)),
+            Err(_) => return Err(format!("{app}@{id} does not exist")),
         }
+
+        // Issue 689: the release answers its probe, asked through the
+        // edge's own listener as a preview of it, at the host of the
+        // first route the overlay changes.
+
+        let Some(path) = overlay
+            .preconditions
+            .as_ref()
+            .and_then(|preconditions| preconditions.probe.as_deref())
+        else {
+            return Ok(());
+        };
+
+        let Some(port) = self
+            .edge
+            .listeners()
+            .into_iter()
+            .find(|(_, tls)| !tls)
+            .map(|(address, _)| address.port())
+        else {
+            return Err("the edge has no plain HTTP listener to probe through".to_owned());
+        };
+
+        let host = self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|route| {
+                route
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| overlay.routes.contains_key(name))
+            })
+            .map(|route| route.host)
+            .filter(|host| !host.is_empty() && !host.contains('*'));
+        let url = format!("http://127.0.0.1:{port}{path}");
+
+        crate::rollouts::probe_host(&self.probe_client, &url, host.as_deref(), &id)
+            .await
+            .map_err(|error| format!("its probe failed: {error}"))
     }
 
     /// Section 9.10: begin and end overlays by their schedules and by the
@@ -3548,7 +3612,7 @@ impl Daemon {
                     changed = true;
                 }
                 crate::overlays::Step::Begin { until } => {
-                    let preconditions = self.overlay_preconditions(overlay);
+                    let preconditions = self.overlay_preconditions(overlay).await;
 
                     // An advisory overlay only says what it would do, once
                     // a window; a skipped one is not retried every second.
@@ -3604,6 +3668,30 @@ impl Daemon {
             }
         }
 
+        // Issue 689: overlays that follow a named condition.
+
+        let conditions: HashMap<String, crate::conditions::Status> = self
+            .conditions
+            .statuses()
+            .into_iter()
+            .map(|status| (status.name.clone(), status))
+            .collect();
+
+        for (name, overlay) in &overlays {
+            if let Some(condition) = crate::overlays::condition(overlay) {
+                changed |= self
+                    .follow_condition(
+                        name,
+                        overlay,
+                        condition,
+                        conditions.get(condition),
+                        states.get(name),
+                        now,
+                    )
+                    .await;
+            }
+        }
+
         let warm_ups = self.warm_ups(&overlays, now);
 
         if warm_ups != self.warm_ups {
@@ -3648,6 +3736,104 @@ impl Daemon {
 
             if let Err(error) = self.push_snapshot().await {
                 tracing::error!(%error, "pushing the snapshot for an overlay failed");
+            }
+        }
+    }
+
+    /// Section 9.10 (issue 689): activate or end an overlay by its named
+    /// condition's state: active while it is firing, ended once it has
+    /// resolved and the overlay has been active for `min_active`, held as
+    /// it is while it is unknown. An activation the cooldown after the
+    /// last end, the cap on activations an hour or a precondition holds
+    /// back is skipped, with one event while the condition keeps firing.
+    /// Gives whether the overlay changed.
+    async fn follow_condition(
+        &mut self,
+        name: &str,
+        overlay: &muru_config::Overlay,
+        condition: &str,
+        status: Option<&crate::conditions::Status>,
+        state: Option<&crate::model::OverlayState>,
+        now: u64,
+    ) -> bool {
+        use crate::conditions::State;
+
+        let subject = format!("overlay {name}");
+        let firing = status.map(|status| status.state);
+        let figures = status
+            .map(crate::overlays::describe_terms)
+            .unwrap_or_default();
+
+        if firing != Some(State::Firing) {
+            self.condition_skips.remove(name);
+        }
+
+        let recent = if state.is_none() && firing == Some(State::Firing) {
+            self.store
+                .overlay_activations_since(name, now.saturating_sub(3_600_000))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let step = match crate::overlays::condition_step(overlay, firing, state, recent, now) {
+            crate::overlays::ConditionStep::Activate => {
+                match self.overlay_preconditions(overlay).await {
+                    Ok(()) => crate::overlays::ConditionStep::Activate,
+                    Err(why) => crate::overlays::ConditionStep::Skip(why),
+                }
+            }
+            step => step,
+        };
+
+        match step {
+            crate::overlays::ConditionStep::Stay => false,
+            crate::overlays::ConditionStep::Skip(why) => {
+                if self.condition_skips.insert(name.to_owned()) {
+                    self.events.emit(
+                        "overlay.skipped",
+                        &subject,
+                        "warning",
+                        &format!("not activated though its condition {condition} is firing: {why}"),
+                    );
+                }
+
+                false
+            }
+            crate::overlays::ConditionStep::End { held_until } => {
+                let held = held_until.map(|until| crate::model::OverlayState {
+                    name: name.to_owned(),
+                    active: false,
+                    source: "cooldown".to_owned(),
+                    since_unix_ms: now,
+                    until_unix_ms: Some(until),
+                });
+                let _ = self.store.set_overlay_state(name, held.as_ref());
+                self.events.emit(
+                    "overlay.ended",
+                    &subject,
+                    "notice",
+                    &format!("ended: its condition {condition} resolved{figures}"),
+                );
+                true
+            }
+            crate::overlays::ConditionStep::Activate => {
+                let state = crate::model::OverlayState {
+                    name: name.to_owned(),
+                    active: true,
+                    source: "condition".to_owned(),
+                    since_unix_ms: now,
+                    until_unix_ms: None,
+                };
+                let _ = self.store.set_overlay_state(name, Some(&state));
+                let _ = self.store.record_overlay_activation(name, now);
+                self.events.emit(
+                    "overlay.activated",
+                    &subject,
+                    "notice",
+                    &format!("activated: its condition {condition} is firing{figures}"),
+                );
+                true
             }
         }
     }
@@ -3808,6 +3994,7 @@ impl Daemon {
                 }
 
                 self.overlay_preconditions(&overlay)
+                    .await
                     .map_err(|why| format!("overlay {name} was not activated: {why}"))?;
                 let state = crate::model::OverlayState {
                     name: name.to_owned(),
@@ -3834,13 +4021,23 @@ impl Daemon {
 
                 let window = crate::overlays::window(&overlay, now)
                     .filter(|(start, end)| now >= *start && end.is_none_or(|end| now < end));
-                let held = window.map(|(_, end)| crate::model::OverlayState {
-                    name: name.to_owned(),
-                    active: false,
-                    source: "ended".to_owned(),
-                    since_unix_ms: now,
-                    until_unix_ms: end,
-                });
+
+                // Issue 689: one its condition activates is held through
+                // its cooldown, so a condition still firing does not
+                // activate it again at once.
+
+                let cooldown = crate::overlays::condition(&overlay)
+                    .map(|_| now + crate::overlays::cooldown(&overlay).as_millis() as u64);
+                let held = window
+                    .map(|(_, end)| end)
+                    .or(cooldown.map(Some))
+                    .map(|until| crate::model::OverlayState {
+                        name: name.to_owned(),
+                        active: false,
+                        source: "ended".to_owned(),
+                        since_unix_ms: now,
+                        until_unix_ms: until,
+                    });
                 self.store
                     .set_overlay_state(name, held.as_ref())
                     .map_err(|error| error.to_string())?;
@@ -4204,6 +4401,7 @@ impl Daemon {
         // Issue 688: the runs a previous daemon left under way.
 
         self.runs.adopt();
+        self.load_conditions();
 
         self.maintenance = self
             .store
@@ -4518,6 +4716,77 @@ impl Daemon {
                 false
             }
         }
+    }
+
+    /// Section 9.10 (issue 123): give the evaluator the conditions declared
+    /// now, the daemon's file's and the applied files', a name the file
+    /// declares staying the file's, as for rate limits.
+    fn load_conditions(&mut self) {
+        let mut declared: Vec<(String, muru_config::Condition, &'static str)> = self
+            .file_conditions
+            .iter()
+            .map(|(name, condition)| (name.clone(), condition.clone(), "file"))
+            .collect();
+
+        for (name, condition) in self.store.conditions().unwrap_or_default() {
+            if self.file_conditions.contains_key(&name) {
+                tracing::warn!(condition = %name, "the daemon's file declares an applied condition too; its table stands");
+            } else {
+                declared.push((name, condition, "applied"));
+            }
+        }
+
+        for error in self.conditions.set(declared) {
+            tracing::warn!("{error}");
+        }
+
+        self.publish_conditions();
+    }
+
+    /// Section 9.10 (issue 123): evaluate every condition over this
+    /// second's figures, raising its events, and publish their states.
+    fn evaluate_conditions(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
+        if self.conditions.is_empty() {
+            return;
+        }
+
+        let mut scaling = Vec::new();
+
+        for ((app, _), running) in &self.running {
+            for group in &running.scalers {
+                scaling.push((
+                    app.clone(),
+                    group.name.clone(),
+                    group.at_max_wanting_more(),
+                    group.denied(),
+                ));
+            }
+        }
+
+        let budget = self.budget();
+        let figures = crate::conditions::Figures {
+            scaling,
+            node_memory_available: budget
+                .memory
+                .map(|limit| limit.saturating_sub(self.budget_usage().memory) as f64),
+        };
+
+        let events = self.conditions.observe(
+            crate::model::now_unix_ms(),
+            samples.unwrap_or_default(),
+            &figures,
+        );
+
+        for (kind, subject, level, message) in events {
+            self.events.emit(kind, &subject, level, &message);
+        }
+
+        self.publish_conditions();
+    }
+
+    /// The conditions' states, for the admin API.
+    fn publish_conditions(&self) {
+        *self.info.conditions.lock().expect("conditions poisoned") = self.conditions.statuses();
     }
 
     /// Section 9.12 (issue 268): run each command whose cron schedule is
@@ -7434,7 +7703,8 @@ impl Daemon {
             self.events.emit(kind, subject, "notice", message);
         }
 
-        // The applied client classes and limits may have changed.
+        // The applied client classes and limits may have changed, and so
+        // may the conditions.
 
         match self.client_rules.policies(&self.store) {
             Ok(clients) => self.clients = clients,
@@ -7442,6 +7712,8 @@ impl Daemon {
                 tracing::warn!(%error, "the client classes stay as they were");
             }
         }
+
+        self.load_conditions();
 
         let started = self.start_referenced().await;
         self.refresh_certificates(true);

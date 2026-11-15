@@ -73,19 +73,17 @@ pub fn describe_trigger(overlay: &Overlay) -> String {
         .as_ref()
         .is_some_and(|trigger| trigger.external == Some(true));
 
-    let Some(schedule) = overlay
+    let schedule = overlay
         .trigger
         .as_ref()
-        .and_then(|trigger| trigger.schedule.as_ref())
-    else {
-        return if external {
-            "by hand or webhook".to_owned()
-        } else {
-            "by hand".to_owned()
-        };
-    };
+        .and_then(|trigger| trigger.schedule.as_ref());
 
-    let mut text = muru_config::describe_schedule(schedule);
+    let mut text = match (schedule, condition(overlay)) {
+        (Some(schedule), _) => muru_config::describe_schedule(schedule),
+        (None, Some(condition)) => format!("condition {condition}"),
+        (None, None) if external => return "by hand or webhook".to_owned(),
+        (None, None) => return "by hand".to_owned(),
+    };
 
     if external {
         text.push_str(", webhook");
@@ -100,6 +98,128 @@ pub fn describe_trigger(overlay: &Overlay) -> String {
     }
 
     text
+}
+
+/// The named condition an overlay follows, if it follows one (issue 689).
+pub fn condition(overlay: &Overlay) -> Option<&str> {
+    overlay
+        .trigger
+        .as_ref()
+        .and_then(|trigger| trigger.condition.as_deref())
+}
+
+/// The least an overlay its condition activated stays active: 5 minutes
+/// unless it says.
+pub fn min_active(overlay: &Overlay) -> std::time::Duration {
+    duration_or(overlay.min_active.as_deref(), 300)
+}
+
+/// How long after an overlay its condition activated ends its condition
+/// cannot activate it again: 10 minutes unless it says.
+pub fn cooldown(overlay: &Overlay) -> std::time::Duration {
+    duration_or(overlay.cooldown.as_deref(), 600)
+}
+
+/// The most activations by its condition an overlay takes in an hour: 4
+/// unless it says.
+pub fn max_per_hour(overlay: &Overlay) -> u32 {
+    overlay.max_per_hour.unwrap_or(4)
+}
+
+fn duration_or(text: Option<&str>, seconds: u64) -> std::time::Duration {
+    text.and_then(|text| muru_config::parse_duration(text).ok())
+        .unwrap_or(std::time::Duration::from_secs(seconds))
+}
+
+/// What an overlay that follows a named condition should do now (issue
+/// 689).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionStep {
+    /// Nothing changes.
+    Stay,
+    /// Its condition fires and nothing holds it back: activate it, once its
+    /// preconditions hold.
+    Activate,
+    /// Its condition fires and the activation is held back, for this
+    /// reason.
+    Skip(String),
+    /// Its condition resolved and it has been active long enough: end it,
+    /// held through its cooldown until then, if it has one.
+    End {
+        /// When the cooldown ends.
+        held_until: Option<u64>,
+    },
+}
+
+/// What an overlay following its condition should do at `now`: active
+/// while the condition fires, ended once it resolves after `min_active`,
+/// held as it is while the condition is unknown. Only an activation by the
+/// condition is ended by it, and a latched one only by hand. While held,
+/// by its cooldown or by hand, and once it has been activated
+/// `max_per_hour` times in the last hour (`recent`), a firing condition
+/// does not activate it.
+pub fn condition_step(
+    overlay: &Overlay,
+    condition: Option<crate::conditions::State>,
+    state: Option<&OverlayState>,
+    recent: u32,
+    now: u64,
+) -> ConditionStep {
+    use crate::conditions::State;
+
+    match state {
+        Some(state) if state.active => {
+            let min_active = min_active(overlay).as_millis() as u64;
+
+            if state.source != "condition"
+                || overlay.latch == Some(true)
+                || condition != Some(State::Resolved)
+                || now.saturating_sub(state.since_unix_ms) < min_active
+            {
+                return ConditionStep::Stay;
+            }
+
+            let cooldown = cooldown(overlay).as_millis() as u64;
+
+            ConditionStep::End {
+                held_until: (cooldown > 0).then_some(now + cooldown),
+            }
+        }
+        Some(held) if condition == Some(State::Firing) => {
+            let why = match held.source.as_str() {
+                "cooldown" => "its cooldown after it last ended",
+                "ended" => "it was ended by hand, and its cooldown",
+                _ => "its hold",
+            };
+
+            ConditionStep::Skip(format!(
+                "{why} lasts until {}",
+                muru_common::log::full(
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::from_millis(held.until_unix_ms.unwrap_or(now))
+                )
+            ))
+        }
+        Some(_) => ConditionStep::Stay,
+        None if condition != Some(State::Firing) => ConditionStep::Stay,
+        None if recent >= max_per_hour(overlay) => ConditionStep::Skip(format!(
+            "it was activated by its condition {recent} times in the last hour, its max_per_hour"
+        )),
+        None => ConditionStep::Activate,
+    }
+}
+
+/// A condition's terms and their figures, as an event's tail: `; TERM:
+/// 0.31; ...`, empty with none.
+pub fn describe_terms(status: &crate::conditions::Status) -> String {
+    status
+        .terms
+        .iter()
+        .map(|(term, value)| match value {
+            crate::conditions::Value::Known(value) => format!("; {term}: {value:.4}"),
+            crate::conditions::Value::Unknown(why) => format!("; {term}: unknown, {why}"),
+        })
+        .collect()
 }
 
 /// A wait as the events say it, to the minute once it is that long:
@@ -1462,5 +1582,123 @@ mod tests {
                 "app shop: maintenance off -> on",
             ]
         );
+    }
+
+    #[test]
+    fn an_overlay_follows_its_condition_with_its_guards() {
+        use crate::conditions::State::{Firing, Resolved, Unknown};
+
+        let overlay: Overlay = toml::from_str(
+            "trigger = { condition = 'shop-errors' }\nmin_active = '5m'\ncooldown = '10m'\nmax_per_hour = 2\n\
+             [routes.shop-root]\nmode = 'degraded'",
+        )
+        .unwrap();
+        let active = |source: &str, since: u64| OverlayState {
+            name: "db-outage".to_owned(),
+            active: true,
+            source: source.to_owned(),
+            since_unix_ms: since,
+            until_unix_ms: None,
+        };
+        let minute = 60_000;
+
+        // Idle: it activates while the condition fires, and only then.
+
+        assert_eq!(
+            condition_step(&overlay, Some(Firing), None, 0, 0),
+            ConditionStep::Activate
+        );
+        assert_eq!(
+            condition_step(&overlay, Some(Resolved), None, 0, 0),
+            ConditionStep::Stay
+        );
+        assert_eq!(
+            condition_step(&overlay, Some(Unknown), None, 0, 0),
+            ConditionStep::Stay
+        );
+        assert_eq!(
+            condition_step(&overlay, None, None, 0, 0),
+            ConditionStep::Stay
+        );
+
+        // Active: it stays while firing or unknown, and until min_active
+        // has passed, then ends into its cooldown.
+
+        let on = active("condition", 0);
+        assert_eq!(
+            condition_step(&overlay, Some(Unknown), Some(&on), 0, 10 * minute),
+            ConditionStep::Stay
+        );
+        assert_eq!(
+            condition_step(&overlay, Some(Resolved), Some(&on), 0, 4 * minute),
+            ConditionStep::Stay
+        );
+        assert_eq!(
+            condition_step(&overlay, Some(Resolved), Some(&on), 0, 5 * minute),
+            ConditionStep::End {
+                held_until: Some(15 * minute)
+            }
+        );
+
+        // Activated by hand, or latched, the condition does not end it.
+
+        assert_eq!(
+            condition_step(
+                &overlay,
+                Some(Resolved),
+                Some(&active("manual", 0)),
+                0,
+                60 * minute
+            ),
+            ConditionStep::Stay
+        );
+        let latched = Overlay {
+            latch: Some(true),
+            ..overlay.clone()
+        };
+        assert_eq!(
+            condition_step(&latched, Some(Resolved), Some(&on), 0, 60 * minute),
+            ConditionStep::Stay
+        );
+
+        // Held by its cooldown, or past its cap, a firing condition is
+        // skipped, saying why.
+
+        let cooling = OverlayState {
+            active: false,
+            source: "cooldown".to_owned(),
+            until_unix_ms: Some(15 * minute),
+            ..on.clone()
+        };
+        let ConditionStep::Skip(why) =
+            condition_step(&overlay, Some(Firing), Some(&cooling), 0, 6 * minute)
+        else {
+            panic!("the cooldown holds it");
+        };
+
+        assert!(
+            why.starts_with("its cooldown after it last ended lasts until"),
+            "{why}"
+        );
+        assert_eq!(
+            condition_step(&overlay, Some(Resolved), Some(&cooling), 0, 6 * minute),
+            ConditionStep::Stay
+        );
+
+        let ConditionStep::Skip(why) = condition_step(&overlay, Some(Firing), None, 2, 0) else {
+            panic!("the cap holds it");
+        };
+        assert!(
+            why.contains("2 times in the last hour, its max_per_hour"),
+            "{why}"
+        );
+
+        // The defaults: 5 minutes, 10 minutes and 4 an hour.
+
+        let plain: Overlay = toml::from_str("trigger = { condition = 'c' }").unwrap();
+        assert_eq!(min_active(&plain), std::time::Duration::from_secs(300));
+        assert_eq!(cooldown(&plain), std::time::Duration::from_secs(600));
+        assert_eq!(max_per_hour(&plain), 4);
+        assert_eq!(describe_trigger(&latched), "condition shop-errors, latched");
     }
 }

@@ -658,6 +658,41 @@
       },
       "type": "object"
     },
+    "Condition": {
+      "additionalProperties": false,
+      "description": "A named condition over Muru's own signals: when it fires and when it resolves, evaluated by the daemon every second. Nothing acts on a condition but what names it.",
+      "properties": {
+        "clear_for": {
+          "default": "0s",
+          "description": "How long the condition must be clear at every evaluation before it resolves.",
+          "type": "string"
+        },
+        "clear_when": {
+          "description": "The expression that resolves it; without one, it resolves when `when` has not held for `clear_for`.",
+          "type": "string"
+        },
+        "for": {
+          "default": "0s",
+          "description": "How long `when` must hold at every evaluation before the condition fires, such as `1m`.",
+          "type": "string"
+        },
+        "min_requests": {
+          "default": 100,
+          "description": "The requests a share, error rate or latency needs in its window to be a figure; fewer leave the term unknown.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "when": {
+          "description": "The expression that fires the condition, such as `error_rate{app='shop'} > 0.2`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "when"
+      ],
+      "type": "object"
+    },
     "Daemon": {
       "additionalProperties": false,
       "description": "The `[daemon]` table of the daemon's file: how the daemon itself runs.",
@@ -1757,10 +1792,27 @@
           "description": "Changes to applications, by name.",
           "type": "object"
         },
+        "cooldown": {
+          "default": "10m",
+          "description": "For an overlay its condition activates: how long after it ends its condition cannot activate it again.",
+          "type": "string"
+        },
         "latch": {
           "default": false,
-          "description": "Once its schedule activates it, it stays active past the window until a person ends it.",
+          "description": "Once its schedule or its condition activates it, it stays active, past the window or the condition resolving, until a person ends it.",
           "type": "boolean"
+        },
+        "max_per_hour": {
+          "default": 4,
+          "description": "For an overlay its condition activates: the most activations by its condition in an hour.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_active": {
+          "default": "5m",
+          "description": "For an overlay its condition activates: the least it stays active, however soon the condition resolves.",
+          "type": "string"
         },
         "preconditions": {
           "$ref": "#/$defs/Preconditions",
@@ -1821,6 +1873,10 @@
       "additionalProperties": false,
       "description": "When an overlay is active on its own.",
       "properties": {
+        "condition": {
+          "description": "A named condition: the overlay is active while it is firing, and ends once it has resolved.",
+          "type": "string"
+        },
         "external": {
           "default": false,
           "description": "Whether the signed webhook of the `[overlay_webhook]` table may activate and end it.",
@@ -1859,6 +1915,10 @@
       "additionalProperties": false,
       "description": "What must hold for an overlay to activate.",
       "properties": {
+        "probe": {
+          "description": "A path the `release_ready` release must answer with 2xx or 3xx, asked through the edge, such as /healthz.",
+          "type": "string"
+        },
         "release_ready": {
           "description": "A release that must be ready, as app@release, or as release when the overlay changes routes of one application only.",
           "type": "string"
@@ -3310,6 +3370,13 @@
     "compression": {
       "$ref": "#/$defs/Compression",
       "description": "How responses are compressed."
+    },
+    "condition": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Condition"
+      },
+      "description": "Named conditions over Muru's own signals, from the daemon's own file or an applied one.",
+      "type": "object"
     },
     "daemon": {
       "$ref": "#/$defs/Daemon",

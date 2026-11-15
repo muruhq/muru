@@ -1235,6 +1235,29 @@ impl Admin for Service {
         Ok(Response::new(Box::pin(stream)))
     }
 
+    async fn list_conditions(
+        &self,
+        request: Request<pb::ListConditionsRequest>,
+    ) -> Result<Response<pb::ListConditionsResponse>, Status> {
+        let name = request.into_inner().name;
+        let conditions: Vec<pb::ConditionStatus> = self
+            .handle
+            .info
+            .conditions
+            .lock()
+            .expect("conditions poisoned")
+            .iter()
+            .filter(|status| name.is_empty() || status.name == name)
+            .map(condition_message)
+            .collect();
+
+        if !name.is_empty() && conditions.is_empty() {
+            return Err(Status::not_found(format!("no condition named {name}")));
+        }
+
+        Ok(Response::new(pb::ListConditionsResponse { conditions }))
+    }
+
     async fn list_command_runs(
         &self,
         request: Request<pb::ListCommandRunsRequest>,
@@ -1883,6 +1906,13 @@ impl Admin for Service {
             .map(|state| (state.name.clone(), state))
             .collect();
         let now = crate::model::now_unix_ms();
+        let conditions = self
+            .handle
+            .info
+            .conditions
+            .lock()
+            .expect("conditions poisoned")
+            .clone();
         let overlays = store
             .overlays()
             .map_err(internal)?
@@ -1890,7 +1920,17 @@ impl Admin for Service {
             .map(|(name, overlay)| {
                 let state = states.get(&name);
                 let window = crate::overlays::window(&overlay, now);
+                let condition = crate::overlays::condition(&overlay)
+                    .unwrap_or_default()
+                    .to_owned();
+                let condition_state = conditions
+                    .iter()
+                    .find(|status| status.name == condition)
+                    .map(|status| status.state.as_str().to_owned())
+                    .unwrap_or_default();
                 pb::OverlayInfo {
+                    condition,
+                    condition_state,
                     active: state.is_some_and(|state| state.active),
                     state: state.map(|state| state.source.clone()).unwrap_or_default(),
                     since_unix_ms: state.map_or(0, |state| state.since_unix_ms),
@@ -1982,8 +2022,45 @@ impl Admin for Service {
             .map(|(app, _)| app)
             .collect();
         let maintenance = crate::overlays::apply_maintenance(&base, &active);
+
+        // Issue 689: the condition it follows, and that condition's terms
+        // now.
+
+        let condition = crate::overlays::condition(&overlay)
+            .unwrap_or_default()
+            .to_owned();
+        let status = self
+            .handle
+            .info
+            .conditions
+            .lock()
+            .expect("conditions poisoned")
+            .iter()
+            .find(|status| status.name == condition)
+            .cloned();
+        let condition_terms = status
+            .as_ref()
+            .map(|status| {
+                status
+                    .terms
+                    .iter()
+                    .map(|(term, value)| match value {
+                        crate::conditions::Value::Known(value) => format!("{term} is {value}"),
+                        crate::conditions::Value::Unknown(why) => {
+                            format!("{term} is unknown: {why}")
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(Response::new(pb::PreviewOverlayResponse {
             changes: crate::overlays::preview(&overlay, &routes, &maintenance),
+            condition_state: status
+                .map(|status| status.state.as_str().to_owned())
+                .unwrap_or_default(),
+            condition,
+            condition_terms,
         }))
     }
 
@@ -4024,6 +4101,44 @@ fn requested_by<T>(request: &Request<T>) -> String {
             || "unknown".to_owned(),
             |credentials| crate::processes::user_name(credentials.uid()),
         )
+}
+
+/// A condition's state as the admin API gives it.
+fn condition_message(status: &crate::conditions::Status) -> pb::ConditionStatus {
+    pb::ConditionStatus {
+        name: status.name.clone(),
+        state: status.state.as_str().to_owned(),
+        held: status.held.as_str().to_owned(),
+        since_unix_ms: status.since_unix_ms,
+        source: status.source.to_owned(),
+        when: status.table.when.clone(),
+        r#for: status.table.for_.clone().unwrap_or_default(),
+        clear_when: status.table.clear_when.clone().unwrap_or_default(),
+        clear_for: status.table.clear_for.clone().unwrap_or_default(),
+        min_requests: status
+            .table
+            .min_requests
+            .unwrap_or(muru_config::condition::DEFAULT_MIN_REQUESTS),
+        unknown: status.unknown.clone().unwrap_or_default(),
+        terms: status
+            .terms
+            .iter()
+            .map(|(term, value)| match value {
+                crate::conditions::Value::Known(value) => pb::ConditionTerm {
+                    term: term.clone(),
+                    known: true,
+                    value: *value,
+                    unknown: String::new(),
+                },
+                crate::conditions::Value::Unknown(why) => pb::ConditionTerm {
+                    term: term.clone(),
+                    known: false,
+                    value: 0.0,
+                    unknown: why.clone(),
+                },
+            })
+            .collect(),
+    }
 }
 
 /// A run as the admin API gives it.

@@ -102,6 +102,9 @@ pub struct NodeSettings {
     /// The file's client classes and rate limits (sections 4.14 and
     /// 4.15), with the directory their list files are relative to.
     pub client_rules: crate::clients::FileRules,
+    /// Section 9.10 (issue 123): the named conditions the daemon's own
+    /// file declares, checked.
+    pub conditions: std::collections::BTreeMap<String, muru_config::Condition>,
 }
 
 impl NodeSettings {
@@ -221,6 +224,7 @@ impl NodeSettings {
                 limits: document.rate_limit.clone(),
                 directory: config_directory(path),
             },
+            conditions: checked_conditions(&document.condition)?,
         })
     }
 }
@@ -536,6 +540,19 @@ fn access_log_from(document: &muru_config::Document) -> Result<muru_edge::access
 
     filter.exclude = logs.access_log_exclude.clone();
     Ok(filter)
+}
+
+/// The daemon's own file's conditions, each of which must read.
+fn checked_conditions(
+    conditions: &std::collections::BTreeMap<String, muru_config::Condition>,
+) -> Result<std::collections::BTreeMap<String, muru_config::Condition>, String> {
+    for (name, condition) in conditions {
+        for warning in muru_config::condition::check(name, condition)? {
+            tracing::warn!("{warning}");
+        }
+    }
+
+    Ok(conditions.clone())
 }
 
 /// `[daemon] keep_command_runs`, at least 1.

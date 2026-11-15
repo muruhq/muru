@@ -12,6 +12,7 @@ pub mod cgroup;
 pub mod client;
 pub mod clients;
 pub mod commands;
+pub mod conditions;
 pub mod config;
 pub mod daemon;
 pub mod dashboard;

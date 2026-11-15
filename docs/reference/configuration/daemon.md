@@ -14,6 +14,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `app` | table of tables, {ref}`[app.NAME] <config-daemon-app-name>` |  | Applications by name. |
 | `client_class` | array of tables, {ref}`[[client_class]] <config-daemon-client-class>` |  | Client classification rules, in order, from the daemon's own file. |
 | `compression` | table, {ref}`[compression] <config-daemon-compression>` |  | How responses are compressed. |
+| `condition` | table of tables, {ref}`[condition.NAME] <config-daemon-condition-name>` |  | Named conditions over Muru's own signals, from the daemon's own file or an applied one. |
 | `daemon` | table, {ref}`[daemon] <config-daemon-daemon>` |  | How the daemon itself runs. |
 | `dashboard` | table, {ref}`[dashboard] <config-daemon-dashboard>` |  | The dashboard. |
 | `error_override` | table, {ref}`[error_override] <config-daemon-error-override>` |  | Replace the application's own error responses with error pages. |
@@ -405,6 +406,19 @@ The same keys apply at `[host.NAME.compression]` and `[route.compression]`.
 | `min_size` | string | `"1KB"` | The smallest body worth compressing, for example 1KB; at least 1 byte. |
 | `types` | array of strings | `["text/*", "application/json", "application/javascript", "application/xml", "image/svg+xml"]` | The content types compressed: exact types or a family as text/*. An empty list is refused. |
 
+(config-daemon-condition-name)=
+## `[condition.NAME]`
+
+A named condition over Muru's own signals: when it fires and when it resolves, evaluated by the daemon every second. Nothing acts on a condition but what names it.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `clear_for` | string | `"0s"` | How long the condition must be clear at every evaluation before it resolves. |
+| `clear_when` | string |  | The expression that resolves it; without one, it resolves when `when` has not held for `clear_for`. |
+| `for` | string | `"0s"` | How long `when` must hold at every evaluation before the condition fires, such as `1m`. |
+| `min_requests` | integer | `100` | The requests a share, error rate or latency needs in its window to be a figure; fewer leave the term unknown. |
+| `when` | string | required | The expression that fires the condition, such as `error_rate{app='shop'} > 0.2`. |
+
 (config-daemon-daemon)=
 ## `[daemon]`
 
@@ -710,7 +724,10 @@ An `[overlay.NAME]` table: changes to named routes and to applications, applied 
 | --- | --- | --- | --- |
 | `advisory` | boolean | `false` | Its schedule only raises overlay.would_activate events; it is activated by hand only. |
 | `apps` | table of tables, {ref}`[overlay.NAME.apps.NAME] <config-daemon-overlay-name-apps-name>` |  | Changes to applications, by name. |
-| `latch` | boolean | `false` | Once its schedule activates it, it stays active past the window until a person ends it. |
+| `cooldown` | string | `"10m"` | For an overlay its condition activates: how long after it ends its condition cannot activate it again. |
+| `latch` | boolean | `false` | Once its schedule or its condition activates it, it stays active, past the window or the condition resolving, until a person ends it. |
+| `max_per_hour` | integer | `4` | For an overlay its condition activates: the most activations by its condition in an hour. |
+| `min_active` | string | `"5m"` | For an overlay its condition activates: the least it stays active, however soon the condition resolves. |
 | `preconditions` | table, {ref}`[overlay.NAME.preconditions] <config-daemon-overlay-name-preconditions>` |  | What must hold for the overlay to activate. |
 | `priority` | integer |  | Which of two active overlays setting the same field wins: the higher. Overlays that would conflict must both set one. |
 | `routes` | table of tables, {ref}`[overlay.NAME.routes.NAME] <config-daemon-overlay-name-routes-name>` |  | Changes to routes, by the route's `name`. |
@@ -741,6 +758,7 @@ What must hold for an overlay to activate.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `probe` | string |  | A path the `release_ready` release must answer with 2xx or 3xx, asked through the edge, such as /healthz. |
 | `release_ready` | string |  | A release that must be ready, as app@release, or as release when the overlay changes routes of one application only. |
 
 (config-daemon-overlay-name-routes-name)=
@@ -791,6 +809,7 @@ When an overlay is active on its own.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `condition` | string |  | A named condition: the overlay is active while it is firing, and ends once it has resolved. |
 | `external` | boolean | `false` | Whether the signed webhook of the `[overlay_webhook]` table may activate and end it. |
 | `schedule` | table, {ref}`[overlay.NAME.trigger.schedule] <config-daemon-overlay-name-trigger-schedule>` |  | A window in time. |
 

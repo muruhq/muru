@@ -309,7 +309,24 @@ pub fn check_probe(url: &str) -> Result<(), String> {
 /// Request a probe URL from one release by preview: a 2xx or 3xx answer
 /// within the timeout passes, and anything else says how it failed.
 pub async fn probe(client: &ProbeClient, url: &str, release: &str) -> Result<(), String> {
-    let request = http::Request::get(url)
+    probe_host(client, url, None, release).await
+}
+
+/// `probe`, with the Host header given rather than the URL's, for a probe
+/// through the edge's own listener of a route on a virtual host.
+pub async fn probe_host(
+    client: &ProbeClient,
+    url: &str,
+    host: Option<&str>,
+    release: &str,
+) -> Result<(), String> {
+    let mut request = http::Request::get(url);
+
+    if let Some(host) = host {
+        request = request.header(http::header::HOST, host);
+    }
+
+    let request = request
         .header(muru_edge::routing::PREVIEW_HEADER, release)
         .header(http::header::USER_AGENT, "muru-probe")
         .body(Empty::new())

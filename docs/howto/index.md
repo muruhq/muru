@@ -52,6 +52,8 @@ Recipes for specific tasks, assuming you already know the basics. The
   gates.
 - [Overlays](overlays.md): configuration laid over the routes by hand or
   on a schedule.
+- [Conditions](conditions.md): when something holds over Muru's own
+  figures, such as an error rate or a crawler surge.
 - [Client classes and rate limits](client-classes.md): classifying
   clients, limiting their rates and restricting methods.
 
@@ -149,6 +151,7 @@ disk-space
 traffic
 rollouts
 overlays
+conditions
 client-classes
 virtual-hosts
 behind-a-proxy

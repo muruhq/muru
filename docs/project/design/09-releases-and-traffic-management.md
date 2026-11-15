@@ -212,15 +212,26 @@ trigger = { schedule = { start = '2026-11-02T09:00', timezone = 'Australia/Sydne
 warm_up = { start_release = 'r43', lead = '30m' }
 preconditions = { release_ready = 'r43', probe = '/healthz' }
 
+[condition.shop-errors]
+when = "error_rate{app='shop',reason='app_error'} > 0.2"
+for = '1m'
+clear_when = "error_rate{app='shop',reason='app_error'} < 0.02"
+clear_for = '5m'
+
+[condition.crawler-surge]
+when = "request_share{app='shop',client_class='ai-crawler'} > 0.3"
+for = '5m'
+clear_when = "request_share{app='shop',client_class='ai-crawler'} < 0.1"
+clear_for = '15m'
+
 [overlay.db-outage]
 routes.shop-root = { target = { static = '/srv/shop/snapshot' }, mode = 'degraded' }
-trigger = { condition = { when = "error_rate{route='shop-root',reason='app_error'} > 0.2", for = '1m', clear_when = 'error_rate < 0.02', clear_for = '5m' } }
+trigger = { condition = 'shop-errors' }
 latch = true
-advisory = true
 
-[overlay.crawler-surge]
+[overlay.crawler-snapshot]
 routes.shop-root.client_routes = { ai-crawler = { target = { static = '/srv/shop/snapshot' } } }
-trigger = { condition = { when = "request_share{client_class='ai-crawler'} > 0.3", for = '5m', clear_when = 'request_share < 0.1', clear_for = '15m' } }
+trigger = { condition = 'crawler-surge' }
 ```
 
 **Triggers**
@@ -228,7 +239,7 @@ trigger = { condition = { when = "request_share{client_class='ai-crawler'} > 0.3
 | Trigger | Behaviour |
 | --- | --- |
 | schedule | One-off start and optional end, or cron plus duration, in a named time zone with daylight saving handled. An overlay with a start and no end stays active until ended or promoted. A declared command's schedule (section 9.12) reads its cron expression the same way |
-| condition | An expression over Muru's signals (request rate and share, error rate by reason, latency percentiles, queue wait, saturation, scaling at maximum or denied by budget, node memory, upstream health), with separate activate and clear thresholds and sustain windows |
+| condition | A named condition (below): an expression over Muru's signals (request rate and share, error rate by reason, latency percentiles, queue wait, saturation, scaling at maximum or denied by budget, node memory, upstream health), with separate fire and clear expressions and waits, declared once and named by the overlay |
 | manual | muructl overlay activate NAME and muructl overlay end NAME, optionally with --for or --until |
 | external | The admin API, or a signed webhook endpoint for monitoring and alerting systems |
 
@@ -236,7 +247,9 @@ trigger = { condition = { when = "request_share{client_class='ai-crawler'} > 0.3
 
 - **Preconditions:** checked at activation, such as a release being ready or a probe passing. If they fail, the overlay is not applied and a skipped event is raised, so a timed switch never moves traffic to something broken. warm_up can start a release ahead of a scheduled switch.
 - **Condition triggers against flapping:** hysteresis through separate clear thresholds and windows, a minimum active duration (default 5 minutes), a cooldown after ending (default 10 minutes), and a cap on activations per hour. latch = true keeps an overlay active until a person ends it, which suits error-triggered overlays.
-- **Advisory mode:** new condition triggers default to advisory = true, which only raises would_activate events, so thresholds can be tuned before they act.
+- **Overlays triggered by a condition (issue 689).** `trigger = { condition = 'NAME' }` names one condition, refused beside a `schedule` and allowed beside `external`, and apply refuses a name that no condition of the daemon's file, the document or the store has. The overlay follows the condition's state, not its events, in the daemon's overlay reconciliation each second (`overlays::condition_step`): idle, it is activated while the condition is `firing`; active by its condition, it ends once the condition is `resolved` and it has been active for `min_active` (5 minutes), held through `cooldown` (10 minutes) as a held state `cooldown`; while the condition is `unknown` it is held as it is, so after a restart it is worked out again from the condition and nothing depends on an event having been seen. Only an activation by the condition (source `condition`) is ended by it: one by hand or by the webhook, and one with `latch = true`, are ended by hand. While held, by the cooldown or by an end by hand, which for such an overlay holds it through its cooldown, and once the store's `overlay_activations` count `max_per_hour` (4) activations by the condition in the last hour, a firing condition is skipped with `overlay.skipped` saying which, raised once while the condition keeps firing; an activation the preconditions refuse is skipped the same way and tried again each second. `preconditions.probe`, a path beside `release_ready` and needing it, is asked through the edge's first plain listener with the preview header for that release and the Host of the first route the overlay changes, and must answer 2xx or 3xx within the probe timeout; it applies to every activation. Activations and ends are `overlay.activated` and `overlay.ended` naming the condition with each term's figure; `ListOverlays` gives the condition and its state, and `PreviewOverlay` its terms' figures. Apply warns when an overlay changes the target of a route whose application a request signal of its condition reads, since that starves the condition of the figure that would end it. `min_active`, `cooldown` and `max_per_hour` are refused on an overlay without a condition, and `advisory` on one without a schedule.
+- **Tuning a condition:** a named condition that nothing names acts on nothing, so its events and `muructl condition show` are how its thresholds are tuned against real traffic before an overlay names it; no advisory setting is needed for conditions.
+- **Named conditions (issue 123, ADR 0061).** `[condition.NAME]` in the daemon's own file or an applied file declares `when`, `for`, `clear_when`, `clear_for` and `min_requests` (100). The language is a PromQL-shaped subset: comparisons of a signal, with `=` and `!=` label matchers and an optional window in brackets of at most an hour, against a number in base units, joined by `and` (binding tighter) and `or` with parentheses, and nothing else; `muru_config::condition` reads it and holds the signals and the labels each takes (`request_rate`, `request_share` and `error_rate` from `muru_requests_total`, `latency` from `muru_request_duration_seconds` with `quantile` and `phase`, `queue_depth`, `capacity_utilisation`, `upstream_healthy` from their gauges, `scaling_at_max` and `scaling_denied` from the autoscaler, `node_memory_available` from the budget less what the releases hold). `latency` takes no `client_class` until the edge keeps durations by client class (issue 695), and no signal takes `route` until the edge counts by route (issues 690 and 513). Apply refuses an unknown signal, a label the signal does not take, a window over an hour and a ratio threshold outside 0 to 1, naming the condition and the term, and warns when `when` and `clear_when` are single comparisons of the same figure with no gap between their thresholds; the store keeps applied conditions in `conditions`, and a name the daemon's file declares stays the file's. The daemon evaluates every condition once a second, after the edge's samples are read: it keeps, for each term's selector, a reading each second for the longest window any term has, the request counters in scope and picked out, the duration histogram's summed buckets, or a gauge's value; a figure over a window is the difference between the newest reading and the oldest in the window (a counter that went back was reset), a gauge's average over it, or a gauge's latest value without one, and a request signal with no series in scope, a gauge with none, or a share, error rate or latency with fewer than `min_requests` requests in its window is unknown. Expressions take three values, `and` false with a false term and `or` true with a true one, anything else with an unknown term unknown. `when` must hold at every evaluation through `for` to fire and `clear_when` (or `when` false) through `clear_for` to resolve, one that does not resetting the wait; an unknown evaluation resets the wait, holds the state and reads `unknown`. A condition starts unknown, the figures being kept only in the daemon's memory, and a change is `condition.firing` (warning) or `condition.resolved` (info), the condition's name the subject, with each term's figure. `ListConditions` gives each condition's state, the state it holds, since when, its source, its table and each term's figure or why it is unknown; `muructl condition list` and `show NAME` print them, and the MCP tool `conditions` gives them.
 - **Prefer the right mechanism:** errors caused by a new release belong to canary gates and rollback (section 9.3), and load belongs to the autoscaler first. Conditions such as scaling at max_workers or denied by budget let a degraded-mode overlay act only when scaling cannot keep up.
 - **Conflicts:** two active overlays setting the same field is a validation error unless they have explicit priorities. Active overlays sit above base configuration and below time-limited runtime overrides. An overlay that pins traffic on a route pauses any rollout on that route.
 - **Visibility:** muructl overlay preview NAME shows the effective changes before activation. config show --effective attributes values to overlays. Activation, end, skip and would_activate are events, and the dashboard shows active and upcoming overlays.
