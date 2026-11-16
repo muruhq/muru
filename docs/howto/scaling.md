@@ -230,6 +230,62 @@ which the next such command for the group replaces, `muructl overlay end`
 ends early, and which is forgotten once it ends. `muructl apply` leaves it
 alone and `muructl config export` does not write it.
 
+## Capacity on a condition
+
+The autoscaler decides how many workers a group needs from the group's
+own signals, every second. A [condition](conditions.md) sets the bounds
+it works within, at the pace of minutes, through an
+[overlay](overlays.md#by-a-condition) that sets capacity: the overlay is
+active while the condition fires, and its `apps.NAME` keys are those of
+a schedule.
+
+Warming one application because another is busy. The storefront's
+traffic reaches the API a little later, and the API's autoscaler reads
+only the API's own group, so a condition on the storefront raises the
+API's floor before its traffic arrives:
+
+```toml
+[condition.storefront-busy]
+when = "request_rate{app='storefront'} > 200"
+for = "1m"
+clear_when = "request_rate{app='storefront'} < 100"
+clear_for = "10m"
+
+[overlay.api-warm]
+trigger = { condition = 'storefront-busy' }
+apps.api = { min_workers = 8 }
+```
+
+Holding capacity while something is wrong. While the payments upstream
+is down, the shop's requests fail fast and its slots look idle, which
+would let the autoscaler reap workers or scale the group to zero just
+before the traffic comes back. A condition on the upstream's health
+raises the floor and holds scale-in until it recovers:
+
+```toml
+[condition.payments-down]
+when = "upstream_healthy{upstream='payments'} < 0.5"
+for = "30s"
+clear_when = "upstream_healthy{upstream='payments'} >= 1"
+clear_for = "5m"
+
+[overlay.shop-hold]
+trigger = { condition = 'payments-down' }
+apps.shop = { min_workers = 4, scale_in = 'hold' }
+```
+
+An overlay's capacity combines with schedules and other overlays as
+[scheduled capacity](#scheduled-capacity) does: the highest floor and
+the highest ceiling apply, and scale-in is held if any of them holds it.
+`muructl scale status` names the overlay on the group's line. After the
+overlay ends, the group scales in by the autoscaler's usual slow rules.
+The overlay's `min_active`, `cooldown` and `max_per_hour` keep a
+condition that hovers near its threshold from changing capacity often.
+
+A condition should not drive capacity on a signal that more workers do
+not improve, such as an application's error rate or the latency of a
+slow database: scaling out on it adds load without fixing the cause.
+
 ## The node's budget
 
 The `[daemon.budget]` table of the daemon's configuration file caps what

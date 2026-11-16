@@ -195,6 +195,9 @@ database's health check upstream, or set `latch = true` and end the
 overlay by hand once `muructl overlay preview` shows the application
 healthy again.
 
+An overlay on a condition can set capacity too, as in [capacity on a
+condition](scaling.md#capacity-on-a-condition).
+
 ## The webhook
 
 Monitoring and alerting systems can activate and end overlays that

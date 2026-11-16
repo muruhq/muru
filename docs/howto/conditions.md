@@ -8,6 +8,10 @@ changes. A condition does nothing else by itself, so its events and
 `muructl condition show` are how you tune its thresholds against real
 traffic.
 
+An [overlay](overlays.md#by-a-condition) acts on a condition: it changes
+routes while the condition fires, or [sets a group's
+capacity](scaling.md#capacity-on-a-condition).
+
 ## Declaring a condition
 
 Declare conditions in the daemon's own file or in a file you apply with
