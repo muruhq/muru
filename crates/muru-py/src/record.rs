@@ -76,6 +76,9 @@ struct State {
     gil_wait: Duration,
     gil_waits: u32,
     gil_first: Option<Duration>,
+    /// Evidence captured of the request's failure, such as its stack at
+    /// the soft timeout (issue 706).
+    captures: Vec<pb::RecordCapture>,
 }
 
 #[derive(Debug)]
@@ -102,6 +105,22 @@ impl Trace {
                 ..State::default()
             }),
         }
+    }
+
+    /// Keep evidence of the request's failure for its record (issue 706):
+    /// the event that captured it, its message, and the stack of the
+    /// request's thread as text.
+    pub fn capture(&self, kind: &str, message: &str, stack: String) {
+        let at_unix_ms = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+
+        self.state().captures.push(pb::RecordCapture {
+            kind: kind.to_owned(),
+            at_unix_ms,
+            message: message.to_owned(),
+            stack,
+        });
     }
 
     /// The request runs on the event loop, as ASGI: its body is the
@@ -293,6 +312,7 @@ impl Trace {
             logs: lines,
             logs_dropped: logs.dropped,
             panels: logs.panels,
+            captures: std::mem::take(&mut state.captures),
             thread_wait: millis(state.thread_wait),
             gil_wait: millis(Some(state.gil_wait)),
             gil_waits: state.gil_waits,
@@ -441,18 +461,19 @@ fn panels(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordPanel>> {
 }
 
 /// Spans as `muru.panels._span` gives them: name, start, duration,
-/// category and the spans beneath, which may nest.
+/// category, the spans beneath, which may nest, and whether it failed.
 fn spans(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordSpan>> {
     let mut spans = Vec::new();
 
     for item in taken.try_iter()? {
         let item = item?;
-        let (name, start, duration, category, children): (
+        let (name, start, duration, category, children, failed): (
             String,
             f64,
             f64,
             String,
             Bound<'_, PyAny>,
+            bool,
         ) = item.extract()?;
 
         spans.push(pb::RecordSpan {
@@ -461,6 +482,7 @@ fn spans(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordSpan>> {
             duration,
             category,
             children: self::spans(&children)?,
+            failed,
         });
     }
 

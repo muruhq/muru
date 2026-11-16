@@ -930,8 +930,26 @@ fn whole(bytes: Bytes) -> Body {
 }
 
 /// Section 10.7: a development run's request page, `/request/ID`, and
-/// the record as JSON at `/v1/requests/ID`.
+/// the record as JSON at `/v1/requests/ID`. A panel's link to another
+/// request's panel, `/_muru/requests/ID/panels/NAME.html` as the toolbar
+/// follows it, goes to that panel on the request's page (issue 706).
 fn request_paths(path: &str, source: &Source, requests: &RequestSource) -> Option<Response<Body>> {
+    if let Some((request_id, panel)) = path
+        .strip_prefix("/_muru/requests/")
+        .and_then(|rest| rest.split_once("/panels/"))
+        .and_then(|(id, panel)| Some((id, panel.strip_suffix(".html")?)))
+    {
+        let mut response = plain(StatusCode::SEE_OTHER, "see the request's page\n");
+
+        if let Ok(location) = format!("../../../../request/{request_id}#panel-{panel}").parse() {
+            response
+                .headers_mut()
+                .insert(http::header::LOCATION, location);
+        }
+
+        return Some(response);
+    }
+
     if let Some(request_id) = path.strip_prefix("/v1/requests/") {
         return Some(match requests(request_id) {
             Ok(view) => json(&view.json),

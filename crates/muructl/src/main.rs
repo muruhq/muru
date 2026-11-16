@@ -4302,14 +4302,25 @@ async fn run_with(
                             }
                         }
                     }
-                    muru_controller::host::HostMessage::Event { kind, level, message, group, reason } => {
+                    muru_controller::host::HostMessage::Event { kind, level, message, group, reason, evidence } => {
                         // The host has logged the event, and its line is
                         // the one the terminal shows; the run counts it
-                        // and keeps it for muructl events.
+                        // and keeps it for muructl events, and its
+                        // evidence goes to the records of the requests it
+                        // names (issue 706).
 
                         let release = format!("r{}", current.release);
                         run_admin::count_worker_event(&label, &release, &kind, &group, &reason);
                         run_events.record(&kind, &format!("{label}@{release}"), &level, &message);
+
+                        if let (Some(evidence), Some(recorder)) = (&evidence, &recorder) {
+                            recorder.capture(evidence);
+                        }
+                    }
+                    muru_controller::host::HostMessage::Capture(evidence) => {
+                        if let Some(recorder) = &recorder {
+                            recorder.capture(&evidence);
+                        }
                     }
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);

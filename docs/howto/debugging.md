@@ -453,8 +453,8 @@ lost the evidence:
 - `request.soft_timeout`: a request past the [soft timeout](timeouts.md),
   with where its thread was, taken before the timeout interrupted it.
 - `request.past_deadline`: a request still running after the edge
-  answered it 504 at its [deadline](timeouts.md#past-the-deadline);
-  `debug stacks` shows where it is.
+  answered it 504 at its [deadline](timeouts.md#past-the-deadline),
+  with where its thread was then; `debug stacks` shows where it is now.
 - `worker.timeout_killed`: a worker replaced for the hard timeout, after
   `worker.loop_stalled` or `worker.gil_stalled`, or because its reports
   stopped, with where its oldest request was. Its threads' stacks go to
@@ -464,6 +464,11 @@ lost the evidence:
   the same way first.
 - `worker.recycled` for memory: a worker replaced over a [memory
   limit](memory.md), with the object types it held most of.
+
+In a development run, the first four also go to the records of the
+requests they name, with the whole stack of each request's thread, so
+the [toolbar's Errors panel](toolbar.md#evidence-of-a-timeout-or-a-killed-worker)
+shows them with the request.
 
 ## Logger levels
 

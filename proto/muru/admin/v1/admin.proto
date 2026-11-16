@@ -382,6 +382,28 @@ message RequestRecord {
   repeated Panel panels = 32;
   string worker_part = 33;          // expected, arrived or missing; empty when the worker was not asked for it
   WorkerPart from_worker = 34;      // what the worker saw, once it arrived
+  repeated RequestCapture captures = 35; // evidence Muru captured of the request's failure (issue 706)
+}
+
+// Evidence of a timeout or a killed worker (issue 706), as the event
+// that captured it had it, joined to the record of each request it
+// names by the request's ID.
+message RequestCapture {
+  string kind = 1;                  // the event: request.soft_timeout, request.past_deadline, worker.timeout_killed or worker.restarted; request.ended for a request past its deadline that has since ended
+  uint64 at_unix_ms = 2;
+  string message = 3;               // the event's message
+  string worker = 4;                // the worker's name, when the capture names it
+  uint32 pid = 5;
+  string reason = 6;                // why a worker was killed
+  string stack = 7;                 // the stack of the request's own thread, as text; empty when none was taken
+  repeated CaptureThread threads = 8; // the worker's other threads that were serving requests
+  repeated string related = 9;      // the other requests whose records the same capture reached
+}
+
+message CaptureThread {
+  string name = 1;
+  string request_id = 2;            // the request it was serving, if any
+  string stack = 3;
 }
 
 // The worker's part of a request's record (section 11.7). Times are
@@ -464,6 +486,7 @@ message PanelSpan {
   double duration_ms = 3;
   string category = 4;
   repeated PanelSpan children = 5;
+  bool failed = 6;                  // the operation failed, drawn so it stands out (issue 705)
 }
 
 message PanelValue {

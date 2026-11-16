@@ -327,18 +327,7 @@ fn watchdog_loop(shared: &Arc<Shared>, timeout: Duration, stop: &AtomicBool, rep
         let interrupted = Python::attach(|py| shared.interrupt_overdue(py));
 
         for request in interrupted {
-            let place = request
-                .place
-                .as_deref()
-                .map(|place| format!(" at {place}"))
-                .unwrap_or_default();
-            let message = format!(
-                "request {} {} {} ran past the soft timeout of {}{place}",
-                request.request_id,
-                request.method,
-                request.path,
-                wsgi::describe_seconds(timeout)
-            );
+            let message = request.message(timeout);
 
             // Section 11.7: the host logs the event, so the worker says
             // it only when there is no host to tell.

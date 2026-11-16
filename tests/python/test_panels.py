@@ -71,7 +71,7 @@ def test_a_requests_panels_are_taken_in_the_shapes_the_edge_draws(recorded: str)
     values["books"] = 7
     values["books"] = 8
     assert queries.table("By statement").add_row(["SELECT 1", 3])
-    assert trace.add(Span("view", 1.0, 2.0, "view", [Span("query", 1.5, 0.5)]))
+    assert trace.add(Span("view", 1.0, 2.0, "view", [Span("query", 1.5, 0.5, failed=True)]))
 
     taken = panels._take(recorded)
 
@@ -90,7 +90,7 @@ def test_a_requests_panels_are_taken_in_the_shapes_the_edge_draws(recorded: str)
         (
             "steps",
             "Steps",
-            [("view", 1.0, 2.0, "view", [("query", 1.5, 0.5, "", [])])],
+            [("view", 1.0, 2.0, "view", [("query", 1.5, 0.5, "", [], True)], False)],
             [],
             [],
             0,
@@ -144,15 +144,20 @@ def test_timed_blocks_nest_as_spans_and_are_added_as_they_end(recorded: str) -> 
         with other.span("aside"):
             pass
 
+    # A block an exception escapes is marked failed, and the exception
+    # goes on, through the block around it too.
+
     with pytest.raises(RuntimeError), trace.span("broken"):
-        raise RuntimeError("the block raised")
+        with trace.span("inner"):
+            raise RuntimeError("the block raised")
 
     taken = {panel[0]: panel for panel in panels._take(recorded)}
 
     view, broken = taken["steps"][2]
     assert view[0] == "view" and view[3] == "view" and view[2] >= view[4][0][2]
     assert [child[0] for child in view[4]] == ["query"]
-    assert broken[0] == "broken"
+    assert not view[5] and not view[4][0][5]
+    assert broken[0] == "broken" and broken[5] and broken[4][0][5]
     assert [span[0] for span in taken["other"][2]] == ["aside"]
 
 
@@ -192,7 +197,18 @@ def test_a_panel_is_declared_once_and_not_as_a_built_in() -> None:
     with pytest.raises(ValueError, match="already declared otherwise"):
         SpansPanel("library", "Library")
 
-    for name in ("timing", "logs", "page", "trace", "sql", "Library", "a b"):
+    for name in (
+        "timing",
+        "logs",
+        "hints",
+        "page",
+        "history",
+        "trace",
+        "sql",
+        "outbound",
+        "Library",
+        "a b",
+    ):
         with pytest.raises(ValueError, match="cannot name a panel"):
             ValuesPanel(name, "X")
 

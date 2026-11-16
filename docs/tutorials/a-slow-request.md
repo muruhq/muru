@@ -191,3 +191,7 @@ muructl daemon stop --shutdown
 
 - The [dashboard](../howto/dashboard.md) shows the stacks and memory of a
   release's workers in a browser.
+
+- [Debugging a page](debugging-a-page.md) uses the development
+  toolbar and tracing to find what is wrong with a page under `muructl
+  run`, a soft timeout's stack included.
