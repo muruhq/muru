@@ -194,6 +194,7 @@ min_workers = 6
 | `group` | The worker group; the default group without it |
 | `min_workers` | The floor: the group has at least this many workers during the window |
 | `max_workers` | The ceiling: the autoscaler may grow the group this far during the window |
+| `cap_workers` | The cap: the group has at most this many workers during the window (see [capping a group](#capping-a-group)) |
 | `warm_up` | How long before each window the floor already applies, such as `30m` |
 | `scale_in` | `hold` keeps the group from scaling in during the window; `normal`, the default, leaves it to the autoscaler |
 | `freeze_deploys` | Refuse deploys and rollouts of the application during the window (see [deploy freezes](rollouts.md#deploy-freezes)) |
@@ -229,6 +230,151 @@ This makes a temporary overlay, `shop:scale` or `shop:scale:reports`,
 which the next such command for the group replaces, `muructl overlay end`
 ends early, and which is forgotten once it ends. `muructl apply` leaves it
 alone and `muructl config export` does not write it.
+
+## Capacity on a condition
+
+The autoscaler decides how many workers a group needs from the group's
+own signals, every second. A [condition](conditions.md) sets the bounds
+it works within, at the pace of minutes, through an
+[overlay](overlays.md#by-a-condition) that sets capacity: the overlay is
+active while the condition fires, and its `apps.NAME` keys are those of
+a schedule.
+
+Warming one application because another is busy. The storefront's
+traffic reaches the API a little later, and the API's autoscaler reads
+only the API's own group, so a condition on the storefront raises the
+API's floor before its traffic arrives:
+
+```toml
+[condition.storefront-busy]
+when = "request_rate{app='storefront'} > 200"
+for = "1m"
+clear_when = "request_rate{app='storefront'} < 100"
+clear_for = "10m"
+
+[overlay.api-warm]
+trigger = { condition = 'storefront-busy' }
+apps.api = { min_workers = 8 }
+```
+
+Holding capacity while something is wrong. While the payments upstream
+is down, the shop's requests fail fast and its slots look idle, which
+would let the autoscaler reap workers or scale the group to zero just
+before the traffic comes back. A condition on the upstream's health
+raises the floor and holds scale-in until it recovers:
+
+```toml
+[condition.payments-down]
+when = "upstream_healthy{upstream='payments'} < 0.5"
+for = "30s"
+clear_when = "upstream_healthy{upstream='payments'} >= 1"
+clear_for = "5m"
+
+[overlay.shop-hold]
+trigger = { condition = 'payments-down' }
+apps.shop = { min_workers = 4, scale_in = 'hold' }
+```
+
+Taking load off a struggling database. When the database slows down,
+requests hold their slots longer, the slots look busy and the autoscaler
+adds workers, which send it more queries at once. A [cap](#capping-a-group)
+while the database is the bottleneck keeps the extra requests waiting at
+the edge, where the queue timeout and the error pages answer them:
+
+```toml
+[condition.db-struggling]
+when = "latency{app='shop',phase='application',quantile='0.95'} > 2 and capacity_utilisation{app='shop'} > 0.9"
+for = "2m"
+clear_when = "latency{app='shop',phase='application',quantile='0.95'} < 0.5"
+clear_for = "5m"
+
+[overlay.shop-cap]
+trigger = { condition = 'db-struggling' }
+apps.shop = { cap_workers = 6 }
+```
+
+An overlay's capacity combines with schedules and other overlays as
+[scheduled capacity](#scheduled-capacity) does: the highest floor and
+the highest ceiling apply, the lowest cap, and scale-in is held if any
+of them holds it. `muructl scale status` names the overlay on the
+group's line. After the
+overlay ends, the group scales in by the autoscaler's usual slow rules.
+The overlay's `min_active`, `cooldown` and `max_per_hour` keep a
+condition that hovers near its threshold from changing capacity often.
+
+A condition should not raise capacity on a signal that more workers do
+not improve, such as an application's error rate or the latency of a
+slow database: scaling out on it adds load without fixing the cause. A
+cap suits such a signal.
+
+## Capping a group
+
+`cap_workers` in an overlay or a schedule caps a group: while it applies,
+the group has at most that many workers, whatever its policy's
+`max_workers` and whatever the autoscaler would choose.
+
+```toml
+[overlay.reports-make-room]
+trigger = { condition = 'shop-denied' }
+apps.reports = { cap_workers = 1 }
+
+[condition.shop-denied]
+when = "scaling_denied{app='shop'} >= 1"
+for = "1m"
+clear_when = "node_memory_available > 2000000000"
+clear_for = "10m"
+```
+
+- A group above a new cap drains its excess workers at once, rather
+  than one per reap interval, and these drains do not count against the
+  [churn budget](#the-churn-budget). Each finishes the requests it has,
+  as in any scale-in. The decision is a `scaling.decision` event, `scale
+  in from 4 to 1 workers: capped at 1 worker by reports-make-room`.
+
+- A static group's count is capped too, and returns to it once the cap
+  ends.
+
+- The cap wins over a floor: a schedule's or an overlay's `min_workers`
+  above the cap is lowered to it, and so is the policy's own
+  `min_workers`. `muructl apply` warns of a floor and a cap on the same
+  group that can be active together. Across overlays and schedules, the
+  lowest cap applies.
+
+- A pin stands as it is: a pinned group keeps its count until it is
+  unpinned, and then the cap applies.
+
+- While a canary or a traffic split gives a release part of the
+  application's requests, the release gets that share of the cap,
+  rounded up, and at least one worker.
+
+- After the cap ends, the group grows again as its signals ask, and a
+  floor or a static count is reached in batches of `max_step_up`.
+
+- In one overlay, `cap_workers` does not go with `max_workers`, and a
+  `min_workers` beside it must not be above it.
+
+`muructl scale status` shows the cap below the group's line, as
+`capped: at most 1 worker from reports-make-room`.
+
+A cap for a while, by hand, such as one making room on the node for
+another application's deploy, which is refused when the node's budget
+has no room for its new release:
+
+```console
+$ muructl scale reports --cap 1 --for 30m
+muru: reports default capped at 1 worker until 2026-11-02T08:00:00Z
+muru: reports default is at 1 worker
+$ muructl deploy shop /srv/shop
+$ muructl overlay end reports:cap
+```
+
+`--cap` waits until the group is at or under the cap before it returns,
+and with `--no-wait` returns at once. It makes a temporary overlay,
+`reports:cap` or `reports:cap:GROUP`, apart from the floor `--min`
+makes, which the next `--cap` for the group replaces, and which is
+forgotten once it ends. It ends by itself, it applies to whichever
+release serves, and `muructl overlay list` shows it beside the other
+overlays.
 
 ## The node's budget
 

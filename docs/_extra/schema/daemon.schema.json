@@ -74,6 +74,12 @@
           "description": "How refused methods are answered, with the values a route's `methods.answer` takes.",
           "type": "string"
         },
+        "cap_workers": {
+          "description": "At most this many workers, whatever the policy and the autoscaler choose (issue 712): the lowest across overlays applies, and it wins over a floor.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "deny": {
           "description": "Methods refused on each of the application's routes.",
           "items": {
@@ -327,6 +333,12 @@
       "additionalProperties": false,
       "description": "An `[[app.NAME.schedule]]` entry: capacity for a window, shorthand for an overlay named `APP.NAME` that sets only the floor, the ceiling, how scale-in behaves and a deploy freeze.",
       "properties": {
+        "cap_workers": {
+          "description": "At most this many workers during the window, whatever the policy and the autoscaler choose.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "cron": {
           "description": "A recurring window's start times.",
           "type": "string"

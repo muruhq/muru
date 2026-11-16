@@ -208,13 +208,23 @@ def test_a_request_past_its_deadline_is_one_event_until_it_ends(tmp_path: Path) 
     assert len(events) == 1
     assert "request r-1 GET /hang is past its deadline, 300.1 s" in str(events[0]["message"])
 
-    # Once the worker stops reporting it, it is forgotten.
+    # Issue 706: the worker gave no stacks here, so the evidence names the
+    # request alone.
+
+    assert events[0]["evidence"] == {"worker": "0", "pid": 4242, "requests": ["r-1"], "threads": []}
+
+    # Once the worker stops reporting it, it is forgotten, and its record
+    # is told it ended.
 
     later = (
         time.monotonic() + (host.PAST_DEADLINE_FORGET_REPORTS + 1) * host.REPORT_INTERVAL_SECONDS
     )
     instance.raise_past_deadline(state, later)
     assert state.past_deadline == {}
+    (ended,) = [message for message in sent if message.get("type") == "capture"]
+    assert ended["kind"] == "request.ended"
+    assert ended["evidence"] == {"worker": "0", "pid": 4242, "requests": ["r-1"]}
+    assert "has ended in worker 0 (pid 4242)" in str(ended["message"])
 
 
 def replacing_host(
@@ -266,10 +276,11 @@ def test_a_timeout_kill_is_reported_at_the_decision_and_not_again_at_the_exit(
             "threads": [
                 {
                     "name": "t",
-                    "request": {"elapsed_ms": 9},
+                    "request": {"request_id": "R1", "elapsed_ms": 9},
                     "frames": [{"file": "/srv/app.py", "line": 13, "function": "application"}],
                 }
-            ]
+            ],
+            "active": [{"request_id": "R1"}, {"request_id": "R2"}],
         },
     }
     assert stacks.then is not None
@@ -282,12 +293,62 @@ def test_a_timeout_kill_is_reported_at_the_decision_and_not_again_at_the_exit(
         "at app.py line 13 in application"
     )
 
+    # Issue 706: the evidence names every request in flight, with the
+    # stack of each thread serving one, for a development run's records.
+
+    assert event["evidence"] == {
+        "worker": "0",
+        "pid": 4242,
+        "reason": "a request ran too long",
+        "requests": ["R1", "R2"],
+        "threads": [
+            {
+                "name": "t",
+                "request_id": "R1",
+                "stack": '  File "/srv/app.py", line 13, in application',
+            }
+        ],
+    }
+
     # The old worker going is a line in the log and no second event.
 
     exits(monkeypatch, (4242, 0))
     instance.reap()
     assert len([message for message in sent if message.get("type") == "event"]) == 1
     assert "worker 0 (pid 4242) exited after its drain grace" in capfd.readouterr().err
+
+
+def test_a_worker_that_cannot_answer_for_its_stacks_still_names_its_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, state, sent, asked = replacing_host(tmp_path, monkeypatch)
+    instance.replace(
+        state,
+        "no thread of it ran Python for the GIL stall timeout of 5 s",
+        "worker.timeout_killed",
+        "gil_stalled",
+        abandon={"which": "all", "reason": "worker_stalled", "error": "stalled"},
+    )
+
+    # Issue 715: the worker gives up its requests from its native thread,
+    # but its stacks need the interpreter, and no answer comes.
+
+    abandon = next(pending for pending in asked if pending.op == "abandon")
+    abandon.answers[4242] = {"ok": True, "result": {"abandoned": ["R1", "R2"]}}
+    assert abandon.then is not None
+    abandon.then(abandon)
+    stacks = next(pending for pending in asked if pending.op == "stacks")
+    assert stacks.then is not None
+    stacks.then(stacks)
+    (event,) = [message for message in sent if message.get("type") == "event"]
+    assert event["message"].endswith("its stacks were written to the log by faulthandler")
+    assert event["evidence"] == {
+        "worker": "0",
+        "pid": 4242,
+        "reason": "no thread of it ran Python for the GIL stall timeout of 5 s",
+        "requests": ["R1", "R2"],
+        "threads": [],
+    }
 
 
 def kinds(sent: list[dict[str, Any]]) -> list[object]:

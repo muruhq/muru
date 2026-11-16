@@ -76,12 +76,14 @@ REQUEST_LIMIT = 2000
 TEXT_LIMIT = 65536
 """The most characters one text panel of a request keeps."""
 
-# The built-in panels' names, and the page view's tab, which a declared
-# panel may not take, and the names of Muru's own panels from tracing,
-# which only Muru declares, within _own().
+# The built-in panels' names, and the toolbar's page view and history
+# tabs, which a declared panel may not take, and the names of Muru's own
+# panels from tracing, which only Muru declares, within _own().
 
-RESERVED = frozenset({"timing", "where", "response", "logs", "errors", "connection", "page"})
-OWN = frozenset({"trace", "sql", "exceptions"})
+RESERVED = frozenset(
+    {"timing", "where", "response", "logs", "errors", "connection", "hints", "page", "history"}
+)
+OWN = frozenset({"trace", "sql", "outbound", "exceptions"})
 
 _owning = False
 
@@ -108,7 +110,8 @@ class Span:
     """A named interval of a spans panel, with the spans beneath it.
 
     Times are milliseconds on the record's clock, as a handle's ``now()``
-    gives them.
+    gives them. ``failed`` marks an operation that failed, which the
+    toolbar draws so it stands out from its category's colour.
     """
 
     name: str
@@ -116,6 +119,7 @@ class Span:
     duration: float
     category: str = ""
     children: list[Span] = field(default_factory=list)
+    failed: bool = False
 
     def size(self) -> int:
         """Count the entries the span takes: itself and every span beneath it."""
@@ -410,7 +414,8 @@ class Spans(_Handle):
         """Time a block as a span, beneath the one an enclosing block is timing.
 
         The span is added as its block ends, however it ends, and with
-        those timed within it once the outermost ends.
+        those timed within it once the outermost ends. A block that an
+        exception escapes is marked failed, and the exception goes on.
         """
 
         if self._kept is None:
@@ -432,6 +437,9 @@ class Spans(_Handle):
 
         try:
             yield
+        except BaseException:
+            opened.failed = True
+            raise
         finally:
             _open_span.reset(token)
             opened.duration = self.now() - opened.start
@@ -589,7 +597,8 @@ def _take(request: str) -> list[tuple[Any, ...]]:
 
     They come in their order of first use, as plain tuples: name, title,
     spans, values, tables, how many entries were not kept, the text, and
-    whether it is markdown.
+    whether it is markdown. A span is a tuple of its name, start,
+    duration, category, the spans beneath it and whether it failed.
     """
 
     kept = _requests.pop(request, None)
@@ -625,4 +634,5 @@ def _span(span: Span) -> tuple[Any, ...]:
         float(span.duration),
         span.category,
         [_span(child) for child in span.children],
+        bool(span.failed),
     )

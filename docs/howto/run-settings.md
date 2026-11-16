@@ -179,3 +179,11 @@ start-up line says so beside the directories and patterns watched.
 table or in `muru.local.toml` for good; `--reload` turns it back on over
 a file that turned it off. Under `--allow-public` the run does not reload
 unless `--reload` is given, and the daemon never reloads.
+
+Files that `.gitignore` names are not watched, including what the
+`.gitignore` files of a repository the project sits in name. A project
+kept in a directory that the repository around it ignores as a whole,
+such as another repository's scratch directory, is watched by its own
+`.gitignore` alone, and the start-up line says so. When no file in the
+watched directories matches the patterns, the start-up line says that no
+change reloads the run.

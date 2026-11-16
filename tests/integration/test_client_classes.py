@@ -226,10 +226,15 @@ def test_a_rate_limit_refuses_with_retry_after_and_its_fields(site: Site) -> Non
         assert site.request("/limited/", {"User-Agent": "Mozilla/5.0"}).status == 200
 
     assert eventually(lambda: "ratelimit.enforcing" in site.daemon.events())
+    metrics = site.metrics()
     assert (
         'muru_rate_limited_total{limit="crawlers",client_class="ai-crawler",action="rejected"} 1'
-        in site.metrics()
+        in metrics
     )
+
+    # The refused request is still the application's (issue 724).
+
+    assert refused_by("rate_limited", metrics).startswith('app="clients",release="r1"')
 
 
 def test_a_delaying_limit_holds_the_request(site: Site) -> None:
@@ -246,10 +251,21 @@ def test_a_logging_limit_only_counts(site: Site) -> None:
     assert 'limit="watch",client_class="scored",action="logged"' in site.metrics()
 
 
+def refused_by(reason: str, metrics: str) -> str:
+    """The labels of the muru_requests_total series with `reason`."""
+
+    return next(
+        line.removeprefix("muru_requests_total{")
+        for line in metrics.splitlines()
+        if line.startswith("muru_requests_total{") and f'reason="{reason}"' in line
+    )
+
+
 def test_methods_are_refused_and_the_mode_reaches_the_application(site: Site) -> None:
     refused = site.request("/readonly/", method="POST")
     assert refused.status == 503
     assert b"read_only" in refused.body
+    assert refused_by("read_only", site.metrics()).startswith('app="clients",release="r1"')
     assert site.seen("/readonly/")["mode"] == "read-only"
 
     not_allowed = site.request("/strict/thing", method="DELETE")

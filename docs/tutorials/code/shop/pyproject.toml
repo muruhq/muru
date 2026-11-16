@@ -1,0 +1,29 @@
+[project]
+name = "shop"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "flask>=3.1",
+    "wrapture>=1.0.0b5",
+    "wrapture-instrumentation>=1.0.0b3",
+]
+
+[tool.muru]
+entrypoint = "shop:app"
+tracing = true
+
+[tool.muru.run]
+toolbar = true
+
+[tool.muru.timeouts]
+soft_timeout = "2s"
+
+[[tool.wrapture.instrument]]
+name = "flask"
+
+[[tool.wrapture.instrument]]
+name = "sqlite3"
+statement = true
+
+[[tool.wrapture.instrument]]
+name = "urllib.request"

@@ -823,6 +823,11 @@ pub struct RunInfo {
     /// cache` leaves while it runs.
     #[serde(default)]
     pub runtime: Vec<PathBuf>,
+    /// When the run started, Unix milliseconds, so that of several runs
+    /// of one project the newest is reached (issue 714); 0 for a run
+    /// that did not say.
+    #[serde(default)]
+    pub started_unix_ms: u64,
 }
 
 /// The run's place in the user runtime directory, removed when dropped.
@@ -873,6 +878,7 @@ impl Registration {
             listen: listen.to_string(),
             socket: socket.clone(),
             runtime: library.map(Path::to_path_buf).into_iter().collect(),
+            started_unix_ms: crate::admin::now_unix_ms(),
         };
         std::fs::write(directory.join("run.json"), serde_json::to_vec(&info)?)?;
         Ok(Self {
@@ -924,6 +930,7 @@ impl Registration {
             listen: listen.to_string(),
             socket: socket.to_path_buf(),
             runtime: Vec::new(),
+            started_unix_ms: crate::admin::now_unix_ms(),
         };
         let registration = socket.with_file_name("serve.json");
         std::fs::write(&registration, serde_json::to_vec(&info)?)?;

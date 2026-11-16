@@ -2254,17 +2254,19 @@ impl Admin for Service {
         };
 
         // Section 7.5: a floor until a time is a temporary schedule over
-        // the application, whichever release serves.
+        // the application, whichever release serves, and so is a cap
+        // (issue 712).
 
-        if let Some(min_workers) = request.min_workers {
+        if request.min_workers.is_some() || request.cap_workers.is_some() {
             let (done_tx, done_rx) = oneshot::channel();
             self.handle
                 .commands
-                .send(Command::ScaleFloor {
+                .send(Command::ScaleTemporary {
                     app: request.app.clone(),
                     group,
-                    min_workers,
+                    min_workers: request.min_workers,
                     max_workers: request.max_workers,
+                    cap_workers: request.cap_workers,
                     until: request.until_unix_ms,
                     done: done_tx,
                 })
@@ -3689,6 +3691,13 @@ pub fn scale_message(
                     .capacity
                     .as_ref()
                     .is_some_and(|capacity| capacity.hold),
+                cap: status.capacity.as_ref().map_or(0, |capacity| capacity.cap),
+                cap_from: status
+                    .capacity
+                    .as_ref()
+                    .filter(|capacity| capacity.cap > 0)
+                    .map(|capacity| capacity.cap_from.clone())
+                    .unwrap_or_default(),
                 worker_cpu: status.workers.worker_cpu,
                 gil_wait_p95_ms: status.workers.gil_wait_p95_ms,
                 loop_lag_p95_ms: status.workers.loop_lag_p95_ms,
@@ -4120,6 +4129,7 @@ fn condition_message(status: &crate::conditions::Status) -> pb::ConditionStatus 
             .min_requests
             .unwrap_or(muru_config::condition::DEFAULT_MIN_REQUESTS),
         unknown: status.unknown.clone().unwrap_or_default(),
+        pending_since_unix_ms: status.pending_since_unix_ms.unwrap_or(0),
         terms: status
             .terms
             .iter()

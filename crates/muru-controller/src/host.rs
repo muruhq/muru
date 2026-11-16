@@ -50,7 +50,14 @@ pub enum HostMessage {
         /// The reason as one word, for the counters of section 11.1:
         /// why a worker was recycled or how it exited.
         reason: String,
+        /// Evidence of a timeout or a killed worker for the records of
+        /// the requests it names (issue 706), which only a development
+        /// run keeps.
+        evidence: Option<muru_edge::recorder::Evidence>,
     },
+    /// Evidence for request records that is no event of its own (issue
+    /// 706): that a request past its deadline has since ended.
+    Capture(muru_edge::recorder::Evidence),
     /// What every worker reported last, for metrics and the dashboard.
     Status {
         /// One entry per worker.
@@ -231,6 +238,46 @@ fn generations(value: &serde_json::Value) -> Vec<GcGeneration> {
         .unwrap_or_default()
 }
 
+/// The evidence an event or a capture carries (issue 706): the event's
+/// kind and message, and under `evidence` the worker, its pid, why it was
+/// killed, the requests the capture names and its threads serving them.
+fn evidence(value: &serde_json::Value) -> muru_edge::recorder::Evidence {
+    let text =
+        |item: &serde_json::Value, key: &str| item[key].as_str().unwrap_or_default().to_owned();
+    let found = &value["evidence"];
+
+    muru_edge::recorder::Evidence {
+        kind: text(value, "kind"),
+        message: text(value, "message"),
+        at_unix_ms: muru_edge::recorder::now_unix_ms(),
+        worker: text(found, "worker"),
+        pid: found["pid"].as_u64().unwrap_or(0) as u32,
+        reason: text(found, "reason"),
+        requests: found["requests"]
+            .as_array()
+            .map(|requests| {
+                requests
+                    .iter()
+                    .filter_map(|request| request.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        threads: found["threads"]
+            .as_array()
+            .map(|threads| {
+                threads
+                    .iter()
+                    .map(|thread| muru_edge::recorder::EvidenceThread {
+                        name: text(thread, "name"),
+                        request_id: text(thread, "request_id"),
+                        stack: text(thread, "stack"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
 impl HostMessage {
     /// Parse one line of the control connection, or none for a line
     /// this version does not know.
@@ -302,7 +349,9 @@ impl HostMessage {
                 message: value["message"].as_str().unwrap_or_default().to_owned(),
                 group: value["group"].as_str().unwrap_or_default().to_owned(),
                 reason: value["reason"].as_str().unwrap_or_default().to_owned(),
+                evidence: value.get("evidence").map(|_| evidence(&value)),
             }),
+            "capture" => Some(Self::Capture(evidence(&value))),
             "response" => Some(Self::Response {
                 id: value["id"].as_u64().unwrap_or(0),
                 error: value["error"].as_str().unwrap_or_default().to_owned(),
@@ -2640,5 +2689,52 @@ mod tests {
 
         assert_eq!(start_time(first.id()), None);
         assert_eq!(start_time(0), None);
+    }
+
+    #[test]
+    fn an_events_evidence_and_a_capture_are_read_for_the_request_records() {
+        let event = HostMessage::parse(
+            r#"{"type":"event","kind":"worker.timeout_killed","level":"warning","message":"killed",
+                "evidence":{"worker":"0","pid":7,"reason":"stuck","requests":["A","B"],
+                "threads":[{"name":"t1","request_id":"A","stack":"here"}]}}"#,
+        );
+        let Some(HostMessage::Event {
+            evidence: Some(evidence),
+            ..
+        }) = event
+        else {
+            panic!("{event:?}");
+        };
+
+        assert_eq!(
+            (
+                evidence.kind.as_str(),
+                evidence.message.as_str(),
+                evidence.pid
+            ),
+            ("worker.timeout_killed", "killed", 7)
+        );
+        assert_eq!(evidence.requests, ["A", "B"]);
+        assert_eq!(evidence.threads[0].stack, "here");
+
+        // An event without evidence has none, and a capture is evidence
+        // alone.
+
+        let plain = HostMessage::parse(r#"{"type":"event","kind":"worker.exited","message":"x"}"#);
+        assert!(matches!(
+            plain,
+            Some(HostMessage::Event { evidence: None, .. })
+        ));
+
+        let ended = HostMessage::parse(
+            r#"{"type":"capture","kind":"request.ended","message":"ended","evidence":{"requests":["A"]}}"#,
+        );
+        let Some(HostMessage::Capture(ended)) = ended else {
+            panic!("{ended:?}");
+        };
+        assert_eq!(
+            (ended.kind.as_str(), ended.requests.len()),
+            ("request.ended", 1)
+        );
     }
 }

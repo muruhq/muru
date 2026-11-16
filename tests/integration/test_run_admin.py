@@ -300,6 +300,26 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
         )
         assert f"{runtime}/runs/" in muructl(runtime, "status", cwd=here).stdout
 
+        # A second run of the first project is the one reached, whichever
+        # port it has, and both it and the commands name the older one
+        # (issue 714).
+
+        third = start(runtime)
+
+        try:
+            older = f"--socket {runtime}/runs/{first.port}/admin.sock"
+            assert "another development run of this project is listening" in third.log()
+            assert older in third.log(), third.log()
+            reached = muructl(runtime, "status", cwd=support.FIXTURES)
+            assert f"runs/{third.port}/admin.sock" in reached.stdout
+            assert (
+                "2 development runs of this project are listening; reaching the newest"
+                in reached.stderr
+            ), reached.stderr
+            assert older in reached.stderr
+        finally:
+            third.stop()
+
         # Elsewhere, with no daemon, the runs are named so one can be
         # chosen. A socket file left behind by a daemon is no daemon.
 
@@ -409,6 +429,7 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
         assert {"x-request-id", "server-timing", "muru-request-link"} <= answered
         assert found["compression"]["compressed"] is False
         assert [panel["name"] for panel in found["panels"]] == [
+            "hints",
             "timing",
             "where",
             "response",
@@ -449,6 +470,11 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
         assert "<h2>Connection</h2>" in page and "hunter2" not in page
         assert json.loads(read(f"/v1/requests/{request_id}"))["request_id"] == request_id
         assert f'href="request/{request_id}"' in read("/fragment/requests")
+
+        # A panel's link to another request's panel, as the toolbar
+        # follows it, goes to that request's page here (issue 706).
+
+        assert "<h2>Errors</h2>" in read(f"/_muru/requests/{request_id}/panels/errors.html")
 
         # A failed request's record has the exception, its traceback and
         # the log record that reported it.
@@ -505,6 +531,14 @@ def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) 
         )
         assert page.body.decode() == f"<html><body><h1>Page</h1>{tag}</body></html>"
 
+        # HTML with no </body> gets the tag at its end only for a request
+        # that said it loads a document, not for a client that sends no
+        # Sec-Fetch-Dest (issue 719).
+
+        appended = server.get("/fragment", headers={"Sec-Fetch-Dest": "document"})
+        assert appended.body.startswith(b"<p>fragment</p><script src=")
+        assert server.get("/fragment").body == b"<p>fragment</p>"
+
         # A fetch from the page is left alone, and a trusted proxy's prefix
         # goes in front of the script's address.
 
@@ -560,6 +594,23 @@ def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) 
         assert refused.status == 403
         rebound = server.get(f"/_muru/requests/{request_id}.json", headers={"Host": "evil.test"})
         assert rebound.status == 403
+
+        # Issue 708: a form's POST that redirects, then the page it led
+        # to, are one entry of the history, the newest, with its steps.
+
+        document = {"Sec-Fetch-Dest": "document"}
+        posted = server.request("POST", "/form", body=b"name=x", headers=document)
+        assert posted.status == 303
+        landed = server.get("/page", headers=document)
+        entries = json.loads(server.get("/_muru/history").body)["entries"]
+        assert [(step["method"], step["target"]) for step in entries[0]["steps"]] == [
+            ("POST", "/form"),
+            ("GET", "/page"),
+        ], entries
+        assert entries[0]["steps"][1]["request_id"] == landed.header("x-request-id")
+        assert all(
+            step["target"] != "/_muru/history" for entry in entries for step in entry["steps"]
+        )
     finally:
         server.stop()
 

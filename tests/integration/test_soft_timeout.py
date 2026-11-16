@@ -15,6 +15,7 @@ import re
 import socket
 import threading
 import time
+from typing import Any
 
 import pytest
 from support import server as support
@@ -345,3 +346,104 @@ def test_a_stall_on_a_condemned_worker_ends_its_grace() -> None:
         assert waited < 12, answers
     finally:
         server.stop()
+
+
+def test_a_timeouts_evidence_is_in_the_failed_requests_record() -> None:
+    """Issue 706, in one run: a request past the soft timeout has its
+    stack in its record, and two requests that hold their worker in C past
+    the deadline and then the hard timeout have the deadline's stack and
+    the kill's, each with the other's thread and a link to its record."""
+
+    server = support.start(
+        "plain_wsgi:application",
+        workers=1,
+        threads=3,
+        args=[
+            "--timeout",
+            "soft=1s",
+            "--timeout",
+            "deadline=2s",
+            "--timeout",
+            "hard=6s",
+            "--timeout",
+            "hard_drain_grace=1s",
+            "--timeout",
+            "shutdown=1s",
+        ],
+    )
+
+    try:
+        # The two that hold the worker, each on a thread of its own; time
+        # in C is not interrupted until it returns.
+
+        held: list[support.Response] = []
+        holders = [
+            threading.Thread(target=lambda: held.append(server.get("/sleep?seconds=30")))
+            for _ in range(2)
+        ]
+
+        for holder in holders:
+            holder.start()
+
+        interrupted = server.get("/busy?seconds=10")
+        assert interrupted.status == 504
+        soft = record(server, interrupted)
+
+        for holder in holders:
+            holder.join(timeout=20)
+
+        assert [response.status for response in held] == [504, 504], held
+        killed = [record(server, response, kinds={"worker.timeout_killed"}) for response in held]
+    finally:
+        server.stop()
+
+    # The soft timeout's capture comes from the worker with the request's
+    # end: the event, its message and the stack where it was interrupted.
+
+    (capture,) = soft["captures"]
+    assert capture["kind"] == "request.soft_timeout"
+    assert "ran past the soft timeout of 1 s" in capture["message"]
+    assert "plain_wsgi.py" in capture["stack"] and "time.sleep(0.01)" in capture["stack"]
+    errors = next(panel for panel in soft["panels"] if panel["name"] == "errors")
+    assert errors["tables"][0]["caption"].startswith("request.soft_timeout at ")
+
+    # Each held request has the deadline's stack, then the kill's, with the
+    # other request's thread beside its own and a link to its record.
+
+    ids = [found["request_id"] for found in killed]
+
+    for found, other in zip(killed, reversed(ids), strict=True):
+        kinds = [capture["kind"] for capture in found["captures"]]
+        assert kinds[0] == "request.past_deadline" and "worker.timeout_killed" in kinds, kinds
+        deadline = found["captures"][0]
+        assert "time.sleep(float" in deadline["stack"], deadline
+        kill = next(c for c in found["captures"] if c["kind"] == "worker.timeout_killed")
+        assert kill["worker"] == "0" and kill["pid"] > 0 and "hard timeout" in kill["reason"]
+        assert "time.sleep(float" in kill["stack"], kill
+        assert [thread["request_id"] for thread in kill["threads"]] == [other], kill
+        assert kill["related"] == [other]
+
+        # Its worker died before sending its part, which the record says.
+
+        assert found["worker_part"] == "missing"
+
+
+def record(
+    server: support.Server, response: support.Response, kinds: set[str] | None = None
+) -> dict[str, Any]:
+    """The record of the request that gave `response`, once it is complete
+    and has a capture of each of `kinds`."""
+
+    request_id = response.header("x-request-id")
+    assert request_id is not None
+    deadline = time.monotonic() + 15
+
+    while True:
+        found: dict[str, Any] = json.loads(server.get(f"/_muru/requests/{request_id}.json").body)
+        captured = {capture["kind"] for capture in found["captures"]}
+
+        if not found["in_progress"] and (kinds or set()) <= captured:
+            return found
+
+        assert time.monotonic() < deadline, found
+        time.sleep(0.1)

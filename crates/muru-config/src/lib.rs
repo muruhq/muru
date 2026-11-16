@@ -3050,6 +3050,11 @@ pub struct AppOverlay {
     /// The most workers, a ceiling over the group's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_workers: Option<u32>,
+    /// At most this many workers, whatever the policy and the autoscaler
+    /// choose (issue 712): the lowest across overlays applies, and it wins
+    /// over a floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_workers: Option<u32>,
     /// `hold` keeps the group from scaling in; `normal` (the default)
     /// leaves it to the autoscaler's rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3065,6 +3070,12 @@ pub struct AppOverlay {
 impl AppOverlay {
     /// Whether it sets any capacity.
     pub fn sets_capacity(&self) -> bool {
+        self.sets_bounds() || self.cap_workers.is_some()
+    }
+
+    /// Whether it sets a floor, a ceiling or how scale-in behaves, the
+    /// capacity a schedule has always set; a cap is apart.
+    pub fn sets_bounds(&self) -> bool {
         self.min_workers.is_some() || self.max_workers.is_some() || self.scale_in.is_some()
     }
 }
@@ -3103,6 +3114,10 @@ pub struct CapacitySchedule {
     /// The most workers during the window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_workers: Option<u32>,
+    /// At most this many workers during the window, whatever the policy
+    /// and the autoscaler choose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_workers: Option<u32>,
     /// How long before each window the floor applies, such as 30m.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm_up: Option<String>,
@@ -3125,6 +3140,7 @@ impl CapacitySchedule {
             group: self.group.clone(),
             min_workers: self.min_workers,
             max_workers: self.max_workers,
+            cap_workers: self.cap_workers,
             scale_in: self.scale_in.clone(),
             freeze_deploys: self.freeze_deploys,
             ..AppOverlay::default()
@@ -3166,6 +3182,7 @@ impl CapacitySchedule {
             group: change.group.clone(),
             min_workers: change.min_workers,
             max_workers: change.max_workers,
+            cap_workers: change.cap_workers,
             warm_up: overlay.warm_up.as_ref().map(|warm_up| warm_up.lead.clone()),
             scale_in: change.scale_in.clone(),
             freeze_deploys: change.freeze_deploys,
@@ -3422,7 +3439,8 @@ fn check_route_overlay(change: &RouteOverlay, outer: bool) -> Result<(), String>
 }
 
 /// Check what an overlay sets on an application: a floor of at least
-/// one, no higher than the ceiling, and a known `scale_in`.
+/// one, no higher than the ceiling, a cap of at least one, not beside a
+/// ceiling and not below the floor, and a known `scale_in`.
 fn check_app_overlay(change: &AppOverlay) -> Result<(), String> {
     if change.maintenance.is_none()
         && !change.sets_capacity()
@@ -3461,6 +3479,24 @@ fn check_app_overlay(change: &AppOverlay) -> Result<(), String> {
         && max < min
     {
         return Err(format!("max_workers {max} is below min_workers {min}"));
+    }
+
+    // Issue 712: a cap lowers the ceiling, where max_workers raises it.
+
+    if change.cap_workers == Some(0) {
+        return Err("cap_workers must be at least 1".to_owned());
+    }
+
+    if change.cap_workers.is_some() && change.max_workers.is_some() {
+        return Err(
+            "cap_workers and max_workers do not go together: max_workers raises the ceiling and cap_workers lowers it".to_owned(),
+        );
+    }
+
+    if let (Some(min), Some(cap)) = (change.min_workers, change.cap_workers)
+        && cap < min
+    {
+        return Err(format!("cap_workers {cap} is below min_workers {min}"));
     }
 
     if let Some(scale_in) = &change.scale_in
@@ -6608,6 +6644,18 @@ mod tests {
             ),
             ("apps.shop = { scale_in = 'never' }", "not hold or normal"),
             (
+                "apps.shop = { cap_workers = 0 }",
+                "cap_workers must be at least 1",
+            ),
+            (
+                "apps.shop = { cap_workers = 4, max_workers = 8 }",
+                "do not go together",
+            ),
+            (
+                "apps.shop = { min_workers = 4, cap_workers = 2 }",
+                "below min_workers",
+            ),
+            (
                 "apps.shop = { group = 'reports', maintenance = true }",
                 "none is set",
             ),
@@ -6637,6 +6685,21 @@ mod tests {
             Some(("shop".to_owned(), schedule.clone()))
         );
         assert_eq!(CapacitySchedule::from_overlay("backup", &overlay), None);
+
+        // Issue 712: a schedule's cap is the overlay's too.
+
+        let capped = Document::parse(
+            "[[app.reports.schedule]]\nname = 'office-hours'\ncron = '0 9 * * mon-fri'\nduration = '8h'\ngroup = 'batch'\ncap_workers = 2\n",
+        )
+        .unwrap();
+        let capped_schedule = &capped.app["reports"].schedule[0];
+        let capped_overlay = capped_schedule.overlay("reports");
+        assert!(check_overlay("reports.office-hours", &capped_overlay).is_ok());
+        assert_eq!(capped_overlay.apps["reports"].cap_workers, Some(2));
+        assert_eq!(
+            CapacitySchedule::from_overlay("reports.office-hours", &capped_overlay),
+            Some(("reports".to_owned(), capped_schedule.clone()))
+        );
 
         let mut merged = document.clone();
         let error = merged.merge(document).unwrap_err();

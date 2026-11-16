@@ -1,0 +1,35 @@
+[project]
+name = "catalog"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.muru]
+entrypoint = "app:application"
+processes = 1
+
+[tool.muru.commands.migrate]
+description = "Apply the database migrations"
+run = ["python", "migrate.py"]
+timeout = "1m"
+before_fork = true
+
+[tool.muru.commands.add-product]
+description = "Add a product, or change its price"
+run = ["python", "manage.py", "add", "{name}", "{price}"]
+inputs.name = { required = true, description = "The product's name" }
+inputs.price = { default = "1.00", pattern = "[0-9]+[.][0-9][0-9]" }
+
+[tool.muru.commands.backup]
+description = "Copy the database to backups/"
+call = "ops:backup"
+timeout = "10m"
+exclusive = true
+inputs.seconds = { default = "30", description = "How long the copy takes" }
+
+[tool.muru.commands.cleanup]
+description = "Remove old backups"
+call = "ops:cleanup"
+timeout = "5m"
+inputs.keep = { default = "1d" }
+inputs.pause = { default = "0", description = "Seconds to wait before starting" }
+schedule = { cron = "* * * * *" }

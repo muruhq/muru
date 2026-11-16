@@ -72,6 +72,19 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
         )
         return [HELLO]
 
+    if path == "/form" and environ["REQUEST_METHOD"] == "POST":
+        # A form's submission that redirects to the page, as post,
+        # redirect, get does, for the toolbar's history.
+
+        start_response("303 See Other", [("Location", "/page"), ("Content-Length", "0")])
+        return [b""]
+
+    if path == "/fragment":
+        # HTML with no </body>, as an error page or a fragment is.
+
+        start_response("200 OK", [("Content-Type", "text/html")])
+        return [b"<p>fragment</p>"]
+
     if path == "/page":
         # An HTML page, in two pieces, for the development toolbar.
 

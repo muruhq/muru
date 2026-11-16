@@ -676,16 +676,18 @@ pub enum Command {
         done: oneshot::Sender<Result<String, String>>,
     },
     /// Section 7.5: a temporary schedule raising a worker group's floor,
-    /// and its ceiling with it, until a time.
-    ScaleFloor {
+    /// and its ceiling with it, or capping it (issue 712), until a time.
+    ScaleTemporary {
         /// The application.
         app: String,
         /// The worker group.
         group: String,
         /// The floor.
-        min_workers: u32,
+        min_workers: Option<u32>,
         /// The ceiling, when raised too.
         max_workers: Option<u32>,
+        /// The cap, in place of a floor.
+        cap_workers: Option<u32>,
         /// When it ends, Unix milliseconds.
         until: u64,
         /// Answered with a sentence about what happened.
@@ -4459,13 +4461,14 @@ impl Daemon {
     }
 
     /// Section 7.5: record and activate the temporary overlay `muructl
-    /// scale --min` stands for, replacing one already there for the group.
-    async fn scale_floor(
+    /// scale --min` stands for, or `--cap` (issue 712), replacing the one
+    /// already there for the group. A floor and a cap are overlays apart,
+    /// so each ends on its own.
+    async fn scale_temporary(
         &mut self,
         app: &str,
         group: &str,
-        min_workers: u32,
-        max_workers: Option<u32>,
+        change: muru_config::AppOverlay,
         until: u64,
     ) -> Result<String, String> {
         self.store.app(app).map_err(|error| error.to_string())?;
@@ -4475,18 +4478,26 @@ impl Daemon {
             return Err("--until is not in the future".to_owned());
         }
 
+        if change.min_workers.is_some() == change.cap_workers.is_some() {
+            return Err("give a floor or a cap".to_owned());
+        }
+
         let change = muru_config::AppOverlay {
             group: (group != muru_edge::routing::DEFAULT_GROUP).then(|| group.to_owned()),
-            min_workers: Some(min_workers),
-            max_workers,
-            ..muru_config::AppOverlay::default()
+            ..change
         };
         let overlay = muru_config::Overlay {
             apps: BTreeMap::from([(app.to_owned(), change.clone())]),
             ..muru_config::Overlay::default()
         };
         muru_config::check_overlay("scale", &overlay)?;
-        let name = crate::overlays::temporary_name(app, group);
+
+        let name = if change.cap_workers.is_some() {
+            crate::overlays::temporary_cap_name(app, group)
+        } else {
+            crate::overlays::temporary_name(app, group)
+        };
+
         self.store
             .put_overlay(&name, &overlay)
             .map_err(|error| error.to_string())?;
@@ -5862,17 +5873,22 @@ impl Daemon {
             } => {
                 let _ = done.send(self.control_overlay(&name, action, external).await);
             }
-            Command::ScaleFloor {
+            Command::ScaleTemporary {
                 app,
                 group,
                 min_workers,
                 max_workers,
+                cap_workers,
                 until,
                 done,
             } => {
-                let outcome = self
-                    .scale_floor(&app, &group, min_workers, max_workers, until)
-                    .await;
+                let change = muru_config::AppOverlay {
+                    min_workers,
+                    max_workers,
+                    cap_workers,
+                    ..muru_config::AppOverlay::default()
+                };
+                let outcome = self.scale_temporary(&app, &group, change, until).await;
                 let _ = done.send(outcome);
             }
             Command::Shutdown { .. } | Command::Upgrade { .. } => {}
@@ -10049,18 +10065,32 @@ impl Daemon {
     }
 
     /// Section 7.5: the capacity active overlays and schedules set, and
-    /// those warming up ahead of a window, for each running release's
-    /// groups. A release taking a share of its application's traffic, as
-    /// a canary does, takes that share of the floor.
+    /// the floors of those warming up ahead of a window, for each running
+    /// release's groups. A release taking a share of its application's
+    /// traffic, as a canary does, takes that share of the floor and of a
+    /// cap (issue 712), rounded up.
     fn capacities(&self) -> HashMap<(String, String, String), crate::scaling::Capacity> {
         let overlays = self.store.overlays().unwrap_or_default();
         let states = self.store.overlay_states().unwrap_or_default();
         let mut applied = crate::overlays::ordered(&overlays, &states);
-        applied.extend(
-            overlays
-                .iter()
-                .filter(|(name, _)| self.warm_ups.contains_key(name)),
-        );
+
+        // A warm-up readies capacity ahead of a window, so an overlay's
+        // cap waits for the window itself.
+
+        let warming: Vec<(String, muru_config::Overlay)> = overlays
+            .iter()
+            .filter(|(name, _)| self.warm_ups.contains_key(name))
+            .map(|(name, overlay)| {
+                let mut overlay = overlay.clone();
+
+                for change in overlay.apps.values_mut() {
+                    change.cap_workers = None;
+                }
+
+                (name.clone(), overlay)
+            })
+            .collect();
+        applied.extend(warming.iter());
         let by_app = crate::overlays::capacities(applied);
         let mut found = HashMap::new();
 
@@ -10085,6 +10115,11 @@ impl Daemon {
 
                 let mut capacity = capacity.clone();
                 capacity.floor = (capacity.floor * share).div_ceil(100);
+
+                if capacity.cap > 0 {
+                    capacity.cap = (capacity.cap * share).div_ceil(100).max(1);
+                }
+
                 found.insert((app.clone(), id.clone(), group.clone()), capacity);
             }
         }
@@ -11619,12 +11654,16 @@ impl Daemon {
                     });
                 }
             }
+            // Section 11.7: only a development run keeps request records,
+            // so the daemon has nothing to join a capture to.
+            HostMessage::Capture(_) => {}
             HostMessage::Event {
                 kind,
                 level,
                 message,
                 group,
                 reason,
+                ..
             } => {
                 let level = match level.as_str() {
                     "error" => "error",

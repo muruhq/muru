@@ -43,6 +43,7 @@ and reach routes by the route's `name`.
 | `apps.NAME.maintenance` | Maintenance mode on (`true`) or off (`false`) for the application |
 | `apps.NAME.mode`, `deny`, `answer` | The site mode and refused methods on each of the application's routes, as `routes.NAME` sets them on one |
 | `apps.NAME.min_workers`, `max_workers`, `scale_in`, `group` | [Scheduled capacity](scaling.md#scheduled-capacity) for the application's default worker group, or `group` |
+| `apps.NAME.cap_workers` | At most this many workers for the group, whatever its policy and the autoscaler choose (see [capping a group](scaling.md#capping-a-group)) |
 | `apps.NAME.freeze_deploys` | Refuse the application's [deploys and rollouts](rollouts.md#deploy-freezes) |
 
 An overlay can choose the page people see while it is active, such as a
@@ -84,7 +85,7 @@ overlay ends.
 
 Two overlays that set the same field cannot both be applied unless each
 has a different `priority` (capacity is the exception: the highest floor
-and ceiling apply); the higher one's value stands while both are active.
+and ceiling apply, and the lowest cap); the higher one's value stands while both are active.
 Each error page key and each class in `client_routes` is a field of its
 own, so overlays choosing pages for different statuses, or routes for
 different classes, do not conflict. `muructl apply` refuses overlays
@@ -140,8 +141,8 @@ routes.shop-root = { target = { static = '/srv/shop/snapshot' }, mode = 'degrade
 trigger = { condition = 'shop-errors' }
 latch = true
 
-[overlay.crawler-snapshot]
-routes.shop-root.client_routes.ai-crawler = { target = { static = '/srv/shop/snapshot' } }
+[overlay.crawler-limits]
+routes.shop-root.client_routes.ai-crawler = { rate_limits = ['crawlers'] }
 trigger = { condition = 'crawler-surge' }
 ```
 
@@ -189,11 +190,19 @@ route shop-root: target app shop -> static /srv/shop/snapshot
 An overlay can take away the traffic its own condition reads: a static
 snapshot in place of the application whose error rate fired it leaves
 that application with no requests, its error rate unknown, and the
-overlay can never end by it. `muructl apply` warns about such an overlay.
+overlay can never end by it. A client class's route to a snapshot does
+the same to a condition on that class's share of the application's
+requests, since a request answered from a static directory is not the
+application's: the share falls while the class keeps coming, and the
+overlay ends too soon. A rate limit keeps the requests it refuses in the
+application's figures. `muructl apply` warns about such an overlay.
 Resolve its condition on another signal, such as `upstream_healthy` for a
-database's health check upstream, or set `latch = true` and end the
-overlay by hand once `muructl overlay preview` shows the application
-healthy again.
+database's health check upstream, or set `latch = true`, which apply does
+not warn about, and end the overlay by hand once `muructl overlay
+preview` shows the application healthy again.
+
+An overlay on a condition can set capacity too, as in [capacity on a
+condition](scaling.md#capacity-on-a-condition).
 
 ## The webhook
 

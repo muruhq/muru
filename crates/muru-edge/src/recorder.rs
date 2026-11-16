@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use muru_proto::admin::v1 as admin;
 use prost::Message as _;
@@ -26,6 +26,19 @@ pub const MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// What a masked value reads.
 pub const MASKED: &str = "***";
+
+/// The most captures one record keeps (issue 706); later ones are left
+/// out, since the first say what failed.
+pub const MAX_CAPTURES: usize = 8;
+
+/// The most other threads a capture keeps on each record it reaches.
+pub const MAX_CAPTURE_THREADS: usize = 32;
+
+/// Issue 715: the most captures kept for requests whose records have not
+/// opened yet, such as those still in flight on a worker killed while
+/// stopped, and how long each waits for its record.
+const MAX_WAITING: usize = 64;
+const WAITING_FOR: Duration = Duration::from_secs(120);
 
 /// Headers whose values are masked whatever they hold.
 const ALWAYS_MASKED: &[&str] = &[
@@ -97,6 +110,9 @@ struct Kept {
 struct Ring {
     kept: VecDeque<Kept>,
     bytes: usize,
+    /// Captures for requests whose records are not open yet, oldest
+    /// first, with when each was taken (issue 715).
+    waiting: VecDeque<(String, admin::RequestCapture, Instant)>,
 }
 
 /// The ring of request records.
@@ -131,6 +147,7 @@ impl Recorder {
             ring: Mutex::new(Ring {
                 kept: VecDeque::new(),
                 bytes: 0,
+                waiting: VecDeque::new(),
             }),
             capacity: capacity.max(1),
             max_bytes,
@@ -139,10 +156,30 @@ impl Recorder {
 
     /// Keep a record, dropping the oldest while the ring is over either
     /// bound, and give back its slot for the rest of it.
-    pub fn open(&self, record: admin::RequestRecord) -> Slot {
+    pub fn open(&self, mut record: admin::RequestRecord) -> Slot {
+        let mut ring = self.ring.lock().expect("recorder poisoned");
+
+        // Issue 715: a capture taken while the request was still in
+        // flight joins its record as it opens.
+
+        let now = Instant::now();
+        ring.waiting
+            .retain(|(_, _, at)| now.saturating_duration_since(*at) < WAITING_FOR);
+
+        while let Some(index) = ring
+            .waiting
+            .iter()
+            .position(|(request_id, _, _)| *request_id == record.request_id)
+        {
+            let (_, capture, _) = ring.waiting.remove(index).expect("found");
+
+            if record.captures.len() < MAX_CAPTURES {
+                record.captures.push(capture);
+            }
+        }
+
         let bytes = record.encoded_len();
         let slot = Arc::new(Mutex::new(record));
-        let mut ring = self.ring.lock().expect("recorder poisoned");
         ring.bytes += bytes;
         ring.kept.push_back(Kept {
             slot: Arc::clone(&slot),
@@ -226,6 +263,85 @@ impl Recorder {
         found
     }
 
+    /// Join a capture to the record of each request it names that is
+    /// still kept (issue 706): the newest record under each ID, whatever
+    /// its state, takes the capture with its own thread's stack as the
+    /// request's, the worker's other threads beside it, and the IDs of
+    /// the other records it reached. A request with no record yet, still
+    /// in flight, takes it when its record opens (issue 715). Returns the
+    /// IDs reached, with those that wait.
+    pub fn capture(&self, evidence: &Evidence) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut reached: Vec<(String, Slot)> = Vec::new();
+        let mut later: Vec<String> = Vec::new();
+
+        {
+            let ring = self.ring.lock().expect("recorder poisoned");
+
+            for request_id in &evidence.requests {
+                if !seen.insert(request_id.as_str()) {
+                    continue;
+                }
+
+                let found = ring.kept.iter().rev().find(|kept| {
+                    kept.slot
+                        .lock()
+                        .expect("request record poisoned")
+                        .request_id
+                        == *request_id
+                });
+
+                match found {
+                    Some(kept) => reached.push((request_id.clone(), Arc::clone(&kept.slot))),
+                    None => later.push(request_id.clone()),
+                }
+            }
+        }
+
+        let ids: Vec<String> = reached
+            .iter()
+            .map(|(id, _)| id.clone())
+            .chain(later.iter().cloned())
+            .collect();
+
+        if !later.is_empty() {
+            let mut ring = self.ring.lock().expect("recorder poisoned");
+
+            for request_id in &later {
+                if ring.waiting.len() >= MAX_WAITING {
+                    ring.waiting.pop_front();
+                }
+
+                let capture = evidence.for_request(request_id, &ids);
+                ring.waiting
+                    .push_back((request_id.clone(), capture, Instant::now()));
+            }
+        }
+
+        for (request_id, slot) in &reached {
+            let capture = evidence.for_request(request_id, &ids);
+
+            self.update(slot, |record| {
+                if record.captures.len() < MAX_CAPTURES {
+                    record.captures.push(capture);
+                }
+            });
+        }
+
+        ids
+    }
+
+    /// Read every record kept, oldest first, by what `read` takes from
+    /// each, leaving out those it gives nothing for.
+    pub fn read_all<T>(&self, mut read: impl FnMut(&admin::RequestRecord) -> Option<T>) -> Vec<T> {
+        let ring = self.ring.lock().expect("recorder poisoned");
+
+        ring.kept
+            .iter()
+            .filter_map(|kept| read(&kept.slot.lock().expect("request record poisoned")))
+            .collect()
+    }
+
     /// How many records are kept, and their bytes.
     pub fn usage(&self) -> (usize, usize) {
         let ring = self.ring.lock().expect("recorder poisoned");
@@ -240,6 +356,79 @@ impl Recorder {
                 break;
             };
             ring.bytes -= oldest.bytes;
+        }
+    }
+}
+
+/// Evidence of a timeout or a killed worker (issue 706), as the host
+/// captured it: the event, the worker, and the stacks of its threads
+/// serving requests, with the requests whose records take it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Evidence {
+    /// The event that captured it.
+    pub kind: String,
+    /// The event's message.
+    pub message: String,
+    /// When it was captured, in Unix milliseconds.
+    pub at_unix_ms: u64,
+    /// The worker's name, empty when the capture names none.
+    pub worker: String,
+    /// The worker's pid.
+    pub pid: u32,
+    /// Why a worker was killed.
+    pub reason: String,
+    /// The requests whose records take the capture, by ID.
+    pub requests: Vec<String>,
+    /// The worker's threads that were serving requests.
+    pub threads: Vec<EvidenceThread>,
+}
+
+/// One thread of a capture, with the request it was serving.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvidenceThread {
+    /// The thread's name.
+    pub name: String,
+    /// The request it was serving, empty for none.
+    pub request_id: String,
+    /// Its stack, as text.
+    pub stack: String,
+}
+
+impl Evidence {
+    /// The capture as one request's record keeps it: that request's own
+    /// thread's stack, the other threads, and the other records reached.
+    fn for_request(&self, request_id: &str, reached: &[String]) -> admin::RequestCapture {
+        let stack = self
+            .threads
+            .iter()
+            .find(|thread| thread.request_id == request_id)
+            .map(|thread| thread.stack.clone())
+            .unwrap_or_default();
+
+        admin::RequestCapture {
+            kind: self.kind.clone(),
+            at_unix_ms: self.at_unix_ms,
+            message: self.message.clone(),
+            worker: self.worker.clone(),
+            pid: self.pid,
+            reason: self.reason.clone(),
+            stack,
+            threads: self
+                .threads
+                .iter()
+                .filter(|thread| thread.request_id != request_id)
+                .take(MAX_CAPTURE_THREADS)
+                .map(|thread| admin::CaptureThread {
+                    name: thread.name.clone(),
+                    request_id: thread.request_id.clone(),
+                    stack: thread.stack.clone(),
+                })
+                .collect(),
+            related: reached
+                .iter()
+                .filter(|other| *other != request_id)
+                .cloned()
+                .collect(),
         }
     }
 }
@@ -376,6 +565,34 @@ pub const WORKER_MISSING: &str = "missing";
 pub fn worker(record: &mut admin::RequestRecord, part: muru_proto::worker::v1::WorkerRecord) {
     record.worker_part = WORKER_ARRIVED.to_owned();
     record.in_progress = record.status == 0;
+
+    // What the worker captured itself, such as its stack at a soft
+    // timeout, comes before what the host captured later.
+
+    let group = if record.group.is_empty() {
+        "default"
+    } else {
+        record.group.as_str()
+    };
+    let worker = record
+        .worker
+        .map(|index| muru_common::worker::WorkerName::new(group, index).to_string())
+        .unwrap_or_default();
+    let captured: Vec<admin::RequestCapture> = part
+        .captures
+        .into_iter()
+        .map(|capture| admin::RequestCapture {
+            kind: capture.kind,
+            at_unix_ms: capture.at_unix_ms,
+            message: capture.message,
+            worker: worker.clone(),
+            stack: capture.stack,
+            ..Default::default()
+        })
+        .collect();
+    record.captures.splice(0..0, captured);
+    record.captures.truncate(MAX_CAPTURES);
+
     record.from_worker = Some(admin::WorkerPart {
         thread: part.thread,
         to_start_response: part.to_start_response,
@@ -430,6 +647,7 @@ fn panel(panel: muru_proto::worker::v1::RecordPanel) -> admin::Panel {
             duration_ms: taken.duration.max(0.0),
             category: taken.category,
             children: taken.children.into_iter().map(span).collect(),
+            failed: taken.failed,
         }
     }
 
@@ -676,6 +894,97 @@ pub(crate) mod tests {
             target: "x".repeat(padding),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_capture_reaches_each_request_it_names_that_is_kept() {
+        let recorder = Recorder::default();
+
+        for request_id in ["A", "B"] {
+            recorder.open(admin::RequestRecord {
+                request_id: request_id.to_owned(),
+                ..Default::default()
+            });
+        }
+
+        let thread = |name: &str, request_id: &str| EvidenceThread {
+            name: name.to_owned(),
+            request_id: request_id.to_owned(),
+            stack: format!("stack of {name}"),
+        };
+        let evidence = Evidence {
+            kind: "worker.timeout_killed".to_owned(),
+            message: "killed".to_owned(),
+            worker: "0".to_owned(),
+            pid: 7,
+            requests: ["A", "B", "GONE", "A"].map(str::to_owned).to_vec(),
+            threads: vec![thread("t1", "A"), thread("t2", "B"), thread("t3", "GONE")],
+            ..Default::default()
+        };
+
+        assert_eq!(recorder.capture(&evidence), ["A", "B", "GONE"]);
+
+        // Each record has its own thread's stack as the request's, the
+        // others beside it, and the other record reached.
+
+        let found = recorder.get("A").unwrap().captures;
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].stack.as_str(), found[0].pid), ("stack of t1", 7));
+        let others: Vec<&str> = found[0]
+            .threads
+            .iter()
+            .map(|thread| thread.name.as_str())
+            .collect();
+        assert_eq!(others, ["t2", "t3"]);
+        assert_eq!(found[0].related, ["B", "GONE"]);
+        assert_eq!(
+            recorder.get("B").unwrap().captures[0].related,
+            ["A", "GONE"]
+        );
+
+        // Issue 715: a request with no record yet, still in flight, takes
+        // the capture when its record opens, and only once.
+
+        recorder.open(admin::RequestRecord {
+            request_id: "GONE".to_owned(),
+            ..Default::default()
+        });
+        let late = recorder.get("GONE").unwrap().captures;
+        assert_eq!(late.len(), 1);
+        assert_eq!(
+            (late[0].stack.as_str(), late[0].related.clone()),
+            ("stack of t3", vec!["A".to_owned(), "B".to_owned()])
+        );
+        recorder.open(admin::RequestRecord {
+            request_id: "LATER".to_owned(),
+            ..Default::default()
+        });
+        assert!(recorder.get("LATER").unwrap().captures.is_empty());
+
+        // At most MAX_CAPTURES on one record; a worker's own captures go
+        // first when its part arrives.
+
+        for _ in 0..MAX_CAPTURES {
+            recorder.capture(&evidence);
+        }
+
+        assert_eq!(recorder.get("A").unwrap().captures.len(), MAX_CAPTURES);
+
+        let mut record = admin::RequestRecord::default();
+        record.captures.push(admin::RequestCapture::default());
+        worker(
+            &mut record,
+            muru_proto::worker::v1::WorkerRecord {
+                captures: vec![muru_proto::worker::v1::RecordCapture {
+                    kind: "request.soft_timeout".to_owned(),
+                    stack: "here".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(record.captures[0].kind, "request.soft_timeout");
+        assert_eq!(record.captures.len(), 2);
     }
 
     #[test]

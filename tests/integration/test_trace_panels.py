@@ -1,5 +1,6 @@
-"""wrapture's events as the toolbar's Trace and SQL panels (issue 640), with
-wrapture and its sqlite3 instrumentation, through muructl run."""
+"""wrapture's events as the toolbar's Trace, SQL, Outbound and Exceptions
+panels (issues 640, 704 and 707), with wrapture and its sqlite3 and
+urllib.request instrumentation, through muructl run."""
 
 from __future__ import annotations
 
@@ -7,6 +8,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from support import server as support
@@ -17,13 +19,42 @@ pytestmark = pytest.mark.skipif(
 
 APP = """
 import sqlite3
+import urllib.request
+
+import wrapture
 
 
 def application(environ, start_response):
+    path = environ["PATH_INFO"]
+
+    if path == "/handled":
+        try:
+            raise LookupError("no such shelf")
+        except LookupError as error:
+            wrapture.note_exception(error)
+
+        start_response("404 Not Found", [("Content-Type", "text/plain")])
+        return [b"no shelf"]
+
+    if path == "/broken":
+        raise RuntimeError("the shelf fell")
+
+    if path == "/outbound":
+        for _ in range(2):
+            address = f"http://{environ['HTTP_HOST']}/handled?shelf=1"
+
+            try:
+                urllib.request.urlopen(address, timeout=10)
+            except urllib.error.HTTPError:
+                pass
+
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"asked"]
+
     connection = sqlite3.connect(":memory:")
     connection.execute("CREATE TABLE book (id INTEGER PRIMARY KEY, title TEXT)")
 
-    for book in range(3):
+    for book in range(5):
         connection.execute("SELECT title FROM book WHERE id = ?", (book,)).fetchall()
 
     connection.close()
@@ -40,6 +71,9 @@ tracing_middleware = true
 [[tool.wrapture.instrument]]
 name = "sqlite3"
 statement = true
+
+[[tool.wrapture.instrument]]
+name = "urllib.request"
 """
 
 
@@ -53,23 +87,24 @@ def test_a_requests_queries_are_its_trace_and_sql_panels(tmp_path: Path) -> None
 
     try:
         response = server.get("/books")
-        request_id = response.header("x-request-id")
-        assert response.body == b"shelved" and request_id is not None
+        assert response.body == b"shelved"
+        found = record(server, response)
 
-        deadline = time.monotonic() + 10
+        handled = server.get("/handled")
+        assert handled.status == 404
+        handled_record = record(server, handled)
 
-        while True:
-            found = json.loads(server.get(f"/_muru/requests/{request_id}.json").body)
+        broken = server.get("/broken")
+        assert broken.status == 500
+        broken_record = record(server, broken)
 
-            if not found["in_progress"] and found["worker_part"] == "arrived":
-                break
-
-            assert time.monotonic() < deadline, found
-            time.sleep(0.05)
+        outbound = server.get("/outbound")
+        assert outbound.body == b"asked"
+        outbound_record = record(server, outbound)
     finally:
         server.stop()
 
-    panels = {panel["name"]: panel for panel in found["panels"]}
+    panels = named(found)
 
     # The request is the tree's root, its queries beneath it, named by
     # their statements, after the queue on the request's clock.
@@ -77,10 +112,69 @@ def test_a_requests_queries_are_its_trace_and_sql_panels(tmp_path: Path) -> None
     (request,) = panels["trace"]["spans"]
     assert request["name"] == "GET /books" and request["start_ms"] >= found["queue_ms"]
     names = [child["name"] for child in request["children"]]
-    assert names.count("SELECT title FROM book WHERE id = ?") == 3, names
+    assert names.count("SELECT title FROM book WHERE id = ?") == 5, names
 
-    # The same statement three times is one row of three.
+    # The same statement five times is one row of five, which the Hints
+    # panel, the record's first, names as an N+1 pattern (issue 709).
 
     by_statement, each = panels["sql"]["tables"]
-    assert ["SELECT title FROM book WHERE id = ?", "3"] == by_statement["rows"][0]["cells"][:2]
-    assert len(each["rows"]) == 4
+    assert ["SELECT title FROM book WHERE id = ?", "5"] == by_statement["rows"][0]["cells"][:2]
+    assert len(each["rows"]) == 6
+    assert found["panels"][0]["name"] == "hints"
+    (hint,) = panels["hints"]["tables"][0]["rows"]
+    assert hint["cells"][0].startswith("the same statement ran 5 times in one request"), hint
+    assert hint["cells"][1] == "SQL"
+
+    # An exception the application caught and noted is in the Exceptions
+    # panel as handled, against the request it was noted in.
+
+    assert exceptions(handled_record) == [["GET /handled", "LookupError: no such shelf (handled)"]]
+    assert named(handled_record)["trace"]["spans"][0]["failed"] is True
+    assert request["failed"] is False
+
+    # One that escaped is there unmarked, and in the Errors panel's
+    # traceback too.
+
+    assert exceptions(broken_record) == [["GET /broken", "RuntimeError: the shelf fell"]]
+    assert named(broken_record)["trace"]["spans"][0]["failed"] is True
+    assert broken_record["from_worker"]["outcome"] == "failed"
+    assert "RuntimeError: the shelf fell" in broken_record["from_worker"]["traceback"]
+
+    # The application's calls to its own server are one endpoint called
+    # twice, each call with its URL without the query and its status; a
+    # request that made none has no Outbound panel.
+
+    by_endpoint, each_call = named(outbound_record)["outbound"]["tables"]
+    host = f"127.0.0.1:{server.port}"
+    assert [row["cells"][:4] for row in by_endpoint["rows"]] == [["GET", host, "/handled", "2"]]
+    assert [row["cells"][2:] for row in each_call["rows"]] == [
+        ["GET", f"http://{host}/handled", "404"]
+    ] * 2
+    assert "outbound" not in panels
+
+
+def record(server: support.Server, response: support.Response) -> dict[str, Any]:
+    """The record of the request that gave `response`, once its worker's
+    part has arrived."""
+
+    request_id = response.header("x-request-id")
+    assert request_id is not None
+    deadline = time.monotonic() + 10
+
+    while True:
+        found: dict[str, Any] = json.loads(server.get(f"/_muru/requests/{request_id}.json").body)
+
+        if not found["in_progress"] and found["worker_part"] == "arrived":
+            return found
+
+        assert time.monotonic() < deadline, found
+        time.sleep(0.05)
+
+
+def named(found: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {panel["name"]: panel for panel in found["panels"]}
+
+
+def exceptions(found: dict[str, Any]) -> list[list[str]]:
+    (table,) = named(found)["exceptions"]["tables"]
+    return [row["cells"] for row in table["rows"]]

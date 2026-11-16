@@ -1,16 +1,39 @@
-{#- The Errors panel: the unhandled exception, or the edge's reason. -#}
-{%- if panel.values %}
+{#- The Errors panel: the unhandled exception, the edge's reason, or a 500
+    the application answered itself with the error it logged, then
+    each capture of a timeout or a killed worker (issue 706): its message,
+    the worker, the request's stack and the worker's other threads, and
+    links to the other requests' records it reached. -#}
+{%- if panel["values"] %}
 <table class="values">
 <tbody>
-{%- for value in panel.values %}
-{%- if value.name == "traceback" %}
+{%- for value in panel["values"] %}
+{%- if value.name in ["traceback", "logged"] %}
 <tr><th>{{ value.name }}</th><td><pre class="error">{{ value.value }}</pre></td></tr>
+{%- elif value.name == "worker's part" %}
+<tr><th>{{ value.name }}</th><td class="muted">{{ value.value }}</td></tr>
 {%- else %}
 <tr><th>{{ value.name }}</th><td>{{ value.value }}</td></tr>
 {%- endif %}
 {%- endfor %}
 </tbody>
 </table>
-{%- else %}
+{%- elif not panel.tables %}
 <p class="muted">No errors.</p>
 {%- endif %}
+{%- for table in panel.tables %}
+<table class="values capture">
+<caption>{{ table.caption }}</caption>
+<tbody>
+{%- for row in table.rows %}
+{%- set name = row.cells[0] %}
+{%- if name == "stack" or name is startingwith("thread ") %}
+<tr><th>{{ name }}</th><td><pre{% if name == "stack" %} class="error"{% endif %}>{{ row.cells[1] }}</pre></td></tr>
+{%- elif name == "also reached" %}
+<tr><th>{{ name }}</th><td class="mono"><a href="/_muru/requests/{{ row.cells[1]|urlencode }}/panels/errors.html">{{ row.cells[1] }}</a></td></tr>
+{%- else %}
+<tr><th>{{ name }}</th><td>{{ row.cells[1] }}</td></tr>
+{%- endif %}
+{%- endfor %}
+</tbody>
+</table>
+{%- endfor %}

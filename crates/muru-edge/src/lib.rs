@@ -41,6 +41,7 @@ pub mod endpoints;
 pub mod errors;
 pub mod grpc;
 pub mod headers;
+pub mod hints;
 pub mod ja4;
 pub mod link;
 pub mod metrics;
@@ -1513,6 +1514,21 @@ async fn serve<I>(
                     &listener,
                     located,
                 );
+
+                // Issue 724: a request the rate limits or the method
+                // restrictions refuse is still the application's it was
+                // routed to, in its record and the metrics, as one that
+                // maintenance refuses is.
+
+                let (app, release, group) = match &decision {
+                    routing::Decision::Serve { selection, .. } => (
+                        selection.app.clone(),
+                        selection.release.clone(),
+                        selection.group.clone(),
+                    ),
+                    _ => Default::default(),
+                };
+
                 let mut context = link::Context {
                     request_id: &request_id,
                     peer: client,
@@ -1526,9 +1542,9 @@ async fn serve<I>(
                     limits: Arc::clone(&in_force),
                     server_name: None,
                     virtual_host: routing.host_name(host.as_deref(), &listener),
-                    app: String::new(),
-                    release: String::new(),
-                    group: String::new(),
+                    app,
+                    release,
+                    group,
                     snapshot: routing.version(),
                     mount: String::new(),
                     mount_path: String::new(),
@@ -2174,7 +2190,8 @@ async fn serve<I>(
                             dashboard.as_deref(),
                             nonce.as_deref(),
                         );
-                        response = toolbar::insert(response, tag);
+                        let append = toolbar::said_document(&parts.headers);
+                        response = toolbar::insert(response, tag, append);
                     }
                     Err(toolbar::Skip::Policy) => {
                         if shared.warned.first(parts.uri.path()) {

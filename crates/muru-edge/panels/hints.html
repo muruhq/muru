@@ -1,0 +1,15 @@
+{#- The Hints panel (issue 709): what stands out in the record, each
+    hint with the panel and the figure it comes from. -#}
+{%- set rows = panel.tables[0].rows if panel.tables else [] %}
+{%- if rows %}
+<table class="hints">
+<thead><tr><th>What stands out</th><th>From</th><th class="num">Figure</th></tr></thead>
+<tbody>
+{%- for row in rows %}
+<tr><td>{{ row.cells[0] }}</td><td class="muted">{{ row.cells[1] }}</td><td class="mono num">{{ row.cells[2] }}</td></tr>
+{%- endfor %}
+</tbody>
+</table>
+{%- else %}
+<p class="muted">Nothing stands out in this request's record.</p>
+{%- endif %}

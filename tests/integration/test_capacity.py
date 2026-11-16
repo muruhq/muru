@@ -1,7 +1,8 @@
 """Scheduled capacity and deploy freezes (design specification sections
 7.5 and 9.6): an application's schedules raise a worker group's floor
 and ceiling for their windows and can freeze deploys, `muructl scale
---min` sets a floor until a time, and the schedules survive an export.
+--min` sets a floor until a time, an overlay or `muructl scale --cap`
+caps a group, and the schedules survive an export.
 """
 
 from __future__ import annotations
@@ -116,6 +117,54 @@ def test_scale_min_is_a_temporary_floor(daemon: Daemon, tmp_path: Path) -> None:
 
     refused = daemon.muructl("scale", "shop", "--min", "2", check=False)
     assert refused.returncode != 0 and "--min needs --until" in refused.stderr
+
+
+def test_a_cap_drains_a_group_at_once_and_wins_over_a_floor(daemon: Daemon, tmp_path: Path) -> None:
+    overlays = """
+[overlay.shop-cap]
+apps.shop = { cap_workers = 1 }
+
+[overlay.shop-floor]
+apps.shop = { min_workers = 3 }
+"""
+    applied = daemon.muructl("apply", "-f", str(shop(tmp_path, overlays)))
+    warning = (
+        "overlay shop-floor keeps shop (default group) at 3 workers or more"
+        " and overlay shop-cap caps it at 1"
+    )
+    assert warning in applied.stdout + applied.stderr
+
+    daemon.muructl("scale", "shop", "--min", "3", "--for", "2m")
+    assert eventually(lambda: workers(daemon) == 3)
+    preview = daemon.muructl("overlay", "preview", "shop-cap").stdout
+    assert "app shop: group default: capped at 1 worker" in preview, preview
+
+    # Activated by hand, the cap takes the group down to it in one step,
+    # floor or not, outside the churn budget.
+
+    daemon.muructl("overlay", "activate", "shop-cap")
+    assert eventually(lambda: workers(daemon) == 1, timeout=15)
+    status = daemon.muructl("scale", "status", "shop").stdout
+    assert "capped: at most 1 worker from shop-cap" in status
+    assert " 0/6 " in status, status
+    events = daemon.muructl("events").stdout
+    assert "scale in from 3 to 1 workers: capped at 1 worker by shop-cap" in events
+
+    # Ended, the floor brings the group back.
+
+    daemon.muructl("overlay", "end", "shop-cap")
+    assert eventually(lambda: workers(daemon) == 3)
+
+    # By hand, --cap waits until the group is under it.
+
+    capped = daemon.muructl("scale", "shop", "--cap", "2", "--for", "1m")
+    assert "muru: shop default capped at 2 workers until" in capped.stdout
+    assert "muru: shop default is at 2 workers" in capped.stdout
+    assert workers(daemon) == 2
+    assert "shop:cap" in daemon.muructl("overlay", "list").stdout
+
+    refused = daemon.muructl("scale", "shop", "--cap", "2", check=False)
+    assert refused.returncode != 0 and "--cap needs --until" in refused.stderr
 
 
 def test_a_freeze_refuses_deploys_unless_overridden(daemon: Daemon, tmp_path: Path) -> None:

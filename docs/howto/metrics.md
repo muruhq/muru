@@ -85,7 +85,11 @@ Names start with `muru_`. Where they apply, labels name the application
 | `muru_snapshot_version` | gauge | | the routing snapshot in force at the edge, 0 in development mode |
 
 A request answered before any release serves, or refused by the routing
-tables, carries no application or release labels.
+tables, carries no application or release labels. One the edge refuses
+after routing it to an application, for a rate limit, a method
+restriction or maintenance, carries that application's labels. One
+answered from a static directory carries none, including one a [client
+class's route](overlays.md#what-an-overlay-changes) sends to a snapshot.
 
 Some figures are read from these families rather than exported on their
 own: the time requests wait for a worker is the `queue` phase of
