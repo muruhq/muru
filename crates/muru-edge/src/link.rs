@@ -2288,7 +2288,21 @@ async fn handle_inner(
                 let end = pb::End::decode(next.payload).unwrap_or_default();
                 return failing.worker_failed(end);
             }
-            Ok(_) => {
+            Ok(Some(next)) => {
+                // Issue 734: a frame out of place says something other
+                // than a worker that went away, so the two are told apart.
+
+                tracing::warn!(
+                    kind = next.kind,
+                    "the worker sent an unexpected frame before the response head"
+                );
+                back.give_reader(None);
+                return failing.worker_crashed(&format!(
+                    "The worker sent an unexpected frame, of type {}, before the response head.",
+                    next.kind
+                ));
+            }
+            Ok(None) => {
                 back.give_reader(None);
                 return failing.worker_crashed("The worker sent no response head.");
             }

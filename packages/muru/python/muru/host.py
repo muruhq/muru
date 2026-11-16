@@ -4748,7 +4748,7 @@ class Host:
 
         while self.workers and time.monotonic() < deadline:
             try:
-                pid, _status = os.waitpid(-1, os.WNOHANG)
+                pid, status = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
                 self.workers.clear()
                 break
@@ -4757,7 +4757,13 @@ class Host:
                 time.sleep(0.05)
                 continue
 
-            self.workers.pop(pid, None)
+            index = self.workers.pop(pid, None)
+
+            # A worker that stops as it should exits with status 0; one
+            # that does not may have lost the requests it was finishing.
+
+            if index is not None and status != 0:
+                log(f"worker {self.worker_name(index)} (pid {pid}) exited with {describe(status)}")
 
         # Whatever is left is killed and reaped.
 

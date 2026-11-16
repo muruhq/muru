@@ -17,7 +17,8 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,28 @@ from support import server as support
 
 SHOP = support.ROOT / "tests" / "fixtures" / "projects" / "shop"
 FACTORY = support.ROOT / "tests" / "fixtures" / "projects" / "factory"
+
+# The lines of each log a failing test's report keeps, from its end.
+
+LOG_TAIL_LINES = 200
+
+
+def stamp(at: float) -> str:
+    """A wall-clock time as the daemon's logs write it, in UTC."""
+
+    return datetime.fromtimestamp(at, UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def tail(path: Path) -> str:
+    """The end of a log, saying how much of it was left out."""
+
+    lines = path.read_text(errors="replace").splitlines()
+
+    if len(lines) <= LOG_TAIL_LINES:
+        return "\n".join(lines)
+
+    left_out = len(lines) - LOG_TAIL_LINES
+    return "\n".join([f"... {left_out} earlier lines", *lines[-LOG_TAIL_LINES:]])
 
 
 @dataclass
@@ -38,6 +61,13 @@ class Daemon:
     run_dir: Path
     log_path: Path
     listeners: list[tuple[int, bool]]
+
+    # What a failing test's report shows (issue 734): each command and
+    # request with when it began and how long it took, and the daemon's
+    # state as it was stopped while an exception was on its way out.
+
+    timeline: list[str] = field(default_factory=list)
+    state_at_stop: str = ""
 
     def muructl(
         self, *arguments: str, check: bool = True, stdin: str | None = None
@@ -74,6 +104,8 @@ class Daemon:
         else:
             full = [*arguments, *where]
 
+        began = time.time()
+
         try:
             completed = subprocess.run(
                 [str(muructl), *full],
@@ -84,6 +116,7 @@ class Daemon:
                 input=stdin,
             )
         except subprocess.TimeoutExpired as error:
+            self.timeline.append(f"{stamp(began)} muructl {' '.join(arguments)}: hung")
             listing = subprocess.run(
                 ["ps", "-ax", "-o", "pid,ppid,stat,command"], capture_output=True, text=True
             ).stdout
@@ -92,6 +125,11 @@ class Daemon:
                 f"muructl {' '.join(arguments)} hung for 180 seconds\n"
                 f"--- daemon log tail\n{self.log()[-4000:]}\n--- processes\n" + "\n".join(ours)
             ) from error
+
+        self.timeline.append(
+            f"{stamp(began)} muructl {' '.join(arguments)}: "
+            f"exit {completed.returncode} after {time.time() - began:.3f} s"
+        )
 
         if check and completed.returncode != 0:
             raise RuntimeError(
@@ -137,12 +175,21 @@ class Daemon:
                 server_hostname=server_hostname or host or "localhost",
             )
 
+        began = time.time()
+        outcome = "failed"
+
         try:
             connection.request(method, path, headers=headers)
             raw = connection.getresponse()
-            return support.Response(raw.status, raw.reason, raw.getheaders(), raw.read())
+            response = support.Response(raw.status, raw.reason, raw.getheaders(), raw.read())
+            outcome = f"{response.status}, request id {response.header('x-request-id')}"
+            return response
         finally:
             connection.close()
+            self.timeline.append(
+                f"{stamp(began)} {method} {host or ''}{path}: "
+                f"{outcome} after {time.time() - began:.3f} s"
+            )
 
     @staticmethod
     def request_static(port: int, path: str = "/") -> support.Response:
@@ -270,6 +317,12 @@ class Daemon:
         """
 
         if self.process.poll() is None:
+            # A test that fails stops its daemon on the way out, so what
+            # its report shows of the releases is taken now.
+
+            if sys.exc_info()[1] is not None:
+                self.state_at_stop = self.state()
+
             arguments = ["daemon", "stop", "--shutdown"] if shutdown else ["daemon", "stop"]
             completed = self.muructl(*arguments, check=False)
 
@@ -283,6 +336,61 @@ class Daemon:
                 raise RuntimeError(
                     f"muructl daemon stop failed: {completed.stdout}{completed.stderr}"
                 )
+
+    def state(self) -> str:
+        """The releases and the daemon's events, as muructl prints them,
+        for a failing test's report. Quick to give up, since a daemon in
+        trouble may not answer."""
+
+        muructl = support.muructl_path()
+        socket = str(self.run_dir / "admin.sock")
+        shown = []
+
+        for arguments in (["release", "list"], ["events"]):
+            try:
+                completed = subprocess.run(
+                    [str(muructl), *arguments, "--socket", socket],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                answer = completed.stdout + completed.stderr
+            except subprocess.TimeoutExpired:
+                answer = "no answer in 10 s"
+
+            shown.append(f"$ muructl {' '.join(arguments)} (at {stamp(time.time())})\n{answer}")
+
+        return "\n".join(shown)
+
+    def failure_report(self) -> list[tuple[str, str]]:
+        """Sections for the report of a test that failed with this daemon:
+        its timeline, its state, and the end of each of its logs (the
+        daemon's, the edge's, the access log and each release's, which
+        carries its host's and workers' lines)."""
+
+        where = self.base.name
+        state = self.state() if self.process.poll() is None else self.state_at_stop
+        sections = [
+            (f"daemon {where}: commands and requests", "\n".join(sorted(self.timeline))),
+            (f"daemon {where}: state", state or "not taken: the daemon had stopped"),
+        ]
+
+        logs = [self.log_path, *sorted((self.base / "logs").rglob("*.log"))]
+
+        for path in logs:
+            if path.is_file():
+                sections.append((f"daemon {where}: {path.relative_to(self.base)}", tail(path)))
+
+        return sections
+
+
+# The daemons started and still to be reported on, for the conftest hook
+# that adds their sections to a failing test's report. One that has
+# stopped is dropped as its test ends; one a module's fixture keeps
+# running stays for the module's later tests.
+
+STARTED: list[Daemon] = []
 
 
 def inherited() -> dict[str, str]:
@@ -376,6 +484,7 @@ def start_daemon(
         )
 
     daemon = Daemon(process, port, base, run_dir, log_path, listeners)
+    STARTED.append(daemon)
 
     deadline = time.monotonic() + 30
 
