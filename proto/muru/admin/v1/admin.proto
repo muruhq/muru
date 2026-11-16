@@ -433,6 +433,14 @@ message WorkerPart {
   double loop_lag = 21;             // the longest stretch of the request with the event loop held
   double loop_lag_at = 22;          // when that stretch began
   repeated Panel panels = 23;       // panels code in the worker added (issue 677), spans on the worker's clock
+  repeated Stretch gil_wait_stretches = 24;  // each wait for the GIL, in order, the first 64 (issue 737)
+  repeated Stretch loop_held_stretches = 25; // each stretch with the event loop held, in order, the longest 64 (issue 737)
+}
+
+// A stretch of a request's time, from when the worker took the request.
+message Stretch {
+  double at_ms = 1;                 // when it began
+  double ms = 2;                    // how long it lasted
 }
 
 message RequestGc {
@@ -487,6 +495,16 @@ message PanelSpan {
   string category = 4;
   repeated PanelSpan children = 5;
   bool failed = 6;                  // the operation failed, drawn so it stands out (issue 705)
+  optional double at_ms = 7;        // the span is an event at this moment rather than a period (issue 737)
+  repeated PanelSegment segments = 8; // the periods the span is made of, in order, within it (issue 737)
+}
+
+// One period of a span made of several (issue 737).
+message PanelSegment {
+  double start_ms = 1;              // from the request's arrival
+  double duration_ms = 2;
+  string label = 3;
+  string detail = 4;
 }
 
 message PanelValue {

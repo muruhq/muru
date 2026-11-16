@@ -41,6 +41,57 @@
    that reads on the light and the dark background alike. */
 .panel tr.failed .bar { outline: 2px solid #e5484d; outline-offset: 1px; }
 .panel .failed-mark { color: #e5484d; font-weight: 700; }
+/* The spans table (issue 737). An event is a diamond at its moment, and
+   each of a panel's events draws a faint dashed line through every row's
+   track, darker while the pointer is over the event's row or it has
+   focus; its name is in italics. A span of several segments draws each
+   on its one line. */
+.panel .track .rule { position: absolute; top: -0.55rem; bottom: -0.75rem; width: 0; border-left: 1px dashed rgba(127, 127, 127, 0.3); pointer-events: none; }
+.panel .track .diamond { position: absolute; top: 50%; width: 0.6rem; height: 0.6rem; margin-left: -0.3rem; margin-top: -0.3rem; transform: rotate(45deg); background: #3f9c5a; }
+.panel tr.edge .diamond { background: #5b8def; }
+.panel tr.worker .diamond { background: #8a63d2; }
+.panel tr.contention .diamond { background: #d08a1e; }
+.panel tr.failed .diamond { outline: 2px solid #e5484d; outline-offset: 1px; }
+.panel .bar:focus-visible, .panel .diamond:focus-visible { outline: 2px solid #2f6fde; outline-offset: 2px; }
+.panel table.spans:has(tr.event-0:hover) .rule.event-0, .panel table.spans:has(tr.event-0:focus-within) .rule.event-0,
+.panel table.spans:has(tr.event-1:hover) .rule.event-1, .panel table.spans:has(tr.event-1:focus-within) .rule.event-1,
+.panel table.spans:has(tr.event-2:hover) .rule.event-2, .panel table.spans:has(tr.event-2:focus-within) .rule.event-2,
+.panel table.spans:has(tr.event-3:hover) .rule.event-3, .panel table.spans:has(tr.event-3:focus-within) .rule.event-3,
+.panel table.spans:has(tr.event-4:hover) .rule.event-4, .panel table.spans:has(tr.event-4:focus-within) .rule.event-4,
+.panel table.spans:has(tr.event-5:hover) .rule.event-5, .panel table.spans:has(tr.event-5:focus-within) .rule.event-5,
+.panel table.spans:has(tr.event-6:hover) .rule.event-6, .panel table.spans:has(tr.event-6:focus-within) .rule.event-6,
+.panel table.spans:has(tr.event-7:hover) .rule.event-7, .panel table.spans:has(tr.event-7:focus-within) .rule.event-7,
+.panel table.spans:has(tr.event-8:hover) .rule.event-8, .panel table.spans:has(tr.event-8:focus-within) .rule.event-8,
+.panel table.spans:has(tr.event-9:hover) .rule.event-9, .panel table.spans:has(tr.event-9:focus-within) .rule.event-9,
+.panel table.spans:has(tr.event-10:hover) .rule.event-10, .panel table.spans:has(tr.event-10:focus-within) .rule.event-10,
+.panel table.spans:has(tr.event-11:hover) .rule.event-11, .panel table.spans:has(tr.event-11:focus-within) .rule.event-11,
+.panel table.spans:has(tr.event-12:hover) .rule.event-12, .panel table.spans:has(tr.event-12:focus-within) .rule.event-12,
+.panel table.spans:has(tr.event-13:hover) .rule.event-13, .panel table.spans:has(tr.event-13:focus-within) .rule.event-13,
+.panel table.spans:has(tr.event-14:hover) .rule.event-14, .panel table.spans:has(tr.event-14:focus-within) .rule.event-14,
+.panel table.spans:has(tr.event-15:hover) .rule.event-15, .panel table.spans:has(tr.event-15:focus-within) .rule.event-15,
+.panel table.spans:has(tr.event-16:hover) .rule.event-16, .panel table.spans:has(tr.event-16:focus-within) .rule.event-16,
+.panel table.spans:has(tr.event-17:hover) .rule.event-17, .panel table.spans:has(tr.event-17:focus-within) .rule.event-17,
+.panel table.spans:has(tr.event-18:hover) .rule.event-18, .panel table.spans:has(tr.event-18:focus-within) .rule.event-18,
+.panel table.spans:has(tr.event-19:hover) .rule.event-19, .panel table.spans:has(tr.event-19:focus-within) .rule.event-19,
+.panel table.spans:has(tr.event-20:hover) .rule.event-20, .panel table.spans:has(tr.event-20:focus-within) .rule.event-20,
+.panel table.spans:has(tr.event-21:hover) .rule.event-21, .panel table.spans:has(tr.event-21:focus-within) .rule.event-21,
+.panel table.spans:has(tr.event-22:hover) .rule.event-22, .panel table.spans:has(tr.event-22:focus-within) .rule.event-22,
+.panel table.spans:has(tr.event-23:hover) .rule.event-23, .panel table.spans:has(tr.event-23:focus-within) .rule.event-23,
+.panel table.spans:has(tr.event-24:hover) .rule.event-24, .panel table.spans:has(tr.event-24:focus-within) .rule.event-24,
+.panel table.spans:has(tr.event-25:hover) .rule.event-25, .panel table.spans:has(tr.event-25:focus-within) .rule.event-25,
+.panel table.spans:has(tr.event-26:hover) .rule.event-26, .panel table.spans:has(tr.event-26:focus-within) .rule.event-26,
+.panel table.spans:has(tr.event-27:hover) .rule.event-27, .panel table.spans:has(tr.event-27:focus-within) .rule.event-27,
+.panel table.spans:has(tr.event-28:hover) .rule.event-28, .panel table.spans:has(tr.event-28:focus-within) .rule.event-28,
+.panel table.spans:has(tr.event-29:hover) .rule.event-29, .panel table.spans:has(tr.event-29:focus-within) .rule.event-29,
+.panel table.spans:has(tr.event-30:hover) .rule.event-30, .panel table.spans:has(tr.event-30:focus-within) .rule.event-30,
+.panel table.spans:has(tr.event-31:hover) .rule.event-31, .panel table.spans:has(tr.event-31:focus-within) .rule.event-31 { border-left-color: rgba(127, 127, 127, 0.95); }
+/* The one floating tooltip of the spans tables, outside any panel. */
+.muru-tip { position: fixed; z-index: 2147483647; max-width: 22rem; padding: 0.35rem 0.6rem; border-radius: 4px; background: #102a43; color: #f0f4f8; font: 12px/1.45 system-ui, sans-serif; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3); pointer-events: none; overflow-wrap: anywhere; }
+.muru-tip[hidden] { display: none; }
+.muru-tip strong { display: block; font-weight: 600; }
+@media (prefers-color-scheme: dark) {
+  .muru-tip { background: #f0f4f8; color: #102a43; }
+}
 .panel caption { text-align: left; font-weight: 600; padding: 0.6rem 0 0.25rem; }
 .panel dt { font-weight: 600; }
 .panel dd { margin: 0 0 0.4rem 1.2rem; }

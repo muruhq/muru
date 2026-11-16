@@ -33,6 +33,10 @@ struct Capture {
     panels_take: Py<PyAny>,
 }
 
+/// The most waits for the GIL, and stretches with the event loop held,
+/// a record carries one by one (issue 737); the rest are only counted.
+const STRETCHES_KEPT: usize = 64;
+
 /// Set once the edge has asked for a record, which it does only in a
 /// development run: until then the pool and the event loop's heartbeat
 /// keep nothing for one.
@@ -72,10 +76,12 @@ struct State {
     /// From the worker taking the request to a thread having it.
     thread_wait: Option<Duration>,
     /// The waits for the GIL on the request's behalf: their sum, how
-    /// many, and the first.
+    /// many, the first, and the first `STRETCHES_KEPT` of them as when
+    /// each began and how long it lasted.
     gil_wait: Duration,
     gil_waits: u32,
     gil_first: Option<Duration>,
+    gil_stretches: Vec<(Duration, Duration)>,
     /// Evidence captured of the request's failure, such as its stack at
     /// the soft timeout (issue 706).
     captures: Vec<pb::RecordCapture>,
@@ -147,25 +153,31 @@ impl Trace {
     /// An application thread took the request at `ready`, and then
     /// waited `waited` for the GIL.
     pub fn picked_up(&self, ready: Instant, waited: Duration) {
-        self.state()
-            .thread_wait
-            .get_or_insert(ready.saturating_duration_since(self.started));
-        self.gil(waited);
-    }
+        let at = ready.saturating_duration_since(self.started);
+        self.state().thread_wait.get_or_insert(at);
 
-    /// The request's thread, or the event loop on its behalf, waited
-    /// `waited` for the GIL. A build without one has no GIL wait.
-    pub fn gil(&self, waited: Duration) {
         if crate::signals::gil_enabled() {
-            self.add_gil(waited);
+            self.add_gil(at, waited);
         }
     }
 
-    fn add_gil(&self, waited: Duration) {
+    /// The request's thread, or the event loop on its behalf, has just
+    /// waited `waited` for the GIL. A build without one has no GIL wait.
+    pub fn gil(&self, waited: Duration) {
+        if crate::signals::gil_enabled() {
+            self.add_gil(self.at().saturating_sub(waited), waited);
+        }
+    }
+
+    fn add_gil(&self, at: Duration, waited: Duration) {
         let mut state = self.state();
         state.gil_wait += waited;
         state.gil_waits += 1;
         state.gil_first.get_or_insert(waited);
+
+        if state.gil_stretches.len() < STRETCHES_KEPT {
+            state.gil_stretches.push((at, waited));
+        }
     }
 
     /// The application called start_response; the first call counts.
@@ -253,12 +265,25 @@ impl Trace {
             (None, false) => ("completed", String::new()),
         };
 
-        // The collections that ended meanwhile, and the longest the event
-        // loop was held, which belong to the worker and not the request.
+        // The collections that ended meanwhile, and the stretches the
+        // event loop was held, the longest named on its own, which belong
+        // to the worker and not the request.
 
         let gc = gc_during(&self.gc_before, &crate::gc::totals());
-        let (loop_lag_at, loop_lag) = crate::link::loop_held(self.started, self.started + close)
+        let held = crate::link::loop_held(self.started, self.started + close, STRETCHES_KEPT);
+        let (loop_lag_at, loop_lag) = held
+            .iter()
+            .copied()
+            .max_by_key(|(_, length)| *length)
             .unwrap_or((Duration::ZERO, Duration::ZERO));
+        let stretches = |kept: &[(Duration, Duration)]| {
+            kept.iter()
+                .map(|(at, length)| pb::Stretch {
+                    at: millis(Some(*at)),
+                    ms: millis(Some(*length)),
+                })
+                .collect()
+        };
 
         let started_wall = self.started_wall;
         let lines = logs
@@ -320,6 +345,8 @@ impl Trace {
             gc,
             loop_lag: millis(Some(loop_lag)),
             loop_lag_at: millis(Some(loop_lag_at)),
+            gil_wait_stretches: stretches(&state.gil_stretches),
+            loop_held_stretches: stretches(&held),
         }
     }
 }
@@ -460,21 +487,28 @@ fn panels(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordPanel>> {
     Ok(panels)
 }
 
-/// Spans as `muru.panels._span` gives them: name, start, duration,
-/// category, the spans beneath, which may nest, and whether it failed.
+/// One span as `muru.panels._span` gives it: name, start, duration,
+/// category, the spans beneath, which may nest, whether it failed, the
+/// moment of an event, and its segments (issue 737).
+type TakenSpan<'py> = (
+    String,
+    f64,
+    f64,
+    String,
+    Bound<'py, PyAny>,
+    bool,
+    Option<f64>,
+    Vec<(f64, f64, String, String)>,
+);
+
+/// Spans as `muru.panels._span` gives them.
 fn spans(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordSpan>> {
     let mut spans = Vec::new();
 
     for item in taken.try_iter()? {
         let item = item?;
-        let (name, start, duration, category, children, failed): (
-            String,
-            f64,
-            f64,
-            String,
-            Bound<'_, PyAny>,
-            bool,
-        ) = item.extract()?;
+        let (name, start, duration, category, children, failed, at, segments): TakenSpan<'_> =
+            item.extract()?;
 
         spans.push(pb::RecordSpan {
             name,
@@ -483,6 +517,16 @@ fn spans(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordSpan>> {
             category,
             children: self::spans(&children)?,
             failed,
+            at,
+            segments: segments
+                .into_iter()
+                .map(|(start, duration, label, detail)| pb::RecordSegment {
+                    start,
+                    duration,
+                    label,
+                    detail,
+                })
+                .collect(),
         });
     }
 
@@ -563,13 +607,33 @@ mod tests {
         let started = Instant::now();
         let trace = Trace::new(started, "iterable");
         trace.state().thread_wait = Some(Duration::from_millis(3));
-        trace.add_gil(Duration::from_millis(2));
-        trace.add_gil(Duration::from_millis(1));
+        trace.add_gil(Duration::from_millis(3), Duration::from_millis(2));
+        trace.add_gil(Duration::from_millis(9), Duration::from_millis(1));
         let record = trace.to_message(false, Logs::default());
         assert!((record.thread_wait - 3.0).abs() < 1e-9);
         assert!((record.gil_wait - 3.0).abs() < 1e-9);
         assert_eq!(record.gil_waits, 2);
         assert!((record.gil_wait_first - 2.0).abs() < 1e-9);
+
+        // Each wait is kept as when it began and how long it lasted, up
+        // to the cap, past which the waits are only counted.
+
+        let waits: Vec<(f64, f64)> = record
+            .gil_wait_stretches
+            .iter()
+            .map(|wait| (wait.at, wait.ms))
+            .collect();
+        assert_eq!(waits, vec![(3.0, 2.0), (9.0, 1.0)]);
+
+        let many = Trace::new(started, "iterable");
+
+        for _ in 0..STRETCHES_KEPT + 5 {
+            many.add_gil(Duration::ZERO, Duration::from_millis(1));
+        }
+
+        let record = many.to_message(false, Logs::default());
+        assert_eq!(record.gil_waits as usize, STRETCHES_KEPT + 5);
+        assert_eq!(record.gil_wait_stretches.len(), STRETCHES_KEPT);
 
         // A thread that took the request later counts from the worker
         // taking it.

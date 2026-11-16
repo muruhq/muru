@@ -209,7 +209,8 @@ says how). Outside such a request every panel keeps nothing.
 | `active` | On every panel: whether it keeps anything for the request being served |
 | `now()`, `at(reading)` | On every panel: milliseconds on the request's clock, now or for a `time.perf_counter()` reading; 0 when it keeps nothing |
 | `add_dropped(count)` | On every panel: counts entries the code left out, shown with those past the limits |
-| `Span(name, start, duration, category="", children=[])` | A span, its times in milliseconds on the request's clock |
+| `Span(name, start=0.0, duration=0.0, category="", children=[], failed=False, at=None, segments=[])` | A span, its times in milliseconds on the request's clock: a period from `start` for `duration`, or an event at `at`, and a period may be made of `segments`; `Spans.add()` raises `ValueError` for one that is not well formed |
+| `Segment(start, duration, label="", detail="")` | One period of a span made of several, with a label and a line of detail for its tooltip |
 | `on_first_record(callback)` | Runs `callback` once, as the worker starts recording its first request |
 | `PANEL_LIMIT`, `REQUEST_LIMIT`, `TEXT_LIMIT` | 500 entries a panel keeps for a request, 2,000 a request keeps, 65,536 characters a text panel keeps |
 

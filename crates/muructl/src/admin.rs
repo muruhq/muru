@@ -2954,22 +2954,43 @@ fn request_text(record: &pb::RequestRecord) -> String {
         let _ = writeln!(text, "\n{}", panel.title);
 
         // Spans indented by depth, each with where it starts on the
-        // request's clock, and a failed one marked.
+        // request's clock, and a failed one marked: an event at its
+        // moment, and a span of several segments with their total and
+        // count (issue 737).
 
         let mut spans: Vec<(usize, &pb::PanelSpan)> =
             panel.spans.iter().rev().map(|span| (0, span)).collect();
         let mut lines = Vec::new();
 
         while let Some((depth, span)) = spans.pop() {
-            lines.push((
-                format!("{}{}", "  ".repeat(depth), span.name),
-                format!(
-                    "{}  from {}{}",
-                    millis(span.duration_ms),
-                    millis(span.start_ms),
-                    if span.failed { "  failed" } else { "" }
+            let failed = if span.failed { "  failed" } else { "" };
+
+            let shown = match (span.at_ms, span.segments.as_slice()) {
+                (Some(at), _) => format!("at {}{failed}", millis(at)),
+                (None, [only]) => format!(
+                    "{}  from {}{failed}",
+                    millis(only.duration_ms),
+                    millis(only.start_ms)
                 ),
-            ));
+                (None, [first, ..]) => format!(
+                    "{} in {} segments  from {}{failed}",
+                    millis(
+                        span.segments
+                            .iter()
+                            .map(|segment| segment.duration_ms)
+                            .sum()
+                    ),
+                    span.segments.len(),
+                    millis(first.start_ms)
+                ),
+                (None, []) => format!(
+                    "{}  from {}{failed}",
+                    millis(span.duration_ms),
+                    millis(span.start_ms)
+                ),
+            };
+
+            lines.push((format!("{}{}", "  ".repeat(depth), span.name), shown));
             spans.extend(span.children.iter().rev().map(|child| (depth + 1, child)));
         }
 
@@ -11139,7 +11160,7 @@ mod logs_list_tests {
     }
 
     #[test]
-    fn a_records_text_marks_a_failed_span() {
+    fn a_records_text_marks_a_failed_span_an_event_and_segments() {
         let span = |name: &str, failed: bool| pb::PanelSpan {
             name: name.to_owned(),
             start_ms: 1.0,
@@ -11147,11 +11168,27 @@ mod logs_list_tests {
             failed,
             ..Default::default()
         };
+        let segment = |start_ms: f64| pb::PanelSegment {
+            start_ms,
+            duration_ms: 0.5,
+            ..Default::default()
+        };
         let record = pb::RequestRecord {
             panels: vec![pb::Panel {
                 title: "Trace".to_owned(),
                 spans: vec![pb::PanelSpan {
-                    children: vec![span("SELECT 1", false), span("lookup", true)],
+                    children: vec![
+                        span("SELECT 1", false),
+                        span("lookup", true),
+                        pb::PanelSpan {
+                            at_ms: Some(2.5),
+                            ..span("response started", false)
+                        },
+                        pb::PanelSpan {
+                            segments: vec![segment(1.0), segment(2.0)],
+                            ..span("waiting", false)
+                        },
+                    ],
                     ..span("GET /books", true)
                 }],
                 ..Default::default()
@@ -11171,5 +11208,10 @@ mod logs_list_tests {
             "{text}"
         );
         assert!(lines[3].ends_with("from 1.0ms  failed"), "{text}");
+        assert!(lines[4].ends_with("  at 2.5ms"), "{text}");
+        assert!(
+            lines[5].ends_with("1.0ms in 2 segments  from 1.0ms"),
+            "{text}"
+        );
     }
 }

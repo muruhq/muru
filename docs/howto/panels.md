@@ -76,7 +76,7 @@ What each kind of panel takes:
 | --- | --- |
 | `ValuesPanel` | `panel[name] = value` sets a value, shown as text; setting it again replaces it |
 | `TablesPanel` | `panel.table(caption).add_row(cells)` adds a row, each cell shown as text |
-| `SpansPanel` | `panel.add(Span(name, start, duration, category, children, failed))` adds a span with those beneath it; `with panel.span(name, category=...)` times a block as one |
+| `SpansPanel` | `panel.add(Span(name, start, duration, category, children, failed, at, segments))` adds a span with those beneath it; `with panel.span(name, category=...)` times a block as one |
 | `TextPanel` | `panel.write(text)` adds a block of text, after a blank line when there is one before it |
 
 The add methods, `add_row()`, `add()` and `write()`, return whether the
@@ -113,12 +113,53 @@ steps.add(Span("query", start, steps.now() - start, "database"))
 
 `Span(..., failed=True)` marks a span added this way as failed.
 
-The toolbar draws each span as a bar on the request's timeline, coloured
-by its category, with those beneath it indented under it. A failed span
-keeps its category's colour, with a red outline on its bar, a ✕ beside
-its name and "failed" in its bar's tooltip; `muructl debug request`
-writes `failed` at the end of its line, and the record's JSON has
-`"failed": true` on it.
+A span can also be a moment rather than a period, an event, given by
+`at` in place of a start and a duration:
+
+```python
+steps.add(Span("cache warmed", at=steps.now(), category="cache"))
+```
+
+A period can be made of several segments, such as each wait for a lock
+during the request, each a `Segment` with its start and duration, and
+optionally a label and a line of detail for its tooltip. The segments
+are in order of their starts and lie within their span:
+
+```python
+from muru.panels import Segment, Span
+
+waits = [Segment(12.0, 3.5, "lock", "orders table"), Segment(40.0, 1.2, "lock")]
+steps.add(Span("waiting for locks", 12.0, 29.2, "contention", segments=waits))
+```
+
+A span is checked as it is added, and `add()` raises `ValueError` for an
+event with a start, a duration or segments of its own, or for segments
+out of order or outside their span.
+
+The toolbar draws each span as a row with a bar on the request's
+timeline, coloured by its category, with those beneath it indented
+under it:
+
+- An event is a diamond at its moment, with its name in italics, its
+  time under Starts and a dash under Takes, and a faint dashed line
+  through every row's bar, darker while the pointer is over its row.
+
+- A span of several segments draws each of them on its one line, with
+  "N segments" under Starts and their total under Takes. A span of a
+  single segment is drawn as an ordinary bar at that segment's start
+  and duration.
+
+- A failed span keeps its category's colour, with a red outline on its
+  bar, a ✕ beside its name and "failed" in its tooltip.
+
+Pointing at a bar, a segment or an event, giving it keyboard focus with
+Tab, or tapping it, shows its tooltip: its name, or a segment's label,
+when it starts, how long it takes, and a segment's detail.
+`muructl debug request` writes an event as `at` its time, a span of
+segments as their total and count, and `failed` at the end of a failed
+span's line. The record's JSON has `at_ms` on an event, `segments` on a
+span made of them, each with `start_ms`, `duration_ms`, `label` and
+`detail`, and `"failed": true` on a failed span.
 
 ### Text
 
@@ -144,8 +185,8 @@ they line up with the Timing panel's phases.
 ## Limits
 
 A panel keeps at most 500 entries for a request, and a request at most
-2,000 across its panels; a span counts once for itself and once for each
-span beneath it. A text panel keeps at most 65,536 characters. What is
+2,000 across its panels; a span counts once for itself, once for each of
+its segments and once for each span beneath it. A text panel keeps at most 65,536 characters. What is
 past a limit is not kept, and the panel says how many entries were not
 kept. Code that leaves entries out itself, to fit, can count them on the
 panel with `add_dropped(count)`, so the panel says so too.

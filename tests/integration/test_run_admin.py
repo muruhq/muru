@@ -452,7 +452,7 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
         text = muructl(runtime, "debug", "request", request_id, cwd=support.FIXTURES).stdout
         assert text.startswith("GET /?token=***&page=2 HTTP/1.1  200  "), text
         assert f"request {request_id}\n" in text
-        assert "\nTiming\n" in text and "    until the response head" in text
+        assert "\nTiming\n" in text and "    response head at the edge  at " in text
         assert "    cookie: ***" in text
 
         # The access log's JSON names the connection in every mode.
@@ -641,6 +641,8 @@ def test_a_blocked_event_loop_is_on_the_requests_record(runtime: Path) -> None:
         worker = found["from_worker"]
         assert worker["loop_lag"] >= 500, worker
         assert worker["loop_lag"] + worker["loop_lag_at"] <= worker["to_close"] + 1, worker
+        held = worker["loop_held_stretches"]
+        assert max(stretch["ms"] for stretch in held) == worker["loop_lag"], worker
         panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html").body.decode()
         assert ">event loop held</td>" in panel and "During the request" in panel
 
@@ -649,6 +651,7 @@ def test_a_blocked_event_loop_is_on_the_requests_record(runtime: Path) -> None:
 
         if support.workers_have_a_gil():
             assert worker["gil_waits"] >= 1, worker
+            assert len(worker["gil_wait_stretches"]) == min(worker["gil_waits"], 64), worker
         else:
             assert worker["gil_waits"] == 0 and ">waiting for the GIL</td>" not in panel
     finally:

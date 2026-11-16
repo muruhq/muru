@@ -47,6 +47,10 @@ const UPLOT_CSS: &[u8] = include_bytes!("../static/uPlot.min.css");
 const CHARTS_JS: &[u8] = include_bytes!("../static/charts.js");
 const TIMES_JS: &[u8] = include_bytes!("../static/times.js");
 
+/// The script for the tooltips of the panels' spans tables on the request
+/// page (issue 737), the one the toolbar carries, kept with the panels.
+const PANELS_JS: &[u8] = include_bytes!("../../muru-edge/panels/tips.js");
+
 /// A response body: whole, or a stream for Server-Sent Events.
 type Body = UnsyncBoxBody<Bytes, Infallible>;
 
@@ -845,6 +849,7 @@ fn asset_path(path: &str) -> Option<Response<Body>> {
         "/static/uplot.min.css" => asset(UPLOT_CSS, "text/css"),
         "/static/charts.js" => asset(CHARTS_JS, "text/javascript"),
         "/static/times.js" => asset(TIMES_JS, "text/javascript"),
+        "/static/panels.js" => asset(PANELS_JS, "text/javascript"),
         _ => return None,
     })
 }

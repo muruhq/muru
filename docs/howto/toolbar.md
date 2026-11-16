@@ -254,19 +254,25 @@ stands out in the rest, which [has a section of its own](#hints):
 
 - **Timing:** the request's phases from its arrival, each with when it
   started, how long it took and a bar placed where it falls in the
-  request:
+  request, and the moments that mark it, each in italics, with its time
+  under Starts, a dash under Takes, a diamond on its row and a faint
+  dashed line through every row, darker while the pointer is over the
+  moment's row:
 
   - **waiting for a worker**, until one was free to take the request;
-  - **until the response head**, from handing the request to the worker
-    until the response's status and headers came back;
-  - **in the worker**, the worker's own account of the same time, from
-    receiving the request: **until the response starts** (the
-    application calling `start_response` or sending
-    `http.response.start`), **producing the body** from its first byte
-    to its last, and **finishing**, until the body's `close()` returned
-    or the ASGI application returned;
-  - **sending the response**, from the head's arrival until the last
-    byte was sent to the client.
+
+  - **in the worker**, the worker's own account, from receiving the
+    request: **running the application**, from the end of the waits it
+    started with until the application called `start_response` or sent
+    `http.response.start`, the moment *response started*, **producing
+    the body** from its first byte to its last, and **finishing**, until
+    the body's `close()` returned or the ASGI application returned;
+
+  - *response head at the edge*, the moment the response's status and
+    headers came back from the worker;
+
+  - **sending the response**, from then until the last byte was sent to
+    the client.
 
   Under "in the worker", marked where they happened, are the waits that
   were not the request's own work:
@@ -274,20 +280,30 @@ stands out in the rest, which [has a section of its own](#hints):
   - **waiting for a thread**, from the worker taking a WSGI request
     until one of its threads started it;
 
-  - **waiting for the GIL**, as that thread, or the event loop for an
-    ASGI request, started running Python;
+  - **waiting for the GIL**, each time that thread, or the event loop
+    for an ASGI request, waited to run Python for the request, counting
+    the waits as an ASGI request's `receive()` calls were woken;
 
-  - **event loop held**, the longest stretch during the request in
-    which the worker's event loop did not get to run. It says the loop
-    was blocked, by this request or another one on it, not what blocked
-    it.
+  - **event loop held**, each stretch during the request in which the
+    worker's event loop did not get to run. It says the loop was
+    blocked, by this request or another one on it, not what blocked it.
+
+  A row of several waits or stretches draws each of them as a segment
+  on its one line, says how many under Starts and gives their total
+  under Takes; a row of one draws it as an ordinary bar. The first 64
+  waits for the GIL, and the 64 longest stretches with the loop held,
+  are drawn; the rest are counted.
+
+  Pointing at a bar, a segment or a moment, giving it keyboard focus
+  with Tab, or tapping it, shows what it is: its name, when it started,
+  how long it took, and for a segment which of the row's it is.
 
   A table under the waterfall, "During the request", gives the same
-  with what cannot be placed on it: the GIL wait in all with how many
-  waits there were, counting those as an ASGI request's `receive()`
-  calls were woken, and the garbage collections that ran while the
-  request was in the worker, how many and how long they took, by
-  generation. A collection pauses every thread of the worker, so it
+  with what cannot be placed on it: the GIL waits in all with how many
+  there were, the stretches with the loop held in all with how many
+  there were and the longest, and the garbage collections that ran
+  while the request was in the worker, how many and how long they took,
+  by generation. A collection pauses every thread of the worker, so it
   holds up whatever requests are in flight. On a free-threaded build
   there is no GIL, and no GIL wait is shown.
 
@@ -464,11 +480,15 @@ GET /orders/42 HTTP/1.1  500  2.0ms  at 10:42:07.123
 request 01JCZ8X4R3T5V6W7Y8Z9A0B1C2
 
 Timing
-  request                    2.0ms  from 0.0ms
-    waiting for a worker     0.0ms  from 0.0ms
-    until the response head  1.9ms  from 0.0ms
-    in the worker            1.8ms  from 0.0ms
-    sending the response     0.0ms  from 1.9ms
+  request                      2.0ms  from 0.0ms
+    waiting for a worker       0.0ms  from 0.0ms
+    in the worker              1.8ms  from 0.0ms
+      running the application  1.7ms  from 0.1ms
+      response started         at 1.8ms
+      producing the body       0.0ms  from 1.8ms
+      finishing                0.0ms  from 1.8ms
+    response head at the edge  at 1.9ms
+    sending the response       0.0ms  from 1.9ms
 
 Where
   application       shop@r3

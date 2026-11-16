@@ -634,7 +634,17 @@ pub fn worker(record: &mut admin::RequestRecord, part: muru_proto::worker::v1::W
         loop_lag: part.loop_lag,
         loop_lag_at: part.loop_lag_at,
         panels: part.panels.into_iter().map(panel).collect(),
+        gil_wait_stretches: part.gil_wait_stretches.into_iter().map(stretch).collect(),
+        loop_held_stretches: part.loop_held_stretches.into_iter().map(stretch).collect(),
     });
+}
+
+/// A stretch of the worker's part, on the worker's clock (issue 737).
+fn stretch(taken: muru_proto::worker::v1::Stretch) -> admin::Stretch {
+    admin::Stretch {
+        at_ms: taken.at,
+        ms: taken.ms,
+    }
 }
 
 /// A panel code in the worker added (issue 677), as the record
@@ -648,6 +658,17 @@ fn panel(panel: muru_proto::worker::v1::RecordPanel) -> admin::Panel {
             category: taken.category,
             children: taken.children.into_iter().map(span).collect(),
             failed: taken.failed,
+            at_ms: taken.at,
+            segments: taken
+                .segments
+                .into_iter()
+                .map(|segment| admin::PanelSegment {
+                    start_ms: segment.start,
+                    duration_ms: segment.duration.max(0.0),
+                    label: segment.label,
+                    detail: segment.detail,
+                })
+                .collect(),
         }
     }
 

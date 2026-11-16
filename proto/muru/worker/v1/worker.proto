@@ -218,6 +218,14 @@ message WorkerRecord {
   double loop_lag_at = 22;          // when that stretch began
   repeated RecordPanel panels = 23; // panels code in the worker added during the request (issue 677)
   repeated RecordCapture captures = 24; // evidence the worker captured, such as the stack at a soft timeout (issue 706)
+  repeated Stretch gil_wait_stretches = 25;  // each wait for the GIL, in order, the first 64 (issue 737)
+  repeated Stretch loop_held_stretches = 26; // each stretch of the request with the event loop held, in order, the longest 64 (issue 737)
+}
+
+// A stretch of a request's time, from when the worker took the request.
+message Stretch {
+  double at = 1;                    // when it began
+  double ms = 2;                    // how long it lasted
 }
 
 message RecordCapture {
@@ -248,6 +256,15 @@ message RecordSpan {
   string category = 4;
   repeated RecordSpan children = 5;
   bool failed = 6;                  // the operation failed (issue 705)
+  optional double at = 7;           // the span is an event at this moment rather than a period (issue 737)
+  repeated RecordSegment segments = 8; // the periods the span is made of, in order, within it (issue 737)
+}
+
+message RecordSegment {
+  double start = 1;                 // milliseconds from when the worker took the request
+  double duration = 2;
+  string label = 3;
+  string detail = 4;
 }
 
 message RecordValue {
