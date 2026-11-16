@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use muru_proto::admin::v1 as admin;
 use prost::Message as _;
@@ -33,6 +33,12 @@ pub const MAX_CAPTURES: usize = 8;
 
 /// The most other threads a capture keeps on each record it reaches.
 pub const MAX_CAPTURE_THREADS: usize = 32;
+
+/// Issue 715: the most captures kept for requests whose records have not
+/// opened yet, such as those still in flight on a worker killed while
+/// stopped, and how long each waits for its record.
+const MAX_WAITING: usize = 64;
+const WAITING_FOR: Duration = Duration::from_secs(120);
 
 /// Headers whose values are masked whatever they hold.
 const ALWAYS_MASKED: &[&str] = &[
@@ -104,6 +110,9 @@ struct Kept {
 struct Ring {
     kept: VecDeque<Kept>,
     bytes: usize,
+    /// Captures for requests whose records are not open yet, oldest
+    /// first, with when each was taken (issue 715).
+    waiting: VecDeque<(String, admin::RequestCapture, Instant)>,
 }
 
 /// The ring of request records.
@@ -138,6 +147,7 @@ impl Recorder {
             ring: Mutex::new(Ring {
                 kept: VecDeque::new(),
                 bytes: 0,
+                waiting: VecDeque::new(),
             }),
             capacity: capacity.max(1),
             max_bytes,
@@ -146,10 +156,30 @@ impl Recorder {
 
     /// Keep a record, dropping the oldest while the ring is over either
     /// bound, and give back its slot for the rest of it.
-    pub fn open(&self, record: admin::RequestRecord) -> Slot {
+    pub fn open(&self, mut record: admin::RequestRecord) -> Slot {
+        let mut ring = self.ring.lock().expect("recorder poisoned");
+
+        // Issue 715: a capture taken while the request was still in
+        // flight joins its record as it opens.
+
+        let now = Instant::now();
+        ring.waiting
+            .retain(|(_, _, at)| now.saturating_duration_since(*at) < WAITING_FOR);
+
+        while let Some(index) = ring
+            .waiting
+            .iter()
+            .position(|(request_id, _, _)| *request_id == record.request_id)
+        {
+            let (_, capture, _) = ring.waiting.remove(index).expect("found");
+
+            if record.captures.len() < MAX_CAPTURES {
+                record.captures.push(capture);
+            }
+        }
+
         let bytes = record.encoded_len();
         let slot = Arc::new(Mutex::new(record));
-        let mut ring = self.ring.lock().expect("recorder poisoned");
         ring.bytes += bytes;
         ring.kept.push_back(Kept {
             slot: Arc::clone(&slot),
@@ -237,10 +267,13 @@ impl Recorder {
     /// still kept (issue 706): the newest record under each ID, whatever
     /// its state, takes the capture with its own thread's stack as the
     /// request's, the worker's other threads beside it, and the IDs of
-    /// the other records it reached. Returns the IDs reached.
+    /// the other records it reached. A request with no record yet, still
+    /// in flight, takes it when its record opens (issue 715). Returns the
+    /// IDs reached, with those that wait.
     pub fn capture(&self, evidence: &Evidence) -> Vec<String> {
         let mut seen = HashSet::new();
         let mut reached: Vec<(String, Slot)> = Vec::new();
+        let mut later: Vec<String> = Vec::new();
 
         {
             let ring = self.ring.lock().expect("recorder poisoned");
@@ -258,13 +291,32 @@ impl Recorder {
                         == *request_id
                 });
 
-                if let Some(kept) = found {
-                    reached.push((request_id.clone(), Arc::clone(&kept.slot)));
+                match found {
+                    Some(kept) => reached.push((request_id.clone(), Arc::clone(&kept.slot))),
+                    None => later.push(request_id.clone()),
                 }
             }
         }
 
-        let ids: Vec<String> = reached.iter().map(|(id, _)| id.clone()).collect();
+        let ids: Vec<String> = reached
+            .iter()
+            .map(|(id, _)| id.clone())
+            .chain(later.iter().cloned())
+            .collect();
+
+        if !later.is_empty() {
+            let mut ring = self.ring.lock().expect("recorder poisoned");
+
+            for request_id in &later {
+                if ring.waiting.len() >= MAX_WAITING {
+                    ring.waiting.pop_front();
+                }
+
+                let capture = evidence.for_request(request_id, &ids);
+                ring.waiting
+                    .push_back((request_id.clone(), capture, Instant::now()));
+            }
+        }
 
         for (request_id, slot) in &reached {
             let capture = evidence.for_request(request_id, &ids);
@@ -870,7 +922,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
 
-        assert_eq!(recorder.capture(&evidence), ["A", "B"]);
+        assert_eq!(recorder.capture(&evidence), ["A", "B", "GONE"]);
 
         // Each record has its own thread's stack as the request's, the
         // others beside it, and the other record reached.
@@ -884,8 +936,30 @@ pub(crate) mod tests {
             .map(|thread| thread.name.as_str())
             .collect();
         assert_eq!(others, ["t2", "t3"]);
-        assert_eq!(found[0].related, ["B"]);
-        assert_eq!(recorder.get("B").unwrap().captures[0].related, ["A"]);
+        assert_eq!(found[0].related, ["B", "GONE"]);
+        assert_eq!(
+            recorder.get("B").unwrap().captures[0].related,
+            ["A", "GONE"]
+        );
+
+        // Issue 715: a request with no record yet, still in flight, takes
+        // the capture when its record opens, and only once.
+
+        recorder.open(admin::RequestRecord {
+            request_id: "GONE".to_owned(),
+            ..Default::default()
+        });
+        let late = recorder.get("GONE").unwrap().captures;
+        assert_eq!(late.len(), 1);
+        assert_eq!(
+            (late[0].stack.as_str(), late[0].related.clone()),
+            ("stack of t3", vec!["A".to_owned(), "B".to_owned()])
+        );
+        recorder.open(admin::RequestRecord {
+            request_id: "LATER".to_owned(),
+            ..Default::default()
+        });
+        assert!(recorder.get("LATER").unwrap().captures.is_empty());
 
         // At most MAX_CAPTURES on one record; a worker's own captures go
         // first when its part arrives.

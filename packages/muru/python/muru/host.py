@@ -1147,6 +1147,12 @@ class Replacement:
 
     evidence: dict[str, Any] | None = None
 
+    # Issue 715: the requests the worker gave up for the edge to answer,
+    # which it names from its native control thread, so they are known
+    # when it cannot answer for its stacks.
+
+    abandoned: list[str] = field(default_factory=list)
+
     # Section 9.3: a timeout kill is reported at the decision, as soon as
     # the replacement exists and the stacks asked for have been answered.
 
@@ -3845,7 +3851,7 @@ class Host:
             # the stuck code may hold for good.
 
             if abandon is not None:
-                self.abandon_requests(state, abandon)
+                self.abandon_requests(state, abandon, replacement)
 
             if kind == "worker.timeout_killed":
                 self.capture_stacks(state, replacement, self.report_timeout_kill)
@@ -3954,17 +3960,27 @@ class Host:
             evidence=replacement.evidence,
         )
 
-    def abandon_requests(self, state: WorkerState, args: dict[str, str]) -> None:
+    def abandon_requests(
+        self,
+        state: WorkerState,
+        args: dict[str, str],
+        replacement: Replacement | None = None,
+    ) -> None:
         """Have a condemned worker give up requests that cannot finish.
 
         The worker answers without its interpreter, which the stuck code
         may hold, and ends each request with the reason given, which the
-        edge turns into the client's error at once (section 7.6).
+        edge turns into the client's error at once (section 7.6). The IDs
+        it names go to the replacement's evidence (issue 715).
         """
 
         def answered(pending: Pending) -> None:
             answer = pending.answers.get(state.pid) or {}
             ids = answer.get("result", {}).get("abandoned", [])
+
+            if replacement is not None:
+                replacement.abandoned = [str(request_id) for request_id in ids]
+                self.complete_evidence(state, replacement)
 
             if ids:
                 log(
@@ -4156,6 +4172,7 @@ class Host:
 
         def settled() -> None:
             replacement.captured = True
+            self.complete_evidence(state, replacement)
 
             if then is not None:
                 then(replacement)
@@ -4235,6 +4252,34 @@ class Host:
             "requests": list(dict.fromkeys(requests)),
             "threads": [evidence_thread(thread) for thread in serving],
         }
+
+    def complete_evidence(self, state: WorkerState, replacement: Replacement) -> None:
+        """Give a timeout kill evidence that names the requests it gave up.
+
+        Issue 715: a worker that cannot answer for its stacks, such as one
+        whose thread holds the GIL in C, still named the requests it gave
+        up for the edge to answer, so each of their records takes the
+        capture, with the event's message, the worker, its pid and why.
+        Once the stacks are settled, the evidence carries those requests
+        too, after the ones the stacks named.
+        """
+
+        if not replacement.captured:
+            return
+
+        if replacement.evidence is None:
+            replacement.evidence = {
+                "worker": self.worker_name(state.index),
+                "pid": state.pid,
+                "reason": replacement.reason,
+                "requests": [],
+                "threads": [],
+            }
+
+        requests = replacement.evidence.setdefault("requests", [])
+        requests.extend(
+            request_id for request_id in replacement.abandoned if request_id not in requests
+        )
 
     def capture_objects(self, state: WorkerState, replacement: Replacement) -> None:
         """Count a worker's commonest objects before it is recycled for memory.

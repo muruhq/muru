@@ -16,6 +16,7 @@ import signal
 import threading
 import time
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 from support import server as support
@@ -38,6 +39,23 @@ def pid_serving(server: support.Server) -> int | None:
         return None
 
     return int(json.loads(response.body)["pid"])
+
+
+def kill_capture(server: support.Server, request_id: str) -> dict[str, Any]:
+    """The capture of a worker's kill in the record of `request_id`, once
+    it has one (issue 715)."""
+
+    deadline = time.monotonic() + 15
+
+    while True:
+        found = json.loads(server.get(f"/_muru/requests/{request_id}.json").body)
+        kills = [c for c in found.get("captures", []) if c["kind"] == "worker.timeout_killed"]
+
+        if kills:
+            return kills[0]
+
+        assert time.monotonic() < deadline, found
+        time.sleep(0.1)
 
 
 def start(gil_stall: str) -> support.Server:
@@ -94,6 +112,16 @@ def test_a_worker_holding_the_gil_is_replaced() -> None:
         assert answers[0].status == 502, answers[0].body
         assert json.loads(answers[0].body)["reason"] == "worker_stalled"
         assert "gave up 1 request for the edge to answer" in server.log()
+
+        # Issue 715: the worker could not answer for its stacks, but named
+        # the request it gave up, so its record has the kill.
+
+        request_id = answers[0].header("x-request-id")
+        assert request_id is not None
+        kill = kill_capture(server, request_id)
+        assert kill["worker"] == "0" and kill["pid"] == stuck, kill
+        assert "GIL stall timeout of 1 s" in kill["reason"], kill
+        assert "replaced by pid" in kill["message"], kill
         wait_for(lambda: pid_serving(server) not in (None, stuck))
         assert server.get("/sleep?seconds=0.1").status == 200
     finally:
@@ -106,6 +134,12 @@ def test_a_worker_that_stops_reporting_is_replaced() -> None:
     try:
         stopped = pid_serving(server)
         assert stopped is not None
+        answers: list[support.Response] = []
+        thread = threading.Thread(
+            target=lambda: answers.append(server.get("/sleep?seconds=30")), daemon=True
+        )
+        thread.start()
+        time.sleep(0.5)
         os.kill(stopped, signal.SIGSTOP)
 
         # A stopped process sends no report, from Python or outside it,
@@ -116,6 +150,17 @@ def test_a_worker_that_stops_reporting_is_replaced() -> None:
         assert "sent no report for" in log and "GIL stall timeout of 2 s" in log, log
         wait_for(lambda: pid_serving(server) not in (None, stopped))
         assert server.get("/").status == 200
+
+        # Issue 715: a worker stopped whole names nothing, so the request
+        # the edge still had in flight on it takes the kill.
+
+        thread.join(timeout=20)
+        assert answers, "the request on the stopped worker was not answered"
+        request_id = answers[0].header("x-request-id")
+        assert request_id is not None
+        kill = kill_capture(server, request_id)
+        assert kill["worker"] == "0" and kill["pid"] == stopped, kill
+        assert "sent no report for" in kill["reason"], kill
     finally:
         try:
             os.kill(stopped, signal.SIGCONT)

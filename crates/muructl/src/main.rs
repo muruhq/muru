@@ -4233,6 +4233,10 @@ async fn run_with(
 
     let pools = edge.pools();
     let drainer = edge.drainer();
+
+    // Issue 715: the requests in flight, for a killed worker's evidence.
+
+    let in_flight = edge.access_log();
     let mut serving = tokio::spawn(edge.run());
     let mut release = 1;
 
@@ -4328,8 +4332,12 @@ async fn run_with(
                         run_admin::count_worker_event(&label, &release, &kind, &group, &reason);
                         run_events.record(&kind, &format!("{label}@{release}"), &level, &message);
 
-                        if let (Some(evidence), Some(recorder)) = (&evidence, &recorder) {
-                            recorder.capture(evidence);
+                        if let (Some(mut evidence), Some(recorder)) = (evidence, &recorder) {
+                            if KILLS.contains(&kind.as_str()) {
+                                add_in_flight(&mut evidence, &group, &in_flight.requests());
+                            }
+
+                            recorder.capture(&evidence);
                         }
                     }
                     muru_controller::host::HostMessage::Capture(evidence) => {
@@ -4710,12 +4718,90 @@ fn describe(paths: &[PathBuf]) -> String {
     }
 }
 
+/// The events of a worker killed with its requests in flight.
+const KILLS: [&str; 2] = ["worker.timeout_killed", "worker.restarted"];
+
+/// Issue 715: a killed worker's evidence also names the requests the
+/// edge has in flight on it and not yet answered, which a worker frozen
+/// whole could not give up and cannot name. The worker is named as the
+/// host names it, its index in its group after the group's name and a
+/// slash outside the default group, as the edge counts it.
+fn add_in_flight(
+    evidence: &mut muru_edge::recorder::Evidence,
+    group: &str,
+    live: &[muru_edge::access::LiveRequest],
+) {
+    let within = evidence.worker.rsplit('/').next().unwrap_or_default();
+    let Ok(within) = within.parse::<usize>() else {
+        return;
+    };
+
+    let group = if group.is_empty() {
+        muru_edge::routing::DEFAULT_GROUP
+    } else {
+        group
+    };
+
+    for request in live {
+        if request.worker == Some(within)
+            && request.group == group
+            && !evidence.requests.contains(&request.request_id)
+        {
+            evidence.requests.push(request.request_id.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory as _;
     use clap::Parser as _;
 
     use super::Cli;
+
+    #[test]
+    fn a_killed_worker_s_evidence_takes_the_requests_in_flight_on_it() {
+        let live =
+            |request_id: &str, group: &str, worker: Option<usize>| muru_edge::access::LiveRequest {
+                request_id: request_id.to_owned(),
+                client: std::net::IpAddr::from([127, 0, 0, 1]),
+                app: "shop".to_owned(),
+                release: "r1".to_owned(),
+                group: group.to_owned(),
+                method: "GET".to_owned(),
+                target: "/".to_owned(),
+                started: std::time::SystemTime::now(),
+                age: std::time::Duration::ZERO,
+                running: worker.is_some(),
+                kind: "wsgi".to_owned(),
+                worker,
+                side: muru_edge::access::Side::Threads,
+            };
+        let requests = [
+            live("A", "default", Some(1)),
+            live("B", "default", Some(0)),
+            live("C", "reports", Some(1)),
+            live("D", "default", None),
+            live("E", "default", Some(1)),
+        ];
+
+        // Issue 715: worker 1 of the default group, which gave up A.
+
+        let mut evidence = muru_edge::recorder::Evidence {
+            worker: "1".to_owned(),
+            requests: vec!["A".to_owned()],
+            ..muru_edge::recorder::Evidence::default()
+        };
+        super::add_in_flight(&mut evidence, "default", &requests);
+        assert_eq!(evidence.requests, ["A", "E"]);
+
+        let mut evidence = muru_edge::recorder::Evidence {
+            worker: "reports/1".to_owned(),
+            ..muru_edge::recorder::Evidence::default()
+        };
+        super::add_in_flight(&mut evidence, "reports", &requests);
+        assert_eq!(evidence.requests, ["C"]);
+    }
 
     #[test]
     fn only_the_commands_that_serve_or_supervise_outlive_their_reader() {
