@@ -141,7 +141,7 @@ pub fn panel(record: &admin::RequestRecord, panels: &[admin::Panel]) -> admin::P
         name: "hints".to_owned(),
         title: "Hints".to_owned(),
         tables: vec![admin::PanelTable {
-            caption: "Hints".to_owned(),
+            caption: "What stands out".to_owned(),
             columns: ["hint", "panel", "figure"].map(str::to_owned).to_vec(),
             rows: hints
                 .into_iter()
@@ -424,7 +424,9 @@ mod tests {
     }
 
     fn hinted(record: &admin::RequestRecord, panels: &[admin::Panel]) -> Vec<Vec<String>> {
-        panel(record, panels).tables[0]
+        let drawn = panel(record, panels);
+        assert_eq!(drawn.tables[0].caption, "What stands out");
+        drawn.tables[0]
             .rows
             .iter()
             .map(|row| row.cells.clone())
