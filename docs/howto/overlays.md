@@ -197,9 +197,9 @@ application's: the share falls while the class keeps coming, and the
 overlay ends too soon. A rate limit keeps the requests it refuses in the
 application's figures. `muructl apply` warns about such an overlay.
 Resolve its condition on another signal, such as `upstream_healthy` for a
-database's health check upstream, or set `latch = true` and end the
-overlay by hand once `muructl overlay preview` shows the application
-healthy again.
+database's health check upstream, or set `latch = true`, which apply does
+not warn about, and end the overlay by hand once `muructl overlay
+preview` shows the application healthy again.
 
 An overlay on a condition can set capacity too, as in [capacity on a
 condition](scaling.md#capacity-on-a-condition).

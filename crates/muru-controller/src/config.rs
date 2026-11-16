@@ -2006,7 +2006,8 @@ fn plan_conditions(store: &Store, document: &Document, plan: &mut Plan) {
 /// static snapshot or another target in its place, so the figure goes
 /// unknown and the condition can never resolve the overlay by it. A route
 /// for a client class does the same to a term that picks that class out
-/// of the application's requests (issue 725).
+/// of the application's requests (issue 725). A latched overlay is ended
+/// by hand, not by its condition, so it is not warned about (issue 729).
 fn starved(
     name: &str,
     overlay: &Overlay,
@@ -2015,6 +2016,10 @@ fn starved(
     route_apps: &BTreeMap<String, String>,
 ) -> Vec<String> {
     use muru_config::condition::Kind;
+
+    if overlay.latch == Some(true) {
+        return Vec::new();
+    }
 
     // The applications the request terms read, each with the client
     // class the term picks out, when it does.
@@ -8430,6 +8435,10 @@ routes.root.client_routes.ai-crawler = { rate_limits = ['crawlers'] }
 
 [overlay.snapshot-all]
 routes.root = { target = { static = '/srv/snapshot' } }
+
+[overlay.snapshot-latched]
+routes.root = { target = { static = '/srv/snapshot' } }
+latch = true
 "#,
         )
         .unwrap();
@@ -8461,6 +8470,10 @@ routes.root = { target = { static = '/srv/snapshot' } }
 
         assert!(warn("snapshot-all", "errors")[0].contains("takes shop's traffic away"));
         assert_eq!(warn("snapshot-all", "crawler-surge").len(), 1);
+
+        // Issue 729: a latched overlay is ended by hand.
+
+        assert!(warn("snapshot-latched", "errors").is_empty());
     }
 
     #[test]
