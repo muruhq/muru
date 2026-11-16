@@ -146,6 +146,31 @@ def test_source_changes_start_a_new_release(project: Path) -> None:
         server.stop()
 
 
+def test_a_project_an_enclosing_repository_ignores_reloads(tmp_path: Path) -> None:
+    """Issue 723: a project in a directory the repository around it ignores
+    as a whole, with no repository of its own, still reloads."""
+
+    (tmp_path / ".git").mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / ".gitignore").write_text("*\n!.gitignore\n")
+    project = scratch / "shop"
+    project.mkdir()
+    write_app(project, "one")
+    server = support.start("reload_app:application", workers=1, chdir=project, args=["--reload"])
+
+    try:
+        assert server.wait_for_log("watching")
+        assert server.wait_for_log("is ignored by the repository around it"), server.log()
+        assert "so no change reloads the run" not in server.log()
+        server.mark_log()
+        time.sleep(1.1)
+        write_app(project, "two")
+        wait_for_version(server, "two")
+    finally:
+        server.stop()
+
+
 def test_files_outside_the_patterns_do_not_reload(project: Path) -> None:
     server = support.start(
         "reload_app:application",

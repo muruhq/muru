@@ -4188,6 +4188,12 @@ async fn run_with(
             .collect::<Vec<_>>()
             .join(", ");
 
+        // Issue 723: what an enclosing repository's ignore files would
+        // hide is said, and so is a watch with nothing to watch.
+
+        let own_rules = watch.ignored_by_enclosing().to_vec();
+        let empty = watch.holds_no_file();
+
         // The baseline is taken before the watch is announced, so any
         // change made after the line below is seen.
 
@@ -4196,6 +4202,21 @@ async fn run_with(
             "watching {watched} for changes to {}{except}",
             include.join(", ")
         );
+
+        for directory in &own_rules {
+            muru_common::muru_println!(
+                "{} is ignored by the repository around it, so only its own ignore files apply to it",
+                directory.display()
+            );
+        }
+
+        if empty {
+            muru_common::muru_println!(
+                "no file in {watched} matches {}, so no change reloads the run",
+                include.join(", ")
+            );
+        }
+
         tokio::spawn(watching);
     } else {
         drop(changed_tx);
