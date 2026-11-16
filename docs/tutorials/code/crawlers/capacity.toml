@@ -1,0 +1,5 @@
+[overlay.crawler-capacity]
+apps.shop = { min_workers = 3, scale_in = "hold" }
+trigger = { condition = "crawler-surge" }
+min_active = "20s"
+cooldown = "1m"

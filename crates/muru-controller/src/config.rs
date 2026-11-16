@@ -2004,7 +2004,10 @@ fn plan_conditions(store: &Store, document: &Document, plan: &mut Plan) {
 /// Section 9.10 (issue 689): a warning when an overlay sends the traffic of
 /// an application its condition's request signals read elsewhere, a
 /// static snapshot or another target in its place, so the figure goes
-/// unknown and the condition can never resolve the overlay by it.
+/// unknown and the condition can never resolve the overlay by it. A route
+/// for a client class does the same to a term that picks that class out
+/// of the application's requests (issue 725). A latched overlay is ended
+/// by hand, not by its condition, so it is not warned about (issue 729).
 fn starved(
     name: &str,
     overlay: &Overlay,
@@ -2014,32 +2017,55 @@ fn starved(
 ) -> Vec<String> {
     use muru_config::condition::Kind;
 
-    let read: BTreeSet<String> = std::iter::once(table.when.as_str())
+    if overlay.latch == Some(true) {
+        return Vec::new();
+    }
+
+    // The applications the request terms read, each with the client
+    // class the term picks out, when it does.
+
+    let read: BTreeSet<(String, Option<String>)> = std::iter::once(table.when.as_str())
         .chain(table.clear_when.as_deref())
         .filter_map(|text| muru_config::condition::parse(text).ok())
         .flat_map(|expr| {
             expr.terms()
                 .into_iter()
                 .filter(|term| term.signal.kind != Kind::Gauge)
-                .filter_map(|term| term.label("app").map(str::to_owned))
+                .filter_map(|term| {
+                    let app = term.label("app")?.to_owned();
+                    Some((app, term.label("client_class").map(str::to_owned)))
+                })
                 .collect::<Vec<_>>()
         })
         .collect();
+    let reads_app = |app: &str| read.iter().any(|(read_app, _)| read_app == app);
+    let reads_class = |app: &str, class: &str| {
+        read.iter()
+            .any(|(read_app, read_class)| read_app == app && read_class.as_deref() == Some(class))
+    };
+    let mut found = BTreeSet::new();
 
-    overlay
-        .routes
-        .iter()
-        .filter(|(_, change)| change.target.is_some())
-        .filter_map(|(route, _)| route_apps.get(route))
-        .filter(|app| read.contains(*app))
-        .map(|app| {
-            format!(
+    for (route, change) in &overlay.routes {
+        let Some(app) = route_apps.get(route) else {
+            continue;
+        };
+
+        if change.target.is_some() && reads_app(app) {
+            found.insert(format!(
                 "overlay {name} takes {app}'s traffic away from what condition {condition} reads, so the condition cannot see the application recover and may never resolve; resolve it on another signal, such as upstream_healthy, or set latch = true and end it by hand"
-            )
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+            ));
+        }
+
+        for (class, class_change) in change.client_routes.iter().flatten() {
+            if class_change.target.is_some() && reads_class(app, class) {
+                found.insert(format!(
+                    "overlay {name} takes {app}'s {class} requests away from what condition {condition} reads, so the condition sees none of them and may resolve while they keep coming; rate-limit the class instead, or read the class's share of every request, without app"
+                ));
+            }
+        }
+    }
+
+    found.into_iter().collect()
 }
 
 /// Section 9.10: the overlays a document declares, checked against the
@@ -2251,6 +2277,12 @@ fn plan_overlays(
     }
 
     plan.errors.extend(crate::overlays::conflicts(&all));
+
+    // Issue 712: a floor above a cap on the same group, which the cap wins
+    // while both are active.
+
+    plan.warnings
+        .extend(crate::overlays::floor_cap_conflicts(&all));
 }
 
 /// Section 7.5: the overlays the applications' `[[app.NAME.schedule]]`
@@ -8382,6 +8414,66 @@ mod tests {
         assert!(plan.errors[2].contains("is not a directory"));
         assert_eq!(plan.warnings.len(), 1);
         assert_eq!(plan.changes.len(), 1, "the app is still created");
+    }
+
+    #[test]
+    fn an_overlay_that_takes_away_what_its_condition_reads_is_a_warning() {
+        let document = Document::parse(
+            r#"
+[condition.crawler-surge]
+when = "request_share{app='shop',client_class='ai-crawler'} > 0.3"
+clear_when = "request_share{app='shop',client_class='ai-crawler'} < 0.1"
+
+[condition.errors]
+when = "error_rate{app='shop'} > 0.2"
+
+[overlay.snapshot-crawlers]
+routes.root.client_routes.ai-crawler = { target = { static = '/srv/snapshot' } }
+
+[overlay.limit-crawlers]
+routes.root.client_routes.ai-crawler = { rate_limits = ['crawlers'] }
+
+[overlay.snapshot-all]
+routes.root = { target = { static = '/srv/snapshot' } }
+
+[overlay.snapshot-latched]
+routes.root = { target = { static = '/srv/snapshot' } }
+latch = true
+"#,
+        )
+        .unwrap();
+        let routes = BTreeMap::from([("root".to_owned(), "shop".to_owned())]);
+        let warn = |overlay: &str, condition: &str| {
+            starved(
+                overlay,
+                &document.overlay[overlay],
+                condition,
+                &document.condition[condition],
+                &routes,
+            )
+        };
+
+        // Issue 725: a class's route to a snapshot starves a term that
+        // picks the class out, but not one over all the requests, and a
+        // rate limit starves nothing.
+
+        let snapshot = warn("snapshot-crawlers", "crawler-surge");
+        assert_eq!(snapshot.len(), 1);
+        assert!(
+            snapshot[0].contains("takes shop's ai-crawler requests away"),
+            "{snapshot:?}"
+        );
+        assert!(warn("snapshot-crawlers", "errors").is_empty());
+        assert!(warn("limit-crawlers", "crawler-surge").is_empty());
+
+        // The route's own target starves every term of the application.
+
+        assert!(warn("snapshot-all", "errors")[0].contains("takes shop's traffic away"));
+        assert_eq!(warn("snapshot-all", "crawler-surge").len(), 1);
+
+        // Issue 729: a latched overlay is ended by hand.
+
+        assert!(warn("snapshot-latched", "errors").is_empty());
     }
 
     #[test]

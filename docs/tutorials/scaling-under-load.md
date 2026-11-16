@@ -238,3 +238,6 @@ muructl daemon stop --shutdown
 
 - [Process models](../explanation/process-models.md) explains processes,
   threads and the GIL, behind the diagnosis lines.
+
+- [Responding to traffic](responding-to-traffic.md) lets a condition on
+  the traffic change rate limits and capacity while it lasts.

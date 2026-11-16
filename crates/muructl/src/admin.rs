@@ -348,7 +348,8 @@ fn may_not_enter(path: &Path) -> bool {
 
 /// The rest of discovery (design specification section 13.8), once there
 /// is no usable serve: a development run whose project is the current
-/// directory, then one started from it, the daemon's socket when it
+/// directory, then one started from it, the newest of several, with a
+/// note naming the others, the daemon's socket when it
 /// listens, then the one run listening. With nothing there, the socket
 /// of a run directory this user may not enter when there is one, so the
 /// permission error is reported, or the daemon's. When the daemon is
@@ -360,17 +361,50 @@ fn discovered(
     daemon_listening: bool,
     denied: Option<PathBuf>,
 ) -> anyhow::Result<Discovery> {
-    let project = runs
+    // The runs whose project is this directory, else those started from
+    // it; of several, the newest (issue 714), with a note naming the
+    // others and how to reach them.
+
+    let mut mine: Vec<&crate::run_admin::RunInfo> = runs
         .iter()
-        .find(|run| here.is_some_and(|here| run.project == here));
+        .filter(|run| here.is_some_and(|here| run.project == here))
+        .collect();
 
-    let started = || {
-        runs.iter()
-            .find(|run| here.is_some() && run.started_from.as_deref() == here)
-    };
+    if mine.is_empty() {
+        mine = runs
+            .iter()
+            .filter(|run| here.is_some() && run.started_from.as_deref() == here)
+            .collect();
+    }
 
-    if let Some(run) = project.or_else(started) {
-        return Ok(Discovery::quiet(run.socket.clone()));
+    mine.sort_by_key(|run| run.started_unix_ms);
+
+    if let Some((newest, others)) = mine.split_last() {
+        let note = (!others.is_empty()).then(|| {
+            format!(
+                "{} development runs of this project are listening; reaching the newest, {} on \
+                 http://{}; pass --socket to reach another: {}",
+                mine.len(),
+                newest.app,
+                newest.listen,
+                others
+                    .iter()
+                    .rev()
+                    .map(|run| format!(
+                        "{} on http://{} (--socket {})",
+                        run.app,
+                        run.listen,
+                        run.socket.display()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+
+        return Ok(Discovery {
+            socket: newest.socket.clone(),
+            note,
+        });
     }
 
     if daemon_listening {
@@ -4305,6 +4339,7 @@ pub enum RolloutCommand {
 /// `scale status` for the autoscaler's state (sections 7.3 and 7.4).
 #[derive(Args, Clone)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+#[command(group = clap::ArgGroup::new("temporary").args(["min_workers", "cap_workers"]))]
 pub struct ScaleArgs {
     #[command(subcommand)]
     pub command: Option<ScaleCommand>,
@@ -4336,17 +4371,29 @@ pub struct ScaleArgs {
     #[arg(long = "max", value_name = "COUNT", requires = "min_workers")]
     max_workers: Option<u32>,
 
-    /// When the floor ends, such as 2026-11-30T23:59 or an RFC 3339 time.
+    /// Allow at most this many workers until --until or for --for,
+    /// whatever the policy, a floor and the autoscaler say; the excess
+    /// drains at once.
+    #[arg(long = "cap", value_name = "COUNT", conflicts_with_all = ["processes", "unpin", "min_workers"])]
+    cap_workers: Option<u32>,
+
+    /// With --cap, return at once rather than waiting until the group is
+    /// at or under the cap.
+    #[arg(long, requires = "cap_workers")]
+    no_wait: bool,
+
+    /// When the floor or the cap ends, such as 2026-11-30T23:59 or an
+    /// RFC 3339 time.
     #[arg(
         long,
         value_name = "TIME",
-        requires = "min_workers",
+        requires = "temporary",
         conflicts_with = "duration"
     )]
     until: Option<String>,
 
-    /// How long the floor lasts, such as 4h.
-    #[arg(long = "for", value_name = "DURATION", value_parser = muru_config::parse_duration, requires = "min_workers")]
+    /// How long the floor or the cap lasts, such as 4h.
+    #[arg(long = "for", value_name = "DURATION", value_parser = muru_config::parse_duration, requires = "temporary")]
     duration: Option<Duration>,
 
     /// The time zone --until is in; the local zone without it.
@@ -4640,9 +4687,13 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
     let target = args.target.unwrap_or_default();
     let (app, release) = split_target(&target)?;
 
-    if args.processes.is_none() && !args.unpin && args.min_workers.is_none() {
+    if args.processes.is_none()
+        && !args.unpin
+        && args.min_workers.is_none()
+        && args.cap_workers.is_none()
+    {
         anyhow::bail!(
-            "give --processes COUNT to pin the group, --unpin, or --min COUNT with --until or --for; `scale status` shows the state"
+            "give --processes COUNT to pin the group, --unpin, or --min COUNT or --cap COUNT with --until or --for; `scale status` shows the state"
         );
     }
 
@@ -4653,6 +4704,9 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
         (None, Some(duration)) => now_unix_ms() + duration.as_millis() as u64,
         (None, None) if args.min_workers.is_some() => {
             anyhow::bail!("--min needs --until TIME or --for DURATION")
+        }
+        (None, None) if args.cap_workers.is_some() => {
+            anyhow::bail!("--cap needs --until TIME or --for DURATION")
         }
         (None, None) => 0,
     };
@@ -4667,6 +4721,7 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
             unpin: args.unpin,
             min_workers: args.min_workers,
             max_workers: args.max_workers,
+            cap_workers: args.cap_workers,
             until_unix_ms,
         })
         .await
@@ -4686,6 +4741,21 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Some(cap) = args.cap_workers {
+        println!(
+            "muru: {app} {} capped at {} until {}",
+            args.group,
+            count_workers(cap),
+            format_time(until_unix_ms)
+        );
+
+        if !args.no_wait {
+            wait_for_cap(&mut client, app, &args.group, cap).await?;
+        }
+
+        return Ok(());
+    }
+
     match args.processes {
         Some(count) => println!(
             "muru: {}@{} {} pinned to {count} workers",
@@ -4698,6 +4768,79 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// "1 worker" or "N workers".
+fn count_workers(count: u32) -> String {
+    if count == 1 {
+        "1 worker".to_owned()
+    } else {
+        format!("{count} workers")
+    }
+}
+
+/// Issue 712: wait until the serving release's group is at or under a
+/// cap just set, polling its status, and say so. A pinned or advisory
+/// group keeps its count, so that is said instead of waiting. The
+/// autoscaler takes the cap at its next tick, so a status without it
+/// is waited through for a few seconds before the cap counts as gone.
+async fn wait_for_cap(
+    client: &mut pb::admin_client::AdminClient<tonic::transport::Channel>,
+    app: &str,
+    group: &str,
+    cap: u32,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+
+    loop {
+        let status = client
+            .get_scale_status(pb::GetScaleStatusRequest {
+                app: app.to_owned(),
+                release: String::new(),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner();
+        let Some(found) = status.groups.iter().find(|found| found.group == group) else {
+            anyhow::bail!("{app}@{} has no worker group named {group}", status.release);
+        };
+
+        if found.pinned {
+            println!(
+                "muru: {app}@{} {group} is pinned to {}, which the cap leaves as it is until --unpin",
+                status.release,
+                count_workers(found.desired)
+            );
+            return Ok(());
+        }
+
+        if found.advisory {
+            println!(
+                "muru: {app}@{} {group} has an advisory policy, which reports the cap without acting on it",
+                status.release
+            );
+            return Ok(());
+        }
+
+        // A canary's share of the cap is what its release is held to.
+
+        let held = if found.cap > 0 { found.cap } else { cap };
+
+        if found.ready <= held && found.desired <= held {
+            println!("muru: {app} {group} is at {}", count_workers(found.ready));
+            return Ok(());
+        }
+
+        if found.cap == 0 && started.elapsed() > Duration::from_secs(5) {
+            println!(
+                "muru: {app} {group} is no longer capped, with {}",
+                count_workers(found.ready)
+            );
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// An application, or app@release; an empty release means the serving one.
@@ -4765,6 +4908,16 @@ fn print_scale_status(status: &pb::ScaleStatus) {
                     ""
                 },
                 group.capacity_from.join(", ")
+            );
+        }
+
+        // Issue 712: a cap in force, and what sets it.
+
+        if group.cap > 0 {
+            println!(
+                "  capped: at most {} from {}",
+                count_workers(group.cap),
+                group.cap_from.join(", ")
             );
         }
 
@@ -5338,10 +5491,18 @@ pub async fn condition(command: ConditionCommand) -> anyhow::Result<()> {
         );
 
         for condition in &answer.conditions {
+            // Issue 727: one waiting out `for` to fire is pending.
+
+            let state = if condition.pending_since_unix_ms > 0 && condition.state != "firing" {
+                "pending"
+            } else {
+                condition.state.as_str()
+            };
+
             println!(
                 "{:<width$} {:<9} {:<21} {}",
                 condition.name,
-                condition.state,
+                state,
                 condition_since(condition),
                 condition.when
             );
@@ -5391,10 +5552,30 @@ fn condition_since(condition: &pb::ConditionStatus) -> String {
     }
 }
 
-/// A condition's state in words: unknown says why and what it holds.
+/// A condition's state in words: unknown says why and what it holds,
+/// and one waiting out `for` or `clear_for` says how long it has waited
+/// (issue 727).
 fn condition_state(condition: &pb::ConditionStatus) -> String {
+    let wait = condition_wait(condition, now_unix_ms());
+
     if condition.state != "unknown" {
-        return format!("{} since {}", condition.state, condition_since(condition));
+        let state = format!("{} since {}", condition.state, condition_since(condition));
+
+        return match wait {
+            Some(wait) if condition.state == "firing" => format!("{state}; {wait}"),
+            Some(wait) => format!("pending: {wait}; {state}"),
+            None => state,
+        };
+    }
+
+    // Before its first change, a condition whose `when` holds from its
+    // first figure has no state to show, only its wait.
+
+    if condition.unknown.is_empty() {
+        return match wait {
+            Some(wait) => format!("pending: {wait}"),
+            None => "unknown: no state yet".to_owned(),
+        };
     }
 
     if condition.held == "unknown" {
@@ -5407,6 +5588,35 @@ fn condition_state(condition: &pb::ConditionStatus) -> String {
             condition.unknown
         )
     }
+}
+
+/// How long the expression a condition waits on has held, against the
+/// wait it needs, as `when has held for 4s of 10s`; none when it is not
+/// waiting.
+fn condition_wait(condition: &pb::ConditionStatus, now_unix_ms: u64) -> Option<String> {
+    if condition.pending_since_unix_ms == 0 {
+        return None;
+    }
+
+    let held =
+        Duration::from_secs(now_unix_ms.saturating_sub(condition.pending_since_unix_ms) / 1000);
+    let firing = condition.state == "firing" || condition.held == "firing";
+
+    let (what, needed) = match (firing, condition.clear_when.is_empty()) {
+        (false, _) => ("when has held", &condition.r#for),
+        (true, false) => ("clear_when has held", &condition.clear_for),
+        (true, true) => ("when has been false", &condition.clear_for),
+    };
+
+    let needed = if needed.is_empty() { "0s" } else { needed };
+
+    let held = if held.is_zero() {
+        "0s".to_owned()
+    } else {
+        muru_config::format_duration(held)
+    };
+
+    Some(format!("{what} for {held} of {needed}"))
 }
 
 /// A figure to four significant digits.
@@ -5619,42 +5829,69 @@ async fn list_overlays(socket: &SocketArgs, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<24} {:<10} {:<34} CHANGES",
-        "OVERLAY", "STATE", "TRIGGER"
-    );
-
-    for overlay in overlays {
-        let mut state = if overlay.state.is_empty() {
-            "idle".to_owned()
-        } else if overlay.active {
-            format!("active ({})", overlay.state)
-        } else {
-            overlay.state.clone()
-        };
-
-        if overlay.until_unix_ms > 0 {
-            state.push_str(&format!(" until {}", format_time(overlay.until_unix_ms)));
-        } else if overlay.starts_unix_ms > 0 {
-            state.push_str(&format!(" from {}", format_time(overlay.starts_unix_ms)));
-        }
-
-        let trigger = if overlay.condition.is_empty() {
-            overlay.trigger.clone()
-        } else {
-            format!("{}, {}", overlay.trigger, overlay.condition_state)
-        };
-
-        println!(
-            "{:<24} {:<10} {:<34} {}",
-            overlay.name,
-            state,
-            trigger,
-            overlay.changes.join(", ")
-        );
+    for line in overlay_table(&overlays) {
+        println!("{line}");
     }
 
     Ok(())
+}
+
+/// The lines of `muructl overlay list`: each column as wide as its widest
+/// value, and no narrower than it always was (issue 728).
+fn overlay_table(overlays: &[pb::OverlayInfo]) -> Vec<String> {
+    let rows: Vec<[String; 4]> = overlays.iter().map(overlay_row).collect();
+    let width = |column: usize, least: usize| {
+        rows.iter()
+            .map(|row| row[column].len())
+            .max()
+            .unwrap_or(0)
+            .max(least)
+    };
+    let (name, state, trigger) = (width(0, 24), width(1, 10), width(2, 34));
+    let mut lines = vec![format!(
+        "{:<name$} {:<state$} {:<trigger$} CHANGES",
+        "OVERLAY", "STATE", "TRIGGER"
+    )];
+
+    for row in &rows {
+        lines.push(format!(
+            "{:<name$} {:<state$} {:<trigger$} {}",
+            row[0], row[1], row[2], row[3]
+        ));
+    }
+
+    lines
+}
+
+/// An overlay's row in `muructl overlay list`: its name, its state, its
+/// trigger with its condition's state, and what it changes.
+fn overlay_row(overlay: &pb::OverlayInfo) -> [String; 4] {
+    let mut state = if overlay.state.is_empty() {
+        "idle".to_owned()
+    } else if overlay.active {
+        format!("active ({})", overlay.state)
+    } else {
+        overlay.state.clone()
+    };
+
+    if overlay.until_unix_ms > 0 {
+        state.push_str(&format!(" until {}", format_time(overlay.until_unix_ms)));
+    } else if overlay.starts_unix_ms > 0 {
+        state.push_str(&format!(" from {}", format_time(overlay.starts_unix_ms)));
+    }
+
+    let trigger = if overlay.condition.is_empty() {
+        overlay.trigger.clone()
+    } else {
+        format!("{}, {}", overlay.trigger, overlay.condition_state)
+    };
+
+    [
+        overlay.name.clone(),
+        state,
+        trigger,
+        overlay.changes.join(", "),
+    ]
 }
 
 /// The `muructl maintenance` subcommands (section 4.12).
@@ -10351,9 +10588,77 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 
 #[cfg(test)]
 mod tests {
+    use super::condition_wait;
     use super::limits_lines;
     use super::metric_samples;
+    use super::overlay_table;
     use super::pb;
+
+    #[test]
+    fn a_condition_waiting_out_its_for_says_how_long() {
+        let mut condition = pb::ConditionStatus {
+            state: "unknown".to_owned(),
+            held: "unknown".to_owned(),
+            r#for: "10s".to_owned(),
+            clear_when: "x < 1".to_owned(),
+            clear_for: "1m".to_owned(),
+            pending_since_unix_ms: 100_000,
+            ..pb::ConditionStatus::default()
+        };
+        assert_eq!(
+            condition_wait(&condition, 104_500).as_deref(),
+            Some("when has held for 4s of 10s")
+        );
+
+        condition.state = "firing".to_owned();
+        assert_eq!(
+            condition_wait(&condition, 130_000).as_deref(),
+            Some("clear_when has held for 30s of 1m")
+        );
+
+        condition.clear_when.clear();
+        assert_eq!(
+            condition_wait(&condition, 130_000).as_deref(),
+            Some("when has been false for 30s of 1m")
+        );
+
+        assert_eq!(
+            condition_wait(&condition, 100_200).as_deref(),
+            Some("when has been false for 0s of 1m")
+        );
+
+        condition.pending_since_unix_ms = 0;
+        assert_eq!(condition_wait(&condition, 130_000), None);
+    }
+
+    #[test]
+    fn the_overlay_list_lines_up_however_long_a_state_is() {
+        let overlays = [
+            pb::OverlayInfo {
+                name: "crawler-limits".to_owned(),
+                active: true,
+                state: "condition".to_owned(),
+                trigger: "condition crawler-surge".to_owned(),
+                condition: "crawler-surge".to_owned(),
+                condition_state: "firing".to_owned(),
+                changes: vec!["route shop".to_owned()],
+                ..pb::OverlayInfo::default()
+            },
+            pb::OverlayInfo {
+                name: "nightly".to_owned(),
+                trigger: "cron '0 2 * * *' for 1h UTC".to_owned(),
+                changes: vec!["route shop".to_owned()],
+                ..pb::OverlayInfo::default()
+            },
+        ];
+        let lines = overlay_table(&overlays);
+        let changes = lines[0].find("CHANGES").unwrap();
+        assert!(lines[1].starts_with("crawler-limits           active (condition) condition"));
+
+        for line in &lines[1..] {
+            assert_eq!(line.find("route shop"), Some(changes), "{lines:#?}");
+        }
+    }
 
     #[test]
     fn the_limits_are_printed_as_the_guide_shows_them() {
@@ -10396,6 +10701,7 @@ mod tests {
             listen: "127.0.0.1:8080".to_owned(),
             socket: PathBuf::from(socket),
             runtime: Vec::new(),
+            started_unix_ms: 0,
         };
         let daemon = PathBuf::from("/user/admin.sock");
         let denied = PathBuf::from("/run/muru/admin.sock");
@@ -10427,6 +10733,60 @@ mod tests {
     }
 
     #[test]
+    fn discovery_reaches_the_newest_of_several_runs_of_a_project_and_names_the_others() {
+        use std::path::{Path, PathBuf};
+
+        use crate::run_admin::RunInfo;
+
+        let run = |port: u16, started_unix_ms: u64| RunInfo {
+            pid: 1,
+            app: "shop".to_owned(),
+            project: PathBuf::from("/work/shop"),
+            started_from: None,
+            listen: format!("127.0.0.1:{port}"),
+            socket: PathBuf::from(format!("/user/runs/{port}/admin.sock")),
+            runtime: Vec::new(),
+            started_unix_ms,
+        };
+
+        // Listed by port, the older run on the lower one.
+
+        let runs = [run(8080, 1_000), run(8090, 2_000)];
+        let found = super::discovered(
+            &runs,
+            Some(Path::new("/work/shop")),
+            PathBuf::from("/user/admin.sock"),
+            true,
+            None,
+        )
+        .expect("found");
+        assert_eq!(found.socket, runs[1].socket);
+        let note = found.note.expect("a note");
+        assert!(
+            note.starts_with(
+                "2 development runs of this project are listening; reaching the newest, shop on http://127.0.0.1:8090;"
+            ),
+            "{note}"
+        );
+        assert!(
+            note.contains("shop on http://127.0.0.1:8080 (--socket /user/runs/8080/admin.sock)"),
+            "{note}"
+        );
+
+        // One run is reached quietly.
+
+        let one = super::discovered(
+            &runs[..1],
+            Some(Path::new("/work/shop")),
+            PathBuf::from("/user/admin.sock"),
+            true,
+            None,
+        )
+        .expect("found");
+        assert_eq!((one.socket, one.note), (runs[0].socket.clone(), None));
+    }
+
+    #[test]
     fn discovery_finds_a_run_from_where_it_was_started_and_says_when_the_daemon_wins() {
         use std::path::{Path, PathBuf};
 
@@ -10440,6 +10800,7 @@ mod tests {
             listen: "127.0.0.1:18380".to_owned(),
             socket: PathBuf::from("/user/runs/18380/admin.sock"),
             runtime: Vec::new(),
+            started_unix_ms: 0,
         };
         let other = RunInfo {
             app: "api".to_owned(),

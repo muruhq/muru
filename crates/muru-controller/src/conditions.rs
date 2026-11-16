@@ -84,6 +84,9 @@ pub struct Status {
     pub since_unix_ms: u64,
     /// Why it is unknown, when it is.
     pub unknown: Option<String>,
+    /// Since when the expression it waits on has held, Unix
+    /// milliseconds, while it waits out `for` or `clear_for` (issue 727).
+    pub pending_since_unix_ms: Option<u64>,
     /// Each term of `when`, then of `clear_when`, with its figure now.
     pub terms: Vec<(String, Value)>,
 }
@@ -235,6 +238,7 @@ impl Engine {
                     held,
                     since_unix_ms: tracked.since_unix_ms,
                     unknown: tracked.unknown.clone(),
+                    pending_since_unix_ms: tracked.pending.map(|since| since * 1000),
                     terms: tracked.terms.clone(),
                 }
             })

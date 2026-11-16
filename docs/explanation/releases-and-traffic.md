@@ -202,7 +202,8 @@ a rollout under way holds its step. Rolling back is never frozen.
 What `muructl apply` reads and `muructl config export` writes is the
 declared state: applications, their releases, routes with their traffic
 policies, client classes and overlays. A rollout's current share, a pin
-set with `muructl scale`, and a temporary floor from `scale --min` are
+set with `muructl scale`, and a temporary floor or cap from `scale --min`
+or `scale --cap` are
 live state, kept by the daemon and left out of the export, so applying
 a file does not undo a rollout in progress. `config export
 --resolve-rollouts` writes a rollout as it stands, as a candidate

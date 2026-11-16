@@ -93,7 +93,13 @@ ceiling, and several things can change them for a while:
 - **A rollout or a split** gives each release its share of the floor,
   rounded up, so a canary at 10% does not hold a full floor of workers.
 
-- **`muructl scale --min`** sets a temporary floor, until a time.
+- **A cap**, `cap_workers` in an overlay or a schedule, holds the group
+  at or under a count, whatever the autoscaler wants, such as to take
+  load off a struggling database or to make room on the node. It wins
+  over a floor, and a group above it drains the excess at once.
+
+- **`muructl scale --min`** sets a temporary floor, until a time, and
+  **`muructl scale --cap`** a temporary cap.
 
 - **A pin**, `muructl scale --processes`, fixes the count and the
   autoscaler stops deciding for the group until it is unpinned.

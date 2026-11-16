@@ -1,0 +1,6 @@
+[condition.crawler-surge]
+when = "request_share{app='shop',client_class='ai-crawler'}[10s] > 0.5"
+for = "10s"
+clear_when = "request_share{app='shop',client_class='ai-crawler'}[10s] < 0.2"
+clear_for = "10s"
+min_requests = 20

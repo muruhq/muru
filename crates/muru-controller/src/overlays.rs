@@ -23,6 +23,17 @@ pub fn temporary_name(app: &str, group: &str) -> String {
     }
 }
 
+/// Issue 712: the name of the overlay `muructl scale --cap` makes for a
+/// worker group, `APP:cap` or `APP:cap:GROUP`, apart from the floor's so
+/// that a floor and a cap end on their own.
+pub fn temporary_cap_name(app: &str, group: &str) -> String {
+    if group == muru_edge::routing::DEFAULT_GROUP {
+        format!("{app}:cap")
+    } else {
+        format!("{app}:cap:{group}")
+    }
+}
+
 /// Whether an overlay stands for an application's `[[app.NAME.schedule]]`
 /// entry (section 7.5), named `APP.NAME`, whose activation and end are
 /// the events schedule.activated and schedule.expired.
@@ -30,8 +41,8 @@ pub fn is_schedule(name: &str) -> bool {
     name.contains('.') && !is_temporary(name)
 }
 
-/// Whether an overlay is one `muructl scale --min` made, which apply
-/// leaves alone and which is forgotten once it ends.
+/// Whether an overlay is one `muructl scale --min` or `--cap` made, which
+/// apply leaves alone and which is forgotten once it ends.
 pub fn is_temporary(name: &str) -> bool {
     name.contains(':')
 }
@@ -474,8 +485,8 @@ pub fn apply_maintenance(
 }
 
 /// Section 7.5: the capacity the overlays set, by application and worker
-/// group: the highest floor and ceiling, and a hold on scale-in if any
-/// sets one.
+/// group: the highest floor and ceiling, a hold on scale-in if any sets
+/// one, and the lowest cap (issue 712).
 pub fn capacities<'a>(
     overlays: impl IntoIterator<Item = &'a (String, Overlay)>,
 ) -> BTreeMap<(String, String), Capacity> {
@@ -492,10 +503,80 @@ pub fn capacities<'a>(
                 .clone()
                 .unwrap_or_else(|| muru_edge::routing::DEFAULT_GROUP.to_owned());
             let capacity = found.entry((app.clone(), group)).or_default();
-            capacity.floor = capacity.floor.max(change.min_workers.unwrap_or(0));
-            capacity.ceiling = capacity.ceiling.max(change.max_workers.unwrap_or(0));
-            capacity.hold |= change.scale_in.as_deref() == Some("hold");
-            capacity.sources.push(name.clone());
+
+            if change.sets_bounds() {
+                capacity.floor = capacity.floor.max(change.min_workers.unwrap_or(0));
+                capacity.ceiling = capacity.ceiling.max(change.max_workers.unwrap_or(0));
+                capacity.hold |= change.scale_in.as_deref() == Some("hold");
+                capacity.sources.push(name.clone());
+            }
+
+            // The lowest cap stands, named by every overlay that sets it.
+
+            if let Some(cap) = change.cap_workers {
+                if capacity.cap == 0 || cap < capacity.cap {
+                    capacity.cap = cap;
+                    capacity.cap_from.clear();
+                }
+
+                if cap == capacity.cap {
+                    capacity.cap_from.push(name.clone());
+                }
+            }
+        }
+    }
+
+    found
+}
+
+/// Issue 712: the overlays and schedules that set a floor above another's
+/// cap on the same group, as warnings for apply, since the cap wins while
+/// both are active. Temporary ones are left out.
+pub fn floor_cap_conflicts(overlays: &BTreeMap<String, Overlay>) -> Vec<String> {
+    let mut floors: Vec<(&str, &str, String, u32)> = Vec::new();
+    let mut caps: Vec<(&str, &str, String, u32)> = Vec::new();
+
+    for (name, overlay) in overlays {
+        if is_temporary(name) {
+            continue;
+        }
+
+        for (app, change) in &overlay.apps {
+            let group = change
+                .group
+                .clone()
+                .unwrap_or_else(|| muru_edge::routing::DEFAULT_GROUP.to_owned());
+
+            if let Some(floor) = change.min_workers {
+                floors.push((name, app, group.clone(), floor));
+            }
+
+            if let Some(cap) = change.cap_workers {
+                caps.push((name, app, group, cap));
+            }
+        }
+    }
+
+    let what = |name: &str| {
+        if is_schedule(name) {
+            "schedule"
+        } else {
+            "overlay"
+        }
+    };
+    let mut found = Vec::new();
+
+    for (cap_name, app, group, cap) in &caps {
+        for (floor_name, floor_app, floor_group, floor) in &floors {
+            if floor_name == cap_name || floor_app != app || floor_group != group || floor <= cap {
+                continue;
+            }
+
+            found.push(format!(
+                "{} {floor_name} keeps {app} ({group} group) at {floor} workers or more and {} {cap_name} caps it at {cap}; while both are active the cap wins",
+                what(floor_name),
+                what(cap_name)
+            ));
         }
     }
 
@@ -962,6 +1043,11 @@ pub fn describe_capacity(change: &muru_config::AppOverlay) -> String {
         parts.push(format!("at most {ceiling}"));
     }
 
+    if let Some(cap) = change.cap_workers {
+        let workers = if cap == 1 { "worker" } else { "workers" };
+        parts.push(format!("capped at {cap} {workers}"));
+    }
+
     if change.scale_in.as_deref() == Some("hold") {
         parts.push("no scale-in".to_owned());
     }
@@ -1220,6 +1306,56 @@ mod tests {
     }
 
     #[test]
+    fn the_lowest_cap_applies_and_a_floor_above_it_is_a_warning() {
+        let declared = [
+            (
+                "shop.weekday".to_owned(),
+                overlay("apps.shop = { min_workers = 8 }"),
+            ),
+            (
+                "db-struggling".to_owned(),
+                overlay("apps.shop = { cap_workers = 6 }"),
+            ),
+            (
+                "node-short".to_owned(),
+                overlay("apps.shop = { cap_workers = 4 }"),
+            ),
+            (
+                "shop:cap".to_owned(),
+                overlay("apps.shop = { cap_workers = 4 }"),
+            ),
+            (
+                "batch".to_owned(),
+                overlay("apps.shop = { group = 'batch', cap_workers = 1 }"),
+            ),
+        ];
+        let all: Vec<&(String, Overlay)> = declared.iter().collect();
+        let found = capacities(all.iter().copied());
+        let web = &found[&("shop".to_owned(), "default".to_owned())];
+        assert_eq!((web.floor, web.cap), (8, 4));
+        assert_eq!(web.sources, ["shop.weekday"]);
+        assert_eq!(web.cap_from, ["node-short", "shop:cap"]);
+        let batch = &found[&("shop".to_owned(), "batch".to_owned())];
+        assert_eq!((batch.floor, batch.cap, batch.sources.len()), (0, 1, 0));
+        assert_eq!(
+            describe_capacity(&declared[4].1.apps["shop"]),
+            "capped at 1 worker"
+        );
+
+        // Each declared cap under the floor is a warning; the temporary
+        // one is not, nor a group the floor does not reach.
+
+        let warnings = floor_cap_conflicts(&declared.into_iter().collect());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with(
+                "schedule shop.weekday keeps shop (default group) at 8 workers or more and overlay db-struggling caps it at 6"
+            ),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
     fn capacity_takes_the_highest_floor_and_ceiling_and_freezes_add_up() {
         let declared = [
             (
@@ -1252,6 +1388,9 @@ mod tests {
 
         assert!(conflicts(&declared.into_iter().collect()).is_empty());
         assert_eq!(temporary_name("shop", "default"), "shop:scale");
+        assert_eq!(temporary_cap_name("shop", "default"), "shop:cap");
+        assert_eq!(temporary_cap_name("shop", "reports"), "shop:cap:reports");
+        assert!(is_temporary("shop:cap") && !is_schedule("shop:cap"));
         assert!(is_temporary(&temporary_name("shop", "reports")));
     }
 

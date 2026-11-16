@@ -56,7 +56,7 @@ Commands that act on a running system use the admin API (Appendix B). A command 
 | Traffic | muructl maintenance on, off APP | Maintenance page at the edge | 4.12 |
 | Operations | muructl status --processes | The instance's processes as Muru's supervision tree: pid, role, what each is for (the daemon as whose daemon and its state directory, a host with its release's part in routing: serving, canary N%, held, draining or retained until HH:MM UTC), user, uptime, CPU, resident memory, each worker's requests per second, busy slots, p95 and its loop lag (ASGI) or GIL wait (WSGI), a group's queue, and the instance's figures; a host adopted again says its operating system parent. Flags: --app APP[@RELEASE], --all, --watch [INTERVAL], --json | 13.10 |
 | Operations | muructl dashboard login | A single-use link signing a browser in to the dashboard, or with --token a bearer token for scripts | 10.7 |
-| Capacity | muructl scale RELEASE or APP | Processes, threads, bounds, temporary floors with --until | 7.4, 7.5 |
+| Capacity | muructl scale RELEASE or APP | Processes, threads, bounds, temporary floors and caps with --until | 7.4, 7.5 |
 | Capacity | muructl scale status [RELEASE] | Signals, decisions, churn counters; the release may be left out under muructl serve, which answers for the one it serves | 7.3, 13.9 |
 | Capacity | muructl restart RELEASE or APP --worker [GROUP/]N | Replace one worker with a fresh one, or every worker in turn with --all; --pid names it by process id, --force kills it at once, --no-wait returns before the replacement serves | 7.6 |
 | Capacity | muructl schedule add, list, remove | Scheduled capacity | 7.5 |

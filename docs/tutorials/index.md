@@ -12,9 +12,11 @@ first-wsgi-app
 asgi-websockets
 deploy-and-roll-back
 first-canary
+commands-and-migrations
 from-gunicorn
 first-django-site
 scaling-under-load
+responding-to-traffic
 a-slow-request
 debugging-a-page
 two-sites-on-one-node

@@ -842,7 +842,8 @@ message SetScaleRequest {
   bool unpin = 5;                   // let the autoscaler decide again
   optional uint32 min_workers = 6;  // section 7.5: a floor until until_unix_ms, as a temporary schedule
   optional uint32 max_workers = 7;  // and a ceiling with it
-  uint64 until_unix_ms = 8;         // when the floor ends
+  uint64 until_unix_ms = 8;         // when the floor or the cap ends
+  optional uint32 cap_workers = 9;  // issue 712: a cap until until_unix_ms, in place of a floor
 }
 
 message DashboardLoginRequest {
@@ -938,6 +939,8 @@ message GroupScale {
   string advice = 30;               // the tuning it suggests for the next release, when any
   optional double gc_share = 31;    // section 11.1: the share of the workers' time spent in garbage collection
   optional double handoff_queue_wait_p95_ms = 32; // section 6.14: the wait for a thread of requests handed from ASGI to WSGI
+  uint32 cap = 33;                  // issue 712: the most workers an overlay or a schedule allows now, 0 for none
+  repeated string cap_from = 34;    // the overlays and schedules whose cap that is
 }
 
 // Section 9.1: pending, starting, warming, ready, draining, stopping,
@@ -1388,6 +1391,7 @@ message ConditionStatus {
   uint64 min_requests = 10;
   string unknown = 11;              // why it is unknown, when it is
   repeated ConditionTerm terms = 12; // each term of when, then of clear_when
+  uint64 pending_since_unix_ms = 13; // issue 727: since when the expression it waits on has held, while it waits out for or clear_for; 0 when it is not waiting
 }
 
 message ConditionTerm {

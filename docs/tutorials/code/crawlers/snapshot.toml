@@ -1,0 +1,6 @@
+[overlay.crawler-response]
+routes.shop.client_routes.ai-crawler = { target = { static = "snapshot" } }
+trigger = { condition = "crawler-surge" }
+min_active = "20s"
+cooldown = "1m"
+latch = true

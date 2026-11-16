@@ -415,9 +415,10 @@ each other request in flight on that worker. A capture goes to the
 record of every request it names that is still kept, at most 8 for one
 record. A worker that cannot answer for its stacks, such as one whose
 thread holds the GIL in C, gives none: a request past its deadline has
-the capture without a stack, and a killed worker, which then cannot say
-which requests it was serving, gives its requests' records no capture.
-Its stacks go to the log through `faulthandler`.
+the capture without a stack, and a killed worker's capture reaches the
+records of the requests it gave up and of those the edge still had in
+flight on it, with the event's message, the worker, its pid and why,
+but no stacks. Its stacks go to the log through `faulthandler`.
 
 The [access log](logging.md)'s JSON lines name the connection too, as
 `connection` and `connection_requests`, in every mode.

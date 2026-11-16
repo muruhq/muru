@@ -257,6 +257,10 @@ The state store remembers `hello` and its releases, so the next
 - [Your first canary](first-canary.md) deploys a release to a share of the
   traffic first and lets the daemon decide whether to promote it.
 
+- [Commands and migrations](commands-and-migrations.md) runs a migration
+  as a gate a release must pass, a backup detached from the terminal and
+  a cleanup on a schedule.
+
 - [The daemon](../howto/daemon.md) covers releases, retention, applying
   files and where the daemon keeps its files.
 

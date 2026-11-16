@@ -1,0 +1,5 @@
+[overlay.crawler-response]
+routes.shop.client_routes.ai-crawler = { rate_limits = ["crawlers"] }
+trigger = { condition = "crawler-surge" }
+min_active = "20s"
+cooldown = "1m"

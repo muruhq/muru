@@ -1,0 +1,18 @@
+[host.shop]
+names = ["shop.localhost"]
+default = true
+
+[[route]]
+name = "shop"
+host = "shop"
+app = "shop"
+
+[[client_class]]
+name = "ai-crawler"
+user_agent = ["GPTBot", "ClaudeBot", "CCBot"]
+
+[rate_limit.crawlers]
+match = { client_class = ["ai-crawler"] }
+key = "client_class"
+rate = "2/s"
+burst = 2

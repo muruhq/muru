@@ -318,6 +318,39 @@ def test_a_timeout_kill_is_reported_at_the_decision_and_not_again_at_the_exit(
     assert "worker 0 (pid 4242) exited after its drain grace" in capfd.readouterr().err
 
 
+def test_a_worker_that_cannot_answer_for_its_stacks_still_names_its_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, state, sent, asked = replacing_host(tmp_path, monkeypatch)
+    instance.replace(
+        state,
+        "no thread of it ran Python for the GIL stall timeout of 5 s",
+        "worker.timeout_killed",
+        "gil_stalled",
+        abandon={"which": "all", "reason": "worker_stalled", "error": "stalled"},
+    )
+
+    # Issue 715: the worker gives up its requests from its native thread,
+    # but its stacks need the interpreter, and no answer comes.
+
+    abandon = next(pending for pending in asked if pending.op == "abandon")
+    abandon.answers[4242] = {"ok": True, "result": {"abandoned": ["R1", "R2"]}}
+    assert abandon.then is not None
+    abandon.then(abandon)
+    stacks = next(pending for pending in asked if pending.op == "stacks")
+    assert stacks.then is not None
+    stacks.then(stacks)
+    (event,) = [message for message in sent if message.get("type") == "event"]
+    assert event["message"].endswith("its stacks were written to the log by faulthandler")
+    assert event["evidence"] == {
+        "worker": "0",
+        "pid": 4242,
+        "reason": "no thread of it ran Python for the GIL stall timeout of 5 s",
+        "requests": ["R1", "R2"],
+        "threads": [],
+    }
+
+
 def kinds(sent: list[dict[str, Any]]) -> list[object]:
     return [message["kind"] for message in sent if message.get("type") == "event"]
 
