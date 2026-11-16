@@ -4305,6 +4305,7 @@ pub enum RolloutCommand {
 /// `scale status` for the autoscaler's state (sections 7.3 and 7.4).
 #[derive(Args, Clone)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+#[command(group = clap::ArgGroup::new("temporary").args(["min_workers", "cap_workers"]))]
 pub struct ScaleArgs {
     #[command(subcommand)]
     pub command: Option<ScaleCommand>,
@@ -4336,17 +4337,29 @@ pub struct ScaleArgs {
     #[arg(long = "max", value_name = "COUNT", requires = "min_workers")]
     max_workers: Option<u32>,
 
-    /// When the floor ends, such as 2026-11-30T23:59 or an RFC 3339 time.
+    /// Allow at most this many workers until --until or for --for,
+    /// whatever the policy, a floor and the autoscaler say; the excess
+    /// drains at once.
+    #[arg(long = "cap", value_name = "COUNT", conflicts_with_all = ["processes", "unpin", "min_workers"])]
+    cap_workers: Option<u32>,
+
+    /// With --cap, return at once rather than waiting until the group is
+    /// at or under the cap.
+    #[arg(long, requires = "cap_workers")]
+    no_wait: bool,
+
+    /// When the floor or the cap ends, such as 2026-11-30T23:59 or an
+    /// RFC 3339 time.
     #[arg(
         long,
         value_name = "TIME",
-        requires = "min_workers",
+        requires = "temporary",
         conflicts_with = "duration"
     )]
     until: Option<String>,
 
-    /// How long the floor lasts, such as 4h.
-    #[arg(long = "for", value_name = "DURATION", value_parser = muru_config::parse_duration, requires = "min_workers")]
+    /// How long the floor or the cap lasts, such as 4h.
+    #[arg(long = "for", value_name = "DURATION", value_parser = muru_config::parse_duration, requires = "temporary")]
     duration: Option<Duration>,
 
     /// The time zone --until is in; the local zone without it.
@@ -4640,9 +4653,13 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
     let target = args.target.unwrap_or_default();
     let (app, release) = split_target(&target)?;
 
-    if args.processes.is_none() && !args.unpin && args.min_workers.is_none() {
+    if args.processes.is_none()
+        && !args.unpin
+        && args.min_workers.is_none()
+        && args.cap_workers.is_none()
+    {
         anyhow::bail!(
-            "give --processes COUNT to pin the group, --unpin, or --min COUNT with --until or --for; `scale status` shows the state"
+            "give --processes COUNT to pin the group, --unpin, or --min COUNT or --cap COUNT with --until or --for; `scale status` shows the state"
         );
     }
 
@@ -4653,6 +4670,9 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
         (None, Some(duration)) => now_unix_ms() + duration.as_millis() as u64,
         (None, None) if args.min_workers.is_some() => {
             anyhow::bail!("--min needs --until TIME or --for DURATION")
+        }
+        (None, None) if args.cap_workers.is_some() => {
+            anyhow::bail!("--cap needs --until TIME or --for DURATION")
         }
         (None, None) => 0,
     };
@@ -4667,6 +4687,7 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
             unpin: args.unpin,
             min_workers: args.min_workers,
             max_workers: args.max_workers,
+            cap_workers: args.cap_workers,
             until_unix_ms,
         })
         .await
@@ -4686,6 +4707,21 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Some(cap) = args.cap_workers {
+        println!(
+            "muru: {app} {} capped at {} until {}",
+            args.group,
+            count_workers(cap),
+            format_time(until_unix_ms)
+        );
+
+        if !args.no_wait {
+            wait_for_cap(&mut client, app, &args.group, cap).await?;
+        }
+
+        return Ok(());
+    }
+
     match args.processes {
         Some(count) => println!(
             "muru: {}@{} {} pinned to {count} workers",
@@ -4698,6 +4734,79 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// "1 worker" or "N workers".
+fn count_workers(count: u32) -> String {
+    if count == 1 {
+        "1 worker".to_owned()
+    } else {
+        format!("{count} workers")
+    }
+}
+
+/// Issue 712: wait until the serving release's group is at or under a
+/// cap just set, polling its status, and say so. A pinned or advisory
+/// group keeps its count, so that is said instead of waiting. The
+/// autoscaler takes the cap at its next tick, so a status without it
+/// is waited through for a few seconds before the cap counts as gone.
+async fn wait_for_cap(
+    client: &mut pb::admin_client::AdminClient<tonic::transport::Channel>,
+    app: &str,
+    group: &str,
+    cap: u32,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+
+    loop {
+        let status = client
+            .get_scale_status(pb::GetScaleStatusRequest {
+                app: app.to_owned(),
+                release: String::new(),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner();
+        let Some(found) = status.groups.iter().find(|found| found.group == group) else {
+            anyhow::bail!("{app}@{} has no worker group named {group}", status.release);
+        };
+
+        if found.pinned {
+            println!(
+                "muru: {app}@{} {group} is pinned to {}, which the cap leaves as it is until --unpin",
+                status.release,
+                count_workers(found.desired)
+            );
+            return Ok(());
+        }
+
+        if found.advisory {
+            println!(
+                "muru: {app}@{} {group} has an advisory policy, which reports the cap without acting on it",
+                status.release
+            );
+            return Ok(());
+        }
+
+        // A canary's share of the cap is what its release is held to.
+
+        let held = if found.cap > 0 { found.cap } else { cap };
+
+        if found.ready <= held && found.desired <= held {
+            println!("muru: {app} {group} is at {}", count_workers(found.ready));
+            return Ok(());
+        }
+
+        if found.cap == 0 && started.elapsed() > Duration::from_secs(5) {
+            println!(
+                "muru: {app} {group} is no longer capped, with {}",
+                count_workers(found.ready)
+            );
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// An application, or app@release; an empty release means the serving one.
@@ -4765,6 +4874,16 @@ fn print_scale_status(status: &pb::ScaleStatus) {
                     ""
                 },
                 group.capacity_from.join(", ")
+            );
+        }
+
+        // Issue 712: a cap in force, and what sets it.
+
+        if group.cap > 0 {
+            println!(
+                "  capped: at most {} from {}",
+                count_workers(group.cap),
+                group.cap_from.join(", ")
             );
         }
 

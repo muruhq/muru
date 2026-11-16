@@ -2251,6 +2251,12 @@ fn plan_overlays(
     }
 
     plan.errors.extend(crate::overlays::conflicts(&all));
+
+    // Issue 712: a floor above a cap on the same group, which the cap wins
+    // while both are active.
+
+    plan.warnings
+        .extend(crate::overlays::floor_cap_conflicts(&all));
 }
 
 /// Section 7.5: the overlays the applications' `[[app.NAME.schedule]]`

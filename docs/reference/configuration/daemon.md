@@ -358,6 +358,7 @@ An `[[app.NAME.schedule]]` entry: capacity for a window, shorthand for an overla
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `cap_workers` | integer |  | At most this many workers during the window, whatever the policy and the autoscaler choose. |
 | `cron` | string |  | A recurring window's start times. |
 | `duration` | string |  | A recurring window's length. |
 | `end` | string |  | A one-off window's end. |
@@ -742,6 +743,7 @@ What an overlay changes on an application: its maintenance mode, and its schedul
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `answer` | string | `"read_only"` | How refused methods are answered, with the values a route's `methods.answer` takes. |
+| `cap_workers` | integer |  | At most this many workers, whatever the policy and the autoscaler choose (issue 712): the lowest across overlays applies, and it wins over a floor. |
 | `deny` | array of strings |  | Methods refused on each of the application's routes. |
 | `freeze_deploys` | boolean | `false` | Refuse deploys and rollouts of the application unless overridden. |
 | `group` | string | `"default"` | The worker group the capacity applies to; the default group without it. |

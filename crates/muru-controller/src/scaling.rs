@@ -504,8 +504,13 @@ pub struct Capacity {
     pub ceiling: u32,
     /// Whether scale-in waits until they are over.
     pub hold: bool,
-    /// The overlays that set it, for the reasons.
+    /// The overlays that set the floor, ceiling or hold, for the reasons.
     pub sources: Vec<String>,
+    /// Issue 712: the most workers whatever the policy, the floor and
+    /// the autoscaler say; none when 0.
+    pub cap: u32,
+    /// The overlays whose cap is the one in force.
+    pub cap_from: Vec<String>,
 }
 
 /// One observation kept for the windows.
@@ -652,26 +657,45 @@ impl Scaler {
     }
 
     /// The fewest workers: the policy's, a static group's count, or a
-    /// schedule's floor, the highest.
+    /// schedule's floor, the highest, and never over a cap (issue 712).
     pub fn floor(&self) -> u32 {
         let own = if self.spec.is_static() {
             self.spec.max_workers
         } else {
             self.spec.min_workers
         };
-        self.capacity
+        let floor = self
+            .capacity
             .as_ref()
-            .map_or(own, |capacity| own.max(capacity.floor))
+            .map_or(own, |capacity| own.max(capacity.floor));
+
+        match self.cap() {
+            Some(cap) => floor.min(cap),
+            None => floor,
+        }
     }
 
     /// The most workers: the policy's, or a schedule's ceiling or floor
-    /// above it.
+    /// above it, and never over a cap.
     pub fn ceiling(&self) -> u32 {
         let raised = self
             .capacity
             .as_ref()
             .map_or(0, |capacity| capacity.ceiling);
-        self.spec.max_workers.max(raised).max(self.floor())
+        let ceiling = self.spec.max_workers.max(raised).max(self.floor());
+
+        match self.cap() {
+            Some(cap) => ceiling.min(cap),
+            None => ceiling,
+        }
+    }
+
+    /// Issue 712: the cap an overlay or a schedule sets now, when one does.
+    pub fn cap(&self) -> Option<u32> {
+        self.capacity
+            .as_ref()
+            .map(|capacity| capacity.cap)
+            .filter(|cap| *cap > 0)
     }
 
     /// Take the count the group has as the one wanted: in advisory mode
@@ -793,6 +817,10 @@ impl Scaler {
             return None;
         }
 
+        if let Some(decision) = self.lower_to_cap(now) {
+            return Some(decision);
+        }
+
         if self.spec.is_static() {
             return self.raise_to_floor(now).or_else(|| self.settle(now));
         }
@@ -896,16 +924,44 @@ impl Scaler {
         Some(Decision::ScaleOut { to: 1, reason })
     }
 
+    /// Issue 712: a group over a cap drains the excess at once, rather
+    /// than one worker per reap interval, since the cap is there to take
+    /// load off something; the churn budget does not count these drains.
+    fn lower_to_cap(&mut self, now: Instant) -> Option<Decision> {
+        let cap = self.cap()?;
+
+        if self.desired <= cap {
+            return None;
+        }
+
+        let from = self.capacity.as_ref()?.cap_from.join(", ");
+        let workers = if cap == 1 { "worker" } else { "workers" };
+        let reason = format!("capped at {cap} {workers} by {from}");
+        self.desired = cap;
+        self.out_since = None;
+        self.last_in = Some(now);
+        self.decisions.1 += 1;
+        self.last = Some((now, format!("scaled in to {cap}: {reason}")));
+        Some(Decision::ScaleIn { to: cap, reason })
+    }
+
     /// Section 7.5: bring the group up to a schedule's floor in staggered
     /// batches of max_step_up, each once the last has arrived and no
-    /// sooner than a scale-out window after it.
+    /// sooner than a scale-out window after it. A group a cap held under
+    /// its own floor or static count comes back the same way once the
+    /// cap ends.
     fn raise_to_floor(&mut self, now: Instant) -> Option<Decision> {
-        let sources = self.capacity.as_ref()?.sources.join(", ");
         let floor = self.floor();
 
         if self.desired >= floor || self.desired > self.signals.ready {
             return None;
         }
+
+        let sources = self
+            .capacity
+            .as_ref()
+            .map(|capacity| capacity.sources.join(", "))
+            .unwrap_or_default();
 
         let window = Duration::from_millis(self.spec.scale_out_window_ms);
 
@@ -917,7 +973,15 @@ impl Scaler {
         }
 
         let to = (self.desired + self.spec.max_step_up.max(1)).min(floor);
-        let reason = format!("raising toward the floor of {floor} that {sources} sets");
+
+        let reason = if !sources.is_empty() {
+            format!("raising toward the floor of {floor} that {sources} sets")
+        } else if self.spec.is_static() {
+            format!("back toward the static count of {floor}")
+        } else {
+            format!("raising toward min_workers {floor}")
+        };
+
         self.last_step = to - self.desired;
         self.desired = to;
         self.last_out = Some(now);
@@ -1936,6 +2000,7 @@ mod tests {
             ceiling: 12,
             hold: true,
             sources: vec!["shop.black-friday".to_owned()],
+            ..Capacity::default()
         }));
         group.run(Duration::ZERO, MINUTE, |_| 0.0);
 
@@ -1991,6 +2056,83 @@ mod tests {
             [3, 2]
         );
         assert_eq!(group.scaler.desired(), 2);
+    }
+
+    fn capped(cap: u32, floor: u32) -> Option<Capacity> {
+        Some(Capacity {
+            floor,
+            sources: if floor > 0 {
+                vec!["shop.weekday".to_owned()]
+            } else {
+                Vec::new()
+            },
+            cap,
+            cap_from: vec!["db-struggling".to_owned()],
+            ..Capacity::default()
+        })
+    }
+
+    #[test]
+    fn a_cap_drains_the_excess_at_once_and_wins_over_a_floor() {
+        let mut group = Group::new(spare(), 8, 1.0);
+        group.ready = 8;
+
+        // Busy, the group would grow, but a cap below what it has takes
+        // it down to the cap at once, and keeps it there.
+
+        group.scaler.set_capacity(capped(3, 6));
+        group.run(Duration::ZERO, MINUTE, |_| 8.0);
+        assert_eq!(group.ins(), [(Duration::ZERO, 3)], "{:?}", group.log);
+        assert!(group.outs().is_empty(), "{:?}", group.log);
+        assert_eq!((group.scaler.floor(), group.scaler.ceiling()), (3, 3));
+        assert!(group.scaler.at_max_wanting_more());
+        assert_eq!(group.scaler.reaps(), 0);
+
+        let Some((_, Decision::ScaleIn { reason, .. })) = group.log.first() else {
+            panic!("{:?}", group.log);
+        };
+        assert_eq!(reason, "capped at 3 workers by db-struggling");
+
+        // Once the cap ends, the floor is raised to and the signals grow
+        // the group again.
+
+        group.scaler.set_capacity(capped(0, 6));
+        group.run(MINUTE, MINUTE, |_| 8.0);
+        assert!(group.scaler.desired() > 6, "{:?}", group.log);
+    }
+
+    #[test]
+    fn a_static_group_is_capped_and_comes_back_to_its_count() {
+        let fixed = ScalingSpec {
+            max_workers: 6,
+            ..ScalingSpec::default()
+        };
+        let mut group = Group::new(fixed, 6, 1.0);
+        group.ready = 6;
+        group.scaler.set_capacity(capped(1, 0));
+        group.run(Duration::ZERO, MINUTE, |_| 1.0);
+        assert_eq!(group.ins(), [(Duration::ZERO, 1)]);
+
+        group.scaler.set_capacity(None);
+        group.run(MINUTE, MINUTE, |_| 1.0);
+        assert_eq!(
+            group.outs().iter().map(|(_, to)| *to).collect::<Vec<_>>(),
+            [5, 6]
+        );
+    }
+
+    #[test]
+    fn a_pin_stands_over_a_cap() {
+        let mut group = Group::new(spare(), 4, 1.0);
+        group.scaler.pin(4, group.start);
+        group.ready = 4;
+        group.scaler.set_capacity(capped(2, 0));
+        group.run(Duration::ZERO, MINUTE, |_| 1.0);
+        assert!(group.log.is_empty(), "{:?}", group.log);
+
+        group.scaler.unpin(group.start + MINUTE);
+        group.run(MINUTE, SECOND * 5, |_| 1.0);
+        assert_eq!(group.ins(), [(MINUTE, 2)]);
     }
 
     #[test]
