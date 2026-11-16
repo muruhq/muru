@@ -300,6 +300,26 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
         )
         assert f"{runtime}/runs/" in muructl(runtime, "status", cwd=here).stdout
 
+        # A second run of the first project is the one reached, whichever
+        # port it has, and both it and the commands name the older one
+        # (issue 714).
+
+        third = start(runtime)
+
+        try:
+            older = f"--socket {runtime}/runs/{first.port}/admin.sock"
+            assert "another development run of this project is listening" in third.log()
+            assert older in third.log(), third.log()
+            reached = muructl(runtime, "status", cwd=support.FIXTURES)
+            assert f"runs/{third.port}/admin.sock" in reached.stdout
+            assert (
+                "2 development runs of this project are listening; reaching the newest"
+                in reached.stderr
+            ), reached.stderr
+            assert older in reached.stderr
+        finally:
+            third.stop()
+
         # Elsewhere, with no daemon, the runs are named so one can be
         # chosen. A socket file left behind by a daemon is no daemon.
 

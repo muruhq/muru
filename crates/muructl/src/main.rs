@@ -4118,7 +4118,7 @@ async fn run_with(
         let state = Arc::new(RunState {
             app: label.clone(),
             release: Arc::clone(&release_number),
-            project,
+            project: project.clone(),
             run_dir: run_dir.clone(),
             socket: registration.socket.clone(),
             listeners,
@@ -4147,6 +4147,21 @@ async fn run_with(
                     muru_common::muru_println!(
                         "muructl commands run from {reached} reach this run"
                     );
+
+                    // Issue 714: the newest run of a project is reached,
+                    // so the runs of it already listening are named, with
+                    // how to reach them.
+
+                    for other in run_admin::runs(&runtime).iter().filter(|other| {
+                        other.project == project && other.socket != registration.socket
+                    }) {
+                        muru_common::muru_println!(
+                            "another development run of this project is listening, {} on http://{}; --socket {} reaches it",
+                            other.app,
+                            other.listen,
+                            other.socket.display()
+                        );
+                    }
                 }
 
                 admin_serving = Some(tokio::spawn(serving));

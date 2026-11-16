@@ -874,8 +874,10 @@ $ muructl logs --access --lines 1
 muru: using the daemon; the development run of shop on http://127.0.0.1:8080 is also listening: run the command from /home/me/shop, or pass --socket /run/user/1000/muru/runs/8080/admin.sock, to reach it
 ```
 
+With several development runs of one project, the newest is reached,
+and the command names the others and their sockets on standard error.
 `muructl run` prints the directories its commands are reached from when
-it starts. A run
+it starts, and any other run of the same project already listening. A run
 directory you may not enter is passed over like one that is not there;
 when nothing else is found, the command says permission was denied on
 its socket.

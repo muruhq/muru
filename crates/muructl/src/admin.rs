@@ -348,7 +348,8 @@ fn may_not_enter(path: &Path) -> bool {
 
 /// The rest of discovery (design specification section 13.8), once there
 /// is no usable serve: a development run whose project is the current
-/// directory, then one started from it, the daemon's socket when it
+/// directory, then one started from it, the newest of several, with a
+/// note naming the others, the daemon's socket when it
 /// listens, then the one run listening. With nothing there, the socket
 /// of a run directory this user may not enter when there is one, so the
 /// permission error is reported, or the daemon's. When the daemon is
@@ -360,17 +361,50 @@ fn discovered(
     daemon_listening: bool,
     denied: Option<PathBuf>,
 ) -> anyhow::Result<Discovery> {
-    let project = runs
+    // The runs whose project is this directory, else those started from
+    // it; of several, the newest (issue 714), with a note naming the
+    // others and how to reach them.
+
+    let mut mine: Vec<&crate::run_admin::RunInfo> = runs
         .iter()
-        .find(|run| here.is_some_and(|here| run.project == here));
+        .filter(|run| here.is_some_and(|here| run.project == here))
+        .collect();
 
-    let started = || {
-        runs.iter()
-            .find(|run| here.is_some() && run.started_from.as_deref() == here)
-    };
+    if mine.is_empty() {
+        mine = runs
+            .iter()
+            .filter(|run| here.is_some() && run.started_from.as_deref() == here)
+            .collect();
+    }
 
-    if let Some(run) = project.or_else(started) {
-        return Ok(Discovery::quiet(run.socket.clone()));
+    mine.sort_by_key(|run| run.started_unix_ms);
+
+    if let Some((newest, others)) = mine.split_last() {
+        let note = (!others.is_empty()).then(|| {
+            format!(
+                "{} development runs of this project are listening; reaching the newest, {} on \
+                 http://{}; pass --socket to reach another: {}",
+                mine.len(),
+                newest.app,
+                newest.listen,
+                others
+                    .iter()
+                    .rev()
+                    .map(|run| format!(
+                        "{} on http://{} (--socket {})",
+                        run.app,
+                        run.listen,
+                        run.socket.display()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+
+        return Ok(Discovery {
+            socket: newest.socket.clone(),
+            note,
+        });
     }
 
     if daemon_listening {
@@ -10667,6 +10701,7 @@ mod tests {
             listen: "127.0.0.1:8080".to_owned(),
             socket: PathBuf::from(socket),
             runtime: Vec::new(),
+            started_unix_ms: 0,
         };
         let daemon = PathBuf::from("/user/admin.sock");
         let denied = PathBuf::from("/run/muru/admin.sock");
@@ -10698,6 +10733,60 @@ mod tests {
     }
 
     #[test]
+    fn discovery_reaches_the_newest_of_several_runs_of_a_project_and_names_the_others() {
+        use std::path::{Path, PathBuf};
+
+        use crate::run_admin::RunInfo;
+
+        let run = |port: u16, started_unix_ms: u64| RunInfo {
+            pid: 1,
+            app: "shop".to_owned(),
+            project: PathBuf::from("/work/shop"),
+            started_from: None,
+            listen: format!("127.0.0.1:{port}"),
+            socket: PathBuf::from(format!("/user/runs/{port}/admin.sock")),
+            runtime: Vec::new(),
+            started_unix_ms,
+        };
+
+        // Listed by port, the older run on the lower one.
+
+        let runs = [run(8080, 1_000), run(8090, 2_000)];
+        let found = super::discovered(
+            &runs,
+            Some(Path::new("/work/shop")),
+            PathBuf::from("/user/admin.sock"),
+            true,
+            None,
+        )
+        .expect("found");
+        assert_eq!(found.socket, runs[1].socket);
+        let note = found.note.expect("a note");
+        assert!(
+            note.starts_with(
+                "2 development runs of this project are listening; reaching the newest, shop on http://127.0.0.1:8090;"
+            ),
+            "{note}"
+        );
+        assert!(
+            note.contains("shop on http://127.0.0.1:8080 (--socket /user/runs/8080/admin.sock)"),
+            "{note}"
+        );
+
+        // One run is reached quietly.
+
+        let one = super::discovered(
+            &runs[..1],
+            Some(Path::new("/work/shop")),
+            PathBuf::from("/user/admin.sock"),
+            true,
+            None,
+        )
+        .expect("found");
+        assert_eq!((one.socket, one.note), (runs[0].socket.clone(), None));
+    }
+
+    #[test]
     fn discovery_finds_a_run_from_where_it_was_started_and_says_when_the_daemon_wins() {
         use std::path::{Path, PathBuf};
 
@@ -10711,6 +10800,7 @@ mod tests {
             listen: "127.0.0.1:18380".to_owned(),
             socket: PathBuf::from("/user/runs/18380/admin.sock"),
             runtime: Vec::new(),
+            started_unix_ms: 0,
         };
         let other = RunInfo {
             app: "api".to_owned(),
