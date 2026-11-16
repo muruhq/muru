@@ -9,6 +9,41 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a29 (2026-11-16)
+
+### Added
+
+- A span in a spans panel can now be marked failed: `muru.panels.Span` takes `failed`, a `span()` block that an exception escapes is marked, and the Trace panel marks each operation an exception escaped or was noted against. The toolbar draws a failed span with a red outline and a mark beside its name, and `muructl debug request` and the record's JSON show it too. ([#705](https://github.com/muruhq/muru/issues/705))
+- The development toolbar's Errors panel now shows the evidence Muru captured of a timeout or a killed worker: the request's stack at a soft timeout, at its deadline or when its worker was killed, with the worker's other threads and links to the other requests in flight on it. `request.past_deadline` names where the request was, and a record whose worker never sent its part says so in its Logs and Errors panels. ([#706](https://github.com/muruhq/muru/issues/706))
+- With tracing on, the development toolbar now has an **Outbound** panel: a request's calls to other services, grouped by method, host and path with how many times each was called and their total time, so an endpoint called once per row shows as one line, then each call with its URL and status. ([#707](https://github.com/muruhq/muru/issues/707))
+- The development toolbar has a **History** tab: the run's recent document requests, newest first, with each redirect joined to the request it led to, so the POST of a form that redirects is a click away from the page it led to. ([#708](https://github.com/muruhq/muru/issues/708))
+- The development toolbar has a **Hints** panel, the first of a record's panels, listing what stands out: a statement or an outbound endpoint repeated (N+1), a slow query or call, an HTML or JSON response that went out uncompressed, the event loop held, long waits for a worker or a thread, garbage collection, and an answer of Muru's own with the setting behind it. The badge counts the hints, and `muructl debug request` and the record's JSON carry them. ([#709](https://github.com/muruhq/muru/issues/709))
+- Added `cap_workers` to overlays and capacity schedules, which caps a worker group at a count whatever its policy and floors say, draining the excess at once, and `muructl scale APP --cap N --for DURATION`, which sets a temporary cap and waits until the group is under it. ([#712](https://github.com/muruhq/muru/issues/712))
+
+### Changed
+
+- The development toolbar now appears on an HTML page with no `</body>`, such as the error pages of Flask and other Werkzeug applications: for a browser loading the page, the edge appends its tag at the end. ([#703](https://github.com/muruhq/muru/issues/703))
+
+### Fixed
+
+- With several `muructl run`s of one project listening, `muructl` commands reach the newest and name the others with their `--socket`, and a run started beside another of its project says so, where commands reached the run on the lowest port. ([#714](https://github.com/muruhq/muru/issues/714))
+- A worker killed for a timeout or a stall that cannot answer for its stacks, such as one whose thread holds the GIL in C or one stopped whole, still gives each request in flight on it a capture in its record, with the event's message, the worker, its pid and why. ([#715](https://github.com/muruhq/muru/issues/715))
+- The development toolbar's Errors panel now shows a 500 that the application answered itself, as Flask and Django do after catching an exception, with the traceback the request logged, rather than nothing. ([#722](https://github.com/muruhq/muru/issues/722))
+- `muructl run` reloads a project kept in a directory that the repository around it ignores, such as another repository's scratch directory, by watching it with its own `.gitignore` alone, and says at start when no watched file matches the reload patterns. ([#723](https://github.com/muruhq/muru/issues/723))
+- A request a rate limit, a method restriction or a site mode refuses is counted in `muru_requests_total` under the application it was routed to, so conditions on the application see it. ([#724](https://github.com/muruhq/muru/issues/724))
+- `muructl apply` warns of an overlay whose route for a client class sends the class to a static snapshot while its condition reads that class's share of the application's requests, and the overlays guide's crawler example uses a rate limit, which the condition still sees. ([#725](https://github.com/muruhq/muru/issues/725))
+- `muructl condition list` shows a condition waiting out `for` as `pending`, and `condition show` says how long its `when` or `clear_when` has held of the wait it needs, where it read `unknown:` with no reason before its first change. ([#727](https://github.com/muruhq/muru/issues/727))
+- `muructl overlay list` keeps its columns in line when an overlay's state or trigger is long, such as `active (condition)` or a cooldown with its end. ([#728](https://github.com/muruhq/muru/issues/728))
+- `muructl apply` no longer warns that an overlay with `latch = true` takes away the traffic its condition reads, since its condition does not end it. ([#729](https://github.com/muruhq/muru/issues/729))
+
+### Documentation
+
+- Added a "Capacity on a condition" section to the scaling guide: an overlay triggered by a condition that warms one application while another is busy, or holds capacity while an upstream is down. ([#711](https://github.com/muruhq/muru/issues/711))
+- Added the tutorial "Responding to traffic", in which a condition on the crawlers' share of a shop's requests is watched before it acts, then rate-limits them through an overlay, holds capacity while it fires, and shows why a response must not take away what its condition reads. ([#713](https://github.com/muruhq/muru/issues/713))
+- Added the tutorial "Debugging a page", which finds and fixes the faults of a small Flask shop with the development toolbar and tracing: an N+1 query, a failing page, a call to another service per row, a form that redirects, a request past the soft timeout, and the hints that point at them. ([#716](https://github.com/muruhq/muru/issues/716))
+- Added the tutorial "Commands and migrations", in which a small catalog with a sqlite database declares commands, runs its migration as a gate a release must pass, runs a backup detached from the terminal and the daemon, and puts a cleanup on a schedule. ([#717](https://github.com/muruhq/muru/issues/717))
+
+
 ## 0.1.0a28 (2026-11-15)
 
 ### Added
