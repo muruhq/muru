@@ -316,7 +316,10 @@ stands out in the rest, which [has a section of its own](#hints):
 - **Errors:** the exception the application did not catch, whether it
   was raised calling the application or while producing the body, and
   its traceback, as the development error page shows it; or, for an
-  error Muru answered itself, its reason. A request that ran past a
+  error Muru answered itself, its reason. When the application caught
+  the exception itself and answered 500, as Flask and Django do, the
+  panel says the application answered it and shows the first error the
+  request logged with a traceback. A request that ran past a
   timeout, or whose worker was killed, has the evidence Muru captured,
   as [below](#evidence-of-a-timeout-or-a-killed-worker).
 

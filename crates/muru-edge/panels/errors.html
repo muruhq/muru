@@ -1,4 +1,5 @@
-{#- The Errors panel: the unhandled exception, or the edge's reason, then
+{#- The Errors panel: the unhandled exception, the edge's reason, or a 500
+    the application answered itself with the error it logged, then
     each capture of a timeout or a killed worker (issue 706): its message,
     the worker, the request's stack and the worker's other threads, and
     links to the other requests' records it reached. -#}
@@ -6,7 +7,7 @@
 <table class="values">
 <tbody>
 {%- for value in panel["values"] %}
-{%- if value.name == "traceback" %}
+{%- if value.name in ["traceback", "logged"] %}
 <tr><th>{{ value.name }}</th><td><pre class="error">{{ value.value }}</pre></td></tr>
 {%- elif value.name == "worker's part" %}
 <tr><th>{{ value.name }}</th><td class="muted">{{ value.value }}</td></tr>

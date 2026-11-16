@@ -699,6 +699,33 @@ fn errors(record: &admin::RequestRecord) -> admin::Panel {
         values.push(value("edge's reason", record.reason.clone()));
     }
 
+    // A framework that catches the exception logs it and answers 500
+    // itself, so the worker saw the application complete (issue 722):
+    // the traceback is the first error the request logged with one.
+
+    if let Some(worker) = &record.from_worker
+        && values.is_empty()
+        && record.status >= 500
+        && record.reason.is_empty()
+    {
+        values.push(value(
+            "answered",
+            format!("the application answered {} itself", record.status),
+        ));
+
+        let logged = worker.logs.iter().find(|line| {
+            matches!(line.level.as_str(), "ERROR" | "CRITICAL")
+                && line.message.contains("Traceback (most recent call last):")
+        });
+
+        if let Some(line) = logged {
+            values.push(value(
+                "logged",
+                format!("{}: {}", line.logger, line.message.trim_end()),
+            ));
+        }
+    }
+
     if record.worker_part == crate::recorder::WORKER_MISSING {
         values.push(value(
             "worker's part",
@@ -1172,6 +1199,34 @@ mod tests {
         let mut fine = fixture();
         fine.from_worker = None;
         let html = Renderer::new(None).render(&errors(&fine));
+        assert!(html.contains("No errors."), "{html}");
+
+        // A 500 a framework answered after catching the exception, with
+        // the error it logged; a 200 with an error logged is not one.
+
+        let mut caught = fixture();
+        caught.status = 500;
+        caught.reason.clear();
+        let worker = caught.from_worker.as_mut().unwrap();
+        worker.outcome = "completed".to_owned();
+        worker.logs.push(admin::RequestLog {
+            level: "ERROR".to_owned(),
+            logger: "shop".to_owned(),
+            message: "Exception on /authors/4 [GET]\nTraceback (most recent call last):\n  ...\nZeroDivisionError: division by zero".to_owned(),
+            ..Default::default()
+        });
+        let html = Renderer::new(None).render(&errors(&caught));
+        assert!(
+            html.contains("<th>answered</th><td>the application answered 500 itself</td>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<pre class=\"error\">shop: Exception on /authors/4 [GET]"),
+            "{html}"
+        );
+
+        caught.status = 200;
+        let html = Renderer::new(None).render(&errors(&caught));
         assert!(html.contains("No errors."), "{html}");
     }
 
