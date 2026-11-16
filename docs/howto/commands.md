@@ -89,7 +89,7 @@ shop@r7
 
 migrate: Apply database migrations
   run: python manage.py migrate --noinput
-  timeout 10m, one run at a time
+  timeout 600s, one run at a time
   last run: 2026-11-01T10:02:13Z with r7, exited with status 0 after 3s
 
 add-user: Create an administrator
@@ -316,7 +316,7 @@ $ muructl command list shop
 ...
 clearsessions
   run: python manage.py clearsessions
-  timeout 10m
+  timeout 600s
   schedule: 30 3 * * * in Australia/Sydney; next 2026-11-02T16:30:00Z
 ```
 
