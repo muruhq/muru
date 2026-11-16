@@ -123,7 +123,10 @@ request was served:
   and gRPC clients. They are grouped by method, host and path, with how
   many times each endpoint was called and their total time, the most
   called first, so an endpoint called once per row of a query shows as
-  one line called many times; then each call in order, with when it
+  one line called many times. A path segment that names a row rather
+  than the endpoint, digits, a UUID or a long hexadecimal string, is
+  grouped as `{id}`, so `/stock/1` and `/stock/2` are one endpoint,
+  `/stock/{id}`; then each call in order, with when it
   started, how long it took, its method, its URL as the instrumentation
   records it, without its query, and its status, or the type of the
   exception it raised. A gRPC call reads as its service and method, with

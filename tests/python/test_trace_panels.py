@@ -181,7 +181,14 @@ def test_a_requests_calls_to_other_services_are_its_outbound_panel(recorded: str
         "path": "/authors",
         "status": 200,
     }
-    calls = [call(**author) for _ in range(3)]
+    calls = [call(**author) for _ in range(2)]
+
+    # Calls for each row group by the path with its ID as a placeholder.
+
+    for row in (7, 8):
+        calls.append(
+            call(**{**author, "path": f"/authors/{row}", "url": f"http://a/authors/{row}"})
+        )
 
     # A client built on another records twice; only the outer call counts.
 
@@ -204,14 +211,16 @@ def test_a_requests_calls_to_other_services_are_its_outbound_panel(recorded: str
 
     by_endpoint, each = taken(recorded)["outbound"][4]
     assert [row[:4] for row in by_endpoint[2]] == [
-        ["GET", "authors.test", "/authors", "4"],
+        ["GET", "authors.test", "/authors", "3"],
+        ["GET", "authors.test", "/authors/{id}", "2"],
         ["POST", "pay.test:8443", "/charge", "1"],
         ["gRPC", "stock:50051", "shop.Stock/Count", "1"],
     ]
-    assert len(each[2]) == 6
+    assert len(each[2]) == 7
+    assert each[2][2][3] == "http://a/authors/7"
     assert each[2][0][2:] == ["GET", "http://authors.test:80/authors", "200"]
-    assert each[2][4][2:] == ["POST", "https://pay.test:8443/charge", "ConnectionRefusedError"]
-    assert each[2][5][2:] == ["gRPC", "shop.Stock/Count", "OK"]
+    assert each[2][5][2:] == ["POST", "https://pay.test:8443/charge", "ConnectionRefusedError"]
+    assert each[2][6][2:] == ["gRPC", "shop.Stock/Count", "OK"]
 
 
 def test_a_request_with_no_calls_has_no_outbound_panel(recorded: str) -> None:
@@ -219,3 +228,13 @@ def test_a_request_with_no_calls_has_no_outbound_panel(recorded: str) -> None:
     run(trees, Event("call", "view"))
 
     assert "outbound" not in taken(recorded)
+
+
+def test_a_paths_id_like_segments_are_one_endpoint() -> None:
+    templated = _trace_panels._templated
+
+    assert templated("/stock/42") == "/stock/{id}"
+    assert templated("/users/3f2b8c1e-0d4a-4e6b-9a1c-2b3d4e5f6a7b/orders") == "/users/{id}/orders"
+    assert templated("/blobs/9f86d081884c7d659a2feaa0c55ad015") == "/blobs/{id}"
+    assert templated("/v2/stock") == "/v2/stock"
+    assert templated("/stock/deadbeef") == "/stock/deadbeef"

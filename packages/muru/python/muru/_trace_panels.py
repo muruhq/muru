@@ -18,9 +18,10 @@ panels:
 
 - **Outbound:** the calls to other services, from events whose category
   is ``external``, outermost only, so a client built on another counts
-  once, in two tables: grouped by method, host and path, the most called
-  first, so one endpoint called once per row shows as one line called
-  many times; and each call in order, with its method, URL as recorded
+  once, in two tables: grouped by method, host and path, with the path's
+  ID-like segments as ``{id}``, the most called first, so one endpoint
+  called once per row shows as one line called many times; and each call
+  in order, with its method, URL as recorded
   (without its query) and status, or the exception's type where it
   raised. A gRPC call reads as its service and method.
 
@@ -203,7 +204,7 @@ def _add(root: _Node, handles: _Handles) -> None:
     endpoints: dict[tuple[str, str, str], list[float]] = {}
 
     for call in calls:
-        endpoints.setdefault((call.method, call.host, call.path), []).append(call.took)
+        endpoints.setdefault((call.method, call.host, _templated(call.path)), []).append(call.took)
 
     by_endpoint = handles.outbound.table("By endpoint")
 
@@ -283,6 +284,21 @@ def _collect(
 
     for child in node.children:
         _collect(child, clock, queries, calls, failures, outbound)
+
+
+# A path segment that names one row rather than the endpoint: digits, a
+# UUID, or a long hexadecimal string (issue 720).
+
+_ID = re.compile(
+    r"^(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{16,})$",
+    re.IGNORECASE,
+)
+
+
+def _templated(path: str) -> str:
+    """Return a path with its ID-like segments as ``{id}``, so calls for each row group together."""
+
+    return "/".join("{id}" if _ID.match(segment) else segment for segment in path.split("/"))
 
 
 # The ports a URL's scheme implies, left out of the host it is grouped by.
