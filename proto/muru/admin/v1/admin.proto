@@ -1391,6 +1391,7 @@ message ConditionStatus {
   uint64 min_requests = 10;
   string unknown = 11;              // why it is unknown, when it is
   repeated ConditionTerm terms = 12; // each term of when, then of clear_when
+  uint64 pending_since_unix_ms = 13; // issue 727: since when the expression it waits on has held, while it waits out for or clear_for; 0 when it is not waiting
 }
 
 message ConditionTerm {

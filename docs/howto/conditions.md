@@ -151,6 +151,12 @@ condition shop-errors (applied)
   term        error_rate{app='shop',reason='app_error'} < 0.02 is 0.31
 ```
 
+A condition waiting out `for` is `pending` in the list, and `show` says
+how long `when` has held of the wait it needs, as `pending: when has
+held for 40s of 1m; resolved since 2026-11-02T05:40:12Z`. One firing and
+waiting out `clear_for` says so on the same line, as `firing since
+2026-11-02T05:42:20Z; clear_when has held for 2m of 5m`.
+
 Both take `--json`. Each change of state is an event, `condition.firing`
 or `condition.resolved`, with the condition's name as its subject and the
 figure of each term:

@@ -4129,6 +4129,7 @@ fn condition_message(status: &crate::conditions::Status) -> pb::ConditionStatus 
             .min_requests
             .unwrap_or(muru_config::condition::DEFAULT_MIN_REQUESTS),
         unknown: status.unknown.clone().unwrap_or_default(),
+        pending_since_unix_ms: status.pending_since_unix_ms.unwrap_or(0),
         terms: status
             .terms
             .iter()

@@ -5457,10 +5457,18 @@ pub async fn condition(command: ConditionCommand) -> anyhow::Result<()> {
         );
 
         for condition in &answer.conditions {
+            // Issue 727: one waiting out `for` to fire is pending.
+
+            let state = if condition.pending_since_unix_ms > 0 && condition.state != "firing" {
+                "pending"
+            } else {
+                condition.state.as_str()
+            };
+
             println!(
                 "{:<width$} {:<9} {:<21} {}",
                 condition.name,
-                condition.state,
+                state,
                 condition_since(condition),
                 condition.when
             );
@@ -5510,10 +5518,30 @@ fn condition_since(condition: &pb::ConditionStatus) -> String {
     }
 }
 
-/// A condition's state in words: unknown says why and what it holds.
+/// A condition's state in words: unknown says why and what it holds,
+/// and one waiting out `for` or `clear_for` says how long it has waited
+/// (issue 727).
 fn condition_state(condition: &pb::ConditionStatus) -> String {
+    let wait = condition_wait(condition, now_unix_ms());
+
     if condition.state != "unknown" {
-        return format!("{} since {}", condition.state, condition_since(condition));
+        let state = format!("{} since {}", condition.state, condition_since(condition));
+
+        return match wait {
+            Some(wait) if condition.state == "firing" => format!("{state}; {wait}"),
+            Some(wait) => format!("pending: {wait}; {state}"),
+            None => state,
+        };
+    }
+
+    // Before its first change, a condition whose `when` holds from its
+    // first figure has no state to show, only its wait.
+
+    if condition.unknown.is_empty() {
+        return match wait {
+            Some(wait) => format!("pending: {wait}"),
+            None => "unknown: no state yet".to_owned(),
+        };
     }
 
     if condition.held == "unknown" {
@@ -5526,6 +5554,35 @@ fn condition_state(condition: &pb::ConditionStatus) -> String {
             condition.unknown
         )
     }
+}
+
+/// How long the expression a condition waits on has held, against the
+/// wait it needs, as `when has held for 4s of 10s`; none when it is not
+/// waiting.
+fn condition_wait(condition: &pb::ConditionStatus, now_unix_ms: u64) -> Option<String> {
+    if condition.pending_since_unix_ms == 0 {
+        return None;
+    }
+
+    let held =
+        Duration::from_secs(now_unix_ms.saturating_sub(condition.pending_since_unix_ms) / 1000);
+    let firing = condition.state == "firing" || condition.held == "firing";
+
+    let (what, needed) = match (firing, condition.clear_when.is_empty()) {
+        (false, _) => ("when has held", &condition.r#for),
+        (true, false) => ("clear_when has held", &condition.clear_for),
+        (true, true) => ("when has been false", &condition.clear_for),
+    };
+
+    let needed = if needed.is_empty() { "0s" } else { needed };
+
+    let held = if held.is_zero() {
+        "0s".to_owned()
+    } else {
+        muru_config::format_duration(held)
+    };
+
+    Some(format!("{what} for {held} of {needed}"))
 }
 
 /// A figure to four significant digits.
@@ -10497,10 +10554,48 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 
 #[cfg(test)]
 mod tests {
+    use super::condition_wait;
     use super::limits_lines;
     use super::metric_samples;
     use super::overlay_table;
     use super::pb;
+
+    #[test]
+    fn a_condition_waiting_out_its_for_says_how_long() {
+        let mut condition = pb::ConditionStatus {
+            state: "unknown".to_owned(),
+            held: "unknown".to_owned(),
+            r#for: "10s".to_owned(),
+            clear_when: "x < 1".to_owned(),
+            clear_for: "1m".to_owned(),
+            pending_since_unix_ms: 100_000,
+            ..pb::ConditionStatus::default()
+        };
+        assert_eq!(
+            condition_wait(&condition, 104_500).as_deref(),
+            Some("when has held for 4s of 10s")
+        );
+
+        condition.state = "firing".to_owned();
+        assert_eq!(
+            condition_wait(&condition, 130_000).as_deref(),
+            Some("clear_when has held for 30s of 1m")
+        );
+
+        condition.clear_when.clear();
+        assert_eq!(
+            condition_wait(&condition, 130_000).as_deref(),
+            Some("when has been false for 30s of 1m")
+        );
+
+        assert_eq!(
+            condition_wait(&condition, 100_200).as_deref(),
+            Some("when has been false for 0s of 1m")
+        );
+
+        condition.pending_since_unix_ms = 0;
+        assert_eq!(condition_wait(&condition, 130_000), None);
+    }
 
     #[test]
     fn the_overlay_list_lines_up_however_long_a_state_is() {
