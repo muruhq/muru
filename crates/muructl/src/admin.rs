@@ -5738,42 +5738,69 @@ async fn list_overlays(socket: &SocketArgs, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<24} {:<10} {:<34} CHANGES",
-        "OVERLAY", "STATE", "TRIGGER"
-    );
-
-    for overlay in overlays {
-        let mut state = if overlay.state.is_empty() {
-            "idle".to_owned()
-        } else if overlay.active {
-            format!("active ({})", overlay.state)
-        } else {
-            overlay.state.clone()
-        };
-
-        if overlay.until_unix_ms > 0 {
-            state.push_str(&format!(" until {}", format_time(overlay.until_unix_ms)));
-        } else if overlay.starts_unix_ms > 0 {
-            state.push_str(&format!(" from {}", format_time(overlay.starts_unix_ms)));
-        }
-
-        let trigger = if overlay.condition.is_empty() {
-            overlay.trigger.clone()
-        } else {
-            format!("{}, {}", overlay.trigger, overlay.condition_state)
-        };
-
-        println!(
-            "{:<24} {:<10} {:<34} {}",
-            overlay.name,
-            state,
-            trigger,
-            overlay.changes.join(", ")
-        );
+    for line in overlay_table(&overlays) {
+        println!("{line}");
     }
 
     Ok(())
+}
+
+/// The lines of `muructl overlay list`: each column as wide as its widest
+/// value, and no narrower than it always was (issue 728).
+fn overlay_table(overlays: &[pb::OverlayInfo]) -> Vec<String> {
+    let rows: Vec<[String; 4]> = overlays.iter().map(overlay_row).collect();
+    let width = |column: usize, least: usize| {
+        rows.iter()
+            .map(|row| row[column].len())
+            .max()
+            .unwrap_or(0)
+            .max(least)
+    };
+    let (name, state, trigger) = (width(0, 24), width(1, 10), width(2, 34));
+    let mut lines = vec![format!(
+        "{:<name$} {:<state$} {:<trigger$} CHANGES",
+        "OVERLAY", "STATE", "TRIGGER"
+    )];
+
+    for row in &rows {
+        lines.push(format!(
+            "{:<name$} {:<state$} {:<trigger$} {}",
+            row[0], row[1], row[2], row[3]
+        ));
+    }
+
+    lines
+}
+
+/// An overlay's row in `muructl overlay list`: its name, its state, its
+/// trigger with its condition's state, and what it changes.
+fn overlay_row(overlay: &pb::OverlayInfo) -> [String; 4] {
+    let mut state = if overlay.state.is_empty() {
+        "idle".to_owned()
+    } else if overlay.active {
+        format!("active ({})", overlay.state)
+    } else {
+        overlay.state.clone()
+    };
+
+    if overlay.until_unix_ms > 0 {
+        state.push_str(&format!(" until {}", format_time(overlay.until_unix_ms)));
+    } else if overlay.starts_unix_ms > 0 {
+        state.push_str(&format!(" from {}", format_time(overlay.starts_unix_ms)));
+    }
+
+    let trigger = if overlay.condition.is_empty() {
+        overlay.trigger.clone()
+    } else {
+        format!("{}, {}", overlay.trigger, overlay.condition_state)
+    };
+
+    [
+        overlay.name.clone(),
+        state,
+        trigger,
+        overlay.changes.join(", "),
+    ]
 }
 
 /// The `muructl maintenance` subcommands (section 4.12).
@@ -10472,7 +10499,37 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 mod tests {
     use super::limits_lines;
     use super::metric_samples;
+    use super::overlay_table;
     use super::pb;
+
+    #[test]
+    fn the_overlay_list_lines_up_however_long_a_state_is() {
+        let overlays = [
+            pb::OverlayInfo {
+                name: "crawler-limits".to_owned(),
+                active: true,
+                state: "condition".to_owned(),
+                trigger: "condition crawler-surge".to_owned(),
+                condition: "crawler-surge".to_owned(),
+                condition_state: "firing".to_owned(),
+                changes: vec!["route shop".to_owned()],
+                ..pb::OverlayInfo::default()
+            },
+            pb::OverlayInfo {
+                name: "nightly".to_owned(),
+                trigger: "cron '0 2 * * *' for 1h UTC".to_owned(),
+                changes: vec!["route shop".to_owned()],
+                ..pb::OverlayInfo::default()
+            },
+        ];
+        let lines = overlay_table(&overlays);
+        let changes = lines[0].find("CHANGES").unwrap();
+        assert!(lines[1].starts_with("crawler-limits           active (condition) condition"));
+
+        for line in &lines[1..] {
+            assert_eq!(line.find("route shop"), Some(changes), "{lines:#?}");
+        }
+    }
 
     #[test]
     fn the_limits_are_printed_as_the_guide_shows_them() {
