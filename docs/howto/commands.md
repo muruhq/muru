@@ -472,3 +472,7 @@ refused there.
 
 Running migrations while two releases share a database takes some care;
 [database migrations](migrations.md) covers how.
+
+The tutorial [commands and migrations](../tutorials/commands-and-migrations.md)
+walks through declaring commands, a migration as a gate, detached runs
+and schedules with a small application.
