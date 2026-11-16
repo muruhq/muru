@@ -511,6 +511,14 @@ def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) 
         )
         assert page.body.decode() == f"<html><body><h1>Page</h1>{tag}</body></html>"
 
+        # HTML with no </body> gets the tag at its end only for a request
+        # that said it loads a document, not for a client that sends no
+        # Sec-Fetch-Dest (issue 719).
+
+        appended = server.get("/fragment", headers={"Sec-Fetch-Dest": "document"})
+        assert appended.body.startswith(b"<p>fragment</p><script src=")
+        assert server.get("/fragment").body == b"<p>fragment</p>"
+
         # A fetch from the page is left alone, and a trusted proxy's prefix
         # goes in front of the script's address.
 

@@ -48,6 +48,11 @@ puts it into the page's body all the same:
 
 It goes into a page a browser loads as a document, so `fetch()` and htmx
 requests, which say otherwise in `Sec-Fetch-Dest`, are left as they are.
+A client that sends no `Sec-Fetch-Dest`, such as curl, `requests` or the
+application calling itself, gets the tag before a `</body>`, but a
+response without one, such as a fragment of HTML, is left as it came:
+the tag goes at the end only for a request that said
+`Sec-Fetch-Dest: document`, as browsers do.
 Muru never changes:
 
 - a response to anything but GET, or one whose status is 204, 206 or

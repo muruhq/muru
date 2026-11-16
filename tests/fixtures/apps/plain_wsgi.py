@@ -79,6 +79,12 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
         start_response("303 See Other", [("Location", "/page"), ("Content-Length", "0")])
         return [b""]
 
+    if path == "/fragment":
+        # HTML with no </body>, as an error page or a fragment is.
+
+        start_response("200 OK", [("Content-Type", "text/html")])
+        return [b"<p>fragment</p>"]
+
     if path == "/page":
         # An HTML page, in two pieces, for the development toolbar.
 

@@ -2175,7 +2175,8 @@ async fn serve<I>(
                             dashboard.as_deref(),
                             nonce.as_deref(),
                         );
-                        response = toolbar::insert(response, tag);
+                        let append = toolbar::said_document(&parts.headers);
+                        response = toolbar::insert(response, tag, append);
                     }
                     Err(toolbar::Skip::Policy) => {
                         if shared.warned.first(parts.uri.path()) {

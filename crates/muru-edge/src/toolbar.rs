@@ -589,10 +589,27 @@ pub fn tag(prefix: &str, request_id: &str, dashboard: Option<&str>, nonce: Optio
     Bytes::from(tag)
 }
 
-/// Insert `tag` before the page's first `</body>`, or at its end when it
-/// has none, changing the headers that no longer hold: the length goes,
-/// and a strong ETag is made weak.
-pub fn insert(response: Response<ResponseBody>, tag: Bytes) -> Response<ResponseBody> {
+/// Whether a request said it loads a document (`Sec-Fetch-Dest:
+/// document`), as every current browser does for a navigation, rather
+/// than sending no such header, as a client that is not a browser does.
+pub fn said_document(request: &HeaderMap) -> bool {
+    request
+        .get("sec-fetch-dest")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|dest| dest.eq_ignore_ascii_case("document"))
+}
+
+/// Insert `tag` before the page's first `</body>`, or, with `append`, at
+/// its end when it has none, changing the headers that no longer hold:
+/// the length goes, and a strong ETag is made weak. `append` is for a
+/// request that said it loads a document (issue 719): a client that
+/// sends no `Sec-Fetch-Dest` may be reading an HTML fragment, which a
+/// tag at its end would change.
+pub fn insert(
+    response: Response<ResponseBody>,
+    tag: Bytes,
+    append: bool,
+) -> Response<ResponseBody> {
     let (mut parts, body) = response.into_parts();
     parts.headers.remove(CONTENT_LENGTH);
 
@@ -613,6 +630,7 @@ pub fn insert(response: Response<ResponseBody>, tag: Bytes) -> Response<Response
             tag: Some(tag),
             held: BytesMut::new(),
             passed: false,
+            append,
             trailers: None,
             ended: false,
         }),
@@ -631,6 +649,8 @@ struct Inserting {
     /// Whether any of the body has come through, so an empty body stays
     /// empty.
     passed: bool,
+    /// Whether a body with no `</body>` gets the tag at its end.
+    append: bool,
     trailers: Option<HeaderMap>,
     ended: bool,
 }
@@ -683,6 +703,7 @@ impl Body for Inserting {
                 // browser puts into the document's body.
 
                 if this.passed
+                    && this.append
                     && let Some(tag) = this.tag.take()
                 {
                     this.held.extend_from_slice(&tag);
@@ -796,7 +817,11 @@ mod tests {
     }
 
     async fn inserted(chunks: &[&'static str]) -> String {
-        let response = insert(page(chunks), Bytes::from_static(b"<TAG>"));
+        appended(chunks, true).await
+    }
+
+    async fn appended(chunks: &[&'static str], append: bool) -> String {
+        let response = insert(page(chunks), Bytes::from_static(b"<TAG>"), append);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(body.to_vec()).unwrap()
     }
@@ -834,6 +859,29 @@ mod tests {
         assert_eq!(inserted(&["<html>", "</html>"]).await, "<html></html><TAG>");
         assert_eq!(inserted(&[]).await, "");
         assert_eq!(inserted(&[""]).await, "");
+
+        // Only for a request that said it loads a document: a client that
+        // sends no Sec-Fetch-Dest may be reading a fragment (issue 719).
+
+        assert_eq!(appended(&["4"], false).await, "4");
+        assert_eq!(
+            appended(&["<body>hi</bo", "dy>"], false).await,
+            "<body>hi<TAG></body>"
+        );
+    }
+
+    #[test]
+    fn only_a_request_that_said_so_loads_a_document() {
+        let dest = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-dest", HeaderValue::from_static(value));
+            headers
+        };
+
+        assert!(said_document(&dest("document")));
+        assert!(said_document(&dest("Document")));
+        assert!(!said_document(&dest("empty")));
+        assert!(!said_document(&HeaderMap::new()));
     }
 
     #[test]
@@ -845,7 +893,7 @@ mod tests {
         response
             .headers_mut()
             .insert(ETAG, HeaderValue::from_static("\"abc\""));
-        let changed = insert(response, Bytes::from_static(b"<TAG>"));
+        let changed = insert(response, Bytes::from_static(b"<TAG>"), true);
         assert!(changed.headers().get(CONTENT_LENGTH).is_none());
         assert_eq!(changed.headers().get(ETAG).unwrap(), "W/\"abc\"");
     }
