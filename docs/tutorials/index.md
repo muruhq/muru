@@ -16,5 +16,6 @@ from-gunicorn
 first-django-site
 scaling-under-load
 a-slow-request
+debugging-a-page
 two-sites-on-one-node
 ```

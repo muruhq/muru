@@ -13,6 +13,10 @@ All of this is part of development mode: under `--allow-public`,
 `muructl serve` and the daemon, there is no toolbar, responses carry
 neither header and no records are kept.
 
+The tutorial [debugging a page](../tutorials/debugging-a-page.md) uses
+the toolbar and tracing to find and fix a page's faults, one panel at a
+time.
+
 ## The toolbar on the page
 
 Turn the toolbar on for a run with `--toolbar`:
