@@ -70,12 +70,25 @@ def test_the_responding_to_traffic_tutorial(tmp_path: Path) -> None:
     daemon = start_daemon(tmp_path / "daemon")
     url = f"http://127.0.0.1:{daemon.port}/"
 
-    def load(seconds: int, crawl: int) -> subprocess.Popen[str]:
-        return subprocess.Popen(
-            [sys.executable, str(project / "load.py"), str(seconds), str(crawl), url],
+    # Issue 731: each load sends the people's requests for longer than
+    # any step needs, since a condition with no traffic has no figure and
+    # holds its state; a step waits for what it shows while the load
+    # runs, then stops the load and reads what it printed.
+
+    loads: list[subprocess.Popen[str]] = []
+
+    def load(crawl: int) -> subprocess.Popen[str]:
+        running = subprocess.Popen(
+            [sys.executable, str(project / "load.py"), "60", str(crawl), url],
             stdout=subprocess.PIPE,
             text=True,
         )
+        loads.append(running)
+        return running
+
+    def stop(running: subprocess.Popen[str]) -> str:
+        running.terminate()
+        return running.communicate(timeout=10)[0]
 
     def show() -> str:
         return text(daemon, "condition", "show", "crawler-surge")
@@ -96,14 +109,14 @@ def test_the_responding_to_traffic_tutorial(tmp_path: Path) -> None:
 
         text(daemon, "apply", "-f", str(project / "watch.toml"))
         assert "crawler-surge unknown   -" in text(daemon, "condition", "list")
-        running = load(18, 8)
+        running = load(8)
         wait_for(lambda: "state       pending: when has held for" in show(), every=0.25)
         assert "crawler-surge pending" in text(daemon, "condition", "list")
         wait_for(lambda: "state       firing since" in show())
         assert "is 0.6" in show()
-        output = running.communicate()[0]
-        assert " x 429" not in output, output
         wait_for(lambda: "state       resolved since" in show())
+        output = stop(running)
+        assert " x 429" not in output, output
         events = text(daemon, "events")
         assert "condition.firing     crawler-surge            firing, when held for 3s" in events
         assert "condition.resolved   crawler-surge            resolved, clear for 3s" in events
@@ -114,13 +127,13 @@ def test_the_responding_to_traffic_tutorial(tmp_path: Path) -> None:
         applied = text(daemon, "apply", "-f", str(project / "respond.toml"))
         assert "create-overlay  overlay crawler-response created" in applied
         assert "crawler-response         idle       condition crawler-surge" in overlays()
-        running = load(18, 8)
+        running = load(8)
         wait_for(lambda: "active (condition) condition crawler-surge, firing" in overlays())
-        output = running.communicate()[0]
+        wait_for(lambda: "cooldown until" in overlays())
+        output = stop(running)
         last = output.splitlines()[-1]
         assert "x 429" in last.split("crawlers")[1], output
         assert "x 429" not in last.split("crawlers")[0], output
-        wait_for(lambda: "cooldown until" in overlays())
         events = text(daemon, "events")
         assert "overlay crawler-response activated: its condition crawler-surge is firing" in events
         assert "overlay crawler-response ended: its condition crawler-surge resolved" in events
@@ -128,11 +141,11 @@ def test_the_responding_to_traffic_tutorial(tmp_path: Path) -> None:
         # A burst inside the cooldown is skipped, and the cooldown
         # outlasts it.
 
-        running = load(12, 6)
+        running = load(6)
         wait_for(lambda: "overlay.skipped" in text(daemon, "events"))
         assert "its cooldown after it last ended lasts until" in text(daemon, "events")
-        running.communicate()
         wait_for(lambda: "state       resolved since" in show())
+        stop(running)
         assert text(daemon, "events").count("overlay crawler-response activated") == 1
         wait_for(lambda: "cooldown" not in overlays(), timeout=30)
 
@@ -150,10 +163,11 @@ def test_the_responding_to_traffic_tutorial(tmp_path: Path) -> None:
         ), warned
         applied = text(daemon, "apply", "-f", str(project / "snapshot.toml"))
         assert "warning" not in applied, applied
-        running = load(16, 16)
-        wait_for(lambda: "latched, resolved" in overlays())
-        assert running.poll() is None, "the crawlers stopped before the condition resolved"
-        output = running.communicate()[0]
+        running = load(60)
+        wait_for(
+            lambda: "active (condition) condition crawler-surge, latched, resolved" in overlays()
+        )
+        output = stop(running)
         assert " x 429" not in output, output
         assert "muru: overlay crawler-response ended by hand" in text(
             daemon, "overlay", "end", "crawler-response"
@@ -163,7 +177,7 @@ def test_the_responding_to_traffic_tutorial(tmp_path: Path) -> None:
 
         text(daemon, "apply", "-f", str(project / "respond.toml"))
         text(daemon, "apply", "-f", str(project / "capacity.toml"))
-        running = load(16, 12)
+        running = load(30)
         wait_for(
             lambda: (
                 "scheduled: 3-4 workers, no scale-in from crawler-capacity"
@@ -178,6 +192,11 @@ def test_the_responding_to_traffic_tutorial(tmp_path: Path) -> None:
         assert "scheduled: 2-2 workers, no scale-in from crawler-capacity" in status, status
         assert "capped: at most 2 workers from shop:cap" in status, status
         assert "muru: overlay shop:cap ended by hand" in text(daemon, "overlay", "end", "shop:cap")
-        running.communicate()
+        stop(running)
     finally:
+        for running in loads:
+            if running.poll() is None:
+                running.kill()
+                running.communicate()
+
         daemon.stop()
