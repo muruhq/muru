@@ -35,6 +35,10 @@ gives the same record as JSON, as `muructl debug request ID --json`
 prints it. [Inspecting requests in development](toolbar.md) describes
 the record.
 
+
+On every page, "Muru" in the title banner goes back to the front page:
+the run's page under `muructl run`, the node's under the daemon.
+
 ## Under the daemon
 
 The daemon serves its dashboard when `--dashboard ADDRESS` on `muructl
