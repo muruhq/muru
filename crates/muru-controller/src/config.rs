@@ -143,6 +143,9 @@ pub enum Action {
         overlay: Box<Overlay>,
         /// Whether it is new rather than changed.
         new: bool,
+        /// What the change clears of what held the overlay back, a skip
+        /// above all, so its next window judges it again (issue 755).
+        cleared: Option<&'static str>,
     },
     /// Drop an overlay, ending it if it is active (prune).
     RemoveOverlay {
@@ -2080,6 +2083,12 @@ fn plan_overlays(
 ) {
     let stored: BTreeMap<String, Overlay> =
         store.overlays().unwrap_or_default().into_iter().collect();
+    let states: BTreeMap<String, crate::model::OverlayState> = store
+        .overlay_states()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|state| (state.name.clone(), state))
+        .collect();
     let stored_routes = store.routes().unwrap_or_default();
     let mut route_names: BTreeMap<String, String> = document
         .route
@@ -2253,14 +2262,20 @@ fn plan_overlays(
 
         match stored.get(name) {
             Some(recorded) if recorded == overlay => plan.unchanged += 1,
-            recorded => plan.changes.push(Change {
-                action: Action::PutOverlay {
-                    name: name.clone(),
-                    overlay: Box::new(overlay.clone()),
-                    new: recorded.is_none(),
-                },
-                detail: describe_overlay(overlay),
-            }),
+            recorded => {
+                let cleared = recorded.and_then(|recorded| {
+                    crate::overlays::cleared_by_change(recorded, overlay, states.get(name))
+                });
+                plan.changes.push(Change {
+                    action: Action::PutOverlay {
+                        name: name.clone(),
+                        overlay: Box::new(overlay.clone()),
+                        new: recorded.is_none(),
+                        cleared,
+                    },
+                    detail: describe_overlay(overlay),
+                });
+            }
         }
     }
 
@@ -2820,8 +2835,20 @@ fn write(
             new,
         } => writes.put_upstream(name, upstream).map(|()| made(*new))?,
         Action::RemoveUpstream { name } => writes.delete_upstream(name).map(|()| "removed")?,
-        Action::PutOverlay { name, overlay, new } => {
-            writes.put_overlay(name, overlay).map(|()| made(*new))?
+        Action::PutOverlay {
+            name,
+            overlay,
+            new,
+            cleared,
+        } => {
+            writes.put_overlay(name, overlay)?;
+
+            let Some(cleared) = cleared else {
+                return Ok(Some(made(*new).to_owned()));
+            };
+
+            writes.clear_overlay_hold(name)?;
+            return Ok(Some(format!("{}; {cleared}", made(*new))));
         }
         Action::RemoveOverlay { name } => writes.delete_overlay(name).map(|()| "removed")?,
         Action::PutCondition {

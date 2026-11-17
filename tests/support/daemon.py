@@ -28,27 +28,11 @@ from support import server as support
 SHOP = support.ROOT / "tests" / "fixtures" / "projects" / "shop"
 FACTORY = support.ROOT / "tests" / "fixtures" / "projects" / "factory"
 
-# The lines of each log a failing test's report keeps, from its end.
-
-LOG_TAIL_LINES = 200
-
 
 def stamp(at: float) -> str:
     """A wall-clock time as the daemon's logs write it, in UTC."""
 
     return datetime.fromtimestamp(at, UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-
-
-def tail(path: Path) -> str:
-    """The end of a log, saying how much of it was left out."""
-
-    lines = path.read_text(errors="replace").splitlines()
-
-    if len(lines) <= LOG_TAIL_LINES:
-        return "\n".join(lines)
-
-    left_out = len(lines) - LOG_TAIL_LINES
-    return "\n".join([f"... {left_out} earlier lines", *lines[-LOG_TAIL_LINES:]])
 
 
 @dataclass
@@ -380,7 +364,9 @@ class Daemon:
 
         for path in logs:
             if path.is_file():
-                sections.append((f"daemon {where}: {path.relative_to(self.base)}", tail(path)))
+                sections.append(
+                    (f"daemon {where}: {path.relative_to(self.base)}", support.tail(path))
+                )
 
         return sections
 

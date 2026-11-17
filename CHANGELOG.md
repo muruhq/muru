@@ -9,6 +9,21 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a31 (2026-11-18)
+
+### Changed
+
+- An overlay whose `preconditions.probe` fails names the release it probed and the host it asked at, as in "its probe of shop@r2 failed: /healthz (as a preview, at host shop) answered 503 Service Unavailable", rather than the edge's listener. ([#758](https://github.com/muruhq/muru/issues/758))
+- `muructl overlay promote` makes the release an overlay pins the application's serving release, as a deploy would, rather than writing a pin into the route that later deploys never moved and the next apply undid. It refuses an overlay that pins only some of the application's routes, a client class's route, or splits traffic, and it prints what to put in the applied files for the next apply to keep the promotion. `muructl release list` and `muructl scale status` show a release's share of each route that splits traffic on a `traffic:` line. ([#759](https://github.com/muruhq/muru/issues/759))
+
+### Fixed
+
+- An apply that changes a scheduled overlay skipped by its preconditions clears the skip, so the overlay is judged again at its next window; one that changes its trigger clears an end by hand too. `muructl overlay list` shows a skip with no end as lasting until the overlay is activated by hand or changed. ([#755](https://github.com/muruhq/muru/issues/755))
+- `overlay.warming` gives the time until the window to the nearest second, and minute, so a lead of `1m` reads "its window begins in 1m" rather than "in 59s". ([#756](https://github.com/muruhq/muru/issues/756))
+- `muructl app list` marks an application an active overlay put in maintenance as `[maintenance by overlay NAME]`, and one an overlay keeps out of it as `[maintenance off by overlay NAME]`; the dashboard's overview names the overlay too, and the JSON gives it as `maintenance_overlay`. ([#757](https://github.com/muruhq/muru/issues/757))
+- `muructl logs --access` shows `class=` for a request whose client class is not `default`, and `redirects=`, `retried=1` and `handoff=` where the edge's own text lines show them. ([#760](https://github.com/muruhq/muru/issues/760))
+
+
 ## 0.1.0a30 (2026-11-17)
 
 ### Added

@@ -349,13 +349,13 @@ impl Admin for Service {
         _: Request<pb::ListAppsRequest>,
     ) -> Result<Response<pb::ListAppsResponse>, Status> {
         let apps = self.handle.store.apps().map_err(internal)?;
-        let maintenance = self.handle.store.maintenance().map_err(internal)?;
+        let maintenance = app_maintenance(&self.handle.store).map_err(internal)?;
         Ok(Response::new(pb::ListAppsResponse {
             apps: apps
                 .into_iter()
                 .map(|app| {
-                    let on = maintenance.iter().any(|(name, _)| *name == app.name);
-                    app_message(app, on)
+                    let maintenance = maintenance(&app.name);
+                    app_message(app, maintenance)
                 })
                 .collect(),
         }))
@@ -370,14 +370,8 @@ impl Admin for Service {
             .store
             .app(&request.into_inner().name)
             .map_err(not_found)?;
-        let on = self
-            .handle
-            .store
-            .maintenance()
-            .map_err(internal)?
-            .iter()
-            .any(|(name, _)| *name == app.name);
-        Ok(Response::new(app_message(app, on)))
+        let maintenance = app_maintenance(&self.handle.store).map_err(internal)?(&app.name);
+        Ok(Response::new(app_message(app, maintenance)))
     }
 
     async fn dashboard_login(
@@ -727,9 +721,30 @@ impl Admin for Service {
             .store
             .releases(app.as_deref())
             .map_err(internal)?;
+        let traffic = traffic_lines(&self.handle.store).map_err(internal)?;
         let mut releases: Vec<pb::Release> = releases
             .into_iter()
-            .map(|release| release_message(release, &self.handle))
+            .map(|release| {
+                let mut message = release_message(release, &self.handle);
+                message.traffic = traffic
+                    .get(&(message.app.clone(), message.id.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+
+                // A held release a route sends traffic to is serving that
+                // share, which the traffic line says (issue 759).
+
+                let shared = message
+                    .traffic
+                    .split(' ')
+                    .any(|word| word.ends_with('%') && word != "0%");
+
+                if shared && message.message == "held: not serving" {
+                    message.message.clear();
+                }
+
+                message
+            })
             .collect();
 
         // Walking the environments is only done when asked for.
@@ -2003,11 +2018,14 @@ impl Admin for Service {
             })
             .await
             .map_err(|_| Status::unavailable("the daemon is stopping"))?;
-        let message = done_rx
+        let outcome = done_rx
             .await
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
-        Ok(Response::new(pb::ControlOverlayResponse { message }))
+        Ok(Response::new(pb::ControlOverlayResponse {
+            message: outcome.message,
+            files: outcome.files,
+        }))
     }
 
     async fn preview_overlay(
@@ -2344,7 +2362,12 @@ impl Admin for Service {
             .await
             .map_err(|_| Status::unavailable(STOPPING))?
             .map_err(Status::failed_precondition)?;
-        Ok(Response::new(scale_message(&request.app, &release, groups)))
+        let mut status = scale_message(&request.app, &release, groups);
+        status.traffic = traffic_lines(&self.handle.store)
+            .map_err(internal)?
+            .remove(&(request.app.clone(), release))
+            .unwrap_or_default();
+        Ok(Response::new(status))
     }
 
     async fn list_hosts(
@@ -3559,7 +3582,51 @@ fn report_message(plan: &Plan) -> pb::ConfigReport {
     }
 }
 
-fn app_message(app: crate::model::App, maintenance: bool) -> pb::App {
+/// Issue 759: how the routes that split traffic, with the active
+/// overlays laid over them, share it by application and release, where
+/// that differs from what serving implies.
+fn traffic_lines(
+    store: &crate::store::Store,
+) -> Result<std::collections::BTreeMap<(String, String), String>, crate::store::StoreError> {
+    let overlays = store.overlays()?;
+    let states = store.overlay_states()?;
+    let serving = store
+        .apps()?
+        .into_iter()
+        .filter_map(|app| app.current.map(|current| (app.name, current)))
+        .collect();
+    Ok(crate::overlays::traffic_lines(
+        &store.routes()?,
+        &crate::overlays::ordered(&overlays, &states),
+        &serving,
+    ))
+}
+
+/// Section 4.12 (issue 757): each application's maintenance as the edge
+/// serves it, by name: whether it is on, and the active overlay whose
+/// setting is in force, if one is, over `muructl maintenance`'s.
+fn app_maintenance(
+    store: &crate::store::Store,
+) -> Result<impl Fn(&str) -> (bool, String) + use<>, crate::store::StoreError> {
+    let base: std::collections::BTreeSet<String> = store
+        .maintenance()?
+        .into_iter()
+        .map(|(app, _)| app)
+        .collect();
+    let overlays = store.overlays()?;
+    let states = store.overlay_states()?;
+    let settings =
+        crate::overlays::maintenance_settings(&crate::overlays::ordered(&overlays, &states));
+
+    Ok(move |app: &str| {
+        settings
+            .get(app)
+            .cloned()
+            .unwrap_or_else(|| (base.contains(app), String::new()))
+    })
+}
+
+fn app_message(app: crate::model::App, (maintenance, by): (bool, String)) -> pb::App {
     pb::App {
         name: app.name,
         current_release: app.current.unwrap_or_default(),
@@ -3570,6 +3637,7 @@ fn app_message(app: crate::model::App, maintenance: bool) -> pb::App {
         group: app.group.unwrap_or_default(),
         umask: app.umask.unwrap_or_default(),
         maintenance,
+        maintenance_overlay: by,
         priority: app.priority,
     }
 }
@@ -3669,6 +3737,7 @@ pub fn scale_message(
     pb::ScaleStatus {
         app: app.to_owned(),
         release: release.to_owned(),
+        traffic: String::new(),
         groups: groups
             .into_iter()
             .map(|(group, status)| pb::GroupScale {
@@ -3981,6 +4050,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
     };
 
     pb::Release {
+        traffic: String::new(),
         app: release.app,
         id: release.id,
         state: release.state.as_str().to_owned(),

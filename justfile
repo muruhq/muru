@@ -161,8 +161,18 @@ version:
 bump version:
     #!/usr/bin/env bash
     set -euo pipefail
-    [[ "{{version}}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([a-z0-9.+-]*)?$ ]] || { echo "not a version: {{version}}" >&2; exit 1; }
-    sed -i.bak -E 's/^version = "[^"]+"/version = "{{version}}"/' Cargo.toml && rm Cargo.toml.bak
+    version="{{version}}"
+
+    # Cargo wants a semver pre-release (0.1.0-alpha.31). The Python form of
+    # the same version (0.1.0a31, 0.1.0b2, 0.1.0rc1) is translated to it.
+
+    if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(a|b|rc)([0-9]+)$ ]]; then
+        case "${BASH_REMATCH[2]}" in a) pre=alpha ;; b) pre=beta ;; rc) pre=rc ;; esac
+        version="${BASH_REMATCH[1]}-$pre.${BASH_REMATCH[3]}"
+    fi
+
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]] || { echo "not a version: {{version}} (give 1.2.3, 1.2.3-alpha.4 or 1.2.3a4)" >&2; exit 1; }
+    sed -i.bak -E "s/^version = \"[^\"]+\"/version = \"$version\"/" Cargo.toml && rm Cargo.toml.bak
     if command -v cargo >/dev/null 2>&1 && [[ -f Cargo.lock ]]; then cargo update --workspace --offline >/dev/null; fi
     echo "version is now $(just version)"
 

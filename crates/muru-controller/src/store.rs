@@ -1815,6 +1815,16 @@ impl Writes<'_> {
         Ok(())
     }
 
+    /// Forget what holds an overlay back while it is not active: a skip,
+    /// an advisory window or an end by hand (issue 755).
+    pub fn clear_overlay_hold(&self, name: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM overlay_state WHERE name = ?1 AND active = 0",
+            [name],
+        )?;
+        Ok(())
+    }
+
     /// Create or replace a route, identified by its host and key: the
     /// path, and the client classes it is for (section 4.14).
     pub fn put_route(&self, route: &Route) -> Result<(), StoreError> {

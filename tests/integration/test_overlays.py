@@ -205,7 +205,9 @@ trigger = {{ schedule = {{ start = '{at(3)}', end = '{at(7)}' }} }}
     assert site.request().status == 200
     assert eventually(lambda: site.request().status == 503)
     assert b"maintenance" in site.request().body
+    assert "[maintenance by overlay window]" in site.daemon.muructl("app", "list").stdout
     assert eventually(lambda: site.request().status == 200)
+    assert "[maintenance" not in site.daemon.muructl("app", "list").stdout
 
     events = site.daemon.muructl("events").stdout
     assert "its schedule's window began" in events
@@ -333,6 +335,30 @@ latch = true
     assert site.seen()["mode"] is None
 
 
+def test_a_change_clears_a_skip_so_the_new_window_judges_it_again(site: Site) -> None:
+    # Issue 755: a window with no end skips for good, until an apply
+    # changes the overlay.
+
+    def retry(start: str, release: str) -> str:
+        return f"""
+[overlay.retry]
+routes.root = {{ mode = 'retried' }}
+trigger = {{ schedule = {{ start = '{start}' }} }}
+preconditions = {{ release_ready = '{release}' }}
+"""
+
+    site.apply(retry(at(1), "r9"), prune=True)
+    assert eventually(lambda: "skipped (activate it by hand" in site.overlay("list"))
+
+    applied = site.apply(retry(at(2), "r2"), prune=True)
+    assert "its skip is cleared" in applied
+    assert eventually(lambda: site.seen()["mode"] == "retried")
+    assert "active (schedule)" in site.overlay("list")
+
+    site.overlay("end", "retry")
+    assert site.seen()["mode"] is None
+
+
 def test_warm_up_starts_a_release_ahead_of_its_window(site: Site) -> None:
     # The apply holds r1 beside r2, which serves, so it is stopped first
     # for the warm-up to start.
@@ -351,7 +377,7 @@ warm_up = {{ lead = '2h', start_release = 'r1' }}
     assert eventually(lambda: site.state("r1") == "ready", timeout=30)
     assert site.seen()["release"] == "r2"
     events = site.daemon.muructl("events").stdout
-    assert "warming up: its window begins in 59m" in events
+    assert "warming up: its window begins in 1h" in events
     assert "starting clients@r1" in events
 
     # Without the overlay nothing keeps it running.
@@ -388,3 +414,32 @@ apps.elsewhere = { maintenance = true }
     assert "overlays clash, read-only all set routes.root.mode" in refused
     assert "overlay nowhere: no route is named missing" in refused
     assert "overlay nowhere: no application named elsewhere" in refused
+
+
+def test_promoting_a_pin_makes_the_release_serve(site: Site) -> None:
+    # Issue 759: last, since it changes the serving release. While the
+    # pin is active, release list says where the route's traffic goes.
+
+    site.apply(OVERLAYS)
+    site.overlay("activate", "pinned")
+    assert eventually(lambda: site.seen()["release"] == "r1")
+    listed = site.daemon.muructl("release", "list", "clients").stdout
+    assert "traffic: root 100% (overlay pinned)" in listed, listed
+    assert "traffic: none, root sends 100% to r1 (overlay pinned)" in listed, listed
+    assert "held: not serving" not in listed, listed
+
+    promoted = site.overlay("promote", "pinned")
+    assert "clients@r1 serves in place of clients@r2, which is retained" in promoted, promoted
+    assert '[app.clients]\nserving = "r1"' in promoted, promoted
+    assert {row["release"] for row in site.daemon.releases("clients") if row["serving"]} == {
+        "clients@r1"
+    }
+    assert "traffic:" not in site.daemon.muructl("release", "list", "clients").stdout
+
+    # The route has no pin of its own, so the files, which name no
+    # serving release, keep the promotion when applied again.
+
+    exported = tomllib.loads(site.daemon.muructl("config", "export").stdout)
+    assert [route.get("traffic") for route in exported["route"]] == [None]
+    site.apply(OVERLAYS)
+    assert site.seen()["release"] == "r1"
