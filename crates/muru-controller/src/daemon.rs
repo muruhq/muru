@@ -672,8 +672,8 @@ pub enum Command {
         action: OverlayAction,
         /// Whether the signed webhook asks, rather than a person.
         external: bool,
-        /// Answered with a sentence about what happened.
-        done: oneshot::Sender<Result<String, String>>,
+        /// Answered with what happened.
+        done: oneshot::Sender<Result<OverlayOutcome, String>>,
     },
     /// Section 7.5: a temporary schedule raising a worker group's floor,
     /// and its ceiling with it, or capping it (issue 712), until a time.
@@ -693,6 +693,16 @@ pub enum Command {
         /// Answered with a sentence about what happened.
         done: oneshot::Sender<Result<String, String>>,
     },
+}
+
+/// What came of what was asked of an overlay (section 9.10).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OverlayOutcome {
+    /// A sentence about what happened.
+    pub message: String,
+    /// After a promotion, what the applied files must say for the next
+    /// apply to keep it, as TOML blocks (issue 759).
+    pub files: Vec<String>,
 }
 
 /// What a person asks of an overlay (section 9.10).
@@ -4573,7 +4583,7 @@ impl Daemon {
         name: &str,
         action: OverlayAction,
         external: bool,
-    ) -> Result<String, String> {
+    ) -> Result<OverlayOutcome, String> {
         let overlay = self
             .store
             .overlays()
@@ -4669,59 +4679,129 @@ impl Daemon {
                     return Err(format!("overlay {name} is not active; activate it first"));
                 }
 
-                // Its changes become the base: the routes as the overlay
-                // leaves them, with those it adds for client classes, and
-                // its maintenance settings.
-
-                let pair = (name.to_owned(), overlay.clone());
-                let before = self.store.routes().unwrap_or_default();
-                let mut changed = before.clone();
-                crate::overlays::apply_routes(&mut changed, &[&pair]);
-
-                for route in changed.iter().filter(|route| !before.contains(route)) {
-                    self.store
-                        .put_route(route)
-                        .map_err(|error| error.to_string())?;
-                }
-
-                for (app, change) in &overlay.apps {
-                    if let Some(on) = change.maintenance {
-                        let since = on.then_some(now);
-                        self.store
-                            .set_maintenance(app, since)
-                            .map_err(|error| error.to_string())?;
-
-                        match since {
-                            Some(since) => {
-                                self.maintenance.entry(app.clone()).or_insert(since);
-                            }
-                            None => {
-                                self.maintenance.remove(app);
-                            }
-                        }
-                    }
-                }
-
-                let held = crate::model::OverlayState {
-                    name: name.to_owned(),
-                    active: false,
-                    source: "promoted".to_owned(),
-                    since_unix_ms: now,
-                    until_unix_ms: None,
-                };
-                self.store
-                    .set_overlay_state(name, Some(&held))
-                    .map_err(|error| error.to_string())?;
-                let detail = "promoted: its changes are now the base configuration".to_owned();
-                self.events
-                    .emit("overlay.promoted", &subject, "notice", &detail);
-                detail
+                return self.promote_overlay(name, &overlay).await;
             }
         };
 
         self.reconcile_traffic().await;
         self.push_snapshot().await?;
-        Ok(message)
+        Ok(OverlayOutcome {
+            message,
+            files: Vec::new(),
+        })
+    }
+
+    /// Section 9.10: fold an active overlay into the base and end it for
+    /// good. Issue 759: a pin makes the pinned release its application's
+    /// serving release, the one that served before drained and retained
+    /// as after a deploy, so later deploys replace it; the routes take
+    /// the rest of what the overlay sets, and the applications its
+    /// maintenance. A split is refused, being a route's traffic policy.
+    /// The outcome carries what the applied files must say for the next
+    /// apply to keep the promotion.
+    async fn promote_overlay(
+        &mut self,
+        name: &str,
+        overlay: &muru_config::Overlay,
+    ) -> Result<OverlayOutcome, String> {
+        let refused = |why: String| format!("overlay {name} was not promoted: {why}");
+        let routes = self.store.routes().unwrap_or_default();
+        let promotion = crate::overlays::promotion(name, overlay, &routes).map_err(refused)?;
+
+        for (app, release) in &promotion.serving {
+            if let Ok(Some(rollout)) = self.store.active_rollout(app) {
+                return Err(refused(format!(
+                    "a rollout of {app}@{} is under way; promote or abort it first",
+                    rollout.candidate
+                )));
+            }
+
+            if !self.running.contains_key(&(app.clone(), release.clone())) {
+                return Err(refused(format!("{app}@{release} is not running")));
+            }
+        }
+
+        let now = now_unix_ms();
+
+        // The switch first, while the pin still sends the traffic there,
+        // so the edge never sees the old release serve again.
+
+        let mut switched = Vec::new();
+
+        for (app, release) in &promotion.serving {
+            let current = self
+                .store
+                .app(app)
+                .map_err(|error| error.to_string())?
+                .current;
+
+            if current.as_deref() == Some(release.as_str()) {
+                continue;
+            }
+
+            self.promote_switch(app, release, Retention::default())
+                .await?;
+            switched.push(match current {
+                Some(current) => {
+                    format!("{app}@{release} serves in place of {app}@{current}, which is retained")
+                }
+                None => format!("{app}@{release} serves"),
+            });
+        }
+
+        for route in &promotion.routes {
+            self.store
+                .put_route(route)
+                .map_err(|error| error.to_string())?;
+        }
+
+        for (app, change) in &overlay.apps {
+            if let Some(on) = change.maintenance {
+                let since = on.then_some(now);
+                self.store
+                    .set_maintenance(app, since)
+                    .map_err(|error| error.to_string())?;
+
+                match since {
+                    Some(since) => {
+                        self.maintenance.entry(app.clone()).or_insert(since);
+                    }
+                    None => {
+                        self.maintenance.remove(app);
+                    }
+                }
+            }
+        }
+
+        let held = crate::model::OverlayState {
+            name: name.to_owned(),
+            active: false,
+            source: "promoted".to_owned(),
+            since_unix_ms: now,
+            until_unix_ms: None,
+        };
+        self.store
+            .set_overlay_state(name, Some(&held))
+            .map_err(|error| error.to_string())?;
+
+        let mut message = "promoted: its changes are now the base configuration".to_owned();
+
+        for line in &switched {
+            message.push_str(&format!("; {line}"));
+        }
+
+        self.events.emit(
+            "overlay.promoted",
+            &format!("overlay {name}"),
+            "notice",
+            &message,
+        );
+        self.reconcile_traffic().await;
+        self.push_snapshot().await?;
+        Ok(OverlayOutcome {
+            message,
+            files: crate::overlays::promotion_files(&promotion),
+        })
     }
 
     /// Section 4.14: read the client classes' list files again when one

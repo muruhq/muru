@@ -466,6 +466,279 @@ pub fn apply_routes(routes: &mut Vec<Route>, overlays: &[&(String, Overlay)]) {
     }
 }
 
+/// What promoting an overlay writes into the base (issue 759).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Promotion {
+    /// The release each application the overlay pins serves from now on.
+    pub serving: BTreeMap<String, String>,
+    /// The routes as the overlay leaves them, its pins aside: those it
+    /// changes and those it adds for client classes.
+    pub routes: Vec<Route>,
+}
+
+/// How a route is named in a refusal: by its name, else its host and
+/// path.
+fn route_label(route: &Route) -> String {
+    match &route.name {
+        Some(name) => format!("route {name}"),
+        None => format!("the unnamed route {} {}", route.host, route.path),
+    }
+}
+
+/// A split as the applied files declare it, for a refusal to show.
+fn split_table(split: &BTreeMap<String, u32>) -> String {
+    let shares: Vec<String> = split
+        .iter()
+        .map(|(release, share)| format!("{release:?} = {share}"))
+        .collect();
+    format!("[route.traffic]\nsplit = {{ {} }}", shares.join(", "))
+}
+
+/// Issue 759: what promoting `overlay`, named `name`, over `routes`
+/// writes, or why it cannot be promoted. A pin becomes its application's
+/// serving release, so later deploys replace it as usual, which needs the
+/// overlay to pin every route of the application to the one release; a
+/// split is the route's traffic policy, which belongs in the applied
+/// files, and is refused with the table to put there. Everything else
+/// the overlay sets on routes is written into them.
+pub fn promotion(name: &str, overlay: &Overlay, routes: &[Route]) -> Result<Promotion, String> {
+    let mut pins: BTreeMap<String, (String, BTreeSet<String>)> = BTreeMap::new();
+
+    for (route_name, change) in &overlay.routes {
+        let Some(route) = routes
+            .iter()
+            .find(|route| route.name.as_ref() == Some(route_name))
+        else {
+            continue;
+        };
+
+        for (class, class_change) in change.client_routes.iter().flatten() {
+            match class_change.traffic.as_ref() {
+                Some(traffic) if traffic.pin.is_some() => {
+                    return Err(format!(
+                        "overlay {name} pins the traffic of client class {class} on route                          {route_name}, and a pin for one class cannot become the application's                          serving release; declare the class's route in the applied files instead"
+                    ));
+                }
+                Some(traffic) => {
+                    let split = traffic.split.clone().unwrap_or_default();
+                    return Err(format!(
+                        "overlay {name} splits the traffic of client class {class} on route                          {route_name}, and a split is a route's traffic policy, which goes in the                          applied files: declare the class's route there with\n{}",
+                        split_table(&split)
+                    ));
+                }
+                None => {}
+            }
+        }
+
+        let Some(traffic) = &change.traffic else {
+            continue;
+        };
+
+        let Some(release) = &traffic.pin else {
+            let split = traffic.split.clone().unwrap_or_default();
+            return Err(format!(
+                "overlay {name} splits the traffic of route {route_name}, and a split is the                  route's traffic policy, which goes in the applied files rather than being                  promoted: add this to route {route_name} there, or move the traffic with a                  rollout\n{}",
+                split_table(&split)
+            ));
+        };
+
+        let app = match change.target.as_ref() {
+            Some(target) if target.app.as_ref() != Some(&route.app) => {
+                return Err(format!(
+                    "overlay {name} pins route {route_name} and gives it another target, which                      promote cannot make a serving release; declare the target in the applied                      files instead"
+                ));
+            }
+            _ => route.app.clone(),
+        };
+
+        let (pinned, named) = pins
+            .entry(app.clone())
+            .or_insert_with(|| (release.clone(), BTreeSet::new()));
+
+        if pinned != release {
+            return Err(format!(
+                "overlay {name} pins routes of {app} to both {pinned} and {release}, and only \
+                 one release can serve"
+            ));
+        }
+
+        named.insert(route_name.clone());
+    }
+
+    // The switch moves every route of the application, so the overlay
+    // must already have pinned them all.
+
+    for (app, (release, named)) in &pins {
+        let left: Vec<String> = routes
+            .iter()
+            .filter(|route| &route.app == app)
+            .filter(|route| !route.name.as_ref().is_some_and(|name| named.contains(name)))
+            .map(route_label)
+            .collect();
+
+        if !left.is_empty() {
+            return Err(format!(
+                "overlay {name} pins {app} to {release} on some of its routes but not on {};                  promoting it would make {app}@{release} serve them too, so pin every route of                  {app}, or switch with `muructl rollout bluegreen {app}@{release}`",
+                left.join(", ")
+            ));
+        }
+    }
+
+    // What the overlay sets besides its pins is written into the routes.
+
+    let mut unpinned = overlay.clone();
+
+    for change in unpinned.routes.values_mut() {
+        change.traffic = None;
+    }
+
+    let pair = (name.to_owned(), unpinned);
+    let mut changed = routes.to_vec();
+    apply_routes(&mut changed, &[&pair]);
+
+    Ok(Promotion {
+        serving: pins
+            .into_iter()
+            .map(|(app, (release, _))| (app, release))
+            .collect(),
+        routes: changed
+            .into_iter()
+            .filter(|route| !routes.contains(route))
+            .collect(),
+    })
+}
+
+/// Issue 759: what the applied files must say for the next apply to
+/// keep a promotion, as TOML to put in them, one block for each
+/// application that now serves another release and each route written.
+pub fn promotion_files(promotion: &Promotion) -> Vec<String> {
+    #[derive(serde::Serialize)]
+    struct Routes<'a> {
+        route: [&'a Route; 1],
+    }
+
+    let mut blocks: Vec<String> = promotion
+        .serving
+        .iter()
+        .map(|(app, release)| {
+            format!(
+                "# {app}: where the files name its serving release\n[app.{app}]\nserving = {release:?}"
+            )
+        })
+        .collect();
+
+    for route in &promotion.routes {
+        let table = toml::to_string(&Routes { route: [route] }).unwrap_or_default();
+
+        let place = match &route.name {
+            Some(_) => "in place of its table in the files".to_owned(),
+            None => "a route for a client class, beside the route it is for".to_owned(),
+        };
+
+        blocks.push(format!(
+            "# {}, {place}\n{}",
+            route_label(route),
+            table.trim_end()
+        ));
+    }
+
+    blocks
+}
+
+/// Issue 759: by application and release, how the routes that split
+/// traffic share it, for `release list` and `scale status` to say beside
+/// a release whose share differs from what serving implies: `shop-root
+/// 100% (overlay summer-sale)` for a release a route sends traffic to,
+/// `none, shop-root sends 100% to r3` for a serving release a route
+/// keeps traffic from. `routes` are the base, `overlays` the active ones
+/// in the order they apply, and `serving` each application's serving
+/// release.
+pub fn traffic_lines(
+    routes: &[Route],
+    overlays: &[&(String, Overlay)],
+    serving: &BTreeMap<String, String>,
+) -> BTreeMap<(String, String), String> {
+    // The overlay whose traffic setting stands on each named route.
+
+    let mut set_by: BTreeMap<String, String> = BTreeMap::new();
+
+    for (name, overlay) in overlays {
+        for (route, change) in &overlay.routes {
+            if change.traffic.is_some() {
+                set_by.insert(route.clone(), name.clone());
+            }
+        }
+    }
+
+    let mut effective = routes.to_vec();
+    apply_routes(&mut effective, overlays);
+    let mut parts: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+
+    for route in &effective {
+        let Some(split) = route
+            .traffic
+            .as_ref()
+            .map(|traffic| &traffic.split)
+            .filter(|split| !split.is_empty())
+        else {
+            continue;
+        };
+
+        let label = match (&route.name, route.classes()) {
+            (Some(name), _) => name.clone(),
+            (None, []) => format!("{} {}", route.host, route.path),
+            (None, classes) => format!("{} {} for {}", route.host, route.path, classes.join(", ")),
+        };
+
+        let by = route
+            .name
+            .as_ref()
+            .and_then(|name| set_by.get(name))
+            .map(|overlay| format!(" (overlay {overlay})"))
+            .unwrap_or_default();
+        let current = serving.get(&route.app);
+        let named: u32 = split.values().sum();
+
+        for (release, share) in split {
+            if release.starts_with("upstream:") || Some(release) == current {
+                continue;
+            }
+
+            parts
+                .entry((route.app.clone(), release.clone()))
+                .or_default()
+                .push(format!("{label} {share}%{by}"));
+        }
+
+        let Some(current) = current else {
+            continue;
+        };
+
+        let share = split.get(current).copied().unwrap_or(0) + 100u32.saturating_sub(named);
+
+        let part = if share == 0 {
+            let sends: Vec<String> = split
+                .iter()
+                .filter(|(_, share)| **share > 0)
+                .map(|(release, share)| format!("{share}% to {release}"))
+                .collect();
+            format!("none, {label} sends {}{by}", sends.join(", "))
+        } else {
+            format!("{label} {share}%{by}")
+        };
+
+        parts
+            .entry((route.app.clone(), current.clone()))
+            .or_default()
+            .push(part);
+    }
+
+    parts
+        .into_iter()
+        .map(|(key, parts)| (key, parts.join("; ")))
+        .collect()
+}
+
 /// Lay one overlay's change over a route.
 fn change_route(route: &mut Route, change: &RouteOverlay) {
     if let Some(mode) = &change.mode {
@@ -1373,6 +1646,99 @@ mod tests {
             ),
             "its probe of shop@r2 failed: /healthz (as a preview, through 127.0.0.1:8080) did not answer within 5s"
         );
+    }
+
+    #[test]
+    fn promoting_a_pin_switches_serving_and_a_split_is_refused() {
+        let routes = [
+            route("root", "shop"),
+            route("api", "shop"),
+            route("blog", "blog"),
+        ];
+
+        // Issue 759: a pin of every route of the application becomes its
+        // serving release, and the rest of the overlay goes on the routes
+        // without the pin.
+
+        let cutover = overlay(
+            "routes.root = { traffic = { pin = 'r3' }, mode = 'sale' }\nroutes.api.traffic = { pin = 'r3' }",
+        );
+        let promoted = promotion("cutover", &cutover, &routes).unwrap();
+        assert_eq!(
+            promoted.serving,
+            BTreeMap::from([("shop".to_owned(), "r3".to_owned())])
+        );
+        assert_eq!(promoted.routes.len(), 1);
+        assert_eq!(promoted.routes[0].mode.as_deref(), Some("sale"));
+        assert_eq!(promoted.routes[0].traffic, None);
+
+        let files = promotion_files(&promoted);
+        assert_eq!(
+            files[0],
+            "# shop: where the files name its serving release\n[app.shop]\nserving = \"r3\""
+        );
+        assert!(
+            files[1].starts_with("# route root, in place of its table in the files\n[[route]]\n")
+        );
+        assert!(files[1].contains("mode = \"sale\""), "{files:?}");
+
+        // A pin of some of the routes would move the others too.
+
+        let partial = overlay("routes.root.traffic = { pin = 'r3' }");
+        let refused = promotion("partial", &partial, &routes).unwrap_err();
+        assert!(refused.contains("but not on route api"), "{refused}");
+
+        let split = overlay("routes.root.traffic = { split = { r3 = 20 } }");
+        let refused = promotion("canary", &split, &routes).unwrap_err();
+        assert!(
+            refused.ends_with("[route.traffic]\nsplit = { \"r3\" = 20 }"),
+            "{refused}"
+        );
+
+        let class = overlay("routes.root.client_routes.bots = { traffic = { pin = 'r3' } }");
+        assert!(
+            promotion("bots", &class, &routes)
+                .unwrap_err()
+                .contains("client class bots")
+        );
+
+        // Without traffic, it is written into the routes as before.
+
+        let plain =
+            overlay("apps.shop = { maintenance = true }\nroutes.blog = { mode = 'read-only' }");
+        let promoted = promotion("plain", &plain, &routes).unwrap();
+        assert!(promoted.serving.is_empty());
+        assert_eq!(promoted.routes[0].name.as_deref(), Some("blog"));
+        assert_eq!(promotion_files(&promoted).len(), 1);
+    }
+
+    #[test]
+    fn traffic_lines_say_where_a_split_sends_a_routes_requests() {
+        let mut canary = route("api", "shop");
+        canary.traffic = Some(Traffic {
+            split: BTreeMap::from([("r2".to_owned(), 10)]),
+            ..Traffic::default()
+        });
+        let routes = [route("root", "shop"), canary];
+        let serving = BTreeMap::from([("shop".to_owned(), "r1".to_owned())]);
+        let pin = (
+            "cutover".to_owned(),
+            overlay("routes.root.traffic = { pin = 'r3' }"),
+        );
+
+        let lines = traffic_lines(&routes, &[&pin], &serving);
+        let line = |release: &str| lines.get(&("shop".to_owned(), release.to_owned())).cloned();
+
+        assert_eq!(line("r2").as_deref(), Some("api 10%"));
+        assert_eq!(line("r3").as_deref(), Some("root 100% (overlay cutover)"));
+        assert_eq!(
+            line("r1").as_deref(),
+            Some("none, root sends 100% to r3 (overlay cutover); api 90%")
+        );
+
+        // A route that splits nothing says nothing.
+
+        assert!(traffic_lines(&routes[..1], &[], &serving).is_empty());
     }
 
     const HOUR: u64 = 3_600_000;

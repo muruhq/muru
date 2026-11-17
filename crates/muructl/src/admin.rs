@@ -4950,6 +4950,11 @@ fn split_target(text: &str) -> anyhow::Result<(&str, &str)> {
 /// The autoscaler's state, a row per group with its last decision below.
 fn print_scale_status(status: &pb::ScaleStatus) {
     println!("{}@{}", status.app, status.release);
+
+    if !status.traffic.is_empty() {
+        println!("traffic: {}", status.traffic);
+    }
+
     println!(
         "{:<12} {:<12} {:<10} {:<7} {:<13} {:<10} POLICY",
         "GROUP", "WORKERS", "SLOTS", "IDLE", "QUEUE-P95", "REAPS"
@@ -5908,6 +5913,19 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
             .map(|until| format!(", until {}", format_time(until)))
             .unwrap_or_default()
     );
+
+    // Issue 759: the applied files still say what the overlay changed,
+    // so the next apply would undo a promotion they are not brought into
+    // line with.
+
+    if !response.files.is_empty() {
+        println!(
+            "muru: the next apply undoes this unless the applied files say the same: put this in \
+             them, and remove overlay {name}\n"
+        );
+        println!("{}", response.files.join("\n\n"));
+    }
+
     Ok(())
 }
 
@@ -6656,6 +6674,10 @@ pub async fn release_list(
 
         if !release.message.is_empty() {
             println!("{:<24} {}", "", release.message);
+        }
+
+        if !release.traffic.is_empty() {
+            println!("{:<24} traffic: {}", "", release.traffic);
         }
     }
 

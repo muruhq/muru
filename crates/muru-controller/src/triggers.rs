@@ -235,8 +235,8 @@ async fn handle(
         .await;
 
     match (sent, done_rx.await) {
-        (Ok(()), Ok(Ok(message))) => {
-            let body = serde_json::json!({ "overlay": name, "message": message });
+        (Ok(()), Ok(Ok(outcome))) => {
+            let body = serde_json::json!({ "overlay": name, "message": outcome.message });
             respond(StatusCode::OK, body.to_string())
         }
         (Ok(()), Ok(Err(why))) => answer(StatusCode::CONFLICT, "refused", &why),

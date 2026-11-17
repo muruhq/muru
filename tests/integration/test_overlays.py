@@ -414,3 +414,32 @@ apps.elsewhere = { maintenance = true }
     assert "overlays clash, read-only all set routes.root.mode" in refused
     assert "overlay nowhere: no route is named missing" in refused
     assert "overlay nowhere: no application named elsewhere" in refused
+
+
+def test_promoting_a_pin_makes_the_release_serve(site: Site) -> None:
+    # Issue 759: last, since it changes the serving release. While the
+    # pin is active, release list says where the route's traffic goes.
+
+    site.apply(OVERLAYS)
+    site.overlay("activate", "pinned")
+    assert eventually(lambda: site.seen()["release"] == "r1")
+    listed = site.daemon.muructl("release", "list", "clients").stdout
+    assert "traffic: root 100% (overlay pinned)" in listed, listed
+    assert "traffic: none, root sends 100% to r1 (overlay pinned)" in listed, listed
+    assert "held: not serving" not in listed, listed
+
+    promoted = site.overlay("promote", "pinned")
+    assert "clients@r1 serves in place of clients@r2, which is retained" in promoted, promoted
+    assert '[app.clients]\nserving = "r1"' in promoted, promoted
+    assert {row["release"] for row in site.daemon.releases("clients") if row["serving"]} == {
+        "clients@r1"
+    }
+    assert "traffic:" not in site.daemon.muructl("release", "list", "clients").stdout
+
+    # The route has no pin of its own, so the files, which name no
+    # serving release, keep the promotion when applied again.
+
+    exported = tomllib.loads(site.daemon.muructl("config", "export").stdout)
+    assert [route.get("traffic") for route in exported["route"]] == [None]
+    site.apply(OVERLAYS)
+    assert site.seen()["release"] == "r1"

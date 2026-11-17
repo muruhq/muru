@@ -55,7 +55,7 @@ $ muructl release show shop@r9 --json
 | `muructl daemon status` | The same as `muructl status`, with `config`, `state_dir`, `run_dir`, `log_dir`, `cache_dir` and `socket`. With no daemon running, `kind` is `stopped` and those six say where a daemon started with the same options would keep them, the rest being empty or 0, and the command exits with status 3 |
 | `muructl daemon reload` | What was reloaded: `message` |
 | `muructl app list` | `{"apps": [...]}`, each with `name`, `current_release`, `previous_release`, `user`, `maintenance`, `maintenance_overlay` (the active overlay whose maintenance setting is in force, or empty) and the rest |
-| `muructl release list` | `{"releases": [...]}`, each a release as `release show` prints it |
+| `muructl release list` | `{"releases": [...]}`, each a release as `release show` prints it, with `traffic`, its shares of the routes that split traffic, or empty |
 | `muructl release show` | The release: `app`, `id`, `state`, `message`, `source`, `entrypoint`, `serving`, its settings, mounts and groups; `host_running` (whether a host runs for it now), `workers` (each with `index`, `pid`, `group`, `socket` and `state`, one of `starting`, `ready`, `debugging`, `replacing` or `retiring`, empty when no host runs), `detected_interface` (`wsgi`, `asgi` or `grpc`, empty until known), `retained_until_unix_ms` (for a retained release, when it is stopped, otherwise `0`); `gates`, the gates it has passed, each with `name`, `stage` (`before_fork` or `before_promote`), `run` and `passed_unix_ms`; for a managed server, `server_instances`, each with `index`, `pid`, `address` and `started_unix_ms` |
 | `muructl release wait` | The release once it reached a state waited for |
 | `muructl host list` | `{"hosts": [...]}` |
@@ -73,13 +73,13 @@ $ muructl release show shop@r9 --json
 | `muructl rollout promote` | The rollout after the change |
 | `muructl rollout abort` | The rollout after the change |
 | `muructl scale` | Each worker group's scaling state after the change: `app`, `release`, `groups` |
-| `muructl scale status` | Each worker group's policy, workers, signals, last decision and churn: `app`, `release`, `groups` |
+| `muructl scale status` | Each worker group's policy, workers, signals, last decision and churn: `app`, `release`, `groups`, and `traffic`, the release's shares of the routes that split traffic, or empty |
 | `muructl restart` | `{"release": ..., "workers": [...]}`, each with `index` (within its group), `group`, `pid`, `new_pid`, `forced`, and `served_by` once the new worker serves (`null` with `--no-wait`) |
 | `muructl overlay list` | `{"overlays": [...]}`, each with `name`, `active`, `state`, `trigger`, `changes`, its times, and for one that follows a condition `condition` and `condition_state` |
 | `muructl overlay preview` | `{"changes": [...]}`: what activating the overlay now would change; for one that follows a condition, `condition`, `condition_state` and `condition_terms`, each term with its figure now |
 | `muructl overlay activate` | The outcome: `message` |
 | `muructl overlay end` | The outcome: `message` |
-| `muructl overlay promote` | The outcome: `message` |
+| `muructl overlay promote` | The outcome: `message`, and `files`, the TOML blocks the applied files need for the next apply to keep the promotion |
 | `muructl maintenance on` | `app`, or `host` with `--host`, `on` and `since_unix_ms` |
 | `muructl maintenance off` | `app`, or `host` with `--host`, `on` and `since_unix_ms` (0) |
 | `muructl dashboard login` | The sign-in link: `url`, `code`, `expires_in_s`, and with `--token` the `token` |

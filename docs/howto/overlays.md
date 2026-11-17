@@ -331,10 +331,58 @@ $ muructl config show shop --effective
 #   app shop: group default: at least 6 workers (schedule shop.weekday-mornings)
 ```
 
-`promote` folds an active overlay's changes into the base configuration,
-the routes and maintenance settings as the overlay leaves them, and ends
-it for good, which is how a timed switch becomes the new normal. Remove a
-promoted overlay from the applied files afterwards.
+`promote` folds an active overlay's changes into the base configuration
+and ends it for good, which is how a timed switch becomes the new normal:
+
+- A `pin` makes the pinned release the application's serving release, as
+  a deploy would. The release that served before drains and is retained
+  for `muructl rollback`, and later deploys replace the pinned release as
+  usual. Since the switch moves every route of the application, the
+  overlay must pin all of them to the same release, and no route of a
+  client class alone; otherwise promote refuses and names the routes it
+  leaves out. A pin with a `target` is refused too, and so is a pin while
+  a rollout of the application is under way.
+
+- A `split` is not promoted. Shares between releases are a route's
+  traffic policy, which belongs in the applied files, or a rollout moves
+  the traffic. Promote refuses, showing the `[route.traffic]` table to
+  add to the route.
+
+- Everything else the overlay sets on routes (mode, methods, target, rate
+  limits, headers, error pages and the routes it adds for client classes)
+  is written into the routes, and its maintenance settings into the
+  applications.
+
+The applied files still declare the routes as they were, and may name
+the serving release with `serving`, so the next `muructl apply` would
+undo the promotion. Promote prints what to put in the files to keep it:
+
+```console
+$ muructl overlay promote cutover-r43
+muru: overlay cutover-r43 promoted: its changes are now the base configuration; shop@r43 serves in place of shop@r42, which is retained
+muru: the next apply undoes this unless the applied files say the same: put this in them, and remove overlay cutover-r43
+
+# shop: where the files name its serving release
+[app.shop]
+serving = "r43"
+```
+
+An overlay that changes a route's mode, say, prints the route as it now
+is, under `# route shop-root, in place of its table in the files`. Put
+the blocks in the files and remove the overlay from them.
+
+While a route's traffic is split, by its own policy or an overlay's,
+`muructl release list` shows each release's share of it under the
+release, and `muructl scale status` the same for the release it shows:
+
+```console
+$ muructl release list shop
+RELEASE                  STATE      SERVING  WORKERS               DISK SOURCE
+shop@r43                 ready               2 (2x4)             48.0MB /srv/shop/r43
+                         traffic: shop-root 100% (overlay cutover-r43)
+shop@r42                 ready      yes      2 (2x4)             48.0MB /srv/shop/r42
+                         traffic: none, shop-root sends 100% to r43 (overlay cutover-r43)
+```
 
 Activations, ends, skips, advisory windows, warm-ups and promotions are
 the events `overlay.activated`, `overlay.ended`, `overlay.skipped`,
