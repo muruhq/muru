@@ -323,6 +323,32 @@ pub fn step(overlay: &Overlay, state: Option<&OverlayState>, now: u64) -> Step {
     }
 }
 
+/// Issue 755: what an apply that changes an overlay from `before` to
+/// `after` clears of what holds it back, as the apply report says it,
+/// so that the overlay is judged again at its next window. A skip and
+/// an advisory window's record go with any change, since the change may
+/// be the fix; an end by hand within the window goes only with a new
+/// trigger, whose window is not the one it was ended in. An active
+/// overlay, a promoted one and a condition's cooldown are kept.
+pub fn cleared_by_change(
+    before: &Overlay,
+    after: &Overlay,
+    state: Option<&OverlayState>,
+) -> Option<&'static str> {
+    let state = state.filter(|state| !state.active)?;
+
+    if before == after {
+        return None;
+    }
+
+    match state.source.as_str() {
+        "skipped" => Some("its skip is cleared"),
+        "advised" => Some("its advisory window is cleared"),
+        "ended" if before.trigger != after.trigger => Some("its end by hand is cleared"),
+        _ => None,
+    }
+}
+
 /// The active overlays in the order they apply: lowest priority first,
 /// so a higher one's setting stands, then by name.
 pub fn ordered<'a>(
@@ -1226,6 +1252,55 @@ mod tests {
         let held = state(false, "ended", Some(end));
         assert_eq!(step(&backup, Some(&held), start + 10), Step::Stay);
         assert_eq!(step(&backup, Some(&held), end), Step::Release);
+    }
+
+    #[test]
+    fn a_change_clears_a_skip_and_a_new_trigger_an_end_by_hand() {
+        let before = overlay(
+            "routes.root.traffic = { pin = 'r3' }\ntrigger = { schedule = { start = '2026-01-01T02:00:00Z' } }\npreconditions = { release_ready = 'r3' }",
+        );
+        let repinned = overlay(
+            "routes.root.traffic = { pin = 'r2' }\ntrigger = { schedule = { start = '2026-01-01T02:00:00Z' } }\npreconditions = { release_ready = 'r2' }",
+        );
+        let moved = overlay(
+            "routes.root.traffic = { pin = 'r3' }\ntrigger = { schedule = { start = '2026-01-02T02:00:00Z' } }\npreconditions = { release_ready = 'r3' }",
+        );
+        let skipped = state(false, "skipped", None);
+        let ended = state(false, "ended", None);
+
+        // Issue 755: a skip in a window with no end lasts for good, so a
+        // change, which may be the fix, clears it.
+
+        assert_eq!(
+            cleared_by_change(&before, &repinned, Some(&skipped)),
+            Some("its skip is cleared")
+        );
+        assert_eq!(cleared_by_change(&before, &before, Some(&skipped)), None);
+        assert_eq!(
+            cleared_by_change(&before, &moved, Some(&state(false, "advised", None))),
+            Some("its advisory window is cleared")
+        );
+
+        // An end by hand stands for its window, so only a new trigger
+        // clears it.
+
+        assert_eq!(cleared_by_change(&before, &repinned, Some(&ended)), None);
+        assert_eq!(
+            cleared_by_change(&before, &moved, Some(&ended)),
+            Some("its end by hand is cleared")
+        );
+
+        // What is active, promoted or cooling down is kept.
+
+        for kept in [
+            state(true, "schedule", None),
+            state(false, "promoted", None),
+            state(false, "cooldown", Some(1)),
+        ] {
+            assert_eq!(cleared_by_change(&before, &moved, Some(&kept)), None);
+        }
+
+        assert_eq!(cleared_by_change(&before, &moved, None), None);
     }
 
     const HOUR: u64 = 3_600_000;

@@ -111,7 +111,8 @@ or `end` may instead be a time with an offset. Daylight saving is
 handled: a local time the clocks skip is read as the time after the
 change, and one they repeat as the first of the two. An overlay with a
 start and no end stays active until it is ended or promoted. Ending a
-scheduled overlay by hand keeps it ended until its window is over.
+scheduled overlay by hand keeps it ended until its window is over, or
+until an apply changes its trigger.
 
 A cron expression has five fields, minute, hour, day of month, month and
 day of week, each a number, `*`, a range such as `1-5`, a step such as
@@ -279,6 +280,15 @@ the release when the overlay changes routes of one application. When it
 does not hold, an activation by hand is refused, and a scheduled one is
 skipped for the rest of its window with the event `overlay.skipped`, so a
 timed switch never moves traffic to something broken.
+
+A skip lasts until the window ends, which for a `start` with no `end` is
+until a person acts. Once the release is fixed, either activate the
+overlay by hand, or apply a change to it, such as a new `start` or the
+release it names: an apply that changes a skipped overlay clears the
+skip, so the overlay is judged again at its next window, or at once if
+its window has begun. `muructl apply` reports `updated; its skip is
+cleared`, and `muructl overlay list` shows a skip with no end as
+`skipped (activate it by hand, or apply a change, to try again)`.
 
 `preconditions.probe` is a path that release must answer with a 2xx or
 3xx response as well, asked through the edge as a preview of the release,

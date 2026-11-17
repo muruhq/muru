@@ -5968,9 +5968,17 @@ fn overlay_row(overlay: &pb::OverlayInfo) -> [String; 4] {
         overlay.state.clone()
     };
 
+    // A hold with no end (a skip, say, in a window with no end) lasts
+    // until a person acts, which the next window's start would belie
+    // (issue 755).
+
+    let held = !overlay.active && !overlay.state.is_empty();
+
     if overlay.until_unix_ms > 0 {
         state.push_str(&format!(" until {}", format_time(overlay.until_unix_ms)));
-    } else if overlay.starts_unix_ms > 0 {
+    } else if held && overlay.state == "skipped" {
+        state.push_str(" (activate it by hand, or apply a change, to try again)");
+    } else if !held && overlay.starts_unix_ms > 0 {
         state.push_str(&format!(" from {}", format_time(overlay.starts_unix_ms)));
     }
 
@@ -10811,6 +10819,29 @@ mod tests {
         for line in &lines[1..] {
             assert_eq!(line.find("route shop"), Some(changes), "{lines:#?}");
         }
+    }
+
+    #[test]
+    fn a_skip_with_no_end_says_how_to_try_again() {
+        // Issue 755: the next window's start is not when a held overlay
+        // is judged again, so it is not shown.
+
+        let skipped = pb::OverlayInfo {
+            name: "summer-sale".to_owned(),
+            state: "skipped".to_owned(),
+            starts_unix_ms: 1_000,
+            ..pb::OverlayInfo::default()
+        };
+        assert_eq!(
+            super::overlay_row(&skipped)[1],
+            "skipped (activate it by hand, or apply a change, to try again)"
+        );
+
+        let idle = pb::OverlayInfo {
+            state: String::new(),
+            ..skipped
+        };
+        assert!(super::overlay_row(&idle)[1].starts_with("idle from "));
     }
 
     #[test]

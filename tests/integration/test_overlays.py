@@ -333,6 +333,30 @@ latch = true
     assert site.seen()["mode"] is None
 
 
+def test_a_change_clears_a_skip_so_the_new_window_judges_it_again(site: Site) -> None:
+    # Issue 755: a window with no end skips for good, until an apply
+    # changes the overlay.
+
+    def retry(start: str, release: str) -> str:
+        return f"""
+[overlay.retry]
+routes.root = {{ mode = 'retried' }}
+trigger = {{ schedule = {{ start = '{start}' }} }}
+preconditions = {{ release_ready = '{release}' }}
+"""
+
+    site.apply(retry(at(1), "r9"), prune=True)
+    assert eventually(lambda: "skipped (activate it by hand" in site.overlay("list"))
+
+    applied = site.apply(retry(at(2), "r2"), prune=True)
+    assert "its skip is cleared" in applied
+    assert eventually(lambda: site.seen()["mode"] == "retried")
+    assert "active (schedule)" in site.overlay("list")
+
+    site.overlay("end", "retry")
+    assert site.seen()["mode"] is None
+
+
 def test_warm_up_starts_a_release_ahead_of_its_window(site: Site) -> None:
     # The apply holds r1 beside r2, which serves, so it is stopped first
     # for the warm-up to start.
