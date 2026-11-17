@@ -9,6 +9,28 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a30 (2026-11-17)
+
+### Added
+
+- Added the modules a request loads for the first time in its worker to its record: the development toolbar's Timing panel draws them as "importing modules" and lists each with its time and the line that imported it, `Server-Timing` carries their time before the response head as `import`, the Hints panel names them when they take a large share of the request, and `muructl debug status` counts the modules each worker has loaded since the fork. ([#738](https://github.com/muruhq/muru/issues/738))
+- Added `preload_modules` to `[tool.muru]` and to a release's table: modules the host imports after the entrypoint and the mounts, and before the `on_load` and `pre_fork` hooks, so a module the application only imports on first use is loaded once before the fork rather than in every worker. A module that cannot be imported fails the load, `muructl check` imports and reports the list, and `--print-config` shows it. ([#739](https://github.com/muruhq/muru/issues/739))
+- Added `lazy_imports` to `[tool.muru]`, `muru.local.toml` and a release's table: with unwrapt in the project's environment, the imports a module names in `__lazy_modules__` are deferred to first use from Python 3.11, as Python 3.15 does natively, along with those unwrapt's own configuration lists for code the project does not own. Deferral stays in place through the fork, the host logs as it forks which deferred imports were used before it, the toolbar's Timing panel marks a module a request loaded through a deferred import, and `--print-config` shows the key and the unwrapt configuration the host finds. ([#740](https://github.com/muruhq/muru/issues/740))
+- Added `import_report` to `[tool.muru]`, `muru.local.toml` and a release's table, `muructl debug imports`, `muructl check --imports` and an `imports` tool in `muructl mcp serve`: the host records its imports with unwrapt as it loads, each labelled with the entry point being loaded, and the report says what each import cost, who pays for it under preload, and what to defer or load before the fork, written as the `__lazy_modules__`, `[tool.unwrapt.lazy_modules]` or `preload_modules` entry to add; with each module the workers have loaded for the first time since the fork, by how many of them. The daemon keeps each release's report beside it, and `muructl run` and `muructl serve` the last four loads'. ([#741](https://github.com/muruhq/muru/issues/741))
+- "Muru" in the dashboard's title banner links back to the front page on every page: the run's page under `muructl run`, the node's under the daemon. ([#747](https://github.com/muruhq/muru/issues/747))
+- Added a `release.loaded` event when a release's host has imported the application, giving how long it took and, with `import_report` on, the import report's headline figures; and the metrics `muru_release_load_seconds`, `muru_worker_load_seconds` (a worker that imported the application itself), and `muru_worker_modules_loaded_total` and `muru_worker_module_load_seconds_total` for the modules each worker has loaded for the first time since the fork. ([#753](https://github.com/muruhq/muru/issues/753))
+
+### Changed
+
+- The host logged a worker that exited with a failure status or by a signal while the host stopped it, and the 502 for a worker that sent an unexpected frame before its response head said so, rather than that the worker sent no response head. ([#734](https://github.com/muruhq/muru/issues/734))
+- The toolbar's Timing panel drew moments as moments and repeated waits one by one: the response head reaching the edge and the response starting became events, shown as a diamond with a dashed line through every row, the application's own time became "running the application", every wait for the GIL and every stretch with the event loop held was drawn as a segment on its row, and a tooltip on every bar, segment and event opened on hover, keyboard focus and tap. `muru.panels.Span` took `at` for an event and `segments` of the new `muru.panels.Segment`, drawn the same way in panels of your own. ([#737](https://github.com/muruhq/muru/issues/737))
+
+### Fixed
+
+- The open toolbar stayed within a narrow window, such as a phone's, scrolling a wide panel sideways, instead of running off the window's left edge. ([#742](https://github.com/muruhq/muru/issues/742))
+- A dashboard section that refreshes no longer sends its scrollable regions, such as the output and the request tables, back to the top: each keeps its place, one scrolled to its end stays at the end as lines arrive, and a section is not refreshed while it is being scrolled. ([#748](https://github.com/muruhq/muru/issues/748))
+
+
 ## 0.1.0a29 (2026-11-16)
 
 ### Added
