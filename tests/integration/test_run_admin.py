@@ -618,7 +618,8 @@ def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) 
 def test_a_blocked_event_loop_is_on_the_requests_record(runtime: Path) -> None:
     """What held a request up is on its record (section 11.7): an ASGI
     request that blocks its event loop for longer than the loop's
-    heartbeat shows the loop held, on the Timing panel too."""
+    heartbeat shows the loop held, on the Timing panel too, and the
+    module it loaded on first use."""
 
     server = support.start("plain_asgi:application", workers=1, env={"MURU_RUN_DIR": str(runtime)})
 
@@ -645,6 +646,13 @@ def test_a_blocked_event_loop_is_on_the_requests_record(runtime: Path) -> None:
         assert max(stretch["ms"] for stretch in held) == worker["loop_lag"], worker
         panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html").body.decode()
         assert ">event loop held</td>" in panel and "During the request" in panel
+
+        # Issue 738: the module the request loaded on first use, under
+        # its own request's id on the loop, before the head too.
+
+        assert "colorsys" in [load["module"] for load in worker["module_loads"]], worker
+        assert worker["modules_ms"] > 0 and ">importing modules</td>" in panel
+        assert "import;dur=" in response.header("server-timing")
 
         # With a GIL, the request's start on the loop waited for it;
         # without one, nothing is shown.

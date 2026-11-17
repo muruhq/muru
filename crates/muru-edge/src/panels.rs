@@ -560,6 +560,12 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
                 |index| format!("stretch {} of {held}", index + 1),
             ));
 
+            // Issue 738: the modules loaded for the first time in the
+            // worker, each outermost load a segment named by its module,
+            // with the loads nested in it inside its segment.
+
+            phases.extend(importing(worker, record.queue_ms));
+
             // A wait goes before the phase that starts with it, and a
             // moment before a period that starts then.
 
@@ -602,11 +608,95 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
         tables: record
             .from_worker
             .as_ref()
-            .map(during)
-            .filter(|table| !table.rows.is_empty())
+            .map(|worker| [during(worker), modules(worker, record.queue_ms)])
             .into_iter()
+            .flatten()
+            .filter(|table| !table.rows.is_empty())
             .collect(),
         ..Default::default()
+    }
+}
+
+/// The row of the modules a request loaded for the first time in the
+/// worker, moved onto the request's clock by `by`: a segment for each
+/// outermost load, named by its module, the loads nested in it inside
+/// it. None when it loaded none.
+fn importing(worker: &admin::WorkerPart, by: f64) -> Option<admin::PanelSpan> {
+    let outermost: Vec<&admin::ModuleLoad> = worker
+        .module_loads
+        .iter()
+        .filter(|load| load.depth == 0)
+        .collect();
+    let first = outermost.first()?;
+    let start_ms = by + first.at_ms;
+    let end_ms = outermost
+        .iter()
+        .map(|load| by + load.at_ms + load.ms)
+        .fold(start_ms, f64::max);
+
+    Some(admin::PanelSpan {
+        name: "importing modules".to_owned(),
+        start_ms,
+        duration_ms: end_ms - start_ms,
+        category: "worker".to_owned(),
+        segments: outermost
+            .iter()
+            .map(|load| admin::PanelSegment {
+                start_ms: by + load.at_ms,
+                duration_ms: load.ms.max(0.0),
+                label: load.module.clone(),
+                detail: loaded_by(load),
+            })
+            .collect(),
+        ..Default::default()
+    })
+}
+
+/// What asked for a module, for its tooltip and its row.
+fn loaded_by(load: &admin::ModuleLoad) -> String {
+    if load.trigger.is_empty() {
+        String::new()
+    } else {
+        format!("loaded by {}", load.trigger)
+    }
+}
+
+/// The modules a request loaded for the first time in the worker, one
+/// row each in the order they began, moved onto the request's clock by
+/// `by`, a nested one indented beneath the one it is nested in, with how
+/// many were past the record's limit.
+fn modules(worker: &admin::WorkerPart, by: f64) -> admin::PanelTable {
+    let mut rows: Vec<admin::PanelRow> = worker
+        .module_loads
+        .iter()
+        .map(|load| admin::PanelRow {
+            cells: vec![
+                format!("{}{}", "  ".repeat(load.depth as usize), load.module),
+                millis(by + load.at_ms),
+                millis(load.ms),
+                load.trigger.clone(),
+            ],
+        })
+        .collect();
+    let past = (worker.modules_loaded as usize).saturating_sub(rows.len());
+
+    if past > 0 {
+        rows.push(admin::PanelRow {
+            cells: vec![
+                format!("{past} more, past the record's limit"),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+        });
+    }
+
+    admin::PanelTable {
+        caption: "Modules loaded on first use".to_owned(),
+        columns: ["Module", "Starts", "Takes", "Loaded by"]
+            .map(str::to_owned)
+            .to_vec(),
+        rows,
     }
 }
 
@@ -660,7 +750,8 @@ fn counted(count: u32, noun: &str) -> String {
 
 /// What held a request up while the worker had it, as a table of what
 /// and how long, with what the timeline cannot place: the GIL waits in
-/// all and the garbage collections. Empty when nothing did.
+/// all and the garbage collections; and the modules loaded on first use
+/// in all. Empty when nothing did.
 fn during(worker: &admin::WorkerPart) -> admin::PanelTable {
     let mut rows = Vec::new();
     let mut row = |what: &str, took: String| {
@@ -714,6 +805,17 @@ fn during(worker: &admin::WorkerPart) -> admin::PanelTable {
                 millis(ms),
                 counted(collections, "collection"),
                 generations.join(", ")
+            ),
+        );
+    }
+
+    if worker.modules_loaded > 0 {
+        row(
+            "modules loaded on first use",
+            format!(
+                "{} in {}",
+                millis(worker.modules_ms),
+                counted(worker.modules_loaded, "module")
             ),
         );
     }
@@ -1318,6 +1420,51 @@ mod tests {
         // Nothing held up, no table.
 
         assert!(timing(&fixture()).tables.is_empty());
+    }
+
+    #[test]
+    fn the_timing_panel_shows_the_modules_loaded_on_first_use() {
+        let mut record = fixture();
+        let worker = record.from_worker.as_mut().unwrap();
+        let load = |module: &str, at_ms: f64, ms: f64, depth: u32| admin::ModuleLoad {
+            module: module.to_owned(),
+            at_ms,
+            ms,
+            depth,
+            trigger: "shop/views.py:12".to_owned(),
+        };
+        worker.module_loads = vec![
+            load("shop.reports", 0.5, 0.25, 0),
+            load("openpyxl", 0.75, 1.0, 0),
+            load("openpyxl.cell", 0.8, 0.5, 1),
+        ];
+        worker.modules_loaded = 4;
+        worker.modules_ms = 1.5;
+        let html = Renderer::new(None).render(&timing(&record));
+
+        // A segment for each outermost load, named by its module, the
+        // nested one inside its segment.
+
+        assert!(html.contains(">importing modules</td>"), "{html}");
+        assert!(html.contains("<td class=\"num\">2 segments</td>"), "{html}");
+        assert!(
+            html.contains("openpyxl\nstarts at 0.95 ms\ntakes 1.0 ms\nloaded by shop/views.py:12"),
+            "{html}"
+        );
+
+        // The table counts them, and each is a row below it, the nested
+        // one indented and the one past the limit counted.
+
+        assert!(html.contains("1.5ms in 4 modules"), "{html}");
+        assert!(
+            html.contains("<summary>Modules loaded on first use</summary>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<td class=\"module\">  openpyxl.cell</td>"),
+            "{html}"
+        );
+        assert!(html.contains("1 more, past the record's limit"), "{html}");
     }
 
     #[test]

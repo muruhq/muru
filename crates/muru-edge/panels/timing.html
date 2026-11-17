@@ -4,13 +4,29 @@
 {%- if panel.spans %}
 {{ table(panel.spans, panel.spans[0].duration_ms, events, "Phase") }}
 {%- endif %}
-{%- for during in panel.tables %}
+{#- What held the request up is a table of names and values; the modules
+    loaded on first use are a table of their own, which opens below it. -#}
+{%- for table in panel.tables %}
+{%- if table.columns|length == 2 %}
 <table class="values">
-<caption>{{ during.caption }}</caption>
-{%- for row in during.rows %}
+<caption>{{ table.caption }}</caption>
+{%- for row in table.rows %}
 <tr><th>{{ row.cells[0] }}</th><td>{{ row.cells[1] }}</td></tr>
 {%- endfor %}
 </table>
+{%- else %}
+<details>
+<summary>{{ table.caption }}</summary>
+<table class="modules">
+<thead><tr><th>{{ table.columns[0] }}</th><th class="num">{{ table.columns[1] }}</th><th class="num">{{ table.columns[2] }}</th><th>{{ table.columns[3] }}</th></tr></thead>
+<tbody>
+{%- for row in table.rows %}
+<tr><td class="module">{{ row.cells[0] }}</td><td class="num">{{ row.cells[1] }}</td><td class="num">{{ row.cells[2] }}</td><td>{{ row.cells[3] }}</td></tr>
+{%- endfor %}
+</tbody>
+</table>
+</details>
+{%- endif %}
 {%- endfor %}
 {%- if not panel.spans %}
 <p class="muted">No times are known yet.</p>
@@ -27,6 +43,7 @@
 <dt><em>response started</em></dt><dd>The moment it did.</dd>
 <dt>producing the body</dt><dd>From the body's first byte to its last.</dd>
 <dt>finishing</dt><dd>Until the body's <code>close()</code> returned, or the ASGI application returned.</dd>
+<dt>importing modules</dt><dd>Each module the request loaded for the first time in this worker, from its import to the end of its code, with the modules it imported in turn inside it. A second request needing the same modules does not load them again. Loading them before the workers start is what <code>preload_modules</code> does.</dd>
 <dt>event loop held</dt><dd>Each stretch during the request in which the worker's event loop did not get to run: it was blocked, by this request or another.</dd>
 <dt><em>response head at the edge</em></dt><dd>The moment the response's status and headers came back from the worker.</dd>
 <dt>sending the response</dt><dd>From then until the last byte was sent to the client.</dd>

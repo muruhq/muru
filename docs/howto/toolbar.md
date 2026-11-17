@@ -219,6 +219,11 @@ Server-Timing: queue;dur=0.21, app;dur=17.93, muru;desc="01JCZ8X4R3T5V6W7Y8Z9A0B
 - `app` is the time from handing the request to the worker until the
   response head arrived.
 
+- `import`, when the worker loaded modules for the first time while the
+  request ran and before its response head, is how long that took, the
+  modules each one imported in turn included. A module is loaded once in
+  each worker, so the entry is on the first request that needed it.
+
 - `muru` carries the request's ID, the same as `X-Request-ID`.
 
 The browser's developer tools show the figures with no setup: in the
@@ -288,10 +293,20 @@ stands out in the rest, which [has a section of its own](#hints):
     worker's event loop did not get to run. It says the loop was
     blocked, by this request or another one on it, not what blocked it.
 
-  A row of several waits or stretches draws each of them as a segment
-  on its one line, says how many under Starts and gives their total
-  under Takes; a row of one draws it as an ordinary bar. The first 64
-  waits for the GIL, and the 64 longest stretches with the loop held,
+  Beside them is **importing modules**: each module the request loaded
+  for the first time in this worker, from the import that asked for it
+  to the end of its code, as a segment named by the module. A module it
+  imports in turn is within the segment of the one that imported it,
+  not drawn again. A module already loaded, by the host before the
+  fork or by an earlier request in the worker, costs nothing and is not
+  shown, so the row is on a worker's first request to a page and gone
+  from the second. Loading such modules before the worker serves is
+  what the `preload_modules` setting does.
+
+  A row of several waits, stretches or modules draws each of them as a
+  segment on its one line, says how many under Starts and gives their
+  total under Takes; a row of one draws it as an ordinary bar. The first
+  64 waits for the GIL, and the 64 longest stretches with the loop held,
   are drawn; the rest are counted.
 
   Pointing at a bar, a segment or a moment, giving it keyboard focus
@@ -306,6 +321,13 @@ stands out in the rest, which [has a section of its own](#hints):
   by generation. A collection pauses every thread of the worker, so it
   holds up whatever requests are in flight. On a free-threaded build
   there is no GIL, and no GIL wait is shown.
+
+  The table's "modules loaded on first use" row gives how many modules
+  the request loaded and how long they took, and "Modules loaded on
+  first use" below it opens to list each of them in the order they
+  began: when it started, how long it took and the file and line whose
+  import asked for it, a module imported by another indented beneath it.
+  A record lists the first 200 and counts the rest.
 
   The panel lists the same under "What the phases are".
 
@@ -391,6 +413,7 @@ and change nothing. Each has a threshold, at or past which it is shown:
 | a long wait for a worker | Timing | the request waited 100 ms or more for a worker, which says the run had too few for the page's requests; the hint names `processes` (`--processes`) |
 | a long wait for a thread | Timing | a WSGI request waited 100 ms or more for a thread of its worker; the hint names `threads` (`--threads`) |
 | garbage collection | Timing | collections during the request took 50 ms or more in all, or there were 20 or more of them |
+| modules loaded on first use | Timing | the modules the worker loaded for the first time during the request took 25% or more of its total time, and at least 50 ms; the hint names the longest and `preload_modules`, which loads them before the worker serves |
 | an answer of Muru's own | Errors | Muru answered the request itself for a timeout or a size limit, such as 504 `deadline` or 413 `body_too_large`; the hint names the setting, such as `request_deadline` (`--timeout deadline=` for a run) |
 
 At most 3 hints of one kind are shown, the strongest first. The same

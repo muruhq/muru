@@ -1003,10 +1003,11 @@ fn report_thread(fd: i32, shared: &Shared, memory_interval: Duration, stop: &Ato
 
     loop {
         let mut line = format!(
-            "{{\"in_flight\":{},\"oldest_ms\":{},\"requests\":{}",
+            "{{\"in_flight\":{},\"oldest_ms\":{},\"requests\":{},\"modules\":{}",
             shared.in_flight(),
             shared.oldest_ms(),
-            shared.total()
+            shared.total(),
+            record::modules_loaded()
         );
 
         // Section 11.7: what each side holds, as of this report, for a
@@ -1340,8 +1341,8 @@ async fn handle_request(
     let trace = shared.request_trace(request_id);
     let edge_id = head.request_id.clone();
 
-    if trace.is_some() {
-        record::start_logs(&edge_id);
+    if let Some(trace) = &trace {
+        record::start_logs(&edge_id, trace);
     }
 
     // Section 6.14: the request may be handed to the event loop, which
@@ -1566,7 +1567,7 @@ async fn handle_asgi_request(
 
     if let Some(trace) = &trace {
         trace.on_loop();
-        record::start_logs(&head.request_id);
+        record::start_logs(&head.request_id, trace);
     }
 
     let aborted = AtomicBool::new(false);
@@ -2104,6 +2105,7 @@ async fn write_response_after(
                         })
                         .collect(),
                     flush: flush as i32,
+                    imports_ms: trace.map_or(0.0, record::Trace::imports_ms),
                 };
 
                 if status == 101 {

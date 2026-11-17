@@ -388,7 +388,7 @@ pub(crate) async fn handle(
     // The application ran until its head, its END or the deadline,
     // whichever came.
 
-    recording.head_arrived(dispatched.elapsed());
+    recording.head_arrived(dispatched.elapsed(), Duration::ZERO);
 
     let response_head = match first {
         Err(_) => {

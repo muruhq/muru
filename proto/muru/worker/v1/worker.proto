@@ -176,6 +176,7 @@ message ResponseHead {
   repeated Header headers = 2;      // ordered, as the application gave them
   FlushPolicy flush = 3;
   string reason = 4;                // the application's reason phrase, for HTTP/1.1
+  double imports_ms = 5;            // a recorded request's first-time module loads before the head, the outermost summed, for Server-Timing (issue 738)
 }
 
 // Payload of an END frame: the end of a body in one direction.
@@ -220,6 +221,18 @@ message WorkerRecord {
   repeated RecordCapture captures = 24; // evidence the worker captured, such as the stack at a soft timeout (issue 706)
   repeated Stretch gil_wait_stretches = 25;  // each wait for the GIL, in order, the first 64 (issue 737)
   repeated Stretch loop_held_stretches = 26; // each stretch of the request with the event loop held, in order, the longest 64 (issue 737)
+  repeated ModuleLoad module_loads = 27;     // modules loaded for the first time in the worker during the request, in order, the first 200 (issue 738)
+  uint32 modules_loaded = 28;                // how many, those past the cap too
+  double modules_ms = 29;                    // their time, the outermost loads summed
+}
+
+// A module loaded for the first time in the worker (issue 738).
+message ModuleLoad {
+  string module = 1;
+  double at = 2;                    // when it began, from when the worker took the request
+  double ms = 3;                    // how long creating and executing it took, the loads nested in it included
+  uint32 depth = 4;                 // how many loads it is nested in
+  string trigger = 5;               // the file and line that asked for it, when known
 }
 
 // A stretch of a request's time, from when the worker took the request.

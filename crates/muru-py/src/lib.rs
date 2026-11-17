@@ -386,6 +386,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(name_thread, m)?)?;
     m.add_function(wrap_pyfunction!(gc::gc_callback, m)?)?;
     m.add_function(wrap_pyfunction!(gc::gc_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(record::module_loaded, m)?)?;
+    m.add_class::<record::ImportTally>()?;
     m.add_class::<wsgi::Input>()?;
     m.add_class::<wsgi::StartResponse>()?;
     m.add_class::<wsgi::FileWrapper>()?;

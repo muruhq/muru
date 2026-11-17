@@ -61,7 +61,16 @@ from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any, TextIO
 
-from muru import RequestTimeout, _asgi, _inspect, _instrumentation, _outside, _signals, preload
+from muru import (
+    RequestTimeout,
+    _asgi,
+    _imports,
+    _inspect,
+    _instrumentation,
+    _outside,
+    _signals,
+    preload,
+)
 from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
@@ -1047,6 +1056,7 @@ class WorkerState:
     started_at: float
     report_fd: int
     requests: int = 0
+    modules: int = 0
     in_flight: int = 0
     oldest_ms: int = 0
     ready: bool = False
@@ -1799,6 +1809,12 @@ class Host:
                     raise
 
                 instruments.finished(context, _instrumentation.SERVE)
+
+            # Issue 738: from here on, a module loaded for the first time
+            # is timed, for the record of the request it ran under and the
+            # worker's count of them.
+
+            _imports.install()
 
             # Section 6.15: the instrumentation modules start in the worker
             # just before post_fork, before the loop exists.
@@ -3091,6 +3107,7 @@ class Host:
                 "debugging": state.debug_sessions > 0,
                 "uptime_s": round(time.monotonic() - state.started_at, 1),
                 "requests": state.requests,
+                "modules": state.modules,
                 **{key: sides[key] for key in SIDES if key in sides},
                 "stale": live is None and bool(state.sides),
                 **state.memory,
@@ -3344,6 +3361,7 @@ class Host:
 
             state.last_report_at = time.monotonic()
             state.requests = int(report.get("requests", state.requests))
+            state.modules = int(report.get("modules", state.modules))
             state.in_flight = int(report.get("in_flight", state.in_flight))
             state.oldest_ms = int(report.get("oldest_ms", state.oldest_ms))
             state.sides = {key: report[key] for key in SIDES if key in report}

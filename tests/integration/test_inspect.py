@@ -105,8 +105,8 @@ def test_status_lists_every_worker_with_its_figures(daemon: Daemon) -> None:
     def status_rows() -> list[list[str]]:
         lines = daemon.muructl("debug", "status", "plain").stdout.splitlines()
         assert lines[0].split() == [
-            "WORKER", "PID", "GROUP", "UP", "REQUESTS", "THREADS", "THREAD-OLDEST",
-            "RSS", "USS", "ROUTED", "STATE",
+            "WORKER", "PID", "GROUP", "UP", "REQUESTS", "MODULES", "THREADS",
+            "THREAD-OLDEST", "RSS", "USS", "ROUTED", "STATE",
         ]  # fmt: skip
         return [line.split() for line in lines[1:]]
 
@@ -121,6 +121,7 @@ def test_status_lists_every_worker_with_its_figures(daemon: Daemon) -> None:
     answer = json.loads(daemon.muructl("debug", "status", "plain@r1", "--json").stdout)
     assert answer["release"] == "r1"
     assert all(worker["ok"] and worker["result"]["requests"] >= 0 for worker in answer["workers"])
+    assert all(worker["result"]["modules"] >= 0 for worker in answer["workers"])
     assert (
         len(
             json.loads(
@@ -295,10 +296,10 @@ def test_status_and_stacks_show_an_asgi_workers_sync_pool(daemon: Daemon) -> Non
 
     assert outcome == [200, 200, 200]
     header = lines[0].split()
-    assert header[5:9] == ["LOOP", "LOOP-OLDEST", "SYNC", "SYNC-OLDEST"], header
+    assert header[6:10] == ["LOOP", "LOOP-OLDEST", "SYNC", "SYNC-OLDEST"], header
     row = lines[1].split()
-    assert row[5] == "3/1000" and row[7] == "2/2", row
-    assert row[8].endswith("s") and row[8] != "-", row
+    assert row[6] == "3/1000" and row[8] == "2/2", row
+    assert row[9].endswith("s") and row[9] != "-", row
 
     # Each thread of the pool is named with the request whose call it runs.
 
@@ -327,7 +328,7 @@ def test_status_counts_the_threads_anyio_and_asgiref_run_sync_code_on(daemon: Da
     def status() -> tuple[str, dict[str, Any]]:
         row = daemon.muructl("debug", "status", "fast").stdout.splitlines()[1].split()
         answer = json.loads(daemon.muructl("debug", "status", "fast", "--json").stdout)
-        return row[7], answer["workers"][0]["result"]["sync_pools"]
+        return row[8], answer["workers"][0]["result"]["sync_pools"]
 
     # FastAPI runs a synchronous endpoint on anyio's worker threads,
     # whose limit is the worker's sync threads: of three requests two

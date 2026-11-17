@@ -49,6 +49,9 @@
 /* A narrow window scrolls a spans table sideways rather than squeezing
    its names to a letter a line. */
 .panel table.spans { min-width: 34rem; }
+/* The modules loaded on first use (issue 738): a nested module is
+   indented beneath the one that loaded it by the spaces its name has. */
+.panel table.modules td.module { white-space: pre; }
 .panel .track .rule { position: absolute; top: -0.55rem; bottom: -0.75rem; width: 0; border-left: 1px dashed rgba(127, 127, 127, 0.3); pointer-events: none; }
 .panel .track .diamond { position: absolute; top: 50%; width: 0.6rem; height: 0.6rem; margin-left: -0.3rem; margin-top: -0.3rem; transform: rotate(45deg); background: #3f9c5a; }
 .panel tr.edge .diamond { background: #5b8def; }

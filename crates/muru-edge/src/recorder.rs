@@ -636,6 +636,19 @@ pub fn worker(record: &mut admin::RequestRecord, part: muru_proto::worker::v1::W
         panels: part.panels.into_iter().map(panel).collect(),
         gil_wait_stretches: part.gil_wait_stretches.into_iter().map(stretch).collect(),
         loop_held_stretches: part.loop_held_stretches.into_iter().map(stretch).collect(),
+        module_loads: part
+            .module_loads
+            .into_iter()
+            .map(|load| admin::ModuleLoad {
+                module: load.module,
+                at_ms: load.at,
+                ms: load.ms,
+                depth: load.depth,
+                trigger: load.trigger,
+            })
+            .collect(),
+        modules_loaded: part.modules_loaded,
+        modules_ms: part.modules_ms,
     });
 }
 

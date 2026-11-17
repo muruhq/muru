@@ -10,9 +10,11 @@
 //! request up is taken where the worker already measures it: the GIL
 //! waits of section 7.3, the garbage collector's totals of section 11.1
 //! read at the start and the end, and the event loop's late heartbeats.
+//! The modules the request loaded for the first time in the worker are
+//! kept by the runtime library's finder (issue 738), by the request's id.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use muru_proto::worker::v1 as pb;
@@ -31,6 +33,8 @@ struct Capture {
     logs_take: Py<PyAny>,
     panels_start: Py<PyAny>,
     panels_take: Py<PyAny>,
+    imports_start: Py<PyAny>,
+    imports_take: Py<PyAny>,
 }
 
 /// The most waits for the GIL, and stretches with the event loop held,
@@ -47,6 +51,37 @@ pub(crate) fn asked() -> bool {
     ASKED.load(Ordering::Relaxed)
 }
 
+/// The modules the worker has loaded since the runtime library's finder
+/// went in, for its status reports (issue 738).
+static MODULES_LOADED: AtomicU64 = AtomicU64::new(0);
+
+/// How many modules the worker has loaded since the fork.
+pub(crate) fn modules_loaded() -> u64 {
+    MODULES_LOADED.load(Ordering::Relaxed)
+}
+
+/// Count a module the worker has loaded for the first time, as the
+/// runtime library's finder does once each load ends.
+#[pyfunction]
+pub fn module_loaded() {
+    MODULES_LOADED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// What a request spent loading modules for the first time, the
+/// outermost loads summed, as the runtime library's finder tells it
+/// each load's milliseconds: read as the response head goes to the edge,
+/// for its `Server-Timing` (issue 738).
+#[pyclass(frozen)]
+pub struct ImportTally(Arc<AtomicU64>);
+
+#[pymethods]
+impl ImportTally {
+    fn __call__(&self, ms: f64) {
+        let nanos = (ms.max(0.0) * 1_000_000.0) as u64;
+        self.0.fetch_add(nanos, Ordering::Relaxed);
+    }
+}
+
 /// What the worker saw of one request, for its record.
 #[derive(Debug)]
 pub struct Trace {
@@ -56,6 +91,8 @@ pub struct Trace {
     started_wall: SystemTime,
     /// The garbage collector's totals then, by generation.
     gc_before: [(u64, u64); 4],
+    /// The request's first-time module loads so far, in nanoseconds.
+    imports: Arc<AtomicU64>,
     state: Mutex<State>,
 }
 
@@ -106,6 +143,7 @@ impl Trace {
             started,
             started_wall: SystemTime::now() - elapsed,
             gc_before: crate::gc::totals(),
+            imports: Arc::default(),
             state: Mutex::new(State {
                 default_source,
                 ..State::default()
@@ -139,6 +177,12 @@ impl Trace {
 
     fn at(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    /// The milliseconds the request has spent so far loading modules for
+    /// the first time, the outermost loads summed.
+    pub fn imports_ms(&self) -> f64 {
+        self.imports.load(Ordering::Relaxed) as f64 / 1_000_000.0
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -347,6 +391,9 @@ impl Trace {
             loop_lag_at: millis(Some(loop_lag_at)),
             gil_wait_stretches: stretches(&state.gil_stretches),
             loop_held_stretches: stretches(&held),
+            module_loads: logs.module_loads,
+            modules_loaded: logs.modules_loaded,
+            modules_ms: logs.modules_ms,
         }
     }
 }
@@ -370,34 +417,46 @@ fn gc_during(before: &[(u64, u64); 4], after: &[(u64, u64); 4]) -> Vec<pb::GcDur
 /// What the runtime library kept of a request for its record: its log
 /// records, each one's time on the wall clock, level, logger and message,
 /// with how many were past the limit; and the panels code in the
-/// worker added (issue 677).
+/// worker added (issue 677); and the modules it loaded for the first
+/// time in the worker (issue 738), with how many in all and their time.
 #[derive(Debug, Default)]
 pub struct Logs {
     kept: Vec<(f64, String, String, String)>,
     dropped: u32,
     panels: Vec<pb::RecordPanel>,
+    module_loads: Vec<pb::ModuleLoad>,
+    modules_loaded: u32,
+    modules_ms: f64,
 }
 
 fn capture(py: Python<'_>) -> PyResult<&Capture> {
     CAPTURE.get_or_try_init(py, || {
         let logging = py.import("muru.logging")?;
         let panels = py.import("muru.panels")?;
+        let imports = py.import("muru._imports")?;
 
         Ok(Capture {
             logs_start: logging.getattr("_capture_start")?.unbind(),
             logs_take: logging.getattr("_capture_take")?.unbind(),
             panels_start: panels.getattr("_start")?.unbind(),
             panels_take: panels.getattr("_take")?.unbind(),
+            imports_start: imports.getattr("_start")?.unbind(),
+            imports_take: imports.getattr("_take")?.unbind(),
         })
     })
 }
 
-/// Start keeping a request's log records and panels.
-pub fn start_logs(request_id: &str) {
+/// Start keeping a request's log records, panels and first-time module
+/// loads, the loads on the clock of its `trace`.
+pub fn start_logs(request_id: &str, trace: &Trace) {
     Python::attach(|py| {
         let started = capture(py).and_then(|capture| {
             capture.logs_start.call1(py, (request_id,))?;
-            capture.panels_start.call1(py, (request_id,))
+            capture.panels_start.call1(py, (request_id,))?;
+
+            let tally = Py::new(py, ImportTally(Arc::clone(&trace.imports)))?;
+            let since = trace.started.elapsed().as_secs_f64();
+            capture.imports_start.call1(py, (request_id, tally, since))
         });
 
         if let Err(error) = started {
@@ -428,13 +487,39 @@ pub fn take_logs(request_id: &str) -> Logs {
                 Vec::new()
             });
 
+        let (loads, modules_loaded, modules_ms) = capture
+            .imports_take
+            .call1(py, (request_id,))
+            .and_then(|taken| taken.extract::<TakenLoads>(py))
+            .unwrap_or_else(|error| {
+                tracing::debug!(%error, "the request's module loads cannot be taken");
+                TakenLoads::default()
+            });
+
         Logs {
             kept,
             dropped,
             panels,
+            module_loads: loads
+                .into_iter()
+                .map(|(at, ms, module, trigger, depth)| pb::ModuleLoad {
+                    module,
+                    at,
+                    ms,
+                    depth,
+                    trigger,
+                })
+                .collect(),
+            modules_loaded,
+            modules_ms,
         }
     })
 }
+
+/// A request's loads as `muru._imports._take` gives them: each one's
+/// start, length, module, trigger and depth; how many in all; and the
+/// outermost loads' time.
+type TakenLoads = (Vec<(f64, f64, String, String, u32)>, u32, f64);
 
 /// One panel as `muru.panels._take` gives it: its name, title, spans,
 /// values, tables (caption, columns, rows), how many entries it dropped,
@@ -689,7 +774,7 @@ mod tests {
                 "low stock".to_owned(),
             )],
             dropped: 3,
-            panels: Vec::new(),
+            ..Logs::default()
         };
         let record = trace.to_message(false, logs);
         assert_eq!(record.logs.len(), 1);

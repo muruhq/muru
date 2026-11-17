@@ -2242,8 +2242,8 @@ fn print_status(response: &pb::DebugResponse) {
         }
     }
     let mut header = format!(
-        "{:<7} {:<8} {:<10} {:<8} {:<10}",
-        "WORKER", "PID", "GROUP", "UP", "REQUESTS"
+        "{:<7} {:<8} {:<10} {:<8} {:<10} {:<8}",
+        "WORKER", "PID", "GROUP", "UP", "REQUESTS", "MODULES"
     );
 
     if sides.threads {
@@ -2267,8 +2267,8 @@ fn print_status(response: &pb::DebugResponse) {
         }
 
         let mut line = format!(
-            "{:<7} {:<8} {:<10} {:<8} {:<10}",
-            row.worker, row.pid, row.group, row.uptime, row.requests
+            "{:<7} {:<8} {:<10} {:<8} {:<10} {:<8}",
+            row.worker, row.pid, row.group, row.uptime, row.requests, row.modules
         );
 
         if sides.threads {

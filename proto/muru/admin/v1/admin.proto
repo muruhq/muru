@@ -435,6 +435,18 @@ message WorkerPart {
   repeated Panel panels = 23;       // panels code in the worker added (issue 677), spans on the worker's clock
   repeated Stretch gil_wait_stretches = 24;  // each wait for the GIL, in order, the first 64 (issue 737)
   repeated Stretch loop_held_stretches = 25; // each stretch with the event loop held, in order, the longest 64 (issue 737)
+  repeated ModuleLoad module_loads = 26;     // modules loaded for the first time in the worker, in order, the first 200 (issue 738)
+  uint32 modules_loaded = 27;                // how many, those past the cap too
+  double modules_ms = 28;                    // their time, the outermost loads summed
+}
+
+// A module loaded for the first time in the worker during a request (issue 738).
+message ModuleLoad {
+  string module = 1;
+  double at_ms = 2;                 // from when the worker took the request
+  double ms = 3;                    // the loads nested in it included
+  uint32 depth = 4;                 // how many loads it is nested in
+  string trigger = 5;               // the file and line that asked for it, when known
 }
 
 // A stretch of a request's time, from when the worker took the request.
