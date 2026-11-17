@@ -4128,7 +4128,15 @@ impl Daemon {
 
         crate::rollouts::probe_host(&self.probe_client, &url, host.as_deref(), &id)
             .await
-            .map_err(|error| format!("its probe failed: {error}"))
+            .map_err(|error| {
+                crate::overlays::describe_probe_failure(
+                    &format!("{app}@{id}"),
+                    &url,
+                    path,
+                    host.as_deref(),
+                    &error,
+                )
+            })
     }
 
     /// Section 9.10: begin and end overlays by their schedules and by the

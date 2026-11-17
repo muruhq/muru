@@ -298,6 +298,14 @@ at the host of the first route the overlay changes:
 preconditions = { release_ready = 'r43', probe = '/healthz' }
 ```
 
+A probe that fails names the release it asked and the host, in the
+refusal of an activation by hand and in `overlay.skipped`:
+
+```console
+$ muructl overlay activate cutover-r43
+muru: error: overlay cutover-r43 was not activated: its probe of shop@r43 failed: /healthz (as a preview, at host shop) answered 503 Service Unavailable
+```
+
 ## Previewing and promoting
 
 ```

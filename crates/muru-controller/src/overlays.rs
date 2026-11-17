@@ -253,6 +253,34 @@ pub fn describe_wait(millis: u64) -> String {
     }
 }
 
+/// Why an overlay's probe of `release` failed, from the error the probe
+/// of `url` gave: the release and the host it was asked at in place of
+/// the edge's listener, which reads as if the serving release had failed
+/// (issue 758).
+pub fn describe_probe_failure(
+    release: &str,
+    url: &str,
+    path: &str,
+    host: Option<&str>,
+    error: &str,
+) -> String {
+    let asked = match host {
+        Some(host) => format!("{path} (as a preview, at host {host})"),
+        None => {
+            let listener = url
+                .strip_prefix("http://")
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or(url);
+            format!("{path} (as a preview, through {listener})")
+        }
+    };
+
+    format!(
+        "its probe of {release} failed: {}",
+        error.replacen(url, &asked, 1)
+    )
+}
+
 /// What should happen to an overlay now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
@@ -1308,6 +1336,32 @@ mod tests {
         }
 
         assert_eq!(cleared_by_change(&before, &moved, None), None);
+    }
+
+    #[test]
+    fn a_failed_probe_names_the_release_and_the_host() {
+        let url = "http://127.0.0.1:8080/healthz";
+
+        assert_eq!(
+            describe_probe_failure(
+                "shop@r2",
+                url,
+                "/healthz",
+                Some("shop"),
+                "http://127.0.0.1:8080/healthz answered 503 Service Unavailable"
+            ),
+            "its probe of shop@r2 failed: /healthz (as a preview, at host shop) answered 503 Service Unavailable"
+        );
+        assert_eq!(
+            describe_probe_failure(
+                "shop@r2",
+                url,
+                "/healthz",
+                None,
+                "http://127.0.0.1:8080/healthz did not answer within 5s"
+            ),
+            "its probe of shop@r2 failed: /healthz (as a preview, through 127.0.0.1:8080) did not answer within 5s"
+        );
     }
 
     const HOUR: u64 = 3_600_000;
