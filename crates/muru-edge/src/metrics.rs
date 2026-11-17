@@ -220,6 +220,26 @@ pub const FAMILIES: &[Family] = &[
         help: "Requests a worker has served since it started, as it last reported.",
     },
     Family {
+        name: "muru_worker_modules_loaded_total",
+        kind: Kind::Counter,
+        help: "Modules a worker has loaded for the first time since the fork, as it last reported.",
+    },
+    Family {
+        name: "muru_worker_module_load_seconds_total",
+        kind: Kind::Counter,
+        help: "Time a worker has spent loading modules for the first time since the fork, the outermost loads summed, as it last reported.",
+    },
+    Family {
+        name: "muru_worker_load_seconds",
+        kind: Kind::Gauge,
+        help: "How long a worker took to import the application itself, with per-worker imports.",
+    },
+    Family {
+        name: "muru_release_load_seconds",
+        kind: Kind::Gauge,
+        help: "How long a release's host took to import the application before the fork, by application and release.",
+    },
+    Family {
         name: "muru_worker_sync_threads_busy",
         kind: Kind::Gauge,
         help: "Threads of a worker's pool for synchronous code running a call, as it last reported.",
@@ -879,6 +899,35 @@ impl Metrics {
 
         samples
     }
+}
+
+/// A worker's samples of what it has loaded (issue 753): the modules it
+/// has loaded for the first time since the fork and their time, and how
+/// long it took to load the application itself when it did.
+pub fn module_samples(
+    labels: &[(&str, &str)],
+    modules: u64,
+    modules_us: u64,
+    load_us: u64,
+) -> Vec<Sample> {
+    let mut samples = vec![
+        Sample::new("muru_worker_modules_loaded_total", labels, modules as f64),
+        Sample::new(
+            "muru_worker_module_load_seconds_total",
+            labels,
+            modules_us as f64 / 1e6,
+        ),
+    ];
+
+    if load_us > 0 {
+        samples.push(Sample::new(
+            "muru_worker_load_seconds",
+            labels,
+            load_us as f64 / 1e6,
+        ));
+    }
+
+    samples
 }
 
 /// A worker's cumulative histogram over the worker protocol's signal

@@ -109,3 +109,20 @@ def test_a_record_keeps_up_to_its_limit_and_a_missing_module_is_searched_once(
     (source / "absent.py").write_text("")
     importlib.invalidate_caches()
     import absent  # noqa: F401
+
+
+def test_the_runtime_times_the_outermost_loads_alone(
+    source: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (source / "outer.py").write_text("import inner\n")
+    (source / "inner.py").write_text("")
+    noted: list[float] = []
+    monkeypatch.setattr(_imports, "_note_loaded", noted.append)
+
+    import outer  # noqa: F401
+
+    # Every load is counted, and only the outermost is timed for the
+    # worker's metrics, since it holds the one nested in it.
+
+    assert len(noted) == 2
+    assert noted[0] == 0.0 and noted[1] > 0.0

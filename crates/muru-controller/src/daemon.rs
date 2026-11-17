@@ -1138,6 +1138,9 @@ struct Running {
     control: Option<HostControl>,
     /// What the workers last reported, for metrics.
     status: Vec<crate::host::WorkerStatus>,
+    /// How long the host took to load the application, in milliseconds,
+    /// once it has said (issue 753).
+    load_ms: Option<u64>,
     /// The workers the host is replacing for memory, for the memory
     /// guard (section 13.9).
     memory_replacements: Vec<crate::host::MemoryReplacement>,
@@ -4806,6 +4809,16 @@ impl Daemon {
                 }
             }
 
+            // Issue 753: how long the host took to load the application.
+
+            if let Some(ms) = running.load_ms {
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_release_load_seconds",
+                    &[("app", app.as_str()), ("release", id.as_str())],
+                    ms as f64 / 1000.0,
+                ));
+            }
+
             // Sections 7.6 and 7.7: what each worker last reported.
 
             for worker in &running.status {
@@ -4834,6 +4847,12 @@ impl Daemon {
                     "muru_worker_requests_in_flight",
                     &labels,
                     worker.in_flight as f64,
+                ));
+                samples.extend(muru_edge::metrics::module_samples(
+                    &labels,
+                    worker.modules,
+                    worker.modules_us,
+                    worker.load_us,
                 ));
 
                 // Section 6.6: the pools an ASGI worker runs synchronous
@@ -5166,6 +5185,7 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        load_ms: None,
                         memory_replacements: Vec::new(),
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
@@ -5268,6 +5288,7 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        load_ms: None,
                         memory_replacements: Vec::new(),
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
@@ -6760,6 +6781,7 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                load_ms: None,
                 memory_replacements: Vec::new(),
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
@@ -7053,6 +7075,7 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                load_ms: None,
                 memory_replacements: Vec::new(),
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
@@ -11662,6 +11685,28 @@ impl Daemon {
             // Section 11.7: only a development run keeps request records,
             // so the daemon has nothing to join a capture to.
             HostMessage::Capture(_) => {}
+            HostMessage::Loaded {
+                outcome,
+                ms,
+                imports,
+                first,
+            } => {
+                // Issue 753: the host's load, an event the first time it
+                // says so and a gauge from then on.
+
+                if let Some(running) = self.running.get_mut(&key) {
+                    running.load_ms = Some(ms);
+                }
+
+                if first {
+                    self.events.emit(
+                        "release.loaded",
+                        &format!("{app}@{id}"),
+                        "info",
+                        &crate::host::loaded_message(&outcome, ms, imports.as_ref()),
+                    );
+                }
+            }
             // Section 6.18: the load's import report is kept in the store
             // beside the release, which removing the release removes.
             HostMessage::Imports { part, parts, data } => {

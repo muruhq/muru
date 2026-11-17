@@ -120,7 +120,7 @@ _missing: set[str] = set()
 # The runtime's counter of the worker's loads, for its status reports,
 # when the extension is there.
 
-_note_loaded: Callable[[], None] | None = None
+_note_loaded: Callable[[float], None] | None = None
 
 
 def loaded() -> tuple[int, int]:
@@ -380,8 +380,11 @@ class _Timed:
             if len(_worker) < WORKER_LOADS_KEPT and name not in _worker:
                 _worker[name] = [current or "", ms, depth, False, int(time.time() * 1000)]
 
+        # The runtime counts every load and times the outermost, which
+        # hold the nested ones, for the worker's metrics (issue 753).
+
         if _note_loaded is not None:
-            _note_loaded()
+            _note_loaded(ms if depth == 0 else 0.0)
 
         kept = self._kept
 

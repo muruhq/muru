@@ -110,6 +110,42 @@ def test_the_import_report_reaches_debug_imports_and_muructl_check(tmp_path: Pat
         assert targets["report_slow"] == "entrypoint", report["candidates"]
         modules = {row["module"]: row for row in found["workers"]["modules"]}
         assert modules["csv"]["loaded_by"] == 1, found["workers"]
+
+        # Issue 753: the load is an event with the report's figures, its
+        # time a metric, and the worker's loads counted once it reports.
+
+        socket = ["--socket", f"{runtime}/runs/{server.port}/admin.sock"]
+        events = subprocess.run(
+            [str(support.muructl_path()), "events", *socket],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        ).stdout
+        assert "release.loaded" in events and "importing took" in events, events
+
+        deadline = time.monotonic() + 30.0
+        metrics = ""
+
+        while time.monotonic() < deadline:
+            metrics = subprocess.run(
+                [str(support.muructl_path()), "metrics", *socket],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            ).stdout
+            counted = [
+                line
+                for line in metrics.splitlines()
+                if line.startswith("muru_worker_modules_loaded_total{")
+            ]
+
+            if counted and not counted[0].endswith(" 0"):
+                break
+
+            time.sleep(0.1)
+
+        assert "muru_release_load_seconds{" in metrics, metrics
+        assert counted and not counted[0].endswith(" 0"), metrics
     finally:
         server.stop()
 

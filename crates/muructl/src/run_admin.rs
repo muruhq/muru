@@ -808,6 +808,79 @@ fn output_dropped_samples() -> Vec<muru_edge::metrics::Sample> {
         .collect()
 }
 
+/// How long each release's host took to load the application, in
+/// milliseconds, and what each worker last reported of the modules it has
+/// loaded since the fork, by application and release (issue 753).
+static LOADS: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
+static WORKER_MODULES: Mutex<BTreeMap<WorkerKey, (u64, u64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// A worker by application, release, group and index.
+type WorkerKey = (String, String, String, u32);
+
+/// Note how long a release's host took to load the application.
+pub fn set_release_load(app: &str, release: &str, ms: u64) {
+    LOADS
+        .lock()
+        .expect("loads poisoned")
+        .insert((app.to_owned(), release.to_owned()), ms);
+}
+
+/// Note what a release's workers last reported of the modules they have
+/// loaded, in place of what the release's workers reported before.
+pub fn set_worker_modules(
+    app: &str,
+    release: &str,
+    workers: &[muru_controller::host::WorkerStatus],
+) {
+    let mut kept = WORKER_MODULES.lock().expect("worker modules poisoned");
+    kept.retain(|(of_app, of_release, _, _), _| of_app != app || of_release != release);
+
+    for worker in workers {
+        kept.insert(
+            (
+                app.to_owned(),
+                release.to_owned(),
+                worker.group.clone(),
+                worker.index,
+            ),
+            (worker.modules, worker.modules_us, worker.load_us),
+        );
+    }
+}
+
+fn load_samples() -> Vec<muru_edge::metrics::Sample> {
+    let loads = LOADS.lock().expect("loads poisoned");
+    let modules = WORKER_MODULES.lock().expect("worker modules poisoned");
+    let mut samples: Vec<muru_edge::metrics::Sample> = loads
+        .iter()
+        .map(|((app, release), ms)| {
+            muru_edge::metrics::Sample::new(
+                "muru_release_load_seconds",
+                &[("app", app.as_str()), ("release", release.as_str())],
+                *ms as f64 / 1000.0,
+            )
+        })
+        .collect();
+
+    for ((app, release, group, index), (loaded, us, load_us)) in modules.iter() {
+        let index = index.to_string();
+
+        samples.extend(muru_edge::metrics::module_samples(
+            &[
+                ("app", app.as_str()),
+                ("release", release.as_str()),
+                ("group", group.as_str()),
+                ("worker", index.as_str()),
+            ],
+            *loaded,
+            *us,
+            *load_us,
+        ));
+    }
+
+    samples
+}
+
 fn worker_event_samples() -> Vec<muru_edge::metrics::Sample> {
     WORKER_EVENTS
         .lock()
@@ -844,7 +917,8 @@ pub fn metrics_text(
         .chain(pool_samples(&routing))
         .chain(connections.samples())
         .chain(worker_event_samples())
-        .chain(output_dropped_samples());
+        .chain(output_dropped_samples())
+        .chain(load_samples());
     render(&aggregate(samples))
 }
 

@@ -55,16 +55,47 @@ pub(crate) fn asked() -> bool {
 /// went in, for its status reports (issue 738).
 static MODULES_LOADED: AtomicU64 = AtomicU64::new(0);
 
+/// The time of those loads, the outermost summed, in microseconds
+/// (issue 753).
+static MODULES_US: AtomicU64 = AtomicU64::new(0);
+
+/// How long the worker's own load of the application took, with
+/// per-worker imports, in microseconds; 0 when the host loaded it
+/// (issue 753).
+static LOAD_US: AtomicU64 = AtomicU64::new(0);
+
 /// How many modules the worker has loaded since the fork.
 pub(crate) fn modules_loaded() -> u64 {
     MODULES_LOADED.load(Ordering::Relaxed)
 }
 
+/// How long the modules the worker has loaded since the fork took, the
+/// outermost loads summed, in microseconds.
+pub(crate) fn modules_us() -> u64 {
+    MODULES_US.load(Ordering::Relaxed)
+}
+
+/// How long the worker's own load of the application took, in
+/// microseconds, 0 when it did not load it.
+pub(crate) fn load_us() -> u64 {
+    LOAD_US.load(Ordering::Relaxed)
+}
+
 /// Count a module the worker has loaded for the first time, as the
-/// runtime library's finder does once each load ends.
+/// runtime library's finder does once each load ends, with its
+/// milliseconds when it is not nested in another load.
 #[pyfunction]
-pub fn module_loaded() {
+#[pyo3(signature = (ms = 0.0))]
+pub fn module_loaded(ms: f64) {
     MODULES_LOADED.fetch_add(1, Ordering::Relaxed);
+    MODULES_US.fetch_add((ms.max(0.0) * 1000.0) as u64, Ordering::Relaxed);
+}
+
+/// Note how long the worker took to load the application itself, with
+/// per-worker imports, for its status reports.
+#[pyfunction]
+pub fn worker_loaded(ms: f64) {
+    LOAD_US.store((ms.max(0.0) * 1000.0) as u64, Ordering::Relaxed);
 }
 
 /// What a request spent loading modules for the first time, the

@@ -1094,6 +1094,8 @@ class WorkerState:
     report_fd: int
     requests: int = 0
     modules: int = 0
+    modules_us: int = 0
+    load_us: int = 0
     in_flight: int = 0
     oldest_ms: int = 0
     ready: bool = False
@@ -1424,6 +1426,12 @@ class Host:
         # that connects.
 
         self.imports: str | None = None
+
+        # Issue 753: how the host's own load went, sent to each supervisor
+        # that connects, the first told it is news.
+
+        self.loaded: dict[str, Any] | None = None
+        self.loaded_sent = False
 
         # Section 6.7: the interfaces the workers settled themselves, by
         # mount, for an application imported in each worker or made by a
@@ -1838,6 +1846,7 @@ class Host:
                         )
 
                     release.load_modules(instruments=instruments, context=context)
+                    note_worker_loaded((time.monotonic() - started) * 1000.0)
                     log(
                         f"worker {self.worker_name(index)} "
                         f"imported {release.spec} in {elapsed_ms(started)} ms"
@@ -2383,6 +2392,12 @@ class Host:
         self.selector.register(connection, selectors.EVENT_READ)
         self.send_to_supervisor(self.workers_message())
         self.send_imports()
+
+        if self.loaded is not None:
+            self.send_to_supervisor(
+                {"type": "loaded", **self.loaded, "first": not self.loaded_sent}
+            )
+            self.loaded_sent = True
 
     def send_imports(self) -> None:
         """Send the load's import report to the supervisor, in parts, if there is one."""
@@ -3425,6 +3440,8 @@ class Host:
             state.last_report_at = time.monotonic()
             state.requests = int(report.get("requests", state.requests))
             state.modules = int(report.get("modules", state.modules))
+            state.modules_us = int(report.get("modules_us", state.modules_us))
+            state.load_us = int(report.get("load_us", state.load_us))
             state.in_flight = int(report.get("in_flight", state.in_flight))
             state.oldest_ms = int(report.get("oldest_ms", state.oldest_ms))
             state.sides = {key: report[key] for key in SIDES if key in report}
@@ -3560,6 +3577,9 @@ class Host:
                         "requests": state.requests,
                         "in_flight": state.in_flight,
                         "oldest_ms": state.oldest_ms,
+                        "modules": state.modules,
+                        "modules_us": state.modules_us,
+                        "load_us": state.load_us,
                         **sync_pools(state.sides),
                         **state.memory,
                         **state.signals,
@@ -5437,6 +5457,25 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def note_worker_loaded(ms: float) -> None:
+    """Tell the runtime how long the worker took to load the application, for its reports."""
+
+    try:
+        from muru import _native
+
+        _native.worker_loaded(ms)
+    except (ImportError, AttributeError):
+        pass
+
+
+def imports_summary() -> dict[str, Any] | None:
+    """Return the headline figures of the load's import report, when there is one."""
+
+    module = sys.modules.get("muru._lazy_imports")
+    summary: dict[str, Any] | None = module.summary() if module is not None else None
+    return summary
+
+
 def imports_report() -> str | None:
     """Take the import report this process's load made, as JSON, when import_report is on.
 
@@ -5628,6 +5667,7 @@ def _main(argv: list[str] | None) -> int:
     # Section 6.2 step 1: no collections during preload.
 
     gc.disable()
+    loaded_ms = 0.0
 
     if args.preload != "false":
         started = time.monotonic()
@@ -5667,6 +5707,7 @@ def _main(argv: list[str] | None) -> int:
                 instruments.finished(context, _instrumentation.FAILED)
                 return 1
 
+        loaded_ms = (time.monotonic() - started) * 1000.0
         log(f"preloaded {args.app} in {elapsed_ms(started)} ms")
 
         # A preloaded application has settled its interface by now; a
@@ -5812,6 +5853,13 @@ def _main(argv: list[str] | None) -> int:
 
     # Section 6.18: the load's import report, or the one a host that fell
     # back to per-worker imports left, for the supervisor.
+
+    if args.preload != "false":
+        host.loaded = {
+            "outcome": "serve" if args.single else "fork",
+            "ms": round(loaded_ms, 1),
+            "imports": imports_summary(),
+        }
 
     host.imports = imports_report() or carried_imports(args.socket_dir)
 

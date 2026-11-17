@@ -107,8 +107,11 @@ def gc_callback(phase: str, info: dict[str, Any]) -> None:
 def gc_stats() -> list[dict[str, Any]]:
     """Return the collections timed since the worker started, one dict per generation."""
 
-def module_loaded() -> None:
-    """Count a module the worker has loaded for the first time, for its status reports."""
+def module_loaded(ms: float = 0.0) -> None:
+    """Count a module the worker has loaded for the first time, with an outermost load's time."""
+
+def worker_loaded(ms: float) -> None:
+    """Note how long the worker took to load the application itself, for its status reports."""
 
 class ImportTally:
     """A request's first-time module loads, summed for its response head's Server-Timing."""

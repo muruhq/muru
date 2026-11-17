@@ -61,6 +61,7 @@ __all__ = [
     "load_finished",
     "load_started",
     "payload",
+    "summary",
     "take_payload",
     "worker_answer",
     "worker_started",
@@ -195,6 +196,22 @@ def payload() -> dict[str, Any] | None:
     """Return the load's import report with Muru's analysis, once load_finished built it."""
 
     return _payload
+
+
+def summary() -> dict[str, Any] | None:
+    """Return the headline figures of the host's import report, for the event of its load."""
+
+    if _payload is None or _payload["labels"].get("role") == "worker":
+        return None
+
+    figures = _payload["summary"]
+
+    return {
+        "import_ms": round(figures["total_import_ms"], 1),
+        "modules": figures["modules_loaded"],
+        "saving_ms": round(figures["estimated_saving_ms"], 1),
+        "deferred_used": len(_payload["deferred_used"]),
+    }
 
 
 def take_payload() -> str | None:

@@ -43,18 +43,22 @@ def test_deploy_serves_and_records_the_release(daemon: Daemon) -> None:
     assert daemon.releases("shop") == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
     assert "shop" in daemon.muructl("app", "list").stdout
 
-    # A worker's own events come from its host, which the daemon hears
-    # only once it has attached to it, so one may arrive after the
-    # release's; the release's events are in order among themselves.
-    # release.state_changed notes how the runtime library was found, a
-    # fetch from PyPI among them, which depends on the machine.
+    # A worker's own events, and the host's load (issue 753), come from
+    # the host, which the daemon hears only once it has attached to it, so
+    # one may arrive after the release's; the release's events are in
+    # order among themselves. release.state_changed notes how the runtime
+    # library was found, a fetch from PyPI among them, which depends on
+    # the machine.
 
+    kinds = daemon.events()
     releases = [
         kind
-        for kind in daemon.events()
-        if not kind.startswith("worker.") and kind != "release.state_changed"
+        for kind in kinds
+        if not kind.startswith("worker.")
+        and kind not in ("release.state_changed", "release.loaded")
     ]
     assert releases[-3:] == ["release.created", "release.ready", "traffic.switched"]
+    assert "release.loaded" in kinds
 
 
 def test_second_deploy_moves_traffic_without_failed_requests(daemon: Daemon) -> None:

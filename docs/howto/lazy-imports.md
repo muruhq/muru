@@ -315,6 +315,22 @@ The host sends the report once its supervisor connects, so a load that
 fails, or one `preload = true` refuses, has no report kept;
 `muructl check --imports` shows the report of such a load.
 
+### In events and metrics
+
+The host's load is a `release.loaded` event, which with `import_report`
+on gives the report's headline figures:
+
+```
+release.loaded  shop@r3  the host loaded the application in 520 ms before the fork; importing took 412 ms over 213 modules, and deferring what can be deferred would save about 120 ms
+```
+
+Its time is the `muru_release_load_seconds` metric whether or not the
+report is on, and `muru_worker_modules_loaded_total` and
+`muru_worker_module_load_seconds_total` count what each worker has
+loaded since the fork, so a deploy that made the load slower, or workers
+that keep loading code, can be graphed and alerted on. The
+[metrics guide](metrics.md) lists them.
+
 ### What it costs
 
 Recording costs the load time, and analysing the report when the load is

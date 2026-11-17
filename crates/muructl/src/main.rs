@@ -4471,6 +4471,18 @@ async fn run_with(
                             recorder.capture(&evidence);
                         }
                     }
+                    muru_controller::host::HostMessage::Loaded { outcome, ms, imports, first } => {
+                        // Issue 753: the host's load, a gauge and, the
+                        // first time it says so, an event.
+
+                        let release = format!("r{}", current.release);
+                        run_admin::set_release_load(&label, &release, ms);
+
+                        if first {
+                            let message = muru_controller::host::loaded_message(&outcome, ms, imports.as_ref());
+                            run_events.record("release.loaded", &format!("{label}@{release}"), "info", &message);
+                        }
+                    }
                     muru_controller::host::HostMessage::Imports { part, parts, data } => {
                         import_reports.take(&format!("r{}", current.release), part, parts, data);
                     }
@@ -4478,6 +4490,8 @@ async fn run_with(
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);
                     }
                     muru_controller::host::HostMessage::Status { workers, host_rss, memory_replacements } => {
+                        run_admin::set_worker_modules(&label, &format!("r{}", current.release), &workers);
+
                         // The relay may have been started again since.
 
                         run_processes.host(current.pid(), current.relay_pid());

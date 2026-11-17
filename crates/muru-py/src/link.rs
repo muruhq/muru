@@ -1003,11 +1003,13 @@ fn report_thread(fd: i32, shared: &Shared, memory_interval: Duration, stop: &Ato
 
     loop {
         let mut line = format!(
-            "{{\"in_flight\":{},\"oldest_ms\":{},\"requests\":{},\"modules\":{}",
+            "{{\"in_flight\":{},\"oldest_ms\":{},\"requests\":{},\"modules\":{},\"modules_us\":{},\"load_us\":{}",
             shared.in_flight(),
             shared.oldest_ms(),
             shared.total(),
-            record::modules_loaded()
+            record::modules_loaded(),
+            record::modules_us(),
+            record::load_us()
         );
 
         // Section 11.7: what each side holds, as of this report, for a
