@@ -134,7 +134,12 @@ def test_asgi_entrypoints_are_served_on_the_event_loop(entrypoint: str, args: li
         response = server.get("/")
         assert response.status == 200
         assert response.body == b"asgi\n"
-        assert " as ASGI" in server.log()
+
+        # With --factory each worker settles the interface and writes the
+        # line itself, and its output is relayed apart from the host's, so
+        # the line can come after the first response (issue 769).
+
+        assert server.wait_for_log(" as ASGI")
     finally:
         server.stop()
 

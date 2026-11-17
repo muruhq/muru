@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests" / "fixtures" / "apps"
 
 LOG_TAIL_LINES = 80  # how much of the log a timed-out `wait_for_log` prints
+REPORT_TAIL_LINES = 200  # how much of each log a failing test's report keeps
 
 # The full UTC time a line written to a file starts with (section 11.8 of
 # the specification): muructl's output goes to a file here, so every line
@@ -117,6 +118,19 @@ def temporary_log(prefix: str) -> Path:
     log = Path(tempfile.mkstemp(prefix=prefix, suffix=".log")[1])
     _temporary_files.append(log)
     return log
+
+
+def tail(path: Path) -> str:
+    """The end of a log, for a failing test's report, saying how much of
+    it was left out."""
+
+    lines = path.read_text(errors="replace").splitlines()
+
+    if len(lines) <= REPORT_TAIL_LINES:
+        return "\n".join(lines)
+
+    left_out = len(lines) - REPORT_TAIL_LINES
+    return "\n".join([f"... {left_out} earlier lines", *lines[-REPORT_TAIL_LINES:]])
 
 
 def short_dirs_made() -> int:
@@ -327,6 +341,19 @@ class Server:
     dashboard_port: int | None = None
     _log_offset: int = field(default=0, repr=False)
 
+    def __post_init__(self) -> None:
+        STARTED.append(self)
+
+    def failure_report(self) -> list[tuple[str, str]]:
+        """The section for the report of a test that failed with this
+        server: the end of its log, which carries its host's and workers'
+        lines and is kept after it stops."""
+
+        if not self.log_path.is_file():
+            return []
+
+        return [(f"muructl run (pid {self.process.pid}): log", tail(self.log_path))]
+
     def request(
         self,
         method: str,
@@ -481,6 +508,14 @@ class Server:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
+
+
+# The servers started and still to be reported on, for the conftest hook
+# that adds their logs to a failing test's report. One that has stopped
+# is dropped as its test ends; one a module's fixture keeps running stays
+# for the module's later tests.
+
+STARTED: list[Server] = []
 
 
 def wait_for_port(port: int, process: subprocess.Popen[bytes], timeout: float = 60.0) -> None:
