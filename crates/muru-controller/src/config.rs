@@ -3198,6 +3198,8 @@ pub struct Tables<'a> {
     pub instrumentation: Option<&'a [muru_config::Instrumentation]>,
     /// The modules the host imports after the entrypoint (section 6.1).
     pub preload_modules: Option<&'a [String]>,
+    /// Whether imports are deferred with unwrapt (section 6.17).
+    pub lazy_imports: Option<bool>,
     /// The release's own limits on the requests it serves (section
     /// 4.6): `max_body_size` and the request timeouts of `timeouts`.
     pub limits: Option<muru_config::RequestLimitSettings>,
@@ -3602,6 +3604,7 @@ pub fn resolve_declared(
         commands: (!table.commands.is_empty()).then_some(&table.commands),
         instrumentation: table.instrumentation.as_deref(),
         preload_modules: table.preload_modules.as_deref(),
+        lazy_imports: table.lazy_imports,
         declared: true,
     };
 
@@ -4218,6 +4221,13 @@ pub fn resolve_spec(
         .to_vec();
     muru_config::check_preload_modules(&preload_modules)?;
 
+    // Section 6.17: lazy_imports from the declaration, else the source.
+    // Its module is not listed by hand; the host is given it at the head
+    // of the list when the release starts.
+
+    let lazy_imports = tables.lazy_imports.or(table.lazy_imports) == Some(true);
+    muru_config::lazy_imports_instrumentation(Some(lazy_imports), &instrumentation)?;
+
     // Section 11.6: the source's tracing key puts its module at the head
     // of the list, with the entry points to wrap. A declaration exported
     // from a release already carries the entry, and keeps it as it is.
@@ -4290,6 +4300,7 @@ pub fn resolve_spec(
             .or_else(|| previous.and_then(|previous| previous.hooks.clone())),
         preload_modules,
         instrumentation,
+        lazy_imports,
         factory,
         reflection: request
             .reflection
@@ -5616,6 +5627,7 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         hooks: (!request.hooks.is_empty()).then(|| request.hooks.clone()),
         preload_modules: None,
         instrumentation: None,
+        lazy_imports: None,
         groups: BTreeMap::new(),
         mounts: BTreeMap::new(),
         logging: None,
@@ -5712,6 +5724,7 @@ fn resolve_http_spec(
         hooks: None,
         preload_modules: Vec::new(),
         instrumentation: Vec::new(),
+        lazy_imports: false,
         factory: None,
         reflection: false,
         handoff: None,
@@ -6324,6 +6337,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         hooks: spec.hooks.clone(),
         preload_modules: (!spec.preload_modules.is_empty()).then(|| spec.preload_modules.clone()),
         instrumentation: (!spec.instrumentation.is_empty()).then(|| spec.instrumentation.clone()),
+        lazy_imports: spec.lazy_imports.then_some(true),
         groups: spec
             .groups
             .iter()
@@ -6616,6 +6630,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "preload_modules",
         declared.preload_modules.join(", "),
         recorded.preload_modules.join(", "),
+    );
+    compare(
+        "lazy_imports",
+        declared.lazy_imports.to_string(),
+        recorded.lazy_imports.to_string(),
     );
     compare(
         "instrumentation",
@@ -7382,6 +7401,27 @@ mod tests {
         assert_eq!(
             resolve("preload_modules = ['shop/reports']\n").unwrap_err(),
             "preload_modules: \"shop/reports\" is not a dotted Python module name"
+        );
+
+        // Issue 740: lazy_imports from the table, its module at the head
+        // of the list the host is given and kept out of the release's own
+        // list, which may not name it.
+
+        assert!(!resolve("").unwrap().lazy_imports);
+        let spec = resolve("lazy_imports = true\n").unwrap();
+        let given: Vec<String> = spec
+            .host_instrumentation()
+            .into_iter()
+            .map(|entry| entry.module)
+            .collect();
+        assert_eq!(given, [muru_config::LAZY_IMPORTS_MODULE, "importtimer"]);
+        assert_eq!(modules(&spec), ["importtimer"]);
+        assert_eq!(table_from(&spec).lazy_imports, Some(true));
+        let by_hand = "[[app.shop.release.r1.instrumentation]]\nmodule = 'muru._lazy_imports'\n";
+        assert!(
+            resolve(by_hand)
+                .unwrap_err()
+                .contains("set up by the lazy_imports key")
         );
 
         // A module named twice is refused.

@@ -19,7 +19,9 @@ length, nesting and the line that triggered it; a load outside any
 request, or under one not recorded, is only counted for the worker. A
 request's record keeps at most ``LOADS_KEPT`` loads, counting the rest.
 The time of the outermost loads is also told to the runtime as each
-ends, for the response head's ``Server-Timing``.
+ends, for the response head's ``Server-Timing``. A load that resolved an
+import deferred by ``lazy_imports`` (section 6.17) is marked as deferred,
+as unwrapt tells ``muru._lazy_imports`` of it.
 """
 
 from __future__ import annotations
@@ -36,13 +38,16 @@ from typing import Any
 
 from muru._context import request_id
 
-__all__ = ["LOADS_KEPT", "install", "loaded", "uninstall"]
+__all__ = ["LOADS_KEPT", "install", "loaded", "mark_deferred", "uninstall"]
 
 LOADS_KEPT = 200
 """The most loads one request's record keeps one by one; the rest are counted."""
 
 # The import system's own frames, and this module's, which are passed
-# over to find the line that triggered a load.
+# over to find the line that triggered a load, and the packages whose
+# frames stand between an import statement and the import system when
+# they wrap builtins.__import__: unwrapt's, with lazy_imports on (section
+# 6.17), and wrapt's beneath it.
 
 _PASSED_OVER = (
     "<frozen importlib._bootstrap>",
@@ -50,6 +55,7 @@ _PASSED_OVER = (
     __file__,
     os.path.join(os.path.dirname(os.__file__), "importlib", "__init__.py"),
 )
+_PASSED_OVER_PACKAGES = ("unwrapt", "wrapt")
 
 
 @dataclass
@@ -61,6 +67,7 @@ class _Loads:
     tally: Callable[[float], None] | None
     lock: threading.Lock = field(default_factory=threading.Lock)
     kept: list[tuple[float, float, str, str, int]] = field(default_factory=list)
+    deferred: set[str] = field(default_factory=set)
     count: int = 0
     outermost_ms: float = 0.0
     taken: bool = False
@@ -137,13 +144,33 @@ def uninstall() -> None:
     _missing.clear()
 
 
+def mark_deferred(module: str) -> None:
+    """Mark the current request's load of `module` as the resolution of a deferred import.
+
+    Called once the module is imported, in the thread whose use of the
+    deferred import loaded it, so the load is in the record already.
+    """
+
+    current = request_id()
+    kept = _requests.get(current) if current is not None else None
+
+    if kept is None:
+        return
+
+    with kept.lock:
+        kept.deferred.add(module)
+
+
 def _trigger() -> str:
     # The line that asked for the load: the first frame that is neither
     # the import system's nor this module's, as its file and line.
 
     frame: FrameType | None = sys._getframe(2)
 
-    while frame is not None and frame.f_code.co_filename in _PASSED_OVER:
+    while frame is not None and (
+        frame.f_code.co_filename in _PASSED_OVER
+        or str(frame.f_globals.get("__name__", "")).partition(".")[0] in _PASSED_OVER_PACKAGES
+    ):
         frame = frame.f_back
 
     if frame is None:
@@ -342,13 +369,16 @@ def _start(request: str, tally: Callable[[float], None] | None = None, since: fl
     _requests[request] = _Loads(time.perf_counter() - since, tally)
 
 
-def _take(request: str) -> tuple[list[tuple[float, float, str, str, int]], int, float]:
+def _take(
+    request: str,
+) -> tuple[list[tuple[float, float, str, str, int, bool]], int, float]:
     """Stop keeping a request's loads, and return them for the runtime to send.
 
     The loads kept, each its start on the request's clock, its length in
-    milliseconds, the module, the line that triggered it and its depth
-    beneath other loads, in the order they began; how many loads there
-    were in all; and the outermost loads' milliseconds summed.
+    milliseconds, the module, the line that triggered it, its depth
+    beneath other loads and whether it resolved a deferred import, in the
+    order they began; how many loads there were in all; and the outermost
+    loads' milliseconds summed.
     """
 
     kept = _requests.pop(request, None)
@@ -359,10 +389,14 @@ def _take(request: str) -> tuple[list[tuple[float, float, str, str, int]], int, 
     with kept.lock:
         kept.taken = True
         loads = sorted(kept.kept)
+        deferred = set(kept.deferred)
         count, outermost_ms = kept.count, kept.outermost_ms
 
     return (
-        [(at, ms, name, _short(trigger), depth) for at, ms, name, trigger, depth in loads],
+        [
+            (at, ms, name, _short(trigger), depth, name in deferred)
+            for at, ms, name, trigger, depth in loads
+        ],
         count,
         outermost_ms,
     )

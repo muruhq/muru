@@ -120,6 +120,8 @@ Recipes for specific tasks, assuming you already know the basics. The
   application.
 - [Tracing with wrapture](tracing.md): each request's calls, queries
   and renders recorded as a tree, with no change to the application.
+- [Deferring imports](lazy-imports.md): imports deferred to first use
+  with `__lazy_modules__` and unwrapt, and when that pays off.
 
 ## Coding agents
 
@@ -180,5 +182,6 @@ toolbar
 panels
 instrumentation
 tracing
+lazy-imports
 coding-agents
 ```

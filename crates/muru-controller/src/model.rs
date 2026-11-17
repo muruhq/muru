@@ -490,6 +490,10 @@ pub struct ReleaseSpec {
     /// The instrumentation modules, in order (section 6.15).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instrumentation: Vec<muru_config::Instrumentation>,
+    /// Whether imports are deferred with unwrapt (section 6.17), by a
+    /// module of Muru's own put at the head of the host's list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lazy_imports: bool,
     /// Whether the entrypoint is a factory, and when it is called.
     pub factory: Option<FactoryPhase>,
     /// The origins whose pages may call it through gRPC-Web, answered
@@ -587,6 +591,19 @@ pub struct ReleaseSpec {
     /// Section 9.12: the commands the application declares, by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<CommandSpec>,
+}
+
+impl ReleaseSpec {
+    /// The instrumentation list the host is given (sections 6.15 and
+    /// 6.17): the module that defers imports first when `lazy_imports` is
+    /// on, then the release's own list.
+    pub fn host_instrumentation(&self) -> Vec<muru_config::Instrumentation> {
+        self.lazy_imports
+            .then(muru_config::lazy_imports_entry)
+            .into_iter()
+            .chain(self.instrumentation.iter().cloned())
+            .collect()
+    }
 }
 
 /// Section 9.12: a command the application declares, resolved and

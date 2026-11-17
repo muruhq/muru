@@ -29,6 +29,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `hooks` | string |  | The module providing the lifecycle hooks. |
 | `instrumentation` | array of tables, {ref}`[[tool.muru.instrumentation]] <config-project-tool-muru-instrumentation>` |  | The instrumentation modules, in order, each with its settings, imported before anything of the application. |
 | `interface` | string | `"auto"` | The interface the entrypoint speaks. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
+| `lazy_imports` | boolean | `false` | Defer imports with unwrapt: each module's `__lazy_modules__` from Python 3.11 to 3.14, and the `[tool.unwrapt.lazy_modules]` table on every version. The project's environment needs the unwrapt package. |
 | `logging` | table, {ref}`[tool.muru.logging] <config-project-tool-muru-logging>` |  | How Python logging is set up in the workers. |
 | `maintenance` | table, {ref}`[tool.muru.maintenance] <config-project-tool-muru-maintenance>` |  | What maintenance mode lets through. |
 | `max_body_size` | string | the host's, else `max_body_size` in `[limits]` | The largest body of a request the release serves, for example 50MB, which the edge enforces. |

@@ -652,12 +652,14 @@ fn importing(worker: &admin::WorkerPart, by: f64) -> Option<admin::PanelSpan> {
     })
 }
 
-/// What asked for a module, for its tooltip and its row.
+/// What asked for a module, for its tooltip and its row, and whether it
+/// resolved an import `lazy_imports` deferred.
 fn loaded_by(load: &admin::ModuleLoad) -> String {
-    if load.trigger.is_empty() {
-        String::new()
-    } else {
-        format!("loaded by {}", load.trigger)
+    match (load.deferred, load.trigger.is_empty()) {
+        (false, true) => String::new(),
+        (false, false) => format!("loaded by {}", load.trigger),
+        (true, true) => "a deferred import".to_owned(),
+        (true, false) => format!("a deferred import, used by {}", load.trigger),
     }
 }
 
@@ -671,7 +673,12 @@ fn modules(worker: &admin::WorkerPart, by: f64) -> admin::PanelTable {
         .iter()
         .map(|load| admin::PanelRow {
             cells: vec![
-                format!("{}{}", "  ".repeat(load.depth as usize), load.module),
+                format!(
+                    "{}{}{}",
+                    "  ".repeat(load.depth as usize),
+                    load.module,
+                    if load.deferred { " (deferred)" } else { "" }
+                ),
                 millis(by + load.at_ms),
                 millis(load.ms),
                 load.trigger.clone(),
@@ -1432,10 +1439,14 @@ mod tests {
             ms,
             depth,
             trigger: "shop/views.py:12".to_owned(),
+            deferred: false,
         };
         worker.module_loads = vec![
             load("shop.reports", 0.5, 0.25, 0),
-            load("openpyxl", 0.75, 1.0, 0),
+            admin::ModuleLoad {
+                deferred: true,
+                ..load("openpyxl", 0.75, 1.0, 0)
+            },
             load("openpyxl.cell", 0.8, 0.5, 1),
         ];
         worker.modules_loaded = 4;
@@ -1448,7 +1459,9 @@ mod tests {
         assert!(html.contains(">importing modules</td>"), "{html}");
         assert!(html.contains("<td class=\"num\">2 segments</td>"), "{html}");
         assert!(
-            html.contains("openpyxl\nstarts at 0.95 ms\ntakes 1.0 ms\nloaded by shop/views.py:12"),
+            html.contains(
+                "openpyxl\nstarts at 0.95 ms\ntakes 1.0 ms\na deferred import, used by shop/views.py:12"
+            ),
             "{html}"
         );
 
@@ -1465,6 +1478,13 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("1 more, past the record's limit"), "{html}");
+
+        // Issue 740: a load that resolved a deferred import says so.
+
+        assert!(
+            html.contains("<td class=\"module\">openpyxl (deferred)</td>"),
+            "{html}"
+        );
     }
 
     #[test]

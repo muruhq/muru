@@ -226,6 +226,10 @@
       },
       "type": "array"
     },
+    "lazy_imports": {
+      "description": "Deferring imports with unwrapt for this machine's runs, in place of the project's `lazy_imports`.",
+      "type": "boolean"
+    },
     "run": {
       "$ref": "#/$defs/RunSettings",
       "description": "How `muructl run` serves the project, over `[tool.muru.run]`."

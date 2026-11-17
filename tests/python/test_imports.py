@@ -51,7 +51,7 @@ def test_a_requests_loads_are_kept_nested_with_what_triggered_them(source: Path)
         _request_id.reset(token)
 
     loads, count, outermost_ms = _imports._take("R1")
-    names = [(name, depth) for _, _, name, _, depth in loads]
+    names = [(name, depth) for _, _, name, _, depth, _ in loads]
 
     # The package, the module and the one it imports, nested; the second
     # import of plain is no load. Each trigger is the line that asked,

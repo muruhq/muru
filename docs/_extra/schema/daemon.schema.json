@@ -2272,6 +2272,11 @@
           "default": "workers",
           "description": "What the release runs: `workers` from an entrypoint, the default, or `http`, an HTTP server started from `command`."
         },
+        "lazy_imports": {
+          "description": "Defer imports with unwrapt; when given, it takes the place of the source's `lazy_imports`.",
+          "type": "boolean",
+          "x-default": "the source's"
+        },
         "logging": {
           "$ref": "#/$defs/Logging",
           "description": "How Python logging is set up in the workers."

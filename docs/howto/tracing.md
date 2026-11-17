@@ -196,7 +196,9 @@ Tracing is set up by an instrumentation module of Muru's own,
 `muru._tracing`, which comes before the modules the
 [instrumentation list](instrumentation.md) names. Its request middleware
 is therefore the outermost wrapper of an entry point. The module is not
-listed by hand.
+listed by hand. With [`lazy_imports`](lazy-imports.md) on, the module
+that defers imports comes before it, so wrapture's own imports can be
+deferred too.
 
 ## Checking
 

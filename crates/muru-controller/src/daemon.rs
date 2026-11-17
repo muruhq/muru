@@ -6491,7 +6491,7 @@ impl Daemon {
             preload: spec.preload,
             hooks: spec.hooks.clone(),
             preload_modules: spec.preload_modules.clone(),
-            instrumentation: spec.instrumentation.clone(),
+            instrumentation: spec.host_instrumentation(),
             chdir: Some(spec.source.clone()),
             tcp_base_port: None,
             single: false,

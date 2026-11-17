@@ -328,7 +328,10 @@ stands out in the rest, which [has a section of its own](#hints):
   first use" below it opens to list each of them in the order they
   began: when it started, how long it took and the file and line whose
   import asked for it, a module imported by another indented beneath it.
-  A record lists the first 200 and counts the rest.
+  A record lists the first 200 and counts the rest. With
+  [`lazy_imports`](lazy-imports.md) on, a module whose deferred import the
+  request used is marked "(deferred)", and its file and line are those of
+  the code that used it.
 
   The panel lists the same under "What the phases are".
 

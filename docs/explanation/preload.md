@@ -100,6 +100,11 @@ A release's table for `muructl apply` takes `preload_modules` too, which
 replaces the list in the source's `[tool.muru]` table, and
 `--print-config` shows the list and where it came from.
 
+The other way round, [`lazy_imports`](../howto/lazy-imports.md) defers a
+module the application imports as it loads, so the host does not load
+it before the fork and a worker loads it only when a request first uses
+it.
+
 ## Hooks: doing it at the right time
 
 Most things that are wrong at import time are right a moment later. A hooks

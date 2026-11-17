@@ -1023,6 +1023,11 @@ pub struct Release {
     /// they replace the list in the source's `[tool.muru]` table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instrumentation: Option<Vec<Instrumentation>>,
+    /// Defer imports with unwrapt (section 6.17); when given, it takes
+    /// the place of the source's `lazy_imports`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's"))]
+    pub lazy_imports: Option<bool>,
     /// Worker groups by name (section 7.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub groups: BTreeMap<String, Group>,
@@ -4375,6 +4380,67 @@ pub fn tracing_instrumentation(
     }))
 }
 
+/// The module that defers imports with unwrapt (section 6.17), put at
+/// the head of a release's instrumentation list, ahead of tracing's, when
+/// `lazy_imports` is on.
+pub const LAZY_IMPORTS_MODULE: &str = "muru._lazy_imports";
+
+/// The instrumentation entry that defers imports with unwrapt (section
+/// 6.17), or None when `lazy_imports` is off. unwrapt finds its own
+/// configuration, so the entry has no settings. The module listed by hand
+/// is refused.
+pub fn lazy_imports_instrumentation(
+    lazy_imports: Option<bool>,
+    listed: &[Instrumentation],
+) -> Result<Option<Instrumentation>, String> {
+    if listed
+        .iter()
+        .any(|entry| entry.module == LAZY_IMPORTS_MODULE)
+    {
+        return Err(format!(
+            "instrumentation module {LAZY_IMPORTS_MODULE} is set up by the lazy_imports key, not listed"
+        ));
+    }
+
+    Ok((lazy_imports == Some(true)).then(lazy_imports_entry))
+}
+
+/// The instrumentation entry of the module that defers imports (section
+/// 6.17), which has no settings: unwrapt finds its own configuration.
+pub fn lazy_imports_entry() -> Instrumentation {
+    Instrumentation {
+        module: LAZY_IMPORTS_MODULE.to_owned(),
+        settings: BTreeMap::new(),
+    }
+}
+
+/// The unwrapt configuration file a host running in `dir` finds (section
+/// 6.17), as unwrapt looks for it: the path in `UNWRAPT_CONFIG`, given as
+/// `variable`, relative to `dir`, whether or not it exists; else
+/// `unwrapt.toml` in `dir`; else `pyproject.toml` in `dir` when it has a
+/// `[tool.unwrapt]` table. None when there is none.
+pub fn find_unwrapt_config(dir: &Path, variable: Option<&str>) -> Option<PathBuf> {
+    if let Some(named) = variable.filter(|named| !named.is_empty()) {
+        return Some(dir.join(named));
+    }
+
+    let own = dir.join("unwrapt.toml");
+
+    if own.is_file() {
+        return Some(own);
+    }
+
+    let pyproject = dir.join("pyproject.toml");
+    let text = std::fs::read_to_string(&pyproject).ok()?;
+    let document: toml::Table = toml::from_str(&text).ok()?;
+
+    document
+        .get("tool")
+        .and_then(|tool| tool.get("unwrapt"))
+        .is_some_and(toml::Value::is_table)
+        .then_some(pyproject)
+}
+
 /// Check an application's static directories (section 4.9): each path
 /// is a prefix below `/`, no two share one, each names a directory, and
 /// the settings parse.
@@ -4889,7 +4955,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
     }
 
     let timeouts = table.timeouts.as_ref();
-    let worker_keys: [(&str, bool); 25] = [
+    let worker_keys: [(&str, bool); 26] = [
         ("entrypoint", !table.entrypoint.is_empty()),
         ("interface", table.interface.is_some()),
         ("handoff", table.handoff.is_some()),
@@ -4905,6 +4971,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
         ("hooks", table.hooks.is_some()),
         ("preload_modules", table.preload_modules.is_some()),
         ("instrumentation", table.instrumentation.is_some()),
+        ("lazy_imports", table.lazy_imports.is_some()),
         ("groups", !table.groups.is_empty()),
         ("mounts", !table.mounts.is_empty()),
         ("logging", table.logging.is_some()),
@@ -5584,6 +5651,9 @@ pub struct LocalFile {
     /// `tracing` (section 11.6), which takes the place of the project's
     /// for this machine's runs.
     pub tracing: Option<Tracing>,
+    /// `lazy_imports` (section 6.17), which takes the place of the
+    /// project's for this machine's runs.
+    pub lazy_imports: Option<bool>,
 }
 
 /// The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a
@@ -6008,6 +6078,13 @@ pub struct ToolMuru {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub tracing_middleware: Option<bool>,
+    /// Defer imports with unwrapt (section 6.17): each module's
+    /// `__lazy_modules__` from Python 3.11 to 3.14, and the
+    /// `[tool.unwrapt.lazy_modules]` table on every version. The
+    /// project's environment needs the unwrapt package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub lazy_imports: Option<bool>,
     /// The interpreter: a path, or a request in uv's syntax such as
     /// "3.13", "3.14t" or ">=3.12" (section 8.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6398,11 +6475,11 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
     if let Some(key) = document.keys().find(|key| {
         !matches!(
             key.as_str(),
-            "run" | "build" | "instrumentation" | "tracing"
+            "run" | "build" | "instrumentation" | "tracing" | "lazy_imports"
         )
     }) {
         return Err(format!(
-            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table, the when key of [build], [[instrumentation]] and tracing; the application's settings belong in {there}"
+            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table, the when key of [build], [[instrumentation]], tracing and lazy_imports; the application's settings belong in {there}"
         ));
     }
 
@@ -6461,11 +6538,18 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
         None => None,
     };
 
+    let lazy_imports = match document.get("lazy_imports") {
+        Some(toml::Value::Boolean(on)) => Some(*on),
+        Some(_) => return Err("lazy_imports: true or false".to_owned()),
+        None => None,
+    };
+
     Ok(LocalFile {
         run,
         build_when,
         instrumentation,
         tracing,
+        lazy_imports,
     })
 }
 
@@ -7479,6 +7563,64 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(error.starts_with("tracing: "), "{error}");
 
         assert_eq!(parse_local("", None).unwrap().tracing, None);
+    }
+
+    #[test]
+    fn the_unwrapt_configuration_is_found_as_unwrapt_finds_it() {
+        let dir = std::env::temp_dir().join(format!("muru-config-unwrapt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[tool.muru]\nlazy_imports = true\n",
+        )
+        .unwrap();
+        assert_eq!(find_unwrapt_config(&dir, None), None);
+
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[tool.unwrapt.lazy_modules]\n\"shop.views\" = [\"openpyxl\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_unwrapt_config(&dir, None),
+            Some(dir.join("pyproject.toml"))
+        );
+
+        std::fs::write(dir.join("unwrapt.toml"), "").unwrap();
+        assert_eq!(
+            find_unwrapt_config(&dir, None),
+            Some(dir.join("unwrapt.toml"))
+        );
+        assert_eq!(
+            find_unwrapt_config(&dir, Some("conf/defer.toml")),
+            Some(dir.join("conf/defer.toml"))
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lazy_imports_is_a_flag_whose_module_heads_the_list() {
+        let local = parse_local("lazy_imports = true\n", None).unwrap();
+        assert_eq!(local.lazy_imports, Some(true));
+        assert_eq!(
+            parse_local("lazy_imports = 'yes'\n", None).unwrap_err(),
+            "lazy_imports: true or false"
+        );
+
+        let entry = lazy_imports_instrumentation(Some(true), &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.module, LAZY_IMPORTS_MODULE);
+        assert_eq!(
+            lazy_imports_instrumentation(Some(false), &[]).unwrap(),
+            None
+        );
+        assert_eq!(lazy_imports_instrumentation(None, &[]).unwrap(), None);
+
+        let listed = [entry];
+        let error = lazy_imports_instrumentation(Some(true), &listed).unwrap_err();
+        assert!(error.contains("set up by the lazy_imports key"), "{error}");
     }
 
     #[test]

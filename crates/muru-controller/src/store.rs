@@ -1849,6 +1849,7 @@ pub(crate) mod tests {
             hooks: None,
             preload_modules: Vec::new(),
             instrumentation: Vec::new(),
+            lazy_imports: false,
             factory: None,
             reflection: false,
             handoff: None,

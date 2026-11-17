@@ -447,6 +447,7 @@ message ModuleLoad {
   double ms = 3;                    // the loads nested in it included
   uint32 depth = 4;                 // how many loads it is nested in
   string trigger = 5;               // the file and line that asked for it, when known
+  bool deferred = 6;                // it resolved an import lazy_imports deferred (issue 740)
 }
 
 // A stretch of a request's time, from when the worker took the request.

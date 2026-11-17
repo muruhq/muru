@@ -1545,6 +1545,11 @@
       "default": "auto",
       "description": "The interface the entrypoint speaks."
     },
+    "lazy_imports": {
+      "default": false,
+      "description": "Defer imports with unwrapt: each module's `__lazy_modules__` from Python 3.11 to 3.14, and the `[tool.unwrapt.lazy_modules]` table on every version. The project's environment needs the unwrapt package.",
+      "type": "boolean"
+    },
     "logging": {
       "$ref": "#/$defs/Logging",
       "description": "How Python logging is set up in the workers."

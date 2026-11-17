@@ -645,6 +645,7 @@ pub fn worker(record: &mut admin::RequestRecord, part: muru_proto::worker::v1::W
                 ms: load.ms,
                 depth: load.depth,
                 trigger: load.trigger,
+                deferred: load.deferred,
             })
             .collect(),
         modules_loaded: part.modules_loaded,

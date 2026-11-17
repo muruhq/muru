@@ -1957,6 +1957,14 @@ struct Resolved {
     /// The instrumentation entry that sets tracing up, when it is on;
     /// the host is given it ahead of the listed modules.
     tracing_entry: Option<muru_config::Instrumentation>,
+    /// `lazy_imports` (section 6.17) as written: muru.local.toml's, else
+    /// the table's.
+    lazy_imports: Option<bool>,
+    /// The muru.local.toml `lazy_imports` came from, when it came from one.
+    lazy_imports_from_local: Option<PathBuf>,
+    /// The instrumentation entry that defers imports, when it is on; the
+    /// host is given it first, ahead of tracing's.
+    lazy_imports_entry: Option<muru_config::Instrumentation>,
     /// The directory the host runs in.
     project: PathBuf,
     /// The file the table came from, when there was one.
@@ -2015,8 +2023,9 @@ impl Resolved {
     /// 11.6): tracing's own module first when tracing is on, so its
     /// request middleware is the outermost wrapper, then the listed ones.
     fn host_instrumentation(&self) -> Vec<muru_config::Instrumentation> {
-        self.tracing_entry
+        self.lazy_imports_entry
             .iter()
+            .chain(&self.tracing_entry)
             .chain(&self.instrumentation)
             .cloned()
             .collect()
@@ -2111,7 +2120,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         None => muru_config::load_local(&project, source.as_deref())?,
     };
 
-    let (local, local_run, local_build_when, local_instrumentation, local_tracing) =
+    let (local, local_run, local_build_when, local_instrumentation, local_tracing, local_lazy) =
         match local_file {
             Some((path, file)) => (
                 Some(path),
@@ -2119,12 +2128,14 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
                 file.build_when,
                 file.instrumentation,
                 file.tracing,
+                file.lazy_imports,
             ),
             None => (
                 None,
                 muru_config::RunSettings::default(),
                 None,
                 Vec::new(),
+                None,
                 None,
             ),
         };
@@ -2155,6 +2166,17 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         &instrumentation,
     )
     .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    // Section 6.17: deferral is set up by a module of Muru's own too, at
+    // the very head of the list, so the imports of the modules after it
+    // can be deferred. muru.local.toml's lazy_imports takes the place of
+    // the project's.
+
+    let lazy_imports_from_local = local_lazy.is_some().then(|| local.clone()).flatten();
+    let lazy_imports = local_lazy.or(table.lazy_imports);
+    let lazy_imports_entry =
+        muru_config::lazy_imports_instrumentation(lazy_imports, &instrumentation)
+            .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     let layers = print_config::Layers::new(&table, &run_table, &local_run);
     let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
@@ -2320,6 +2342,9 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         tracing_from_local,
         tracing_middleware: table.tracing_middleware,
         tracing_entry,
+        lazy_imports,
+        lazy_imports_from_local,
+        lazy_imports_entry,
         project,
         source,
         groups: table.groups,

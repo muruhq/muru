@@ -84,6 +84,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `instrumentation` | array of tables, {ref}`[[app.NAME.release.ID.instrumentation]] <config-daemon-app-name-release-id-instrumentation>` |  | The instrumentation modules, in order; when given, they replace the list in the source's `[tool.muru]` table. |
 | `interface` | string | `"auto"` | The interface, when declared rather than detected. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `kind` | string | `"workers"` | What the release runs: `workers` from an entrypoint, the default, or `http`, an HTTP server started from `command`. `workers`: Muru's own workers, from an entrypoint. `http`: An HTTP server Muru starts and supervises, from a command. |
+| `lazy_imports` | boolean | the source's | Defer imports with unwrapt; when given, it takes the place of the source's `lazy_imports`. |
 | `logging` | table, {ref}`[logging] <config-daemon-logging>` |  | How Python logging is set up in the workers. |
 | `maintenance` | table, {ref}`[host.NAME.maintenance] <config-daemon-host-name-maintenance>` |  | What maintenance mode lets through. |
 | `max_body_size` | string | the host's, else `max_body_size` in `[limits]` | The largest body of a request the release serves, for example 50MB, which the edge enforces. |

@@ -502,13 +502,16 @@ pub fn take_logs(request_id: &str) -> Logs {
             panels,
             module_loads: loads
                 .into_iter()
-                .map(|(at, ms, module, trigger, depth)| pb::ModuleLoad {
-                    module,
-                    at,
-                    ms,
-                    depth,
-                    trigger,
-                })
+                .map(
+                    |(at, ms, module, trigger, depth, deferred)| pb::ModuleLoad {
+                        module,
+                        at,
+                        ms,
+                        depth,
+                        trigger,
+                        deferred,
+                    },
+                )
                 .collect(),
             modules_loaded,
             modules_ms,
@@ -517,9 +520,9 @@ pub fn take_logs(request_id: &str) -> Logs {
 }
 
 /// A request's loads as `muru._imports._take` gives them: each one's
-/// start, length, module, trigger and depth; how many in all; and the
-/// outermost loads' time.
-type TakenLoads = (Vec<(f64, f64, String, String, u32)>, u32, f64);
+/// start, length, module, trigger, depth and whether it resolved a
+/// deferred import; how many in all; and the outermost loads' time.
+type TakenLoads = (Vec<(f64, f64, String, String, u32, bool)>, u32, f64);
 
 /// One panel as `muru.panels._take` gives it: its name, title, spans,
 /// values, tables (caption, columns, rows), how many entries it dropped,
