@@ -132,9 +132,10 @@ class Entry:
 
 @dataclass(frozen=True)
 class Target:
-    """What a callback is about: the hooks module, the entrypoint or a mount.
+    """What a callback is about: the hooks module, the entrypoint, a mount or a listed module.
 
-    `kind` is ``hooks``, ``entrypoint`` or ``mount``; `name` is a mount's
+    `kind` is ``hooks``, ``entrypoint``, ``mount`` or ``module``, the last
+    for one of the release's ``preload_modules``; `name` is a mount's
     name, empty for the others; `spec` is the module, or ``module:callable``
     for an entry point. `error` is what an import raised, given to
     after_import when it failed.

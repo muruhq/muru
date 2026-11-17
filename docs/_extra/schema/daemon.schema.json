@@ -2311,6 +2311,13 @@
           "default": "auto",
           "description": "Whether the application is imported once, in the host, before the workers are forked from it."
         },
+        "preload_modules": {
+          "description": "Modules the host imports after the entrypoint and the mounts, so they are loaded once before the fork; when given, they replace the list in the source's `[tool.muru]` table.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "processes": {
           "default": 1,
           "description": "The default group's worker processes.",

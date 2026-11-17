@@ -1941,6 +1941,9 @@ struct Resolved {
     concurrency: usize,
     preload: muru_config::Preload,
     hooks: Option<String>,
+    /// The modules the host imports after the entrypoint and the mounts
+    /// (section 6.1).
+    preload_modules: Vec<String>,
     /// The instrumentation modules (section 6.15): muru.local.toml's,
     /// then the table's.
     instrumentation: Vec<muru_config::Instrumentation>,
@@ -2135,6 +2138,8 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         .collect();
     muru_config::check_instrumentation(&instrumentation)
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+    muru_config::check_preload_modules(&table.preload_modules)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     // Section 11.6: tracing is set up by a module of Muru's own, at the
     // head of the list the host is given. muru.local.toml's tracing takes
@@ -2309,6 +2314,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
             .or(table.preload)
             .unwrap_or(muru_config::Preload::Auto),
         hooks: args.hooks.clone().or(table.hooks),
+        preload_modules: table.preload_modules,
         instrumentation,
         tracing,
         tracing_from_local,
@@ -2809,6 +2815,9 @@ struct CheckReport {
     entrypoints: Vec<CheckEntrypoint>,
     #[serde(default)]
     hooks: Vec<String>,
+    /// The `preload_modules` it imported, in order.
+    #[serde(default)]
+    modules: Vec<String>,
     #[serde(default)]
     instrumentation: Vec<CheckInstrument>,
     #[serde(default)]
@@ -2949,6 +2958,10 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
         command.arg("--hooks").arg(hooks);
     }
 
+    for module in &resolved.preload_modules {
+        command.arg("--preload-module").arg(module);
+    }
+
     // Section 6.15: the instrumentation modules, as the host is given them.
 
     let instrumentation = resolved.host_instrumentation();
@@ -3060,6 +3073,13 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
             "muru: check: hooks module {} defines {}",
             resolved.hooks.as_deref().unwrap_or("?"),
             report.hooks.join(", ")
+        );
+    }
+
+    if !report.modules.is_empty() {
+        println!(
+            "muru: check: preload_modules imported: {}",
+            report.modules.join(", ")
         );
     }
 
@@ -3483,6 +3503,7 @@ async fn run_with(
         concurrency: resolved.concurrency,
         preload: resolved.preload,
         hooks: resolved.hooks.clone(),
+        preload_modules: resolved.preload_modules.clone(),
         instrumentation: resolved.host_instrumentation(),
         chdir: Some(resolved.project.clone()),
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),

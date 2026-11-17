@@ -228,6 +228,7 @@ def host_main(
     (modules / "failing_hooks.py").write_text(
         "def on_load(context):\n    raise RuntimeError('load-boom')\n"
     )
+    (modules / "plain_extra.py").write_text("")
 
     def run(app: str, *args: str) -> int:
         monkeypatch.setenv(ENVIRONMENT, Entry.encode([Entry("first_tool"), Entry("second_tool")]))
@@ -243,7 +244,7 @@ def host_main(
         for end in leaky.LEFT_OPEN:
             end.close()
 
-    for name in ("plain_app", "failing_hooks", "missing_app"):
+    for name in ("plain_app", "failing_hooks", "missing_app", "plain_extra"):
         sys.modules.pop(name, None)
 
 
@@ -273,14 +274,29 @@ def test_a_failed_import_or_on_load_ends_the_load_as_failed(
         *finished("failed"),
     ]
 
-    sys.modules["instrumented_order"].CALLS.clear()
-    sys.modules.pop("first_tool")
-    sys.modules.pop("second_tool")
-    assert host_main("plain_app:application", "--hooks", "failing_hooks") == 1
+    # Section 6.1: the preload_modules come after the entrypoint and
+    # before on_load, and one that cannot be imported fails the load.
+
+    def again(*args: str) -> int:
+        sys.modules["instrumented_order"].CALLS.clear()
+        sys.modules.pop("first_tool")
+        sys.modules.pop("second_tool")
+        return host_main("plain_app:application", *args)
+
+    assert again("--hooks", "failing_hooks", "--preload-module", "plain_extra") == 1
     assert calls() == [
         *STARTED,
         *bracket("hooks", "failing_hooks"),
         *bracket("entrypoint", "plain_app:application"),
+        *bracket("module", "plain_extra"),
+        *finished("failed"),
+    ]
+
+    assert again("--preload-module", "missing_extra") == 1
+    assert calls() == [
+        *STARTED,
+        *bracket("entrypoint", "plain_app:application"),
+        *bracket("module", "missing_extra", "ModuleNotFoundError"),
         *finished("failed"),
     ]
 

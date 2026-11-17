@@ -585,6 +585,9 @@ pub struct HostSpec {
     pub preload: muru_config::Preload,
     /// The hooks module, if any.
     pub hooks: Option<String>,
+    /// The modules the host imports after the entrypoint and the mounts
+    /// (section 6.1).
+    pub preload_modules: Vec<String>,
     /// The instrumentation modules, in order (section 6.15), given to the
     /// host in `MURU_INSTRUMENTATION`.
     pub instrumentation: Vec<muru_config::Instrumentation>,
@@ -992,6 +995,10 @@ impl HostProcess {
 
         if let Some(hooks) = &spec.hooks {
             command.arg("--hooks").arg(hooks);
+        }
+
+        for module in &spec.preload_modules {
+            command.arg("--preload-module").arg(module);
         }
 
         if let Some(phase) = spec.factory {

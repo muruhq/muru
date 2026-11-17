@@ -83,6 +83,31 @@ def test_an_entrypoint_that_does_not_resolve_fails_with_the_error(tmp_path: Path
     assert "the check failed" in completed.stderr
 
 
+def test_preload_modules_are_imported_and_one_missing_fails_the_check(tmp_path: Path) -> None:
+    # Section 6.1: the listed modules are imported after the entrypoint,
+    # under the import check, and a failed import fails the load.
+
+    directory = tmp_path / "project"
+    directory.mkdir()
+    shutil.copy(support.FIXTURES / "plain_wsgi.py", directory / "app.py")
+    (directory / "reports.py").write_text("")
+    project = "[tool.muru]\nentrypoint = 'app:application'\npreload_modules = [{}]\n"
+    (directory / "pyproject.toml").write_text(project.format("'reports'"))
+    completed = check(str(directory))
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "muru: check: preload_modules imported: reports" in completed.stdout
+
+    (directory / "pyproject.toml").write_text(project.format("'reports', 'missing_reports'"))
+    missing = check(str(directory))
+
+    assert missing.returncode != 0, missing.stdout + missing.stderr
+    assert (
+        "muru: check: error: ModuleNotFoundError: No module named 'missing_reports'"
+        in missing.stdout
+    ), missing.stdout
+
+
 def test_an_instrumentation_callback_that_raises_fails_the_check(tmp_path: Path) -> None:
     # Section 6.15: under a run the failure is logged and the release
     # carries on; the check names the module and the callback, and fails.

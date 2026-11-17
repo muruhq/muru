@@ -301,7 +301,8 @@ stands out in the rest, which [has a section of its own](#hints):
   fork or by an earlier request in the worker, costs nothing and is not
   shown, so the row is on a worker's first request to a page and gone
   from the second. Loading such modules before the worker serves is
-  what the `preload_modules` setting does.
+  what the [`preload_modules`](../explanation/preload.md#modules-loaded-on-first-use)
+  setting does.
 
   A row of several waits, stretches or modules draws each of them as a
   segment on its one line, says how many under Starts and gives their

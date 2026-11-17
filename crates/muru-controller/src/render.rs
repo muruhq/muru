@@ -430,6 +430,7 @@ fn workers(
     writer.whole("maintenance", table.maintenance.is_some());
     writer.whole("commands", !table.commands.is_empty());
     writer.whole("instrumentation", !table.instrumentation.is_empty());
+    writer.whole("preload_modules", !table.preload_modules.is_empty());
 
     ReleaseTable {
         kind: None,
@@ -494,6 +495,7 @@ fn workers(
         ),
         hooks: writer.given("hooks", text(&request.hooks), table.hooks),
         instrumentation: (!table.instrumentation.is_empty()).then_some(table.instrumentation),
+        preload_modules: (!table.preload_modules.is_empty()).then_some(table.preload_modules),
         groups: table.groups,
         mounts: table.mounts,
         static_dirs,

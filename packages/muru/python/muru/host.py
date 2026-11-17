@@ -672,6 +672,11 @@ class Release:
 
     instruments: Instruments = field(default_factory=Instruments)
 
+    # Section 6.1: the modules imported after the entrypoint and the
+    # mounts, before the on_load hook.
+
+    preload_modules: list[str] = field(default_factory=list)
+
     @property
     def preloaded(self) -> bool:
         """Whether the entrypoint was imported in the host."""
@@ -721,6 +726,29 @@ class Release:
                 self.accept(self.target())
 
         return self.hooks
+
+    def load_modules(
+        self,
+        recorder: preload.ImportRecorder | None = None,
+        *,
+        instruments: Instruments | None = None,
+        context: Context | None = None,
+    ) -> None:
+        """Import the release's ``preload_modules``, in order, after the entrypoint and mounts.
+
+        Each import is bracketed by the instrumentation modules' before_import
+        and after_import, as a target of kind ``module``, and goes through
+        the import check's recorder when there is one. A module that cannot
+        be imported raises, which fails the load.
+        """
+
+        import_module = recorder.import_module if recorder else importlib.import_module
+        instruments = instruments or Instruments()
+        context = context or self.context
+
+        for name in self.preload_modules:
+            with instruments.importing(context, Target("module", "", name)):
+                import_module(name)
 
     def accept(self, app: Any) -> None:
         """Keep the application and settle the interface it is served with.
@@ -1795,6 +1823,7 @@ class Host:
                             instruments=instruments, context=context, mount=mount.name
                         )
 
+                    release.load_modules(instruments=instruments, context=context)
                     log(
                         f"worker {self.worker_name(index)} "
                         f"imported {release.spec} in {elapsed_ms(started)} ms"
@@ -5100,6 +5129,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--hooks", default=None, help="module providing the lifecycle hooks")
     parser.add_argument(
+        "--preload-module",
+        dest="preload_modules",
+        action="append",
+        default=[],
+        help="a module to import after the entrypoint and mounts; repeatable",
+    )
+    parser.add_argument(
         "--single",
         action="store_true",
         help="serve in this process with one thread and no fork, for debuggers",
@@ -5473,6 +5509,7 @@ def _main(argv: list[str] | None) -> int:
         factory=args.factory,
         factory_phase=args.factory_phase,
         instruments=Instruments(instrumentation),
+        preload_modules=args.preload_modules,
     )
 
     try:
@@ -5538,6 +5575,8 @@ def _main(argv: list[str] | None) -> int:
                     mount.release.load(
                         recorder, instruments=instruments, context=context, mount=mount.name
                     )
+
+                release.load_modules(recorder, instruments=instruments, context=context)
             except Exception as error:
                 log(f"cannot load {args.app}: {error.__class__.__name__}: {error}")
                 instruments.finished(context, _instrumentation.FAILED)

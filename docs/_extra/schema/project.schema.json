@@ -1584,6 +1584,13 @@
       "default": "auto",
       "description": "Whether the application is imported once, in the host, before the workers are forked from it."
     },
+    "preload_modules": {
+      "description": "Modules the host imports after the entrypoint and the mounts, and before the `on_load` and `pre_fork` hooks, so a module the application only imports on first use is loaded once before the fork rather than in every worker. With per-worker imports each worker imports them as part of its load. A module that cannot be imported fails the load.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "processes": {
       "description": "The default group's worker processes.",
       "format": "uint",

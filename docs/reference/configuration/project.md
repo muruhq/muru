@@ -37,6 +37,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `memory` | table, {ref}`[tool.muru.memory] <config-project-tool-muru-memory>` |  | The memory policy for the workers. |
 | `mounts` | table of tables, {ref}`[tool.muru.mounts.NAME] <config-project-tool-muru-mounts-name>` |  | Mounts by name. |
 | `preload` | string | `"auto"` | Whether the application is imported once, in the host, before the workers are forked from it. `auto`: Preload when the import check passes, otherwise import per worker. `true`: Preload, and fail the release when the import check does not pass. `false`: Import in every worker. |
+| `preload_modules` | array of strings |  | Modules the host imports after the entrypoint and the mounts, and before the `on_load` and `pre_fork` hooks, so a module the application only imports on first use is loaded once before the fork rather than in every worker. With per-worker imports each worker imports them as part of its load. A module that cannot be imported fails the load. |
 | `processes` | integer | `1`; under `muructl serve`, the container's CPU limit, else the CPU count | The default group's worker processes. |
 | `python` | string | found at start | The interpreter: a path, or a request in uv's syntax such as "3.13", "3.14t" or ">=3.12". |
 | `reflection` | boolean | `false` | Serve gRPC server reflection for the registered services. |

@@ -66,6 +66,40 @@ opens.
 
 The same setting lives in a project's `[tool.muru]` table.
 
+## Modules loaded on first use
+
+Some modules are only imported when a request first needs them: a
+framework imports a view module the first time it resolves a URL, and an
+`import` inside a function runs when the function is first called. Such
+a module is loaded in each worker separately, after the fork, and its
+time goes to whichever request needs it first. The
+[toolbar](../howto/toolbar.md)'s Timing panel shows the modules a
+request loaded this way and what imported them, and `muructl debug
+status` counts the modules each worker has loaded since the fork.
+
+`preload_modules` lists modules for the host to import before the fork:
+
+```toml
+[tool.muru]
+entrypoint = "shop.wsgi:application"
+preload_modules = ["shop.views.reports", "openpyxl"]
+```
+
+The host imports them in order after the entrypoint and the mounts, and
+before the `on_load` and `pre_fork` hooks, under the import check like
+the rest of the load, so a module that opens a connection as it is
+imported is reported as the entrypoint would be. A module that cannot be
+imported fails the load, as an entrypoint that cannot be imported does,
+and `muructl check` imports the list and reports it. With per-worker
+imports, after the fallback or with `preload = false`, each worker
+imports the list as part of its own load, before it serves. The list is
+the release's: every worker group's workers have the modules, whichever
+mounts the group serves.
+
+A release's table for `muructl apply` takes `preload_modules` too, which
+replaces the list in the source's `[tool.muru]` table, and
+`--print-config` shows the list and where it came from.
+
 ## Hooks: doing it at the right time
 
 Most things that are wrong at import time are right a moment later. A hooks

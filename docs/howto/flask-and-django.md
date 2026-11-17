@@ -58,6 +58,22 @@ If a settings module opens a database connection at import time, the
 [import check](../explanation/preload.md) says so and the workers import
 the application themselves instead.
 
+The view modules are imported the first time a URL resolves to them, so
+each worker loads them on its first request to the page. The toolbar's
+Timing panel shows them as "importing modules", and listing them in
+[`preload_modules`](../explanation/preload.md#modules-loaded-on-first-use)
+has the host import them before the fork:
+
+```toml
+[tool.muru]
+entrypoint = "mysite.wsgi:application"
+preload_modules = ["mysite.urls", "shop.views"]
+```
+
+Importing `mysite.urls` imports the views it names. The listed modules
+are imported after the entrypoint, whose `get_wsgi_application()` has
+set Django up by then, so a view module may import models.
+
 Django also answers an unhandled exception itself, with its debug page
 when `DEBUG = True` and its `handler500` view otherwise. Setting
 `DEBUG_PROPAGATE_EXCEPTIONS = True` lets the exception reach Muru, which

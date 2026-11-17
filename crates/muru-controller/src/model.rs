@@ -483,6 +483,10 @@ pub struct ReleaseSpec {
     pub preload: Preload,
     /// The hooks module, if any.
     pub hooks: Option<String>,
+    /// The modules the host imports after the entrypoint and the mounts
+    /// (section 6.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preload_modules: Vec<String>,
     /// The instrumentation modules, in order (section 6.15).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instrumentation: Vec<muru_config::Instrumentation>,

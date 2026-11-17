@@ -335,6 +335,14 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
         top.push(Row::new("hooks", hooks, app(args.hooks.is_some(), "hooks")));
     }
 
+    if !resolved.preload_modules.is_empty() {
+        top.push(Row::new(
+            "preload_modules",
+            &resolved.preload_modules,
+            app(false, "preload_modules"),
+        ));
+    }
+
     // Section 6.15: muru.local.toml's instrumentation entries come before
     // the project's, so the row names both when both give some.
 
@@ -674,6 +682,14 @@ pub fn serve_settings(resolved: &crate::Resolved, serve: Serve) -> Settings {
 
     if let Some(hooks) = &resolved.hooks {
         top.push(Row::new("hooks", hooks, app("hooks")));
+    }
+
+    if !resolved.preload_modules.is_empty() {
+        top.push(Row::new(
+            "preload_modules",
+            &resolved.preload_modules,
+            app("preload_modules"),
+        ));
     }
 
     if !resolved.instrumentation.is_empty() {

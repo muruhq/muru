@@ -3196,6 +3196,8 @@ pub struct Tables<'a> {
     pub commands: Option<&'a BTreeMap<String, muru_config::CommandTable>>,
     /// Instrumentation modules (section 6.15).
     pub instrumentation: Option<&'a [muru_config::Instrumentation]>,
+    /// The modules the host imports after the entrypoint (section 6.1).
+    pub preload_modules: Option<&'a [String]>,
     /// The release's own limits on the requests it serves (section
     /// 4.6): `max_body_size` and the request timeouts of `timeouts`.
     pub limits: Option<muru_config::RequestLimitSettings>,
@@ -3599,6 +3601,7 @@ pub fn resolve_declared(
         maintenance: table.maintenance.as_ref(),
         commands: (!table.commands.is_empty()).then_some(&table.commands),
         instrumentation: table.instrumentation.as_deref(),
+        preload_modules: table.preload_modules.as_deref(),
         declared: true,
     };
 
@@ -4206,6 +4209,15 @@ pub fn resolve_spec(
         .to_vec();
     muru_config::check_instrumentation(&instrumentation)?;
 
+    // Section 6.1: preload_modules is a list, so it too comes from the
+    // declaration, else the source.
+
+    let preload_modules = tables
+        .preload_modules
+        .unwrap_or(&table.preload_modules)
+        .to_vec();
+    muru_config::check_preload_modules(&preload_modules)?;
+
     // Section 11.6: the source's tracing key puts its module at the head
     // of the list, with the entry points to wrap. A declaration exported
     // from a release already carries the entry, and keeps it as it is.
@@ -4276,6 +4288,7 @@ pub fn resolve_spec(
             .then(|| request.hooks.clone())
             .or(table.hooks)
             .or_else(|| previous.and_then(|previous| previous.hooks.clone())),
+        preload_modules,
         instrumentation,
         factory,
         reflection: request
@@ -5601,6 +5614,7 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         scaling: None,
         preload: parse_optional(&request.preload)?,
         hooks: (!request.hooks.is_empty()).then(|| request.hooks.clone()),
+        preload_modules: None,
         instrumentation: None,
         groups: BTreeMap::new(),
         mounts: BTreeMap::new(),
@@ -5696,6 +5710,7 @@ fn resolve_http_spec(
         concurrency: 0,
         preload: muru_config::Preload::Auto,
         hooks: None,
+        preload_modules: Vec::new(),
         instrumentation: Vec::new(),
         factory: None,
         reflection: false,
@@ -6307,6 +6322,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         scaling: scaling_table(&spec.scaling),
         preload: Some(spec.preload),
         hooks: spec.hooks.clone(),
+        preload_modules: (!spec.preload_modules.is_empty()).then(|| spec.preload_modules.clone()),
         instrumentation: (!spec.instrumentation.is_empty()).then(|| spec.instrumentation.clone()),
         groups: spec
             .groups
@@ -6595,6 +6611,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "hooks",
         declared.hooks.clone().unwrap_or_default(),
         recorded.hooks.clone().unwrap_or_default(),
+    );
+    compare(
+        "preload_modules",
+        declared.preload_modules.join(", "),
+        recorded.preload_modules.join(", "),
     );
     compare(
         "instrumentation",
@@ -7307,7 +7328,7 @@ mod tests {
     }
 
     #[test]
-    fn a_release_tables_instrumentation_replaces_the_sources_and_is_exported() {
+    fn a_release_tables_instrumentation_and_preload_modules_replace_the_sources() {
         let source = std::env::temp_dir().join(format!(
             "muru-config-instrumentation-{}",
             std::process::id()
@@ -7316,6 +7337,7 @@ mod tests {
         std::fs::write(
             source.join("pyproject.toml"),
             "[tool.muru]\nentrypoint = 'shop.wsgi:application'\n\
+             preload_modules = ['shop.reports']\n\
              [[tool.muru.instrumentation]]\nmodule = 'importtimer'\n\
              settings = { output = 'times.json' }\n",
         )
@@ -7349,6 +7371,18 @@ mod tests {
         let spec = resolve("[[app.shop.release.r1.instrumentation]]\nmodule = 'apm'\n").unwrap();
         assert_eq!(modules(&spec), ["apm"]);
         assert_eq!(table_from(&spec).instrumentation.unwrap()[0].module, "apm");
+
+        // Issue 739: preload_modules is a list as well, the source's
+        // unless the table gives one, and checked.
+
+        assert_eq!(resolve("").unwrap().preload_modules, ["shop.reports"]);
+        let spec = resolve("preload_modules = ['openpyxl']\n").unwrap();
+        assert_eq!(spec.preload_modules, ["openpyxl"]);
+        assert_eq!(table_from(&spec).preload_modules.unwrap(), ["openpyxl"]);
+        assert_eq!(
+            resolve("preload_modules = ['shop/reports']\n").unwrap_err(),
+            "preload_modules: \"shop/reports\" is not a dotted Python module name"
+        );
 
         // A module named twice is refused.
 

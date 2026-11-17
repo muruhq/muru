@@ -104,8 +104,9 @@ and an exception from one is logged and otherwise ignored.
 | `wrap_application(context, target, application, interface)` | In each worker, once for each entry point, after any factory and before the event loop and lifespan start; a return value other than `None` is served in place of `application` |
 | `worker_stopped(context)` | In each worker that ran `worker_started`, in reverse order, as the last thing it does, after `on_exit`, the `atexit` callbacks and the event loop stopping, also when it failed to start or to serve |
 
-`target` has `kind` (`hooks`, `entrypoint` or `mount`), `name` (a
-mount's name, empty for the others), `spec` (the module, or
+`target` has `kind` (`hooks`, `entrypoint`, `mount` or `module`, the
+last for one of the release's `preload_modules`), `name` (a mount's
+name, empty for the others), `spec` (the module, or
 `module:callable`) and `error` (what a failed import raised, for
 `after_import`). `interface` is `wsgi`, `asgi` or `grpc`.
 

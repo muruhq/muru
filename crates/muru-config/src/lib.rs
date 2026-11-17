@@ -1014,6 +1014,11 @@ pub struct Release {
     /// The module holding the lifecycle hooks, as a Python module name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<String>,
+    /// Modules the host imports after the entrypoint and the mounts, so
+    /// they are loaded once before the fork (section 6.1); when given,
+    /// they replace the list in the source's `[tool.muru]` table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preload_modules: Option<Vec<String>>,
     /// The instrumentation modules, in order (section 6.15); when given,
     /// they replace the list in the source's `[tool.muru]` table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4195,23 +4200,44 @@ pub struct Instrumentation {
     pub settings: BTreeMap<String, serde_json::Value>,
 }
 
+/// Whether `name` is a dotted Python module name.
+fn dotted(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|part| {
+            let mut chars = part.chars();
+
+            chars
+                .next()
+                .is_some_and(|first| first.is_alphabetic() || first == '_')
+                && chars.all(|rest| rest.is_alphanumeric() || rest == '_')
+        })
+}
+
+/// Check a release's `preload_modules` (section 6.1): every module a
+/// dotted Python name, and none named twice.
+pub fn check_preload_modules(modules: &[String]) -> Result<(), String> {
+    for (index, module) in modules.iter().enumerate() {
+        if !dotted(module) {
+            return Err(format!(
+                "preload_modules: {module:?} is not a dotted Python module name"
+            ));
+        }
+
+        if modules[..index].contains(module) {
+            return Err(format!("preload_modules: {module} is listed twice"));
+        }
+    }
+
+    Ok(())
+}
+
 /// Check a release's instrumentation list (section 6.15): every module a
 /// dotted Python name, and none named twice.
 pub fn check_instrumentation(entries: &[Instrumentation]) -> Result<(), String> {
     let mut seen: Vec<&str> = Vec::new();
 
     for entry in entries {
-        let dotted = !entry.module.is_empty()
-            && entry.module.split('.').all(|part| {
-                let mut chars = part.chars();
-
-                chars
-                    .next()
-                    .is_some_and(|first| first.is_alphabetic() || first == '_')
-                    && chars.all(|rest| rest.is_alphanumeric() || rest == '_')
-            });
-
-        if !dotted {
+        if !dotted(&entry.module) {
             return Err(format!(
                 "instrumentation module {:?} is not a dotted Python module name",
                 entry.module
@@ -4863,7 +4889,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
     }
 
     let timeouts = table.timeouts.as_ref();
-    let worker_keys: [(&str, bool); 24] = [
+    let worker_keys: [(&str, bool); 25] = [
         ("entrypoint", !table.entrypoint.is_empty()),
         ("interface", table.interface.is_some()),
         ("handoff", table.handoff.is_some()),
@@ -4877,6 +4903,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
         ("scaling", table.scaling.is_some()),
         ("preload", table.preload.is_some()),
         ("hooks", table.hooks.is_some()),
+        ("preload_modules", table.preload_modules.is_some()),
         ("instrumentation", table.instrumentation.is_some()),
         ("groups", !table.groups.is_empty()),
         ("mounts", !table.mounts.is_empty()),
@@ -5957,6 +5984,14 @@ pub struct ToolMuru {
     /// The module providing the lifecycle hooks (section 6.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<String>,
+    /// Modules the host imports after the entrypoint and the mounts, and
+    /// before the `on_load` and `pre_fork` hooks (section 6.1), so a
+    /// module the application only imports on first use is loaded once
+    /// before the fork rather than in every worker. With per-worker
+    /// imports each worker imports them as part of its load. A module
+    /// that cannot be imported fails the load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preload_modules: Vec<String>,
     /// The instrumentation modules, in order (section 6.15), each with
     /// its settings, imported before anything of the application.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
