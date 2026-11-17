@@ -375,7 +375,7 @@ warm_up = {{ lead = '2h', start_release = 'r1' }}
     assert eventually(lambda: site.state("r1") == "ready", timeout=30)
     assert site.seen()["release"] == "r2"
     events = site.daemon.muructl("events").stdout
-    assert "warming up: its window begins in 59m" in events
+    assert "warming up: its window begins in 1h" in events
     assert "starting clients@r1" in events
 
     # Without the overlay nothing keeps it running.

@@ -233,13 +233,20 @@ pub fn describe_terms(status: &crate::conditions::Status) -> String {
         .collect()
 }
 
-/// A wait as the events say it, to the minute once it is that long:
-/// 45s, 59m, 2h, 1h30m.
+/// A wait as the events say it, to the nearest second, and to the
+/// nearest minute once it is that long: 45s, 59m, 2h, 1h30m. Rounding
+/// down would say 59s for a lead of 1m, since the daemon looks a moment
+/// after the lead begins (issue 756).
 pub fn describe_wait(millis: u64) -> String {
-    let minutes = millis / 60_000;
+    let seconds = (millis + 500) / 1000;
+
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+
+    let minutes = (seconds + 30) / 60;
 
     match (minutes / 60, minutes % 60) {
-        (0, 0) => format!("{}s", millis / 1000),
         (0, minutes) => format!("{minutes}m"),
         (hours, 0) => format!("{hours}h"),
         (hours, minutes) => format!("{hours}h{minutes}m"),
@@ -1376,8 +1383,15 @@ mod tests {
         assert!(warming(&cutover, nine + 24 * HOUR - 60_000));
         assert_eq!(describe_trigger(&cutover), "cron '0 9 * * *' for 1h UTC");
         assert_eq!(describe_wait(45_000), "45s");
-        assert_eq!(describe_wait(HOUR - 1), "59m");
+        assert_eq!(describe_wait(59 * 60_000), "59m");
         assert_eq!(describe_wait(HOUR * 3 / 2), "1h30m");
+
+        // Issue 756: a lead looked at a moment after it began is the lead.
+
+        assert_eq!(describe_wait(59_400), "59s");
+        assert_eq!(describe_wait(59_600), "1m");
+        assert_eq!(describe_wait(119_300), "2m");
+        assert_eq!(describe_wait(HOUR - 400), "1h");
     }
 
     #[test]
