@@ -393,6 +393,15 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
         top.push(Row::new("lazy_imports", lazy_imports, source));
     }
 
+    if let Some(import_report) = resolved.import_report {
+        let source = match &resolved.import_report_from_local {
+            Some(path) => path.display().to_string(),
+            None => project.clone(),
+        };
+
+        top.push(Row::new("import_report", import_report, source));
+    }
+
     if let Some(python) = args.python.as_ref().or(resolved.python.as_ref()) {
         top.push(Row::new(
             "python",
@@ -626,7 +635,7 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
 /// the release's environment or muructl's own, else in the project's
 /// directory.
 fn unwrapt_note(resolved: &crate::Resolved) -> Option<String> {
-    if resolved.lazy_imports != Some(true) {
+    if resolved.lazy_imports != Some(true) && resolved.import_report != Some(true) {
         return None;
     }
 
@@ -637,13 +646,13 @@ fn unwrapt_note(resolved: &crate::Resolved) -> Option<String> {
 
     Some(
         match muru_config::find_unwrapt_config(&resolved.project, variable.as_deref()) {
-            Some(path) => format!(
-                "lazy_imports defers with the unwrapt configuration in {}.",
-                path.display()
-            ),
-            None => "lazy_imports finds no unwrapt configuration, so only each module's \
-                     __lazy_modules__ is deferred."
-                .to_owned(),
+            Some(path) => format!("unwrapt's configuration is read from {}.", path.display()),
+            None if resolved.lazy_imports == Some(true) => {
+                "No unwrapt configuration is found, so only each module's __lazy_modules__ \
+                 is deferred."
+                    .to_owned()
+            }
+            None => "No unwrapt configuration is found.".to_owned(),
         },
     )
 }
@@ -750,6 +759,10 @@ pub fn serve_settings(resolved: &crate::Resolved, serve: Serve) -> Settings {
 
     if let Some(lazy_imports) = resolved.lazy_imports {
         top.push(Row::new("lazy_imports", lazy_imports, project.clone()));
+    }
+
+    if let Some(import_report) = resolved.import_report {
+        top.push(Row::new("import_report", import_report, project.clone()));
     }
 
     if let Some(requests) = resolved.max_requests {

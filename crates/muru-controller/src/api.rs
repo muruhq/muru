@@ -1861,8 +1861,27 @@ impl Admin for Service {
                     wait.as_secs()
                 ))
             })?
-            .map_err(|_| Status::unavailable("the daemon is stopping"))?
-            .map_err(Status::failed_precondition)?;
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+
+        // Section 6.18: the import report of the host's load is the
+        // store's, and stands without a worker to ask, as for a release
+        // whose workers have not started.
+
+        let host_json = if request.op == "imports" {
+            self.handle
+                .store
+                .import_report(&request.app, &release)
+                .map_err(internal)?
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let answered = match answered {
+            Err(_) if request.op == "imports" && request.worker.is_none() => Vec::new(),
+            answered => answered.map_err(Status::failed_precondition)?,
+        };
+
         Ok(Response::new(pb::DebugResponse {
             workers: answered
                 .into_iter()
@@ -1876,6 +1895,7 @@ impl Admin for Service {
                 })
                 .collect(),
             release,
+            host_json,
         }))
     }
 

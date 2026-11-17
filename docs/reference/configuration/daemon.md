@@ -80,6 +80,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `grpc_web_origins` | array of strings |  | The origins whose pages may call the release's gRPC methods through gRPC-Web, answered with CORS: scheme, host and port, or `*`; none when empty. |
 | `handoff` | string |  | The interface the default mount's requests may be handed to; none when absent. `asgi`: Continue the request as an ASGI application on the event loop. `wsgi`: Continue the request as a WSGI callable on the thread pool. |
 | `hooks` | string |  | The module holding the lifecycle hooks, as a Python module name. |
+| `import_report` | boolean | the source's | Record the host's imports for `muructl debug imports`; when given, it takes the place of the source's `import_report`. |
 | `instances` | integer | `1` | How many instances of the command an `http` release runs. |
 | `instrumentation` | array of tables, {ref}`[[app.NAME.release.ID.instrumentation]] <config-daemon-app-name-release-id-instrumentation>` |  | The instrumentation modules, in order; when given, they replace the list in the source's `[tool.muru]` table. |
 | `interface` | string | `"auto"` | The interface, when declared rather than detected. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |

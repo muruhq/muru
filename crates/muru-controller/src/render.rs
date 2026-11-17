@@ -432,6 +432,7 @@ fn workers(
     writer.whole("instrumentation", !table.instrumentation.is_empty());
     writer.whole("preload_modules", !table.preload_modules.is_empty());
     writer.whole("lazy_imports", table.lazy_imports.is_some());
+    writer.whole("import_report", table.import_report.is_some());
 
     ReleaseTable {
         kind: None,
@@ -498,6 +499,7 @@ fn workers(
         instrumentation: (!table.instrumentation.is_empty()).then_some(table.instrumentation),
         preload_modules: (!table.preload_modules.is_empty()).then_some(table.preload_modules),
         lazy_imports: table.lazy_imports,
+        import_report: table.import_report,
         groups: table.groups,
         mounts: table.mounts,
         static_dirs,

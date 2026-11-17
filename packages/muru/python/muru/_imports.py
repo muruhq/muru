@@ -38,10 +38,21 @@ from typing import Any
 
 from muru._context import request_id
 
-__all__ = ["LOADS_KEPT", "install", "loaded", "mark_deferred", "uninstall"]
+__all__ = [
+    "LOADS_KEPT",
+    "WORKER_LOADS_KEPT",
+    "install",
+    "loaded",
+    "mark_deferred",
+    "uninstall",
+    "worker_loads",
+]
 
 LOADS_KEPT = 200
 """The most loads one request's record keeps one by one; the rest are counted."""
+
+WORKER_LOADS_KEPT = 2000
+"""The most loads a worker keeps for ``muructl debug imports``; the rest are counted."""
 
 # The import system's own frames, and this module's, which are passed
 # over to find the line that triggered a load, and the packages whose
@@ -80,6 +91,13 @@ _requests: dict[str, _Loads] = {}
 
 _counts = [0, 0]
 _counting = threading.Lock()
+
+# Each module this worker has loaded since the finder went in, for the
+# import report's section on the workers (issue 741): the module, the
+# request it ran under, its milliseconds, its depth, whether it resolved
+# a deferred import, and when it ended, the first WORKER_LOADS_KEPT.
+
+_worker: dict[str, list[Any]] = {}
 
 # Each thread's depth of loads under way, and the names it is searching
 # for, so a finder after this one that imports while it searches does not
@@ -142,6 +160,33 @@ def uninstall() -> None:
     _counts[:] = [0, 0]
     _requests.clear()
     _missing.clear()
+    _worker.clear()
+
+
+def worker_loads() -> dict[str, Any]:
+    """Return the modules this worker has loaded since the fork, for ``muructl debug imports``.
+
+    Each is its module, the request it ran under (empty outside one),
+    its milliseconds, its depth beneath other loads, whether it resolved
+    a deferred import, and when it ended in Unix milliseconds; with how
+    many loads there were in all.
+    """
+
+    with _counting:
+        loads = [
+            {
+                "module": module,
+                "request": request,
+                "ms": round(ms, 3),
+                "depth": depth,
+                "deferred": deferred,
+                "at_unix_ms": at,
+            }
+            for module, (request, ms, depth, deferred, at) in _worker.items()
+        ]
+        count = _counts[0]
+
+    return {"loads": loads, "loaded": count}
 
 
 def mark_deferred(module: str) -> None:
@@ -150,6 +195,12 @@ def mark_deferred(module: str) -> None:
     Called once the module is imported, in the thread whose use of the
     deferred import loaded it, so the load is in the record already.
     """
+
+    with _counting:
+        load = _worker.get(module)
+
+        if load is not None:
+            load[3] = True
 
     current = request_id()
     kept = _requests.get(current) if current is not None else None
@@ -318,11 +369,16 @@ class _Timed:
         # A load that ended: counted for the worker, and kept for its
         # request when that is recorded.
 
-        outside = request_id() is None
+        current = request_id()
+        ms = (ended - self._started) * 1000.0
+        name = self._spec.name
 
         with _counting:
             _counts[0] += 1
-            _counts[1] += outside
+            _counts[1] += current is None
+
+            if len(_worker) < WORKER_LOADS_KEPT and name not in _worker:
+                _worker[name] = [current or "", ms, depth, False, int(time.time() * 1000)]
 
         if _note_loaded is not None:
             _note_loaded()
@@ -332,7 +388,6 @@ class _Timed:
         if kept is None:
             return
 
-        ms = (ended - self._started) * 1000.0
         tally = None
 
         with kept.lock:

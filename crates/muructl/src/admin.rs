@@ -1040,6 +1040,16 @@ pub enum DebugCommand {
     /// its [daemon] table sets debug_exec.
     Exec(ExecArgs),
 
+    /// The import report of a release's load: what each import cost,
+    /// which entry point paid for it, and what to defer or load before
+    /// the fork, as configuration to write; then each module the workers
+    /// have loaded for the first time since the fork, by how many of them
+    /// and what to do about it. The host's load by default, or with
+    /// --worker a worker's own, when it loaded the application itself.
+    /// The release needs import_report on, or the report of a load
+    /// muructl check --imports prints.
+    Imports(ImportsArgs),
+
     /// A short summary of the installation to attach to a bug report:
     /// versions, how Muru runs, each release's interface, framework and
     /// state, the serving releases' settings and recent events. Safe to
@@ -1216,6 +1226,51 @@ pub struct MemoryArgs {
     top: u32,
 }
 
+/// `muructl debug imports`.
+#[derive(Args)]
+pub struct ImportsArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// Only the imports made while the host loaded one of its targets:
+    /// hooks, entrypoint, mount:NAME or module:NAME (one of the
+    /// preload_modules), or none for those made outside them, by an
+    /// instrumentation module or the on_load and pre_fork hooks.
+    #[arg(long = "target", id = "load_target", value_name = "TARGET")]
+    load_target: Option<String>,
+
+    /// The most rows of each table.
+    #[arg(long, default_value_t = crate::imports::DEFAULT_TOP, value_name = "N")]
+    top: usize,
+
+    /// Only rows that took at least this many milliseconds.
+    #[arg(long, default_value_t = 0.0, value_name = "MS")]
+    min_ms: f64,
+
+    /// Only modules and importers under this top-level package;
+    /// repeatable.
+    #[arg(long, value_name = "PACKAGE")]
+    package: Vec<String>,
+
+    /// The chain of imports that brought one module in, outermost first,
+    /// in place of the tables.
+    #[arg(long, value_name = "NAME")]
+    module: Option<String>,
+}
+
+impl ImportsArgs {
+    /// The rows the command keeps.
+    pub fn filters(&self) -> crate::imports::Filters {
+        crate::imports::Filters {
+            target: self.load_target.clone(),
+            top: self.top,
+            min_ms: self.min_ms,
+            packages: self.package.clone(),
+            module: self.module.clone(),
+        }
+    }
+}
+
 /// `muructl debug exec`.
 #[derive(Args)]
 pub struct ExecArgs {
@@ -1388,6 +1443,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
                 "timeout_s": exec.timeout.as_secs_f64(),
             }),
         ),
+        DebugCommand::Imports(imports) => ("imports", &imports.common, serde_json::json!({})),
         DebugCommand::Attach(_)
         | DebugCommand::Report(_)
         | DebugCommand::Bundle(_)
@@ -1398,6 +1454,22 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
 
     let target = args.target.as_deref().unwrap_or_default();
     let response = ask(&args.socket, target, op, args.worker.as_ref(), request).await?;
+
+    // Section 6.18: the import report is one document of the host's
+    // answer and the workers', in text or as JSON.
+
+    if let DebugCommand::Imports(imports) = &command {
+        let worker = args.worker.as_ref().map(ToString::to_string);
+        let found = crate::imports::document(&response, worker.as_deref(), &imports.filters())?;
+
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&found)?);
+        } else {
+            print!("{}", crate::imports::render(&found));
+        }
+
+        return Ok(());
+    }
 
     if args.json {
         print_json(&response);
@@ -1417,7 +1489,8 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::Attach(_)
         | DebugCommand::Report(_)
         | DebugCommand::Bundle(_)
-        | DebugCommand::Request(_) => {}
+        | DebugCommand::Request(_)
+        | DebugCommand::Imports(_) => {}
     }
 
     Ok(())

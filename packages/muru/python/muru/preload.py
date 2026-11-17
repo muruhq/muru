@@ -26,7 +26,7 @@ from importlib.util import resolve_name
 from types import ModuleType, TracebackType
 from typing import Any
 
-__all__ = ["Finding", "ImportRecorder", "child_pids", "thread_count"]
+__all__ = ["Finding", "ImportRecorder", "child_pids", "latest_findings", "thread_count"]
 
 # Compared through a name rather than sys.platform itself, so that mypy on
 # one platform does not report the other platform's branch as unreachable.
@@ -506,7 +506,21 @@ class ImportRecorder:
 
         for pid in sorted(children):
             findings.append(Finding("child", f"a child process running (pid {pid})"))
+
+        # Kept for the import report (section 6.17), which the release's
+        # load_finished builds from them.
+
+        _latest[:] = findings
         return findings
+
+
+_latest: list[Finding] = []
+
+
+def latest_findings() -> list[Finding]:
+    """Return what the import check last found, for the import report."""
+
+    return list(_latest)
 
 
 def _threads(count: int) -> str:

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import faulthandler
 import functools
 import gc
@@ -162,6 +163,14 @@ STARTUP_WINDOW_SECONDS = 5.0
 MAX_START_FAILURES = 3
 PRELOAD_MODES = ("auto", "true", "false")
 READ_SIZE = 65536
+
+# Section 6.18: the import report goes to the supervisor in parts of at
+# most this many characters, so no one line holds the host's loop for
+# long; and a report made before a fallback to per-worker imports waits
+# in the run directory, under this name, for the host started again.
+
+IMPORTS_PART = 1 << 20
+IMPORTS_FILE = "imports.json"
 
 # Section 11.3: how many exited workers' pipes are kept for a relay that
 # has not read them yet: 64 workers' worth.
@@ -1411,6 +1420,11 @@ class Host:
         self.version = 0
         self.acked = 0
 
+        # Section 6.18: the load's import report, sent to each supervisor
+        # that connects.
+
+        self.imports: str | None = None
+
         # Section 6.7: the interfaces the workers settled themselves, by
         # mount, for an application imported in each worker or made by a
         # factory there, which the host never loads.
@@ -2368,6 +2382,26 @@ class Host:
         self.supervisor_buffer = b""
         self.selector.register(connection, selectors.EVENT_READ)
         self.send_to_supervisor(self.workers_message())
+        self.send_imports()
+
+    def send_imports(self) -> None:
+        """Send the load's import report to the supervisor, in parts, if there is one."""
+
+        if self.imports is None:
+            return
+
+        text = self.imports
+        parts = max(1, -(-len(text) // IMPORTS_PART))
+
+        for part in range(parts):
+            self.send_to_supervisor(
+                {
+                    "type": "imports",
+                    "part": part,
+                    "parts": parts,
+                    "data": text[part * IMPORTS_PART : (part + 1) * IMPORTS_PART],
+                }
+            )
 
     def drop_supervisor(self) -> None:
         """Close the supervisor connection, if there is one."""
@@ -5403,6 +5437,53 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def imports_report() -> str | None:
+    """Take the import report this process's load made, as JSON, when import_report is on.
+
+    The host keeps it as one string, which the garbage collector never
+    walks, so the workers it forks share its pages rather than copying
+    them as a collection touches the objects of a parsed document.
+    """
+
+    module = sys.modules.get("muru._lazy_imports")
+    report: str | None = module.take_payload() if module is not None else None
+    return report
+
+
+def carry_imports(run_dir: str) -> None:
+    """Leave the load's import report in the run directory, for the host started again."""
+
+    report = imports_report()
+
+    if report is None:
+        return
+
+    try:
+        os.makedirs(run_dir, exist_ok=True)
+
+        with open(os.path.join(run_dir, IMPORTS_FILE), "w", encoding="utf-8") as file:
+            file.write(report)
+    except OSError as error:
+        log(f"the import report could not be kept for the per-worker imports: {error}")
+
+
+def carried_imports(run_dir: str) -> str | None:
+    """Take the import report a host that fell back left in the run directory, if any."""
+
+    path = os.path.join(run_dir, IMPORTS_FILE)
+
+    try:
+        with open(path, encoding="utf-8") as file:
+            report = file.read()
+    except OSError:
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+    return report or None
+
+
 def parse_logger_level(text: str) -> tuple[str, str]:
     """Parse NAME=LEVEL for --logger."""
 
@@ -5628,6 +5709,11 @@ def _main(argv: list[str] | None) -> int:
             instruments.finished(context, _instrumentation.FALLBACK)
             flush_streams()
 
+            # Section 6.18: the load's import report waits in the run
+            # directory for the host started again, which sends it.
+
+            carry_imports(args.socket_dir)
+
             # The instrumentation list goes back in the environment, so
             # the host started again gives it to each worker.
 
@@ -5723,6 +5809,11 @@ def _main(argv: list[str] | None) -> int:
         handoff=args.handoff,
         cgroup=args.cgroup,
     )
+
+    # Section 6.18: the load's import report, or the one a host that fell
+    # back to per-worker imports left, for the supervisor.
+
+    host.imports = imports_report() or carried_imports(args.socket_dir)
 
     # Section 2.1: the host says which release it is; each worker it
     # forks says so too, with its group and index.

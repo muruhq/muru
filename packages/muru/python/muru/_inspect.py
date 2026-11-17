@@ -65,6 +65,25 @@ _set_to: dict[str, int] = {}
 _lock = threading.Lock()
 
 
+def imports() -> dict[str, Any]:
+    """Return the modules the worker has loaded since the fork, and its own import report.
+
+    For ``muructl debug imports`` (section 6.18): the report is there
+    when the release has ``import_report`` on and the worker loaded the
+    application itself.
+    """
+
+    from muru import _imports
+
+    module = sys.modules.get("muru._lazy_imports")
+
+    if module is None:
+        return {"modules": _imports.worker_loads(), "report": None}
+
+    answer: dict[str, Any] = module.worker_answer()
+    return answer
+
+
 def handle(
     line: str,
     active: list[dict[str, Any]],
@@ -134,6 +153,8 @@ def handle(
             )
         elif op == "exec":
             result = run_code(str(args.get("code", "")))
+        elif op == "imports":
+            result = imports()
         elif op == "breakpoints":
             result = _debug.waiting()
         elif op == "attach":

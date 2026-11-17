@@ -21,6 +21,16 @@ use crate::logs::Logs;
 /// What a host says over its control connection (section 5.9).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostMessage {
+    /// A part of the load's import report (section 6.18): the JSON text
+    /// split into `parts` pieces, this one the `part`th from 0.
+    Imports {
+        /// Which part this is, from 0.
+        part: usize,
+        /// How many parts the report is in.
+        parts: usize,
+        /// This part's text.
+        data: String,
+    },
     /// The sockets the edge should route to now: the default group's,
     /// and each named group's. Acknowledged by version once the edge
     /// routes by them.
@@ -352,6 +362,11 @@ impl HostMessage {
                 evidence: value.get("evidence").map(|_| evidence(&value)),
             }),
             "capture" => Some(Self::Capture(evidence(&value))),
+            "imports" => Some(Self::Imports {
+                part: value["part"].as_u64().unwrap_or(0) as usize,
+                parts: value["parts"].as_u64().unwrap_or(1) as usize,
+                data: value["data"].as_str().unwrap_or_default().to_owned(),
+            }),
             "response" => Some(Self::Response {
                 id: value["id"].as_u64().unwrap_or(0),
                 error: value["error"].as_str().unwrap_or_default().to_owned(),
@@ -439,6 +454,37 @@ impl HostMessage {
             }),
             _ => None,
         }
+    }
+}
+
+/// The import report a host sends in parts (section 6.18), put back
+/// together as they arrive.
+#[derive(Debug, Default)]
+pub struct ImportsParts {
+    parts: Vec<String>,
+}
+
+impl ImportsParts {
+    /// Take one part, and return the whole report's text once the last
+    /// has arrived. A first part starts the report again, and a part out
+    /// of order is dropped with what came before it.
+    pub fn take(&mut self, part: usize, parts: usize, data: String) -> Option<String> {
+        if part == 0 {
+            self.parts.clear();
+        }
+
+        if part != self.parts.len() {
+            self.parts.clear();
+            return None;
+        }
+
+        self.parts.push(data);
+
+        if self.parts.len() < parts.max(1) {
+            return None;
+        }
+
+        Some(std::mem::take(&mut self.parts).concat())
     }
 }
 
@@ -2696,6 +2742,28 @@ mod tests {
 
         assert_eq!(start_time(first.id()), None);
         assert_eq!(start_time(0), None);
+    }
+
+    #[test]
+    fn an_import_report_in_parts_is_put_back_together() {
+        let mut parts = ImportsParts::default();
+        assert_eq!(parts.take(0, 3, "ab".to_owned()), None);
+        assert_eq!(parts.take(1, 3, "cd".to_owned()), None);
+        assert_eq!(parts.take(2, 3, "e".to_owned()).as_deref(), Some("abcde"));
+
+        // A part out of order drops what came before it, and a report in
+        // one part is whole at once.
+
+        assert_eq!(parts.take(0, 2, "x".to_owned()), None);
+        assert_eq!(parts.take(2, 2, "z".to_owned()), None);
+        assert_eq!(parts.take(1, 2, "y".to_owned()), None);
+        assert_eq!(parts.take(0, 1, "{}".to_owned()).as_deref(), Some("{}"));
+
+        let parsed = HostMessage::parse(r#"{"type":"imports","part":1,"parts":2,"data":"x"}"#);
+        assert!(matches!(
+            parsed,
+            Some(HostMessage::Imports { part: 1, parts: 2, ref data }) if data == "x"
+        ));
     }
 
     #[test]

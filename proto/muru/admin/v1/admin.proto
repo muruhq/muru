@@ -1110,6 +1110,7 @@ message DebugRequest {
 message DebugResponse {
   repeated WorkerDebug workers = 1;
   string release = 2;               // the release asked
+  string host_json = 3;             // for imports: the import report of the host's load, as the host sent it, when it did (issue 741)
 }
 
 // One worker's answer.

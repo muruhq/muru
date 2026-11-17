@@ -258,6 +258,53 @@ pub struct RunState {
     /// The request records a development run keeps (section 11.7); none
     /// under `--allow-public` and `muructl serve`.
     pub recorder: Option<Arc<muru_edge::recorder::Recorder>>,
+    /// The import reports of the last few loads (section 6.18).
+    pub imports: Arc<ImportReports>,
+}
+
+/// The import reports of a run's last few loads (section 6.18), each
+/// under the release whose host sent it, the newest last: a run and
+/// `muructl serve`, which has no state directory, keep them in memory.
+#[derive(Debug, Default)]
+pub struct ImportReports {
+    inner: Mutex<(
+        muru_controller::host::ImportsParts,
+        std::collections::VecDeque<(String, String)>,
+    )>,
+}
+
+impl ImportReports {
+    /// How many loads' reports are kept.
+    pub const KEPT: usize = 4;
+
+    /// Take one part of a report a host sent, keeping the report once the
+    /// last part has arrived, in place of one the same release sent.
+    pub fn take(&self, release: &str, part: usize, parts: usize, data: String) {
+        let mut inner = self.inner.lock().expect("import reports poisoned");
+        let (pending, kept) = &mut *inner;
+
+        let Some(text) = pending.take(part, parts, data) else {
+            return;
+        };
+
+        kept.retain(|(of, _)| of != release);
+        kept.push_back((release.to_owned(), text));
+
+        while kept.len() > Self::KEPT {
+            kept.pop_front();
+        }
+    }
+
+    /// The report of a release's load, if it is one of those kept.
+    pub fn of(&self, release: &str) -> Option<String> {
+        let inner = self.inner.lock().expect("import reports poisoned");
+
+        inner
+            .1
+            .iter()
+            .find(|(of, _)| of == release)
+            .map(|(_, text)| text.clone())
+    }
 }
 
 /// What `muructl status --processes` lists of a development run or a
@@ -1523,6 +1570,24 @@ impl Admin for Service {
         request: Request<pb::DebugRequest>,
     ) -> Result<Response<pb::DebugResponse>, Status> {
         let request = request.into_inner();
+        let imports = request.op == "imports";
+
+        // Section 6.18: an earlier load's import report is kept too, under
+        // the release that loaded, though its workers are gone.
+
+        if imports
+            && !request.release.is_empty()
+            && (request.app.is_empty() || request.app == self.state.app)
+            && request.release != self.state.release_id()
+            && let Some(host_json) = self.state.imports.of(&request.release)
+        {
+            return Ok(Response::new(pb::DebugResponse {
+                workers: Vec::new(),
+                release: request.release,
+                host_json,
+            }));
+        }
+
         let release = self
             .state
             .target(&request.app, &request.release)
@@ -1547,8 +1612,21 @@ impl Admin for Service {
                     .map(|index| WorkerName::new(&request.group, index)),
                 args,
             )
-            .await
-            .map_err(Status::failed_precondition)?;
+            .await;
+
+        // The host's import report stands without a worker to ask.
+
+        let answered = match answered {
+            Err(_) if imports && request.worker.is_none() => Vec::new(),
+            answered => answered.map_err(Status::failed_precondition)?,
+        };
+
+        let host_json = if imports {
+            self.state.imports.of(&release).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
         Ok(Response::new(pb::DebugResponse {
             workers: answered
                 .into_iter()
@@ -1562,6 +1640,7 @@ impl Admin for Service {
                 })
                 .collect(),
             release,
+            host_json,
         }))
     }
 

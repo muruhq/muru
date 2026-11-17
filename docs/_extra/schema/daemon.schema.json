@@ -2248,6 +2248,11 @@
           "description": "The module holding the lifecycle hooks, as a Python module name.",
           "type": "string"
         },
+        "import_report": {
+          "description": "Record the host's imports for `muructl debug imports`; when given, it takes the place of the source's `import_report`.",
+          "type": "boolean",
+          "x-default": "the source's"
+        },
         "instances": {
           "default": 1,
           "description": "How many instances of the command an `http` release runs.",

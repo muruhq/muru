@@ -1533,6 +1533,11 @@
       "description": "The module providing the lifecycle hooks.",
       "type": "string"
     },
+    "import_report": {
+      "default": false,
+      "description": "Record the host's imports with unwrapt's profile recorder as it loads the application, for `muructl debug imports`, with or without `lazy_imports`. The project's environment needs the unwrapt package.",
+      "type": "boolean"
+    },
     "instrumentation": {
       "description": "The instrumentation modules, in order, each with its settings, imported before anything of the application.",
       "items": {

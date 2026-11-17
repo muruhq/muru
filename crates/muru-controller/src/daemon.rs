@@ -1875,6 +1875,9 @@ struct Daemon {
     commands: mpsc::Sender<Command>,
     /// Requests to hosts awaiting their answers, by request id.
     asked: HashMap<u64, oneshot::Sender<Result<Vec<WorkerReply>, String>>>,
+    /// Section 6.18: the import reports hosts are sending in parts, by
+    /// release.
+    imports_parts: HashMap<(String, String), crate::host::ImportsParts>,
     /// The last request id given out.
     last_request: u64,
     /// Section 9.12 (issue 268): each scheduled command's next due time,
@@ -2278,6 +2281,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         owns_log,
         commands: handle_commands,
         asked: HashMap::new(),
+        imports_parts: HashMap::new(),
         last_request: 0,
         schedules: HashMap::new(),
         condition_skips: BTreeSet::new(),
@@ -11658,6 +11662,23 @@ impl Daemon {
             // Section 11.7: only a development run keeps request records,
             // so the daemon has nothing to join a capture to.
             HostMessage::Capture(_) => {}
+            // Section 6.18: the load's import report is kept in the store
+            // beside the release, which removing the release removes.
+            HostMessage::Imports { part, parts, data } => {
+                let whole = self
+                    .imports_parts
+                    .entry(key.clone())
+                    .or_default()
+                    .take(part, parts, data);
+
+                if let Some(text) = whole {
+                    self.imports_parts.remove(&key);
+
+                    if let Err(error) = self.store.put_import_report(app, id, &text) {
+                        tracing::warn!(%error, "release {app}@{id}: the import report cannot be kept");
+                    }
+                }
+            }
             HostMessage::Event {
                 kind,
                 level,

@@ -180,6 +180,153 @@ worker waits for it to load. The Timing panel shows that time, and the
 Hints panel points at modules whose first load took a large share of a
 request.
 
+## Finding what to defer: the import report
+
+`import_report = true` records the host's imports with unwrapt's profile
+recorder as it loads the application, and keeps the report for
+`muructl debug imports`. It is independent of `lazy_imports`:
+
+| `lazy_imports` | `import_report` | What it gives |
+| --- | --- | --- |
+| on | off | Deferral alone |
+| off | on | A report with nothing deferred: the run for finding candidates |
+| on | on | A report with the deferrals in place: the run for checking them |
+
+```toml
+[tool.muru]
+entrypoint = "shop.app:app"
+import_report = true
+```
+
+`import_report` in `muru.local.toml` takes the place of the project's for
+that machine's runs, and a release's table for `muructl apply` takes it
+too. It needs unwrapt in the project's environment, as `lazy_imports`
+does.
+
+`muructl debug imports` prints the report of the host's load:
+
+```
+Import report of the host's load of shop@r3: outcome fork, Python 3.13.2, 4 workers
+  412.3 ms importing, 213 modules loaded, 2804 import calls; deferring what can be deferred would save about 120.4 ms
+
+Advice
+  defer: openpyxl imported by shop.reports, 96.4 ms, loading entrypoint
+    paid by the host, once before the fork, shared by the 4 workers; deferred, each worker that uses it loads it on first use
+    add 'openpyxl' to __lazy_modules__ in shop.reports
+      __lazy_modules__ = ['openpyxl']
+  fork safety: shop.metrics imported by shop.app, 12.0 ms, loading entrypoint
+    paid by its import left a thread running (metrics-flush) in the host, which cannot cross the fork
+    add 'shop.metrics' to __lazy_modules__ in shop.app
+      __lazy_modules__ = ['shop.metrics']
+
+Imports that loaded a module, by cumulative time
+  CUM MS SAVES MS IMPORTED      IMPORTED BY     LOADING    3.15 UNWRAPT NOTES
+   140.2    140.2 shop.reports  shop.views      entrypoint yes  yes
+    96.4     96.4 openpyxl      shop.reports    entrypoint yes  yes
+...
+```
+
+- **The summary** is unwrapt's: the time the load spent importing, the
+  modules it loaded, and a conservative estimate of what deferring every
+  import that can be deferred would save.
+
+- **The advice** names the imports deferring which saves the most, each
+  with who pays for the module and the configuration to write. An import
+  in the project's own code is deferred with the module's
+  `__lazy_modules__`; one in a package the project depends on, with an
+  entry of `[tool.unwrapt.lazy_modules]`. Under preload the host pays for
+  a module once and its workers share it, so deferring it moves the load
+  into each worker that uses it; with per-worker imports each worker pays
+  for it as it starts. A module whose import left a thread, a socket or a
+  child process in the host, which makes the release fall back to
+  per-worker imports, is a strong candidate: deferred, it is loaded after
+  the fork, in the worker that uses it. A deferred import the load used
+  anyway is named too, since deferring it gains nothing.
+
+- **LOADING** says which of the host's targets the import was made while
+  loading: `hooks`, `entrypoint`, `mount:NAME`, or `module:NAME` for one
+  of the `preload_modules`. A module several targets need is paid for by
+  the first. An import made outside them, by an instrumentation module or
+  by the `on_load` and `pre_fork` hooks, has no target.
+
+- **3.15** and **UNWRAPT** say whether each way of deferring can defer the
+  import's form: `from x import y` defers on Python 3.15 alone, and below
+  it only once rewritten as `import x`.
+
+An import that takes less than half a millisecond is not kept as a
+candidate. The line of an import made while the host loads under preload
+is not known, so the chains give its file alone.
+
+The options narrow it:
+
+| Option | Keeps |
+| --- | --- |
+| `--target TARGET` | The imports made while loading one target, or `none` for those outside any |
+| `--top N` | The first N rows of each table (20 by default) |
+| `--min-ms MS` | Rows that took at least MS milliseconds |
+| `--package NAME` | Modules and importers under a top-level package; repeatable |
+| `--module NAME` | The chain of imports that brought one module in, outermost first, with the best place to cut it |
+| `--worker N` | A worker's own report, when it loaded the application itself, with `preload = false` or after the fallback to per-worker imports |
+| `--json` | The same as JSON |
+
+### The workers
+
+After the report, `muructl debug imports` asks each worker which modules
+it has loaded for the first time since the fork, as `muructl debug
+status` asks for its status:
+
+```
+Modules the 4 workers asked loaded for the first time since the fork
+  MODULE          LOADED BY FIRST REQUEST               MS ADVICE
+  shop.export     4 of 4    01M7KQB0T2RJAQ4CG18KYPG80D 41.0 every worker loads it: load it before the fork with preload_modules = ["shop.export"]
+  pandas (deferred) 1 of 4  01M7KQC4YV3M8T5WQ0J1E9X2HB 310.2 deferral pays off: only some workers load it
+  matplotlib (deferred in shop.charts): never needed: deferring it saves it in every worker
+```
+
+Each row is a module a worker loaded while it served, by how many of the
+workers asked, the first request that loaded it and its time, with
+deferred modules marked. A module every worker loads is better loaded
+before the fork; one only some of them load pays off loaded on first use,
+or deferred; and a deferred import of the host's load that no worker has
+used is never needed. The figures grow as the workers serve, so read them
+after the application has seen representative traffic. A module loaded
+only inside another's load comes with it and is not listed.
+
+### Checking a change
+
+`muructl check --imports` records one load of the application and prints
+its report, without serving anything, whatever `import_report` says, and
+works in CI. Without `--imports`, `muructl check` prints the report when
+`import_report` is on. Run it before and after adding a deferral to see
+what it saved.
+
+A coding agent reads the same report through the `imports` tool of
+[`muructl mcp serve`](coding-agents.md), can read the code at each import
+the advice names, and can run `muructl check --imports` again to confirm
+a change.
+
+### Where the report is kept
+
+The daemon keeps each release's report in its state, beside the release,
+and removes it with the release. `muructl run` and `muructl serve` keep
+the reports of their last four loads in memory, so `muructl debug imports
+APP@RELEASE` reads an earlier load's report of a run that has reloaded.
+The host sends the report once its supervisor connects, so a load that
+fails, or one `preload = true` refuses, has no report kept;
+`muructl check --imports` shows the report of such a load.
+
+### What it costs
+
+Recording costs the load time, and analysing the report when the load is
+done costs more. Measured on Python 3.15 on macOS, the median of 21 fresh
+processes loading Django with its admin and contrib applications and
+FastAPI, 801 modules and 4,061 import calls recorded: the load took 152
+ms without the recorder and 179 ms with it, and the analysis 81 ms more.
+The report was 2.4 MB of JSON. Under preload the time is taken before
+the release is sent traffic, but `muructl run` takes it again on every
+reload, so `import_report` is for the runs that look for what to defer
+rather than one to leave on.
+
 ## Beside `preload_modules`
 
 [`preload_modules`](../explanation/preload.md#modules-loaded-on-first-use)

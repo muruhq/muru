@@ -2154,6 +2154,7 @@ mod tests {
                 worker(1, true, r#"{"stacks": {"main;view": 4}}"#),
                 worker(2, false, ""),
             ],
+            ..Default::default()
         };
 
         assert_eq!(
@@ -2167,6 +2168,7 @@ mod tests {
         let refused = pb::DebugResponse {
             release: "r3".to_owned(),
             workers: vec![worker(2, false, "")],
+            ..Default::default()
         };
         assert_eq!(
             collapsed(&refused).unwrap_err(),

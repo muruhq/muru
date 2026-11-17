@@ -1028,6 +1028,12 @@ pub struct Release {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "the source's"))]
     pub lazy_imports: Option<bool>,
+    /// Record the host's imports for `muructl debug imports` (section
+    /// 6.18); when given, it takes the place of the source's
+    /// `import_report`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's"))]
+    pub import_report: Option<bool>,
     /// Worker groups by name (section 7.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub groups: BTreeMap<String, Group>,
@@ -4380,17 +4386,19 @@ pub fn tracing_instrumentation(
     }))
 }
 
-/// The module that defers imports with unwrapt (section 6.17), put at
-/// the head of a release's instrumentation list, ahead of tracing's, when
-/// `lazy_imports` is on.
+/// The module that defers imports with unwrapt and records the import
+/// report (sections 6.17 and 6.18), put at the head of a release's
+/// instrumentation list, ahead of tracing's, when `lazy_imports` or
+/// `import_report` is on.
 pub const LAZY_IMPORTS_MODULE: &str = "muru._lazy_imports";
 
-/// The instrumentation entry that defers imports with unwrapt (section
-/// 6.17), or None when `lazy_imports` is off. unwrapt finds its own
-/// configuration, so the entry has no settings. The module listed by hand
-/// is refused.
+/// The instrumentation entry that defers imports and records the import
+/// report (sections 6.17 and 6.18), or None when both keys are off. The
+/// module listed by hand is refused.
 pub fn lazy_imports_instrumentation(
     lazy_imports: Option<bool>,
+    import_report: Option<bool>,
+    workers: usize,
     listed: &[Instrumentation],
 ) -> Result<Option<Instrumentation>, String> {
     if listed
@@ -4398,20 +4406,36 @@ pub fn lazy_imports_instrumentation(
         .any(|entry| entry.module == LAZY_IMPORTS_MODULE)
     {
         return Err(format!(
-            "instrumentation module {LAZY_IMPORTS_MODULE} is set up by the lazy_imports key, not listed"
+            "instrumentation module {LAZY_IMPORTS_MODULE} is set up by the lazy_imports and import_report keys, not listed"
         ));
     }
 
-    Ok((lazy_imports == Some(true)).then(lazy_imports_entry))
+    Ok(lazy_imports_entry(
+        lazy_imports == Some(true),
+        import_report == Some(true),
+        workers,
+    ))
 }
 
-/// The instrumentation entry of the module that defers imports (section
-/// 6.17), which has no settings: unwrapt finds its own configuration.
-pub fn lazy_imports_entry() -> Instrumentation {
-    Instrumentation {
-        module: LAZY_IMPORTS_MODULE.to_owned(),
-        settings: BTreeMap::new(),
+/// The instrumentation entry of the module that defers imports and
+/// records the import report (sections 6.17 and 6.18), or None when it
+/// does neither. Its settings say which it does, and how many workers the
+/// release starts with, for the report's analysis; unwrapt finds its own
+/// configuration.
+pub fn lazy_imports_entry(defer: bool, report: bool, workers: usize) -> Option<Instrumentation> {
+    if !defer && !report {
+        return None;
     }
+
+    let mut settings = BTreeMap::new();
+    settings.insert("defer".to_owned(), serde_json::json!(defer));
+    settings.insert("report".to_owned(), serde_json::json!(report));
+    settings.insert("workers".to_owned(), serde_json::json!(workers));
+
+    Some(Instrumentation {
+        module: LAZY_IMPORTS_MODULE.to_owned(),
+        settings,
+    })
 }
 
 /// The unwrapt configuration file a host running in `dir` finds (section
@@ -4955,7 +4979,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
     }
 
     let timeouts = table.timeouts.as_ref();
-    let worker_keys: [(&str, bool); 26] = [
+    let worker_keys: [(&str, bool); 27] = [
         ("entrypoint", !table.entrypoint.is_empty()),
         ("interface", table.interface.is_some()),
         ("handoff", table.handoff.is_some()),
@@ -4972,6 +4996,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
         ("preload_modules", table.preload_modules.is_some()),
         ("instrumentation", table.instrumentation.is_some()),
         ("lazy_imports", table.lazy_imports.is_some()),
+        ("import_report", table.import_report.is_some()),
         ("groups", !table.groups.is_empty()),
         ("mounts", !table.mounts.is_empty()),
         ("logging", table.logging.is_some()),
@@ -5654,6 +5679,8 @@ pub struct LocalFile {
     /// `lazy_imports` (section 6.17), which takes the place of the
     /// project's for this machine's runs.
     pub lazy_imports: Option<bool>,
+    /// `import_report` (section 6.18), likewise.
+    pub import_report: Option<bool>,
 }
 
 /// The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a
@@ -6085,6 +6112,13 @@ pub struct ToolMuru {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub lazy_imports: Option<bool>,
+    /// Record the host's imports with unwrapt's profile recorder as it
+    /// loads the application, for `muructl debug imports` (section 6.18),
+    /// with or without `lazy_imports`. The project's environment needs
+    /// the unwrapt package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub import_report: Option<bool>,
     /// The interpreter: a path, or a request in uv's syntax such as
     /// "3.13", "3.14t" or ">=3.12" (section 8.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6475,11 +6509,11 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
     if let Some(key) = document.keys().find(|key| {
         !matches!(
             key.as_str(),
-            "run" | "build" | "instrumentation" | "tracing" | "lazy_imports"
+            "run" | "build" | "instrumentation" | "tracing" | "lazy_imports" | "import_report"
         )
     }) {
         return Err(format!(
-            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table, the when key of [build], [[instrumentation]], tracing and lazy_imports; the application's settings belong in {there}"
+            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table, the when key of [build], [[instrumentation]], tracing, lazy_imports and import_report; the application's settings belong in {there}"
         ));
     }
 
@@ -6538,10 +6572,10 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
         None => None,
     };
 
-    let lazy_imports = match document.get("lazy_imports") {
-        Some(toml::Value::Boolean(on)) => Some(*on),
-        Some(_) => return Err("lazy_imports: true or false".to_owned()),
-        None => None,
+    let flag = |key: &str| match document.get(key) {
+        Some(toml::Value::Boolean(on)) => Ok(Some(*on)),
+        Some(_) => Err(format!("{key}: true or false")),
+        None => Ok(None),
     };
 
     Ok(LocalFile {
@@ -6549,7 +6583,8 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
         build_when,
         instrumentation,
         tracing,
-        lazy_imports,
+        lazy_imports: flag("lazy_imports")?,
+        import_report: flag("import_report")?,
     })
 }
 
@@ -7608,19 +7643,40 @@ traffic = { classes = { ai-crawler = 'r1' } }"
             "lazy_imports: true or false"
         );
 
-        let entry = lazy_imports_instrumentation(Some(true), &[])
+        let entry = lazy_imports_instrumentation(Some(true), None, 2, &[])
             .unwrap()
             .unwrap();
         assert_eq!(entry.module, LAZY_IMPORTS_MODULE);
         assert_eq!(
-            lazy_imports_instrumentation(Some(false), &[]).unwrap(),
+            serde_json::json!(entry.settings),
+            serde_json::json!({"defer": true, "report": false, "workers": 2})
+        );
+        assert_eq!(
+            lazy_imports_instrumentation(Some(false), None, 2, &[]).unwrap(),
             None
         );
-        assert_eq!(lazy_imports_instrumentation(None, &[]).unwrap(), None);
+        assert_eq!(
+            lazy_imports_instrumentation(None, None, 2, &[]).unwrap(),
+            None
+        );
+
+        // Issue 741: the import report alone records with nothing deferred.
+
+        let report = lazy_imports_instrumentation(None, Some(true), 2, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.settings["defer"], false);
+        assert_eq!(report.settings["report"], true);
+        assert_eq!(
+            parse_local("import_report = true\n", None)
+                .unwrap()
+                .import_report,
+            Some(true)
+        );
 
         let listed = [entry];
-        let error = lazy_imports_instrumentation(Some(true), &listed).unwrap_err();
-        assert!(error.contains("set up by the lazy_imports key"), "{error}");
+        let error = lazy_imports_instrumentation(Some(true), None, 2, &listed).unwrap_err();
+        assert!(error.contains("set up by the lazy_imports"), "{error}");
     }
 
     #[test]

@@ -494,6 +494,10 @@ pub struct ReleaseSpec {
     /// module of Muru's own put at the head of the host's list.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lazy_imports: bool,
+    /// Whether the host records its imports for `muructl debug imports`
+    /// (section 6.18), through the same module.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub import_report: bool,
     /// Whether the entrypoint is a factory, and when it is called.
     pub factory: Option<FactoryPhase>,
     /// The origins whose pages may call it through gRPC-Web, answered
@@ -594,12 +598,18 @@ pub struct ReleaseSpec {
 }
 
 impl ReleaseSpec {
-    /// The instrumentation list the host is given (sections 6.15 and
-    /// 6.17): the module that defers imports first when `lazy_imports` is
-    /// on, then the release's own list.
+    /// The instrumentation list the host is given (sections 6.15, 6.17
+    /// and 6.18): the module that defers imports and records the import
+    /// report first when either key is on, then the release's own list.
     pub fn host_instrumentation(&self) -> Vec<muru_config::Instrumentation> {
-        self.lazy_imports
-            .then(muru_config::lazy_imports_entry)
+        let workers = self.processes as usize
+            + self
+                .groups
+                .iter()
+                .map(|group| group.processes as usize)
+                .sum::<usize>();
+
+        muru_config::lazy_imports_entry(self.lazy_imports, self.import_report, workers)
             .into_iter()
             .chain(self.instrumentation.iter().cloned())
             .collect()

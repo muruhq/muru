@@ -344,6 +344,16 @@ application whose collections still cost it can create fewer long-lived
 cyclic objects after the fork, or call `gc.freeze()` itself once its
 caches are warm.
 
+## Imports
+
+`muructl debug imports` prints the import report of the release's load,
+when the release has `import_report` on: what each import cost, which
+entry point paid for it, and what to defer or load before the fork,
+written as the configuration to add; then each module the workers have
+loaded for the first time since the fork, by how many of them. The
+[guide to deferring imports](lazy-imports.md#finding-what-to-defer-the-import-report)
+sets it out.
+
 ## Running code
 
 `muructl debug exec` runs a snippet in the workers and prints what it

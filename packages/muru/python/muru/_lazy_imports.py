@@ -1,25 +1,37 @@
-"""Deferring imports with unwrapt (design specification section 6.17).
+"""Deferring imports with unwrapt, and the import report (specification sections 6.17, 6.18).
 
-A project turns deferral on with ``lazy_imports = true``, and the
-release's instrumentation list then starts with this module (section
-6.15), ahead of tracing's, so the imports of the modules after it can be
-deferred too. unwrapt is the application's dependency, not Muru's: it is
-imported only here, only when the key is on, from the project's
+A project turns deferral on with ``lazy_imports = true``, the import
+report with ``import_report = true``, or both, and the release's
+instrumentation list then starts with this module (section 6.15), ahead
+of tracing's, so the imports of the modules after it can be deferred and
+recorded too. Its settings say which: ``defer`` and ``report``, with
+``workers``, how many workers the release starts with, for the report's
+analysis. unwrapt is the application's dependency, not Muru's: it is
+imported only here, only when a key is on, from the project's
 environment.
 
-- ``load_started`` installs unwrapt's deferral with the configuration
-  unwrapt finds itself (``UNWRAPT_CONFIG``, else ``unwrapt.toml``, else a
-  ``[tool.unwrapt]`` table in ``pyproject.toml``, in the directory the
-  host runs in), before anything of the application is imported. Below
-  Python 3.15 each module's ``__lazy_modules__`` is honoured as well as
-  the configuration's ``lazy_modules``; from 3.15 the interpreter honours
-  ``__lazy_modules__`` itself, and unwrapt is installed only when its
+- ``load_started`` installs unwrapt with the configuration it finds itself
+  (``UNWRAPT_CONFIG``, else ``unwrapt.toml``, else a ``[tool.unwrapt]``
+  table in ``pyproject.toml``, in the directory the host runs in), before
+  anything of the application is imported: the shim when deferring, and
+  the profile recorder for the report. Below Python 3.15 the shim
+  honours each module's ``__lazy_modules__`` as well as the
+  configuration's ``lazy_modules``; from 3.15 the interpreter honours
+  ``__lazy_modules__`` itself, and unwrapt installs its shim only when
   ``lazy_modules`` has entries. Deferral stays installed through the
   fork, and each deferred module loads in a worker on first use.
 
-- ``load_finished`` writes one line to the release's log when the host
-  forks, naming the deferred imports already used before the fork, which
-  under preload save nothing.
+- ``before_import`` and ``after_import`` label the imports of each entry
+  point the release loads, for the report: ``hooks``, ``entrypoint``,
+  ``mount:NAME`` and ``module:NAME`` for one of the ``preload_modules``.
+  Imports outside any pair, by an instrumentation module, ``on_load`` or
+  ``pre_fork``, carry no target.
+
+- ``load_finished`` stops the recorder, on every outcome, labels the
+  report and has ``muru._import_report`` analyse it, keeping the result
+  for the host to send to the controller; and when the host forks it
+  writes one line to the release's log naming the deferred imports
+  already used before the fork, which under preload save nothing.
 
 - ``worker_started`` subscribes to unwrapt's resolutions, so a module a
   request loads on first use is marked as deferred in the request's
@@ -27,12 +39,14 @@ environment.
 
 A missing or too old unwrapt, or a configuration file it cannot use,
 raises from ``load_started``; Muru logs that with the reason, and the
-release starts without deferral.
+release starts without deferral or a report.
 """
 
 from __future__ import annotations
 
 import importlib
+import json
+import os
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -40,16 +54,47 @@ from typing import Any
 from muru import _imports
 from muru._instrumentation import FORK
 
-__all__ = ["load_finished", "load_started", "worker_started"]
+__all__ = [
+    "after_import",
+    "before_import",
+    "configure",
+    "load_finished",
+    "load_started",
+    "payload",
+    "take_payload",
+    "worker_answer",
+    "worker_started",
+]
 
 # The most deferred imports the line at the fork names one by one.
 
 NAMED = 10
 
+# The settings Muru gives the module.
+
+_defer = True
+_report = False
+_workers = 1
+
 # unwrapt, once load_started installed it; None until then or when it
 # failed, so the later callbacks do nothing.
 
 _unwrapt: Any = None
+
+# How many deferrals unwrapt had handed out before load_started, which
+# lists every one in the process, so the line at the fork counts this
+# load's alone.
+
+_deferred_before = 0
+
+# The scopes before_import pushed, which after_import pops.
+
+_scopes: list[Any] = []
+
+# The load's import report and Muru's analysis of it, once load_finished
+# has built them.
+
+_payload: dict[str, Any] | None = None
 
 # What unsubscribes from unwrapt's resolutions, once worker_started has
 # subscribed.
@@ -57,41 +102,178 @@ _unwrapt: Any = None
 _unsubscribe: Callable[[], None] | None = None
 
 
+def configure(settings: dict[str, Any]) -> None:
+    """Take the settings Muru built from the release's lazy_imports and import_report keys."""
+
+    global _defer, _report, _workers
+
+    _defer = bool(settings.get("defer", True))
+    _report = bool(settings.get("report", False))
+    _workers = max(1, int(settings.get("workers", 1) or 1))
+
+
 def load_started(context: Any) -> None:
-    """Install unwrapt's deferral before the application is imported.
+    """Install unwrapt, deferring and recording as asked, before the application is imported.
 
     Raises when unwrapt is missing or too old, or its configuration
     cannot be used; Muru logs that, and the release starts without
-    deferral.
+    deferral or a report.
     """
 
-    global _unwrapt
+    global _deferred_before, _unwrapt
 
     unwrapt = _module()
 
     try:
         config = unwrapt.load_config()
     except unwrapt.ConfigError as error:
-        raise RuntimeError(f"lazy_imports cannot use the unwrapt configuration: {error}") from error
+        raise RuntimeError(f"{_key()} cannot use the unwrapt configuration: {error}") from error
 
     # unwrapt installed already, by its own bootstrap, keeps the settings
     # it was installed with.
 
-    if not unwrapt.install(config, defer=True) and unwrapt.installed() is not None:
+    if (
+        not unwrapt.install(config, defer=_defer, profile=_report)
+        and unwrapt.installed() is not None
+    ):
         _write(
-            "lazy_imports: unwrapt was already installed in this process, so its own settings apply"
+            f"{_key()}: unwrapt was already installed in this process, so its own settings apply"
         )
 
+    _deferred_before = len(unwrapt.deferred())
     _unwrapt = unwrapt
 
 
-def load_finished(context: Any, outcome: str) -> None:
-    """Say at the fork which deferred imports were used before it."""
+def before_import(context: Any, target: Any) -> None:
+    """Label the imports of the hooks module, the entrypoint, a mount or a listed module."""
 
-    if _unwrapt is None or outcome != FORK:
+    if _unwrapt is None or not _report:
         return
 
-    deferrals = _unwrapt.deferred()
+    if target.kind in ("mount", "module"):
+        label = f"{target.kind}:{target.name or target.spec}"
+    else:
+        label = target.kind
+
+    _scopes.append(_unwrapt.push_scope(target=label))
+
+
+def after_import(context: Any, target: Any) -> None:
+    """End the label before_import began."""
+
+    if _unwrapt is None or not _scopes:
+        return
+
+    _unwrapt.pop_scope(_scopes.pop())
+
+
+def load_finished(context: Any, outcome: str) -> None:
+    """Build the import report, and say at the fork which deferred imports were used before it."""
+
+    if _unwrapt is None:
+        return
+
+    if _report:
+        _record(context, outcome)
+
+    if _defer and outcome == FORK:
+        _say_deferred()
+
+
+def worker_started(context: Any) -> None:
+    """Mark a deferred module a request loads in the worker as deferred, in its record."""
+
+    global _unsubscribe
+
+    if _unwrapt is None or not _defer or _unsubscribe is not None:
+        return
+
+    _unsubscribe = _unwrapt.on_resolve(_resolved)
+
+
+def payload() -> dict[str, Any] | None:
+    """Return the load's import report with Muru's analysis, once load_finished built it."""
+
+    return _payload
+
+
+def take_payload() -> str | None:
+    """Take the host's import report as JSON, leaving none behind as objects.
+
+    A worker's own report, made when it loaded the application itself, is
+    kept for ``worker_answer``.
+    """
+
+    global _payload
+
+    if _payload is None or _payload["labels"].get("role") == "worker":
+        return None
+
+    text = json.dumps(_payload)
+    _payload = None
+    return text
+
+
+def worker_answer() -> dict[str, Any]:
+    """Answer ``muructl debug imports`` in a worker.
+
+    The modules the worker has loaded since the fork, and the report of
+    its own load when it loaded the application itself, with per-worker
+    imports; a forked worker's copy of the host's report is the host's,
+    and is left out.
+    """
+
+    own = _payload if _payload and _payload["labels"].get("role") == "worker" else None
+    return {"modules": _imports.worker_loads(), "report": own}
+
+
+def _record(context: Any, outcome: str) -> None:
+    # The recorder's report, labelled with what it is of, and Muru's
+    # analysis of it.
+
+    global _payload
+
+    from muru import _import_report, preload
+
+    # A scope a failed import left open is closed first.
+
+    while _scopes:
+        _unwrapt.pop_scope(_scopes.pop())
+
+    report = _unwrapt.stop_profile(write=False)
+
+    if report is None:
+        return
+
+    worker = context.worker_id
+    labels = {
+        "app": context.app,
+        "release": context.release,
+        "role": "host" if worker is None else "worker",
+        "outcome": outcome,
+        "python": sys.version.split()[0],
+    }
+
+    if worker is not None:
+        labels["worker"] = (
+            str(worker) if context.group == "default" else f"{context.group}/{worker}"
+        )
+
+    report.labels.update(labels)
+    _payload = _import_report.analyse(
+        report,
+        outcome=outcome,
+        workers=_workers,
+        found=preload.latest_findings() if worker is None else (),
+        root=os.getcwd(),
+    )
+
+
+def _say_deferred() -> None:
+    # One line at the fork: what was deferred, and what of it the host's
+    # load used anyway.
+
+    deferrals = _unwrapt.deferred()[_deferred_before:]
 
     if not deferrals:
         return
@@ -117,17 +299,6 @@ def load_finished(context: Any, outcome: str) -> None:
     )
 
 
-def worker_started(context: Any) -> None:
-    """Mark a deferred module a request loads in the worker as deferred, in its record."""
-
-    global _unsubscribe
-
-    if _unwrapt is None or _unsubscribe is not None:
-        return
-
-    _unsubscribe = _unwrapt.on_resolve(_resolved)
-
-
 def _resolved(resolution: Any) -> None:
     # A deferred import resolving, in the thread that used it, once the
     # module is imported: it was loaded then unless something else had
@@ -135,6 +306,12 @@ def _resolved(resolution: Any) -> None:
 
     if resolution.loaded:
         _imports.mark_deferred(resolution.module)
+
+
+def _key() -> str:
+    # The key that turned the module on, for its messages.
+
+    return "lazy_imports" if _defer else "import_report"
 
 
 def _write(line: str) -> None:
@@ -155,16 +332,18 @@ def _module() -> Any:
         module = importlib.import_module("unwrapt")
     except ImportError as error:
         raise RuntimeError(
-            "lazy_imports needs the unwrapt package in the project's environment; "
+            f"{_key()} needs the unwrapt package in the project's environment; "
             f"add it to the project's dependencies ({error})"
         ) from error
 
-    # install() taking a configuration, deferred() and on_resolve()
-    # arrived in 1.0.0a2.
+    # install() taking a configuration, deferred(), on_resolve(), the
+    # scopes and stop_profile() returning the report arrived in 1.0.0a2.
 
-    if not (hasattr(module, "on_resolve") and hasattr(module, "deferred")):
+    if not all(
+        hasattr(module, name) for name in ("on_resolve", "deferred", "push_scope", "stop_profile")
+    ):
         raise RuntimeError(
-            "lazy_imports needs unwrapt 1.0.0a2 or later, and the environment has "
+            f"{_key()} needs unwrapt 1.0.0a2 or later, and the environment has "
             f"{getattr(module, '__version__', 'an older one')}"
         )
 

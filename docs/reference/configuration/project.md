@@ -27,6 +27,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `grpc_web_origins` | array of strings |  | The origins whose pages may call the gRPC methods through gRPC-Web, or `*`. |
 | `handoff` | string |  | The interface the entrypoint's requests may be handed to. `asgi`: Continue the request as an ASGI application on the event loop. `wsgi`: Continue the request as a WSGI callable on the thread pool. |
 | `hooks` | string |  | The module providing the lifecycle hooks. |
+| `import_report` | boolean | `false` | Record the host's imports with unwrapt's profile recorder as it loads the application, for `muructl debug imports`, with or without `lazy_imports`. The project's environment needs the unwrapt package. |
 | `instrumentation` | array of tables, {ref}`[[tool.muru.instrumentation]] <config-project-tool-muru-instrumentation>` |  | The instrumentation modules, in order, each with its settings, imported before anything of the application. |
 | `interface` | string | `"auto"` | The interface the entrypoint speaks. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `lazy_imports` | boolean | `false` | Defer imports with unwrapt: each module's `__lazy_modules__` from Python 3.11 to 3.14, and the `[tool.unwrapt.lazy_modules]` table on every version. The project's environment needs the unwrapt package. |

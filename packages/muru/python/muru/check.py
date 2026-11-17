@@ -216,6 +216,15 @@ def main(argv: list[str] | None = None) -> int:
         }
         for finding in findings
     ]
+
+    # Section 6.18: the load's import report, when the import report is
+    # on, for muructl to print.
+
+    lazy_imports = sys.modules.get("muru._lazy_imports")
+
+    if lazy_imports is not None and lazy_imports.payload() is not None:
+        report["imports"] = lazy_imports.payload()
+
     json.dump(report, sys.stdout)
     sys.stdout.write("\n")
     return 0 if report["ok"] else 1

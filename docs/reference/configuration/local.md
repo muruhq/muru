@@ -2,7 +2,7 @@
 
 # muru.local.toml
 
-A developer's own settings for `muructl run`, in `muru.local.toml` beside the project, which is not committed. Its `[run]` table holds the keys of `[tool.muru.run]` and takes precedence over them; lists add to the project's. Its `[[instrumentation]]` entries come before the project's, and its `tracing` and `lazy_imports` take the place of the project's.
+A developer's own settings for `muructl run`, in `muru.local.toml` beside the project, which is not committed. Its `[run]` table holds the keys of `[tool.muru.run]` and takes precedence over them; lists add to the project's. Its `[[instrumentation]]` entries come before the project's, and its `tracing`, `lazy_imports` and `import_report` take the place of the project's.
 
 The JSON Schema of the same keys, for an editor that checks TOML against one, is `https://docs.muruhq.dev/en/latest/schema/local.schema.json`.
 
@@ -12,6 +12,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `build` | table, {ref}`[build] <config-local-build>` |  | When `muructl run` builds the environment. |
+| `import_report` | boolean |  | The import report for this machine's runs, in place of the project's `import_report`. |
 | `instrumentation` | array of tables, {ref}`[[instrumentation]] <config-local-instrumentation>` |  | Instrumentation modules for this machine's runs, before the project's own. |
 | `lazy_imports` | boolean |  | Deferring imports with unwrapt for this machine's runs, in place of the project's `lazy_imports`. |
 | `run` | table, {ref}`[run] <config-local-run>` |  | How `muructl run` serves the project, over `[tool.muru.run]`. |
