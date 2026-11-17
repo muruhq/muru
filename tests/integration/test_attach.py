@@ -102,7 +102,7 @@ def test_status_counts_a_request_waiting_at_a_breakpoint(daemon: Daemon, tmp_pat
         lines = daemon.muructl("debug", "status", "paused").stdout.splitlines()
         assert "THREADS THREAD-OLDEST" in " ".join(lines[0].split())
         assert "LOOP" not in lines[0]
-        assert any(line.split()[5] == "1/2" for line in lines[1:]), lines
+        assert any(line.split()[6] == "1/2" for line in lines[1:]), lines
     finally:
         thread.join()
 

@@ -10,9 +10,11 @@
 //! request up is taken where the worker already measures it: the GIL
 //! waits of section 7.3, the garbage collector's totals of section 11.1
 //! read at the start and the end, and the event loop's late heartbeats.
+//! The modules the request loaded for the first time in the worker are
+//! kept by the runtime library's finder (issue 738), by the request's id.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use muru_proto::worker::v1 as pb;
@@ -31,7 +33,13 @@ struct Capture {
     logs_take: Py<PyAny>,
     panels_start: Py<PyAny>,
     panels_take: Py<PyAny>,
+    imports_start: Py<PyAny>,
+    imports_take: Py<PyAny>,
 }
+
+/// The most waits for the GIL, and stretches with the event loop held,
+/// a record carries one by one (issue 737); the rest are only counted.
+const STRETCHES_KEPT: usize = 64;
 
 /// Set once the edge has asked for a record, which it does only in a
 /// development run: until then the pool and the event loop's heartbeat
@@ -43,6 +51,68 @@ pub(crate) fn asked() -> bool {
     ASKED.load(Ordering::Relaxed)
 }
 
+/// The modules the worker has loaded since the runtime library's finder
+/// went in, for its status reports (issue 738).
+static MODULES_LOADED: AtomicU64 = AtomicU64::new(0);
+
+/// The time of those loads, the outermost summed, in microseconds
+/// (issue 753).
+static MODULES_US: AtomicU64 = AtomicU64::new(0);
+
+/// How long the worker's own load of the application took, with
+/// per-worker imports, in microseconds; 0 when the host loaded it
+/// (issue 753).
+static LOAD_US: AtomicU64 = AtomicU64::new(0);
+
+/// How many modules the worker has loaded since the fork.
+pub(crate) fn modules_loaded() -> u64 {
+    MODULES_LOADED.load(Ordering::Relaxed)
+}
+
+/// How long the modules the worker has loaded since the fork took, the
+/// outermost loads summed, in microseconds.
+pub(crate) fn modules_us() -> u64 {
+    MODULES_US.load(Ordering::Relaxed)
+}
+
+/// How long the worker's own load of the application took, in
+/// microseconds, 0 when it did not load it.
+pub(crate) fn load_us() -> u64 {
+    LOAD_US.load(Ordering::Relaxed)
+}
+
+/// Count a module the worker has loaded for the first time, as the
+/// runtime library's finder does once each load ends, with its
+/// milliseconds when it is not nested in another load.
+#[pyfunction]
+#[pyo3(signature = (ms = 0.0))]
+pub fn module_loaded(ms: f64) {
+    MODULES_LOADED.fetch_add(1, Ordering::Relaxed);
+    MODULES_US.fetch_add((ms.max(0.0) * 1000.0) as u64, Ordering::Relaxed);
+}
+
+/// Note how long the worker took to load the application itself, with
+/// per-worker imports, for its status reports.
+#[pyfunction]
+pub fn worker_loaded(ms: f64) {
+    LOAD_US.store((ms.max(0.0) * 1000.0) as u64, Ordering::Relaxed);
+}
+
+/// What a request spent loading modules for the first time, the
+/// outermost loads summed, as the runtime library's finder tells it
+/// each load's milliseconds: read as the response head goes to the edge,
+/// for its `Server-Timing` (issue 738).
+#[pyclass(frozen)]
+pub struct ImportTally(Arc<AtomicU64>);
+
+#[pymethods]
+impl ImportTally {
+    fn __call__(&self, ms: f64) {
+        let nanos = (ms.max(0.0) * 1_000_000.0) as u64;
+        self.0.fetch_add(nanos, Ordering::Relaxed);
+    }
+}
+
 /// What the worker saw of one request, for its record.
 #[derive(Debug)]
 pub struct Trace {
@@ -52,6 +122,8 @@ pub struct Trace {
     started_wall: SystemTime,
     /// The garbage collector's totals then, by generation.
     gc_before: [(u64, u64); 4],
+    /// The request's first-time module loads so far, in nanoseconds.
+    imports: Arc<AtomicU64>,
     state: Mutex<State>,
 }
 
@@ -72,10 +144,12 @@ struct State {
     /// From the worker taking the request to a thread having it.
     thread_wait: Option<Duration>,
     /// The waits for the GIL on the request's behalf: their sum, how
-    /// many, and the first.
+    /// many, the first, and the first `STRETCHES_KEPT` of them as when
+    /// each began and how long it lasted.
     gil_wait: Duration,
     gil_waits: u32,
     gil_first: Option<Duration>,
+    gil_stretches: Vec<(Duration, Duration)>,
     /// Evidence captured of the request's failure, such as its stack at
     /// the soft timeout (issue 706).
     captures: Vec<pb::RecordCapture>,
@@ -100,6 +174,7 @@ impl Trace {
             started,
             started_wall: SystemTime::now() - elapsed,
             gc_before: crate::gc::totals(),
+            imports: Arc::default(),
             state: Mutex::new(State {
                 default_source,
                 ..State::default()
@@ -135,6 +210,12 @@ impl Trace {
         self.started.elapsed()
     }
 
+    /// The milliseconds the request has spent so far loading modules for
+    /// the first time, the outermost loads summed.
+    pub fn imports_ms(&self) -> f64 {
+        self.imports.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("request trace poisoned")
     }
@@ -147,25 +228,31 @@ impl Trace {
     /// An application thread took the request at `ready`, and then
     /// waited `waited` for the GIL.
     pub fn picked_up(&self, ready: Instant, waited: Duration) {
-        self.state()
-            .thread_wait
-            .get_or_insert(ready.saturating_duration_since(self.started));
-        self.gil(waited);
-    }
+        let at = ready.saturating_duration_since(self.started);
+        self.state().thread_wait.get_or_insert(at);
 
-    /// The request's thread, or the event loop on its behalf, waited
-    /// `waited` for the GIL. A build without one has no GIL wait.
-    pub fn gil(&self, waited: Duration) {
         if crate::signals::gil_enabled() {
-            self.add_gil(waited);
+            self.add_gil(at, waited);
         }
     }
 
-    fn add_gil(&self, waited: Duration) {
+    /// The request's thread, or the event loop on its behalf, has just
+    /// waited `waited` for the GIL. A build without one has no GIL wait.
+    pub fn gil(&self, waited: Duration) {
+        if crate::signals::gil_enabled() {
+            self.add_gil(self.at().saturating_sub(waited), waited);
+        }
+    }
+
+    fn add_gil(&self, at: Duration, waited: Duration) {
         let mut state = self.state();
         state.gil_wait += waited;
         state.gil_waits += 1;
         state.gil_first.get_or_insert(waited);
+
+        if state.gil_stretches.len() < STRETCHES_KEPT {
+            state.gil_stretches.push((at, waited));
+        }
     }
 
     /// The application called start_response; the first call counts.
@@ -253,12 +340,25 @@ impl Trace {
             (None, false) => ("completed", String::new()),
         };
 
-        // The collections that ended meanwhile, and the longest the event
-        // loop was held, which belong to the worker and not the request.
+        // The collections that ended meanwhile, and the stretches the
+        // event loop was held, the longest named on its own, which belong
+        // to the worker and not the request.
 
         let gc = gc_during(&self.gc_before, &crate::gc::totals());
-        let (loop_lag_at, loop_lag) = crate::link::loop_held(self.started, self.started + close)
+        let held = crate::link::loop_held(self.started, self.started + close, STRETCHES_KEPT);
+        let (loop_lag_at, loop_lag) = held
+            .iter()
+            .copied()
+            .max_by_key(|(_, length)| *length)
             .unwrap_or((Duration::ZERO, Duration::ZERO));
+        let stretches = |kept: &[(Duration, Duration)]| {
+            kept.iter()
+                .map(|(at, length)| pb::Stretch {
+                    at: millis(Some(*at)),
+                    ms: millis(Some(*length)),
+                })
+                .collect()
+        };
 
         let started_wall = self.started_wall;
         let lines = logs
@@ -320,6 +420,11 @@ impl Trace {
             gc,
             loop_lag: millis(Some(loop_lag)),
             loop_lag_at: millis(Some(loop_lag_at)),
+            gil_wait_stretches: stretches(&state.gil_stretches),
+            loop_held_stretches: stretches(&held),
+            module_loads: logs.module_loads,
+            modules_loaded: logs.modules_loaded,
+            modules_ms: logs.modules_ms,
         }
     }
 }
@@ -343,34 +448,46 @@ fn gc_during(before: &[(u64, u64); 4], after: &[(u64, u64); 4]) -> Vec<pb::GcDur
 /// What the runtime library kept of a request for its record: its log
 /// records, each one's time on the wall clock, level, logger and message,
 /// with how many were past the limit; and the panels code in the
-/// worker added (issue 677).
+/// worker added (issue 677); and the modules it loaded for the first
+/// time in the worker (issue 738), with how many in all and their time.
 #[derive(Debug, Default)]
 pub struct Logs {
     kept: Vec<(f64, String, String, String)>,
     dropped: u32,
     panels: Vec<pb::RecordPanel>,
+    module_loads: Vec<pb::ModuleLoad>,
+    modules_loaded: u32,
+    modules_ms: f64,
 }
 
 fn capture(py: Python<'_>) -> PyResult<&Capture> {
     CAPTURE.get_or_try_init(py, || {
         let logging = py.import("muru.logging")?;
         let panels = py.import("muru.panels")?;
+        let imports = py.import("muru._imports")?;
 
         Ok(Capture {
             logs_start: logging.getattr("_capture_start")?.unbind(),
             logs_take: logging.getattr("_capture_take")?.unbind(),
             panels_start: panels.getattr("_start")?.unbind(),
             panels_take: panels.getattr("_take")?.unbind(),
+            imports_start: imports.getattr("_start")?.unbind(),
+            imports_take: imports.getattr("_take")?.unbind(),
         })
     })
 }
 
-/// Start keeping a request's log records and panels.
-pub fn start_logs(request_id: &str) {
+/// Start keeping a request's log records, panels and first-time module
+/// loads, the loads on the clock of its `trace`.
+pub fn start_logs(request_id: &str, trace: &Trace) {
     Python::attach(|py| {
         let started = capture(py).and_then(|capture| {
             capture.logs_start.call1(py, (request_id,))?;
-            capture.panels_start.call1(py, (request_id,))
+            capture.panels_start.call1(py, (request_id,))?;
+
+            let tally = Py::new(py, ImportTally(Arc::clone(&trace.imports)))?;
+            let since = trace.started.elapsed().as_secs_f64();
+            capture.imports_start.call1(py, (request_id, tally, since))
         });
 
         if let Err(error) = started {
@@ -401,13 +518,42 @@ pub fn take_logs(request_id: &str) -> Logs {
                 Vec::new()
             });
 
+        let (loads, modules_loaded, modules_ms) = capture
+            .imports_take
+            .call1(py, (request_id,))
+            .and_then(|taken| taken.extract::<TakenLoads>(py))
+            .unwrap_or_else(|error| {
+                tracing::debug!(%error, "the request's module loads cannot be taken");
+                TakenLoads::default()
+            });
+
         Logs {
             kept,
             dropped,
             panels,
+            module_loads: loads
+                .into_iter()
+                .map(
+                    |(at, ms, module, trigger, depth, deferred)| pb::ModuleLoad {
+                        module,
+                        at,
+                        ms,
+                        depth,
+                        trigger,
+                        deferred,
+                    },
+                )
+                .collect(),
+            modules_loaded,
+            modules_ms,
         }
     })
 }
+
+/// A request's loads as `muru._imports._take` gives them: each one's
+/// start, length, module, trigger, depth and whether it resolved a
+/// deferred import; how many in all; and the outermost loads' time.
+type TakenLoads = (Vec<(f64, f64, String, String, u32, bool)>, u32, f64);
 
 /// One panel as `muru.panels._take` gives it: its name, title, spans,
 /// values, tables (caption, columns, rows), how many entries it dropped,
@@ -460,21 +606,28 @@ fn panels(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordPanel>> {
     Ok(panels)
 }
 
-/// Spans as `muru.panels._span` gives them: name, start, duration,
-/// category, the spans beneath, which may nest, and whether it failed.
+/// One span as `muru.panels._span` gives it: name, start, duration,
+/// category, the spans beneath, which may nest, whether it failed, the
+/// moment of an event, and its segments (issue 737).
+type TakenSpan<'py> = (
+    String,
+    f64,
+    f64,
+    String,
+    Bound<'py, PyAny>,
+    bool,
+    Option<f64>,
+    Vec<(f64, f64, String, String)>,
+);
+
+/// Spans as `muru.panels._span` gives them.
 fn spans(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordSpan>> {
     let mut spans = Vec::new();
 
     for item in taken.try_iter()? {
         let item = item?;
-        let (name, start, duration, category, children, failed): (
-            String,
-            f64,
-            f64,
-            String,
-            Bound<'_, PyAny>,
-            bool,
-        ) = item.extract()?;
+        let (name, start, duration, category, children, failed, at, segments): TakenSpan<'_> =
+            item.extract()?;
 
         spans.push(pb::RecordSpan {
             name,
@@ -483,6 +636,16 @@ fn spans(taken: &Bound<'_, PyAny>) -> PyResult<Vec<pb::RecordSpan>> {
             category,
             children: self::spans(&children)?,
             failed,
+            at,
+            segments: segments
+                .into_iter()
+                .map(|(start, duration, label, detail)| pb::RecordSegment {
+                    start,
+                    duration,
+                    label,
+                    detail,
+                })
+                .collect(),
         });
     }
 
@@ -563,13 +726,33 @@ mod tests {
         let started = Instant::now();
         let trace = Trace::new(started, "iterable");
         trace.state().thread_wait = Some(Duration::from_millis(3));
-        trace.add_gil(Duration::from_millis(2));
-        trace.add_gil(Duration::from_millis(1));
+        trace.add_gil(Duration::from_millis(3), Duration::from_millis(2));
+        trace.add_gil(Duration::from_millis(9), Duration::from_millis(1));
         let record = trace.to_message(false, Logs::default());
         assert!((record.thread_wait - 3.0).abs() < 1e-9);
         assert!((record.gil_wait - 3.0).abs() < 1e-9);
         assert_eq!(record.gil_waits, 2);
         assert!((record.gil_wait_first - 2.0).abs() < 1e-9);
+
+        // Each wait is kept as when it began and how long it lasted, up
+        // to the cap, past which the waits are only counted.
+
+        let waits: Vec<(f64, f64)> = record
+            .gil_wait_stretches
+            .iter()
+            .map(|wait| (wait.at, wait.ms))
+            .collect();
+        assert_eq!(waits, vec![(3.0, 2.0), (9.0, 1.0)]);
+
+        let many = Trace::new(started, "iterable");
+
+        for _ in 0..STRETCHES_KEPT + 5 {
+            many.add_gil(Duration::ZERO, Duration::from_millis(1));
+        }
+
+        let record = many.to_message(false, Logs::default());
+        assert_eq!(record.gil_waits as usize, STRETCHES_KEPT + 5);
+        assert_eq!(record.gil_wait_stretches.len(), STRETCHES_KEPT);
 
         // A thread that took the request later counts from the worker
         // taking it.
@@ -625,7 +808,7 @@ mod tests {
                 "low stock".to_owned(),
             )],
             dropped: 3,
-            panels: Vec::new(),
+            ..Logs::default()
         };
         let record = trace.to_message(false, logs);
         assert_eq!(record.logs.len(), 1);

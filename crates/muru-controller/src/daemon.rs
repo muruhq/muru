@@ -1138,6 +1138,9 @@ struct Running {
     control: Option<HostControl>,
     /// What the workers last reported, for metrics.
     status: Vec<crate::host::WorkerStatus>,
+    /// How long the host took to load the application, in milliseconds,
+    /// once it has said (issue 753).
+    load_ms: Option<u64>,
     /// The workers the host is replacing for memory, for the memory
     /// guard (section 13.9).
     memory_replacements: Vec<crate::host::MemoryReplacement>,
@@ -1875,6 +1878,9 @@ struct Daemon {
     commands: mpsc::Sender<Command>,
     /// Requests to hosts awaiting their answers, by request id.
     asked: HashMap<u64, oneshot::Sender<Result<Vec<WorkerReply>, String>>>,
+    /// Section 6.18: the import reports hosts are sending in parts, by
+    /// release.
+    imports_parts: HashMap<(String, String), crate::host::ImportsParts>,
     /// The last request id given out.
     last_request: u64,
     /// Section 9.12 (issue 268): each scheduled command's next due time,
@@ -2278,6 +2284,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         owns_log,
         commands: handle_commands,
         asked: HashMap::new(),
+        imports_parts: HashMap::new(),
         last_request: 0,
         schedules: HashMap::new(),
         condition_skips: BTreeSet::new(),
@@ -4802,6 +4809,16 @@ impl Daemon {
                 }
             }
 
+            // Issue 753: how long the host took to load the application.
+
+            if let Some(ms) = running.load_ms {
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_release_load_seconds",
+                    &[("app", app.as_str()), ("release", id.as_str())],
+                    ms as f64 / 1000.0,
+                ));
+            }
+
             // Sections 7.6 and 7.7: what each worker last reported.
 
             for worker in &running.status {
@@ -4830,6 +4847,12 @@ impl Daemon {
                     "muru_worker_requests_in_flight",
                     &labels,
                     worker.in_flight as f64,
+                ));
+                samples.extend(muru_edge::metrics::module_samples(
+                    &labels,
+                    worker.modules,
+                    worker.modules_us,
+                    worker.load_us,
                 ));
 
                 // Section 6.6: the pools an ASGI worker runs synchronous
@@ -5162,6 +5185,7 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        load_ms: None,
                         memory_replacements: Vec::new(),
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
@@ -5264,6 +5288,7 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        load_ms: None,
                         memory_replacements: Vec::new(),
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
@@ -6490,7 +6515,8 @@ impl Daemon {
             concurrency: spec.concurrency as usize,
             preload: spec.preload,
             hooks: spec.hooks.clone(),
-            instrumentation: spec.instrumentation.clone(),
+            preload_modules: spec.preload_modules.clone(),
+            instrumentation: spec.host_instrumentation(),
             chdir: Some(spec.source.clone()),
             tcp_base_port: None,
             single: false,
@@ -6755,6 +6781,7 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                load_ms: None,
                 memory_replacements: Vec::new(),
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
@@ -7048,6 +7075,7 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                load_ms: None,
                 memory_replacements: Vec::new(),
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
@@ -11657,6 +11685,45 @@ impl Daemon {
             // Section 11.7: only a development run keeps request records,
             // so the daemon has nothing to join a capture to.
             HostMessage::Capture(_) => {}
+            HostMessage::Loaded {
+                outcome,
+                ms,
+                imports,
+                first,
+            } => {
+                // Issue 753: the host's load, an event the first time it
+                // says so and a gauge from then on.
+
+                if let Some(running) = self.running.get_mut(&key) {
+                    running.load_ms = Some(ms);
+                }
+
+                if first {
+                    self.events.emit(
+                        "release.loaded",
+                        &format!("{app}@{id}"),
+                        "info",
+                        &crate::host::loaded_message(&outcome, ms, imports.as_ref()),
+                    );
+                }
+            }
+            // Section 6.18: the load's import report is kept in the store
+            // beside the release, which removing the release removes.
+            HostMessage::Imports { part, parts, data } => {
+                let whole = self
+                    .imports_parts
+                    .entry(key.clone())
+                    .or_default()
+                    .take(part, parts, data);
+
+                if let Some(text) = whole {
+                    self.imports_parts.remove(&key);
+
+                    if let Err(error) = self.store.put_import_report(app, id, &text) {
+                        tracing::warn!(%error, "release {app}@{id}: the import report cannot be kept");
+                    }
+                }
+            }
             HostMessage::Event {
                 kind,
                 level,

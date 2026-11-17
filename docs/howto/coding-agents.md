@@ -49,7 +49,8 @@ command; `MURU_LOG=info,rmcp=debug` adds the MCP library's own messages.
 
 A [development run](run-settings.md) started from the same directory is
 found first, as it is for every command. Its admin socket answers
-`status`, `events`, `logs`, `metrics`, `websockets` and `debug`, and
+`status`, `events`, `logs`, `metrics`, `websockets`, `debug` and
+`imports`, and
 `commands` and `run_command` for [the project's own
 commands](commands.md#the-projects-own-commands) with the run's
 application as the target, but not the lists or a deploy; stop it, or

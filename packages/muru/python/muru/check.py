@@ -6,7 +6,8 @@ are imported under the import check of section 6.2, after the
 instrumentation modules of section 6.15 are imported and configured as
 the host does, the entrypoint is
 settled as WSGI, ASGI or gRPC with the signature rules the host applies,
-and the mounts are loaded the same way. The on_load and pre_fork hooks
+the mounts are loaded the same way, and the ``preload_modules`` are
+imported after them. The on_load and pre_fork hooks
 run where the host runs them, before the check. Nothing is served and
 nothing is forked. The result is one JSON document on stdout, for muructl to report.
 """
@@ -80,6 +81,13 @@ def main(argv: list[str] | None = None) -> int:
         type=parse_mount,
         help="a named mount as NAME=ENTRYPOINT=INTERFACE; repeatable",
     )
+    parser.add_argument(
+        "--preload-module",
+        dest="preload_modules",
+        action="append",
+        default=[],
+        help="a module to import after the entrypoint and mounts; repeatable",
+    )
     args = parser.parse_args(argv)
 
     if args.chdir:
@@ -92,6 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         "muru": __version__,
         "entrypoints": [],
         "hooks": [],
+        "modules": [],
         "instrumentation": [],
         "findings": [],
         "errors": [],
@@ -149,6 +158,16 @@ def main(argv: list[str] | None = None) -> int:
                     loaded["mount"] = name
                     report["entrypoints"].append(loaded)
 
+                # Section 6.1: the preload_modules, after the mounts and
+                # before on_load, under the import check as the host has
+                # them.
+
+                for name in args.preload_modules:
+                    with instruments.importing(context, Target("module", "", name)):
+                        recorder.import_module(name)
+
+                    report["modules"].append(name)
+
                 hooks.call("on_load", context)
             except Exception as error:
                 failed(error)
@@ -197,6 +216,15 @@ def main(argv: list[str] | None = None) -> int:
         }
         for finding in findings
     ]
+
+    # Section 6.18: the load's import report, when the import report is
+    # on, for muructl to print.
+
+    lazy_imports = sys.modules.get("muru._lazy_imports")
+
+    if lazy_imports is not None and lazy_imports.payload() is not None:
+        report["imports"] = lazy_imports.payload()
+
     json.dump(report, sys.stdout)
     sys.stdout.write("\n")
     return 0 if report["ok"] else 1

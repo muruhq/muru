@@ -19,6 +19,8 @@ dev = [
     "pytest>=8.3",
     "ruff>=0.9",
     "towncrier>=24.8",
+    # Deferring imports (lazy_imports), which the Python unit tests use.
+    "unwrapt>=1.0.0a2",
     "zstandard>=0.25.0",
 ]
 fixtures = [

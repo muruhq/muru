@@ -83,9 +83,15 @@ class Receiver:
 def without_notes(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The events without release.state_changed, which notes how the
     runtime library was found, a fetch from PyPI among them, and so
-    depends on the machine."""
+    depends on the machine; and without release.loaded, which comes from
+    the host once the daemon has attached to it, and so has no fixed
+    place among the release's own."""
 
-    return [event for event in events if event["type"] != "dev.muru.release.state_changed"]
+    return [
+        event
+        for event in events
+        if event["type"] not in ("dev.muru.release.state_changed", "dev.muru.release.loaded")
+    ]
 
 
 def sink_config(port: int, **extra: str) -> str:

@@ -169,6 +169,12 @@ CREATE TABLE IF NOT EXISTS gates (
     passed_unix_ms INTEGER NOT NULL,
     PRIMARY KEY (app, release, name, stage)
 );
+CREATE TABLE IF NOT EXISTS import_reports (
+    app TEXT NOT NULL,
+    release TEXT NOT NULL,
+    report TEXT NOT NULL,
+    PRIMARY KEY (app, release)
+);
 CREATE TABLE IF NOT EXISTS log_periods (
     path TEXT PRIMARY KEY,
     period TEXT NOT NULL
@@ -184,7 +190,7 @@ CREATE TABLE IF NOT EXISTS log_files_seen (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 
 /// The store.
 pub struct Store {
@@ -221,8 +227,9 @@ impl Store {
         // (section 11.3), version 16 the runs of commands kept in place of
         // each command's last run (issue 688), version 17 the gates each
         // release has passed (issue 266), version 18 the named conditions
-        // of applied files (issue 123), and version 19 the activations of
-        // overlays by their conditions (issue 689).
+        // of applied files (issue 123), version 19 the activations of
+        // overlays by their conditions (issue 689), and version 20 the
+        // import report of each release's load (issue 741).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -491,10 +498,41 @@ impl Store {
                 params![app, id],
             )?;
             connection.execute(
+                "DELETE FROM import_reports WHERE app = ?1 AND release = ?2",
+                params![app, id],
+            )?;
+            connection.execute(
                 "DELETE FROM releases WHERE app = ?1 AND id = ?2",
                 params![app, id],
             )?;
             Ok(())
+        })
+    }
+
+    /// Keep a release's import report (section 6.18), the JSON its host
+    /// sent, in place of the one before.
+    pub fn put_import_report(&self, app: &str, id: &str, report: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO import_reports (app, release, report) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (app, release) DO UPDATE SET report = excluded.report",
+                params![app, id, report],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// A release's import report (section 6.18), if its host sent one.
+    pub fn import_report(&self, app: &str, id: &str) -> Result<Option<String>, StoreError> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT report FROM import_reports WHERE app = ?1 AND release = ?2",
+                    params![app, id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(StoreError::from)
         })
     }
 
@@ -1847,7 +1885,10 @@ pub(crate) mod tests {
             concurrency: 1000,
             preload: Preload::Auto,
             hooks: None,
+            preload_modules: Vec::new(),
             instrumentation: Vec::new(),
+            lazy_imports: false,
+            import_report: false,
             factory: None,
             reflection: false,
             handoff: None,
@@ -1899,6 +1940,24 @@ pub(crate) mod tests {
         );
         assert_eq!(store.app("shop").unwrap().current.as_deref(), Some("r1"));
         assert!(store.release("shop", "r9").is_err());
+    }
+
+    #[test]
+    fn an_import_report_is_kept_beside_its_release_and_removed_with_it() {
+        let store = Store::in_memory().unwrap();
+        store.ensure_app("shop").unwrap();
+        store.create_release("shop", "r1", &spec()).unwrap();
+        assert_eq!(store.import_report("shop", "r1").unwrap(), None);
+
+        store.put_import_report("shop", "r1", "{\"a\":1}").unwrap();
+        store.put_import_report("shop", "r1", "{\"a\":2}").unwrap();
+        assert_eq!(
+            store.import_report("shop", "r1").unwrap().as_deref(),
+            Some("{\"a\":2}")
+        );
+
+        store.delete_release("shop", "r1").unwrap();
+        assert_eq!(store.import_report("shop", "r1").unwrap(), None);
     }
 
     #[test]

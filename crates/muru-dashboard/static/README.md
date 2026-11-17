@@ -10,3 +10,5 @@ Embedded in the binary; there is no build step.
 - `uPlot.iife.min.js` and `uPlot.min.css`: uPlot 1.6.32
   (https://github.com/leeoniya/uPlot), MIT, see `uPlot.LICENSE`.
 - `charts.js`: Muru's own, drawing the history the gateway serves.
+- `scroll.js`: Muru's own, keeping each scrollable region's place across a
+  live refresh.

@@ -80,10 +80,12 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `grpc_web_origins` | array of strings |  | The origins whose pages may call the release's gRPC methods through gRPC-Web, answered with CORS: scheme, host and port, or `*`; none when empty. |
 | `handoff` | string |  | The interface the default mount's requests may be handed to; none when absent. `asgi`: Continue the request as an ASGI application on the event loop. `wsgi`: Continue the request as a WSGI callable on the thread pool. |
 | `hooks` | string |  | The module holding the lifecycle hooks, as a Python module name. |
+| `import_report` | boolean | the source's | Record the host's imports for `muructl debug imports`; when given, it takes the place of the source's `import_report`. |
 | `instances` | integer | `1` | How many instances of the command an `http` release runs. |
 | `instrumentation` | array of tables, {ref}`[[app.NAME.release.ID.instrumentation]] <config-daemon-app-name-release-id-instrumentation>` |  | The instrumentation modules, in order; when given, they replace the list in the source's `[tool.muru]` table. |
 | `interface` | string | `"auto"` | The interface, when declared rather than detected. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `kind` | string | `"workers"` | What the release runs: `workers` from an entrypoint, the default, or `http`, an HTTP server started from `command`. `workers`: Muru's own workers, from an entrypoint. `http`: An HTTP server Muru starts and supervises, from a command. |
+| `lazy_imports` | boolean | the source's | Defer imports with unwrapt; when given, it takes the place of the source's `lazy_imports`. |
 | `logging` | table, {ref}`[logging] <config-daemon-logging>` |  | How Python logging is set up in the workers. |
 | `maintenance` | table, {ref}`[host.NAME.maintenance] <config-daemon-host-name-maintenance>` |  | What maintenance mode lets through. |
 | `max_body_size` | string | the host's, else `max_body_size` in `[limits]` | The largest body of a request the release serves, for example 50MB, which the edge enforces. |
@@ -92,6 +94,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `memory` | table, {ref}`[app.NAME.release.ID.memory] <config-daemon-app-name-release-id-memory>` |  | The memory policy for the workers. |
 | `mounts` | table of tables, {ref}`[app.NAME.release.ID.mounts.NAME] <config-daemon-app-name-release-id-mounts-name>` |  | Mounts by name. |
 | `preload` | string | `"auto"` | Whether the application is imported once, in the host, before the workers are forked from it. `auto`: Preload when the import check passes, otherwise import per worker. `true`: Preload, and fail the release when the import check does not pass. `false`: Import in every worker. |
+| `preload_modules` | array of strings |  | Modules the host imports after the entrypoint and the mounts, so they are loaded once before the fork; when given, they replace the list in the source's `[tool.muru]` table. |
 | `processes` | integer | `1` | The default group's worker processes. |
 | `profile` | string |  | The server an `http` release runs: gunicorn, uvicorn, granian, mod_wsgi-express, uwsgi or generic. `gunicorn`: gunicorn: `--bind unix:PATH` or `--bind HOST:PORT`, stopped by TERM. `uvicorn`: uvicorn: `--uds PATH` or `--host HOST --port PORT`, stopped by TERM. `granian`: Granian: `--uds PATH` or `--host HOST --port PORT`, stopped by TERM. `mod_wsgi-express`: mod_wsgi-express: `--host HOST --port PORT`, stopped by TERM. `uwsgi`: uWSGI: `--http-socket PATH` or `--http-socket HOST:PORT`, with `--master` and a hook that makes TERM a graceful stop, which in uWSGI 2.0 would otherwise reload. `generic`: Any server: the command binds through `{bind}` and `stop_signal` says how it is stopped. |
 | `python` | string | found at start | The interpreter: a path, or a request in uv's syntax. |

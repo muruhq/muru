@@ -29,6 +29,10 @@ SHOP = support.ROOT / "docs" / "tutorials" / "code" / "shop"
 
 DOCUMENT = {"Sec-Fetch-Dest": "document"}
 
+# The two lines of the loop in shop.py's report.
+
+LOOP = ("for book_id in range(400_000_000):", "total += book_id % 7")
+
 
 def test_the_debugging_tutorial(tmp_path: Path) -> None:
     pytest.importorskip("flask")
@@ -120,7 +124,13 @@ def test_the_debugging_tutorial(tmp_path: Path) -> None:
         assert report.status == 504
         (capture,) = record(server, report)["captures"]
         assert capture["kind"] == "request.soft_timeout"
-        assert "in report" in capture["stack"] and "total += book_id % 7" in capture["stack"]
+
+        # The stack ends in report, on one of its loop's two lines: the
+        # soft timeout can sample the thread on either.
+
+        *_, frame, line = capture["stack"].splitlines()
+        assert frame.endswith(", in report"), capture["stack"]
+        assert line.strip() in LOOP, capture["stack"]
 
         # Hints on the first traced visit to the list, kept from before
         # its fixes.

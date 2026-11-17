@@ -21,6 +21,30 @@ use crate::logs::Logs;
 /// What a host says over its control connection (section 5.9).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostMessage {
+    /// How the host's own load of the application went (issue 753): how
+    /// it ended (`fork`, or `serve` with `--single`), how long it took,
+    /// and the import report's headline figures when it made one.
+    /// `first` is set the first time the host says so, which is the news.
+    Loaded {
+        /// How the load ended.
+        outcome: String,
+        /// How long it took, in whole milliseconds.
+        ms: u64,
+        /// The import report's figures, when `import_report` is on.
+        imports: Option<serde_json::Value>,
+        /// Whether this is the first time the host has said so.
+        first: bool,
+    },
+    /// A part of the load's import report (section 6.18): the JSON text
+    /// split into `parts` pieces, this one the `part`th from 0.
+    Imports {
+        /// Which part this is, from 0.
+        part: usize,
+        /// How many parts the report is in.
+        parts: usize,
+        /// This part's text.
+        data: String,
+    },
     /// The sockets the edge should route to now: the default group's,
     /// and each named group's. Acknowledged by version once the edge
     /// routes by them.
@@ -144,6 +168,14 @@ pub struct WorkerStatus {
     pub in_flight: u64,
     /// The age of its oldest request, in milliseconds.
     pub oldest_ms: u64,
+    /// Modules it has loaded for the first time since the fork (issue
+    /// 753).
+    pub modules: u64,
+    /// Their time, the outermost loads summed, in microseconds.
+    pub modules_us: u64,
+    /// How long it took to load the application itself, with per-worker
+    /// imports, in microseconds; 0 when the host loaded it.
+    pub load_us: u64,
     /// The pools synchronous code runs on for its event loop (section
     /// 6.6), each by name with its threads running a call and the
     /// threads it has; empty for a worker without a loop.
@@ -352,6 +384,20 @@ impl HostMessage {
                 evidence: value.get("evidence").map(|_| evidence(&value)),
             }),
             "capture" => Some(Self::Capture(evidence(&value))),
+            "loaded" => Some(Self::Loaded {
+                outcome: value["outcome"].as_str().unwrap_or_default().to_owned(),
+                ms: value["ms"].as_f64().map_or(0, |ms| ms.round() as u64),
+                imports: value
+                    .get("imports")
+                    .filter(|imports| imports.is_object())
+                    .cloned(),
+                first: value["first"].as_bool().unwrap_or(false),
+            }),
+            "imports" => Some(Self::Imports {
+                part: value["part"].as_u64().unwrap_or(0) as usize,
+                parts: value["parts"].as_u64().unwrap_or(1) as usize,
+                data: value["data"].as_str().unwrap_or_default().to_owned(),
+            }),
             "response" => Some(Self::Response {
                 id: value["id"].as_u64().unwrap_or(0),
                 error: value["error"].as_str().unwrap_or_default().to_owned(),
@@ -389,6 +435,9 @@ impl HostMessage {
                                 requests: worker["requests"].as_u64().unwrap_or(0),
                                 in_flight: worker["in_flight"].as_u64().unwrap_or(0),
                                 oldest_ms: worker["oldest_ms"].as_u64().unwrap_or(0),
+                                modules: worker["modules"].as_u64().unwrap_or(0),
+                                modules_us: worker["modules_us"].as_u64().unwrap_or(0),
+                                load_us: worker["load_us"].as_u64().unwrap_or(0),
                                 sync_pools: worker["sync_pools"]
                                     .as_object()
                                     .map(|pools| {
@@ -439,6 +488,70 @@ impl HostMessage {
             }),
             _ => None,
         }
+    }
+}
+
+/// The words of the event of a host's load (issue 753): how long it took
+/// and how it ended, with the import report's figures when there are
+/// some.
+pub fn loaded_message(outcome: &str, ms: u64, imports: Option<&serde_json::Value>) -> String {
+    let ended = match outcome {
+        "serve" => "and serves it in the same process",
+        _ => "before the fork",
+    };
+
+    let mut message = format!("the host loaded the application in {ms} ms {ended}");
+
+    if let Some(imports) = imports {
+        let figure = |key: &str| imports[key].as_f64().unwrap_or(0.0);
+
+        message.push_str(&format!(
+            "; importing took {:.0} ms over {:.0} modules, and deferring what can be deferred would save about {:.0} ms",
+            figure("import_ms"),
+            figure("modules"),
+            figure("saving_ms"),
+        ));
+
+        let used = figure("deferred_used");
+
+        if used > 0.0 {
+            message.push_str(&format!(
+                "; {used:.0} deferred imports were used before the fork"
+            ));
+        }
+    }
+
+    message
+}
+
+/// The import report a host sends in parts (section 6.18), put back
+/// together as they arrive.
+#[derive(Debug, Default)]
+pub struct ImportsParts {
+    parts: Vec<String>,
+}
+
+impl ImportsParts {
+    /// Take one part, and return the whole report's text once the last
+    /// has arrived. A first part starts the report again, and a part out
+    /// of order is dropped with what came before it.
+    pub fn take(&mut self, part: usize, parts: usize, data: String) -> Option<String> {
+        if part == 0 {
+            self.parts.clear();
+        }
+
+        if part != self.parts.len() {
+            self.parts.clear();
+            return None;
+        }
+
+        self.parts.push(data);
+
+        if self.parts.len() < parts.max(1) {
+            return None;
+        }
+
+        Some(std::mem::take(&mut self.parts).concat())
     }
 }
 
@@ -585,6 +698,9 @@ pub struct HostSpec {
     pub preload: muru_config::Preload,
     /// The hooks module, if any.
     pub hooks: Option<String>,
+    /// The modules the host imports after the entrypoint and the mounts
+    /// (section 6.1).
+    pub preload_modules: Vec<String>,
     /// The instrumentation modules, in order (section 6.15), given to the
     /// host in `MURU_INSTRUMENTATION`.
     pub instrumentation: Vec<muru_config::Instrumentation>,
@@ -992,6 +1108,10 @@ impl HostProcess {
 
         if let Some(hooks) = &spec.hooks {
             command.arg("--hooks").arg(hooks);
+        }
+
+        for module in &spec.preload_modules {
+            command.arg("--preload-module").arg(module);
         }
 
         if let Some(phase) = spec.factory {
@@ -2689,6 +2809,57 @@ mod tests {
 
         assert_eq!(start_time(first.id()), None);
         assert_eq!(start_time(0), None);
+    }
+
+    #[test]
+    fn a_hosts_load_is_an_event_with_the_import_reports_figures() {
+        let parsed = HostMessage::parse(
+            r#"{"type":"loaded","outcome":"fork","ms":519.6,"first":true,
+                "imports":{"import_ms":412.3,"modules":213,"saving_ms":120.4,"deferred_used":2}}"#,
+        );
+        let Some(HostMessage::Loaded {
+            outcome,
+            ms,
+            imports,
+            first,
+        }) = parsed
+        else {
+            panic!("not a load: {parsed:?}");
+        };
+
+        assert_eq!((outcome.as_str(), ms, first), ("fork", 520, true));
+        assert_eq!(
+            loaded_message(&outcome, ms, imports.as_ref()),
+            "the host loaded the application in 520 ms before the fork; importing took 412 ms \
+             over 213 modules, and deferring what can be deferred would save about 120 ms; \
+             2 deferred imports were used before the fork"
+        );
+        assert_eq!(
+            loaded_message("serve", 80, None),
+            "the host loaded the application in 80 ms and serves it in the same process"
+        );
+    }
+
+    #[test]
+    fn an_import_report_in_parts_is_put_back_together() {
+        let mut parts = ImportsParts::default();
+        assert_eq!(parts.take(0, 3, "ab".to_owned()), None);
+        assert_eq!(parts.take(1, 3, "cd".to_owned()), None);
+        assert_eq!(parts.take(2, 3, "e".to_owned()).as_deref(), Some("abcde"));
+
+        // A part out of order drops what came before it, and a report in
+        // one part is whole at once.
+
+        assert_eq!(parts.take(0, 2, "x".to_owned()), None);
+        assert_eq!(parts.take(2, 2, "z".to_owned()), None);
+        assert_eq!(parts.take(1, 2, "y".to_owned()), None);
+        assert_eq!(parts.take(0, 1, "{}".to_owned()).as_deref(), Some("{}"));
+
+        let parsed = HostMessage::parse(r#"{"type":"imports","part":1,"parts":2,"data":"x"}"#);
+        assert!(matches!(
+            parsed,
+            Some(HostMessage::Imports { part: 1, parts: 2, ref data }) if data == "x"
+        ));
     }
 
     #[test]

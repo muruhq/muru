@@ -41,6 +41,9 @@ pub struct Timing {
     pub queue: Duration,
     /// The time from dispatch until the response head arrived.
     pub application: Duration,
+    /// What the worker spent before the head loading modules for the
+    /// first time, as its head says (issue 738).
+    pub imports: Duration,
 }
 
 /// One connection a listener accepted: its ID, given at accept from
@@ -339,9 +342,10 @@ impl Links {
 }
 
 /// The value of `Server-Timing` for a response: `queue` and `app` in
-/// milliseconds when a worker or an upstream answered, and the request
-/// ID as `muru`'s description in every case. There is no total, since
-/// the head goes out before the body is complete.
+/// milliseconds when a worker or an upstream answered, `import` when the
+/// worker loaded modules for the first time before the head, and the
+/// request ID as `muru`'s description in every case. There is no total,
+/// since the head goes out before the body is complete.
 pub fn server_timing(request_id: &str, timing: Option<Timing>) -> String {
     let mut value = String::new();
 
@@ -351,6 +355,10 @@ pub fn server_timing(request_id: &str, timing: Option<Timing>) -> String {
             millis(timing.queue),
             millis(timing.application)
         ));
+
+        if !timing.imports.is_zero() {
+            value.push_str(&format!("import;dur={}, ", millis(timing.imports)));
+        }
     }
 
     value.push_str("muru;desc=\"");
@@ -481,11 +489,23 @@ mod tests {
         let timing = Timing {
             queue: Duration::from_micros(210),
             application: Duration::from_micros(17_930),
+            imports: Duration::ZERO,
         };
 
         assert_eq!(
             server_timing("01JCZ8X4R3T5V6W7Y8Z9A0B1C2", Some(timing)),
             "queue;dur=0.21, app;dur=17.93, muru;desc=\"01JCZ8X4R3T5V6W7Y8Z9A0B1C2\""
+        );
+
+        // Modules the worker loaded for the first time before the head.
+
+        let importing = Timing {
+            imports: Duration::from_micros(12_500),
+            ..timing
+        };
+        assert_eq!(
+            server_timing("A1", Some(importing)),
+            "queue;dur=0.21, app;dur=17.93, import;dur=12.50, muru;desc=\"A1\""
         );
 
         // A response the edge produced itself names only the request,
@@ -518,10 +538,12 @@ mod tests {
         let first = Timing {
             queue: Duration::from_millis(1),
             application: Duration::from_millis(2),
+            imports: Duration::ZERO,
         };
         let last = Timing {
             queue: Duration::from_millis(3),
             application: Duration::from_millis(4),
+            imports: Duration::ZERO,
         };
         request.note(first);
         request.note(last);

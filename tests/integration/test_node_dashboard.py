@@ -97,6 +97,7 @@ def test_pages_show_the_node_its_releases_requests_events_and_logs(
     assert "frame-ancestors 'self'" in headers["content-security-policy"]
     page = body.decode()
     assert "<title>Muru: daemon</title>" in page
+    assert '<h1><a href="./"' in page, "the banner links to the front page"
     assert f"http://127.0.0.1:{daemon.port}" in page
     assert "shop@r1" in page and "ready" in page
     assert '<th class="num">Threads</th>' in page and '<td class="num">0/6</td>' in page
@@ -181,6 +182,7 @@ def test_worker_pages_show_status_stacks_tasks_and_memory(served: tuple[Daemon, 
     assert status == 200 and headers["content-type"].startswith("text/html")
     page = body.decode()
     assert "<title>Muru: shop@r1 workers</title>" in page
+    assert '<h1><a href="./"' in page
     assert '<a href="worker?release=shop@r1&worker=0">0</a>' in page
     assert '<a href="worker?release=shop@r1&worker=1">1</a>' in page
     assert page.count('class="state-ready">ready') == 2

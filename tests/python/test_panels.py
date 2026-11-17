@@ -9,7 +9,7 @@ import pytest
 
 from muru import panels
 from muru._context import _request_id
-from muru.panels import Span, SpansPanel, TablesPanel, TextPanel, ValuesPanel
+from muru.panels import Segment, Span, SpansPanel, TablesPanel, TextPanel, ValuesPanel
 
 
 @pytest.fixture(autouse=True)
@@ -90,7 +90,18 @@ def test_a_requests_panels_are_taken_in_the_shapes_the_edge_draws(recorded: str)
         (
             "steps",
             "Steps",
-            [("view", 1.0, 2.0, "view", [("query", 1.5, 0.5, "", [], True)], False)],
+            [
+                (
+                    "view",
+                    1.0,
+                    2.0,
+                    "view",
+                    [("query", 1.5, 0.5, "", [], True, None, [])],
+                    False,
+                    None,
+                    [],
+                )
+            ],
             [],
             [],
             0,
@@ -98,6 +109,44 @@ def test_a_requests_panels_are_taken_in_the_shapes_the_edge_draws(recorded: str)
             False,
         ),
     ]
+
+
+def test_a_span_is_an_event_or_a_period_of_segments_in_order_within_it(recorded: str) -> None:
+    """Issue 737: events and segments are taken as the edge draws them,
+    and a span that is not well formed is refused as it is added."""
+
+    steps = SpansPanel("steps", "Steps").current()
+    waits = [Segment(1.0, 0.5, "lock", "the first"), Segment(3.0, 1.0)]
+
+    assert steps.add(Span("committed", at=2.5))
+    assert steps.add(Span("waiting", 1.0, 3.0, "contention", segments=waits))
+
+    (taken,) = panels._take(recorded)
+    assert taken[2] == [
+        ("committed", 2.5, 0.0, "", [], False, 2.5, []),
+        (
+            "waiting",
+            1.0,
+            3.0,
+            "contention",
+            [],
+            False,
+            None,
+            [(1.0, 0.5, "lock", "the first"), (3.0, 1.0, "", "")],
+        ),
+    ]
+
+    panels._start("R1")
+    steps = SpansPanel("steps", "Steps").current()
+
+    for refused, reason in [
+        (Span("committed", 0, 1.0, at=2.5), "is an event"),
+        (Span("waiting", 1.0, 3.0, segments=list(reversed(waits))), "not in order"),
+        (Span("waiting", 1.0, 2.0, segments=waits), "lies outside it"),
+        (Span("view", 0, 9, children=[Span("late", 1, 1, segments=waits)]), "lies outside it"),
+    ]:
+        with pytest.raises(ValueError, match=reason):
+            steps.add(refused)
 
 
 def test_a_text_panels_blocks_are_joined_and_kept_within_its_limit(

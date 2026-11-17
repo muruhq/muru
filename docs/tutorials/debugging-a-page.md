@@ -110,7 +110,7 @@ Each tab is a panel of the record: Timing, its phases, from waiting for
 a worker to sending the response; Where, the worker and thread that
 served it; Response, its status, headers and compression; and Logs,
 what the application logged while serving it. Nearly all of the list's
-time is in the application, until the response head.
+time is in the worker, running the application.
 
 ## An N+1 query
 
@@ -298,7 +298,7 @@ Hints
 Timing
   request                        1.0ms  from 0.0ms
     waiting for a worker         0.0ms  from 0.0ms
-    until the response head      0.8ms  from 0.0ms
+    in the worker                0.8ms  from 0.0ms
 ...
 ```
 

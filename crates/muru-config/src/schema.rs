@@ -93,7 +93,7 @@ impl File {
                  the project, which is not committed. Its `[run]` table holds the keys of \
                  `[tool.muru.run]` and takes precedence over them; lists add to the \
                  project's. Its `[[instrumentation]]` entries come before the project's, \
-                 and its `tracing` takes the place of the project's."
+                 and its `tracing`, `lazy_imports` and `import_report` take the place of the project's."
             }
         }
     }
@@ -116,6 +116,12 @@ struct LocalFile {
     /// Tracing with wrapture for this machine's runs, in place of the
     /// project's `tracing`.
     tracing: Option<crate::Tracing>,
+    /// Deferring imports with unwrapt for this machine's runs, in place
+    /// of the project's `lazy_imports`.
+    lazy_imports: Option<bool>,
+    /// The import report for this machine's runs, in place of the
+    /// project's `import_report`.
+    import_report: Option<bool>,
 }
 
 /// The `[build]` table of muru.local.toml.

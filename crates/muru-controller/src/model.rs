@@ -483,9 +483,21 @@ pub struct ReleaseSpec {
     pub preload: Preload,
     /// The hooks module, if any.
     pub hooks: Option<String>,
+    /// The modules the host imports after the entrypoint and the mounts
+    /// (section 6.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preload_modules: Vec<String>,
     /// The instrumentation modules, in order (section 6.15).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instrumentation: Vec<muru_config::Instrumentation>,
+    /// Whether imports are deferred with unwrapt (section 6.17), by a
+    /// module of Muru's own put at the head of the host's list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lazy_imports: bool,
+    /// Whether the host records its imports for `muructl debug imports`
+    /// (section 6.18), through the same module.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub import_report: bool,
     /// Whether the entrypoint is a factory, and when it is called.
     pub factory: Option<FactoryPhase>,
     /// The origins whose pages may call it through gRPC-Web, answered
@@ -583,6 +595,25 @@ pub struct ReleaseSpec {
     /// Section 9.12: the commands the application declares, by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<CommandSpec>,
+}
+
+impl ReleaseSpec {
+    /// The instrumentation list the host is given (sections 6.15, 6.17
+    /// and 6.18): the module that defers imports and records the import
+    /// report first when either key is on, then the release's own list.
+    pub fn host_instrumentation(&self) -> Vec<muru_config::Instrumentation> {
+        let workers = self.processes as usize
+            + self
+                .groups
+                .iter()
+                .map(|group| group.processes as usize)
+                .sum::<usize>();
+
+        muru_config::lazy_imports_entry(self.lazy_imports, self.import_report, workers)
+            .into_iter()
+            .chain(self.instrumentation.iter().cloned())
+            .collect()
+    }
 }
 
 /// Section 9.12: a command the application declares, resolved and

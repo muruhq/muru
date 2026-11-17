@@ -98,6 +98,17 @@ record small.
 
 ## More information
 
+Issue 737 added two kinds of span to the panel data, keeping the
+decision: an event, a moment given by `at_ms` rather than a start and a
+duration, and a period made of `segments`, each with a start, a
+duration, a label and a detail. The sanitiser's allowlist gained
+`data-tip` and `tabindex` on `span` and `aria-label` on `td`, so a span's
+tooltip text travels as data, and the toolbar's script, and a script of
+the dashboard's request page, show it in one floating element; panels
+still carry no script of their own. Section 11.7 of the specification
+describes them.
+
+
 Sections 10.7 and 11.7 of the design specification; issues 634 and 641;
 ADR 0062, the toolbar this draws for; ADR 0011, the dashboard's askama
 pages.

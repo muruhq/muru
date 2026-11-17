@@ -30,8 +30,14 @@ use crate::{BoxError, ResponseBody};
 /// The prefix the edge answers itself in a development run.
 pub const PREFIX: &str = "/_muru/";
 
-/// The toolbar's script, embedded in the binary.
-pub const SCRIPT: &str = include_str!("../toolbar/toolbar.js");
+/// The toolbar's script, embedded in the binary, with the script for the
+/// spans tables' tooltips after it (issue 737), which the dashboard serves
+/// on its own.
+pub const SCRIPT: &str = concat!(
+    include_str!("../toolbar/toolbar.js"),
+    "\n",
+    include_str!("../panels/tips.js")
+);
 
 /// The toolbar's stylesheet, with the panels' classes after its own.
 pub fn stylesheet() -> String {

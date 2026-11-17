@@ -1247,6 +1247,7 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
     { name = "towncrier" },
+    { name = "unwrapt" },
     { name = "zstandard" },
 ]
 docs = [
@@ -1299,6 +1300,7 @@ dev = [
     { name = "pytest", specifier = ">=8.3" },
     { name = "ruff", specifier = ">=0.9" },
     { name = "towncrier", specifier = ">=24.8" },
+    { name = "unwrapt", specifier = ">=1.0.0a2" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
 docs = [
@@ -2118,6 +2120,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d9/68/f1b440335057bfce71b6e50a9d09445aa2ecbd08359a337976627b8409e7/tzdata-2026.5.tar.gz", hash = "sha256:8cc73c0a0bfca7dbfa59235d60b2eff82231dee33f53d206db1acd9173cfc0a7", size = 200404, upload-time = "2026-10-03T09:23:14.143Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/94/21/1e5995a1c920cce14e4bffae20c665ec10e7ed03ab25e006cd741092b718/tzdata-2026.5-py2.py3-none-any.whl", hash = "sha256:b683bd1b6659ddcd810ff02ad09ba821d4bf1065072805063eb35c49617905ac", size = 347996, upload-time = "2026-10-03T09:23:12.535Z" },
+]
+
+[[package]]
+name = "unwrapt"
+version = "1.0.0a2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "wrapt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a4/83/06890569fb479e468dd4b331bc963f156f3f01b16f7973dc06798f1abc2c/unwrapt-1.0.0a2.tar.gz", hash = "sha256:835538e98e6d9d393322c527d90ee58d01b825581954fb23f9c1895bab4c472c", size = 72223, upload-time = "2026-11-17T00:22:40.217Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c9/1a/bb30771711c1df42fe5dcb225a12ba2b8ac5f8a99f4e004ab2b84e7577af/unwrapt-1.0.0a2-py3-none-any.whl", hash = "sha256:61ce88f40f73da1fb1059214eacb6dec2dae089c72a4093e65fee3a5e7f46d93", size = 47020, upload-time = "2026-11-17T00:22:38.87Z" },
 ]
 
 [[package]]

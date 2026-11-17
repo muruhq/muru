@@ -395,39 +395,48 @@ pub fn loop_beat() {
     }
 }
 
-/// The longest stretch between `since` and `until` in which the event
-/// loop was held, as when it began after `since` and how long it lasted
-/// within the two, counting one still under way; none in a worker with
-/// no loop, or when the loop was never held.
-pub(crate) fn loop_held(since: Instant, until: Instant) -> Option<(Duration, Duration)> {
+/// The stretches between `since` and `until` in which the event loop was
+/// held, each as when it began after `since` and how long it lasted
+/// within the two, counting one still under way, in order: the longest
+/// `most` of them (issue 737). None in a worker with no loop, or when the
+/// loop was never held.
+pub(crate) fn loop_held(since: Instant, until: Instant, most: usize) -> Vec<(Duration, Duration)> {
     let last = LOOP_BEAT_MS.load(Ordering::Relaxed);
 
     if last == 0 {
-        return None;
+        return Vec::new();
     }
 
     let late =
         Duration::from_millis(clock_ms().saturating_sub(last)).saturating_sub(LOOP_BEAT_INTERVAL);
     let running = (late >= HELD_AT_LEAST).then(|| (Instant::now(), late));
     let held = HELD.lock().expect("loop stretches poisoned");
-    longest_held(held.iter().copied().chain(running), since, until)
+    overlaps_held(held.iter().copied().chain(running), since, until, most)
 }
 
-/// The longest overlap of the stretches, each as when it ended and how
-/// long it was, with the time from `since` to `until`: when it began
-/// after `since` and its length.
-fn longest_held(
+/// The overlaps of the stretches, each as when it ended and how long it
+/// was, with the time from `since` to `until`: when each began after
+/// `since` and its length, the longest `most` of them, in order.
+fn overlaps_held(
     stretches: impl Iterator<Item = (Instant, Duration)>,
     since: Instant,
     until: Instant,
-) -> Option<(Duration, Duration)> {
-    stretches
+    most: usize,
+) -> Vec<(Duration, Duration)> {
+    let mut overlaps: Vec<(Duration, Duration)> = stretches
         .filter_map(|(ended, length)| {
             let from = ended.checked_sub(length).unwrap_or(ended).max(since);
             let overlap = ended.min(until).checked_duration_since(from)?;
             (overlap >= HELD_AT_LEAST).then(|| (from.duration_since(since), overlap))
         })
-        .max_by_key(|(_, overlap)| *overlap)
+        .collect();
+
+    // The longest are kept past the cap, then put back in order.
+
+    overlaps.sort_by_key(|(_, overlap)| std::cmp::Reverse(*overlap));
+    overlaps.truncate(most);
+    overlaps.sort_by_key(|(from, _)| *from);
+    overlaps
 }
 
 /// Tell the host, once a stall, when the event loop has gone longer than
@@ -994,10 +1003,13 @@ fn report_thread(fd: i32, shared: &Shared, memory_interval: Duration, stop: &Ato
 
     loop {
         let mut line = format!(
-            "{{\"in_flight\":{},\"oldest_ms\":{},\"requests\":{}",
+            "{{\"in_flight\":{},\"oldest_ms\":{},\"requests\":{},\"modules\":{},\"modules_us\":{},\"load_us\":{}",
             shared.in_flight(),
             shared.oldest_ms(),
-            shared.total()
+            shared.total(),
+            record::modules_loaded(),
+            record::modules_us(),
+            record::load_us()
         );
 
         // Section 11.7: what each side holds, as of this report, for a
@@ -1331,8 +1343,8 @@ async fn handle_request(
     let trace = shared.request_trace(request_id);
     let edge_id = head.request_id.clone();
 
-    if trace.is_some() {
-        record::start_logs(&edge_id);
+    if let Some(trace) = &trace {
+        record::start_logs(&edge_id, trace);
     }
 
     // Section 6.14: the request may be handed to the event loop, which
@@ -1557,7 +1569,7 @@ async fn handle_asgi_request(
 
     if let Some(trace) = &trace {
         trace.on_loop();
-        record::start_logs(&head.request_id);
+        record::start_logs(&head.request_id, trace);
     }
 
     let aborted = AtomicBool::new(false);
@@ -2095,6 +2107,7 @@ async fn write_response_after(
                         })
                         .collect(),
                     flush: flush as i32,
+                    imports_ms: trace.map_or(0.0, record::Trace::imports_ms),
                 };
 
                 if status == 101 {
@@ -2355,15 +2368,16 @@ async fn write_body(
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{longest_held, period_operation, stop_within_request};
+    use super::{overlaps_held, period_operation, stop_within_request};
 
     #[test]
-    fn the_longest_hold_of_the_loop_is_the_part_within_the_request() {
+    fn the_holds_of_the_loop_are_the_parts_within_the_request() {
         let since = Instant::now();
         let ms = Duration::from_millis;
 
         // A stretch that began before the request counts from its start;
-        // a short one is the timer's lateness; the longest wins.
+        // a short one is the timer's lateness; past the cap the longest
+        // are kept, in order.
 
         let stretches = [
             (since + ms(30), ms(50)),
@@ -2372,24 +2386,24 @@ mod tests {
         ];
         let end = since + ms(500);
         assert_eq!(
-            longest_held(stretches.into_iter(), since, end),
-            Some((ms(60), ms(40)))
+            overlaps_held(stretches.into_iter(), since, end, 64),
+            vec![(ms(0), ms(30)), (ms(60), ms(40))]
         );
         assert_eq!(
-            longest_held(stretches[..1].iter().copied(), since, end),
-            Some((ms(0), ms(30)))
+            overlaps_held(stretches.into_iter(), since, end, 1),
+            vec![(ms(60), ms(40))]
         );
 
         // One that ended before the request is not part of it, and one
         // that ran past its end counts until then.
 
         assert_eq!(
-            longest_held([(since, ms(80))].into_iter(), since + ms(1), end),
-            None
+            overlaps_held([(since, ms(80))].into_iter(), since + ms(1), end, 64),
+            Vec::new()
         );
         assert_eq!(
-            longest_held([(since + ms(600), ms(300))].into_iter(), since, end),
-            Some((ms(300), ms(200)))
+            overlaps_held([(since + ms(600), ms(300))].into_iter(), since, end, 64),
+            vec![(ms(300), ms(200))]
         );
     }
 

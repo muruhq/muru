@@ -9,7 +9,7 @@
 </head>
 <body>
 <header>
-  <h1>Muru</h1>
+  <h1><a href="./" title="The dashboard's front page">Muru</a></h1>
   <span>{{ data.app }}</span>
   <span>release r{{ data.release }}</span>
   {% if data.development %}<span>development mode</span>{% endif %}
@@ -37,6 +37,7 @@
   </section>
 </main>
 <script src="static/htmx.min.js"></script>
+<script src="static/scroll.js"></script>
 <script src="static/uplot.min.js"></script>
 <script src="static/charts.js"></script>
 <script src="static/times.js"></script>

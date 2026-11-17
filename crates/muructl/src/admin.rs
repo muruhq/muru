@@ -1040,6 +1040,16 @@ pub enum DebugCommand {
     /// its [daemon] table sets debug_exec.
     Exec(ExecArgs),
 
+    /// The import report of a release's load: what each import cost,
+    /// which entry point paid for it, and what to defer or load before
+    /// the fork, as configuration to write; then each module the workers
+    /// have loaded for the first time since the fork, by how many of them
+    /// and what to do about it. The host's load by default, or with
+    /// --worker a worker's own, when it loaded the application itself.
+    /// The release needs import_report on, or the report of a load
+    /// muructl check --imports prints.
+    Imports(ImportsArgs),
+
     /// A short summary of the installation to attach to a bug report:
     /// versions, how Muru runs, each release's interface, framework and
     /// state, the serving releases' settings and recent events. Safe to
@@ -1216,6 +1226,51 @@ pub struct MemoryArgs {
     top: u32,
 }
 
+/// `muructl debug imports`.
+#[derive(Args)]
+pub struct ImportsArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// Only the imports made while the host loaded one of its targets:
+    /// hooks, entrypoint, mount:NAME or module:NAME (one of the
+    /// preload_modules), or none for those made outside them, by an
+    /// instrumentation module or the on_load and pre_fork hooks.
+    #[arg(long = "target", id = "load_target", value_name = "TARGET")]
+    load_target: Option<String>,
+
+    /// The most rows of each table.
+    #[arg(long, default_value_t = crate::imports::DEFAULT_TOP, value_name = "N")]
+    top: usize,
+
+    /// Only rows that took at least this many milliseconds.
+    #[arg(long, default_value_t = 0.0, value_name = "MS")]
+    min_ms: f64,
+
+    /// Only modules and importers under this top-level package;
+    /// repeatable.
+    #[arg(long, value_name = "PACKAGE")]
+    package: Vec<String>,
+
+    /// The chain of imports that brought one module in, outermost first,
+    /// in place of the tables.
+    #[arg(long, value_name = "NAME")]
+    module: Option<String>,
+}
+
+impl ImportsArgs {
+    /// The rows the command keeps.
+    pub fn filters(&self) -> crate::imports::Filters {
+        crate::imports::Filters {
+            target: self.load_target.clone(),
+            top: self.top,
+            min_ms: self.min_ms,
+            packages: self.package.clone(),
+            module: self.module.clone(),
+        }
+    }
+}
+
 /// `muructl debug exec`.
 #[derive(Args)]
 pub struct ExecArgs {
@@ -1388,6 +1443,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
                 "timeout_s": exec.timeout.as_secs_f64(),
             }),
         ),
+        DebugCommand::Imports(imports) => ("imports", &imports.common, serde_json::json!({})),
         DebugCommand::Attach(_)
         | DebugCommand::Report(_)
         | DebugCommand::Bundle(_)
@@ -1398,6 +1454,22 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
 
     let target = args.target.as_deref().unwrap_or_default();
     let response = ask(&args.socket, target, op, args.worker.as_ref(), request).await?;
+
+    // Section 6.18: the import report is one document of the host's
+    // answer and the workers', in text or as JSON.
+
+    if let DebugCommand::Imports(imports) = &command {
+        let worker = args.worker.as_ref().map(ToString::to_string);
+        let found = crate::imports::document(&response, worker.as_deref(), &imports.filters())?;
+
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&found)?);
+        } else {
+            print!("{}", crate::imports::render(&found));
+        }
+
+        return Ok(());
+    }
 
     if args.json {
         print_json(&response);
@@ -1417,7 +1489,8 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::Attach(_)
         | DebugCommand::Report(_)
         | DebugCommand::Bundle(_)
-        | DebugCommand::Request(_) => {}
+        | DebugCommand::Request(_)
+        | DebugCommand::Imports(_) => {}
     }
 
     Ok(())
@@ -2242,8 +2315,8 @@ fn print_status(response: &pb::DebugResponse) {
         }
     }
     let mut header = format!(
-        "{:<7} {:<8} {:<10} {:<8} {:<10}",
-        "WORKER", "PID", "GROUP", "UP", "REQUESTS"
+        "{:<7} {:<8} {:<10} {:<8} {:<10} {:<8}",
+        "WORKER", "PID", "GROUP", "UP", "REQUESTS", "MODULES"
     );
 
     if sides.threads {
@@ -2267,8 +2340,8 @@ fn print_status(response: &pb::DebugResponse) {
         }
 
         let mut line = format!(
-            "{:<7} {:<8} {:<10} {:<8} {:<10}",
-            row.worker, row.pid, row.group, row.uptime, row.requests
+            "{:<7} {:<8} {:<10} {:<8} {:<10} {:<8}",
+            row.worker, row.pid, row.group, row.uptime, row.requests, row.modules
         );
 
         if sides.threads {
@@ -2954,22 +3027,43 @@ fn request_text(record: &pb::RequestRecord) -> String {
         let _ = writeln!(text, "\n{}", panel.title);
 
         // Spans indented by depth, each with where it starts on the
-        // request's clock, and a failed one marked.
+        // request's clock, and a failed one marked: an event at its
+        // moment, and a span of several segments with their total and
+        // count (issue 737).
 
         let mut spans: Vec<(usize, &pb::PanelSpan)> =
             panel.spans.iter().rev().map(|span| (0, span)).collect();
         let mut lines = Vec::new();
 
         while let Some((depth, span)) = spans.pop() {
-            lines.push((
-                format!("{}{}", "  ".repeat(depth), span.name),
-                format!(
-                    "{}  from {}{}",
-                    millis(span.duration_ms),
-                    millis(span.start_ms),
-                    if span.failed { "  failed" } else { "" }
+            let failed = if span.failed { "  failed" } else { "" };
+
+            let shown = match (span.at_ms, span.segments.as_slice()) {
+                (Some(at), _) => format!("at {}{failed}", millis(at)),
+                (None, [only]) => format!(
+                    "{}  from {}{failed}",
+                    millis(only.duration_ms),
+                    millis(only.start_ms)
                 ),
-            ));
+                (None, [first, ..]) => format!(
+                    "{} in {} segments  from {}{failed}",
+                    millis(
+                        span.segments
+                            .iter()
+                            .map(|segment| segment.duration_ms)
+                            .sum()
+                    ),
+                    span.segments.len(),
+                    millis(first.start_ms)
+                ),
+                (None, []) => format!(
+                    "{}  from {}{failed}",
+                    millis(span.duration_ms),
+                    millis(span.start_ms)
+                ),
+            };
+
+            lines.push((format!("{}{}", "  ".repeat(depth), span.name), shown));
             spans.extend(span.children.iter().rev().map(|child| (depth + 1, child)));
         }
 
@@ -11139,7 +11233,7 @@ mod logs_list_tests {
     }
 
     #[test]
-    fn a_records_text_marks_a_failed_span() {
+    fn a_records_text_marks_a_failed_span_an_event_and_segments() {
         let span = |name: &str, failed: bool| pb::PanelSpan {
             name: name.to_owned(),
             start_ms: 1.0,
@@ -11147,11 +11241,27 @@ mod logs_list_tests {
             failed,
             ..Default::default()
         };
+        let segment = |start_ms: f64| pb::PanelSegment {
+            start_ms,
+            duration_ms: 0.5,
+            ..Default::default()
+        };
         let record = pb::RequestRecord {
             panels: vec![pb::Panel {
                 title: "Trace".to_owned(),
                 spans: vec![pb::PanelSpan {
-                    children: vec![span("SELECT 1", false), span("lookup", true)],
+                    children: vec![
+                        span("SELECT 1", false),
+                        span("lookup", true),
+                        pb::PanelSpan {
+                            at_ms: Some(2.5),
+                            ..span("response started", false)
+                        },
+                        pb::PanelSpan {
+                            segments: vec![segment(1.0), segment(2.0)],
+                            ..span("waiting", false)
+                        },
+                    ],
                     ..span("GET /books", true)
                 }],
                 ..Default::default()
@@ -11171,5 +11281,10 @@ mod logs_list_tests {
             "{text}"
         );
         assert!(lines[3].ends_with("from 1.0ms  failed"), "{text}");
+        assert!(lines[4].ends_with("  at 2.5ms"), "{text}");
+        assert!(
+            lines[5].ends_with("1.0ms in 2 segments  from 1.0ms"),
+            "{text}"
+        );
     }
 }

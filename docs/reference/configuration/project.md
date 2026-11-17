@@ -27,8 +27,10 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `grpc_web_origins` | array of strings |  | The origins whose pages may call the gRPC methods through gRPC-Web, or `*`. |
 | `handoff` | string |  | The interface the entrypoint's requests may be handed to. `asgi`: Continue the request as an ASGI application on the event loop. `wsgi`: Continue the request as a WSGI callable on the thread pool. |
 | `hooks` | string |  | The module providing the lifecycle hooks. |
+| `import_report` | boolean | `false` | Record the host's imports with unwrapt's profile recorder as it loads the application, for `muructl debug imports`, with or without `lazy_imports`. The project's environment needs the unwrapt package. |
 | `instrumentation` | array of tables, {ref}`[[tool.muru.instrumentation]] <config-project-tool-muru-instrumentation>` |  | The instrumentation modules, in order, each with its settings, imported before anything of the application. |
 | `interface` | string | `"auto"` | The interface the entrypoint speaks. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
+| `lazy_imports` | boolean | `false` | Defer imports with unwrapt: each module's `__lazy_modules__` from Python 3.11 to 3.14, and the `[tool.unwrapt.lazy_modules]` table on every version. The project's environment needs the unwrapt package. |
 | `logging` | table, {ref}`[tool.muru.logging] <config-project-tool-muru-logging>` |  | How Python logging is set up in the workers. |
 | `maintenance` | table, {ref}`[tool.muru.maintenance] <config-project-tool-muru-maintenance>` |  | What maintenance mode lets through. |
 | `max_body_size` | string | the host's, else `max_body_size` in `[limits]` | The largest body of a request the release serves, for example 50MB, which the edge enforces. |
@@ -37,6 +39,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `memory` | table, {ref}`[tool.muru.memory] <config-project-tool-muru-memory>` |  | The memory policy for the workers. |
 | `mounts` | table of tables, {ref}`[tool.muru.mounts.NAME] <config-project-tool-muru-mounts-name>` |  | Mounts by name. |
 | `preload` | string | `"auto"` | Whether the application is imported once, in the host, before the workers are forked from it. `auto`: Preload when the import check passes, otherwise import per worker. `true`: Preload, and fail the release when the import check does not pass. `false`: Import in every worker. |
+| `preload_modules` | array of strings |  | Modules the host imports after the entrypoint and the mounts, and before the `on_load` and `pre_fork` hooks, so a module the application only imports on first use is loaded once before the fork rather than in every worker. With per-worker imports each worker imports them as part of its load. A module that cannot be imported fails the load. |
 | `processes` | integer | `1`; under `muructl serve`, the container's CPU limit, else the CPU count | The default group's worker processes. |
 | `python` | string | found at start | The interpreter: a path, or a request in uv's syntax such as "3.13", "3.14t" or ">=3.12". |
 | `reflection` | boolean | `false` | Serve gRPC server reflection for the registered services. |
