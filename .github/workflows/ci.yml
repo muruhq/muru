@@ -121,7 +121,22 @@ jobs:
       - run: cd packages/muru && uv run --project ../.. maturin develop
       - run: cargo build -p muructl
       - run: bash packaging/dev/fetch-h2spec.sh
-      - run: uv run pytest tests/integration tests/conformance
+      # pytest keeps the temporary directories of failed tests only, under
+      # a short path (sockets go under them), so a failure can upload them.
+      - run: uv run pytest tests/integration tests/conformance --basetemp=/tmp/muru-pytest -o tmp_path_retention_policy=failed
+      # A failed test's directories hold its daemon's full logs and state
+      # database, beyond the log tails its report shows (issue 734).
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: integration-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            /tmp/muru-pytest/
+            !/tmp/muru-pytest/**/pycache/**
+            !/tmp/muru-pytest/**/__pycache__/**
+            !/tmp/muru-pytest/**/.venv/**
+          if-no-files-found: ignore
+          retention-days: 14
 
   python:
     runs-on: ${{ matrix.os }}
