@@ -3343,12 +3343,34 @@ impl Daemon {
         };
 
         let mut apps = Vec::new();
-        let maintenance: HashMap<String, u64> = self
+        let mut maintenance: HashMap<String, (u64, String)> = self
             .store
             .maintenance()
             .unwrap_or_default()
             .into_iter()
+            .map(|(app, since)| (app, (since, String::new())))
             .collect();
+
+        // Issue 757: an active overlay's maintenance setting stands over
+        // the application's own, and dates from the overlay's activation.
+
+        let overlays = self.store.overlays().unwrap_or_default();
+        let states = self.store.overlay_states().unwrap_or_default();
+        let settings =
+            crate::overlays::maintenance_settings(&crate::overlays::ordered(&overlays, &states));
+
+        for (app, (on, by)) in settings {
+            if !on {
+                maintenance.remove(&app);
+                continue;
+            }
+
+            let since = states
+                .iter()
+                .find(|state| state.name == by)
+                .map_or(0, |state| state.since_unix_ms);
+            maintenance.insert(app, (since, by));
+        }
 
         for app in self.store.apps().unwrap_or_default() {
             let mut releases = Vec::new();
@@ -3392,7 +3414,11 @@ impl Daemon {
                 previous: app.previous.clone().unwrap_or_default(),
                 maintenance_since: maintenance
                     .get(&app.name)
-                    .map(|since| full_time(*since))
+                    .map(|(since, _)| full_time(*since))
+                    .unwrap_or_default(),
+                maintenance_overlay: maintenance
+                    .get(&app.name)
+                    .map(|(_, by)| by.clone())
                     .unwrap_or_default(),
                 releases,
             });

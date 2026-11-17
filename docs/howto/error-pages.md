@@ -169,6 +169,23 @@ $ muructl maintenance off shop
 muru: shop serves as usual again
 ```
 
+An [overlay](overlays.md) can put an application in maintenance for as
+long as it is active, such as for a planned upgrade, with `apps.shop = {
+maintenance = true }`. While it is, `muructl app list` names the
+overlay, and the dashboard's overview says which overlay since when:
+
+```console
+$ muructl app list
+APP                  CURRENT      PREVIOUS     USER
+shop                 r1           -            - [maintenance by overlay db-upgrade]
+```
+
+When the overlay ends, the application is as `muructl maintenance` left
+it. An overlay with `maintenance = false` keeps an application out of
+maintenance while it is active, and `app list` marks it `[maintenance
+off by overlay NAME]`. Overlays set an application's maintenance, not a
+virtual host's.
+
 ### A whole virtual host
 
 A site served by several applications, or by static and upstream routes

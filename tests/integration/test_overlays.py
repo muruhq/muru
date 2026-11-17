@@ -205,7 +205,9 @@ trigger = {{ schedule = {{ start = '{at(3)}', end = '{at(7)}' }} }}
     assert site.request().status == 200
     assert eventually(lambda: site.request().status == 503)
     assert b"maintenance" in site.request().body
+    assert "[maintenance by overlay window]" in site.daemon.muructl("app", "list").stdout
     assert eventually(lambda: site.request().status == 200)
+    assert "[maintenance" not in site.daemon.muructl("app", "list").stdout
 
     events = site.daemon.muructl("events").stdout
     assert "its schedule's window began" in events

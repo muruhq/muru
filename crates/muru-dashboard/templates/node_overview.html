@@ -13,7 +13,7 @@
   {% for app in data.apps %}
   {% for release in app.releases %}
   <tr>
-    <td>{% if release.workers > 0 %}<a href="workers?release={{ app.name }}@{{ release.id }}">{{ app.name }}@{{ release.id }}</a>{% else %}{{ app.name }}@{{ release.id }}{% endif %}{% if !app.maintenance_since.is_empty() && release.serving %} <span class="state-draining">maintenance since <time datetime="{{ app.maintenance_since }}">{{ app.maintenance_since }}</time></span>{% endif %}</td>
+    <td>{% if release.workers > 0 %}<a href="workers?release={{ app.name }}@{{ release.id }}">{{ app.name }}@{{ release.id }}</a>{% else %}{{ app.name }}@{{ release.id }}{% endif %}{% if !app.maintenance_since.is_empty() && release.serving %} <span class="state-draining">maintenance since <time datetime="{{ app.maintenance_since }}">{{ app.maintenance_since }}</time>{% if !app.maintenance_overlay.is_empty() %}, by overlay {{ app.maintenance_overlay }}{% endif %}</span>{% endif %}</td>
     <td class="state-{{ release.state }}">{{ release.state }}</td>
     <td>{% if release.serving %}yes{% endif %}</td>
     <td class="num">{{ release.workers }}</td>

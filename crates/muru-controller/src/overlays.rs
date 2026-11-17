@@ -528,21 +528,32 @@ pub fn apply_maintenance(
 ) -> BTreeSet<String> {
     let mut apps = base.clone();
 
-    for (_, overlay) in overlays {
-        for (app, change) in &overlay.apps {
-            match change.maintenance {
-                Some(true) => {
-                    apps.insert(app.clone());
-                }
-                Some(false) => {
-                    apps.remove(app);
-                }
-                None => {}
-            }
+    for (app, (on, _)) in maintenance_settings(overlays) {
+        if on {
+            apps.insert(app);
+        } else {
+            apps.remove(&app);
         }
     }
 
     apps
+}
+
+/// Section 4.12 (issue 757): the maintenance settings the active
+/// overlays put in force, by application: on or off, and the overlay
+/// whose setting stands, the last of them in the order they apply.
+pub fn maintenance_settings(overlays: &[&(String, Overlay)]) -> BTreeMap<String, (bool, String)> {
+    let mut settings = BTreeMap::new();
+
+    for (name, overlay) in overlays {
+        for (app, change) in &overlay.apps {
+            if let Some(on) = change.maintenance {
+                settings.insert(app.clone(), (on, name.clone()));
+            }
+        }
+    }
+
+    settings
 }
 
 /// Section 7.5: the capacity the overlays set, by application and worker
@@ -1605,6 +1616,34 @@ mod tests {
         // The inactive overlay's maintenance does not apply.
 
         assert!(apply_maintenance(&BTreeSet::new(), &active).is_empty());
+    }
+
+    #[test]
+    fn the_last_overlay_to_set_maintenance_is_named() {
+        let upgrade = (
+            "db-upgrade".to_owned(),
+            overlay("apps.shop = { maintenance = true }"),
+        );
+        let open = (
+            "open-anyway".to_owned(),
+            overlay("apps.shop = { maintenance = false }\npriority = 1"),
+        );
+        let other = (
+            "blog".to_owned(),
+            overlay("apps.blog = { mode = 'read-only' }"),
+        );
+
+        assert_eq!(
+            maintenance_settings(&[&upgrade, &other]),
+            BTreeMap::from([("shop".to_owned(), (true, "db-upgrade".to_owned()))])
+        );
+        assert_eq!(
+            maintenance_settings(&[&upgrade, &open]),
+            BTreeMap::from([("shop".to_owned(), (false, "open-anyway".to_owned()))])
+        );
+        assert!(
+            apply_maintenance(&BTreeSet::from(["shop".to_owned()]), &[&upgrade, &open]).is_empty()
+        );
     }
 
     #[test]

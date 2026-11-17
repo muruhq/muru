@@ -5451,15 +5451,22 @@ pub async fn app_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             } else {
                 format!(" [priority {}]", app.priority)
             },
-            if app.maintenance {
-                " [maintenance]"
-            } else {
-                ""
-            }
+            maintenance_mark(&app)
         );
     }
 
     Ok(())
+}
+
+/// How `app list` marks an application's maintenance, naming the overlay
+/// that set it, or that turned it off, when one did (issue 757).
+fn maintenance_mark(app: &pb::App) -> String {
+    match (app.maintenance, app.maintenance_overlay.as_str()) {
+        (true, "") => " [maintenance]".to_owned(),
+        (true, overlay) => format!(" [maintenance by overlay {overlay}]"),
+        (false, "") => String::new(),
+        (false, overlay) => format!(" [maintenance off by overlay {overlay}]"),
+    }
 }
 
 /// Remove an application and all its releases.
@@ -10819,6 +10826,26 @@ mod tests {
         for line in &lines[1..] {
             assert_eq!(line.find("route shop"), Some(changes), "{lines:#?}");
         }
+    }
+
+    #[test]
+    fn app_list_names_the_overlay_that_set_maintenance() {
+        let app = |maintenance: bool, overlay: &str| pb::App {
+            maintenance,
+            maintenance_overlay: overlay.to_owned(),
+            ..pb::App::default()
+        };
+
+        assert_eq!(super::maintenance_mark(&app(true, "")), " [maintenance]");
+        assert_eq!(
+            super::maintenance_mark(&app(true, "db-upgrade")),
+            " [maintenance by overlay db-upgrade]"
+        );
+        assert_eq!(super::maintenance_mark(&app(false, "")), "");
+        assert_eq!(
+            super::maintenance_mark(&app(false, "open")),
+            " [maintenance off by overlay open]"
+        );
     }
 
     #[test]

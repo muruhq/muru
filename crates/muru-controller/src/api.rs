@@ -349,13 +349,13 @@ impl Admin for Service {
         _: Request<pb::ListAppsRequest>,
     ) -> Result<Response<pb::ListAppsResponse>, Status> {
         let apps = self.handle.store.apps().map_err(internal)?;
-        let maintenance = self.handle.store.maintenance().map_err(internal)?;
+        let maintenance = app_maintenance(&self.handle.store).map_err(internal)?;
         Ok(Response::new(pb::ListAppsResponse {
             apps: apps
                 .into_iter()
                 .map(|app| {
-                    let on = maintenance.iter().any(|(name, _)| *name == app.name);
-                    app_message(app, on)
+                    let maintenance = maintenance(&app.name);
+                    app_message(app, maintenance)
                 })
                 .collect(),
         }))
@@ -370,14 +370,8 @@ impl Admin for Service {
             .store
             .app(&request.into_inner().name)
             .map_err(not_found)?;
-        let on = self
-            .handle
-            .store
-            .maintenance()
-            .map_err(internal)?
-            .iter()
-            .any(|(name, _)| *name == app.name);
-        Ok(Response::new(app_message(app, on)))
+        let maintenance = app_maintenance(&self.handle.store).map_err(internal)?(&app.name);
+        Ok(Response::new(app_message(app, maintenance)))
     }
 
     async fn dashboard_login(
@@ -3559,7 +3553,31 @@ fn report_message(plan: &Plan) -> pb::ConfigReport {
     }
 }
 
-fn app_message(app: crate::model::App, maintenance: bool) -> pb::App {
+/// Section 4.12 (issue 757): each application's maintenance as the edge
+/// serves it, by name: whether it is on, and the active overlay whose
+/// setting is in force, if one is, over `muructl maintenance`'s.
+fn app_maintenance(
+    store: &crate::store::Store,
+) -> Result<impl Fn(&str) -> (bool, String) + use<>, crate::store::StoreError> {
+    let base: std::collections::BTreeSet<String> = store
+        .maintenance()?
+        .into_iter()
+        .map(|(app, _)| app)
+        .collect();
+    let overlays = store.overlays()?;
+    let states = store.overlay_states()?;
+    let settings =
+        crate::overlays::maintenance_settings(&crate::overlays::ordered(&overlays, &states));
+
+    Ok(move |app: &str| {
+        settings
+            .get(app)
+            .cloned()
+            .unwrap_or_else(|| (base.contains(app), String::new()))
+    })
+}
+
+fn app_message(app: crate::model::App, (maintenance, by): (bool, String)) -> pb::App {
     pb::App {
         name: app.name,
         current_release: app.current.unwrap_or_default(),
@@ -3570,6 +3588,7 @@ fn app_message(app: crate::model::App, maintenance: bool) -> pb::App {
         group: app.group.unwrap_or_default(),
         umask: app.umask.unwrap_or_default(),
         maintenance,
+        maintenance_overlay: by,
         priority: app.priority,
     }
 }

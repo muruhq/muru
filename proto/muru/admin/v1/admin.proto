@@ -602,6 +602,7 @@ message App {
   string umask = 8;                 // octal
   bool maintenance = 9;             // the edge serves its maintenance page (section 4.12)
   int32 priority = 10;              // the node's budget admits higher priorities' scale-ups first (section 7.4)
+  string maintenance_overlay = 11;  // the active overlay whose maintenance setting is in force, if one is (issue 757)
 }
 
 // A deploy names the application (created on first use) and the source.

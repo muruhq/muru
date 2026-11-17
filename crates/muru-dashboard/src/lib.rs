@@ -400,6 +400,9 @@ pub struct AppRow {
     /// When maintenance mode began, in the full UTC form shown as the
     /// viewer's local clock, or empty when it is off (section 4.12).
     pub maintenance_since: String,
+    /// The active overlay that put it in maintenance, or empty when
+    /// `muructl maintenance` did or it is off (issue 757).
+    pub maintenance_overlay: String,
     /// Its releases, newest first.
     pub releases: Vec<ReleaseRow>,
 }
