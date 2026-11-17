@@ -67,6 +67,8 @@ def test_page_shows_workers_requests_and_logs(dashboard: tuple[support.Server, i
     assert "frame-ancestors 'self'" in headers["content-security-policy"]
     page = body.decode()
     assert "<title>Muru: wsgi_conformance:application</title>" in page
+    assert '<h1><a href="./"' in page, "the banner links to the front page"
+    assert '<script src="static/scroll.js">' in page
     assert "release r1" in page
     assert "Workers" in page and page.count("worker-") >= 2
 
@@ -94,7 +96,15 @@ def test_fragments_and_assets(dashboard: tuple[support.Server, int]) -> None:
     assert status == 200
     assert headers["content-type"] == "text/javascript"
     assert body.startswith(b"var htmx=")
+    assert fetch(port, "/static/scroll.js")[0] == 200
     assert fetch(port, "/missing")[0] == 404
+
+    # A request whose record is gone still has the banner, and its link
+    # back to the run's page.
+
+    status, _headers, body = fetch(port, "/request/01UNKNOWN")
+    assert status == 404
+    assert '<h1><a href="../"' in body.decode()
 
 
 def test_dashboard_can_be_off() -> None:

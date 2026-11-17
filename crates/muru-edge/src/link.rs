@@ -1583,9 +1583,10 @@ impl Recording {
 
     /// The response head arrived from a worker or an upstream after
     /// `application`: the record takes the time, and a development run
-    /// notes it with the queue's for the response (section 4.20), unless
-    /// this hop is a sub-request of the edge's own.
-    pub(crate) fn head_arrived(&mut self, application: Duration) {
+    /// notes it with the queue's for the response (section 4.20), and
+    /// what the worker spent loading modules for the first time before
+    /// the head, unless this hop is a sub-request of the edge's own.
+    pub(crate) fn head_arrived(&mut self, application: Duration, imports: Duration) {
         self.record.application = application;
 
         if let Some(noted) = &self.noted
@@ -1594,6 +1595,7 @@ impl Recording {
             noted.note(crate::development::Timing {
                 queue: self.record.queue,
                 application,
+                imports,
             });
         }
     }
@@ -2288,7 +2290,21 @@ async fn handle_inner(
                 let end = pb::End::decode(next.payload).unwrap_or_default();
                 return failing.worker_failed(end);
             }
-            Ok(_) => {
+            Ok(Some(next)) => {
+                // Issue 734: a frame out of place says something other
+                // than a worker that went away, so the two are told apart.
+
+                tracing::warn!(
+                    kind = next.kind,
+                    "the worker sent an unexpected frame before the response head"
+                );
+                back.give_reader(None);
+                return failing.worker_crashed(&format!(
+                    "The worker sent an unexpected frame, of type {}, before the response head.",
+                    next.kind
+                ));
+            }
+            Ok(None) => {
                 back.give_reader(None);
                 return failing.worker_crashed("The worker sent no response head.");
             }
@@ -2308,7 +2324,10 @@ async fn handle_inner(
     let mut recording = failing.recording.lock().expect("recording poisoned").take();
 
     if let Some(recording) = recording.as_mut() {
-        recording.head_arrived(dispatched.elapsed());
+        recording.head_arrived(
+            dispatched.elapsed(),
+            Duration::from_secs_f64(head.imports_ms.max(0.0) / 1000.0),
+        );
         recording.record.status = u16::try_from(head.status).unwrap_or(500);
 
         // Section 11.7: a response flushed as it goes streams, for as long

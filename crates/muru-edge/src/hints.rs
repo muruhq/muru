@@ -37,6 +37,13 @@ pub const GC_MS: f64 = 50.0;
 /// ...as are this many of them.
 pub const GC_COLLECTIONS: u32 = 20;
 
+/// Modules loaded for the first time in the worker taking this share of
+/// the request's total time are a hint...
+pub const IMPORT_SHARE: f64 = 0.25;
+
+/// ...when they took at least this long, in milliseconds.
+pub const IMPORT_MS: f64 = 50.0;
+
 /// The most hints of one kind, the strongest first.
 const PER_KIND: usize = 3;
 
@@ -133,6 +140,7 @@ pub fn panel(record: &admin::RequestRecord, panels: &[admin::Panel]) -> admin::P
         held(&mut hints, record, worker, named("trace"));
         waited(&mut hints, record, worker);
         collected(&mut hints, worker);
+        imported(&mut hints, record, worker);
     }
 
     answered(&mut hints, record);
@@ -377,6 +385,50 @@ fn collected(hints: &mut Vec<Hint>, worker: &admin::WorkerPart) {
             "{collections} {}, {} in all",
             if collections == 1 { "collection" } else { "collections" },
             millis(ms)
+        ),
+    });
+}
+
+/// Modules loaded for the first time in the worker that took at least
+/// `IMPORT_MS` and `IMPORT_SHARE` of the request, naming the longest of
+/// the outermost loads (issue 738).
+fn imported(hints: &mut Vec<Hint>, record: &admin::RequestRecord, worker: &admin::WorkerPart) {
+    if record.total_ms <= 0.0
+        || worker.modules_ms < IMPORT_MS
+        || worker.modules_ms < IMPORT_SHARE * record.total_ms
+    {
+        return;
+    }
+
+    let mut outermost: Vec<&admin::ModuleLoad> = worker
+        .module_loads
+        .iter()
+        .filter(|load| load.depth == 0)
+        .collect();
+    outermost.sort_by(|one, other| other.ms.total_cmp(&one.ms));
+    let longest: Vec<&str> = outermost
+        .iter()
+        .take(PER_KIND)
+        .map(|load| load.module.as_str())
+        .collect();
+
+    let modules = if worker.modules_loaded == 1 {
+        "1 module".to_owned()
+    } else {
+        format!("{} modules", worker.modules_loaded)
+    };
+
+    hints.push(Hint {
+        text: format!(
+            "the worker loaded {modules} for the first time during the request, {:.0}% of its time, which each worker does again for the first request that needs them; list the longest in preload_modules to load them before the worker serves: {}",
+            worker.modules_ms * 100.0 / record.total_ms,
+            longest.join(", ")
+        ),
+        panel: "Timing",
+        figure: format!(
+            "{} of {} loading modules",
+            millis(worker.modules_ms),
+            millis(record.total_ms)
         ),
     });
 }
@@ -646,6 +698,44 @@ mod tests {
         );
         assert_eq!(collected(1, GC_MS)[0][2], "1 collection, 50ms in all");
         assert_eq!(collected(GC_COLLECTIONS + 1, GC_MS + 1.0).len(), 1);
+    }
+
+    #[test]
+    fn first_time_module_loads_are_a_hint_naming_the_longest() {
+        let imported = |ms: f64| {
+            let mut found = record();
+            let worker = found.from_worker.as_mut().unwrap();
+            let load = |module: &str, ms: f64, depth: u32| admin::ModuleLoad {
+                module: module.to_owned(),
+                ms,
+                depth,
+                ..Default::default()
+            };
+            worker.module_loads = vec![
+                load("shop.reports", ms * 0.3, 0),
+                load("openpyxl", ms * 0.7, 0),
+                load("openpyxl.cell", ms * 0.5, 1),
+            ];
+            worker.modules_loaded = 3;
+            worker.modules_ms = ms;
+            hinted(&found, &[])
+        };
+
+        // The request's 100 ms: below either threshold is no hint.
+
+        assert!(imported(IMPORT_MS - 1.0).is_empty());
+        let found = imported(IMPORT_MS);
+        assert_eq!(found.len(), 1);
+        assert!(
+            found[0][0]
+                .contains("3 modules for the first time during the request, 50% of its time"),
+            "{}",
+            found[0][0]
+        );
+        assert!(found[0][0].ends_with(
+            "preload_modules to load them before the worker serves: openpyxl, shop.reports"
+        ));
+        assert_eq!(found[0][2], "50ms of 100ms loading modules");
     }
 
     #[test]

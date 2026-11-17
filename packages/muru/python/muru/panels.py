@@ -7,7 +7,9 @@ from the record; this module lets code in the worker add panels of its
 own, the application's or a library's, as data in the shapes the edge
 draws, each declared once by a class of its own:
 
-- ``SpansPanel``: named intervals on the record's clock that may nest.
+- ``SpansPanel``: named intervals on the record's clock that may nest, a
+  span being a period, an event at one moment, or a period made of
+  several segments.
 - ``TablesPanel``: rows under captioned columns, in one or more tables.
 - ``ValuesPanel``: names with values.
 - ``TextPanel``: text, plain or markdown, which the edge draws.
@@ -24,8 +26,8 @@ work only to feed a panel.
 
 Each panel keeps at most ``PANEL_LIMIT`` entries and a request
 ``REQUEST_LIMIT`` across its panels; what is past them is counted and
-shown. A span counts once for itself and once for each span beneath it,
-and a block of text once, a text panel keeping at most ``TEXT_LIMIT``
+shown. A span counts once for itself, once for each of its segments and
+once for each span beneath it, and a block of text once, a text panel keeping at most ``TEXT_LIMIT``
 characters.
 
 The worker starts keeping a request's panels when it takes the request
@@ -54,6 +56,7 @@ __all__ = [
     "REQUEST_LIMIT",
     "TEXT_LIMIT",
     "Panel",
+    "Segment",
     "Span",
     "Spans",
     "SpansPanel",
@@ -105,6 +108,27 @@ def _own() -> Iterator[None]:
 _NAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
 
+# How far a segment may lie outside its span, for times computed in
+# floating point.
+
+_SLACK = 1e-6
+
+
+@dataclass
+class Segment:
+    """One period of a span made of several, drawn on the span's one line.
+
+    Such as each of a request's waits for a lock. Times are milliseconds
+    on the record's clock. ``label`` names the segment in its tooltip,
+    the span's name when it is empty, and ``detail`` adds a line there.
+    """
+
+    start: float
+    duration: float
+    label: str = ""
+    detail: str = ""
+
+
 @dataclass
 class Span:
     """A named interval of a spans panel, with the spans beneath it.
@@ -112,19 +136,56 @@ class Span:
     Times are milliseconds on the record's clock, as a handle's ``now()``
     gives them. ``failed`` marks an operation that failed, which the
     toolbar draws so it stands out from its category's colour.
+
+    A span is a period, from ``start`` for ``duration``, or an event: a
+    moment, given as ``at`` in place of the start and the duration. A
+    period may be made of ``segments``, in order and within it, each
+    drawn on the span's line; a span of a single segment is drawn as an
+    ordinary period with that segment's start and duration. A span is
+    checked as it is added to a panel that keeps it, ``ValueError`` being
+    raised for an event with a start, a duration or segments of its own,
+    or segments out of order or outside their span.
     """
 
     name: str
-    start: float
-    duration: float
+    start: float = 0.0
+    duration: float = 0.0
     category: str = ""
     children: list[Span] = field(default_factory=list)
     failed: bool = False
+    at: float | None = None
+    segments: list[Segment] = field(default_factory=list)
 
     def size(self) -> int:
-        """Count the entries the span takes: itself and every span beneath it."""
+        """Count the entries the span takes: itself, its segments and every span beneath it."""
 
-        return 1 + sum(child.size() for child in self.children)
+        return 1 + len(self.segments) + sum(child.size() for child in self.children)
+
+    def _check(self) -> None:
+        # An event or a period, never both, and segments in order within
+        # their span; the spans beneath it too.
+
+        if self.at is not None:
+            if self.duration or self.segments or self.start not in (0, self.at):
+                raise ValueError(
+                    f"the span {self.name!r} is an event at {self.at} ms, "
+                    "so it has no start, duration or segments of its own"
+                )
+
+        ends = self.start + self.duration
+        previous = self.start
+
+        for segment in self.segments:
+            if segment.duration < 0 or segment.start < previous - _SLACK:
+                raise ValueError(f"the segments of the span {self.name!r} are not in order")
+
+            if segment.start + segment.duration > ends + _SLACK:
+                raise ValueError(f"a segment of the span {self.name!r} lies outside it")
+
+            previous = segment.start
+
+        for child in self.children:
+            child._check()
 
 
 # What one request's panels keep, from when the worker took it.
@@ -406,7 +467,15 @@ class Spans(_Handle):
     __slots__ = ()
 
     def add(self, span: Span) -> bool:
-        """Add a span, with those beneath it. Returns whether it was kept."""
+        """Add a span, with those beneath it. Returns whether it was kept.
+
+        A span the panel keeps is checked first, raising ``ValueError``
+        for an event with a duration or segments, or segments out of
+        order or outside their span.
+        """
+
+        if self.active:
+            span._check()
 
         return self._add(span.size(), lambda entries: entries.spans.append(span))
 
@@ -598,7 +667,9 @@ def _take(request: str) -> list[tuple[Any, ...]]:
     They come in their order of first use, as plain tuples: name, title,
     spans, values, tables, how many entries were not kept, the text, and
     whether it is markdown. A span is a tuple of its name, start,
-    duration, category, the spans beneath it and whether it failed.
+    duration, category, the spans beneath it, whether it failed, the
+    moment of an event or None, and its segments, each a tuple of its
+    start, duration, label and detail.
     """
 
     kept = _requests.pop(request, None)
@@ -628,11 +699,18 @@ def _take(request: str) -> list[tuple[Any, ...]]:
 
 
 def _span(span: Span) -> tuple[Any, ...]:
+    at = None if span.at is None else float(span.at)
+
     return (
         span.name,
-        float(span.start),
+        float(span.start if at is None else at),
         float(span.duration),
         span.category,
         [_span(child) for child in span.children],
         bool(span.failed),
+        at,
+        [
+            (float(segment.start), float(segment.duration), segment.label, segment.detail)
+            for segment in span.segments
+        ],
     )

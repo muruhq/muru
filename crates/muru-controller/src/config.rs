@@ -3196,6 +3196,12 @@ pub struct Tables<'a> {
     pub commands: Option<&'a BTreeMap<String, muru_config::CommandTable>>,
     /// Instrumentation modules (section 6.15).
     pub instrumentation: Option<&'a [muru_config::Instrumentation]>,
+    /// The modules the host imports after the entrypoint (section 6.1).
+    pub preload_modules: Option<&'a [String]>,
+    /// Whether imports are deferred with unwrapt (section 6.17).
+    pub lazy_imports: Option<bool>,
+    /// Whether the host records its imports (section 6.18).
+    pub import_report: Option<bool>,
     /// The release's own limits on the requests it serves (section
     /// 4.6): `max_body_size` and the request timeouts of `timeouts`.
     pub limits: Option<muru_config::RequestLimitSettings>,
@@ -3599,6 +3605,9 @@ pub fn resolve_declared(
         maintenance: table.maintenance.as_ref(),
         commands: (!table.commands.is_empty()).then_some(&table.commands),
         instrumentation: table.instrumentation.as_deref(),
+        preload_modules: table.preload_modules.as_deref(),
+        lazy_imports: table.lazy_imports,
+        import_report: table.import_report,
         declared: true,
     };
 
@@ -4206,6 +4215,29 @@ pub fn resolve_spec(
         .to_vec();
     muru_config::check_instrumentation(&instrumentation)?;
 
+    // Section 6.1: preload_modules is a list, so it too comes from the
+    // declaration, else the source.
+
+    let preload_modules = tables
+        .preload_modules
+        .unwrap_or(&table.preload_modules)
+        .to_vec();
+    muru_config::check_preload_modules(&preload_modules)?;
+
+    // Sections 6.17 and 6.18: lazy_imports and import_report from the
+    // declaration, else the source. Their module is not listed by hand;
+    // the host is given it at the head of the list when the release
+    // starts.
+
+    let lazy_imports = tables.lazy_imports.or(table.lazy_imports) == Some(true);
+    let import_report = tables.import_report.or(table.import_report) == Some(true);
+    muru_config::lazy_imports_instrumentation(
+        Some(lazy_imports),
+        Some(import_report),
+        0,
+        &instrumentation,
+    )?;
+
     // Section 11.6: the source's tracing key puts its module at the head
     // of the list, with the entry points to wrap. A declaration exported
     // from a release already carries the entry, and keeps it as it is.
@@ -4276,7 +4308,10 @@ pub fn resolve_spec(
             .then(|| request.hooks.clone())
             .or(table.hooks)
             .or_else(|| previous.and_then(|previous| previous.hooks.clone())),
+        preload_modules,
         instrumentation,
+        lazy_imports,
+        import_report,
         factory,
         reflection: request
             .reflection
@@ -5601,7 +5636,10 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         scaling: None,
         preload: parse_optional(&request.preload)?,
         hooks: (!request.hooks.is_empty()).then(|| request.hooks.clone()),
+        preload_modules: None,
         instrumentation: None,
+        lazy_imports: None,
+        import_report: None,
         groups: BTreeMap::new(),
         mounts: BTreeMap::new(),
         logging: None,
@@ -5696,7 +5734,10 @@ fn resolve_http_spec(
         concurrency: 0,
         preload: muru_config::Preload::Auto,
         hooks: None,
+        preload_modules: Vec::new(),
         instrumentation: Vec::new(),
+        lazy_imports: false,
+        import_report: false,
         factory: None,
         reflection: false,
         handoff: None,
@@ -6307,7 +6348,10 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         scaling: scaling_table(&spec.scaling),
         preload: Some(spec.preload),
         hooks: spec.hooks.clone(),
+        preload_modules: (!spec.preload_modules.is_empty()).then(|| spec.preload_modules.clone()),
         instrumentation: (!spec.instrumentation.is_empty()).then(|| spec.instrumentation.clone()),
+        lazy_imports: spec.lazy_imports.then_some(true),
+        import_report: spec.import_report.then_some(true),
         groups: spec
             .groups
             .iter()
@@ -6595,6 +6639,21 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "hooks",
         declared.hooks.clone().unwrap_or_default(),
         recorded.hooks.clone().unwrap_or_default(),
+    );
+    compare(
+        "preload_modules",
+        declared.preload_modules.join(", "),
+        recorded.preload_modules.join(", "),
+    );
+    compare(
+        "lazy_imports",
+        declared.lazy_imports.to_string(),
+        recorded.lazy_imports.to_string(),
+    );
+    compare(
+        "import_report",
+        declared.import_report.to_string(),
+        recorded.import_report.to_string(),
     );
     compare(
         "instrumentation",
@@ -7307,7 +7366,7 @@ mod tests {
     }
 
     #[test]
-    fn a_release_tables_instrumentation_replaces_the_sources_and_is_exported() {
+    fn a_release_tables_instrumentation_and_preload_modules_replace_the_sources() {
         let source = std::env::temp_dir().join(format!(
             "muru-config-instrumentation-{}",
             std::process::id()
@@ -7316,6 +7375,7 @@ mod tests {
         std::fs::write(
             source.join("pyproject.toml"),
             "[tool.muru]\nentrypoint = 'shop.wsgi:application'\n\
+             preload_modules = ['shop.reports']\n\
              [[tool.muru.instrumentation]]\nmodule = 'importtimer'\n\
              settings = { output = 'times.json' }\n",
         )
@@ -7349,6 +7409,39 @@ mod tests {
         let spec = resolve("[[app.shop.release.r1.instrumentation]]\nmodule = 'apm'\n").unwrap();
         assert_eq!(modules(&spec), ["apm"]);
         assert_eq!(table_from(&spec).instrumentation.unwrap()[0].module, "apm");
+
+        // Issue 739: preload_modules is a list as well, the source's
+        // unless the table gives one, and checked.
+
+        assert_eq!(resolve("").unwrap().preload_modules, ["shop.reports"]);
+        let spec = resolve("preload_modules = ['openpyxl']\n").unwrap();
+        assert_eq!(spec.preload_modules, ["openpyxl"]);
+        assert_eq!(table_from(&spec).preload_modules.unwrap(), ["openpyxl"]);
+        assert_eq!(
+            resolve("preload_modules = ['shop/reports']\n").unwrap_err(),
+            "preload_modules: \"shop/reports\" is not a dotted Python module name"
+        );
+
+        // Issue 740: lazy_imports from the table, its module at the head
+        // of the list the host is given and kept out of the release's own
+        // list, which may not name it.
+
+        assert!(!resolve("").unwrap().lazy_imports);
+        let spec = resolve("lazy_imports = true\n").unwrap();
+        let given: Vec<String> = spec
+            .host_instrumentation()
+            .into_iter()
+            .map(|entry| entry.module)
+            .collect();
+        assert_eq!(given, [muru_config::LAZY_IMPORTS_MODULE, "importtimer"]);
+        assert_eq!(modules(&spec), ["importtimer"]);
+        assert_eq!(table_from(&spec).lazy_imports, Some(true));
+        let by_hand = "[[app.shop.release.r1.instrumentation]]\nmodule = 'muru._lazy_imports'\n";
+        assert!(
+            resolve(by_hand)
+                .unwrap_err()
+                .contains("set up by the lazy_imports and import_report keys")
+        );
 
         // A module named twice is refused.
 

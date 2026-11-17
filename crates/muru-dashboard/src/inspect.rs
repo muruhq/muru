@@ -84,6 +84,10 @@ pub struct StatusRow {
     pub uptime: String,
     /// Requests it has served.
     pub requests: u64,
+    /// Modules it has loaded for the first time since the fork (issue
+    /// 738), so a worker still loading code long after it started
+    /// stands out.
+    pub modules: u64,
     /// Its application threads, when requests run on them.
     pub threads: Option<SideView>,
     /// Its event loop, when it has one.
@@ -133,7 +137,7 @@ pub struct StatusShape {
 impl StatusShape {
     /// The columns of a row after the pid: the group and the figures.
     pub fn width(&self) -> usize {
-        7 + 2 * usize::from(self.threads)
+        8 + 2 * usize::from(self.threads)
             + 2 * usize::from(self.event_loop)
             + 2 * usize::from(self.sync)
     }
@@ -340,6 +344,7 @@ pub fn status_rows(answer: &DebugAnswer) -> Vec<StatusRow> {
                 group: result["group"].as_str().unwrap_or("default").to_owned(),
                 uptime: uptime_text(result["uptime_s"].as_f64().unwrap_or(0.0) as u64),
                 requests: result["requests"].as_u64().unwrap_or(0),
+                modules: result["modules"].as_u64().unwrap_or(0),
                 threads: side_view(&result["threads"], stale),
                 event_loop: side_view(&result["loop"], stale),
                 sync: side_view(&result["sync"], stale),
@@ -698,7 +703,7 @@ mod tests {
                 stale: true
             }
         );
-        assert_eq!(shape.width(), 11);
+        assert_eq!(shape.width(), 12);
         assert_eq!(age(400), "0.4s");
         assert_eq!(age(62_000), "1m02s");
     }

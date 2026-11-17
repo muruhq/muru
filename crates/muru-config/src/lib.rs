@@ -1014,10 +1014,26 @@ pub struct Release {
     /// The module holding the lifecycle hooks, as a Python module name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<String>,
+    /// Modules the host imports after the entrypoint and the mounts, so
+    /// they are loaded once before the fork (section 6.1); when given,
+    /// they replace the list in the source's `[tool.muru]` table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preload_modules: Option<Vec<String>>,
     /// The instrumentation modules, in order (section 6.15); when given,
     /// they replace the list in the source's `[tool.muru]` table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instrumentation: Option<Vec<Instrumentation>>,
+    /// Defer imports with unwrapt (section 6.17); when given, it takes
+    /// the place of the source's `lazy_imports`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's"))]
+    pub lazy_imports: Option<bool>,
+    /// Record the host's imports for `muructl debug imports` (section
+    /// 6.18); when given, it takes the place of the source's
+    /// `import_report`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's"))]
+    pub import_report: Option<bool>,
     /// Worker groups by name (section 7.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub groups: BTreeMap<String, Group>,
@@ -4195,23 +4211,44 @@ pub struct Instrumentation {
     pub settings: BTreeMap<String, serde_json::Value>,
 }
 
+/// Whether `name` is a dotted Python module name.
+fn dotted(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|part| {
+            let mut chars = part.chars();
+
+            chars
+                .next()
+                .is_some_and(|first| first.is_alphabetic() || first == '_')
+                && chars.all(|rest| rest.is_alphanumeric() || rest == '_')
+        })
+}
+
+/// Check a release's `preload_modules` (section 6.1): every module a
+/// dotted Python name, and none named twice.
+pub fn check_preload_modules(modules: &[String]) -> Result<(), String> {
+    for (index, module) in modules.iter().enumerate() {
+        if !dotted(module) {
+            return Err(format!(
+                "preload_modules: {module:?} is not a dotted Python module name"
+            ));
+        }
+
+        if modules[..index].contains(module) {
+            return Err(format!("preload_modules: {module} is listed twice"));
+        }
+    }
+
+    Ok(())
+}
+
 /// Check a release's instrumentation list (section 6.15): every module a
 /// dotted Python name, and none named twice.
 pub fn check_instrumentation(entries: &[Instrumentation]) -> Result<(), String> {
     let mut seen: Vec<&str> = Vec::new();
 
     for entry in entries {
-        let dotted = !entry.module.is_empty()
-            && entry.module.split('.').all(|part| {
-                let mut chars = part.chars();
-
-                chars
-                    .next()
-                    .is_some_and(|first| first.is_alphabetic() || first == '_')
-                    && chars.all(|rest| rest.is_alphanumeric() || rest == '_')
-            });
-
-        if !dotted {
+        if !dotted(&entry.module) {
             return Err(format!(
                 "instrumentation module {:?} is not a dotted Python module name",
                 entry.module
@@ -4347,6 +4384,85 @@ pub fn tracing_instrumentation(
         module: TRACING_MODULE.to_owned(),
         settings,
     }))
+}
+
+/// The module that defers imports with unwrapt and records the import
+/// report (sections 6.17 and 6.18), put at the head of a release's
+/// instrumentation list, ahead of tracing's, when `lazy_imports` or
+/// `import_report` is on.
+pub const LAZY_IMPORTS_MODULE: &str = "muru._lazy_imports";
+
+/// The instrumentation entry that defers imports and records the import
+/// report (sections 6.17 and 6.18), or None when both keys are off. The
+/// module listed by hand is refused.
+pub fn lazy_imports_instrumentation(
+    lazy_imports: Option<bool>,
+    import_report: Option<bool>,
+    workers: usize,
+    listed: &[Instrumentation],
+) -> Result<Option<Instrumentation>, String> {
+    if listed
+        .iter()
+        .any(|entry| entry.module == LAZY_IMPORTS_MODULE)
+    {
+        return Err(format!(
+            "instrumentation module {LAZY_IMPORTS_MODULE} is set up by the lazy_imports and import_report keys, not listed"
+        ));
+    }
+
+    Ok(lazy_imports_entry(
+        lazy_imports == Some(true),
+        import_report == Some(true),
+        workers,
+    ))
+}
+
+/// The instrumentation entry of the module that defers imports and
+/// records the import report (sections 6.17 and 6.18), or None when it
+/// does neither. Its settings say which it does, and how many workers the
+/// release starts with, for the report's analysis; unwrapt finds its own
+/// configuration.
+pub fn lazy_imports_entry(defer: bool, report: bool, workers: usize) -> Option<Instrumentation> {
+    if !defer && !report {
+        return None;
+    }
+
+    let mut settings = BTreeMap::new();
+    settings.insert("defer".to_owned(), serde_json::json!(defer));
+    settings.insert("report".to_owned(), serde_json::json!(report));
+    settings.insert("workers".to_owned(), serde_json::json!(workers));
+
+    Some(Instrumentation {
+        module: LAZY_IMPORTS_MODULE.to_owned(),
+        settings,
+    })
+}
+
+/// The unwrapt configuration file a host running in `dir` finds (section
+/// 6.17), as unwrapt looks for it: the path in `UNWRAPT_CONFIG`, given as
+/// `variable`, relative to `dir`, whether or not it exists; else
+/// `unwrapt.toml` in `dir`; else `pyproject.toml` in `dir` when it has a
+/// `[tool.unwrapt]` table. None when there is none.
+pub fn find_unwrapt_config(dir: &Path, variable: Option<&str>) -> Option<PathBuf> {
+    if let Some(named) = variable.filter(|named| !named.is_empty()) {
+        return Some(dir.join(named));
+    }
+
+    let own = dir.join("unwrapt.toml");
+
+    if own.is_file() {
+        return Some(own);
+    }
+
+    let pyproject = dir.join("pyproject.toml");
+    let text = std::fs::read_to_string(&pyproject).ok()?;
+    let document: toml::Table = toml::from_str(&text).ok()?;
+
+    document
+        .get("tool")
+        .and_then(|tool| tool.get("unwrapt"))
+        .is_some_and(toml::Value::is_table)
+        .then_some(pyproject)
 }
 
 /// Check an application's static directories (section 4.9): each path
@@ -4863,7 +4979,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
     }
 
     let timeouts = table.timeouts.as_ref();
-    let worker_keys: [(&str, bool); 24] = [
+    let worker_keys: [(&str, bool); 27] = [
         ("entrypoint", !table.entrypoint.is_empty()),
         ("interface", table.interface.is_some()),
         ("handoff", table.handoff.is_some()),
@@ -4877,7 +4993,10 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
         ("scaling", table.scaling.is_some()),
         ("preload", table.preload.is_some()),
         ("hooks", table.hooks.is_some()),
+        ("preload_modules", table.preload_modules.is_some()),
         ("instrumentation", table.instrumentation.is_some()),
+        ("lazy_imports", table.lazy_imports.is_some()),
+        ("import_report", table.import_report.is_some()),
         ("groups", !table.groups.is_empty()),
         ("mounts", !table.mounts.is_empty()),
         ("logging", table.logging.is_some()),
@@ -5557,6 +5676,11 @@ pub struct LocalFile {
     /// `tracing` (section 11.6), which takes the place of the project's
     /// for this machine's runs.
     pub tracing: Option<Tracing>,
+    /// `lazy_imports` (section 6.17), which takes the place of the
+    /// project's for this machine's runs.
+    pub lazy_imports: Option<bool>,
+    /// `import_report` (section 6.18), likewise.
+    pub import_report: Option<bool>,
 }
 
 /// The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a
@@ -5957,6 +6081,14 @@ pub struct ToolMuru {
     /// The module providing the lifecycle hooks (section 6.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<String>,
+    /// Modules the host imports after the entrypoint and the mounts, and
+    /// before the `on_load` and `pre_fork` hooks (section 6.1), so a
+    /// module the application only imports on first use is loaded once
+    /// before the fork rather than in every worker. With per-worker
+    /// imports each worker imports them as part of its load. A module
+    /// that cannot be imported fails the load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preload_modules: Vec<String>,
     /// The instrumentation modules, in order (section 6.15), each with
     /// its settings, imported before anything of the application.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -5973,6 +6105,20 @@ pub struct ToolMuru {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub tracing_middleware: Option<bool>,
+    /// Defer imports with unwrapt (section 6.17): each module's
+    /// `__lazy_modules__` from Python 3.11 to 3.14, and the
+    /// `[tool.unwrapt.lazy_modules]` table on every version. The
+    /// project's environment needs the unwrapt package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub lazy_imports: Option<bool>,
+    /// Record the host's imports with unwrapt's profile recorder as it
+    /// loads the application, for `muructl debug imports` (section 6.18),
+    /// with or without `lazy_imports`. The project's environment needs
+    /// the unwrapt package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub import_report: Option<bool>,
     /// The interpreter: a path, or a request in uv's syntax such as
     /// "3.13", "3.14t" or ">=3.12" (section 8.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6363,11 +6509,11 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
     if let Some(key) = document.keys().find(|key| {
         !matches!(
             key.as_str(),
-            "run" | "build" | "instrumentation" | "tracing"
+            "run" | "build" | "instrumentation" | "tracing" | "lazy_imports" | "import_report"
         )
     }) {
         return Err(format!(
-            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table, the when key of [build], [[instrumentation]] and tracing; the application's settings belong in {there}"
+            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table, the when key of [build], [[instrumentation]], tracing, lazy_imports and import_report; the application's settings belong in {there}"
         ));
     }
 
@@ -6426,11 +6572,19 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
         None => None,
     };
 
+    let flag = |key: &str| match document.get(key) {
+        Some(toml::Value::Boolean(on)) => Ok(Some(*on)),
+        Some(_) => Err(format!("{key}: true or false")),
+        None => Ok(None),
+    };
+
     Ok(LocalFile {
         run,
         build_when,
         instrumentation,
         tracing,
+        lazy_imports: flag("lazy_imports")?,
+        import_report: flag("import_report")?,
     })
 }
 
@@ -7444,6 +7598,85 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(error.starts_with("tracing: "), "{error}");
 
         assert_eq!(parse_local("", None).unwrap().tracing, None);
+    }
+
+    #[test]
+    fn the_unwrapt_configuration_is_found_as_unwrapt_finds_it() {
+        let dir = std::env::temp_dir().join(format!("muru-config-unwrapt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[tool.muru]\nlazy_imports = true\n",
+        )
+        .unwrap();
+        assert_eq!(find_unwrapt_config(&dir, None), None);
+
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[tool.unwrapt.lazy_modules]\n\"shop.views\" = [\"openpyxl\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_unwrapt_config(&dir, None),
+            Some(dir.join("pyproject.toml"))
+        );
+
+        std::fs::write(dir.join("unwrapt.toml"), "").unwrap();
+        assert_eq!(
+            find_unwrapt_config(&dir, None),
+            Some(dir.join("unwrapt.toml"))
+        );
+        assert_eq!(
+            find_unwrapt_config(&dir, Some("conf/defer.toml")),
+            Some(dir.join("conf/defer.toml"))
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lazy_imports_is_a_flag_whose_module_heads_the_list() {
+        let local = parse_local("lazy_imports = true\n", None).unwrap();
+        assert_eq!(local.lazy_imports, Some(true));
+        assert_eq!(
+            parse_local("lazy_imports = 'yes'\n", None).unwrap_err(),
+            "lazy_imports: true or false"
+        );
+
+        let entry = lazy_imports_instrumentation(Some(true), None, 2, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.module, LAZY_IMPORTS_MODULE);
+        assert_eq!(
+            serde_json::json!(entry.settings),
+            serde_json::json!({"defer": true, "report": false, "workers": 2})
+        );
+        assert_eq!(
+            lazy_imports_instrumentation(Some(false), None, 2, &[]).unwrap(),
+            None
+        );
+        assert_eq!(
+            lazy_imports_instrumentation(None, None, 2, &[]).unwrap(),
+            None
+        );
+
+        // Issue 741: the import report alone records with nothing deferred.
+
+        let report = lazy_imports_instrumentation(None, Some(true), 2, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.settings["defer"], false);
+        assert_eq!(report.settings["report"], true);
+        assert_eq!(
+            parse_local("import_report = true\n", None)
+                .unwrap()
+                .import_report,
+            Some(true)
+        );
+
+        let listed = [entry];
+        let error = lazy_imports_instrumentation(Some(true), None, 2, &listed).unwrap_err();
+        assert!(error.contains("set up by the lazy_imports"), "{error}");
     }
 
     #[test]

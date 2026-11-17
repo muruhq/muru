@@ -219,6 +219,11 @@ Server-Timing: queue;dur=0.21, app;dur=17.93, muru;desc="01JCZ8X4R3T5V6W7Y8Z9A0B
 - `app` is the time from handing the request to the worker until the
   response head arrived.
 
+- `import`, when the worker loaded modules for the first time while the
+  request ran and before its response head, is how long that took, the
+  modules each one imported in turn included. A module is loaded once in
+  each worker, so the entry is on the first request that needed it.
+
 - `muru` carries the request's ID, the same as `X-Request-ID`.
 
 The browser's developer tools show the figures with no setup: in the
@@ -254,19 +259,25 @@ stands out in the rest, which [has a section of its own](#hints):
 
 - **Timing:** the request's phases from its arrival, each with when it
   started, how long it took and a bar placed where it falls in the
-  request:
+  request, and the moments that mark it, each in italics, with its time
+  under Starts, a dash under Takes, a diamond on its row and a faint
+  dashed line through every row, darker while the pointer is over the
+  moment's row:
 
   - **waiting for a worker**, until one was free to take the request;
-  - **until the response head**, from handing the request to the worker
-    until the response's status and headers came back;
-  - **in the worker**, the worker's own account of the same time, from
-    receiving the request: **until the response starts** (the
-    application calling `start_response` or sending
-    `http.response.start`), **producing the body** from its first byte
-    to its last, and **finishing**, until the body's `close()` returned
-    or the ASGI application returned;
-  - **sending the response**, from the head's arrival until the last
-    byte was sent to the client.
+
+  - **in the worker**, the worker's own account, from receiving the
+    request: **running the application**, from the end of the waits it
+    started with until the application called `start_response` or sent
+    `http.response.start`, the moment *response started*, **producing
+    the body** from its first byte to its last, and **finishing**, until
+    the body's `close()` returned or the ASGI application returned;
+
+  - *response head at the edge*, the moment the response's status and
+    headers came back from the worker;
+
+  - **sending the response**, from then until the last byte was sent to
+    the client.
 
   Under "in the worker", marked where they happened, are the waits that
   were not the request's own work:
@@ -274,22 +285,53 @@ stands out in the rest, which [has a section of its own](#hints):
   - **waiting for a thread**, from the worker taking a WSGI request
     until one of its threads started it;
 
-  - **waiting for the GIL**, as that thread, or the event loop for an
-    ASGI request, started running Python;
+  - **waiting for the GIL**, each time that thread, or the event loop
+    for an ASGI request, waited to run Python for the request, counting
+    the waits as an ASGI request's `receive()` calls were woken;
 
-  - **event loop held**, the longest stretch during the request in
-    which the worker's event loop did not get to run. It says the loop
-    was blocked, by this request or another one on it, not what blocked
-    it.
+  - **event loop held**, each stretch during the request in which the
+    worker's event loop did not get to run. It says the loop was
+    blocked, by this request or another one on it, not what blocked it.
+
+  Beside them is **importing modules**: each module the request loaded
+  for the first time in this worker, from the import that asked for it
+  to the end of its code, as a segment named by the module. A module it
+  imports in turn is within the segment of the one that imported it,
+  not drawn again. A module already loaded, by the host before the
+  fork or by an earlier request in the worker, costs nothing and is not
+  shown, so the row is on a worker's first request to a page and gone
+  from the second. Loading such modules before the worker serves is
+  what the [`preload_modules`](../explanation/preload.md#modules-loaded-on-first-use)
+  setting does.
+
+  A row of several waits, stretches or modules draws each of them as a
+  segment on its one line, says how many under Starts and gives their
+  total under Takes; a row of one draws it as an ordinary bar. The first
+  64 waits for the GIL, and the 64 longest stretches with the loop held,
+  are drawn; the rest are counted.
+
+  Pointing at a bar, a segment or a moment, giving it keyboard focus
+  with Tab, or tapping it, shows what it is: its name, when it started,
+  how long it took, and for a segment which of the row's it is.
 
   A table under the waterfall, "During the request", gives the same
-  with what cannot be placed on it: the GIL wait in all with how many
-  waits there were, counting those as an ASGI request's `receive()`
-  calls were woken, and the garbage collections that ran while the
-  request was in the worker, how many and how long they took, by
-  generation. A collection pauses every thread of the worker, so it
+  with what cannot be placed on it: the GIL waits in all with how many
+  there were, the stretches with the loop held in all with how many
+  there were and the longest, and the garbage collections that ran
+  while the request was in the worker, how many and how long they took,
+  by generation. A collection pauses every thread of the worker, so it
   holds up whatever requests are in flight. On a free-threaded build
   there is no GIL, and no GIL wait is shown.
+
+  The table's "modules loaded on first use" row gives how many modules
+  the request loaded and how long they took, and "Modules loaded on
+  first use" below it opens to list each of them in the order they
+  began: when it started, how long it took and the file and line whose
+  import asked for it, a module imported by another indented beneath it.
+  A record lists the first 200 and counts the rest. With
+  [`lazy_imports`](lazy-imports.md) on, a module whose deferred import the
+  request used is marked "(deferred)", and its file and line are those of
+  the code that used it.
 
   The panel lists the same under "What the phases are".
 
@@ -375,6 +417,7 @@ and change nothing. Each has a threshold, at or past which it is shown:
 | a long wait for a worker | Timing | the request waited 100 ms or more for a worker, which says the run had too few for the page's requests; the hint names `processes` (`--processes`) |
 | a long wait for a thread | Timing | a WSGI request waited 100 ms or more for a thread of its worker; the hint names `threads` (`--threads`) |
 | garbage collection | Timing | collections during the request took 50 ms or more in all, or there were 20 or more of them |
+| modules loaded on first use | Timing | the modules the worker loaded for the first time during the request took 25% or more of its total time, and at least 50 ms; the hint names the longest and `preload_modules`, which loads them before the worker serves |
 | an answer of Muru's own | Errors | Muru answered the request itself for a timeout or a size limit, such as 504 `deadline` or 413 `body_too_large`; the hint names the setting, such as `request_deadline` (`--timeout deadline=` for a run) |
 
 At most 3 hints of one kind are shown, the strongest first. The same
@@ -464,11 +507,15 @@ GET /orders/42 HTTP/1.1  500  2.0ms  at 10:42:07.123
 request 01JCZ8X4R3T5V6W7Y8Z9A0B1C2
 
 Timing
-  request                    2.0ms  from 0.0ms
-    waiting for a worker     0.0ms  from 0.0ms
-    until the response head  1.9ms  from 0.0ms
-    in the worker            1.8ms  from 0.0ms
-    sending the response     0.0ms  from 1.9ms
+  request                      2.0ms  from 0.0ms
+    waiting for a worker       0.0ms  from 0.0ms
+    in the worker              1.8ms  from 0.0ms
+      running the application  1.7ms  from 0.1ms
+      response started         at 1.8ms
+      producing the body       0.0ms  from 1.8ms
+      finishing                0.0ms  from 1.8ms
+    response head at the edge  at 1.9ms
+    sending the response       0.0ms  from 1.9ms
 
 Where
   application       shop@r3

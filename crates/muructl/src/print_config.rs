@@ -335,6 +335,14 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
         top.push(Row::new("hooks", hooks, app(args.hooks.is_some(), "hooks")));
     }
 
+    if !resolved.preload_modules.is_empty() {
+        top.push(Row::new(
+            "preload_modules",
+            &resolved.preload_modules,
+            app(false, "preload_modules"),
+        ));
+    }
+
     // Section 6.15: muru.local.toml's instrumentation entries come before
     // the project's, so the row names both when both give some.
 
@@ -372,6 +380,26 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
 
     if let Some(middleware) = resolved.tracing_middleware {
         top.push(Row::new("tracing_middleware", middleware, project.clone()));
+    }
+
+    // Section 6.17: deferring imports, from muru.local.toml or the project.
+
+    if let Some(lazy_imports) = resolved.lazy_imports {
+        let source = match &resolved.lazy_imports_from_local {
+            Some(path) => path.display().to_string(),
+            None => project.clone(),
+        };
+
+        top.push(Row::new("lazy_imports", lazy_imports, source));
+    }
+
+    if let Some(import_report) = resolved.import_report {
+        let source = match &resolved.import_report_from_local {
+            Some(path) => path.display().to_string(),
+            None => project.clone(),
+        };
+
+        top.push(Row::new("import_report", import_report, source));
     }
 
     if let Some(python) = args.python.as_ref().or(resolved.python.as_ref()) {
@@ -581,6 +609,8 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
         trailer.push("The serve table is muructl serve's, and is not read here.".to_owned());
     }
 
+    trailer.extend(unwrapt_note(resolved));
+
     // What the run's .env file sets, by name and never by value.
 
     if let Some(file) = &serving.env_file {
@@ -598,6 +628,33 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
         rows,
         trailer,
     }
+}
+
+/// The line of the report naming the unwrapt configuration the host finds
+/// when `lazy_imports` is on (section 6.17): through `UNWRAPT_CONFIG` in
+/// the release's environment or muructl's own, else in the project's
+/// directory.
+fn unwrapt_note(resolved: &crate::Resolved) -> Option<String> {
+    if resolved.lazy_imports != Some(true) && resolved.import_report != Some(true) {
+        return None;
+    }
+
+    let variable = match resolved.env.get("UNWRAPT_CONFIG") {
+        Some(muru_config::EnvValue::Plain(value)) => Some(value.clone()),
+        _ => std::env::var("UNWRAPT_CONFIG").ok(),
+    };
+
+    Some(
+        match muru_config::find_unwrapt_config(&resolved.project, variable.as_deref()) {
+            Some(path) => format!("unwrapt's configuration is read from {}.", path.display()),
+            None if resolved.lazy_imports == Some(true) => {
+                "No unwrapt configuration is found, so only each module's __lazy_modules__ \
+                 is deferred."
+                    .to_owned()
+            }
+            None => "No unwrapt configuration is found.".to_owned(),
+        },
+    )
 }
 
 /// The line of the report for the run's `.env` file: what it sets, and
@@ -676,6 +733,14 @@ pub fn serve_settings(resolved: &crate::Resolved, serve: Serve) -> Settings {
         top.push(Row::new("hooks", hooks, app("hooks")));
     }
 
+    if !resolved.preload_modules.is_empty() {
+        top.push(Row::new(
+            "preload_modules",
+            &resolved.preload_modules,
+            app("preload_modules"),
+        ));
+    }
+
     if !resolved.instrumentation.is_empty() {
         top.push(Row::new(
             "instrumentation",
@@ -690,6 +755,14 @@ pub fn serve_settings(resolved: &crate::Resolved, serve: Serve) -> Settings {
 
     if let Some(middleware) = resolved.tracing_middleware {
         top.push(Row::new("tracing_middleware", middleware, project.clone()));
+    }
+
+    if let Some(lazy_imports) = resolved.lazy_imports {
+        top.push(Row::new("lazy_imports", lazy_imports, project.clone()));
+    }
+
+    if let Some(import_report) = resolved.import_report {
+        top.push(Row::new("import_report", import_report, project.clone()));
     }
 
     if let Some(requests) = resolved.max_requests {
@@ -719,6 +792,8 @@ pub fn serve_settings(resolved: &crate::Resolved, serve: Serve) -> Settings {
     if has(&layers.table, "run") {
         trailer.push("The run table is muructl run's, and is not read here.".to_owned());
     }
+
+    trailer.extend(unwrapt_note(resolved));
 
     trailer.extend(serve.trailer);
 

@@ -9,7 +9,7 @@
 </head>
 <body>
 <header>
-  <h1>Muru</h1>
+  <h1><a href="./" title="The dashboard's front page">Muru</a></h1>
   <span>daemon pid {{ data.pid }}, version {{ data.version }}</span>
   <span>up {{ data.uptime }}</span>
   {% for listener in data.listeners %}<span>{{ listener }}</span>{% endfor %}
@@ -38,6 +38,7 @@
   </section>
 </main>
 <script src="static/htmx.min.js"></script>
+<script src="static/scroll.js"></script>
 <script src="static/sse.js"></script>
 <script src="static/uplot.min.js"></script>
 <script src="static/charts.js"></script>

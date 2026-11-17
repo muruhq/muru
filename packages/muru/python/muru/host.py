@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import faulthandler
 import functools
 import gc
@@ -61,7 +62,16 @@ from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any, TextIO
 
-from muru import RequestTimeout, _asgi, _inspect, _instrumentation, _outside, _signals, preload
+from muru import (
+    RequestTimeout,
+    _asgi,
+    _imports,
+    _inspect,
+    _instrumentation,
+    _outside,
+    _signals,
+    preload,
+)
 from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
@@ -153,6 +163,14 @@ STARTUP_WINDOW_SECONDS = 5.0
 MAX_START_FAILURES = 3
 PRELOAD_MODES = ("auto", "true", "false")
 READ_SIZE = 65536
+
+# Section 6.18: the import report goes to the supervisor in parts of at
+# most this many characters, so no one line holds the host's loop for
+# long; and a report made before a fallback to per-worker imports waits
+# in the run directory, under this name, for the host started again.
+
+IMPORTS_PART = 1 << 20
+IMPORTS_FILE = "imports.json"
 
 # Section 11.3: how many exited workers' pipes are kept for a relay that
 # has not read them yet: 64 workers' worth.
@@ -663,6 +681,11 @@ class Release:
 
     instruments: Instruments = field(default_factory=Instruments)
 
+    # Section 6.1: the modules imported after the entrypoint and the
+    # mounts, before the on_load hook.
+
+    preload_modules: list[str] = field(default_factory=list)
+
     @property
     def preloaded(self) -> bool:
         """Whether the entrypoint was imported in the host."""
@@ -712,6 +735,29 @@ class Release:
                 self.accept(self.target())
 
         return self.hooks
+
+    def load_modules(
+        self,
+        recorder: preload.ImportRecorder | None = None,
+        *,
+        instruments: Instruments | None = None,
+        context: Context | None = None,
+    ) -> None:
+        """Import the release's ``preload_modules``, in order, after the entrypoint and mounts.
+
+        Each import is bracketed by the instrumentation modules' before_import
+        and after_import, as a target of kind ``module``, and goes through
+        the import check's recorder when there is one. A module that cannot
+        be imported raises, which fails the load.
+        """
+
+        import_module = recorder.import_module if recorder else importlib.import_module
+        instruments = instruments or Instruments()
+        context = context or self.context
+
+        for name in self.preload_modules:
+            with instruments.importing(context, Target("module", "", name)):
+                import_module(name)
 
     def accept(self, app: Any) -> None:
         """Keep the application and settle the interface it is served with.
@@ -1047,6 +1093,9 @@ class WorkerState:
     started_at: float
     report_fd: int
     requests: int = 0
+    modules: int = 0
+    modules_us: int = 0
+    load_us: int = 0
     in_flight: int = 0
     oldest_ms: int = 0
     ready: bool = False
@@ -1372,6 +1421,17 @@ class Host:
         self.supervisor_buffer = b""
         self.version = 0
         self.acked = 0
+
+        # Section 6.18: the load's import report, sent to each supervisor
+        # that connects.
+
+        self.imports: str | None = None
+
+        # Issue 753: how the host's own load went, sent to each supervisor
+        # that connects, the first told it is news.
+
+        self.loaded: dict[str, Any] | None = None
+        self.loaded_sent = False
 
         # Section 6.7: the interfaces the workers settled themselves, by
         # mount, for an application imported in each worker or made by a
@@ -1785,6 +1845,8 @@ class Host:
                             instruments=instruments, context=context, mount=mount.name
                         )
 
+                    release.load_modules(instruments=instruments, context=context)
+                    note_worker_loaded((time.monotonic() - started) * 1000.0)
                     log(
                         f"worker {self.worker_name(index)} "
                         f"imported {release.spec} in {elapsed_ms(started)} ms"
@@ -1799,6 +1861,12 @@ class Host:
                     raise
 
                 instruments.finished(context, _instrumentation.SERVE)
+
+            # Issue 738: from here on, a module loaded for the first time
+            # is timed, for the record of the request it ran under and the
+            # worker's count of them.
+
+            _imports.install()
 
             # Section 6.15: the instrumentation modules start in the worker
             # just before post_fork, before the loop exists.
@@ -2323,6 +2391,32 @@ class Host:
         self.supervisor_buffer = b""
         self.selector.register(connection, selectors.EVENT_READ)
         self.send_to_supervisor(self.workers_message())
+        self.send_imports()
+
+        if self.loaded is not None:
+            self.send_to_supervisor(
+                {"type": "loaded", **self.loaded, "first": not self.loaded_sent}
+            )
+            self.loaded_sent = True
+
+    def send_imports(self) -> None:
+        """Send the load's import report to the supervisor, in parts, if there is one."""
+
+        if self.imports is None:
+            return
+
+        text = self.imports
+        parts = max(1, -(-len(text) // IMPORTS_PART))
+
+        for part in range(parts):
+            self.send_to_supervisor(
+                {
+                    "type": "imports",
+                    "part": part,
+                    "parts": parts,
+                    "data": text[part * IMPORTS_PART : (part + 1) * IMPORTS_PART],
+                }
+            )
 
     def drop_supervisor(self) -> None:
         """Close the supervisor connection, if there is one."""
@@ -3091,6 +3185,7 @@ class Host:
                 "debugging": state.debug_sessions > 0,
                 "uptime_s": round(time.monotonic() - state.started_at, 1),
                 "requests": state.requests,
+                "modules": state.modules,
                 **{key: sides[key] for key in SIDES if key in sides},
                 "stale": live is None and bool(state.sides),
                 **state.memory,
@@ -3344,6 +3439,9 @@ class Host:
 
             state.last_report_at = time.monotonic()
             state.requests = int(report.get("requests", state.requests))
+            state.modules = int(report.get("modules", state.modules))
+            state.modules_us = int(report.get("modules_us", state.modules_us))
+            state.load_us = int(report.get("load_us", state.load_us))
             state.in_flight = int(report.get("in_flight", state.in_flight))
             state.oldest_ms = int(report.get("oldest_ms", state.oldest_ms))
             state.sides = {key: report[key] for key in SIDES if key in report}
@@ -3479,6 +3577,9 @@ class Host:
                         "requests": state.requests,
                         "in_flight": state.in_flight,
                         "oldest_ms": state.oldest_ms,
+                        "modules": state.modules,
+                        "modules_us": state.modules_us,
+                        "load_us": state.load_us,
                         **sync_pools(state.sides),
                         **state.memory,
                         **state.signals,
@@ -4748,7 +4849,7 @@ class Host:
 
         while self.workers and time.monotonic() < deadline:
             try:
-                pid, _status = os.waitpid(-1, os.WNOHANG)
+                pid, status = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
                 self.workers.clear()
                 break
@@ -4757,7 +4858,13 @@ class Host:
                 time.sleep(0.05)
                 continue
 
-            self.workers.pop(pid, None)
+            index = self.workers.pop(pid, None)
+
+            # A worker that stops as it should exits with status 0; one
+            # that does not may have lost the requests it was finishing.
+
+            if index is not None and status != 0:
+                log(f"worker {self.worker_name(index)} (pid {pid}) exited with {describe(status)}")
 
         # Whatever is left is killed and reaped.
 
@@ -5076,6 +5183,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--hooks", default=None, help="module providing the lifecycle hooks")
     parser.add_argument(
+        "--preload-module",
+        dest="preload_modules",
+        action="append",
+        default=[],
+        help="a module to import after the entrypoint and mounts; repeatable",
+    )
+    parser.add_argument(
         "--single",
         action="store_true",
         help="serve in this process with one thread and no fork, for debuggers",
@@ -5343,6 +5457,72 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def note_worker_loaded(ms: float) -> None:
+    """Tell the runtime how long the worker took to load the application, for its reports."""
+
+    try:
+        from muru import _native
+
+        _native.worker_loaded(ms)
+    except (ImportError, AttributeError):
+        pass
+
+
+def imports_summary() -> dict[str, Any] | None:
+    """Return the headline figures of the load's import report, when there is one."""
+
+    module = sys.modules.get("muru._lazy_imports")
+    summary: dict[str, Any] | None = module.summary() if module is not None else None
+    return summary
+
+
+def imports_report() -> str | None:
+    """Take the import report this process's load made, as JSON, when import_report is on.
+
+    The host keeps it as one string, which the garbage collector never
+    walks, so the workers it forks share its pages rather than copying
+    them as a collection touches the objects of a parsed document.
+    """
+
+    module = sys.modules.get("muru._lazy_imports")
+    report: str | None = module.take_payload() if module is not None else None
+    return report
+
+
+def carry_imports(run_dir: str) -> None:
+    """Leave the load's import report in the run directory, for the host started again."""
+
+    report = imports_report()
+
+    if report is None:
+        return
+
+    try:
+        os.makedirs(run_dir, exist_ok=True)
+
+        with open(os.path.join(run_dir, IMPORTS_FILE), "w", encoding="utf-8") as file:
+            file.write(report)
+    except OSError as error:
+        log(f"the import report could not be kept for the per-worker imports: {error}")
+
+
+def carried_imports(run_dir: str) -> str | None:
+    """Take the import report a host that fell back left in the run directory, if any."""
+
+    path = os.path.join(run_dir, IMPORTS_FILE)
+
+    try:
+        with open(path, encoding="utf-8") as file:
+            report = file.read()
+    except OSError:
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+    return report or None
+
+
 def parse_logger_level(text: str) -> tuple[str, str]:
     """Parse NAME=LEVEL for --logger."""
 
@@ -5449,6 +5629,7 @@ def _main(argv: list[str] | None) -> int:
         factory=args.factory,
         factory_phase=args.factory_phase,
         instruments=Instruments(instrumentation),
+        preload_modules=args.preload_modules,
     )
 
     try:
@@ -5486,6 +5667,7 @@ def _main(argv: list[str] | None) -> int:
     # Section 6.2 step 1: no collections during preload.
 
     gc.disable()
+    loaded_ms = 0.0
 
     if args.preload != "false":
         started = time.monotonic()
@@ -5514,6 +5696,8 @@ def _main(argv: list[str] | None) -> int:
                     mount.release.load(
                         recorder, instruments=instruments, context=context, mount=mount.name
                     )
+
+                release.load_modules(recorder, instruments=instruments, context=context)
             except Exception as error:
                 log(f"cannot load {args.app}: {error.__class__.__name__}: {error}")
                 instruments.finished(context, _instrumentation.FAILED)
@@ -5523,6 +5707,7 @@ def _main(argv: list[str] | None) -> int:
                 instruments.finished(context, _instrumentation.FAILED)
                 return 1
 
+        loaded_ms = (time.monotonic() - started) * 1000.0
         log(f"preloaded {args.app} in {elapsed_ms(started)} ms")
 
         # A preloaded application has settled its interface by now; a
@@ -5564,6 +5749,11 @@ def _main(argv: list[str] | None) -> int:
             )
             instruments.finished(context, _instrumentation.FALLBACK)
             flush_streams()
+
+            # Section 6.18: the load's import report waits in the run
+            # directory for the host started again, which sends it.
+
+            carry_imports(args.socket_dir)
 
             # The instrumentation list goes back in the environment, so
             # the host started again gives it to each worker.
@@ -5660,6 +5850,18 @@ def _main(argv: list[str] | None) -> int:
         handoff=args.handoff,
         cgroup=args.cgroup,
     )
+
+    # Section 6.18: the load's import report, or the one a host that fell
+    # back to per-worker imports left, for the supervisor.
+
+    if args.preload != "false":
+        host.loaded = {
+            "outcome": "serve" if args.single else "fork",
+            "ms": round(loaded_ms, 1),
+            "imports": imports_summary(),
+        }
+
+    host.imports = imports_report() or carried_imports(args.socket_dir)
 
     # Section 2.1: the host says which release it is; each worker it
     # forks says so too, with its group and index.

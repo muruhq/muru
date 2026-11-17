@@ -901,6 +901,39 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "imports",
+            description: "The import report of a release's load, as muructl debug imports gives it: what each import cost and which entry point paid for it, advice on what to defer or load before the fork written as the configuration to add (__lazy_modules__, [tool.unwrapt.lazy_modules] or preload_modules), the deferrals the load used anyway, and each module the workers have loaded since the fork, by how many of them. The release needs import_report on; muructl check --imports gives the same for one load. Read the code at each import statement before suggesting a change.",
+            changes: false,
+            properties: json!({
+                "target": {"type": "string", "description": "app, or app@release; the one application of muructl run when left out"},
+                "worker": {"type": "string", "description": "A worker's own report, when it loaded the application itself: its index within its group, as GROUP/N outside the default group"},
+                "load_target": {"type": "string", "description": "Only the imports made while one target loaded: hooks, entrypoint, mount:NAME, module:NAME, or none for those outside any"},
+                "top": {"type": "integer", "description": "The most rows of each table (default 20)"},
+                "min_ms": {"type": "number", "description": "Only rows that took at least this many milliseconds"},
+                "package": {"type": "string", "description": "Only modules and importers under this top-level package"},
+                "module": {"type": "string", "description": "The chain of imports that brought this module in"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["debug", "imports"]);
+                command.extend(text(arguments, "target"));
+                command.extend(option(arguments, "worker", "--worker"));
+                command.extend(option(arguments, "load_target", "--target"));
+                command.extend(option(arguments, "package", "--package"));
+                command.extend(option(arguments, "module", "--module"));
+
+                if let Some(top) = arguments.get("top").and_then(Value::as_u64) {
+                    command.extend(["--top".to_owned(), top.to_string()]);
+                }
+
+                if let Some(min_ms) = arguments.get("min_ms").and_then(Value::as_f64) {
+                    command.extend(["--min-ms".to_owned(), min_ms.to_string()]);
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "scale_status",
             description: "Each worker group's scaling policy, workers, signals, last decision and churn for a release.",
             changes: false,

@@ -68,6 +68,33 @@ class Unwinder:
         return self.trace
 
 
+class Clock:
+    """A clock that moves only when the profile sleeps.
+
+    It stands in for the time module in `_outside`, so the number of
+    rounds a profile makes is set by its duration and interval rather
+    than by how fast the machine runs them.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
+    """Drive the profile's rounds from the test rather than the wall clock."""
+
+    clock = Clock()
+    monkeypatch.setattr(_outside, "time", clock)
+    return clock
+
+
 def fake_proc(tmp_path: Path, pid: int, process: bytes, threads: dict[int, bytes]) -> str:
     """Write the `comm` files Linux shows for a process and its threads.
 
@@ -94,14 +121,14 @@ def busy_in_summarise(tmp_path: Path) -> Any:
 
 
 def test_a_profile_samples_on_after_a_failed_read(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: Clock
 ) -> None:
     failure = RuntimeError("Failed to parse initial frame in chain")
     trace = busy_in_summarise(tmp_path)
     monkeypatch.setattr(_outside, "_unwinder", lambda pid: Unwinder([failure, failure], trace))
 
     reader = _outside.Reader(str(tmp_path / "proc"))
-    results = reader.profile([1], 0.2, 0.01, {1: {"7": "muru-app-0"}})
+    results = reader.profile([1], 0.25, 0.0625, {1: {"7": "muru-app-0"}})
 
     # Each function is labelled by the line it starts on, as inside.
 
@@ -110,7 +137,9 @@ def test_a_profile_samples_on_after_a_failed_read(
     assert list(stacks) == ["muru-app-0;build_report (report.py:14);summarise (report.py:5)"]
 
 
-def test_a_profile_reports_a_worker_no_read_reached(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_profile_reports_a_worker_no_read_reached(
+    monkeypatch: pytest.MonkeyPatch, clock: Clock
+) -> None:
     failures: list[Exception] = [RuntimeError("Failed to parse initial frame in chain")] * 1000
     monkeypatch.setattr(_outside, "_unwinder", lambda pid: Unwinder(failures, []))
 
@@ -257,7 +286,7 @@ def test_stacks_carry_the_names_linux_holds(
 
 
 def test_a_profile_names_threads_as_linux_does_asking_once_each(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: Clock
 ) -> None:
     report = tmp_path / "report.py"
     report.write_text(REPORT)
@@ -274,15 +303,15 @@ def test_a_profile_names_threads_as_linux_does_asking_once_each(
 
     monkeypatch.setattr(_outside, "_comm", counted)
 
-    results = _outside.Reader(proc).profile([40], 0.1, 0.01, {40: {"42": "muru-app-0"}})
+    results = _outside.Reader(proc).profile([40], 0.25, 0.0625, {40: {"42": "muru-app-0"}})
 
     # The main thread, whose TID is the pid, is not sampled; the loop
-    # thread is named by Linux, read once over every round, and the
+    # thread is named by Linux, read once over all four rounds, and the
     # thread the runtime names is not asked about.
 
     stacks = results[40]["result"]["stacks"]
     assert sorted(stack.split(";")[0] for stack in stacks) == ["muru-app-0", "muru-loop"]
-    assert results[40]["result"]["rounds"] > 1
+    assert results[40]["result"]["rounds"] == 4
     assert sorted(path.split("/")[-2] for path in reads) == ["40", "41"]
 
 

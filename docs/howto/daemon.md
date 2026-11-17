@@ -232,7 +232,8 @@ files are the one exception, taken from its `source`. The other keys are
 those of the
 `[tool.muru]` table (`entrypoint`, `interface`, `factory`,
 `factory_phase`, `python`, `processes`, `threads`, `sync_threads`,
-`concurrency`, `preload` and `hooks`), and what a table leaves out comes
+`concurrency`, `preload`, `hooks` and `preload_modules`), and what a
+table leaves out comes
 from the source's `[tool.muru]` table and then the defaults, exactly as
 a deploy resolves them. A directory applies every `.toml` file in it, in
 name order, as one configuration.

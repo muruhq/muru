@@ -131,8 +131,9 @@ def load_finished(context, outcome):
 
 - **What each pair covers.** `before_import` and `after_import` bracket
   the hooks module (`target.kind` is `hooks`), the entrypoint
-  (`entrypoint`) and each mount (`mount`, with `target.name`), and a
-  factory the host calls falls inside the entrypoint's pair. What
+  (`entrypoint`), each mount (`mount`, with `target.name`) and each of
+  the release's `preload_modules` (`module`), and a factory the host
+  calls falls inside the entrypoint's pair. What
   `on_load` and `pre_fork` import falls outside any pair. `before_import`
   runs in listed order and `after_import` in reverse, so the pairs of
   several modules nest.

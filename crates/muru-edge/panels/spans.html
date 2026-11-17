@@ -1,0 +1,86 @@
+{#- Spans drawn as a table, for the Timing panel and the generic one: each
+    span a row with a track on the request's clock (issue 737). A period
+    is a bar placed where it starts and as wide as it lasts; an event is a
+    diamond at its moment, with a dashed line through every row's track;
+    a span made of several segments draws each of them on its one line,
+    and one of a single segment draws as an ordinary bar. Each bar,
+    segment and event carries the text of its tooltip in data-tip, which
+    the toolbar's and the dashboard's script show in one floating element
+    on hover, on keyboard focus and on tap. -#}
+
+{%- macro place(start, duration, total) -%}
+{%- set from = [[(start * 100 / total)|round|int, 0]|max, 100]|min if total > 0 else 0 -%}
+{%- set width = [[(duration * 100 / total)|round|int, 0]|max, 100 - from]|min if total > 0 else 0 -%}
+from-{{ from }} for-{{ width }}
+{%- endmacro -%}
+
+{%- macro ms(value) -%}{{ value|round(2) }} ms{%- endmacro -%}
+
+{%- macro period(name, start, duration, failed, detail) -%}
+{{ name }}
+starts at {{ ms(start) }}
+takes {{ ms(duration) }}{% if failed %}
+failed{% endif %}{% if detail %}
+{{ detail }}{% endif %}
+{%- endmacro -%}
+
+{#- An event's index among the panel's, which names its dashed line. -#}
+
+{%- macro mark(events, at) -%}
+{%- set found = namespace(index=-1) -%}
+{%- for one in events %}{% if found.index < 0 and one == at %}{% set found.index = loop.index0 %}{% endif %}{% endfor -%}
+{%- if found.index >= 0 %} event-{{ found.index }}{% endif -%}
+{%- endmacro -%}
+
+{%- macro track(span, total, events) -%}
+<span class="track">
+{%- for at in events %}<span class="rule event-{{ loop.index0 }} {{ place(at, 0, total) }}"></span>{% endfor -%}
+{%- if span.at_ms is not none -%}
+<span class="diamond {{ place(span.at_ms, 0, total) }}" tabindex="0" data-tip="{{ span.name }}
+at {{ ms(span.at_ms) }}{% if span.failed %}
+failed{% endif %}"></span>
+{%- elif span.segments|length > 1 -%}
+{%- for segment in span.segments -%}
+<span class="bar segment {{ place(segment.start_ms, segment.duration_ms, total) }}" tabindex="0" data-tip="{{ period(segment.label or span.name, segment.start_ms, segment.duration_ms, false, segment.detail) }}"></span>
+{%- endfor -%}
+{%- elif span.segments -%}
+{%- set only = span.segments[0] -%}
+<span class="bar {{ place(only.start_ms, only.duration_ms, total) }}" tabindex="0" data-tip="{{ period(only.label or span.name, only.start_ms, only.duration_ms, span.failed, only.detail) }}"></span>
+{%- else -%}
+<span class="bar {{ place(span.start_ms, span.duration_ms, total) }}" tabindex="0" data-tip="{{ period(span.name, span.start_ms, span.duration_ms, span.failed, "") }}"></span>
+{%- endif -%}
+</span>
+{%- endmacro -%}
+
+{#- The table: `heading` names the first column, `total` is the length of
+    the clock the tracks show, and `events` the moments of the panel's
+    events, whose dashed lines every track carries. -#}
+
+{%- macro table(spans, total, events, heading) -%}
+<table class="spans">
+<thead><tr><th>{{ heading }}</th><th class="num">Starts</th><th class="num">Takes</th><th>On the request's clock</th></tr></thead>
+<tbody>
+{%- for span in spans recursive %}
+{%- set event = span.at_ms is not none %}
+<tr class="{{ span.category }}{% if span.failed %} failed{% endif %}{% if event %} event{{ mark(events, span.at_ms) }}{% endif %}">
+<td class="depth-{{ loop.depth }}">{% if span.failed %}<span class="failed-mark" title="failed">✕</span> {% endif %}{% if event %}<em>{{ span.name }}</em>{% else %}{{ span.name }}{% endif %}</td>
+{%- if event %}
+<td class="num">{{ ms(span.at_ms) }}</td>
+<td class="num" title="event" aria-label="event">–</td>
+{%- elif span.segments|length > 1 %}
+<td class="num">{{ span.segments|length }} segments</td>
+<td class="num">{{ ms(span.segments|map(attribute="duration_ms")|sum) }}</td>
+{%- elif span.segments %}
+<td class="num">{{ ms(span.segments[0].start_ms) }}</td>
+<td class="num">{{ ms(span.segments[0].duration_ms) }}</td>
+{%- else %}
+<td class="num">{{ ms(span.start_ms) }}</td>
+<td class="num">{{ ms(span.duration_ms) }}</td>
+{%- endif %}
+<td>{{ track(span, total, events) }}</td>
+</tr>
+{%- if span.children %}{{ loop(span.children) }}{% endif %}
+{%- endfor %}
+</tbody>
+</table>
+{%- endmacro -%}

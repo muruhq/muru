@@ -2248,6 +2248,11 @@
           "description": "The module holding the lifecycle hooks, as a Python module name.",
           "type": "string"
         },
+        "import_report": {
+          "description": "Record the host's imports for `muructl debug imports`; when given, it takes the place of the source's `import_report`.",
+          "type": "boolean",
+          "x-default": "the source's"
+        },
         "instances": {
           "default": 1,
           "description": "How many instances of the command an `http` release runs.",
@@ -2271,6 +2276,11 @@
           "$ref": "#/$defs/ReleaseKind",
           "default": "workers",
           "description": "What the release runs: `workers` from an entrypoint, the default, or `http`, an HTTP server started from `command`."
+        },
+        "lazy_imports": {
+          "description": "Defer imports with unwrapt; when given, it takes the place of the source's `lazy_imports`.",
+          "type": "boolean",
+          "x-default": "the source's"
         },
         "logging": {
           "$ref": "#/$defs/Logging",
@@ -2310,6 +2320,13 @@
           "$ref": "#/$defs/Preload",
           "default": "auto",
           "description": "Whether the application is imported once, in the host, before the workers are forked from it."
+        },
+        "preload_modules": {
+          "description": "Modules the host imports after the entrypoint and the mounts, so they are loaded once before the fork; when given, they replace the list in the source's `[tool.muru]` table.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "processes": {
           "default": 1,

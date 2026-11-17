@@ -348,7 +348,10 @@ async def application(scope: Scope, receive: Receive, send: Send) -> None:
         await asyncio.sleep(float(query.get("seconds", "0.5")))
         await respond(send, 200, b"slept\n")
     elif path == "/block":
-        # Section 7.6: hold the event loop, as code that never awaits does.
+        # Section 7.6: hold the event loop, as code that never awaits does,
+        # after loading a module on first use (issue 738).
+
+        import colorsys  # noqa: F401
 
         time.sleep(float(query.get("seconds", "0.5")))
         await respond(send, 200, b"blocked\n")

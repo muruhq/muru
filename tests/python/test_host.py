@@ -260,6 +260,25 @@ def exits(monkeypatch: pytest.MonkeyPatch, *statuses: tuple[int, int]) -> None:
     monkeypatch.setattr(os, "waitpid", lambda _pid, _flags: waiting.pop(0) if waiting else (0, 0))
 
 
+def test_a_worker_that_exits_badly_while_stopping_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Issue 734: a worker that fails as the host stops says how; one
+    that stops as it should says nothing."""
+
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=2, threads=1)
+    instance.workers.update({4242: 0, 4243: 1})
+    monkeypatch.setattr(os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(instance, "stop_orphans", lambda: None)
+    exits(monkeypatch, (4242, 0), (4243, signal.SIGKILL))
+    instance.terminate_all()
+
+    logged = capfd.readouterr().err
+    assert "worker 1 (pid 4243) exited with signal SIGKILL" in logged
+    assert "pid 4242" not in logged
+
+
 def test_a_timeout_kill_is_reported_at_the_decision_and_not_again_at_the_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> None:

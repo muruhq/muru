@@ -27,7 +27,21 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("connection", include_str!("../panels/connection.html")),
     ("hints", include_str!("../panels/hints.html")),
     (GENERIC, include_str!("../panels/panel.html")),
+    (SPANS, include_str!("../panels/spans.html")),
 ];
+
+/// The spans table the Timing and generic templates import (issue 737),
+/// under a name no panel can take.
+const SPANS: &str = "_spans";
+
+/// The most events whose dashed lines a spans table draws through its
+/// tracks, which the stylesheet has a class for each of.
+const EVENTS_DRAWN: usize = 32;
+
+/// The script that shows a spans table's tooltips (issue 737): one
+/// floating element for every bar, segment and event, from its `data-tip`.
+/// The toolbar's script carries it, and the dashboard serves it.
+pub const SCRIPT: &str = include_str!("../panels/tips.js");
 
 /// The template of a panel with none of its own, such as one Muru's
 /// extensions add in the worker (issue 677).
@@ -79,12 +93,14 @@ const TAGS: &[&str] = &[
     "abbr",
 ];
 
-/// The attributes elements keep besides `class`, where they take them.
+/// The attributes elements keep besides `class`, where they take them:
+/// a span's tooltip text and its place in the keyboard's order, for the
+/// spans table's bars, segments and events (issue 737).
 const ATTRIBUTES: &[(&str, &[&str])] = &[
     ("a", &["href", "title"]),
     ("abbr", &["title"]),
-    ("span", &["title"]),
-    ("td", &["title"]),
+    ("span", &["title", "data-tip", "tabindex"]),
+    ("td", &["title", "aria-label"]),
     ("th", &["title"]),
     ("time", &["datetime", "title"]),
     ("meter", &["value", "min", "max", "title"]),
@@ -139,6 +155,8 @@ impl Renderer {
                 template.render(context! {
                     panel => minijinja::value::Serde(panel),
                     numeric => numeric_columns(panel),
+                    events => events(&panel.spans),
+                    extent => extent(&panel.spans),
                 })
             });
 
@@ -299,6 +317,44 @@ fn numeric_columns(panel: &admin::Panel) -> Vec<Vec<bool>> {
         .collect()
 }
 
+/// The moments of the events among spans, in the order the table draws
+/// them, the first `EVENTS_DRAWN`: each has a dashed line through every
+/// row's track.
+fn events(spans: &[admin::PanelSpan]) -> Vec<f64> {
+    fn gather(spans: &[admin::PanelSpan], found: &mut Vec<f64>) {
+        for span in spans {
+            if let Some(at) = span.at_ms
+                && found.len() < EVENTS_DRAWN
+            {
+                found.push(at);
+            }
+
+            gather(&span.children, found);
+        }
+    }
+
+    let mut found = Vec::new();
+    gather(spans, &mut found);
+    found
+}
+
+/// Where the last of the spans ends, an event at its moment and a span
+/// of segments at its last, for the generic template's clock.
+fn extent(spans: &[admin::PanelSpan]) -> f64 {
+    spans
+        .iter()
+        .map(|span| {
+            let own = span.at_ms.unwrap_or(span.start_ms + span.duration_ms);
+            let segments = span
+                .segments
+                .iter()
+                .map(|segment| segment.start_ms + segment.duration_ms)
+                .fold(0.0, f64::max);
+            own.max(segments).max(extent(&span.children))
+        })
+        .fold(0.0, f64::max)
+}
+
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -339,6 +395,15 @@ pub fn all(record: &admin::RequestRecord) -> Vec<admin::Panel> {
 fn shift(spans: &mut [admin::PanelSpan], by: f64) {
     for span in spans {
         span.start_ms += by;
+
+        if let Some(at) = span.at_ms.as_mut() {
+            *at += by;
+        }
+
+        for segment in &mut span.segments {
+            segment.start_ms += by;
+        }
+
         shift(&mut span.children, by);
     }
 }
@@ -370,16 +435,26 @@ fn millis(ms: f64) -> String {
     format_duration(std::time::Duration::from_secs_f64(ms.max(0.0) / 1000.0))
 }
 
-/// The request's phases on its clock: waiting for a worker, the
-/// application until the response head, and sending the response.
+/// The request's phases on its clock: waiting for a worker, the worker's
+/// own phases, the response head reaching the edge, and sending the
+/// response.
 fn timing(record: &admin::RequestRecord) -> admin::Panel {
     let span = |name: &str, start_ms: f64, duration_ms: f64, category: &str| admin::PanelSpan {
         name: name.to_owned(),
         start_ms,
         duration_ms: duration_ms.max(0.0),
         category: category.to_owned(),
-        children: Vec::new(),
-        failed: false,
+        ..Default::default()
+    };
+
+    // A moment rather than a period (issue 737).
+
+    let event = |name: &str, at_ms: f64, category: &str| admin::PanelSpan {
+        name: name.to_owned(),
+        start_ms: at_ms,
+        at_ms: Some(at_ms),
+        category: category.to_owned(),
+        ..Default::default()
     };
 
     let mut spans = Vec::new();
@@ -397,12 +472,7 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
             let answered = record.queue_ms + record.app_ms;
             request.children = vec![
                 span("waiting for a worker", 0.0, record.queue_ms, "edge"),
-                span(
-                    "until the response head",
-                    record.queue_ms,
-                    record.app_ms,
-                    "application",
-                ),
+                event("response head at the edge", answered, "edge"),
                 span(
                     "sending the response",
                     answered,
@@ -419,11 +489,20 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
             let at = |ms: f64| record.queue_ms + ms;
             let mut phases = Vec::new();
 
+            // The application runs once the waits it started with are
+            // over: for a thread, then for the GIL.
+
             if worker.to_start_response > 0.0 {
+                let running = worker.thread_wait + worker.gil_wait_first;
                 phases.push(span(
-                    "until the response starts",
-                    at(0.0),
-                    worker.to_start_response,
+                    "running the application",
+                    at(running),
+                    worker.to_start_response - running,
+                    "worker",
+                ));
+                phases.push(event(
+                    "response started",
+                    at(worker.to_start_response),
                     "worker",
                 ));
             }
@@ -453,8 +532,8 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
             }
 
             // What held the request up, where it can be placed: the wait
-            // for a thread, the first wait for the GIL after it, and the
-            // longest the event loop was held.
+            // for a thread, every wait for the GIL and every stretch with
+            // the event loop held.
 
             if worker.thread_wait > 0.0 {
                 phases.push(span(
@@ -465,38 +544,48 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
                 ));
             }
 
-            if worker.gil_wait_first > 0.0 {
-                phases.push(span(
-                    "waiting for the GIL",
-                    at(worker.thread_wait),
-                    worker.gil_wait_first,
-                    "contention",
-                ));
-            }
+            let waits = worker.gil_waits as usize;
+            phases.extend(stretches(
+                "waiting for the GIL",
+                &worker.gil_wait_stretches,
+                record.queue_ms,
+                |index| format!("wait {} of {}", index + 1, waits.max(index + 1)),
+            ));
 
-            if worker.loop_lag > 0.0 {
-                phases.push(span(
-                    "event loop held",
-                    at(worker.loop_lag_at),
-                    worker.loop_lag,
-                    "contention",
-                ));
-            }
+            let held = worker.loop_held_stretches.len();
+            phases.extend(stretches(
+                "event loop held",
+                &worker.loop_held_stretches,
+                record.queue_ms,
+                |index| format!("stretch {} of {held}", index + 1),
+            ));
 
-            // A wait goes before the phase that starts with it.
+            // Issue 738: the modules loaded for the first time in the
+            // worker, each outermost load a segment named by its module,
+            // with the loads nested in it inside its segment.
 
+            phases.extend(importing(worker, record.queue_ms));
+
+            // A wait goes before the phase that starts with it, and a
+            // moment before a period that starts then.
+
+            let rank = |span: &admin::PanelSpan| match (span.category.as_str(), span.at_ms) {
+                ("contention", _) => 0,
+                (_, Some(_)) => 1,
+                _ => 2,
+            };
             phases.sort_by(|one, other| {
-                one.start_ms.total_cmp(&other.start_ms).then_with(|| {
-                    (one.category != "contention").cmp(&(other.category != "contention"))
-                })
+                one.start_ms
+                    .total_cmp(&other.start_ms)
+                    .then_with(|| rank(one).cmp(&rank(other)))
             });
             let mut whole = span("in the worker", at(0.0), worker.to_close, "worker");
             whole.children = phases;
 
-            // It goes beside the edge's view of the same time, before the
-            // sending that follows it.
+            // It goes beside the edge's view of the same time, after the
+            // queue.
 
-            let at = request.children.len().min(2);
+            let at = request.children.len().min(1);
             request.children.insert(at, whole);
         }
 
@@ -519,18 +608,148 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
         tables: record
             .from_worker
             .as_ref()
-            .map(during)
-            .filter(|table| !table.rows.is_empty())
+            .map(|worker| [during(worker), modules(worker, record.queue_ms)])
             .into_iter()
+            .flatten()
+            .filter(|table| !table.rows.is_empty())
             .collect(),
         ..Default::default()
     }
+}
+
+/// The row of the modules a request loaded for the first time in the
+/// worker, moved onto the request's clock by `by`: a segment for each
+/// outermost load, named by its module, the loads nested in it inside
+/// it. None when it loaded none.
+fn importing(worker: &admin::WorkerPart, by: f64) -> Option<admin::PanelSpan> {
+    let outermost: Vec<&admin::ModuleLoad> = worker
+        .module_loads
+        .iter()
+        .filter(|load| load.depth == 0)
+        .collect();
+    let first = outermost.first()?;
+    let start_ms = by + first.at_ms;
+    let end_ms = outermost
+        .iter()
+        .map(|load| by + load.at_ms + load.ms)
+        .fold(start_ms, f64::max);
+
+    Some(admin::PanelSpan {
+        name: "importing modules".to_owned(),
+        start_ms,
+        duration_ms: end_ms - start_ms,
+        category: "worker".to_owned(),
+        segments: outermost
+            .iter()
+            .map(|load| admin::PanelSegment {
+                start_ms: by + load.at_ms,
+                duration_ms: load.ms.max(0.0),
+                label: load.module.clone(),
+                detail: loaded_by(load),
+            })
+            .collect(),
+        ..Default::default()
+    })
+}
+
+/// What asked for a module, for its tooltip and its row, and whether it
+/// resolved an import `lazy_imports` deferred.
+fn loaded_by(load: &admin::ModuleLoad) -> String {
+    match (load.deferred, load.trigger.is_empty()) {
+        (false, true) => String::new(),
+        (false, false) => format!("loaded by {}", load.trigger),
+        (true, true) => "a deferred import".to_owned(),
+        (true, false) => format!("a deferred import, used by {}", load.trigger),
+    }
+}
+
+/// The modules a request loaded for the first time in the worker, one
+/// row each in the order they began, moved onto the request's clock by
+/// `by`, a nested one indented beneath the one it is nested in, with how
+/// many were past the record's limit.
+fn modules(worker: &admin::WorkerPart, by: f64) -> admin::PanelTable {
+    let mut rows: Vec<admin::PanelRow> = worker
+        .module_loads
+        .iter()
+        .map(|load| admin::PanelRow {
+            cells: vec![
+                format!(
+                    "{}{}{}",
+                    "  ".repeat(load.depth as usize),
+                    load.module,
+                    if load.deferred { " (deferred)" } else { "" }
+                ),
+                millis(by + load.at_ms),
+                millis(load.ms),
+                load.trigger.clone(),
+            ],
+        })
+        .collect();
+    let past = (worker.modules_loaded as usize).saturating_sub(rows.len());
+
+    if past > 0 {
+        rows.push(admin::PanelRow {
+            cells: vec![
+                format!("{past} more, past the record's limit"),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+        });
+    }
+
+    admin::PanelTable {
+        caption: "Modules loaded on first use".to_owned(),
+        columns: ["Module", "Starts", "Takes", "Loaded by"]
+            .map(str::to_owned)
+            .to_vec(),
+        rows,
+    }
+}
+
+/// A row of the worker's stretches, moved onto the request's clock by
+/// `by`: one stretch as an ordinary bar, several as the segments of one
+/// span from the first's start to the last's end, each of them described
+/// by `detail` from its index. None with no stretch.
+fn stretches(
+    name: &str,
+    stretches: &[admin::Stretch],
+    by: f64,
+    detail: impl Fn(usize) -> String,
+) -> Option<admin::PanelSpan> {
+    let first = stretches.first()?;
+    let last = stretches.last()?;
+    let start_ms = by + first.at_ms;
+
+    Some(admin::PanelSpan {
+        name: name.to_owned(),
+        start_ms,
+        duration_ms: (by + last.at_ms + last.ms - start_ms).max(0.0),
+        category: "contention".to_owned(),
+        segments: stretches
+            .iter()
+            .enumerate()
+            .map(|(index, stretch)| admin::PanelSegment {
+                start_ms: by + stretch.at_ms,
+                duration_ms: stretch.ms.max(0.0),
+                label: name.to_owned(),
+                detail: if stretches.len() > 1 {
+                    detail(index)
+                } else {
+                    String::new()
+                },
+            })
+            .collect(),
+        ..Default::default()
+    })
 }
 
 /// `count` of `noun`, in the plural unless it is one.
 fn counted(count: u32, noun: &str) -> String {
     if count == 1 {
         format!("1 {noun}")
+    } else if noun.ends_with("ch") {
+        format!("{count} {noun}es")
     } else {
         format!("{count} {noun}s")
     }
@@ -538,7 +757,8 @@ fn counted(count: u32, noun: &str) -> String {
 
 /// What held a request up while the worker had it, as a table of what
 /// and how long, with what the timeline cannot place: the GIL waits in
-/// all and the garbage collections. Empty when nothing did.
+/// all and the garbage collections; and the modules loaded on first use
+/// in all. Empty when nothing did.
 fn during(worker: &admin::WorkerPart) -> admin::PanelTable {
     let mut rows = Vec::new();
     let mut row = |what: &str, took: String| {
@@ -596,11 +816,26 @@ fn during(worker: &admin::WorkerPart) -> admin::PanelTable {
         );
     }
 
-    if worker.loop_lag > 0.0 {
+    if worker.modules_loaded > 0 {
+        row(
+            "modules loaded on first use",
+            format!(
+                "{} in {}",
+                millis(worker.modules_ms),
+                counted(worker.modules_loaded, "module")
+            ),
+        );
+    }
+
+    let held = &worker.loop_held_stretches;
+
+    if !held.is_empty() {
         row(
             "event loop held",
             format!(
-                "{} at the longest, from {} on the worker's clock",
+                "{} in {}, the longest {} from {} on the worker's clock",
+                millis(held.iter().map(|stretch| stretch.ms).sum()),
+                counted(u32::try_from(held.len()).unwrap_or(u32::MAX), "stretch"),
                 millis(worker.loop_lag),
                 millis(worker.loop_lag_at)
             ),
@@ -1078,18 +1313,18 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("<td class=\"depth-2\">until the response head</td>"),
+            html.contains("<td class=\"depth-2\"><em>response head at the edge</em></td>"),
             "{html}"
         );
-        assert!(html.contains("17.9 ms"), "{html}");
         assert!(html.contains("What the phases are"), "{html}");
 
         // Each bar starts where its phase does, in whole percent of the
-        // request: the request's own across all of it, the application's
-        // from 0.2 ms of 18.4 for 17.9 ms.
+        // request: the request's own across all of it. The head reached
+        // the edge at 18.1 ms of 18.4, a moment drawn as a diamond.
 
         assert!(html.contains("class=\"bar from-0 for-100\""), "{html}");
-        assert!(html.contains("class=\"bar from-1 for-97\""), "{html}");
+        assert!(html.contains("<td class=\"num\">18.1 ms</td>"), "{html}");
+        assert!(html.contains("class=\"diamond from-98 for-0\""), "{html}");
     }
 
     #[test]
@@ -1100,7 +1335,11 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("<td class=\"depth-3\">until the response starts</td>"),
+            html.contains("<td class=\"depth-3\">running the application</td>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<td class=\"depth-3\"><em>response started</em></td>"),
             "{html}"
         );
         assert!(
@@ -1129,6 +1368,9 @@ mod tests {
         worker.gil_wait = 0.4;
         worker.gil_waits = 3;
         worker.gil_wait_first = 0.3;
+        let stretch = |at_ms: f64, ms: f64| admin::Stretch { at_ms, ms };
+        worker.gil_wait_stretches = vec![stretch(0.5, 0.3), stretch(6.0, 0.05), stretch(9.0, 0.05)];
+        worker.loop_held_stretches = vec![stretch(4.0, 9.0)];
         worker.gc = vec![admin::RequestGc {
             generation: "2".to_owned(),
             collections: 1,
@@ -1148,6 +1390,24 @@ mod tests {
         assert!(thread < gil && gil < held && held < body, "{html}");
         assert!(html.contains("<tr class=\"contention\">"), "{html}");
 
+        // Every wait for the GIL is a segment on the one line, and the
+        // application runs from the end of the first; the one stretch
+        // with the loop held is an ordinary bar.
+
+        assert!(html.contains("<td class=\"num\">3 segments</td>"), "{html}");
+        assert!(
+            html.contains("waiting for the GIL\nstarts at 6.2 ms\ntakes 0.05 ms\nwait 2 of 3"),
+            "{html}"
+        );
+        assert!(
+            html.contains("running the application\nstarts at 1.0 ms\ntakes 1.2 ms"),
+            "{html}"
+        );
+        assert!(
+            html.contains("event loop held\nstarts at 4.2 ms\ntakes 9.0 ms\""),
+            "{html}"
+        );
+
         // The table has all of it.
 
         assert!(
@@ -1159,11 +1419,72 @@ mod tests {
             html.contains("1.5ms in 1 collection: 1 of generation 2 in 1.5ms"),
             "{html}"
         );
-        assert!(html.contains("9.0ms at the longest, from 4.0ms"), "{html}");
+        assert!(
+            html.contains("9.0ms in 1 stretch, the longest 9.0ms from 4.0ms"),
+            "{html}"
+        );
 
         // Nothing held up, no table.
 
         assert!(timing(&fixture()).tables.is_empty());
+    }
+
+    #[test]
+    fn the_timing_panel_shows_the_modules_loaded_on_first_use() {
+        let mut record = fixture();
+        let worker = record.from_worker.as_mut().unwrap();
+        let load = |module: &str, at_ms: f64, ms: f64, depth: u32| admin::ModuleLoad {
+            module: module.to_owned(),
+            at_ms,
+            ms,
+            depth,
+            trigger: "shop/views.py:12".to_owned(),
+            deferred: false,
+        };
+        worker.module_loads = vec![
+            load("shop.reports", 0.5, 0.25, 0),
+            admin::ModuleLoad {
+                deferred: true,
+                ..load("openpyxl", 0.75, 1.0, 0)
+            },
+            load("openpyxl.cell", 0.8, 0.5, 1),
+        ];
+        worker.modules_loaded = 4;
+        worker.modules_ms = 1.5;
+        let html = Renderer::new(None).render(&timing(&record));
+
+        // A segment for each outermost load, named by its module, the
+        // nested one inside its segment.
+
+        assert!(html.contains(">importing modules</td>"), "{html}");
+        assert!(html.contains("<td class=\"num\">2 segments</td>"), "{html}");
+        assert!(
+            html.contains(
+                "openpyxl\nstarts at 0.95 ms\ntakes 1.0 ms\na deferred import, used by shop/views.py:12"
+            ),
+            "{html}"
+        );
+
+        // The table counts them, and each is a row below it, the nested
+        // one indented and the one past the limit counted.
+
+        assert!(html.contains("1.5ms in 4 modules"), "{html}");
+        assert!(
+            html.contains("<summary>Modules loaded on first use</summary>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<td class=\"module\">  openpyxl.cell</td>"),
+            "{html}"
+        );
+        assert!(html.contains("1 more, past the record's limit"), "{html}");
+
+        // Issue 740: a load that resolved a deferred import says so.
+
+        assert!(
+            html.contains("<td class=\"module\">openpyxl (deferred)</td>"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -1389,15 +1710,55 @@ mod tests {
                 start_ms: 1.0,
                 duration_ms: 3.0,
                 category: "view".to_owned(),
-                children: vec![admin::PanelSpan {
-                    name: "<script>".to_owned(),
-                    start_ms: 2.0,
-                    duration_ms: 0.5,
-                    category: "database".to_owned(),
-                    children: Vec::new(),
-                    failed: true,
-                }],
-                failed: false,
+                children: vec![
+                    admin::PanelSpan {
+                        name: "<script>".to_owned(),
+                        start_ms: 2.0,
+                        duration_ms: 0.5,
+                        category: "database".to_owned(),
+                        failed: true,
+                        ..Default::default()
+                    },
+                    admin::PanelSpan {
+                        name: "committed".to_owned(),
+                        start_ms: 3.5,
+                        at_ms: Some(3.5),
+                        category: "database".to_owned(),
+                        ..Default::default()
+                    },
+                    admin::PanelSpan {
+                        name: "imports".to_owned(),
+                        start_ms: 1.0,
+                        duration_ms: 3.0,
+                        segments: vec![
+                            admin::PanelSegment {
+                                start_ms: 1.0,
+                                duration_ms: 1.0,
+                                label: "json".to_owned(),
+                                detail: "from the standard library".to_owned(),
+                            },
+                            admin::PanelSegment {
+                                start_ms: 3.0,
+                                duration_ms: 1.0,
+                                label: "decimal".to_owned(),
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    admin::PanelSpan {
+                        name: "one".to_owned(),
+                        start_ms: 1.0,
+                        duration_ms: 3.0,
+                        segments: vec![admin::PanelSegment {
+                            start_ms: 2.0,
+                            duration_ms: 2.0,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
             }],
             dropped: 2,
             ..Default::default()
@@ -1423,7 +1784,51 @@ mod tests {
         assert!(html.contains("<tr class=\"view\">"), "{html}");
         assert!(html.contains("<tr class=\"database failed\">"), "{html}");
         assert_eq!(html.matches("class=\"failed-mark\"").count(), 1, "{html}");
-        assert!(html.contains("2.5 ms, failed\""), "{html}");
+        assert!(
+            html.contains("data-tip=\"&lt;script&gt;\nstarts at 2.0 ms\ntakes 0.5 ms\nfailed\""),
+            "{html}"
+        );
+
+        // Issue 737: an event is a diamond, named in italics, its time
+        // under Starts and a dash for its length, and its dashed line goes
+        // through every row's track, 3.5 ms of the clock's 4.
+
+        assert!(
+            html.contains("<tr class=\"database event event-0\">"),
+            "{html}"
+        );
+        assert!(html.contains("<em>committed</em>"), "{html}");
+        assert!(
+            html.contains("<td class=\"num\" title=\"event\" aria-label=\"event\">–</td>"),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "class=\"diamond from-88 for-0\" tabindex=\"0\" data-tip=\"committed\nat 3.5 ms\""
+            ),
+            "{html}"
+        );
+        assert_eq!(
+            html.matches("class=\"rule event-0 from-88 for-0\"").count(),
+            5,
+            "{html}"
+        );
+
+        // Several segments on one line, counted and summed, each with its
+        // own tooltip; a single segment is an ordinary bar where it is.
+
+        assert!(html.contains("<td class=\"num\">2 segments</td>"), "{html}");
+        assert!(html.contains("<td class=\"num\">2.0 ms</td>"), "{html}");
+        assert!(
+            html.contains("class=\"bar segment from-25 for-25\" tabindex=\"0\" data-tip=\"json\nstarts at 1.0 ms\ntakes 1.0 ms\nfrom the standard library\""),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "class=\"bar from-50 for-50\" tabindex=\"0\" data-tip=\"one\nstarts at 2.0 ms"
+            ),
+            "{html}"
+        );
         assert!(
             html.contains("&lt;script&gt;") && !html.contains("<script>"),
             "{html}"
@@ -1514,11 +1919,24 @@ mod tests {
                         name: "view".to_owned(),
                         start_ms: 1.0,
                         duration_ms: 2.0,
-                        children: vec![admin::PanelSpan {
-                            name: "query".to_owned(),
-                            start_ms: 1.5,
-                            ..Default::default()
-                        }],
+                        children: vec![
+                            admin::PanelSpan {
+                                name: "query".to_owned(),
+                                start_ms: 1.5,
+                                segments: vec![admin::PanelSegment {
+                                    start_ms: 1.5,
+                                    duration_ms: 0.5,
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                            admin::PanelSpan {
+                                name: "committed".to_owned(),
+                                start_ms: 2.5,
+                                at_ms: Some(2.5),
+                                ..Default::default()
+                            },
+                        ],
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -1551,5 +1969,10 @@ mod tests {
         let trace = &panels[7];
         assert_eq!(trace.spans[0].start_ms, 5.0);
         assert_eq!(trace.spans[0].children[0].start_ms, 5.5);
+
+        // An event's moment and a span's segments move with it.
+
+        assert_eq!(trace.spans[0].children[0].segments[0].start_ms, 5.5);
+        assert_eq!(trace.spans[0].children[1].at_ms, Some(6.5));
     }
 }

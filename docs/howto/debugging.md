@@ -43,15 +43,23 @@ figures over the last second, and `--watch` keeps the view live. The
 
 ## Status
 
-Each worker's pid, group, uptime, requests served, what it holds as of
-the moment it answers, its memory, whether the edge routes to it, and
-its state.
+Each worker's pid, group, uptime, requests served, the modules it has
+loaded since the fork, what it holds as of the moment it answers, its
+memory, whether the edge routes to it, and its state.
 
 ```
-WORKER  PID      GROUP      UP       REQUESTS   THREADS  THREAD-OLDEST  RSS     USS     ROUTED  STATE
-0       41213    default    5m18s    12044      1/4      0.1s           48MB    31MB    yes     ready
-1       41214    default    5m18s    11980      0/4      -              47MB    30MB    yes     ready
+WORKER  PID      GROUP      UP       REQUESTS   MODULES  THREADS  THREAD-OLDEST  RSS     USS     ROUTED  STATE
+0       41213    default    5m18s    12044      38       1/4      0.1s           48MB    31MB    yes     ready
+1       41214    default    5m18s    11980      38       0/4      -              47MB    30MB    yes     ready
 ```
+
+MODULES counts the modules the worker loaded for the first time after
+it started serving: those the host did not load before the fork, which
+cost each worker separately and add to whichever request needs them
+first. The count settles once the workers have served each kind of
+request; one still growing long after its worker started says code is
+loaded late, and the [toolbar's Timing panel](toolbar.md) shows which
+modules a request loaded and what asked for them.
 
 THREADS is the application threads busy of the worker's threads, and
 THREAD-OLDEST how long the longest has been held: a request holds its
@@ -72,8 +80,8 @@ SYNC-OLDEST is the age of the oldest request with a call on the loop's
 pool or asgiref's thread, and a dash when the busy threads are anyio's.
 
 ```
-WORKER  PID      GROUP      UP       REQUESTS   LOOP      LOOP-OLDEST  SYNC    SYNC-OLDEST  RSS     USS     ROUTED  STATE
-0       41213    default    5m18s    12044      31/1000   4.2s         8/8     4.2s         52MB    34MB    yes     ready
+WORKER  PID      GROUP      UP       REQUESTS   MODULES  LOOP      LOOP-OLDEST  SYNC    SYNC-OLDEST  RSS     USS     ROUTED  STATE
+0       41213    default    5m18s    12044      38       31/1000   4.2s         8/8     4.2s         52MB    34MB    yes     ready
 ```
 
 A worker shows the sides it has, and the table the columns any worker
@@ -335,6 +343,16 @@ so a worker's collections scan only what the worker itself created; an
 application whose collections still cost it can create fewer long-lived
 cyclic objects after the fork, or call `gc.freeze()` itself once its
 caches are warm.
+
+## Imports
+
+`muructl debug imports` prints the import report of the release's load,
+when the release has `import_report` on: what each import cost, which
+entry point paid for it, and what to defer or load before the fork,
+written as the configuration to add; then each module the workers have
+loaded for the first time since the fork, by how many of them. The
+[guide to deferring imports](lazy-imports.md#finding-what-to-defer-the-import-report)
+sets it out.
 
 ## Running code
 

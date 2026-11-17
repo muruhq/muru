@@ -219,12 +219,20 @@
       "$ref": "#/$defs/LocalBuild",
       "description": "When `muructl run` builds the environment."
     },
+    "import_report": {
+      "description": "The import report for this machine's runs, in place of the project's `import_report`.",
+      "type": "boolean"
+    },
     "instrumentation": {
       "description": "Instrumentation modules for this machine's runs, before the project's own.",
       "items": {
         "$ref": "#/$defs/Instrumentation"
       },
       "type": "array"
+    },
+    "lazy_imports": {
+      "description": "Deferring imports with unwrapt for this machine's runs, in place of the project's `lazy_imports`.",
+      "type": "boolean"
     },
     "run": {
       "$ref": "#/$defs/RunSettings",

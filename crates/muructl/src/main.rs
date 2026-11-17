@@ -12,6 +12,7 @@ mod dashboard;
 mod devcert;
 mod diagnostics;
 mod edge;
+mod imports;
 mod init;
 mod log_format;
 mod mcp;
@@ -1941,6 +1942,9 @@ struct Resolved {
     concurrency: usize,
     preload: muru_config::Preload,
     hooks: Option<String>,
+    /// The modules the host imports after the entrypoint and the mounts
+    /// (section 6.1).
+    preload_modules: Vec<String>,
     /// The instrumentation modules (section 6.15): muru.local.toml's,
     /// then the table's.
     instrumentation: Vec<muru_config::Instrumentation>,
@@ -1954,6 +1958,16 @@ struct Resolved {
     /// The instrumentation entry that sets tracing up, when it is on;
     /// the host is given it ahead of the listed modules.
     tracing_entry: Option<muru_config::Instrumentation>,
+    /// `lazy_imports` (section 6.17) as written: muru.local.toml's, else
+    /// the table's.
+    lazy_imports: Option<bool>,
+    /// The muru.local.toml `lazy_imports` came from, when it came from one.
+    lazy_imports_from_local: Option<PathBuf>,
+    /// `import_report` (section 6.18) as written: muru.local.toml's, else
+    /// the table's.
+    import_report: Option<bool>,
+    /// The muru.local.toml `import_report` came from, when it came from one.
+    import_report_from_local: Option<PathBuf>,
     /// The directory the host runs in.
     project: PathBuf,
     /// The file the table came from, when there was one.
@@ -2012,8 +2026,29 @@ impl Resolved {
     /// 11.6): tracing's own module first when tracing is on, so its
     /// request middleware is the outermost wrapper, then the listed ones.
     fn host_instrumentation(&self) -> Vec<muru_config::Instrumentation> {
-        self.tracing_entry
-            .iter()
+        self.host_instrumentation_reporting(false)
+    }
+
+    /// The instrumentation modules the host is given, with the import
+    /// report on whatever `import_report` says when `report` is set, as
+    /// `muructl check --imports` asks (section 6.18). The module that
+    /// defers imports and records the report comes first, ahead of
+    /// tracing's, when either is on.
+    fn host_instrumentation_reporting(&self, report: bool) -> Vec<muru_config::Instrumentation> {
+        let workers = self.processes
+            + self
+                .groups
+                .values()
+                .map(|group| group.processes.unwrap_or(self.processes))
+                .sum::<usize>();
+        let lazy = muru_config::lazy_imports_entry(
+            self.lazy_imports == Some(true),
+            report || self.import_report == Some(true),
+            workers,
+        );
+
+        lazy.iter()
+            .chain(&self.tracing_entry)
             .chain(&self.instrumentation)
             .cloned()
             .collect()
@@ -2108,7 +2143,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         None => muru_config::load_local(&project, source.as_deref())?,
     };
 
-    let (local, local_run, local_build_when, local_instrumentation, local_tracing) =
+    let (local, local_run, local_build_when, local_instrumentation, local_tracing, local_imports) =
         match local_file {
             Some((path, file)) => (
                 Some(path),
@@ -2116,6 +2151,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
                 file.build_when,
                 file.instrumentation,
                 file.tracing,
+                (file.lazy_imports, file.import_report),
             ),
             None => (
                 None,
@@ -2123,8 +2159,10 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
                 None,
                 Vec::new(),
                 None,
+                (None, None),
             ),
         };
+    let (local_lazy, local_report) = local_imports;
 
     // Section 6.15: this machine's instrumentation modules come before the
     // project's, so a tool one developer adds measures the others too.
@@ -2134,6 +2172,8 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         .chain(table.instrumentation.iter().cloned())
         .collect();
     muru_config::check_instrumentation(&instrumentation)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+    muru_config::check_preload_modules(&table.preload_modules)
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     // Section 11.6: tracing is set up by a module of Muru's own, at the
@@ -2150,6 +2190,19 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         &instrumentation,
     )
     .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    // Sections 6.17 and 6.18: deferral and the import report are set up
+    // by a module of Muru's own too, at the very head of the list, so the
+    // imports of the modules after it can be deferred and recorded.
+    // muru.local.toml's lazy_imports and import_report take the place of
+    // the project's.
+
+    let lazy_imports_from_local = local_lazy.is_some().then(|| local.clone()).flatten();
+    let lazy_imports = local_lazy.or(table.lazy_imports);
+    let import_report_from_local = local_report.is_some().then(|| local.clone()).flatten();
+    let import_report = local_report.or(table.import_report);
+    muru_config::lazy_imports_instrumentation(lazy_imports, import_report, 0, &instrumentation)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     let layers = print_config::Layers::new(&table, &run_table, &local_run);
     let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
@@ -2309,11 +2362,16 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
             .or(table.preload)
             .unwrap_or(muru_config::Preload::Auto),
         hooks: args.hooks.clone().or(table.hooks),
+        preload_modules: table.preload_modules,
         instrumentation,
         tracing,
         tracing_from_local,
         tracing_middleware: table.tracing_middleware,
         tracing_entry,
+        lazy_imports,
+        lazy_imports_from_local,
+        import_report,
+        import_report_from_local,
         project,
         source,
         groups: table.groups,
@@ -2788,6 +2846,13 @@ struct CheckArgs {
     /// A .env file of NAME=VALUE lines, for settings the import reads.
     #[arg(long, value_name = "FILE")]
     env_file: Option<PathBuf>,
+
+    /// Record the load's imports and print the import report, as
+    /// import_report does for a release: what each import cost, which
+    /// entry point paid for it, and what to defer or load before the
+    /// fork. The project's environment needs the unwrapt package.
+    #[arg(long)]
+    imports: bool,
 }
 
 /// The variables of a `.env` file, or why it cannot be used.
@@ -2809,12 +2874,18 @@ struct CheckReport {
     entrypoints: Vec<CheckEntrypoint>,
     #[serde(default)]
     hooks: Vec<String>,
+    /// The `preload_modules` it imported, in order.
+    #[serde(default)]
+    modules: Vec<String>,
     #[serde(default)]
     instrumentation: Vec<CheckInstrument>,
     #[serde(default)]
     findings: Vec<CheckFinding>,
     #[serde(default)]
     errors: Vec<CheckError>,
+    /// The load's import report (section 6.18), when it was recorded.
+    #[serde(default)]
+    imports: Option<serde_json::Value>,
 }
 
 /// An instrumentation module the check imported (section 6.15), with the
@@ -2949,9 +3020,13 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
         command.arg("--hooks").arg(hooks);
     }
 
+    for module in &resolved.preload_modules {
+        command.arg("--preload-module").arg(module);
+    }
+
     // Section 6.15: the instrumentation modules, as the host is given them.
 
-    let instrumentation = resolved.host_instrumentation();
+    let instrumentation = resolved.host_instrumentation_reporting(args.imports);
 
     if instrumentation.is_empty() {
         command.env_remove(muru_controller::host::INSTRUMENTATION_VARIABLE);
@@ -3063,11 +3138,35 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
         );
     }
 
+    if !report.modules.is_empty() {
+        println!(
+            "muru: check: preload_modules imported: {}",
+            report.modules.join(", ")
+        );
+    }
+
     for finding in &report.findings {
         println!(
             "muru: check: warning: {}; {}",
             finding.description, finding.advice
         );
+    }
+
+    // Section 6.18: the import report, with --imports or import_report.
+
+    if let Some(imports) = &report.imports {
+        let response = muru_proto::admin::v1::DebugResponse {
+            workers: Vec::new(),
+            release: imports["labels"]["release"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            host_json: imports.to_string(),
+        };
+        let found = imports::document(&response, None, &imports::Filters::default())?;
+        print!("{}", imports::render(&found));
+    } else if args.imports {
+        println!("muru: check: no import report was recorded; the reason is above");
     }
 
     for error in &report.errors {
@@ -3483,6 +3582,7 @@ async fn run_with(
         concurrency: resolved.concurrency,
         preload: resolved.preload,
         hooks: resolved.hooks.clone(),
+        preload_modules: resolved.preload_modules.clone(),
         instrumentation: resolved.host_instrumentation(),
         chdir: Some(resolved.project.clone()),
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
@@ -3683,6 +3783,10 @@ async fn run_with(
     // for the dashboard and the admin socket as well as the edge.
 
     let recorder = development.then(|| Arc::new(muru_edge::recorder::Recorder::default()));
+
+    // Section 6.18: the import reports of the run's last few loads.
+
+    let import_reports = Arc::new(run_admin::ImportReports::default());
 
     let edge = match muru_edge::Edge::bind(muru_edge::Config {
         listen: http_address,
@@ -4137,6 +4241,7 @@ async fn run_with(
             settings: Arc::clone(&settings),
             processes: Arc::clone(&run_processes),
             recorder: recorder.clone(),
+            imports: Arc::clone(&import_reports),
         });
 
         match run_admin::serve(state, admin_stop_rx).await {
@@ -4366,10 +4471,27 @@ async fn run_with(
                             recorder.capture(&evidence);
                         }
                     }
+                    muru_controller::host::HostMessage::Loaded { outcome, ms, imports, first } => {
+                        // Issue 753: the host's load, a gauge and, the
+                        // first time it says so, an event.
+
+                        let release = format!("r{}", current.release);
+                        run_admin::set_release_load(&label, &release, ms);
+
+                        if first {
+                            let message = muru_controller::host::loaded_message(&outcome, ms, imports.as_ref());
+                            run_events.record("release.loaded", &format!("{label}@{release}"), "info", &message);
+                        }
+                    }
+                    muru_controller::host::HostMessage::Imports { part, parts, data } => {
+                        import_reports.take(&format!("r{}", current.release), part, parts, data);
+                    }
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);
                     }
                     muru_controller::host::HostMessage::Status { workers, host_rss, memory_replacements } => {
+                        run_admin::set_worker_modules(&label, &format!("r{}", current.release), &workers);
+
                         // The relay may have been started again since.
 
                         run_processes.host(current.pid(), current.relay_pid());
