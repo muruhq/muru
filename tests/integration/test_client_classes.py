@@ -280,11 +280,17 @@ def test_methods_are_refused_and_the_mode_reaches_the_application(site: Site) ->
     assert seen["method"] == "GET"
 
 
-def test_requests_are_counted_by_class(site: Site) -> None:
-    site.seen("/", {"User-Agent": "GPTBot"})
+def test_requests_are_counted_and_logged_by_class(site: Site) -> None:
+    site.seen("/?counted", {"User-Agent": "GPTBot"})
     text = site.metrics()
     assert 'client_class="ai-crawler"' in text
     assert 'status="2xx",client_class="default"}' in text
+
+    # muructl's lines name the class as the edge's text lines do (issue 760).
+
+    lines = site.daemon.muructl("logs", "--access", "--lines", "50").stdout.splitlines()
+    counted = [line for line in lines if " /?counted " in line]
+    assert counted and " class=ai-crawler " in counted[-1], lines
 
 
 def test_a_changed_list_is_read_again(site: Site) -> None:

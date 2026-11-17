@@ -37,6 +37,11 @@ policy stops naming a release that is not the serving one, the release
 drains and is retained as it would be after a deploy. A deploy or rollback
 that would drain a release some policy still names leaves it running.
 
+`muructl release list` shows each release's share of a route that splits
+its traffic on a `traffic:` line below the release, such as `traffic:
+shop / 10%` for `r2` here and `traffic: shop / 90%` for the serving
+release (a route with a `name` goes by it), and `muructl scale status` the same for the release it shows.
+
 A share can go to an [HTTP upstream](upstreams.md) instead of a release,
 named `upstream:NAME` in `split`. Its buckets sit below the releases'
 ranges, and the sticky and preview cookies name it the same way.

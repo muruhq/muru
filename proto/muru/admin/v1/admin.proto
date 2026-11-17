@@ -602,6 +602,7 @@ message App {
   string umask = 8;                 // octal
   bool maintenance = 9;             // the edge serves its maintenance page (section 4.12)
   int32 priority = 10;              // the node's budget admits higher priorities' scale-ups first (section 7.4)
+  string maintenance_overlay = 11;  // the active overlay whose maintenance setting is in force, if one is (issue 757)
 }
 
 // A deploy names the application (created on first use) and the source.
@@ -933,6 +934,7 @@ message ScaleStatus {
   string app = 1;
   string release = 2;
   repeated GroupScale groups = 3;
+  string traffic = 4;               // the release's shares of the routes that split traffic, as Release.traffic (issue 759)
 }
 
 // One worker group's scaling: the policy, where it stands and what the
@@ -1014,6 +1016,7 @@ message Release {
   uint64 disk_freed_bytes = 35;     // what removing it would give back, less than disk_bytes when files are hard-linked elsewhere
   repeated string instrumentation = 36; // its instrumentation modules, in order (section 6.15)
   repeated GatePassed gates = 37;   // the gates it has passed, in order (section 9.12)
+  string traffic = 38;              // its shares of the routes that split traffic, where they differ from what serving implies (issue 759)
 }
 
 // A gate a release passed: a run of a command at a point in its life.
@@ -1161,6 +1164,7 @@ message ControlOverlayRequest {
 
 message ControlOverlayResponse {
   string message = 1;               // what happened
+  repeated string files = 2;        // after a promotion, TOML the applied files need for the next apply to keep it (issue 759)
 }
 
 message PreviewOverlayRequest {

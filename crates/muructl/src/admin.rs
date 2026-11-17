@@ -4950,6 +4950,11 @@ fn split_target(text: &str) -> anyhow::Result<(&str, &str)> {
 /// The autoscaler's state, a row per group with its last decision below.
 fn print_scale_status(status: &pb::ScaleStatus) {
     println!("{}@{}", status.app, status.release);
+
+    if !status.traffic.is_empty() {
+        println!("traffic: {}", status.traffic);
+    }
+
     println!(
         "{:<12} {:<12} {:<10} {:<7} {:<13} {:<10} POLICY",
         "GROUP", "WORKERS", "SLOTS", "IDLE", "QUEUE-P95", "REAPS"
@@ -5451,15 +5456,22 @@ pub async fn app_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             } else {
                 format!(" [priority {}]", app.priority)
             },
-            if app.maintenance {
-                " [maintenance]"
-            } else {
-                ""
-            }
+            maintenance_mark(&app)
         );
     }
 
     Ok(())
+}
+
+/// How `app list` marks an application's maintenance, naming the overlay
+/// that set it, or that turned it off, when one did (issue 757).
+fn maintenance_mark(app: &pb::App) -> String {
+    match (app.maintenance, app.maintenance_overlay.as_str()) {
+        (true, "") => " [maintenance]".to_owned(),
+        (true, overlay) => format!(" [maintenance by overlay {overlay}]"),
+        (false, "") => String::new(),
+        (false, overlay) => format!(" [maintenance off by overlay {overlay}]"),
+    }
 }
 
 /// Remove an application and all its releases.
@@ -5901,6 +5913,19 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
             .map(|until| format!(", until {}", format_time(until)))
             .unwrap_or_default()
     );
+
+    // Issue 759: the applied files still say what the overlay changed,
+    // so the next apply would undo a promotion they are not brought into
+    // line with.
+
+    if !response.files.is_empty() {
+        println!(
+            "muru: the next apply undoes this unless the applied files say the same: put this in \
+             them, and remove overlay {name}\n"
+        );
+        println!("{}", response.files.join("\n\n"));
+    }
+
     Ok(())
 }
 
@@ -5968,9 +5993,17 @@ fn overlay_row(overlay: &pb::OverlayInfo) -> [String; 4] {
         overlay.state.clone()
     };
 
+    // A hold with no end (a skip, say, in a window with no end) lasts
+    // until a person acts, which the next window's start would belie
+    // (issue 755).
+
+    let held = !overlay.active && !overlay.state.is_empty();
+
     if overlay.until_unix_ms > 0 {
         state.push_str(&format!(" until {}", format_time(overlay.until_unix_ms)));
-    } else if overlay.starts_unix_ms > 0 {
+    } else if held && overlay.state == "skipped" {
+        state.push_str(" (activate it by hand, or apply a change, to try again)");
+    } else if !held && overlay.starts_unix_ms > 0 {
         state.push_str(&format!(" from {}", format_time(overlay.starts_unix_ms)));
     }
 
@@ -6641,6 +6674,10 @@ pub async fn release_list(
 
         if !release.message.is_empty() {
             println!("{:<24} {}", "", release.message);
+        }
+
+        if !release.traffic.is_empty() {
+            println!("{:<24} traffic: {}", "", release.traffic);
         }
     }
 
@@ -10526,7 +10563,8 @@ pub(crate) fn human_size(bytes: u64) -> String {
 }
 
 /// An access log record as the compact line a development run prints,
-/// with the release, host, group and mount when the record names them,
+/// with the release and host, and the fields the edge's text format
+/// writes (group, mount, client class and the rest) when they say something,
 /// starting with the record's full time unless `timed` is false. A line
 /// that is not a record is printed as it is.
 fn format_access_line(line: &str, timed: bool) -> String {
@@ -10588,20 +10626,47 @@ fn format_access_line(line: &str, timed: bool) -> String {
             millis("queue_ms"),
             millis("app_ms")
         ));
+    } else if number("queue_ms") > 0.0 {
+        out.push_str(&format!(" queue={}", millis("queue_ms")));
     }
 
     if !text("reason").is_empty() {
         out.push_str(&format!(" reason={}", text("reason")));
     }
 
-    for key in ["group", "mount"] {
+    let redirects: Vec<&str> = record
+        .get("redirects")
+        .and_then(|v| v.as_array())
+        .map(|targets| targets.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    if !redirects.is_empty() {
+        out.push_str(&format!(" redirects={}", redirects.join(",")));
+    }
+
+    // The fields after the timings come in the order the edge's own text
+    // format writes them, each left out when it says nothing.
+
+    for (key, name) in [
+        ("group", "group"),
+        ("mount", "mount"),
+        ("client_class", "class"),
+    ] {
         if !text(key).is_empty() && text(key) != "default" {
-            out.push_str(&format!(" {key}={}", text(key)));
+            out.push_str(&format!(" {name}={}", text(key)));
         }
     }
 
     if let Some(worker) = record.get("worker").and_then(|v| v.as_u64()) {
         out.push_str(&format!(" worker={worker}"));
+    }
+
+    if record.get("retried").and_then(|v| v.as_bool()) == Some(true) {
+        out.push_str(" retried=1");
+    }
+
+    if !text("handoff").is_empty() {
+        out.push_str(&format!(" handoff={}", text("handoff")));
     }
 
     out.push_str(&format!(" id={}", text("request_id")));
@@ -10683,10 +10748,41 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 #[cfg(test)]
 mod tests {
     use super::condition_wait;
+    use super::format_access_line;
     use super::limits_lines;
     use super::metric_samples;
     use super::overlay_table;
     use super::pb;
+
+    #[test]
+    fn an_access_line_names_what_the_edge_text_format_names() {
+        // Issue 760: the client class, like the group and mount, is shown
+        // for anything but default, and the other fields follow in the
+        // edge's order.
+
+        let record = r#"{"time":"2026-11-17T01:02:03.456Z","request_id":"01ABC","app":"shop","release":"r1","host":"127.0.0.1","group":"api","mount":"default","method":"GET","target":"/","status":200,"reason":"","bytes":58,"worker":0,"retried":true,"queue_ms":0.0,"app_ms":20.0,"total_ms":20.0,"redirects":["/a","/b"],"client_class":"ai-crawler","websocket":null,"handoff":"file"}"#;
+
+        assert_eq!(
+            format_access_line(record, false),
+            "200 GET / 58B 20ms release=shop@r1 host=127.0.0.1 queue=0.0ms app=20ms \
+             redirects=/a,/b group=api class=ai-crawler worker=0 retried=1 handoff=file id=01ABC"
+        );
+
+        let plain = record
+            .replace(
+                r#""client_class":"ai-crawler""#,
+                r#""client_class":"default""#,
+            )
+            .replace(r#""retried":true"#, r#""retried":false"#)
+            .replace(r#""handoff":"file""#, r#""handoff":null"#)
+            .replace(r#""redirects":["/a","/b"]"#, r#""redirects":[]"#);
+
+        assert_eq!(
+            format_access_line(&plain, false),
+            "200 GET / 58B 20ms release=shop@r1 host=127.0.0.1 queue=0.0ms app=20ms \
+             group=api worker=0 id=01ABC"
+        );
+    }
 
     #[test]
     fn a_condition_waiting_out_its_for_says_how_long() {
@@ -10752,6 +10848,49 @@ mod tests {
         for line in &lines[1..] {
             assert_eq!(line.find("route shop"), Some(changes), "{lines:#?}");
         }
+    }
+
+    #[test]
+    fn app_list_names_the_overlay_that_set_maintenance() {
+        let app = |maintenance: bool, overlay: &str| pb::App {
+            maintenance,
+            maintenance_overlay: overlay.to_owned(),
+            ..pb::App::default()
+        };
+
+        assert_eq!(super::maintenance_mark(&app(true, "")), " [maintenance]");
+        assert_eq!(
+            super::maintenance_mark(&app(true, "db-upgrade")),
+            " [maintenance by overlay db-upgrade]"
+        );
+        assert_eq!(super::maintenance_mark(&app(false, "")), "");
+        assert_eq!(
+            super::maintenance_mark(&app(false, "open")),
+            " [maintenance off by overlay open]"
+        );
+    }
+
+    #[test]
+    fn a_skip_with_no_end_says_how_to_try_again() {
+        // Issue 755: the next window's start is not when a held overlay
+        // is judged again, so it is not shown.
+
+        let skipped = pb::OverlayInfo {
+            name: "summer-sale".to_owned(),
+            state: "skipped".to_owned(),
+            starts_unix_ms: 1_000,
+            ..pb::OverlayInfo::default()
+        };
+        assert_eq!(
+            super::overlay_row(&skipped)[1],
+            "skipped (activate it by hand, or apply a change, to try again)"
+        );
+
+        let idle = pb::OverlayInfo {
+            state: String::new(),
+            ..skipped
+        };
+        assert!(super::overlay_row(&idle)[1].starts_with("idle from "));
     }
 
     #[test]

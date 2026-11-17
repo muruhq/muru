@@ -92,7 +92,8 @@ crawler user agents or a provider's address ranges can be dropped in as
 they are.
 
 The class appears in the access log as `class=` (for anything but
-`default`) and as `client_class` in JSON lines, as the `client_class`
+`default`, as on the lines `muructl logs --access` prints) and as
+`client_class` in JSON lines, as the `client_class`
 label of `muru_requests_total`, and to the application as
 `muru.client_class` in the environ or `client_class` in the scope's
 `extensions["muru"]`.
