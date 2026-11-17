@@ -10526,7 +10526,8 @@ pub(crate) fn human_size(bytes: u64) -> String {
 }
 
 /// An access log record as the compact line a development run prints,
-/// with the release, host, group and mount when the record names them,
+/// with the release and host, and the fields the edge's text format
+/// writes (group, mount, client class and the rest) when they say something,
 /// starting with the record's full time unless `timed` is false. A line
 /// that is not a record is printed as it is.
 fn format_access_line(line: &str, timed: bool) -> String {
@@ -10588,20 +10589,47 @@ fn format_access_line(line: &str, timed: bool) -> String {
             millis("queue_ms"),
             millis("app_ms")
         ));
+    } else if number("queue_ms") > 0.0 {
+        out.push_str(&format!(" queue={}", millis("queue_ms")));
     }
 
     if !text("reason").is_empty() {
         out.push_str(&format!(" reason={}", text("reason")));
     }
 
-    for key in ["group", "mount"] {
+    let redirects: Vec<&str> = record
+        .get("redirects")
+        .and_then(|v| v.as_array())
+        .map(|targets| targets.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    if !redirects.is_empty() {
+        out.push_str(&format!(" redirects={}", redirects.join(",")));
+    }
+
+    // The fields after the timings come in the order the edge's own text
+    // format writes them, each left out when it says nothing.
+
+    for (key, name) in [
+        ("group", "group"),
+        ("mount", "mount"),
+        ("client_class", "class"),
+    ] {
         if !text(key).is_empty() && text(key) != "default" {
-            out.push_str(&format!(" {key}={}", text(key)));
+            out.push_str(&format!(" {name}={}", text(key)));
         }
     }
 
     if let Some(worker) = record.get("worker").and_then(|v| v.as_u64()) {
         out.push_str(&format!(" worker={worker}"));
+    }
+
+    if record.get("retried").and_then(|v| v.as_bool()) == Some(true) {
+        out.push_str(" retried=1");
+    }
+
+    if !text("handoff").is_empty() {
+        out.push_str(&format!(" handoff={}", text("handoff")));
     }
 
     out.push_str(&format!(" id={}", text("request_id")));
@@ -10683,10 +10711,41 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 #[cfg(test)]
 mod tests {
     use super::condition_wait;
+    use super::format_access_line;
     use super::limits_lines;
     use super::metric_samples;
     use super::overlay_table;
     use super::pb;
+
+    #[test]
+    fn an_access_line_names_what_the_edge_text_format_names() {
+        // Issue 760: the client class, like the group and mount, is shown
+        // for anything but default, and the other fields follow in the
+        // edge's order.
+
+        let record = r#"{"time":"2026-11-17T01:02:03.456Z","request_id":"01ABC","app":"shop","release":"r1","host":"127.0.0.1","group":"api","mount":"default","method":"GET","target":"/","status":200,"reason":"","bytes":58,"worker":0,"retried":true,"queue_ms":0.0,"app_ms":20.0,"total_ms":20.0,"redirects":["/a","/b"],"client_class":"ai-crawler","websocket":null,"handoff":"file"}"#;
+
+        assert_eq!(
+            format_access_line(record, false),
+            "200 GET / 58B 20ms release=shop@r1 host=127.0.0.1 queue=0.0ms app=20ms \
+             redirects=/a,/b group=api class=ai-crawler worker=0 retried=1 handoff=file id=01ABC"
+        );
+
+        let plain = record
+            .replace(
+                r#""client_class":"ai-crawler""#,
+                r#""client_class":"default""#,
+            )
+            .replace(r#""retried":true"#, r#""retried":false"#)
+            .replace(r#""handoff":"file""#, r#""handoff":null"#)
+            .replace(r#""redirects":["/a","/b"]"#, r#""redirects":[]"#);
+
+        assert_eq!(
+            format_access_line(&plain, false),
+            "200 GET / 58B 20ms release=shop@r1 host=127.0.0.1 queue=0.0ms app=20ms \
+             group=api worker=0 id=01ABC"
+        );
+    }
 
     #[test]
     fn a_condition_waiting_out_its_for_says_how_long() {
