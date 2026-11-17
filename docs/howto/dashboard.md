@@ -37,7 +37,11 @@ the record.
 
 
 On every page, "Muru" in the title banner goes back to the front page:
-the run's page under `muructl run`, the node's under the daemon.
+the run's page under `muructl run`, the node's under the daemon. A
+section that refreshes keeps the place of everything in it that scrolls,
+the output and the tables among them: a region scrolled to its end
+stays at the end as lines arrive, and a section is left as it is while
+it is being scrolled.
 
 ## Under the daemon
 
