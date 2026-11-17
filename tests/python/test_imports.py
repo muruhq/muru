@@ -73,6 +73,7 @@ def test_a_requests_loads_are_kept_nested_with_what_triggered_them(source: Path)
     # A load outside any request is only counted, for the worker.
 
     (source / "later.py").write_text("")
+    importlib.invalidate_caches()
     import later  # noqa: F401
 
     assert _imports.loaded() == (5, 1)
