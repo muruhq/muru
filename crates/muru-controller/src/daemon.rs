@@ -4274,8 +4274,31 @@ impl Daemon {
                         until_unix_ms: if latched { None } else { until },
                     };
                     let _ = self.store.set_overlay_state(name, Some(&state));
-                    self.events.emit(kind, &subject, level, &detail);
-                    changed |= active;
+
+                    // Issue 779: an activation the edge refuses is skipped
+                    // for the window, saying why.
+
+                    if !active {
+                        self.events.emit(kind, &subject, level, &detail);
+                    } else if let Err(error) =
+                        self.push_overlay_change(name, states.get(name)).await
+                    {
+                        let skipped = crate::model::OverlayState {
+                            active: false,
+                            source: "skipped".to_owned(),
+                            until_unix_ms: until,
+                            ..state
+                        };
+                        let _ = self.store.set_overlay_state(name, Some(&skipped));
+                        self.events.emit(
+                            "overlay.skipped",
+                            &subject,
+                            "warning",
+                            &format!("not activated: {error}"),
+                        );
+                    } else {
+                        self.events.emit(kind, &subject, level, &detail);
+                    }
                 }
             }
         }
@@ -4438,6 +4461,34 @@ impl Daemon {
                     until_unix_ms: None,
                 };
                 let _ = self.store.set_overlay_state(name, Some(&state));
+
+                // Issue 779: an activation the edge refuses is held back
+                // for its cooldown, a minute at least, before the firing
+                // condition tries it again.
+
+                if let Err(error) = self.push_overlay_change(name, None).await {
+                    let wait = crate::overlays::cooldown(overlay).max(Duration::from_secs(60));
+                    let held = crate::model::OverlayState {
+                        active: false,
+                        source: "skipped".to_owned(),
+                        until_unix_ms: Some(now + wait.as_millis() as u64),
+                        ..state
+                    };
+                    let _ = self.store.set_overlay_state(name, Some(&held));
+                    self.condition_skips.insert(name.to_owned());
+                    self.events.emit(
+                        "overlay.skipped",
+                        &subject,
+                        "warning",
+                        &format!(
+                            "not activated though its condition {condition} is firing: {error}; \
+                             it is tried again in {}",
+                            crate::overlays::describe_wait(wait.as_millis() as u64)
+                        ),
+                    );
+                    return false;
+                }
+
                 let _ = self.store.record_overlay_activation(name, now);
                 self.events.emit(
                     "overlay.activated",
@@ -4608,7 +4659,7 @@ impl Daemon {
             ("manual", "by hand")
         };
 
-        let message = match action {
+        let (kind, verb, message) = match action {
             OverlayAction::Activate { until } => {
                 if active {
                     return Err(format!("overlay {name} is already active"));
@@ -4643,10 +4694,7 @@ impl Daemon {
                 self.store
                     .set_overlay_state(name, Some(&state))
                     .map_err(|error| error.to_string())?;
-                let detail = format!("activated {by}");
-                self.events
-                    .emit("overlay.activated", &subject, "notice", &detail);
-                detail
+                ("overlay.activated", "activated", format!("activated {by}"))
             }
             OverlayAction::End => {
                 if !active {
@@ -4678,17 +4726,7 @@ impl Daemon {
                 self.store
                     .set_overlay_state(name, held.as_ref())
                     .map_err(|error| error.to_string())?;
-
-                if crate::overlays::is_temporary(name) {
-                    self.store
-                        .delete_overlay(name)
-                        .map_err(|error| error.to_string())?;
-                }
-
-                let detail = format!("ended {by}");
-                self.events
-                    .emit("overlay.ended", &subject, "notice", &detail);
-                detail
+                ("overlay.ended", "ended", format!("ended {by}"))
             }
             OverlayAction::Promote => {
                 if !active {
@@ -4699,12 +4737,49 @@ impl Daemon {
             }
         };
 
-        self.reconcile_traffic().await;
-        self.push_snapshot().await?;
+        // Issue 779: the change stands, and is reported, once the edge
+        // has taken it.
+
+        self.push_overlay_change(name, state.as_ref())
+            .await
+            .map_err(|error| format!("overlay {name} was not {verb}: {error}"))?;
+
+        if kind == "overlay.ended" && crate::overlays::is_temporary(name) {
+            self.store
+                .delete_overlay(name)
+                .map_err(|error| error.to_string())?;
+        }
+
+        self.events.emit(kind, &subject, "notice", &message);
         Ok(OverlayOutcome {
             message,
             files: Vec::new(),
         })
+    }
+
+    /// Issue 779: give the edge the snapshot once an overlay's state has
+    /// changed from `previous`, and put `previous` back when the edge
+    /// refuses it, so that the overlay is not recorded as in force, or
+    /// as ended, when the edge serves otherwise. Gives the edge's error.
+    async fn push_overlay_change(
+        &mut self,
+        name: &str,
+        previous: Option<&crate::model::OverlayState>,
+    ) -> Result<(), String> {
+        self.reconcile_traffic().await;
+
+        let Err(error) = self.push_snapshot().await else {
+            return Ok(());
+        };
+
+        let _ = self.store.set_overlay_state(name, previous);
+        self.reconcile_traffic().await;
+
+        if let Err(again) = self.push_snapshot().await {
+            tracing::error!(error = %again, "pushing the snapshot without overlay {name}'s change failed");
+        }
+
+        Err(error)
     }
 
     /// Section 9.10: fold an active overlay into the base and end it for

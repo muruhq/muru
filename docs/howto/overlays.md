@@ -55,6 +55,14 @@ apps.shop = { maintenance = true }
 routes.shop-root.error_pages = { '503:maintenance' = { file = '/srv/shop/upgrade.html' } }
 ```
 
+`muructl apply` refuses an overlay whose page file does not exist. If
+the file goes after the apply, the edge refuses the overlay when it is
+activated, and the overlay is not recorded as active: `muructl overlay
+activate` fails with the edge's reason, and an activation by schedule or
+condition is skipped with an `overlay.skipped` warning saying why. A
+condition that is still firing tries again once the overlay's cooldown,
+or a minute if that is shorter, has passed.
+
 An overlay can also give a client class a route of its own while it is
 active, such as sending crawlers to a static snapshot when they become a
 burden. Where the route has a route for that class alone at the same

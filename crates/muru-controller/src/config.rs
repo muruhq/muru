@@ -2189,6 +2189,19 @@ fn plan_overlays(
                     }
                 }
 
+                // Issue 779: a page file is checked here, as a route's and
+                // a host's are, rather than by the edge at activation.
+
+                for (key, page) in change.error_pages.iter().flatten() {
+                    if let Some(file) = &page.file
+                        && !Path::new(file).is_file()
+                    {
+                        errors.push(format!(
+                            "overlay {name}: {field}.error_pages.{key}: {file} is not a file"
+                        ));
+                    }
+                }
+
                 let Some(target) = &change.target else {
                     continue;
                 };

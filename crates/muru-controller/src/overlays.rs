@@ -207,6 +207,7 @@ pub fn condition_step(
             let why = match held.source.as_str() {
                 "cooldown" => "its cooldown after it last ended",
                 "ended" => "it was ended by hand, and its cooldown",
+                "skipped" => "the wait after the edge refused its activation",
                 _ => "its hold",
             };
 
