@@ -3,17 +3,22 @@
 Every command that reports something takes --json and prints the admin
 API's answer with its field names, so scripts and coding agents read one
 shape; a command that fails with --json prints its error as JSON too, with
-the same exit status.
+the same exit status. Without it, the error is one `muru: error:` line,
+on a terminal as elsewhere.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import select
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
+from support import server as support
 from support.daemon import SHOP, Daemon
 from support.daemon import daemon as daemon_fixture
 
@@ -111,6 +116,38 @@ def test_a_failure_prints_its_error_as_json(daemon: Daemon) -> None:
     assert failed.returncode == 1
     error = json.loads(failed.stdout)["error"]
     assert isinstance(error, str) and error
+
+
+def test_a_failure_on_a_terminal_is_one_muru_line(tmp_path: Path) -> None:
+    # Issue 777: the same line as elsewhere, cause and all, with no time.
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    leader, follower = os.openpty()
+
+    try:
+        failed = subprocess.run(
+            [str(muructl), "deploy", "shop", str(tmp_path / "missing")],
+            stdout=subprocess.PIPE,
+            stderr=follower,
+            check=False,
+            timeout=30,
+        )
+        written = b""
+
+        # What it wrote waits in the terminal until it is read.
+
+        while select.select([leader], [], [], 0.5)[0]:
+            written += os.read(leader, 4096)
+    finally:
+        os.close(follower)
+        os.close(leader)
+
+    assert failed.returncode == 1
+    missing = tmp_path / "missing"
+    assert written.decode().splitlines() == [
+        f"muru: error: {missing} does not exist: No such file or directory (os error 2)"
+    ]
 
 
 def test_apply_names_a_release_that_failed_and_why(daemon: Daemon, tmp_path: Path) -> None:

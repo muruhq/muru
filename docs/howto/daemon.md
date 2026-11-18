@@ -618,7 +618,7 @@ wrote to `daemon.log`, the last twenty of them:
 
 ```console
 $ muructl daemon start
-Error: the daemon exited before it answered (exit status: 1); from /var/log/muru/daemon.log:
+muru: error: the daemon exited before it answered (exit status: 1); from /var/log/muru/daemon.log:
   2026-11-02T05:40:11.204Z muru: config: /etc/muru/muru.toml (default)
   2026-11-02T05:40:11.204Z muru: state: /var/lib/muru (default)
   2026-11-02T05:40:11.204Z muru: run: /run/muru (default)
