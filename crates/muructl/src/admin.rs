@@ -3099,6 +3099,16 @@ fn request_text(record: &pb::RequestRecord) -> String {
 
             for row in &table.rows {
                 match row.cells.as_slice() {
+                    // Issue 780: a value of several lines, such as a
+                    // stack, goes below its name, every line indented, as
+                    // a panel's own values do.
+                    [name, value] if value.contains('\n') => {
+                        let _ = writeln!(text, "    {name}");
+
+                        for line in value.lines() {
+                            let _ = writeln!(text, "      {line}");
+                        }
+                    }
                     [name, value] => {
                         let _ = writeln!(text, "    {name}: {value}");
                     }
@@ -11525,6 +11535,54 @@ mod logs_list_tests {
         assert!(lines[4].ends_with("  at 2.5ms"), "{text}");
         assert!(
             lines[5].ends_with("1.0ms in 2 segments  from 1.0ms"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_capture_s_stack_is_indented_below_its_name() {
+        let row = |name: &str, value: &str| pb::PanelRow {
+            cells: vec![name.to_owned(), value.to_owned()],
+        };
+        let record = pb::RequestRecord {
+            panels: vec![pb::Panel {
+                title: "Errors".to_owned(),
+                tables: vec![pb::PanelTable {
+                    caption: "request.soft_timeout at 14:26:36.016".to_owned(),
+                    columns: vec!["name".to_owned(), "value".to_owned()],
+                    rows: vec![
+                        row("worker", "0"),
+                        row(
+                            "stack",
+                            "  File \"shop.py\", line 180, in report\n    total += 1\n",
+                        ),
+                        row(
+                            "thread pool-1",
+                            "  File \"a.py\", line 1, in run\n    wait()",
+                        ),
+                    ],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // Issue 780: every line of a value of several lines sits under
+        // its name, as the panel's own values do.
+
+        let text = super::request_text(&record);
+        let lines: Vec<&str> = text.lines().skip_while(|line| *line != "Errors").collect();
+        assert_eq!(
+            lines[1..8],
+            [
+                "  request.soft_timeout at 14:26:36.016",
+                "    worker: 0",
+                "    stack",
+                "        File \"shop.py\", line 180, in report",
+                "          total += 1",
+                "    thread pool-1",
+                "        File \"a.py\", line 1, in run",
+            ],
             "{text}"
         );
     }
