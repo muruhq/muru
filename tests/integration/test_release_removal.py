@@ -75,6 +75,11 @@ def test_release_prune_takes_only_what_it_may(tmp_path: Path) -> None:
 
         # A dry run lists what would go and why the rest stays. Serving and
         # rollback stay at --keep 0; the failed release is newer than both.
+        # The releases the deploys superseded stop beside the daemon's other
+        # work, and prune leaves one that is still stopping.
+
+        for release in ("shop@r1", "shop@r2"):
+            daemon.wait_for_state(release, "stopped")
 
         plan = as_json(daemon, "release", "prune", "shop", "--keep", "0", "--dry-run")
         assert plan["dry_run"] is True
@@ -165,6 +170,10 @@ def test_release_prune_takes_only_what_it_may(tmp_path: Path) -> None:
         assert answer["removed"][0]["why"] == "named"
         assert not (logs / "r9.log").exists()
 
+        # r3 was superseded as the rollback release by r7's deploy, and is
+        # refused while it is still stopping.
+
+        daemon.wait_for_state("shop@r3", "stopped")
         answer = as_json(daemon, "release", "remove", "shop@r3", "--keep-logs", "--yes")
         assert removed_ids(answer) == ["r3"]
         assert (logs / "r3.log").exists()
