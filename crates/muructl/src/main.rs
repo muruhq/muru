@@ -951,6 +951,36 @@ fn explain_bind_error(error: anyhow::Error, https: SocketAddr) -> anyhow::Error 
     }
 }
 
+/// Turn a failure to serve the dashboard into advice, as for the HTTP
+/// port: who holds its address when that can be found out, and what to
+/// do instead (issue 750).
+fn explain_dashboard_error(error: anyhow::Error, address: &str) -> anyhow::Error {
+    let in_use = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+    });
+
+    if !in_use {
+        return error.context(format!("the dashboard cannot be served on {address}"));
+    }
+
+    let holder = address
+        .parse::<SocketAddr>()
+        .ok()
+        .and_then(|bound| port_holder(bound.port()));
+    let instead = "choose another address with --dashboard ADDRESS, or turn it off with \
+                   --dashboard off";
+
+    match holder {
+        Some(holder) => anyhow::anyhow!(
+            "the dashboard's address {address} is in use by {holder}; {instead}, or stop that \
+             process"
+        ),
+        None => anyhow::anyhow!("the dashboard's address {address} is in use; {instead}"),
+    }
+}
+
 /// The process listening on a TCP port, as "command (pid N)", found with
 /// lsof or ss when either is installed.
 fn port_holder(port: u16) -> Option<String> {
@@ -3717,6 +3747,27 @@ async fn run_with(
         None => None,
     };
 
+    // Issue 750: the dashboard's address is bound before anything starts,
+    // so a run that cannot have its dashboard stops at once, as it does
+    // when its HTTP port is taken, rather than leaving the browser and the
+    // toolbar's links on whatever holds the address.
+
+    let dashboard = match resolved.serving.dashboard.as_deref() {
+        Some("off") => None,
+        Some(address) => Some(address.to_owned()),
+        None if development => Some("127.0.0.1:8081".to_owned()),
+        None => None,
+    };
+
+    let dashboard_listener = match &dashboard {
+        Some(address) => Some(
+            dashboard::bind(address)
+                .await
+                .map_err(|error| explain_dashboard_error(error, address))?,
+        ),
+        None => None,
+    };
+
     let mut current = HostProcess::start(
         &spec,
         &run_dir,
@@ -4107,18 +4158,11 @@ async fn run_with(
         });
     }
 
-    let dashboard = match resolved.serving.dashboard.as_deref() {
-        Some("off") => None,
-        Some(address) => Some(address.to_owned()),
-        None if development => Some("127.0.0.1:8081".to_owned()),
-        None => None,
-    };
-
     let mut dashboard_address = None;
 
-    if let Some(address) = dashboard {
+    if let Some(listener) = dashboard_listener {
         match dashboard::start(
-            &address,
+            listener,
             dashboard::Inputs {
                 development,
                 app: resolved.entrypoint.clone(),
@@ -4127,6 +4171,11 @@ async fn run_with(
                 listen: edge.local_addr(),
                 https: edge.https_addr(),
                 started: std::time::Instant::now(),
+                started_at: std::time::SystemTime::now(),
+                project: resolved
+                    .project
+                    .canonicalize()
+                    .unwrap_or_else(|_| resolved.project.clone()),
                 release: Arc::clone(&release_number),
                 pools: edge.pools(),
                 connections: edge.connections(),
@@ -4155,7 +4204,11 @@ async fn run_with(
 
                 dashboard_address = Some(address);
             }
-            Err(error) => muru_common::muru_println!("no dashboard: {error:#}"),
+            Err(error) => {
+                current.stop(stop_budget).await;
+                let _ = std::fs::remove_dir_all(&run_dir);
+                return Err(error.context("the dashboard cannot be served"));
+            }
         }
     }
 

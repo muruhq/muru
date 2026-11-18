@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import re
+import shutil
 import time
 from collections.abc import Iterator
 
@@ -99,6 +100,14 @@ def test_fragments_and_assets(dashboard: tuple[support.Server, int]) -> None:
     assert fetch(port, "/static/scroll.js")[0] == 200
     assert fetch(port, "/missing")[0] == 404
 
+    # Issue 750: the banner names the run's project and when it started,
+    # on the request pages too.
+
+    for path in ("/", "/request/01UNKNOWN"):
+        page = fetch(port, path)[2].decode()
+        assert f'"The project this run serves">{support.ROOT}' in page, path
+        assert re.search(r"started \d{4}-\d\d-\d\dT", page), path
+
     # A request whose record is gone still has the banner, and its link
     # back to the run's page.
 
@@ -124,14 +133,28 @@ def test_dashboard_can_be_off() -> None:
         server.stop()
 
 
-def test_dashboard_refuses_non_loopback_addresses() -> None:
-    server = support.start("plain_wsgi:application", workers=1, args=["--dashboard", "0.0.0.0:0"])
+def test_a_dashboard_that_cannot_be_served_stops_the_run(
+    dashboard: tuple[support.Server, int],
+) -> None:
+    with pytest.raises(RuntimeError) as failure:
+        support.start("plain_wsgi:application", workers=1, args=["--dashboard", "0.0.0.0:0"])
+    assert "the dashboard is only served on loopback" in str(failure.value)
 
-    try:
-        assert server.wait_for_log("no dashboard: the dashboard is only served on loopback")
-        assert server.get("/").status == 200
-    finally:
-        server.stop()
+    # Issue 750: another run holds the address, and the message names it.
+
+    _server, port = dashboard
+
+    with pytest.raises(RuntimeError) as failure:
+        support.start(
+            "plain_wsgi:application", workers=1, args=["--dashboard", f"127.0.0.1:{port}"]
+        )
+
+    message = str(failure.value)
+    assert f"the dashboard's address 127.0.0.1:{port} is in use" in message, message
+    assert "--dashboard off" in message
+
+    if shutil.which("lsof") or shutil.which("ss"):
+        assert re.search(r"in use by \S+ \(pid \d+\)", message), message
 
 
 def test_metrics_are_served_beside_the_pages(dashboard: tuple[support.Server, int]) -> None:
