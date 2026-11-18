@@ -796,7 +796,7 @@
           "type": "string"
         },
         "file": {
-          "description": "A file sent as the body, with the content type its name implies. A release's page may be a path relative to its source directory; elsewhere the path is absolute.",
+          "description": "A file sent as the body, with the content type its name implies. A relative path is taken from the source directory for a release's own page (in `[tool.muru]`, `muru.toml` or the release's table), and from the file's directory for any other page in a file `muructl apply` reads; in the daemon's own file the path is absolute.",
           "type": "string"
         },
         "path": {
@@ -1751,7 +1751,7 @@
           "x-default": "the release's"
         },
         "sendfile_roots": {
-          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint.",
+          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. In a file `muructl apply` reads, a relative path is taken from the file's directory; in a project's settings each is absolute.",
           "items": {
             "type": "string"
           },
@@ -2189,7 +2189,7 @@
           "type": "integer"
         },
         "cwd": {
-          "description": "The directory an `http` release's command runs in; `source` when absent, and one of the two is required.",
+          "description": "The directory an `http` release's command runs in; `source` when absent, and one of the two is required. A relative path is taken from the file's directory.",
           "type": "string",
           "x-default": "`source`"
         },
@@ -2340,7 +2340,7 @@
           "description": "The server an `http` release runs: gunicorn, uvicorn, granian, mod_wsgi-express, uwsgi or generic."
         },
         "python": {
-          "description": "The interpreter: a path, or a request in uv's syntax.",
+          "description": "The interpreter: a path, or a request in uv's syntax. A relative path with a directory in it, such as `.venv/bin/python`, is taken from the file's directory.",
           "type": "string",
           "x-default": "found at start"
         },
@@ -2362,7 +2362,7 @@
           "type": "string"
         },
         "sendfile_roots": {
-          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file, for the default mount and any mount that does not say otherwise; with none every hint is refused.",
+          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file, for the default mount and any mount that does not say otherwise; with none every hint is refused. A relative path is taken from the file's directory.",
           "items": {
             "type": "string"
           },
@@ -2640,7 +2640,7 @@
           "type": "string"
         },
         "static": {
-          "description": "The directory served by the edge, instead of an application.",
+          "description": "The directory served by the edge, instead of an application. A relative path is taken from the file's directory.",
           "type": "string"
         },
         "timeouts": {
@@ -2734,7 +2734,7 @@
           "type": "string"
         },
         "static": {
-          "description": "A directory the edge serves.",
+          "description": "A directory the edge serves. A relative path is taken from the file's directory.",
           "type": "string"
         },
         "upstream": {
@@ -3268,7 +3268,7 @@
           "type": "string"
         },
         "sendfile_roots": {
-          "description": "Directories a path in a trusted `X-Muru-Sendfile` response header must lie in for the edge to serve the file; with none every hint is refused.",
+          "description": "Directories a path in a trusted `X-Muru-Sendfile` response header must lie in for the edge to serve the file; with none every hint is refused. A relative path is taken from the file's directory.",
           "items": {
             "type": "string"
           },
@@ -3341,7 +3341,7 @@
       "description": "How an upstream's TLS connections are made.",
       "properties": {
         "ca": {
-          "description": "A PEM file of the certificates trusted, by absolute path; the public roots without it.",
+          "description": "A PEM file of the certificates trusted; the public roots without it. A relative path is taken from the file's directory.",
           "type": "string"
         },
         "server_name": {

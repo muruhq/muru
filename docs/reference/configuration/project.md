@@ -151,7 +151,7 @@ A custom error page: one entry of an `error_pages` table, keyed by status (`404`
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `content_type` | string | `"text/html; charset=utf-8"` | The content type of a template. |
-| `file` | string |  | A file sent as the body, with the content type its name implies. A release's page may be a path relative to its source directory; elsewhere the path is absolute. |
+| `file` | string |  | A file sent as the body, with the content type its name implies. A relative path is taken from the source directory for a release's own page (in `[tool.muru]`, `muru.toml` or the release's table), and from the file's directory for any other page in a file `muructl apply` reads; in the daemon's own file the path is absolute. |
 | `path` | string |  | An application path the edge asks for the page, as an internal sub-request that sees `REDIRECT_STATUS` and `muru.error_reason`. |
 | `template` | string |  | A template the edge renders, with `{status}`, `{title}`, `{reason}`, `{description}`, `{request_id}`, `{retry_after}`, `{host}` and `{path}` filled in. |
 
@@ -267,7 +267,7 @@ A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` ta
 | `max_connections` | integer |  | Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; each holds a request slot when absent. |
 | `path` | string |  | The path prefix; the longest wins, on segment boundaries. A gRPC mount has none: its calls are matched by service name. |
 | `sendfile_header` | string | the release's | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
-| `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. |
+| `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. In a file `muructl apply` reads, a relative path is taken from the file's directory; in a project's settings each is absolute. |
 | `threads` | integer or table, {ref}`[tool.muru.mounts.NAME.threads] <config-project-tool-muru-mounts-name-threads>` |  | Threads of the mount's own, for a WSGI or gRPC mount; it shares the worker's pool when absent. |
 | `tracing_middleware` | boolean | `false` | Wrap the mount's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for. |
 

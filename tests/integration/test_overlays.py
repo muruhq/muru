@@ -263,7 +263,8 @@ routes.root.error_pages = { '503:maintenance' = { template = '<p>Upgrading, back
 
 
 def test_an_overlays_page_must_exist_and_a_refused_activation_does_not_stand(site: Site) -> None:
-    # Issue 779: the page is relative to the applied file's directory.
+    # Issues 778 and 779: the page is relative to the applied file's
+    # directory, which is not the current one, and must exist.
 
     page = site.base / "pages" / "down.html"
     page.parent.mkdir(exist_ok=True)
@@ -287,6 +288,8 @@ def test_an_overlays_page_must_exist_and_a_refused_activation_does_not_stand(sit
 
     page.write_text("<p>Down</p>")
     site.apply(down())
+    preview = site.overlay("preview", "down")
+    assert f"error_pages.503:maintenance (none) -> file {page}" in preview, preview
     page.unlink()
     refused = site.overlay("activate", "down", check=False)
     assert "overlay down was not activated: the edge refused the snapshot" in refused, refused

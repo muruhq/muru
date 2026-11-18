@@ -7594,6 +7594,14 @@ fn resolve_paths(document: &mut muru_config::Document, base: &Path) {
             for root in &mut release.sendfile_roots {
                 *root = absolute(root);
             }
+
+            for root in release
+                .mounts
+                .values_mut()
+                .flat_map(|mount| mount.sendfile_roots.iter_mut().flatten())
+            {
+                *root = absolute(root);
+            }
         }
     }
 
@@ -7621,11 +7629,16 @@ fn resolve_paths(document: &mut muru_config::Document, base: &Path) {
         if let Some(tls) = &mut upstream.tls {
             resolve(&mut tls.ca);
         }
+
+        for root in &mut upstream.sendfile_roots {
+            *root = absolute(root);
+        }
     }
 
     for class in &mut document.client_class {
         resolve(&mut class.user_agent_list);
         resolve(&mut class.address_list);
+        resolve(&mut class.ja4_list);
     }
 }
 
@@ -10891,6 +10904,95 @@ mod tests {
             ..skipped
         };
         assert!(super::overlay_row(&idle)[1].starts_with("idle from "));
+    }
+
+    #[test]
+    fn every_relative_path_in_an_applied_file_is_taken_from_its_directory() {
+        let mut document = muru_config::Document::parse(
+            r#"
+[app.shop.release.r1]
+source = "src"
+cwd = "run"
+python = ".venv/bin/python"
+sendfile_roots = ["media"]
+mounts.api = { path = "/api", entrypoint = "api:app", sendfile_roots = ["api-media"] }
+error_pages = { 503 = { file = "pages/own.html" } }
+
+[host.shop]
+names = ["shop.test"]
+tls = { certificate = "tls/cert.pem", key = "tls/key.pem" }
+error_pages = { 404 = { file = "pages/404.html" } }
+
+[[route]]
+name = "root"
+host = "shop"
+path = "/"
+static = "site"
+error_pages = { 500 = { file = "/srv/500.html" } }
+
+[overlay.down]
+routes.root = { target = { static = "snapshot" }, error_pages = { 503 = { file = "pages/down.html" } } }
+
+[upstream.legacy]
+addresses = ["127.0.0.1:9000"]
+sendfile_roots = ["legacy"]
+tls = { ca = "ca.pem" }
+"#,
+        )
+        .unwrap();
+        super::resolve_paths(&mut document, std::path::Path::new("/base"));
+
+        let release = &document.app["shop"].release["r1"];
+        assert_eq!(release.source.as_deref(), Some("/base/src"));
+        assert_eq!(release.cwd.as_deref(), Some("/base/run"));
+        assert_eq!(release.python.as_deref(), Some("/base/.venv/bin/python"));
+        assert_eq!(release.sendfile_roots, ["/base/media"]);
+        assert_eq!(
+            release.mounts["api"].sendfile_roots.as_deref(),
+            Some(&["/base/api-media".to_owned()][..])
+        );
+
+        // A release's own pages are its source directory's.
+
+        assert_eq!(
+            release.error_pages["503"].file.as_deref(),
+            Some("pages/own.html")
+        );
+
+        let host = &document.host["shop"];
+        let tls = host.tls.as_ref().unwrap();
+        assert_eq!(
+            (tls.certificate.as_str(), tls.key.as_str()),
+            ("/base/tls/cert.pem", "/base/tls/key.pem")
+        );
+        assert_eq!(
+            host.error_pages["404"].file.as_deref(),
+            Some("/base/pages/404.html")
+        );
+
+        let route = &document.route[0];
+        assert_eq!(route.static_dir.as_deref(), Some("/base/site"));
+        assert_eq!(
+            route.error_pages["500"].file.as_deref(),
+            Some("/srv/500.html")
+        );
+
+        let overlay = &document.overlay["down"].routes["root"];
+        assert_eq!(
+            overlay.target.as_ref().unwrap().static_dir.as_deref(),
+            Some("/base/snapshot")
+        );
+        assert_eq!(
+            overlay.error_pages.as_ref().unwrap()["503"].file.as_deref(),
+            Some("/base/pages/down.html")
+        );
+
+        let upstream = &document.upstream["legacy"];
+        assert_eq!(upstream.sendfile_roots, ["/base/legacy"]);
+        assert_eq!(
+            upstream.tls.as_ref().unwrap().ca.as_deref(),
+            Some("/base/ca.pem")
+        );
     }
 
     #[test]

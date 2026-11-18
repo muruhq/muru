@@ -47,12 +47,14 @@ and reach routes by the route's `name`.
 | `apps.NAME.freeze_deploys` | Refuse the application's [deploys and rollouts](rollouts.md#deploy-freezes) |
 
 An overlay can choose the page people see while it is active, such as a
-notice for a planned upgrade; a page's file must be an absolute path:
+notice for a planned upgrade. A relative file is taken from the
+directory of the file the overlay is applied from, here
+`pages/upgrade.html` beside it:
 
 ```toml
 [overlay.db-upgrade]
 apps.shop = { maintenance = true }
-routes.shop-root.error_pages = { '503:maintenance' = { file = '/srv/shop/upgrade.html' } }
+routes.shop-root.error_pages = { '503:maintenance' = { file = 'pages/upgrade.html' } }
 ```
 
 `muructl apply` refuses an overlay whose page file does not exist. If

@@ -2470,8 +2470,9 @@ fn describe_upstream(upstream: &UpstreamTable) -> String {
 }
 
 /// Section 4.12: a host's or route's error pages and override, whose
-/// files must be absolute paths to files that exist, so a missing page is
-/// refused here rather than by the edge when the snapshot reaches it.
+/// files must exist, so a missing page is refused here rather than by the
+/// edge when the snapshot reaches it. muructl apply has made a relative
+/// file absolute, from the applied file's directory (issue 778).
 fn check_error_tables(
     pages: &BTreeMap<String, muru_config::ErrorPage>,
     override_: Option<&muru_config::ErrorOverride>,

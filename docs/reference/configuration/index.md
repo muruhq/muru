@@ -23,6 +23,16 @@ A project with both a `muru.toml` and a `[tool.muru]` table in its
 are not merged, which `muructl run`, `muructl serve`, `muructl check`
 and `muructl deploy` say when they find both.
 
+A relative path in a file given to `muructl apply` is taken from that
+file's directory, whichever key it is in, except a release's own static
+directories and error pages, which are taken from the release's source
+directory. Apply sends the daemon the absolute paths, which
+`muructl config show`, `muructl overlay preview` and the plans show. In
+a project's settings (`[tool.muru]` or `muru.toml`) a relative path is
+taken from the source directory, which under `muructl run` is the
+project directory. In the daemon's own file the client classes' list
+files are taken from its directory, and every other path is absolute.
+
 A duration is a number of seconds, or a number with a unit, `ms`, `s`,
 `m`, `h`, `d` or `y`: `250ms`, `1.5s`, `10m`. A size is a number of bytes,
 or a number with `KB`, `MB` or `GB` (or `K`, `M` or `G`), which count in
