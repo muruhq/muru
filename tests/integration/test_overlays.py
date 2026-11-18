@@ -397,6 +397,18 @@ def test_promotion_makes_an_overlay_the_base(site: Site) -> None:
     assert 'mode = "read-only"' in exported
     assert "overlay.promoted" in site.daemon.events()
 
+    # Issue 776: it is not activated again, and stays promoted, until an
+    # apply changes it.
+
+    refused = site.overlay("activate", "read-only", check=False)
+    assert "read-only was promoted" in refused, refused
+    assert "promoted" in site.overlay("list")
+
+    changed = site.apply(OVERLAYS.replace("deny = ['POST', 'PUT']", "deny = ['POST']"))
+    assert "its promotion is cleared" in changed, changed
+    assert "activated" in site.overlay("activate", "read-only")
+    site.overlay("end", "read-only")
+
 
 def test_apply_refuses_overlays_that_do_not_fit(site: Site) -> None:
     refused = site.apply(

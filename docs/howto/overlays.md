@@ -371,6 +371,11 @@ An overlay that changes a route's mode, say, prints the route as it now
 is, under `# route shop-root, in place of its table in the files`. Put
 the blocks in the files and remove the overlay from them.
 
+A promoted overlay stays `promoted` in `muructl overlay list` and is not
+activated again, by hand, by the webhook, by its schedule or by its
+condition, until an apply removes it or changes it. A changed one is a
+new overlay, and the apply report says its promotion is cleared.
+
 While a route's traffic is split, by its own policy or an overlay's,
 `muructl release list` shows each release's share of it under the
 release, and `muructl scale status` the same for the release it shows:

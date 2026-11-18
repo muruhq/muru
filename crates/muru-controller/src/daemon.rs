@@ -4614,6 +4614,22 @@ impl Daemon {
                     return Err(format!("overlay {name} is already active"));
                 }
 
+                // Issue 776: a promoted overlay's changes are the base now,
+                // and a pin laid over it again would send the traffic back
+                // to the release it promoted. An apply that changes it
+                // makes it a new overlay.
+
+                if state
+                    .as_ref()
+                    .is_some_and(|state| state.source == "promoted")
+                {
+                    return Err(format!(
+                        "overlay {name} was promoted, so its changes are already the base \
+                         configuration; remove it from the applied files, or change it and \
+                         apply them to use it as a new overlay"
+                    ));
+                }
+
                 self.overlay_preconditions(&overlay)
                     .await
                     .map_err(|why| format!("overlay {name} was not activated: {why}"))?;

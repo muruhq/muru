@@ -162,6 +162,10 @@ pub enum ConditionStep {
     },
 }
 
+/// Why a promoted overlay is not activated again, by its condition or
+/// otherwise, until an apply changes it (issue 776).
+pub const PROMOTED: &str = "it was promoted, and its changes are already the base configuration";
+
 /// What an overlay following its condition should do at `now`: active
 /// while the condition fires, ended once it resolves after `min_active`,
 /// held as it is while the condition is unknown. Only an activation by the
@@ -195,6 +199,9 @@ pub fn condition_step(
             ConditionStep::End {
                 held_until: (cooldown > 0).then_some(now + cooldown),
             }
+        }
+        Some(held) if condition == Some(State::Firing) && held.source == "promoted" => {
+            ConditionStep::Skip(PROMOTED.to_owned())
         }
         Some(held) if condition == Some(State::Firing) => {
             let why = match held.source.as_str() {
@@ -363,8 +370,9 @@ pub fn step(overlay: &Overlay, state: Option<&OverlayState>, now: u64) -> Step {
 /// so that the overlay is judged again at its next window. A skip and
 /// an advisory window's record go with any change, since the change may
 /// be the fix; an end by hand within the window goes only with a new
-/// trigger, whose window is not the one it was ended in. An active
-/// overlay, a promoted one and a condition's cooldown are kept.
+/// trigger, whose window is not the one it was ended in. A promotion goes
+/// with any change too, which makes the overlay a new one (issue 776).
+/// An active overlay and a condition's cooldown are kept.
 pub fn cleared_by_change(
     before: &Overlay,
     after: &Overlay,
@@ -379,6 +387,7 @@ pub fn cleared_by_change(
     match state.source.as_str() {
         "skipped" => Some("its skip is cleared"),
         "advised" => Some("its advisory window is cleared"),
+        "promoted" => Some("its promotion is cleared, so it is a new overlay"),
         "ended" if before.trigger != after.trigger => Some("its end by hand is cleared"),
         _ => None,
     }
@@ -1609,11 +1618,20 @@ mod tests {
             Some("its end by hand is cleared")
         );
 
-        // What is active, promoted or cooling down is kept.
+        // Issue 776: a change makes a promoted overlay a new one, which
+        // can be activated again.
+
+        let promoted = state(false, "promoted", None);
+        assert_eq!(cleared_by_change(&before, &before, Some(&promoted)), None);
+        assert_eq!(
+            cleared_by_change(&before, &repinned, Some(&promoted)),
+            Some("its promotion is cleared, so it is a new overlay")
+        );
+
+        // What is active or cooling down is kept.
 
         for kept in [
             state(true, "schedule", None),
-            state(false, "promoted", None),
             state(false, "cooldown", Some(1)),
         ] {
             assert_eq!(cleared_by_change(&before, &moved, Some(&kept)), None);
@@ -2370,6 +2388,19 @@ mod tests {
         assert_eq!(
             condition_step(&overlay, Some(Resolved), Some(&cooling), 0, 6 * minute),
             ConditionStep::Stay
+        );
+
+        // Issue 776: a promoted overlay is not activated again.
+
+        let promoted = OverlayState {
+            active: false,
+            source: "promoted".to_owned(),
+            until_unix_ms: None,
+            ..on.clone()
+        };
+        assert_eq!(
+            condition_step(&overlay, Some(Firing), Some(&promoted), 0, 6 * minute),
+            ConditionStep::Skip(PROMOTED.to_owned())
         );
 
         let ConditionStep::Skip(why) = condition_step(&overlay, Some(Firing), None, 2, 0) else {
