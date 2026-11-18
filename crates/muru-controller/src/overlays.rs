@@ -261,6 +261,30 @@ pub fn describe_wait(millis: u64) -> String {
     }
 }
 
+/// How long the daemon may take to see that a warm-up's lead has begun:
+/// it looks every second, and a busy loop looks a moment later.
+const WARM_UP_SLACK_MS: u64 = 5_000;
+
+/// The time until an overlay's window, `starts` milliseconds away, as its
+/// warm-up says it: the `lead` as the overlay declares it when the
+/// warm-up began as the lead did, since the daemon sees that a moment
+/// late, and the wait itself when it began later, after an apply or a
+/// restart within the lead (issue 756).
+pub fn warming_wait(overlay: &Overlay, starts: u64) -> String {
+    let lead = overlay.warm_up.as_ref().and_then(|warm_up| {
+        muru_config::parse_duration(&warm_up.lead)
+            .ok()
+            .map(|parsed| (warm_up.lead.as_str(), parsed.as_millis() as u64))
+    });
+
+    match lead {
+        Some((written, lead)) if starts <= lead && lead - starts <= WARM_UP_SLACK_MS => {
+            written.to_owned()
+        }
+        _ => describe_wait(starts),
+    }
+}
+
 /// Why an overlay's probe of `release` failed, from the error the probe
 /// of `url` gave: the release and the host it was asked at in place of
 /// the edge's listener, which reads as if the serving release had failed
@@ -1836,7 +1860,18 @@ mod tests {
         assert_eq!(describe_wait(59 * 60_000), "59m");
         assert_eq!(describe_wait(HOUR * 3 / 2), "1h30m");
 
-        // Issue 756: a lead looked at a moment after it began is the lead.
+        // Issue 756: a warm-up begun as its lead began says the lead as
+        // declared; one begun later says the wait.
+
+        let led: Overlay = toml::from_str(
+            "trigger = { schedule = { start = '2026-01-01T02:00:00Z' } }\nwarm_up = { lead = '1m' }",
+        )
+        .unwrap();
+        assert_eq!(warming_wait(&led, 59_000), "1m");
+        assert_eq!(warming_wait(&led, 60_000), "1m");
+        assert_eq!(warming_wait(&led, 30_000), "30s");
+
+        // A lead looked at a moment after it began is the lead.
 
         assert_eq!(describe_wait(59_400), "59s");
         assert_eq!(describe_wait(59_600), "1m");

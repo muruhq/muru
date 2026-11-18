@@ -4335,15 +4335,16 @@ impl Daemon {
                     continue;
                 }
 
-                let starts = overlays
+                let wait = overlays
                     .iter()
                     .find(|(declared, _)| declared == name)
-                    .and_then(|(_, overlay)| crate::overlays::window(overlay, now))
-                    .map_or(0, |(start, _)| start.saturating_sub(now));
-                let mut detail = format!(
-                    "warming up: its window begins in {}",
-                    crate::overlays::describe_wait(starts)
-                );
+                    .and_then(|(_, overlay)| {
+                        crate::overlays::window(overlay, now).map(|(start, _)| {
+                            crate::overlays::warming_wait(overlay, start.saturating_sub(now))
+                        })
+                    })
+                    .unwrap_or_else(|| crate::overlays::describe_wait(0));
+                let mut detail = format!("warming up: its window begins in {wait}");
 
                 if let Some((app, id)) = release {
                     detail.push_str(&format!("; starting {app}@{id}"));
