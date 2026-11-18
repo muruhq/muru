@@ -182,14 +182,32 @@ jobs:
 
   ci-ok:
     # One check for branch rules to require, so the job list and matrices can
-    # change without the rules going stale. Fails if any job did not succeed.
+    # change without the rules going stale. Fails unless every leg of every
+    # job succeeded. A matrix job's needs result can be success although a
+    # leg was cancelled before it ran (issue 772), so each job's own
+    # conclusion is read from the run as well.
     needs: [lint, rust, msrv, extension, integration, python, docs]
     if: always()
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
     steps:
-      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          echo 'A required job did not succeed:'
-          echo '${{ toJSON(needs) }}'
-          exit 1
-      - run: echo "all jobs succeeded"
+          set -euo pipefail
+
+          needs=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"' <<<"$NEEDS")
+
+          legs=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
+            --jq '.jobs[] | select(.name != "ci-ok") | select(.conclusion != "success") | "\(.name): \(.conclusion // .status)"')
+
+          if [ -n "$needs$legs" ]; then
+            echo 'These jobs did not succeed:'
+            printf '%s\n' "$needs" "$legs" | sed '/^$/d' | sort -u
+            exit 1
+          fi
+
+          echo "all jobs succeeded"
