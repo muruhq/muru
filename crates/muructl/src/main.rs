@@ -4265,6 +4265,31 @@ async fn run_with(
         }
     };
 
+    // Issue 764: once the addresses are known, the title names them too,
+    // so `pgrep -f` finds a run by its port, and a development run says
+    // its process id, written beside its admin socket, for a script that
+    // started it in the background to stop exactly that run.
+
+    let mut title = format!("{title} {}", edge.local_addr());
+
+    if let Some(address) = dashboard_address {
+        title.push_str(&format!(" dashboard {address}"));
+    }
+
+    muru_common::title::set(&title, short);
+
+    if serve.is_none() {
+        let pid = std::process::id();
+
+        match registration
+            .as_ref()
+            .and_then(|registration| registration.write_pid(pid))
+        {
+            Some(path) => muru_common::muru_println!("pid {pid}, written to {}", path.display()),
+            None => muru_common::muru_println!("pid {pid}"),
+        }
+    }
+
     if let Some(registration) = &registration {
         let mut listeners = vec![format!("http://{}", edge.local_addr())];
 

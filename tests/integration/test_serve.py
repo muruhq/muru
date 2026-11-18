@@ -186,7 +186,7 @@ def test_started_with_a_short_command_line_its_title_names_the_application(
             text=True,
             check=False,
         ).stdout.strip()
-        assert title == "muru serve plain-wsgi", title
+        assert title == f"muru serve plain-wsgi 127.0.0.1:{serve.port}", title
 
         status, body = serve.get("/env?name=MURU_TEST_KEPT")
         assert status == 200 and json.loads(body)["value"] == "kept", body
