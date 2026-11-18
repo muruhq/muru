@@ -5352,10 +5352,11 @@ pub struct Document {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub host: BTreeMap<String, Host>,
     /// Client classification rules, in order (section 4.14), from the
-    /// daemon's own file.
+    /// daemon's own file or an applied one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_class: Vec<ClientClass>,
-    /// Rate limits by name (section 4.15), from the daemon's own file.
+    /// Rate limits by name (section 4.15), from the daemon's own file or
+    /// an applied one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rate_limit: BTreeMap<String, RateLimit>,
     /// Overlays by name (section 9.10): partial configuration laid over

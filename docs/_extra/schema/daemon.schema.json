@@ -3390,7 +3390,7 @@
       "type": "object"
     },
     "client_class": {
-      "description": "Client classification rules, in order, from the daemon's own file.",
+      "description": "Client classification rules, in order, from the daemon's own file or an applied one.",
       "items": {
         "$ref": "#/$defs/ClientClass"
       },
@@ -3479,7 +3479,7 @@
       "additionalProperties": {
         "$ref": "#/$defs/RateLimit"
       },
-      "description": "Rate limits by name, from the daemon's own file.",
+      "description": "Rate limits by name, from the daemon's own file or an applied one.",
       "type": "object"
     },
     "route": {

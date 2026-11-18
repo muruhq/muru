@@ -2,7 +2,7 @@
 
 # The daemon's configuration and applied files
 
-The keys of the daemon's configuration file, `muru.toml` in its configuration directory, and of the files `muructl apply` reads, which share one format. A file in this format kept beside a project's code is named `muru.daemon.toml`, since `muru.toml` there is the project's settings, which have other keys. Listeners, limits, the proxy, compression, secret stores, logs, shutdown, metrics, events, the dashboard, the overlay webhook, client classes and rate limits belong to the daemon's own file; an applied file that sets them is refused. Applications, their releases, hosts, routes, upstreams and overlays may be in either. A relative path in a file `muructl apply` reads is taken from that file's directory, except a release's own static directories and error pages, which are taken from its source directory; apply sends the daemon the absolute paths. In the daemon's own file, the client classes' list files are taken from its directory, and every other path is absolute.
+The keys of the daemon's configuration file, `muru.toml` in its configuration directory, and of the files `muructl apply` reads, which share one format. A file in this format kept beside a project's code is named `muru.daemon.toml`, since `muru.toml` there is the project's settings, which have other keys. Listeners, limits, the proxy, compression, secret stores, logs, shutdown, metrics, events, the dashboard and the overlay webhook belong to the daemon's own file; an apply leaves them out, with a warning. Applications, their releases, hosts, routes, upstreams, overlays, conditions, client classes and rate limits may be in either, and an applied file may not redefine a client class or rate limit the daemon's own file defines. A relative path in a file `muructl apply` reads is taken from that file's directory, except a release's own static directories and error pages, which are taken from its source directory; apply sends the daemon the absolute paths. In the daemon's own file, the client classes' list files are taken from its directory, and every other path is absolute.
 
 The JSON Schema of the same keys, for an editor that checks TOML against one, is `https://docs.muruhq.dev/en/latest/schema/daemon.schema.json`.
 
@@ -12,7 +12,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `app` | table of tables, {ref}`[app.NAME] <config-daemon-app-name>` |  | Applications by name. |
-| `client_class` | array of tables, {ref}`[[client_class]] <config-daemon-client-class>` |  | Client classification rules, in order, from the daemon's own file. |
+| `client_class` | array of tables, {ref}`[[client_class]] <config-daemon-client-class>` |  | Client classification rules, in order, from the daemon's own file or an applied one. |
 | `compression` | table, {ref}`[compression] <config-daemon-compression>` |  | How responses are compressed. |
 | `condition` | table of tables, {ref}`[condition.NAME] <config-daemon-condition-name>` |  | Named conditions over Muru's own signals, from the daemon's own file or an applied one. |
 | `daemon` | table, {ref}`[daemon] <config-daemon-daemon>` |  | How the daemon itself runs. |
@@ -29,7 +29,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `overlay` | table of tables, {ref}`[overlay.NAME] <config-daemon-overlay-name>` |  | Overlays by name: partial configuration laid over the routes and applications while active. |
 | `overlay_webhook` | table, {ref}`[overlay_webhook] <config-daemon-overlay-webhook>` |  | The overlays' external trigger. |
 | `proxy` | table, {ref}`[proxy] <config-daemon-proxy>` |  | Trusted proxies and the headers taken from them. |
-| `rate_limit` | table of tables, {ref}`[rate_limit.NAME] <config-daemon-rate-limit-name>` |  | Rate limits by name, from the daemon's own file. |
+| `rate_limit` | table of tables, {ref}`[rate_limit.NAME] <config-daemon-rate-limit-name>` |  | Rate limits by name, from the daemon's own file or an applied one. |
 | `route` | array of tables, {ref}`[[route]] <config-daemon-route>` |  | Routes, in the order written. |
 | `secrets` | table, {ref}`[secrets] <config-daemon-secrets>` |  | Secret stores. |
 | `shutdown` | table, {ref}`[shutdown] <config-daemon-shutdown>` |  | What SIGTERM means to the daemon, and how a shutdown runs. |
