@@ -51,6 +51,9 @@ def wrapture(monkeypatch: pytest.MonkeyPatch) -> Iterator[types.SimpleNamespace]
     held: list[bool] = []
 
     class Config:
+        instrument = (types.SimpleNamespace(name="flask"), types.SimpleNamespace(name="sqlite3"))
+        observe = ()
+
         def apply(self, *, start: bool = True) -> Applied:
             held.append(not start)
             return applied
@@ -116,14 +119,45 @@ def test_only_the_entry_points_asked_for_are_wrapped(wrapture: types.SimpleNames
     assert wrapped.label == "raw:app"
 
 
+def test_the_start_up_says_once_what_tracing_applies(
+    wrapture: types.SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Issue 781: in the host, or the first worker when each loads.
+
+    monkeypatch.delenv("WRAPTURE_CONFIG", raising=False)
+    _tracing.configure({})
+    _tracing.load_started(Context(worker_id=None))
+    assert capsys.readouterr().err == (
+        "tracing on: wrapture configuration from [tool.wrapture] in ./pyproject.toml, "
+        "instrumenting flask, sqlite3\n"
+    )
+
+    _tracing.configure({"config": "tracing/wrapture.toml"})
+    _tracing.load_started(Context(worker_id=1))
+    assert capsys.readouterr().err == ""
+    _tracing.load_started(Context(worker_id=0))
+    assert "from ./tracing/wrapture.toml, instrumenting" in capsys.readouterr().err
+
+
 def test_no_configuration_or_no_wrapture_is_said_plainly(
-    wrapture: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    wrapture: types.SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _tracing.configure({})
     monkeypatch.setattr(wrapture.module, "find_config", lambda: None)
 
     with pytest.raises(RuntimeError, match="no wrapture configuration was found"):
         _tracing.load_started(Context())
+
+    # Issue 781: a one-line warning, beside the traceback Muru logs.
+
+    assert capsys.readouterr().err.startswith(
+        "warning: the release is served untraced: tracing is on but no "
+        "wrapture configuration was found"
+    )
 
     monkeypatch.setitem(sys.modules, "wrapture", None)
 
