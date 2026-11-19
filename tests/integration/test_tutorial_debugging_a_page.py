@@ -96,7 +96,13 @@ def test_the_debugging_tutorial(tmp_path: Path) -> None:
         fix(server, tmp_path, "fixed.py", "books", "in_stock")
         batched = record(server, page(server, "/"))
         assert [row[2:4] for row in rows(batched, "outbound")] == [["/stock", "1"]]
-        assert rows(batched, "hints") == []
+
+        # Neither fault's hint is left. A call to the stock service can
+        # still be slow enough on a loaded machine for a hint of its own,
+        # which says nothing of the fixes (issue 796).
+
+        hints = [hint[0] for hint in rows(batched, "hints")]
+        assert not [hint for hint in hints if hint.startswith("the same ")], hints
 
         # A form that redirects: the POST and the page it led to are one
         # entry of the history, and the POST's record has its log line.
