@@ -36,7 +36,6 @@ The result is plain data, ready to send to the controller as JSON.
 from __future__ import annotations
 
 import os
-import sys
 from collections.abc import Iterable
 from typing import Any
 
@@ -90,18 +89,9 @@ def analyse(
 
     from unwrapt import report as unwrapt_report
 
-    from muru import preload
-
     data = report.to_dict()
     label_sets: list[dict[str, str]] = data.get("label_sets") or [{}]
     edges = {edge["id"]: edge for edge in data.get("edges", [])}
-
-    # unwrapt takes an import's file and line from the frame that called
-    # its hook, which under the import check is the check's own wrapper of
-    # builtins.__import__ (section 6.2). The file is the importing
-    # module's, and the line is not known.
-
-    _correct_files(edges.values(), preload.__file__)
 
     def target(edge_id: int | None) -> str:
         edge = edges.get(edge_id) if edge_id is not None else None
@@ -144,18 +134,6 @@ def analyse(
         "findings": findings,
         "targets": [dict(entry) for entry in targets],
     }
-
-
-def _correct_files(edges: Iterable[dict[str, Any]], wrapper: str | None) -> None:
-    # An edge recorded from a wrapper's frame gets its importer's file.
-
-    for edge in edges:
-        if wrapper is None or edge.get("file") != wrapper:
-            continue
-
-        module = sys.modules.get(edge.get("importer") or "")
-        edge["file"] = getattr(module, "__file__", None)
-        edge["line"] = None
 
 
 def _application(importer: str | None) -> bool:

@@ -158,6 +158,33 @@ def test_a_module_loaded_by_a_from_import_is_counted_and_advised_only_in_own_cod
     assert "below it only once rewritten as import shop_slow" in advice["shop_slow"]["advice"]
 
 
+def test_an_import_under_the_check_names_its_statement_and_import_a_b_as_c_is_not_advised(
+    project: Path,
+) -> None:
+    # Issue 751: unwrapt finds the statement's own frame, so the entry
+    # point's line is kept, and `import a.b as c`, which unwrapt cannot
+    # defer, is read from the statement and not advised as an entry.
+
+    package = project / "shop_pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "part.py").write_text("import time\ntime.sleep(0.003)\n")
+    (project / "shop_app.py").write_text("import os\nimport shop_pkg.part as part\n")
+    _lazy_imports.configure({"defer": False, "report": True, "workers": 2})
+    load(Context(), _instrumentation.FORK)
+    payload = _lazy_imports.payload()
+
+    assert payload is not None
+    edge = next(
+        edge
+        for edge in payload["report"]["edges"]
+        if edge["importer"] == "shop_app" and edge["imported"] == "shop_pkg.part"
+    )
+    assert (Path(edge["file"]).name, edge["line"]) == ("shop_app.py", 2)
+    assert edge["defer"] == {"native": True, "unwrapt": False, "reason": "dotted-as"}
+    assert "shop_pkg.part" not in {row["module"] for row in payload["findings"]}
+
+
 def test_nothing_a_preload_modules_entry_loads_is_advised_and_its_cost_is_kept(
     project: Path,
 ) -> None:
