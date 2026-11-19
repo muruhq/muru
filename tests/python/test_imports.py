@@ -112,6 +112,40 @@ def test_a_record_keeps_up_to_its_limit_and_a_missing_module_is_searched_once(
     import absent  # noqa: F401
 
 
+def test_a_record_past_its_limit_keeps_the_first_loads_to_start(
+    source: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue 782: loads end innermost first, so keeping the first to end
+    # would drop the outer import; the first to start keep it, with the
+    # loads nested in it beneath. The worker's list is kept the same way.
+
+    monkeypatch.setattr(_imports, "LOADS_KEPT", 3)
+    monkeypatch.setattr(_imports, "WORKER_LOADS_KEPT", 3)
+    (source / "report.py").write_text("".join(f"import part{index}\n" for index in range(5)))
+
+    for index in range(5):
+        (source / f"part{index}.py").write_text("")
+
+    _imports._start("R1")
+    token = _request_id.set("R1")
+
+    try:
+        import report  # noqa: F401
+    finally:
+        _request_id.reset(token)
+
+    loads, count, outermost_ms = _imports._take("R1")
+    kept = [(name, depth) for _, _, name, _, depth, _ in loads]
+    assert kept == [("report", 0), ("part0", 1), ("part1", 1)]
+    assert count == 6
+    assert loads[0][1] == pytest.approx(outermost_ms)
+    assert loads[0][1] >= sum(load[1] for load in loads[1:])
+
+    worker = _imports.worker_loads()
+    assert [load["module"] for load in worker["loads"]] == ["report", "part0", "part1"]
+    assert worker["loads"][0]["depth"] == 0 and worker["loaded"] == 6
+
+
 def test_the_runtime_times_the_outermost_loads_alone(
     source: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -50,10 +50,16 @@ __all__ = [
 ]
 
 LOADS_KEPT = 200
-"""The most loads one request's record keeps one by one; the rest are counted."""
+"""The most loads one request's record keeps one by one, the first to start.
+
+The rest are counted.
+"""
 
 WORKER_LOADS_KEPT = 2000
-"""The most loads a worker keeps for ``muructl debug imports``; the rest are counted."""
+"""The most loads a worker keeps for ``muructl debug imports``, the first to start.
+
+The rest are counted.
+"""
 
 # The import system's own frames, and this module's, which are passed
 # over to find the line that triggered a load, and the packages whose
@@ -78,7 +84,7 @@ class _Loads:
     started: float
     tally: Callable[[float], None] | None
     lock: threading.Lock = field(default_factory=threading.Lock)
-    kept: list[tuple[float, float, str, str, int]] = field(default_factory=list)
+    kept: list[list[Any]] = field(default_factory=list)
     deferred: set[str] = field(default_factory=set)
     count: int = 0
     outermost_ms: float = 0.0
@@ -96,7 +102,8 @@ _counting = threading.Lock()
 # Each module this worker has loaded since the finder went in, for the
 # import report's section on the workers (issue 741): the module, the
 # request it ran under, its milliseconds, its depth, whether it resolved
-# a deferred import, and when it ended, the first WORKER_LOADS_KEPT.
+# a deferred import, and when it ended, the first WORKER_LOADS_KEPT to
+# start; one still under way has no end yet.
 
 _worker: dict[str, list[Any]] = {}
 
@@ -169,8 +176,9 @@ def worker_loads() -> dict[str, Any]:
 
     Each is its module, the request it ran under (empty outside one),
     its milliseconds, its depth beneath other loads, whether it resolved
-    a deferred import, and when it ended in Unix milliseconds; with how
-    many loads there were in all.
+    a deferred import, and when it ended in Unix milliseconds, the first
+    ``WORKER_LOADS_KEPT`` to start, leaving out one still under way; with
+    how many loads there were in all.
     """
 
     with _counting:
@@ -184,6 +192,7 @@ def worker_loads() -> dict[str, Any]:
                 "at_unix_ms": at,
             }
             for module, (request, ms, depth, deferred, at) in _worker.items()
+            if at
         ]
         count = _counts[0]
 
@@ -330,8 +339,22 @@ class _Timed:
     # The module is given its own loader back before it executes, so its
     # code, and anything reading __loader__ or __spec__.loader later, sees
     # the real one.
+    #
+    # A load takes its place among those kept as it starts, the request's
+    # and the worker's, and fills in its length as it ends. An outer load
+    # starts before the loads nested in it and ends after them, so keeping
+    # the first to start keeps every kept load's ancestors (issue 782).
 
-    __slots__ = ("_kept", "_loader", "_spec", "_started", "_trigger")
+    __slots__ = (
+        "_depth",
+        "_entry",
+        "_kept",
+        "_loader",
+        "_spec",
+        "_started",
+        "_trigger",
+        "_worker_entry",
+    )
 
     def __init__(self, spec: ModuleSpec, loader: Any, kept: _Loads | None, trigger: str) -> None:
         self._spec = spec
@@ -339,6 +362,9 @@ class _Timed:
         self._kept = kept
         self._trigger = trigger
         self._started = 0.0
+        self._depth = 0
+        self._entry: list[Any] | None = None
+        self._worker_entry: list[Any] | None = None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._loader, name)
@@ -346,8 +372,14 @@ class _Timed:
     def create_module(self, spec: ModuleSpec) -> ModuleType | None:
         """Start the clock, and have the real loader create the module."""
 
-        self._started = time.perf_counter()
-        created: ModuleType | None = self._loader.create_module(spec)
+        self._begin()
+
+        try:
+            created: ModuleType | None = self._loader.create_module(spec)
+        except BaseException:
+            self._note(time.perf_counter())
+            raise
+
         return created
 
     def exec_module(self, module: ModuleType) -> None:
@@ -366,31 +398,55 @@ class _Timed:
         # thread are those this one is nested in.
 
         if not self._started:
-            self._started = time.perf_counter()
+            self._begin()
 
-        depth: int = getattr(_local, "depth", 0)
-        _local.depth = depth + 1
+        _local.depth = self._depth + 1
 
         try:
             loader.exec_module(module)
         finally:
-            _local.depth = depth
-            self._note(time.perf_counter(), depth)
+            _local.depth = self._depth
+            self._note(time.perf_counter())
 
-    def _note(self, ended: float, depth: int) -> None:
+    def _begin(self) -> None:
+        # A load that starts: its place among those kept, while there is
+        # room, for its length to be filled in as it ends.
+
+        self._started = time.perf_counter()
+        self._depth = depth = getattr(_local, "depth", 0)
+        current = request_id()
+        name = self._spec.name
+
+        with _counting:
+            if len(_worker) < WORKER_LOADS_KEPT and name not in _worker:
+                self._worker_entry = _worker[name] = [current or "", 0.0, depth, False, 0]
+
+        kept = self._kept
+
+        if kept is None:
+            return
+
+        with kept.lock:
+            if not kept.taken and len(kept.kept) < LOADS_KEPT:
+                at = (self._started - kept.started) * 1000.0
+                self._entry = [at, None, name, self._trigger, depth]
+                kept.kept.append(self._entry)
+
+    def _note(self, ended: float) -> None:
         # A load that ended: counted for the worker, and kept for its
         # request when that is recorded.
 
         current = request_id()
         ms = (ended - self._started) * 1000.0
-        name = self._spec.name
+        depth = self._depth
 
         with _counting:
             _counts[0] += 1
             _counts[1] += current is None
 
-            if len(_worker) < WORKER_LOADS_KEPT and name not in _worker:
-                _worker[name] = [current or "", ms, depth, False, int(time.time() * 1000)]
+            if self._worker_entry is not None:
+                self._worker_entry[1] = ms
+                self._worker_entry[4] = int(time.time() * 1000)
 
         # The runtime counts every load and times the outermost, which
         # hold the nested ones, for the worker's metrics (issue 753).
@@ -411,9 +467,8 @@ class _Timed:
 
             kept.count += 1
 
-            if len(kept.kept) < LOADS_KEPT:
-                at = (self._started - kept.started) * 1000.0
-                kept.kept.append((at, ms, self._spec.name, self._trigger, depth))
+            if self._entry is not None:
+                self._entry[1] = ms
 
             if depth == 0:
                 kept.outermost_ms += ms
@@ -456,9 +511,12 @@ def _take(
     if kept is None:
         return [], 0, 0.0
 
+    # The loads were kept in the order they began; one still under way,
+    # on a thread the request started, has no length and is left out.
+
     with kept.lock:
         kept.taken = True
-        loads = sorted(kept.kept)
+        loads = [tuple(load) for load in kept.kept if load[1] is not None]
         deferred = set(kept.deferred)
         count, outermost_ms = kept.count, kept.outermost_ms
 
