@@ -51,6 +51,8 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
         _lazy_imports._unwrapt = None
         _lazy_imports._payload = None
         _lazy_imports._scopes.clear()
+        _lazy_imports._started.clear()
+        _lazy_imports._targets.clear()
         _lazy_imports.configure({})
 
         for name in set(sys.modules) - before:
@@ -58,8 +60,11 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
                 del sys.modules[name]
 
 
-def load(context: Context, outcome: str) -> None:
-    """Load the project as a host does, under the import check, each entry point bracketed."""
+def load(context: Context, outcome: str, modules: tuple[str, ...] = ()) -> None:
+    """Load the project as a host does, under the import check, each entry point bracketed.
+
+    `modules` are the release's preload_modules, loaded after the entrypoint.
+    """
 
     _lazy_imports.load_started(context)
 
@@ -67,6 +72,7 @@ def load(context: Context, outcome: str) -> None:
         for target, module in (
             (Target("hooks", "", "shop_hooks"), "shop_hooks"),
             (Target("entrypoint", "", "shop_app:app"), "shop_app"),
+            *((Target("module", "", name), name) for name in modules),
         ):
             _lazy_imports.before_import(context, target)
             recorder.import_module(module)
@@ -150,6 +156,28 @@ def test_a_module_loaded_by_a_from_import_is_counted_and_advised_only_in_own_cod
     advice = {row["module"]: row for row in payload["findings"] if row["kind"] == "defer"}
     assert "vendored_pkg" not in advice
     assert "below it only once rewritten as import shop_slow" in advice["shop_slow"]["advice"]
+
+
+def test_nothing_a_preload_modules_entry_loads_is_advised_and_its_cost_is_kept(
+    project: Path,
+) -> None:
+    # Issue 785: the entry says the project wants the module loaded before
+    # the fork, so deferring what it imports would undo it.
+
+    (project / "shop_app.py").write_text("")
+    (project / "shop_reports.py").write_text("import vendored\nimport shop_slow\n")
+    _lazy_imports.configure({"defer": False, "report": True, "workers": 2})
+    load(Context(), _instrumentation.FORK, modules=("shop_reports",))
+    payload = _lazy_imports.payload()
+
+    assert payload is not None
+    targets = {row["imported"]: row["target"] for row in payload["candidates"]}
+    assert targets["shop_slow"] == "module:shop_reports"
+    assert not [row for row in payload["findings"] if row["target"].startswith("module:")]
+
+    costs = {row["target"]: row["ms"] for row in payload["targets"]}
+    assert set(costs) == {"hooks", "entrypoint", "module:shop_reports"}
+    assert costs["module:shop_reports"] >= 5.0 + 3.0
 
 
 def test_a_deferral_used_before_the_fork_gains_nothing(project: Path) -> None:

@@ -26,6 +26,10 @@ unwrapt configuration:
 - **Deferrals that gain nothing.** A deferred import used before the
   fork was loaded in the host anyway.
 
+- **The preload_modules.** The project lists a module there to have it
+  loaded before the fork, so nothing loaded for an entry is advised to
+  be deferred, and each entry's own time, as Muru timed it, is kept.
+
 The result is plain data, ready to send to the controller as JSON.
 """
 
@@ -73,13 +77,15 @@ def analyse(
     workers: int,
     found: Iterable[Any] = (),
     root: str = "",
+    targets: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """Build the document Muru keeps for a load from its unwrapt report.
 
     `outcome` is how the load ended, as load_finished is told, `workers`
     how many workers the release starts with, `found` the import check's
-    findings and `root` the directory the host runs in, under which a
-    module is the project's own.
+    findings, `root` the directory the host runs in, under which a
+    module is the project's own, and `targets` each entry point's label
+    and the milliseconds its import took, timed by Muru.
     """
 
     from unwrapt import report as unwrapt_report
@@ -136,6 +142,7 @@ def analyse(
         "deferred_used": used,
         "deferred_unused": unwrapt_report.deferred_unused(report),
         "findings": findings,
+        "targets": [dict(entry) for entry in targets],
     }
 
 
@@ -157,6 +164,13 @@ def _application(importer: str | None) -> bool:
 
     name = str(importer or "")
     return bool(name) and name != "__main__" and not name.startswith(("muru.", "importlib."))
+
+
+def _preloaded(target: str) -> bool:
+    # Whether an import was made while the host loaded one of the
+    # preload_modules, which the project wants loaded before the fork.
+
+    return target.startswith("module:")
 
 
 def _own(edge: dict[str, Any] | None, root: str) -> bool:
@@ -225,7 +239,11 @@ def _deferrals(
     chosen: list[tuple[float, dict[str, Any]]] = []
 
     for candidate in candidates:
-        if not _application(candidate["importer"]) or candidate["already_lazy"]:
+        if (
+            not _application(candidate["importer"])
+            or candidate["already_lazy"]
+            or _preloaded(candidate["target"])
+        ):
             continue
 
         if candidate["unwrapt"]:
@@ -296,18 +314,27 @@ def _fork_safety(
 
         candidate = by_module.get(module)
         importer = candidate["importer"] if candidate else None
-        advice, config = (
-            _advice(importer, module, False)
-            if importer
-            else (f"defer the import of {module} to first use", "")
-        )
+        target = candidate["target"] if candidate else ""
+
+        # A module loaded for a preload_modules entry is to be loaded
+        # before the fork, so deferring it is no advice (issue 785).
+
+        if _preloaded(target):
+            advice, config = (
+                f"it is loaded before the fork for preload_modules; {finding.advice}",
+                "",
+            )
+        elif importer:
+            advice, config = _advice(importer, module, False)
+        else:
+            advice, config = (f"defer the import of {module} to first use", "")
 
         findings.append(
             {
                 "kind": "fork_safety",
                 "module": module,
                 "importer": importer,
-                "target": candidate["target"] if candidate else "",
+                "target": target,
                 "ms": candidate["cum_ms"] if candidate else 0.0,
                 "saving_ms": candidate["saving_ms"] if candidate else 0.0,
                 "pays": (

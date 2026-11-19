@@ -168,6 +168,7 @@ fn analysis(report: &Value, filters: &Filters) -> Value {
         "workers": report["workers"],
         "summary": report["summary"],
         "findings": rows("findings", "ms"),
+        "targets": report["targets"],
         "candidates": rows("candidates", "cum_ms"),
         "deferred_used": rows("deferred_used", "load_ms"),
         "deferred_unused": Value::Array(
@@ -549,6 +550,22 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
         ms(&summary["estimated_saving_ms"]),
     );
 
+    // Issue 785: each of the preload_modules' own cost, as Muru timed
+    // its load, for someone weighing it against the reload time.
+
+    for target in report["targets"].as_array().into_iter().flatten() {
+        if let Some(module) = target["target"]
+            .as_str()
+            .and_then(|label| label.strip_prefix("module:"))
+        {
+            let _ = writeln!(
+                out,
+                "  preload_modules entry {module}: {} ms in {of}",
+                ms(&target["ms"])
+            );
+        }
+    }
+
     // --module: the chain that brought the module in.
 
     if let Some(chain) = report.get("chain") {
@@ -611,11 +628,7 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
                     text(&row["target"]),
                     yes(&row["native"]),
                     yes(&row["unwrapt"]),
-                    if row["already_lazy"].as_bool() == Some(true) {
-                        "already lazy".to_owned()
-                    } else {
-                        String::new()
-                    },
+                    notes(row),
                 ]
             })
             .collect();
@@ -677,6 +690,26 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
 
         table(out, &["MODULE", "DEFERRED IN"], &rows, &[false, false]);
     }
+}
+
+/// What a row of the imports table notes: an import already deferred,
+/// and one made while the host loaded one of the `preload_modules`,
+/// which is not advised to be deferred (issue 785).
+fn notes(row: &Value) -> String {
+    let mut notes = Vec::new();
+
+    if row["already_lazy"].as_bool() == Some(true) {
+        notes.push("already lazy");
+    }
+
+    if row["target"]
+        .as_str()
+        .is_some_and(|target| target.starts_with("module:"))
+    {
+        notes.push("preload_modules");
+    }
+
+    notes.join(", ")
 }
 
 fn yes(value: &Value) -> String {
@@ -813,8 +846,11 @@ mod tests {
                 {"edge": 2, "imported": "openpyxl", "importer": "shop.reports", "target": "entrypoint",
                  "cum_ms": 30.0, "saving_ms": 30.0, "native": true, "unwrapt": true, "already_lazy": false},
                 {"edge": 4, "imported": "yaml", "importer": "shop.hooks", "target": "hooks",
-                 "cum_ms": 0.5, "saving_ms": 0.5, "native": true, "unwrapt": false, "already_lazy": false}
+                 "cum_ms": 0.5, "saving_ms": 0.5, "native": true, "unwrapt": false, "already_lazy": false},
+                {"edge": 5, "imported": "pandas", "importer": "shop.stats", "target": "module:shop.stats",
+                 "cum_ms": 178.0, "saving_ms": 178.0, "native": true, "unwrapt": true, "already_lazy": false}
             ],
+            "targets": [{"target": "entrypoint", "ms": 40.0}, {"target": "module:shop.stats", "ms": 178.8}],
             "deferred_used": [],
             "deferred_unused": [{"module": "pandas", "importer": "shop.views"}],
             "chains": [{"module": "openpyxl", "best_cut": 2}],
@@ -922,6 +958,25 @@ mod tests {
         );
         assert!(text.contains("__lazy_modules__ = ['openpyxl']"), "{text}");
         assert!(text.contains("pandas.io (deferred)"), "{text}");
+    }
+
+    #[test]
+    fn a_preload_modules_entry_has_its_cost_and_its_imports_are_noted() {
+        let found = document(&response(&[]), None, &Filters::default()).unwrap();
+        let text = render(&found);
+
+        // Issue 785: the entry's own time on a line of its own, and the
+        // imports made while loading it noted as the list's.
+
+        assert!(
+            text.contains("\n  preload_modules entry shop.stats: 178.8 ms in the host\n"),
+            "{text}"
+        );
+        let row = text.lines().find(|line| line.contains(" pandas ")).unwrap();
+        assert!(
+            row.ends_with("module:shop.stats yes  yes     preload_modules"),
+            "{row}"
+        );
     }
 
     #[test]

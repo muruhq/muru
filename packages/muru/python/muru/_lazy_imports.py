@@ -23,7 +23,8 @@ environment.
 
 - ``before_import`` and ``after_import`` label the imports of each entry
   point the release loads, for the report: ``hooks``, ``entrypoint``,
-  ``mount:NAME`` and ``module:NAME`` for one of the ``preload_modules``.
+  ``mount:NAME`` and ``module:NAME`` for one of the ``preload_modules``,
+  and time each one's import as a whole.
   Imports outside any pair, by an instrumentation module, ``on_load`` or
   ``pre_fork``, carry no target.
 
@@ -48,6 +49,7 @@ import importlib
 import json
 import os
 import sys
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -88,9 +90,13 @@ _unwrapt: Any = None
 
 _deferred_before = 0
 
-# The scopes before_import pushed, which after_import pops.
+# The scopes before_import pushed, which after_import pops, each with
+# its target's label and when its import began; and each target's label
+# and milliseconds once its import ended (issue 785).
 
 _scopes: list[Any] = []
+_started: list[tuple[str, float]] = []
+_targets: list[dict[str, Any]] = []
 
 # The load's import report and Muru's analysis of it, once load_finished
 # has built them.
@@ -157,15 +163,20 @@ def before_import(context: Any, target: Any) -> None:
         label = target.kind
 
     _scopes.append(_unwrapt.push_scope(target=label))
+    _started.append((label, time.perf_counter()))
 
 
 def after_import(context: Any, target: Any) -> None:
-    """End the label before_import began."""
+    """End the label before_import began, and keep how long the target's import took."""
 
     if _unwrapt is None or not _scopes:
         return
 
     _unwrapt.pop_scope(_scopes.pop())
+
+    if _started:
+        label, started = _started.pop()
+        _targets.append({"target": label, "ms": (time.perf_counter() - started) * 1000.0})
 
 
 def load_finished(context: Any, outcome: str) -> None:
@@ -257,6 +268,10 @@ def _record(context: Any, outcome: str) -> None:
     while _scopes:
         _unwrapt.pop_scope(_scopes.pop())
 
+    _started.clear()
+    targets = list(_targets)
+    _targets.clear()
+
     report = _unwrapt.stop_profile(write=False)
 
     if report is None:
@@ -283,6 +298,7 @@ def _record(context: Any, outcome: str) -> None:
         workers=_workers,
         found=preload.latest_findings() if worker is None else (),
         root=os.getcwd(),
+        targets=targets,
     )
 
 

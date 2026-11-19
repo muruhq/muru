@@ -249,6 +249,13 @@ Imports that loaded a module, by cumulative time
   the first. An import made outside them, by an instrumentation module or
   by the `on_load` and `pre_fork` hooks, has no target.
 
+- **The `preload_modules`.** An entry of the list asks for its module to
+  be loaded before the fork, so nothing loaded while the host loads it is
+  advised to be deferred, and its rows say `preload_modules` under NOTES.
+  Each entry's own time is on a line of its own below the summary, as
+  `preload_modules entry shop.reports: 178.8 ms in the host`, to weigh
+  against the time `muructl run` takes to load again on every reload.
+
 - **3.15** and **UNWRAPT** say whether each way of deferring can defer the
   import's form: `from x import y` defers on Python 3.15 alone, and below
   it only once rewritten as `import x`. A module first loaded by a `from`
