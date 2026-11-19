@@ -315,9 +315,9 @@ stands out in the rest, which [has a section of its own](#hints):
     named by the module, with the request loading it. The import system
     holds back every other thread that asks for a module until its load
     is done, so a request that needs the module while another loads it
-    waits for that load rather than loading it itself. A wait of less
-    than a millisecond is not shown, and neither is a wait through
-    `importlib.import_module`, which the import system makes elsewhere.
+    waits for that load rather than loading it itself, whether it asked
+    with an `import` statement or through `importlib.import_module`, as
+    Django does for views. A wait of less than a millisecond is not shown.
 
   A row of several waits, stretches or modules draws each of them as a
   segment on its one line, says how many under Starts and gives their

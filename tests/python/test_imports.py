@@ -7,6 +7,7 @@ import sys
 import threading
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -237,4 +238,71 @@ def test_a_request_waiting_on_another_threads_load_is_kept_with_who_loads_it(
     loads, _count, _outermost_ms, kept = _imports._take("R2")
     assert [load[2] for load in loads] == ["circle_a", "circle_b"]
     assert [(module, loader) for _, _, module, loader in kept] == [("slow", "R1")]
+    assert waits == [kept[0][1]]
+
+
+@pytest.mark.parametrize("name", ["slow_m", "pkg.slow_m"])
+def test_a_wait_through_import_module_is_kept_once(
+    source: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    # Issue 794: importlib.import_module blocks in the module lock manager
+    # _find_and_load enters, which the runtime replaces, before it calls
+    # _lock_unlock_module, which must not count the wait again. Python
+    # 3.15 locks a dotted name through a hierarchical lock manager.
+
+    bootstrap: Any = importlib._bootstrap
+    assert issubclass(bootstrap._ModuleLockManager, _imports._lock_managers["_ModuleLockManager"])
+    monkeypatch.setattr(_imports, "WAIT_MIN_MS", 0.0)
+
+    (source / "gate.py").write_text(
+        "import threading\nstarted = threading.Event()\nrelease = threading.Event()\n"
+    )
+    (source / "pkg").mkdir()
+    (source / "pkg" / "__init__.py").write_text("")
+    slow = "import gate\ngate.started.set()\ngate.release.wait(10)\n"
+    (source / "slow_m.py").write_text(slow)
+    (source / "pkg" / "slow_m.py").write_text(slow)
+    import gate
+
+    # The module's lock, as the waiting thread is about to block on it,
+    # lets the load go.
+
+    waiting = threading.Event()
+    get_module_lock = bootstrap._get_module_lock
+
+    def lock_for(module: str) -> Any:
+        if module == name and _request_id.get() == "R2":
+            waiting.set()
+
+        return get_module_lock(module)
+
+    monkeypatch.setattr(bootstrap, "_get_module_lock", lock_for)
+    waits: list[float] = []
+    _imports._start("R1")
+    _imports._start("R2", wait_tally=waits.append)
+
+    def request(request: str) -> None:
+        token = _request_id.set(request)
+
+        try:
+            importlib.import_module(name)
+        finally:
+            _request_id.reset(token)
+
+    loading = threading.Thread(target=request, args=("R1",))
+    loading.start()
+    assert gate.started.wait(10)
+    waiter = threading.Thread(target=request, args=("R2",))
+    waiter.start()
+    assert waiting.wait(10)
+    gate.release.set()
+    loading.join()
+    waiter.join()
+
+    loaded = _imports._take("R1")
+    assert name in [load[2] for load in loaded[0]] and loaded[3] == []
+
+    loads, _count, _outermost_ms, kept = _imports._take("R2")
+    assert loads == []
+    assert [(module, loader) for _, _, module, loader in kept] == [(name, "R1")]
     assert waits == [kept[0][1]]

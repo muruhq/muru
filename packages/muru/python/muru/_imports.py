@@ -31,7 +31,13 @@ runtime wraps ``importlib._bootstrap._lock_unlock_module``, which the
 import system calls only when the module asked for is still being
 initialised, and keeps each wait of at least ``WAIT_MIN_MS`` in the
 waiting request's record, naming the module and the request loading it,
-its time told to the runtime apart from the loads' time.
+its time told to the runtime apart from the loads' time. A thread that
+asks through ``importlib.import_module``, or for a module not yet in
+``sys.modules``, waits instead in the module lock manager that
+``importlib._bootstrap._find_and_load`` enters, so the runtime replaces
+that class (and the hierarchical one Python 3.15 uses for a dotted name)
+with a subclass timing the acquire, kept the same way only when another
+thread has the load under way (issue 794).
 """
 
 from __future__ import annotations
@@ -142,6 +148,12 @@ _loading: dict[str, tuple[str, int]] = {}
 
 _lock_unlock: Callable[[str], None] | None = None
 
+# The import system's module lock manager classes, by name, while they
+# are replaced with ones that time the acquire.
+
+_LOCK_MANAGERS = ("_ModuleLockManager", "_HierarchicalLockManager")
+_lock_managers: dict[str, type[Any]] = {}
+
 # Each thread's depth of loads under way, and the names it is searching
 # for, so a finder after this one that imports while it searches does not
 # bring the same search back here.
@@ -190,6 +202,7 @@ def install() -> None:
     _finder = _Finder()
     sys.meta_path.insert(0, _finder)
     _wrap_lock_unlock()
+    _wrap_lock_managers()
 
 
 def uninstall() -> None:
@@ -207,6 +220,7 @@ def uninstall() -> None:
     _worker.clear()
     _loading.clear()
     _unwrap_lock_unlock()
+    _unwrap_lock_managers()
 
 
 def _wrap_lock_unlock() -> None:
@@ -234,14 +248,95 @@ def _unwrap_lock_unlock() -> None:
     _lock_unlock = None
 
 
+def _wrap_lock_managers() -> None:
+    # _find_and_load looks its lock manager class up by name in
+    # importlib._bootstrap on each call, and enters it only for a module
+    # not yet in sys.modules or still being initialised.
+
+    for attr in _LOCK_MANAGERS:
+        original = getattr(importlib._bootstrap, attr, None)
+
+        if original is None or attr in _lock_managers:
+            continue
+
+        _lock_managers[attr] = original
+        setattr(importlib._bootstrap, attr, _timed_lock_manager(original))
+
+
+def _unwrap_lock_managers() -> None:
+    for attr, original in _lock_managers.items():
+        setattr(importlib._bootstrap, attr, original)
+
+    _lock_managers.clear()
+
+
+def _timed_lock_manager(original: type[Any]) -> type[Any]:
+    # A subclass of the import system's lock manager whose __enter__
+    # times the acquire of the module's lock (and, for the hierarchical
+    # one, its parents' locks first).
+
+    def __enter__(self: Any) -> Any:
+        _local.waited_on = None
+        name: str = self._name
+        me = threading.get_ident()
+        own = _loading.get(name)
+
+        if own is not None and own[1] == me:
+            return original.__enter__(self)
+
+        # The first module of those it locks, parents before the module
+        # itself, that another thread has a load of under way, since that
+        # is the lock it blocks on first.
+
+        chain: Sequence[str] = getattr(self, "_module_chain", None) or (name,)
+        waits_on: tuple[str, str] | None = None
+
+        for module in chain:
+            loading = _loading.get(module)
+
+            if loading is not None and loading[1] != me:
+                waits_on = (module, loading[0])
+                break
+
+        started = time.perf_counter()
+        result = original.__enter__(self)
+        ended = time.perf_counter()
+
+        # A module there once the lock is held was loaded by the thread
+        # that held it, which may not yet have begun the load when this
+        # one asked.
+        # _find_and_load then calls _lock_unlock_module for it, which no
+        # longer blocks and must not count the wait again.
+
+        if name in sys.modules:
+            _local.waited_on = name
+
+            if waits_on is None:
+                entry = _worker.get(name)
+                waits_on = (name, entry[0] if entry is not None else "")
+
+        if waits_on is not None:
+            _waited(waits_on[0], waits_on[1], started, ended)
+
+        return result
+
+    return type(original.__name__, (original,), {"__enter__": __enter__, "__module__": __name__})
+
+
 def _waiting(name: str) -> None:
     # The import system's wait for a module another thread is loading,
     # timed. A wait on the thread's own load, as in a circular import,
-    # does not block and is left alone.
+    # does not block and is left alone, and so is the call that follows
+    # a wait already timed in the lock manager.
 
     original = _lock_unlock
 
     if original is None:
+        return
+
+    if getattr(_local, "waited_on", None) == name:
+        _local.waited_on = None
+        original(name)
         return
 
     loading = _loading.get(name)
