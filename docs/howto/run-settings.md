@@ -187,3 +187,27 @@ such as another repository's scratch directory, is watched by its own
 `.gitignore` alone, and the start-up line says so. When no file in the
 watched directories matches the patterns, the start-up line says that no
 change reloads the run.
+
+The settings files are watched whatever the patterns say:
+`pyproject.toml`, `muru.toml`, `muru.local.toml` and the file
+`--settings-file` names. A change to one reads the project's settings
+again, and the new release starts with them: `preload_modules`,
+`import_report`, `lazy_imports`, `tracing`, `preload`, the hooks, the
+mounts and groups, the worker timeouts and the rest of what a release
+takes. Settings that are not usable, such as a file that does not parse,
+leave the current release serving, and the terminal says why.
+
+The run table's settings (the port, HTTPS, the dashboard, the reload
+patterns, the access log, the toolbar and the rest), `python` and the
+limits on a request (`max_body_size` and the request timeouts) apply only
+as the run starts. A change to one of them is named on a line of its own,
+and the run keeps the value it started with:
+
+```
+muru: reloading, ./pyproject.toml changed
+muru: pyproject.toml changed port; restart the run for it to take effect
+muru: switched to release r2
+```
+
+A setting given on the command line wins over the files, so a change to
+it in a file changes nothing and is not named.

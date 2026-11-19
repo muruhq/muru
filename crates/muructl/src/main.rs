@@ -2049,6 +2049,18 @@ struct Resolved {
 }
 
 impl Resolved {
+    /// These settings, read again for a reload, with what only a restart
+    /// applies kept as `running` has it: the run table, the interpreter
+    /// and the limits on a request (issue 783).
+    fn keeping_restart_only(mut self, mut running: Resolved) -> Resolved {
+        std::mem::swap(&mut self.serving, &mut running.serving);
+        std::mem::swap(&mut self.python, &mut running.python);
+        std::mem::swap(&mut self.layers.run, &mut running.layers.run);
+        std::mem::swap(&mut self.layers.local, &mut running.layers.local);
+        self.served = running.served;
+        self
+    }
+
     /// The instrumentation modules the host is given (sections 6.15 and
     /// 11.6): tracing's own module first when tracing is on, so its
     /// request middleware is the outermost wrapper, then the listed ones.
@@ -3261,6 +3273,338 @@ fn relay_watcher(
     })
 }
 
+/// The host's settings for a release of a run or a serve, from the
+/// project's settings as resolved: checked as the run starts, and built
+/// again from the settings read afresh when a reload follows a change to
+/// a settings file (issue 783).
+fn host_spec(
+    args: &RunArgs,
+    resolved: &Resolved,
+    serve: Option<&serve::Mode>,
+    label: &str,
+    python: PathBuf,
+    pythonpath: Option<PathBuf>,
+) -> anyhow::Result<HostSpec> {
+    let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
+    let memory = memory_policy(&args.memory, resolved.memory.as_ref())?;
+
+    let groups = resolved
+        .groups
+        .iter()
+        .map(|(name, group)| {
+            Ok(muru_controller::host::HostGroup {
+                name: name.clone(),
+                processes: group.processes.unwrap_or(resolved.processes),
+                threads: group.threads.unwrap_or(resolved.threads),
+                sync_threads: group.sync_threads.unwrap_or(resolved.sync_threads),
+                concurrency: group.concurrency.unwrap_or(resolved.concurrency),
+                timeouts: group_timeouts(name, group.timeouts.as_ref(), &timeouts)?,
+                memory: group_memory(name, group.memory.as_ref(), &memory)?,
+                max_requests: match group.max_requests {
+                    Some(0) => {
+                        anyhow::bail!("[tool.muru.groups.{name}] max_requests must be at least 1")
+                    }
+                    Some(count) => Some(count),
+                    None => resolved.max_requests,
+                },
+                max_lifetime: match &group.max_lifetime {
+                    Some(text) => {
+                        let lifetime = muru_config::parse_duration(text).map_err(|error| {
+                            anyhow::anyhow!("[tool.muru.groups.{name}] max_lifetime: {error}")
+                        })?;
+                        anyhow::ensure!(
+                            !lifetime.is_zero(),
+                            "[tool.muru.groups.{name}] max_lifetime must be longer than nothing"
+                        );
+                        Some(lifetime)
+                    }
+                    None => resolved.max_lifetime,
+                },
+                optional: group.optional.unwrap_or(false),
+                mounts: group.mounts.clone(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let env = resolved
+        .env
+        .iter()
+        .map(|(name, value)| match value {
+            muru_config::EnvValue::Plain(text) => Ok((name.clone(), text.clone())),
+            muru_config::EnvValue::Secret(_) => Err(anyhow::anyhow!(
+                "[tool.muru.env] {name}: secrets are resolved by the daemon; a development \
+                 run cannot deliver them"
+            )),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let mut spec = HostSpec {
+        python,
+        pythonpath,
+        pycache_prefix: None,
+        bytecode: None,
+        clean_env: false,
+        app: resolved.entrypoint.clone(),
+        name: Some(label.to_owned()),
+        release: None,
+        interface: resolved.interface,
+        factory: resolved.factory,
+        reflection: resolved.reflection,
+        handoff: resolved.handoff,
+        processes: resolved.processes,
+        threads: resolved.threads,
+        sync_threads: resolved.sync_threads,
+        concurrency: resolved.concurrency,
+        preload: resolved.preload,
+        hooks: resolved.hooks.clone(),
+        preload_modules: resolved.preload_modules.clone(),
+        instrumentation: resolved.host_instrumentation(),
+        chdir: Some(resolved.project.clone()),
+        tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
+        single: args.single,
+        hold_before_fork: false,
+        detach_to: None,
+        relay: muru_controller::host::RelaySettings::default(),
+        groups,
+        mounts: resolved
+            .mounts
+            .iter()
+            .map(|(name, mount)| muru_controller::host::HostMount {
+                name: name.clone(),
+                path: mount.path.clone(),
+                entrypoint: mount.entrypoint.clone(),
+                interface: mount.interface.unwrap_or(muru_config::Interface::Auto),
+                threads: mount.threads,
+                concurrency: mount.concurrency,
+                max_connections: mount.max_connections,
+                handoff: mount.handoff,
+            })
+            .collect(),
+        logging: resolved
+            .logging
+            .as_ref()
+            .and_then(|logging| logging.python.clone())
+            .unwrap_or_default(),
+        max_requests: resolved.max_requests,
+        max_lifetime: resolved.max_lifetime,
+        soft_timeout: timeouts.soft,
+        hard_timeout: timeouts.hard,
+        hard_drain_grace: timeouts.hard_drain_grace,
+        shutdown_timeout: timeouts.shutdown,
+        websocket_drain_grace: timeouts.websocket_drain_grace,
+        exit_grace: timeouts.exit_grace,
+        loop_stall_timeout: timeouts.loop_stall,
+        gil_stall_timeout: timeouts.gil_stall,
+        memory,
+        cgroup: serve.and_then(serve::Mode::cgroup),
+        env,
+        shown_env: resolved.env.keys().cloned().collect(),
+        identity: None,
+    };
+
+    // Section 11.8: under serve --log-format json, Python logging writes
+    // its records as JSON too, unless the project names a format, so a
+    // record and its exception reach a log collector as one object.
+
+    if serve.is_some_and(|mode| mode.json) && spec.logging.format.is_none() {
+        spec.logging.format = Some("json".to_owned());
+    }
+
+    Ok(spec)
+}
+
+/// The project's error pages and its override of Muru's own, checked and
+/// loaded for the edge (section 4.12).
+async fn error_policy(resolved: &Resolved) -> anyhow::Result<Arc<muru_edge::errors::ErrorPolicy>> {
+    muru_config::check_error_pages(&resolved.error_pages, true)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    if let Some(table) = &resolved.error_override {
+        muru_config::check_error_override(table)
+            .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+    }
+
+    let policy = muru_edge::errors::ErrorPolicy::load(
+        &muru_controller::daemon::error_pages_message(
+            &resolved.error_pages,
+            Some(&resolved.project),
+        ),
+        resolved
+            .error_override
+            .as_ref()
+            .map(muru_controller::daemon::error_override_message)
+            .as_ref(),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    Ok(Arc::new(policy))
+}
+
+/// How the edge follows a response's redirect headers, as the project
+/// says.
+fn redirect_flags(resolved: &Resolved) -> muru_edge::routing::RedirectFlags {
+    muru_edge::routing::RedirectFlags {
+        accel_redirect: resolved.accel_redirect,
+        cgi_local_redirect: resolved.cgi_local_redirect,
+    }
+}
+
+/// Which files the edge sends for a response that names one, as the
+/// project says.
+fn sendfile(resolved: &Resolved) -> Arc<muru_edge::routing::Sendfile> {
+    muru_edge::routing::Sendfile::new(
+        &resolved.sendfile_roots,
+        resolved.sendfile_header.as_deref().unwrap_or_default(),
+    )
+}
+
+/// The settings a run takes only as it starts, each its key and value,
+/// for a reload to name those a changed settings file changed (issue
+/// 783): the run table's, the interpreter and the limits on a request.
+fn restart_only(args: &RunArgs, resolved: &Resolved) -> Vec<(String, String)> {
+    let served = &resolved.served;
+    let mut found = print_config::run_settings(args, resolved).section_values();
+
+    found.extend(
+        [
+            ("python", format!("{:?}", resolved.python)),
+            ("max_body_size", format!("{:?}", served.max_body_size)),
+            (
+                "timeouts.queue_timeout",
+                format!("{:?}", served.queue_timeout),
+            ),
+            (
+                "timeouts.request_deadline",
+                format!("{:?}", served.request_deadline),
+            ),
+            (
+                "timeouts.body_idle_timeout",
+                format!("{:?}", served.body_idle_timeout),
+            ),
+            (
+                "timeouts.response_idle_timeout",
+                format!("{:?}", served.response_idle_timeout),
+            ),
+        ]
+        .map(|(key, value)| (key.to_owned(), value)),
+    );
+
+    found
+}
+
+/// The project's settings files a run reads, for a reload to tell a
+/// change to one: the project file, muru.toml or pyproject.toml, the
+/// local file, and the file `--settings-file` names.
+fn settings_files(args: &RunArgs, project: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = muru_config::PROJECT_FILES
+        .iter()
+        .chain([&muru_config::LOCAL_FILE])
+        .map(|name| project.join(name))
+        .collect();
+
+    files.extend(args.settings_file.clone());
+    files
+}
+
+/// What a reload after a change to a settings file starts the next
+/// release with (issue 783): the settings read again, the host's spec
+/// from them, and the edge's directories and error pages.
+struct Reread {
+    resolved: Resolved,
+    spec: HostSpec,
+    static_paths: Vec<muru_edge::routing::StaticPath>,
+    errors: Arc<muru_edge::errors::ErrorPolicy>,
+}
+
+/// Read the project's settings again, as the run first read them, and
+/// check what a release takes from them; the interpreter stays the one
+/// `spec` runs, which only a build changes.
+async fn reread(
+    args: &RunArgs,
+    serve: Option<&serve::Mode>,
+    label: &str,
+    spec: &HostSpec,
+) -> anyhow::Result<Reread> {
+    let mut resolved = resolve_for(args, serve)?;
+
+    if args.single {
+        resolved.processes = 1;
+        resolved.threads = 1;
+    }
+
+    let spec = host_spec(
+        args,
+        &resolved,
+        serve,
+        label,
+        spec.python.clone(),
+        spec.pythonpath.clone(),
+    )?;
+    let static_paths = static_paths(&resolved)?;
+    let errors = error_policy(&resolved).await?;
+
+    Ok(Reread {
+        resolved,
+        spec,
+        static_paths,
+        errors,
+    })
+}
+
+/// The line naming what a changed settings file changed that only a
+/// restart applies, as `pyproject.toml changed port; restart the run for
+/// it to take effect`; none when it changed nothing of the kind.
+/// `started` is what those settings were as the run started.
+fn restart_line(
+    args: &RunArgs,
+    paths: &[PathBuf],
+    started: &[(String, String)],
+    next: &Resolved,
+) -> Option<String> {
+    let changed: Vec<String> = restart_only(args, next)
+        .into_iter()
+        .filter(|setting| !started.contains(setting))
+        .map(|(key, _)| key)
+        .collect();
+
+    if changed.is_empty() {
+        return None;
+    }
+
+    let settings = settings_files(args, &next.project);
+    let files: Vec<String> = paths
+        .iter()
+        .filter(|path| is_settings_file(std::slice::from_ref(path), &settings))
+        .filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+        .collect();
+    let them = if changed.len() == 1 { "it" } else { "them" };
+
+    Some(format!(
+        "{} changed {}; restart the run for {them} to take effect",
+        and_list(&files),
+        and_list(&changed)
+    ))
+}
+
+/// Items in a sentence: `a`, `a and b`, `a, b and c`.
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Whether one of `paths` is one of the settings `files`, compared as
+/// the same file whichever way each was named.
+fn is_settings_file(paths: &[PathBuf], files: &[PathBuf]) -> bool {
+    let same = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let files: Vec<PathBuf> = files.iter().map(|file| same(file)).collect();
+
+    paths.iter().any(|path| files.contains(&same(path)))
+}
+
 /// Serve as `muructl run` does, or as `muructl serve` with `serve`
 /// (section 13.9): production behaviours, one run directory, no
 /// installs, the admin port, and every line on standard output.
@@ -3318,10 +3662,15 @@ async fn run_with(
     // The settings in force with where each came from, which the admin
     // socket gives a command that asks for the effective configuration.
 
-    let settings = Arc::new(match serve_settings {
+    let settings = Arc::new(std::sync::RwLock::new(match serve_settings {
         Some(serve) => print_config::serve_settings(&resolved, serve),
         None => print_config::run_settings(&args, &resolved),
-    });
+    }));
+
+    // Issue 783: what only a restart applies, as the run starts, for a
+    // reload after a settings file changed to name what it cannot apply.
+
+    let restart_settings = restart_only(&args, &resolved);
 
     // The interpreter is found as the run would find it, so that one the
     // run could not use is refused here with the same words.
@@ -3370,7 +3719,6 @@ async fn run_with(
         },
     )?;
     let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
-    let memory = memory_policy(&args.memory, resolved.memory.as_ref())?;
     let requests_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
     let stop_budget = requests_budget + timeouts.exit_grace;
 
@@ -3396,55 +3744,17 @@ async fn run_with(
 
     muru_common::title::set(&title, short);
 
-    let groups = resolved
-        .groups
-        .iter()
-        .map(|(name, group)| {
-            Ok(muru_controller::host::HostGroup {
-                name: name.clone(),
-                processes: group.processes.unwrap_or(resolved.processes),
-                threads: group.threads.unwrap_or(resolved.threads),
-                sync_threads: group.sync_threads.unwrap_or(resolved.sync_threads),
-                concurrency: group.concurrency.unwrap_or(resolved.concurrency),
-                timeouts: group_timeouts(name, group.timeouts.as_ref(), &timeouts)?,
-                memory: group_memory(name, group.memory.as_ref(), &memory)?,
-                max_requests: match group.max_requests {
-                    Some(0) => {
-                        anyhow::bail!("[tool.muru.groups.{name}] max_requests must be at least 1")
-                    }
-                    Some(count) => Some(count),
-                    None => resolved.max_requests,
-                },
-                max_lifetime: match &group.max_lifetime {
-                    Some(text) => {
-                        let lifetime = muru_config::parse_duration(text).map_err(|error| {
-                            anyhow::anyhow!("[tool.muru.groups.{name}] max_lifetime: {error}")
-                        })?;
-                        anyhow::ensure!(
-                            !lifetime.is_zero(),
-                            "[tool.muru.groups.{name}] max_lifetime must be longer than nothing"
-                        );
-                        Some(lifetime)
-                    }
-                    None => resolved.max_lifetime,
-                },
-                optional: group.optional.unwrap_or(false),
-                mounts: group.mounts.clone(),
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    // The settings a release takes are checked here, with the others, and
+    // built again from the settings read afresh at each reload (issue 783).
 
-    let env = resolved
-        .env
-        .iter()
-        .map(|(name, value)| match value {
-            muru_config::EnvValue::Plain(text) => Ok((name.clone(), text.clone())),
-            muru_config::EnvValue::Secret(_) => Err(anyhow::anyhow!(
-                "[tool.muru.env] {name}: secrets are resolved by the daemon; a development \
-                 run cannot deliver them"
-            )),
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    host_spec(
+        &args,
+        &resolved,
+        serve.as_ref(),
+        &label,
+        PathBuf::new(),
+        None,
+    )?;
 
     // The reload watch is made here, so a pattern that does not parse is
     // refused with the other settings. Includes add to the default and
@@ -3470,14 +3780,21 @@ async fn run_with(
             .map(|directory| directory.canonicalize().unwrap_or(directory))
             .collect();
 
-        Some(
-            Watch::new(directories, &include, &resolved.serving.reload_exclude)?.with_files(
-                muru_provision::build::TRIGGER_FILES
-                    .iter()
-                    .map(|name| resolved.project.join(name))
-                    .collect(),
-            ),
-        )
+        // The lock, the manifest and uv's pin, and the settings files
+        // (issue 783), are watched whatever the patterns say.
+
+        let mut files: Vec<PathBuf> = muru_provision::build::TRIGGER_FILES
+            .iter()
+            .map(|name| resolved.project.join(name))
+            .collect();
+
+        for file in settings_files(&args, &resolved.project) {
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+
+        Some(Watch::new(directories, &include, &resolved.serving.reload_exclude)?.with_files(files))
     } else {
         None
     };
@@ -3485,33 +3802,11 @@ async fn run_with(
     // Section 4.9: the application's own directories of files, under
     // the project, each checked to exist before anything starts.
 
-    let static_paths = static_paths(&resolved)?;
+    let mut static_paths = static_paths(&resolved)?;
 
     // Section 4.12: the project's error pages, with files under it.
 
-    muru_config::check_error_pages(&resolved.error_pages, true)
-        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
-
-    if let Some(table) = &resolved.error_override {
-        muru_config::check_error_override(table)
-            .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
-    }
-
-    let error_policy = Arc::new(
-        muru_edge::errors::ErrorPolicy::load(
-            &muru_controller::daemon::error_pages_message(
-                &resolved.error_pages,
-                Some(&resolved.project),
-            ),
-            resolved
-                .error_override
-                .as_ref()
-                .map(muru_controller::daemon::error_override_message)
-                .as_ref(),
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?,
-    );
+    let mut error_policy = error_policy(&resolved).await?;
 
     // Section 8.2: run is build under the build mode, then serve. A
     // project with a lock and no environment is built once; an existing
@@ -3590,77 +3885,14 @@ async fn run_with(
         serve::group_writable(&run_dir, 0o770);
     }
 
-    let mut spec = HostSpec {
-        python: python.python.clone(),
-        pythonpath: library.pythonpath.clone(),
-        pycache_prefix: None,
-        bytecode: None,
-        clean_env: false,
-        app: resolved.entrypoint.clone(),
-        name: Some(label.clone()),
-        release: None,
-        interface: resolved.interface,
-        factory: resolved.factory,
-        reflection: resolved.reflection,
-        handoff: resolved.handoff,
-        processes: resolved.processes,
-        threads: resolved.threads,
-        sync_threads: resolved.sync_threads,
-        concurrency: resolved.concurrency,
-        preload: resolved.preload,
-        hooks: resolved.hooks.clone(),
-        preload_modules: resolved.preload_modules.clone(),
-        instrumentation: resolved.host_instrumentation(),
-        chdir: Some(resolved.project.clone()),
-        tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
-        single: args.single,
-        hold_before_fork: false,
-        detach_to: None,
-        relay: muru_controller::host::RelaySettings::default(),
-        groups,
-        mounts: resolved
-            .mounts
-            .iter()
-            .map(|(name, mount)| muru_controller::host::HostMount {
-                name: name.clone(),
-                path: mount.path.clone(),
-                entrypoint: mount.entrypoint.clone(),
-                interface: mount.interface.unwrap_or(muru_config::Interface::Auto),
-                threads: mount.threads,
-                concurrency: mount.concurrency,
-                max_connections: mount.max_connections,
-                handoff: mount.handoff,
-            })
-            .collect(),
-        logging: resolved
-            .logging
-            .as_ref()
-            .and_then(|logging| logging.python.clone())
-            .unwrap_or_default(),
-        max_requests: resolved.max_requests,
-        max_lifetime: resolved.max_lifetime,
-        soft_timeout: timeouts.soft,
-        hard_timeout: timeouts.hard,
-        hard_drain_grace: timeouts.hard_drain_grace,
-        shutdown_timeout: timeouts.shutdown,
-        websocket_drain_grace: timeouts.websocket_drain_grace,
-        exit_grace: timeouts.exit_grace,
-        loop_stall_timeout: timeouts.loop_stall,
-        gil_stall_timeout: timeouts.gil_stall,
-        memory: memory.clone(),
-        cgroup: serve.as_ref().and_then(serve::Mode::cgroup),
-        env,
-        shown_env: resolved.env.keys().cloned().collect(),
-        identity: None,
-    };
-
-    // Section 11.8: under serve --log-format json, Python logging writes
-    // its records as JSON too, unless the project names a format, so a
-    // record and its exception reach a log collector as one object.
-
-    if serve.as_ref().is_some_and(|mode| mode.json) && spec.logging.format.is_none() {
-        spec.logging.format = Some("json".to_owned());
-    }
+    let mut spec = host_spec(
+        &args,
+        &resolved,
+        serve.as_ref(),
+        &label,
+        python.python.clone(),
+        library.pythonpath.clone(),
+    )?;
 
     // Section 9.12: what the application is served with, which a command
     // of the project run through the admin socket runs with too.
@@ -3672,16 +3904,10 @@ async fn run_with(
     });
 
     let logs = Logs::default();
-    let group_tables = resolved.groups.clone();
-    let mounts = mount_paths(&resolved);
-    let redirect_flags = muru_edge::routing::RedirectFlags {
-        accel_redirect: resolved.accel_redirect,
-        cgi_local_redirect: resolved.cgi_local_redirect,
-    };
-    let sendfile = muru_edge::routing::Sendfile::new(
-        &resolved.sendfile_roots,
-        resolved.sendfile_header.as_deref().unwrap_or_default(),
-    );
+    let mut group_tables = resolved.groups.clone();
+    let mut mounts = mount_paths(&resolved);
+    let mut redirect_flags = redirect_flags(&resolved);
+    let mut sendfile = sendfile(&resolved);
 
     // Section 13.9: the admin port and the probe socket answer while the
     // application loads, the startup and readiness probes failing until
@@ -4628,6 +4854,39 @@ async fn run_with(
                 let mut paths = vec![path];
                 settle(&mut changed, &mut paths).await;
                 muru_common::muru_println!("reloading, {} changed", describe(&paths));
+
+                // Issue 783: a change to a settings file reads the
+                // project's settings again, and the release that follows
+                // starts with them. What only a restart applies keeps its
+                // value from the start and is named; settings that cannot
+                // be used leave the current release serving.
+
+                if is_settings_file(&paths, &settings_files(&args, &resolved.project)) {
+                    let next = match reread(&args, serve.as_ref(), &label, &spec).await {
+                        Ok(next) => next,
+                        Err(error) => {
+                            muru_common::muru_println!("{error:#}; release r{} keeps serving", current.release);
+                            continue;
+                        }
+                    };
+
+                    if let Some(line) = restart_line(&args, &paths, &restart_settings, &next.resolved) {
+                        muru_common::muru_println!("{line}");
+                    }
+
+                    spec = next.spec;
+                    static_paths = next.static_paths;
+                    error_policy = next.errors;
+                    group_tables = next.resolved.groups.clone();
+                    mounts = mount_paths(&next.resolved);
+                    redirect_flags = self::redirect_flags(&next.resolved);
+                    sendfile = self::sendfile(&next.resolved);
+                    resolved = next.resolved.keeping_restart_only(resolved);
+
+                    if serve.is_none() {
+                        *settings.write().expect("settings poisoned") = print_config::run_settings(&args, &resolved);
+                    }
+                }
 
                 // Section 8.2: a change to the lock, or to what names the
                 // interpreter, builds before the new release starts; the
