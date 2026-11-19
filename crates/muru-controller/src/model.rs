@@ -609,10 +609,15 @@ impl ReleaseSpec {
                 .map(|group| group.processes as usize)
                 .sum::<usize>();
 
-        muru_config::lazy_imports_entry(self.lazy_imports, self.import_report, workers)
-            .into_iter()
-            .chain(self.instrumentation.iter().cloned())
-            .collect()
+        muru_config::lazy_imports_entry(
+            self.lazy_imports,
+            self.import_report,
+            workers,
+            "the release's settings",
+        )
+        .into_iter()
+        .chain(self.instrumentation.iter().cloned())
+        .collect()
     }
 }
 

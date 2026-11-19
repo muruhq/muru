@@ -177,6 +177,7 @@ message ResponseHead {
   FlushPolicy flush = 3;
   string reason = 4;                // the application's reason phrase, for HTTP/1.1
   double imports_ms = 5;            // a recorded request's first-time module loads before the head, the outermost summed, for Server-Timing (issue 738)
+  double import_wait_ms = 6;        // its waits before the head on modules other threads were loading, summed, for Server-Timing (issue 787)
 }
 
 // Payload of an END frame: the end of a body in one direction.
@@ -224,6 +225,16 @@ message WorkerRecord {
   repeated ModuleLoad module_loads = 27;     // modules loaded for the first time in the worker during the request, in order, the first 200 (issue 738)
   uint32 modules_loaded = 28;                // how many, those past the cap too
   double modules_ms = 29;                    // their time, the outermost loads summed
+  repeated ImportWait import_waits = 30;     // its waits on modules other threads were loading, in order, the first 50 (issue 787)
+}
+
+// A request's wait on a module another thread was loading for the first
+// time in the worker (issue 787).
+message ImportWait {
+  string module = 1;
+  double at = 2;                    // when it began, from when the worker took the request
+  double ms = 3;                    // how long it lasted
+  string loader = 4;                // the request loading the module, empty when not a recorded one
 }
 
 // A module loaded for the first time in the worker (issue 738).

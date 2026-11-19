@@ -438,6 +438,7 @@ message WorkerPart {
   repeated ModuleLoad module_loads = 26;     // modules loaded for the first time in the worker, in order, the first 200 (issue 738)
   uint32 modules_loaded = 27;                // how many, those past the cap too
   double modules_ms = 28;                    // their time, the outermost loads summed
+  repeated ImportWait import_waits = 29;     // its waits on modules other threads were loading, in order, the first 50 (issue 787)
 }
 
 // A module loaded for the first time in the worker during a request (issue 738).
@@ -448,6 +449,15 @@ message ModuleLoad {
   uint32 depth = 4;                 // how many loads it is nested in
   string trigger = 5;               // the file and line that asked for it, when known
   bool deferred = 6;                // it resolved an import lazy_imports deferred (issue 740)
+}
+
+// A request's wait on a module another thread was loading for the first
+// time in the worker (issue 787).
+message ImportWait {
+  string module = 1;
+  double at_ms = 2;                 // from when the worker took the request
+  double ms = 3;                    // how long it lasted
+  string loader = 4;                // the request loading the module, empty when not a recorded one
 }
 
 // A stretch of a request's time, from when the worker took the request.

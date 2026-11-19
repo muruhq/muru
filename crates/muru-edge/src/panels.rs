@@ -566,6 +566,11 @@ fn timing(record: &admin::RequestRecord) -> admin::Panel {
 
             phases.extend(importing(worker, record.queue_ms));
 
+            // Issue 787: a wait on a module another request was loading,
+            // which is the request's own time but not its load.
+
+            phases.extend(waiting_for_imports(worker, record.queue_ms));
+
             // A wait goes before the phase that starts with it, and a
             // moment before a period that starts then.
 
@@ -650,6 +655,47 @@ fn importing(worker: &admin::WorkerPart, by: f64) -> Option<admin::PanelSpan> {
             .collect(),
         ..Default::default()
     })
+}
+
+/// The request's waits on modules other threads were loading for the
+/// first time, moved onto the request's clock by `by`: a segment for
+/// each, named by its module, with the request loading it as its
+/// detail. None when it waited on none.
+fn waiting_for_imports(worker: &admin::WorkerPart, by: f64) -> Option<admin::PanelSpan> {
+    let first = worker.import_waits.first()?;
+    let start_ms = by + first.at_ms;
+    let end_ms = worker
+        .import_waits
+        .iter()
+        .map(|wait| by + wait.at_ms + wait.ms)
+        .fold(start_ms, f64::max);
+
+    Some(admin::PanelSpan {
+        name: "waiting for an import".to_owned(),
+        start_ms,
+        duration_ms: end_ms - start_ms,
+        category: "contention".to_owned(),
+        segments: worker
+            .import_waits
+            .iter()
+            .map(|wait| admin::PanelSegment {
+                start_ms: by + wait.at_ms,
+                duration_ms: wait.ms.max(0.0),
+                label: wait.module.clone(),
+                detail: loading_request(wait),
+            })
+            .collect(),
+        ..Default::default()
+    })
+}
+
+/// Who was loading the module a request waited on.
+fn loading_request(wait: &admin::ImportWait) -> String {
+    if wait.loader.is_empty() {
+        "loaded by another thread".to_owned()
+    } else {
+        format!("loaded by request {}", wait.loader)
+    }
 }
 
 /// What asked for a module, for its tooltip and its row, and whether it
@@ -823,6 +869,26 @@ fn during(worker: &admin::WorkerPart) -> admin::PanelTable {
                 "{} in {}",
                 millis(worker.modules_ms),
                 counted(worker.modules_loaded, "module")
+            ),
+        );
+    }
+
+    if !worker.import_waits.is_empty() {
+        let waited: Vec<String> = worker
+            .import_waits
+            .iter()
+            .map(|wait| format!("{}, {}", wait.module, loading_request(wait)))
+            .collect();
+        row(
+            "waiting for an import",
+            format!(
+                "{} in {}: {}",
+                millis(worker.import_waits.iter().map(|wait| wait.ms).sum()),
+                counted(
+                    u32::try_from(worker.import_waits.len()).unwrap_or(u32::MAX),
+                    "wait"
+                ),
+                waited.join("; ")
             ),
         );
     }
@@ -1427,6 +1493,34 @@ mod tests {
         // Nothing held up, no table.
 
         assert!(timing(&fixture()).tables.is_empty());
+    }
+
+    #[test]
+    fn the_timing_panel_shows_a_wait_on_another_requests_import() {
+        let mut record = fixture();
+        let worker = record.from_worker.as_mut().unwrap();
+        worker.import_waits = vec![admin::ImportWait {
+            module: "shop.reports".to_owned(),
+            at_ms: 0.5,
+            ms: 98.0,
+            loader: "01ALOADER".to_owned(),
+        }];
+        let html = Renderer::new(None).render(&timing(&record));
+
+        // Issue 787: its own row, a wait, with the module and the request
+        // loading it, and in the table.
+
+        assert!(html.contains(">waiting for an import</td>"), "{html}");
+        assert!(
+            html.contains(
+                "shop.reports\nstarts at 0.7 ms\ntakes 98.0 ms\nloaded by request 01ALOADER"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("98ms in 1 wait: shop.reports, loaded by request 01ALOADER"),
+            "{html}"
+        );
     }
 
     #[test]

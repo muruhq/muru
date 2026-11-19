@@ -10,7 +10,6 @@ import on the way so that a finding can name the module that caused it.
 
 from __future__ import annotations
 
-import builtins
 import ctypes
 import ctypes.util
 import importlib
@@ -19,12 +18,14 @@ import socket
 import stat
 import sys
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import partial
-from importlib.util import resolve_name
+from importlib.machinery import ModuleSpec
 from types import ModuleType, TracebackType
 from typing import Any
+
+from muru._imports import find_after
 
 __all__ = ["Finding", "ImportRecorder", "child_pids", "latest_findings", "thread_count"]
 
@@ -275,17 +276,19 @@ def _classify(fd: int, mode: int, children_appeared: bool) -> tuple[str, str] | 
 
 # --- the recorder -----------------------------------------------------------
 
-ImportFunction = Callable[..., ModuleType]
-
 
 class ImportRecorder:
     """Watch what preload leaves behind, attributing it to the imports that did it.
 
     Use as a context manager around the import of the application and its
-    on_load hook, then read ``findings()``. While active, the builtin
-    ``__import__`` is wrapped so that each module's first import is checked
-    for new descriptors and threads; ``import_module`` does the same for an
-    import made through importlib.
+    on_load hook, then read ``findings()``. While active, a finder first
+    on ``sys.meta_path`` wraps the loader of each module loaded for the
+    first time, so that what the module's creation and execution leave
+    (new descriptors and threads) is put down to it, however it was
+    imported: an ``import`` statement, a from-import's submodules or
+    ``importlib.import_module``. The check never loads a module itself
+    and stays out of ``builtins.__import__``, which unwrapt's profile
+    recorder hooks for the import report (issue 788).
 
     ``instrumentation`` names the release's instrumentation modules. A
     Python thread whose code is in one of them, or in the package one of
@@ -303,15 +306,15 @@ class ImportRecorder:
         self._fd_owner: dict[tuple[int, Identity], str] = {}
         self._thread_owner: dict[threading.Thread, str] = {}
         self._thread_owners: list[tuple[str, int]] = []
-        self._original_import: ImportFunction | None = None
+        self._finder: _RecordingFinder | None = None
 
     def __enter__(self) -> ImportRecorder:
         self._fds_before = open_fds()
         self._threads_before = thread_count()
         self._python_threads_before = set(threading.enumerate())
         self._children_before = child_pids()
-        self._original_import = builtins.__import__
-        builtins.__import__ = self._import
+        self._finder = _RecordingFinder(self)
+        sys.meta_path.insert(0, self._finder)
         return self
 
     def __exit__(
@@ -320,115 +323,49 @@ class ImportRecorder:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        if self._original_import is not None:
-            builtins.__import__ = self._original_import
-            self._original_import = None
+        if self._finder is not None and self._finder in sys.meta_path:
+            sys.meta_path.remove(self._finder)
+
+        self._finder = None
 
     def import_module(self, name: str) -> ModuleType:
-        """Import a module through importlib, attributing what it leaves to it."""
+        """Import a module through importlib; each module it loads is attributed as it loads."""
 
-        return self._record(name, lambda: importlib.import_module(name))
+        return importlib.import_module(name)
 
-    def _import(
-        self,
-        name: str,
-        globals: Mapping[str, object] | None = None,
-        locals: Mapping[str, object] | None = None,
-        fromlist: Any = (),
-        level: int = 0,
-    ) -> ModuleType:
-        original = self._original_import or builtins.__import__
-        full_name: str | None = name
+    def _snapshot(self) -> _Snapshot:
+        # The process as a load begins, to compare with as it ends.
 
-        if level > 0:
-            package = globals.get("__package__") if globals else None
+        return _Snapshot(open_fds(), thread_count(), set(threading.enumerate()))
 
-            try:
-                full_name = resolve_name("." * level + name, str(package or ""))
-            except (ImportError, ValueError):
-                full_name = None
+    def _claim(self, module: str, before: _Snapshot) -> None:
+        # What a load left, compared with as it began. A load nested in
+        # another ends first, so it claims what it left before the outer
+        # load can.
+        #
+        # A descriptor is the load's when its number is new or now refers
+        # to something else, as when the load closed one and its number
+        # was taken again; an owner is kept by identity, so a number
+        # reused by a later load is that load's (issue 685). Listing the
+        # descriptors opens one of its own, which is closed again by the
+        # time it is examined and so is left out.
 
-        def call() -> ModuleType:
-            return original(name, globals, locals, fromlist, level)
+        for fd, identity in open_fds().items():
+            if before.fds.get(fd) != identity:
+                self._fd_owner.setdefault((fd, identity), module)
 
-        # importlib loads a submodule named in fromlist, as in `from shop
-        # import db`, without coming back through __import__, so that
-        # whatever it leaves would be put down to the module importing it.
-        # The package and each such submodule are recorded as imports of
-        # their own first, and the import itself then finds them loaded.
+        # A Python thread is charged by name; what grew besides is native
+        # threads, charged by count.
 
-        if fromlist and full_name:
-            if full_name not in sys.modules:
-                self._record(full_name, partial(importlib.import_module, full_name))
+        started = set(threading.enumerate()) - before.python_threads
 
-            self._import_fromlist(full_name, fromlist)
-            return call()
+        for thread in started:
+            self._thread_owner.setdefault(thread, module)
 
-        if full_name is None or full_name in sys.modules:
-            return call()
-        return self._record(full_name, call)
+        grown = thread_count() - before.threads - len(started)
 
-    def _import_fromlist(self, package_name: str, fromlist: Any) -> None:
-        """Record the import of each submodule a fromlist names that is not loaded yet.
-
-        As importlib does, a name the package already has is taken as it
-        is, and a name that is no submodule is left for the import itself
-        to refuse.
-        """
-
-        package = sys.modules.get(package_name)
-
-        if package is None or not hasattr(package, "__path__"):
-            return
-
-        names = [entry for entry in fromlist if entry != "*"]
-
-        if "*" in fromlist:
-            names.extend(getattr(package, "__all__", ()))
-
-        for entry in names:
-            submodule = f"{package_name}.{entry}"
-
-            if not isinstance(entry, str) or hasattr(package, entry) or submodule in sys.modules:
-                continue
-
-            try:
-                self._record(submodule, partial(importlib.import_module, submodule))
-            except ModuleNotFoundError as error:
-                if error.name != submodule:
-                    raise
-
-    def _record(self, module: str, run: Callable[[], ModuleType]) -> ModuleType:
-        fds_before = open_fds()
-        threads_before = thread_count()
-        python_threads_before = set(threading.enumerate())
-
-        try:
-            return run()
-        finally:
-            # A descriptor is the import's when its number is new or now
-            # refers to something else, as when the import closed one and
-            # its number was taken again; an owner is kept by identity, so
-            # a number reused by a later import is that import's (issue 685).
-            # Listing the descriptors opens one of its own, which is
-            # closed again by the time it is examined and so is left out.
-
-            for fd, identity in open_fds().items():
-                if fds_before.get(fd) != identity:
-                    self._fd_owner.setdefault((fd, identity), module)
-
-            # A Python thread is charged by name; what grew besides is
-            # native threads, charged by count.
-
-            started = set(threading.enumerate()) - python_threads_before
-
-            for thread in started:
-                self._thread_owner.setdefault(thread, module)
-
-            grown = thread_count() - threads_before - len(started)
-
-            if grown > 0:
-                self._thread_owners.append((module, grown))
+        if grown > 0:
+            self._thread_owners.append((module, grown))
 
     def _instrumentation_of(self, code: str | None, module: str | None) -> str | None:
         """Return the instrumentation module that the module ``code`` is part of, if any.
@@ -546,3 +483,120 @@ def _thread_code(thread: threading.Thread) -> str | None:
     # The threading module's own code, as for Event.wait, says nothing.
 
     return module if isinstance(module, str) and module != "threading" else None
+
+
+@dataclass(frozen=True)
+class _Snapshot:
+    # The descriptors and threads as a load began.
+
+    fds: dict[int, Identity]
+    threads: int
+    python_threads: set[threading.Thread]
+
+
+class _RecordingFinder:
+    """The import check's finder, first on ``sys.meta_path`` while it is active."""
+
+    def __init__(self, recorder: ImportRecorder) -> None:
+        self._recorder = recorder
+        self._local = threading.local()
+
+    def find_spec(
+        self, name: str, path: Sequence[str] | None, target: ModuleType | None = None
+    ) -> ModuleSpec | None:
+        """Find the module through the finders after this one, with its loader wrapped."""
+
+        # A reload, or a search this thread is already making, is left to
+        # the other finders as if this one were not there.
+
+        if name in sys.modules:
+            return None
+
+        searching: set[str] | None = getattr(self._local, "searching", None)
+
+        if searching is None:
+            searching = self._local.searching = set()
+
+        if name in searching:
+            return None
+
+        searching.add(name)
+
+        try:
+            spec = find_after(self, name, path, target)
+        finally:
+            searching.discard(name)
+
+        # Only a loader that creates and executes a module can be wrapped;
+        # what a loader of the old protocol leaves goes to the load it is
+        # nested in.
+
+        loader = spec.loader if spec is not None else None
+
+        if (
+            spec is None
+            or loader is None
+            or not hasattr(loader, "exec_module")
+            or not hasattr(loader, "create_module")
+        ):
+            return spec
+
+        spec.loader = _Recorded(spec, loader, self._recorder)  # type: ignore[assignment]
+        return spec
+
+    def invalidate_caches(self) -> None:
+        """Nothing is cached here."""
+
+
+class _Recorded:
+    # A loader that has the recorder compare the process before and after
+    # another's creation and execution of one module. The module is given
+    # its own loader back before it executes, so its code, and anything
+    # reading __loader__ or __spec__.loader later, sees the real one.
+
+    __slots__ = ("_before", "_loader", "_recorder", "_spec")
+
+    def __init__(self, spec: ModuleSpec, loader: Any, recorder: ImportRecorder) -> None:
+        self._spec = spec
+        self._loader = loader
+        self._recorder = recorder
+        self._before: _Snapshot | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._loader, name)
+
+    def create_module(self, spec: ModuleSpec) -> ModuleType | None:
+        """Take the baseline, and have the real loader create the module."""
+
+        # An extension module runs its initialisation as it is created,
+        # so the baseline comes first; a creation that fails ends the
+        # load, and what it left is the module's still.
+
+        self._before = self._recorder._snapshot()
+
+        try:
+            created: ModuleType | None = self._loader.create_module(spec)
+        except BaseException:
+            self._recorder._claim(self._spec.name, self._before)
+            raise
+
+        return created
+
+    def exec_module(self, module: ModuleType) -> None:
+        """Have the real loader execute the module, and claim what the load left."""
+
+        loader = self._loader
+        self._spec.loader = loader
+
+        try:
+            module.__loader__ = loader
+        except AttributeError:
+            pass
+
+        before = self._before or self._recorder._snapshot()
+        self._before = None
+
+        try:
+            loader.exec_module(module)
+        finally:
+            self._recorder._claim(self._spec.name, before)

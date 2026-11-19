@@ -57,7 +57,7 @@ entrypoint = "shop.app:app"
 lazy_imports = true
 ```
 
-`lazy_imports` needs unwrapt 1.0.0a2 or later in the project's
+`lazy_imports` needs unwrapt 1.0.0a5 or later in the project's
 environment. Muru imports unwrapt only when `lazy_imports` is on.
 
 ## Imports in code the project does not own
@@ -95,7 +95,7 @@ With none of them, only each module's own `__lazy_modules__` is
 deferred. `muructl run --print-config` and `muructl serve --print-config`
 show `lazy_imports` and the file the host finds.
 
-A missing unwrapt, one older than 1.0.0a2, and a configuration file
+A missing unwrapt, one older than 1.0.0a5, and a configuration file
 unwrapt cannot use are logged with the reason, and the release starts
 without deferral.
 
@@ -223,12 +223,24 @@ Imports that loaded a module, by cumulative time
   CUM MS SAVES MS IMPORTED      IMPORTED BY     LOADING    3.15 UNWRAPT NOTES
    140.2    140.2 shop.reports  shop.views      entrypoint yes  yes
     96.4     96.4 openpyxl      shop.reports    entrypoint yes  yes
-...
+    24.1      0.0 pandas        shop.charts     entrypoint yes  yes     also imported eagerly by shop.stats
+  183 more rows with nothing to act on; --all lists them
 ```
 
 - **The summary** is unwrapt's: the time the load spent importing, the
   modules it loaded, and a conservative estimate of what deferring every
   import that can be deferred would save.
+
+- **The table** lists the imports there is something to do about: each
+  one whose deferral would save time, and each one that would save but
+  for another module importing the same module eagerly, which NOTES
+  names as `also imported eagerly by shop.stats`. An import made inside
+  the load of a listed one is covered by deferring that one and is left
+  out, unless the advice names it, and so is an import nothing can
+  defer. A line below the table counts the rows left out, and `--all`
+  lists them. Among them are the imports a compiled extension module
+  makes as it loads, such as those between pandas' own extensions,
+  noted `extension module`: they have no statement to change.
 
 - **The advice** names the imports deferring which saves the most, each
   with who pays for the module and the configuration to write. An import
@@ -243,29 +255,63 @@ Imports that loaded a module, by cumulative time
   the fork, in the worker that uses it. A deferred import the load used
   anyway is named too, since deferring it gains nothing.
 
+- **An import used as its module loads** is never advised: when the
+  importing module's own code uses the name at module level, in a class
+  body, a decorator or a default argument, a deferred import resolves
+  before that module has finished loading, and deferring it saves
+  nothing. Its row says `used at load, deferring saves nothing`, and
+  `--all` lists it. A deferral already in place that the load used this
+  way is noted the same in "Deferred but used during the load", and the
+  advice is to remove the entry.
+
+- **An import declared deferred that loaded eagerly**, one a module's
+  `__lazy_modules__` or unwrapt's `lazy_modules` names in a load with
+  `lazy_imports` off, keeps its cost and its saving, is noted `declared
+  lazy, loaded eagerly`, and the advice names what is missing and where
+  the setting is off:
+
+  ```
+  defer: openpyxl imported by shop.export, 72.3 ms, loading entrypoint
+    paid by the host, once before the fork, shared by the 4 workers; deferred, each worker that uses it loads it on first use
+    shop.export names it in __lazy_modules__, but nothing defers it: Python 3.14 needs lazy_imports = true (it is false in muru.local.toml)
+      lazy_imports = true
+  ```
+
 - **LOADING** says which of the host's targets the import was made while
   loading: `hooks`, `entrypoint`, `mount:NAME`, or `module:NAME` for one
   of the `preload_modules`. A module several targets need is paid for by
   the first. An import made outside them, by an instrumentation module or
   by the `on_load` and `pre_fork` hooks, has no target.
 
+- **The `preload_modules`.** An entry of the list asks for its module to
+  be loaded before the fork, so nothing loaded while the host loads it is
+  advised to be deferred, and its rows say `preload_modules` under NOTES.
+  Each entry's own time is on a line of its own below the summary, as
+  `preload_modules entry shop.reports: 178.8 ms in the host`, to weigh
+  against the time `muructl run` takes to load again on every reload.
+
 - **3.15** and **UNWRAPT** say whether each way of deferring can defer the
   import's form: `from x import y` defers on Python 3.15 alone, and below
-  it only once rewritten as `import x`.
+  it only once rewritten as `import x`. A module first loaded by a `from`
+  import is counted, with its time, like any other. Its SAVES MS is 0,
+  since unwrapt cannot defer it, and the advice names it only when it is
+  in the project's own code and its load takes at least 10 ms, with the
+  rewrite it needs below 3.15. A `from` import in a package the project
+  depends on is never advised.
 
 An import that takes less than half a millisecond is not kept as a
-candidate. The line of an import made while the host loads under preload
-is not known, so the chains give its file alone.
+candidate.
 
 The options narrow it:
 
 | Option | Keeps |
 | --- | --- |
-| `--target TARGET` | The imports made while loading one target, or `none` for those outside any |
+| `--target TARGET` | The imports made while loading one target, or `none` for those outside any, with the summary narrowed to them and the whole load's time beside it, as `41.2 ms importing for entrypoint, of 260.3 ms` |
 | `--top N` | The first N rows of each table (20 by default) |
 | `--min-ms MS` | Rows that took at least MS milliseconds |
 | `--package NAME` | Modules and importers under a top-level package; repeatable |
 | `--module NAME` | The chain of imports that brought one module in, outermost first, with the best place to cut it |
+| `--all` | Every row of the imports table, those with nothing to act on too |
 | `--worker N` | A worker's own report, when it loaded the application itself, with `preload = false` or after the fallback to per-worker imports |
 | `--json` | The same as JSON |
 
@@ -276,21 +322,39 @@ it has loaded for the first time since the fork, as `muructl debug
 status` asks for its status:
 
 ```
-Modules the 4 workers asked loaded for the first time since the fork
+Modules loaded for the first time since the fork, by the 4 workers that answered
   MODULE          LOADED BY FIRST REQUEST               MS ADVICE
   shop.export     4 of 4    01M7KQB0T2RJAQ4CG18KYPG80D 41.0 every worker loads it: load it before the fork with preload_modules = ["shop.export"]
-  pandas (deferred) 1 of 4  01M7KQC4YV3M8T5WQ0J1E9X2HB 310.2 deferral pays off: only some workers load it
-  matplotlib (deferred in shop.charts): never needed: deferring it saves it in every worker
+  pandas (deferred) 1 of 4  01M7KQC4YV3M8T5WQ0J1E9X2HB 310.2 deferred in the host; loaded by 1 of 4 workers: loading on first use pays off: only some workers load it
+  matplotlib, imported by shop.charts: deferred in the host; loaded by 0 of 4 workers: the deferral is paying off
+  The counts cover the requests served so far; read them after representative traffic.
 ```
 
 Each row is a module a worker loaded while it served, by how many of the
-workers asked, the first request that loaded it and its time, with
+workers that answered, the first request that loaded it and its time, with
 deferred modules marked. A module every worker loads is better loaded
-before the fork; one only some of them load pays off loaded on first use,
-or deferred; and a deferred import of the host's load that no worker has
-used is never needed. The figures grow as the workers serve, so read them
-after the application has seen representative traffic. A module loaded
-only inside another's load comes with it and is not listed.
+before the fork, and one only some of them load pays off loaded on first
+use. A module loaded only inside another's load comes with it and is not
+listed, unless it was deferred and its use came as the module deferring
+it loaded: that deferral saved nothing, and its row says where, as
+`deferred in openpyxl.compat.numbers: used as openpyxl.compat.numbers
+loads, at openpyxl/compat/numbers.py:16; deferring it saves nothing,
+remove the entry`.
+
+Each import the host's load deferred is listed whatever its depth, with
+how many of the workers have loaded it so far, which settles whether the
+deferral is worth keeping: loaded by none of them, the deferral is paying
+off; by some, loading on first use pays off; by every one, the module
+costs each worker on a real request and its memory is not shared, so it
+is better loaded before the fork. The figures grow as the workers serve,
+so read them after the application has seen representative traffic.
+
+A private module, one with a part of its name starting with an
+underscore such as `_osx_support`, is never suggested for
+`preload_modules`: its name often changes with the platform and the
+build. The suggestion names instead the nearest public module whose load
+it was part of in that worker, and a private module with none has no
+suggestion.
 
 ### Checking a change
 

@@ -2108,6 +2108,7 @@ async fn write_response_after(
                         .collect(),
                     flush: flush as i32,
                     imports_ms: trace.map_or(0.0, record::Trace::imports_ms),
+                    import_wait_ms: trace.map_or(0.0, record::Trace::import_wait_ms),
                 };
 
                 if status == 101 {

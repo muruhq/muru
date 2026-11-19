@@ -141,10 +141,10 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Configuration | config.applied, config.apply_failed, route.changed, traffic_policy.changed, maintenance.changed, access_log.changed, access_log.reverted |
 | Releases | release.created, release.building, release.built, release.build_failed, release.loaded, release.state_changed, release.removed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden, release.idle, release.woken |
 | Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.oom_killed, worker.recycled, worker.timeout_killed, worker.loop_stalled, worker.gil_stalled, worker.restarted, server.started, server.exited, server.failed |
-| Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired, schedule.over_budget |
+| Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired, schedule.end_refused, schedule.over_budget |
 | Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened, logs.rotated, logs.truncated, logs.pruned, clock.unsynchronised, clock.synchronised |
 | Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable, output.dropping, output.held, output.failing, output.caught_up, output.relay_restarting |
-| Overlays | overlay.activated, overlay.ended, overlay.skipped, overlay.would_activate, overlay.warming, overlay.promoted |
+| Overlays | overlay.activated, overlay.ended, overlay.skipped, overlay.would_activate, overlay.warming, overlay.promoted, overlay.end_refused |
 | Clients | ratelimit.enforcing, client_class.list_reloaded |
 | Dashboard | dashboard.login_issued |
 | Commands | command.started, command.finished, command.failed |

@@ -35,6 +35,15 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// The settings of the command's table, each its key and its value,
+    /// whatever set it.
+    pub fn section_values(&self) -> Vec<(String, String)> {
+        self.rows
+            .iter()
+            .map(|row| (row.key.to_owned(), row.value.to_string()))
+            .collect()
+    }
+
     /// Each setting as a line of `muructl config show --effective`, which
     /// reads `SCOPE: KEY = VALUE (SOURCE)`, with those of the command's
     /// table under its name, as `run.port`.

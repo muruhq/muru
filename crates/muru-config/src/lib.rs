@@ -4421,6 +4421,7 @@ pub fn lazy_imports_instrumentation(
         lazy_imports == Some(true),
         import_report == Some(true),
         workers,
+        "",
     ))
 }
 
@@ -4428,8 +4429,16 @@ pub fn lazy_imports_instrumentation(
 /// records the import report (sections 6.17 and 6.18), or None when it
 /// does neither. Its settings say which it does, and how many workers the
 /// release starts with, for the report's analysis; unwrapt finds its own
-/// configuration.
-pub fn lazy_imports_entry(defer: bool, report: bool, workers: usize) -> Option<Instrumentation> {
+/// configuration. `lazy_from` names where `lazy_imports` was set, a file
+/// name or "the release's settings", empty when it was not set, for the
+/// report's advice on an import declared deferred that nothing deferred
+/// (issue 786).
+pub fn lazy_imports_entry(
+    defer: bool,
+    report: bool,
+    workers: usize,
+    lazy_from: &str,
+) -> Option<Instrumentation> {
     if !defer && !report {
         return None;
     }
@@ -4438,6 +4447,10 @@ pub fn lazy_imports_entry(defer: bool, report: bool, workers: usize) -> Option<I
     settings.insert("defer".to_owned(), serde_json::json!(defer));
     settings.insert("report".to_owned(), serde_json::json!(report));
     settings.insert("workers".to_owned(), serde_json::json!(workers));
+
+    if report && !lazy_from.is_empty() {
+        settings.insert("lazy_imports_from".to_owned(), serde_json::json!(lazy_from));
+    }
 
     Some(Instrumentation {
         module: LAZY_IMPORTS_MODULE.to_owned(),
@@ -7679,6 +7692,12 @@ traffic = { classes = { ai-crawler = 'r1' } }"
             .unwrap();
         assert_eq!(report.settings["defer"], false);
         assert_eq!(report.settings["report"], true);
+
+        // Issue 786: the report is told where lazy_imports was set.
+
+        let told = lazy_imports_entry(false, true, 2, "muru.local.toml").unwrap();
+        assert_eq!(told.settings["lazy_imports_from"], "muru.local.toml");
+        assert!(!report.settings.contains_key("lazy_imports_from"));
         assert_eq!(
             parse_local("import_report = true\n", None)
                 .unwrap()

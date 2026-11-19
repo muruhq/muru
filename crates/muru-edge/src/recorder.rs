@@ -650,6 +650,16 @@ pub fn worker(record: &mut admin::RequestRecord, part: muru_proto::worker::v1::W
             .collect(),
         modules_loaded: part.modules_loaded,
         modules_ms: part.modules_ms,
+        import_waits: part
+            .import_waits
+            .into_iter()
+            .map(|wait| admin::ImportWait {
+                module: wait.module,
+                at_ms: wait.at,
+                ms: wait.ms,
+                loader: wait.loader,
+            })
+            .collect(),
     });
 }
 

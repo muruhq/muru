@@ -1585,8 +1585,14 @@ impl Recording {
     /// `application`: the record takes the time, and a development run
     /// notes it with the queue's for the response (section 4.20), and
     /// what the worker spent loading modules for the first time before
-    /// the head, unless this hop is a sub-request of the edge's own.
-    pub(crate) fn head_arrived(&mut self, application: Duration, imports: Duration) {
+    /// the head and waiting on other threads' loads, unless this hop is
+    /// a sub-request of the edge's own.
+    pub(crate) fn head_arrived(
+        &mut self,
+        application: Duration,
+        imports: Duration,
+        import_wait: Duration,
+    ) {
         self.record.application = application;
 
         if let Some(noted) = &self.noted
@@ -1596,6 +1602,7 @@ impl Recording {
                 queue: self.record.queue,
                 application,
                 imports,
+                import_wait,
             });
         }
     }
@@ -2327,6 +2334,7 @@ async fn handle_inner(
         recording.head_arrived(
             dispatched.elapsed(),
             Duration::from_secs_f64(head.imports_ms.max(0.0) / 1000.0),
+            Duration::from_secs_f64(head.import_wait_ms.max(0.0) / 1000.0),
         );
         recording.record.status = u16::try_from(head.status).unwrap_or(500);
 

@@ -31,6 +31,8 @@ pub struct Filters {
     /// The chain of imports that brought this module in, in place of the
     /// tables.
     pub module: Option<String>,
+    /// Every row of the imports table, not only those a reader can act on.
+    pub all: bool,
 }
 
 /// The rows each table keeps unless `--top` says otherwise.
@@ -163,12 +165,35 @@ fn analysis(report: &Value, filters: &Filters) -> Value {
     // A deferred import never used has no time, so only the packages
     // apply to it.
 
+    // Issue 784: the imports table keeps the rows the analysis marked as
+    // ones to act on, unless every row is asked for, and says how many it
+    // left out.
+
+    let kept: Vec<&Value> = report["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| filters.keeps(row, "cum_ms"))
+        .collect();
+    let shown: Vec<Value> = kept
+        .iter()
+        .filter(|row| filters.all || row["shown"].as_bool() != Some(false))
+        .take(top)
+        .map(|row| (*row).clone())
+        .collect();
+    let hidden = kept
+        .iter()
+        .filter(|row| !filters.all && row["shown"].as_bool() == Some(false))
+        .count();
+
     let mut found = json!({
         "labels": report["labels"],
         "workers": report["workers"],
         "summary": report["summary"],
         "findings": rows("findings", "ms"),
-        "candidates": rows("candidates", "cum_ms"),
+        "targets": report["targets"],
+        "candidates": shown,
+        "candidates_hidden": hidden,
         "deferred_used": rows("deferred_used", "load_ms"),
         "deferred_unused": Value::Array(
             report["deferred_unused"]
@@ -189,6 +214,22 @@ fn analysis(report: &Value, filters: &Filters) -> Value {
 
     if let Some(module) = &filters.module {
         found["chain"] = chain(report, module);
+    }
+
+    // Issue 786: --target narrows the summary as it narrows the tables,
+    // keeping the whole load's figures beside it.
+
+    if let Some(target) = &filters.target {
+        let label = if target == "none" {
+            ""
+        } else {
+            target.as_str()
+        };
+
+        found["target"] = json!(target);
+        found["target_summary"] = report["by_target"].get(label).cloned().unwrap_or_else(
+            || json!({"total_import_ms": 0.0, "modules_loaded": 0, "import_calls": 0}),
+        );
     }
 
     found
@@ -289,9 +330,15 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
         ms: Vec<f64>,
         deferred: bool,
         depth: u64,
+        used_at_load: Option<(String, String)>,
     }
 
     let mut modules: BTreeMap<String, Seen> = BTreeMap::new();
+
+    // Each worker's loads with the load each was nested in, for a private
+    // module's nearest public ancestor (issue 763).
+
+    let mut parents: BTreeMap<(String, String), String> = BTreeMap::new();
 
     for (name, result) in workers {
         let loads = result["modules"]["loads"]
@@ -310,6 +357,10 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
             });
             let at = load["at_unix_ms"].as_u64().unwrap_or(u64::MAX);
             let request = load["request"].as_str().unwrap_or_default().to_owned();
+            parents.insert(
+                (name.clone(), module.to_owned()),
+                load["parent"].as_str().unwrap_or_default().to_owned(),
+            );
 
             if seen
                 .first
@@ -323,19 +374,48 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
             seen.ms.push(load["ms"].as_f64().unwrap_or(0.0));
             seen.deferred |= load["deferred"].as_bool().unwrap_or(false);
             seen.depth = seen.depth.min(load["depth"].as_u64().unwrap_or(0));
+
+            if let Some(importer) = load["used_at_load"].as_str() {
+                seen.used_at_load = Some((
+                    importer.to_owned(),
+                    load["used_at"].as_str().unwrap_or_default().to_owned(),
+                ));
+            }
         }
     }
 
     let asked = workers.len();
+
+    // Issue 793: the imports the host's load deferred, each of which the
+    // section says how many workers have loaded, so a deferral that pays
+    // off shows as well as one that does not.
+
+    let host_deferred: BTreeMap<String, String> = host
+        .and_then(|host| host["deferred_unused"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            Some((
+                row["module"].as_str()?.to_owned(),
+                row["importer"].as_str().unwrap_or_default().to_owned(),
+            ))
+        })
+        .collect();
+
     let mut rows: Vec<Value> = modules
         .into_iter()
         .filter(|(module, seen)| {
             let ms = seen.ms.iter().copied().fold(0.0, f64::max);
 
             // A module loaded only inside another's load comes with it,
-            // and Muru's own modules are not the application's to move.
+            // unless the host deferred it or its deferral saved nothing,
+            // used as the module deferring it loaded (issue 789), and
+            // Muru's own modules are not the application's to move.
 
-            (seen.depth == 0 || filters.module.is_some())
+            (seen.depth == 0
+                || filters.module.is_some()
+                || host_deferred.contains_key(module)
+                || seen.used_at_load.is_some())
                 && !module.starts_with("muru.")
                 && filters.under(module)
                 && ms >= filters.min_ms
@@ -346,8 +426,30 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
         })
         .map(|(module, seen)| {
             let ms = seen.ms.iter().sum::<f64>() / seen.ms.len().max(1) as f64;
-            let advice = worker_advice(seen.workers.len(), asked, seen.deferred, &module);
             let (at, request, worker) = seen.first.unwrap_or_default();
+            let listed = public_module(&module, &worker, &parents);
+
+            let advice = if let Some((importer, at)) = &seen.used_at_load {
+                let at = if at.is_empty() {
+                    String::new()
+                } else {
+                    format!(", at {at}")
+                };
+
+                format!(
+                    "deferred in {importer}: used as {importer} loads{at}; deferring it saves nothing, remove the entry"
+                )
+            } else if host_deferred.contains_key(&module) {
+                deferral_advice(seen.workers.len(), asked, &module, listed.as_deref())
+            } else {
+                worker_advice(
+                    seen.workers.len(),
+                    asked,
+                    seen.deferred,
+                    &module,
+                    listed.as_deref(),
+                )
+            };
 
             json!({
                 "module": module,
@@ -359,6 +461,7 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
                 "ms": ms,
                 "outermost": seen.depth == 0,
                 "deferred": seen.deferred,
+                "used_at_load": seen.used_at_load.as_ref().map(|(importer, _)| importer),
                 "advice": advice,
             })
         })
@@ -371,32 +474,24 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
             .total_cmp(&left["ms"].as_f64().unwrap_or(0.0))
     });
 
-    // A deferral the host's load made that no worker has used saves its
-    // module in every worker.
+    // A deferral the host's load made that no worker has loaded is paying
+    // off, so far.
 
     let loaded: Vec<String> = rows
         .iter()
         .filter_map(|row| row["module"].as_str().map(str::to_owned))
         .collect();
-    let never: Vec<Value> = host
-        .and_then(|host| host["deferred_unused"].as_array())
-        .map(|unused| {
-            unused
-                .iter()
-                .filter(|row| {
-                    let module = row["module"].as_str().unwrap_or_default();
-                    !loaded.iter().any(|seen| seen == module) && filters.under(module)
-                })
-                .map(|row| {
-                    json!({
-                        "module": row["module"],
-                        "importer": row["importer"],
-                        "advice": "never needed: deferring it saves it in every worker",
-                    })
-                })
-                .collect()
+    let never: Vec<Value> = host_deferred
+        .iter()
+        .filter(|(module, _)| !loaded.contains(module) && filters.under(module))
+        .map(|(module, importer)| {
+            json!({
+                "module": module,
+                "importer": importer,
+                "advice": deferral_advice(0, asked, module, Some(module)),
+            })
         })
-        .unwrap_or_default();
+        .collect();
 
     let top = if filters.top == 0 {
         DEFAULT_TOP
@@ -412,31 +507,113 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
     })
 }
 
-/// What to do about a module `loaded_by` of `asked` workers loaded on
-/// first use.
-fn worker_advice(loaded_by: usize, asked: usize, deferred: bool, module: &str) -> String {
-    if loaded_by >= asked && asked > 1 {
-        if deferred {
-            return format!(
-                "every worker loads it, so deferring it gains nothing: load it before the fork with preload_modules = [\"{module}\"]"
-            );
+/// Whether a module is private: a part of its name starts with an
+/// underscore, as `_osx_support` or `_sysconfigdata_t_darwin_darwin`,
+/// whose names often change with the platform and the build.
+fn private(module: &str) -> bool {
+    module.split('.').any(|part| part.starts_with('_'))
+}
+
+/// The module to list in `preload_modules` for one a worker loaded: the
+/// module itself, or for a private one the nearest public module whose
+/// load it was part of in that worker; none when there is none (issue
+/// 763).
+fn public_module(
+    module: &str,
+    worker: &str,
+    parents: &BTreeMap<(String, String), String>,
+) -> Option<String> {
+    let mut current = module.to_owned();
+
+    // A chain of loads is as deep as the imports nest, which a bound
+    // keeps finite whatever the answers say.
+
+    for _ in 0..64 {
+        if !private(&current) {
+            return Some(current);
         }
 
-        return format!(
-            "every worker loads it: load it before the fork with preload_modules = [\"{module}\"]"
-        );
+        current = parents
+            .get(&(worker.to_owned(), current))
+            .filter(|parent| !parent.is_empty())?
+            .clone();
+    }
+
+    None
+}
+
+/// What to do about a module `loaded_by` of `asked` workers loaded on
+/// first use, with `listed` the module to name in `preload_modules`: the
+/// module itself, the public module that loaded a private one, or none.
+fn worker_advice(
+    loaded_by: usize,
+    asked: usize,
+    deferred: bool,
+    module: &str,
+    listed: Option<&str>,
+) -> String {
+    let preload = match listed {
+        Some(listed) if listed == module => {
+            format!("load it before the fork with preload_modules = [\"{listed}\"]")
+        }
+        Some(listed) => format!(
+            "load it before the fork with preload_modules = [\"{listed}\"], whose load loads it"
+        ),
+        None => String::new(),
+    };
+
+    if loaded_by >= asked && asked > 1 {
+        return match (deferred, preload.is_empty()) {
+            (_, true) => {
+                "every worker loads it; a private module is not one to list in preload_modules"
+                    .to_owned()
+            }
+            (true, false) => {
+                format!("every worker loads it, so deferring it gains nothing: {preload}")
+            }
+            (false, false) => format!("every worker loads it: {preload}"),
+        };
     }
 
     if loaded_by >= asked {
-        return format!(
-            "the worker loaded it on first use: load it before the fork with preload_modules = [\"{module}\"] if most requests need it"
-        );
+        if preload.is_empty() {
+            return "the worker loaded it on first use; a private module is not one to list in preload_modules".to_owned();
+        }
+
+        return format!("the worker loaded it on first use: {preload} if most requests need it");
     }
 
     if deferred {
         "deferral pays off: only some workers load it".to_owned()
     } else {
         "loading on first use pays off: only some workers load it".to_owned()
+    }
+}
+
+/// What to say of an import the host's load deferred that `loaded_by`
+/// of `asked` workers have loaded (issue 793): none, paying off; some,
+/// loading on first use pays off; every one, better loaded before the
+/// fork, naming `listed` in `preload_modules` when there is one.
+fn deferral_advice(loaded_by: usize, asked: usize, module: &str, listed: Option<&str>) -> String {
+    let noun = if asked == 1 { "worker" } else { "workers" };
+    let counted = format!("deferred in the host; loaded by {loaded_by} of {asked} {noun}");
+
+    if loaded_by == 0 {
+        return format!("{counted}: the deferral is paying off");
+    }
+
+    if loaded_by < asked {
+        return format!("{counted}: loading on first use pays off: only some workers load it");
+    }
+
+    match listed {
+        Some(listed) if listed == module => {
+            format!("{counted}: load it before the fork with preload_modules = [\"{listed}\"]")
+        }
+        Some(listed) => format!(
+            "{counted}: load it before the fork with preload_modules = [\"{listed}\"], whose load loads it"
+        ),
+        None => format!("{counted}, so deferring it gains nothing"),
     }
 }
 
@@ -540,14 +717,61 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
         text(&labels["python"]),
         if workers == 1 { "worker" } else { "workers" },
     );
-    let _ = writeln!(
-        out,
-        "  {} ms importing, {} modules loaded, {} import calls; deferring what can be deferred would save about {} ms",
-        ms(&summary["total_import_ms"]),
-        summary["modules_loaded"].as_u64().unwrap_or(0),
-        summary["import_calls"].as_u64().unwrap_or(0),
-        ms(&summary["estimated_saving_ms"]),
-    );
+
+    // With --target, the target's own figures, the whole load's time
+    // beside them and its saving, which is the plan's for the whole load.
+
+    match (report["target"].as_str(), report.get("target_summary")) {
+        (Some(target), Some(narrowed)) => {
+            let what = if target == "none" {
+                "outside the targets".to_owned()
+            } else {
+                format!("for {target}")
+            };
+
+            let _ = writeln!(
+                out,
+                "  {} ms importing {what}, of {} ms, {} modules loaded, {} import calls; deferring what can be deferred in the whole load would save about {} ms",
+                ms(&narrowed["total_import_ms"]),
+                ms(&summary["total_import_ms"]),
+                narrowed["modules_loaded"].as_u64().unwrap_or(0),
+                narrowed["import_calls"].as_u64().unwrap_or(0),
+                ms(&summary["estimated_saving_ms"]),
+            );
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "  {} ms importing, {} modules loaded, {} import calls; deferring what can be deferred would save about {} ms",
+                ms(&summary["total_import_ms"]),
+                summary["modules_loaded"].as_u64().unwrap_or(0),
+                summary["import_calls"].as_u64().unwrap_or(0),
+                ms(&summary["estimated_saving_ms"]),
+            );
+        }
+    }
+
+    // Issue 785: each of the preload_modules' own cost, as Muru timed
+    // its load, for someone weighing it against the reload time; with
+    // --target, the target's alone.
+
+    let asked = report["target"].as_str();
+
+    for target in report["targets"].as_array().into_iter().flatten() {
+        let label = target["target"].as_str().unwrap_or_default();
+
+        if asked.is_some_and(|asked| asked != label) {
+            continue;
+        }
+
+        if let Some(module) = label.strip_prefix("module:") {
+            let _ = writeln!(
+                out,
+                "  preload_modules entry {module}: {} ms in {of}",
+                ms(&target["ms"])
+            );
+        }
+    }
 
     // --module: the chain that brought the module in.
 
@@ -611,11 +835,7 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
                     text(&row["target"]),
                     yes(&row["native"]),
                     yes(&row["unwrapt"]),
-                    if row["already_lazy"].as_bool() == Some(true) {
-                        "already lazy".to_owned()
-                    } else {
-                        String::new()
-                    },
+                    notes(row),
                 ]
             })
             .collect();
@@ -637,6 +857,16 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
         );
     }
 
+    let hidden = report["candidates_hidden"].as_u64().unwrap_or(0);
+
+    if hidden > 0 {
+        let rows = if hidden == 1 { "row" } else { "rows" };
+        let _ = writeln!(
+            out,
+            "  {hidden} more {rows} with nothing to act on; --all lists them"
+        );
+    }
+
     if let Some(used) = report["deferred_used"]
         .as_array()
         .filter(|rows| !rows.is_empty())
@@ -653,15 +883,27 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
                     row["line"]
                         .as_u64()
                         .map_or("-".to_owned(), |line| line.to_string()),
+                    if row["used_at_load"].as_bool() == Some(true) {
+                        "used at load, deferring saves nothing".to_owned()
+                    } else {
+                        String::new()
+                    },
                 ]
             })
             .collect();
 
         table(
             out,
-            &["LOAD MS", "MODULE", "DEFERRED IN", "USED IN", "LINE"],
+            &[
+                "LOAD MS",
+                "MODULE",
+                "DEFERRED IN",
+                "USED IN",
+                "LINE",
+                "NOTES",
+            ],
             &rows,
-            &[true, false, false, false, true],
+            &[true, false, false, false, true, false],
         );
     }
 
@@ -676,6 +918,70 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
             .collect();
 
         table(out, &["MODULE", "DEFERRED IN"], &rows, &[false, false]);
+    }
+}
+
+/// What a row of the imports table notes: an import already deferred;
+/// one made while the host loaded one of the `preload_modules`, which is
+/// not advised to be deferred (issue 785); one an extension module made
+/// as it loaded, which nothing can defer; and the other modules that
+/// import the same module eagerly, which keep its saving at nothing
+/// (issue 784); one declared deferred that loaded eagerly (issue 786);
+/// and one its importer uses as it loads, which deferring cannot help
+/// (issue 789).
+fn notes(row: &Value) -> String {
+    let mut notes = Vec::new();
+
+    if row["already_lazy"].as_bool() == Some(true) {
+        notes.push("already lazy".to_owned());
+    } else if row["declared_lazy"].as_bool() == Some(true) {
+        notes.push("declared lazy, loaded eagerly".to_owned());
+    }
+
+    if row["reason"].as_str() == Some("extension-module") {
+        notes.push("extension module".to_owned());
+    }
+
+    if row["used_at_load"].as_bool() == Some(true) {
+        notes.push("used at load, deferring saves nothing".to_owned());
+    }
+
+    if row["target"]
+        .as_str()
+        .is_some_and(|target| target.starts_with("module:"))
+    {
+        notes.push("preload_modules".to_owned());
+    }
+
+    let shared: Vec<&str> = row["shared"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+
+    if !shared.is_empty() && format!("{:.1}", row["saving_ms"].as_f64().unwrap_or(0.0)) == "0.0" {
+        let more = match shared.len() {
+            0..=3 => String::new(),
+            count => format!(" and {} more", count - 3),
+        };
+
+        notes.push(format!(
+            "also imported eagerly by {}{more}",
+            shared[..shared.len().min(3)].join(", ")
+        ));
+    }
+
+    notes.join(", ")
+}
+
+/// Text with its first letter a capital.
+fn capitalised(text: &str) -> String {
+    let mut characters = text.chars();
+
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
     }
 }
 
@@ -742,17 +1048,25 @@ fn render_workers(out: &mut String, workers: &Value) {
         .unwrap_or_default();
     let noun = if asked == 1 { "worker" } else { "workers" };
 
+    let answered = if asked == 1 {
+        "the worker that answered".to_owned()
+    } else {
+        format!("the {asked} {noun} that answered")
+    };
+
     if modules.is_empty() && never.is_empty() {
+        let have = if asked == 1 { "has" } else { "have" };
         let _ = writeln!(
             out,
-            "\nThe {asked} {noun} asked have loaded no module for the first time since the fork."
+            "\n{} {have} loaded no module for the first time since the fork.",
+            capitalised(&answered)
         );
         return;
     }
 
     let _ = writeln!(
         out,
-        "\nModules the {asked} {noun} asked loaded for the first time since the fork"
+        "\nModules loaded for the first time since the fork, by {answered}"
     );
     let rows: Vec<Vec<String>> = modules
         .iter()
@@ -789,10 +1103,26 @@ fn render_workers(out: &mut String, workers: &Value) {
     for row in &never {
         let _ = writeln!(
             out,
-            "  {} (deferred in {}): {}",
+            "  {}, imported by {}: {}",
             text(&row["module"]),
             text(&row["importer"]),
             text(&row["advice"])
+        );
+    }
+
+    // The counts grow as the workers serve.
+
+    let deferrals = !never.is_empty()
+        || modules.iter().any(|row| {
+            row["advice"]
+                .as_str()
+                .is_some_and(|advice| advice.starts_with("deferred in the host"))
+        });
+
+    if deferrals {
+        let _ = writeln!(
+            out,
+            "  The counts cover the requests served so far; read them after representative traffic."
         );
     }
 }
@@ -813,8 +1143,11 @@ mod tests {
                 {"edge": 2, "imported": "openpyxl", "importer": "shop.reports", "target": "entrypoint",
                  "cum_ms": 30.0, "saving_ms": 30.0, "native": true, "unwrapt": true, "already_lazy": false},
                 {"edge": 4, "imported": "yaml", "importer": "shop.hooks", "target": "hooks",
-                 "cum_ms": 0.5, "saving_ms": 0.5, "native": true, "unwrapt": false, "already_lazy": false}
+                 "cum_ms": 0.5, "saving_ms": 0.5, "native": true, "unwrapt": false, "already_lazy": false},
+                {"edge": 5, "imported": "pandas", "importer": "shop.stats", "target": "module:shop.stats",
+                 "cum_ms": 178.0, "saving_ms": 178.0, "native": true, "unwrapt": true, "already_lazy": false}
             ],
+            "targets": [{"target": "entrypoint", "ms": 40.0}, {"target": "module:shop.stats", "ms": 178.8}],
             "deferred_used": [],
             "deferred_unused": [{"module": "pandas", "importer": "shop.views"}],
             "chains": [{"module": "openpyxl", "best_cut": 2}],
@@ -922,6 +1255,230 @@ mod tests {
         );
         assert!(text.contains("__lazy_modules__ = ['openpyxl']"), "{text}");
         assert!(text.contains("pandas.io (deferred)"), "{text}");
+    }
+
+    #[test]
+    fn a_preload_modules_entry_has_its_cost_and_its_imports_are_noted() {
+        let found = document(&response(&[]), None, &Filters::default()).unwrap();
+        let text = render(&found);
+
+        // Issue 785: the entry's own time on a line of its own, and the
+        // imports made while loading it noted as the list's.
+
+        assert!(
+            text.contains("\n  preload_modules entry shop.stats: 178.8 ms in the host\n"),
+            "{text}"
+        );
+        let row = text.lines().find(|line| line.contains(" pandas ")).unwrap();
+        assert!(
+            row.ends_with("module:shop.stats yes  yes     preload_modules"),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn a_private_module_is_suggested_through_its_public_ancestor_or_not_at_all() {
+        let worker = json!({
+            "modules": {
+                "loads": [
+                    {"module": "_sysconfigdata_t_darwin_darwin", "request": "R1", "ms": 0.5, "depth": 0,
+                     "deferred": false, "at_unix_ms": 1000, "parent": ""},
+                    {"module": "urllib.request", "request": "R1", "ms": 5.0, "depth": 0,
+                     "deferred": false, "at_unix_ms": 1001, "parent": ""},
+                    {"module": "_osx_support", "request": "R1", "ms": 0.1, "depth": 1,
+                     "deferred": false, "at_unix_ms": 1002, "parent": "urllib.request"}
+                ],
+                "loaded": 3,
+            },
+            "report": null,
+        });
+        let answered = response(&[(0, worker.clone()), (1, worker)]);
+        let advice = |module: &str| {
+            let filters = Filters {
+                module: Some(module.to_owned()),
+                ..Filters::default()
+            };
+            let found = document(&answered, None, &filters).unwrap();
+            found["workers"]["modules"][0]["advice"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+
+        // Issue 763: a private module is never listed; the public module
+        // whose load it was part of is, and with none there is no entry.
+
+        assert_eq!(
+            advice("_osx_support"),
+            "every worker loads it: load it before the fork with preload_modules = [\"urllib.request\"], whose load loads it"
+        );
+        assert_eq!(
+            advice("_sysconfigdata_t_darwin_darwin"),
+            "every worker loads it; a private module is not one to list in preload_modules"
+        );
+
+        // The heading says whose loads they are.
+
+        let text = render(&document(&answered, None, &Filters::default()).unwrap());
+        assert!(
+            text.contains(
+                "\nModules loaded for the first time since the fork, by the 2 workers that answered\n"
+            ),
+            "{text}"
+        );
+        let one = response(&[(0, loads(&[]))]);
+        let nothing = Filters {
+            packages: vec!["absent".to_owned()],
+            ..Filters::default()
+        };
+        let text = render(&document(&one, None, &nothing).unwrap());
+        assert!(
+            text.contains(
+                "The worker that answered has loaded no module for the first time since the fork."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_deferral_the_host_made_says_how_many_workers_loaded_it() {
+        let mut answered = response(&[
+            (0, loads(&[("xlsx", "R1", true), ("charts", "R2", true)])),
+            (1, loads(&[("xlsx", "R3", true)])),
+        ]);
+        let mut host = host();
+        host["deferred_unused"] = json!([
+            {"module": "pandas", "importer": "shop.views"},
+            {"module": "xlsx", "importer": "shop.export"},
+            {"module": "charts", "importer": "shop.views"}
+        ]);
+        answered.host_json = host.to_string();
+        let found = document(&answered, None, &Filters::default()).unwrap();
+        let advice = |module: &str| {
+            found["workers"]["modules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["module"] == module)
+                .map(|row| row["advice"].as_str().unwrap().to_owned())
+        };
+
+        // Issue 793: every worker, some, or none.
+
+        assert_eq!(
+            advice("xlsx").unwrap(),
+            "deferred in the host; loaded by 2 of 2 workers: load it before the fork with preload_modules = [\"xlsx\"]"
+        );
+        assert_eq!(
+            advice("charts").unwrap(),
+            "deferred in the host; loaded by 1 of 2 workers: loading on first use pays off: only some workers load it"
+        );
+        assert_eq!(
+            found["workers"]["never_used"][0]["advice"],
+            "deferred in the host; loaded by 0 of 2 workers: the deferral is paying off"
+        );
+
+        let text = render(&found);
+        assert!(
+            text.contains("  pandas, imported by shop.views: deferred in the host; loaded by 0 of 2 workers: the deferral is paying off\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("The counts cover the requests served so far"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_imports_table_shows_what_can_be_acted_on_unless_all_is_asked() {
+        // Issue 784: a row whose saving another module's eager import
+        // takes names that module, and an extension module's import is
+        // left out unless every row is asked for.
+
+        let mut host = host();
+        host["candidates"] = json!([
+            {"edge": 2, "imported": "pandas", "importer": "shop.reports", "target": "entrypoint",
+             "cum_ms": 90.0, "saving_ms": 0.0, "native": true, "unwrapt": true, "already_lazy": false,
+             "shared": ["shop.stats"], "shown": true},
+            {"edge": 3, "imported": "pandas._libs.missing", "importer": "pandas._libs.hashtable",
+             "target": "entrypoint", "cum_ms": 18.5, "saving_ms": 0.0, "native": false,
+             "unwrapt": false, "reason": "extension-module", "already_lazy": false, "shared": [],
+             "shown": false}
+        ]);
+        let answered = pb::DebugResponse {
+            host_json: host.to_string(),
+            ..response(&[])
+        };
+
+        let text = render(&document(&answered, None, &Filters::default()).unwrap());
+        assert!(
+            text.contains("also imported eagerly by shop.stats"),
+            "{text}"
+        );
+        assert!(!text.contains("pandas._libs.missing"), "{text}");
+        assert!(
+            text.contains("1 more row with nothing to act on; --all lists them"),
+            "{text}"
+        );
+
+        let every = Filters {
+            all: true,
+            ..Filters::default()
+        };
+        let text = render(&document(&answered, None, &every).unwrap());
+        assert!(text.contains("pandas._libs.missing"), "{text}");
+        assert!(text.contains("extension module"), "{text}");
+        assert!(!text.contains("--all lists them"), "{text}");
+    }
+
+    #[test]
+    fn target_narrows_the_summary_and_keeps_the_whole_load_beside_it() {
+        let mut host = host();
+        host["by_target"] = json!({
+            "entrypoint": {"total_import_ms": 41.2, "modules_loaded": 3, "import_calls": 12},
+            "hooks": {"total_import_ms": 8.8, "modules_loaded": 6, "import_calls": 28}
+        });
+        let answered = pb::DebugResponse {
+            host_json: host.to_string(),
+            ..response(&[])
+        };
+        let filters = Filters {
+            target: Some("entrypoint".to_owned()),
+            ..Filters::default()
+        };
+
+        let text = render(&document(&answered, None, &filters).unwrap());
+        assert!(
+            text.contains("41.2 ms importing for entrypoint, of 50.0 ms, 3 modules loaded, 12 import calls; deferring what can be deferred in the whole load would save about 30.0 ms"),
+            "{text}"
+        );
+        assert!(!text.contains("preload_modules entry"), "{text}");
+    }
+
+    #[test]
+    fn a_deferral_used_as_its_importer_loads_has_a_row_whatever_its_depth() {
+        // Issue 789: numpy, deferred in openpyxl.compat.numbers and used
+        // as that module loaded, inside openpyxl's load.
+
+        let worker = json!({
+            "modules": {"loads": [
+                {"module": "openpyxl", "request": "R1", "ms": 40.0, "depth": 0,
+                 "deferred": true, "at_unix_ms": 1000},
+                {"module": "numpy", "request": "R1", "ms": 25.0, "depth": 2,
+                 "deferred": true, "at_unix_ms": 1000, "parent": "openpyxl.compat.numbers",
+                 "used_at_load": "openpyxl.compat.numbers", "used_at": "openpyxl/compat/numbers.py:16"}
+            ], "loaded": 2},
+            "report": null,
+        });
+        let found = document(&response(&[(0, worker)]), None, &Filters::default()).unwrap();
+        let modules = found["workers"]["modules"].as_array().unwrap();
+        let numpy = modules.iter().find(|row| row["module"] == "numpy").unwrap();
+
+        assert_eq!(
+            numpy["advice"],
+            "deferred in openpyxl.compat.numbers: used as openpyxl.compat.numbers loads, \
+             at openpyxl/compat/numbers.py:16; deferring it saves nothing, remove the entry"
+        );
     }
 
     #[test]
