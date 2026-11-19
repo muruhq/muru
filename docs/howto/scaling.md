@@ -213,8 +213,10 @@ rounded up.
 Each schedule is an [overlay](overlays.md) named `APP.NAME`, so `muructl
 overlay list` shows it with its next window, and `muructl overlay
 activate` and `end` start or stop it by hand. The events are
-`schedule.activated` and `schedule.expired`, and the floor's scale-outs
-are `scaling.decision` events. An `[overlay.NAME]` table sets the same
+`schedule.activated` and `schedule.expired`, with the warning
+`schedule.end_refused` when the edge refuses the configuration a
+schedule's end returns to, and the floor's scale-outs are
+`scaling.decision` events. An `[overlay.NAME]` table sets the same
 capacity on an application with `apps.NAME = { min_workers = 24,
 max_workers = 48 }`, beside its other changes.
 

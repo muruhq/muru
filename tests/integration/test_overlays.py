@@ -52,7 +52,7 @@ class Site:
         completed = self.daemon.muructl("overlay", *arguments, check=check)
         return completed.stdout + completed.stderr
 
-    def apply(self, overlays: str, check: bool = True, prune: bool = False) -> str:
+    def apply(self, overlays: str, check: bool = True, prune: bool = False, route: str = "") -> str:
         config = self.base / "site.toml"
         config.write_text(
             f"""[app.clients.release.r1]
@@ -76,6 +76,7 @@ host = 'site'
 path = '/'
 app = 'clients'
 """
+            + route
             + overlays
         )
         prune_flag = ["--prune"] if prune else []
@@ -310,6 +311,66 @@ def test_an_overlays_page_must_exist_and_a_refused_activation_does_not_stand(sit
     assert "skipped" in site.overlay("list")
     assert site.request().status == 200
     site.apply(OVERLAYS, prune=True)
+
+
+def test_a_refused_promotion_changes_nothing_and_a_refused_end_warns(site: Site) -> None:
+    # Issue 790: a pin with a page that goes once it is active. The edge
+    # refuses the promotion's snapshot, so the pinned release still
+    # serves by the overlay and the serving release stays as it was.
+
+    page = site.base / "pages" / "moved.html"
+    page.parent.mkdir(exist_ok=True)
+    page.write_text("<p>Moved</p>")
+    pin = "routes.root.traffic = { pin = 'r1' }\n"
+    moved = "routes.root.error_pages = { '503:maintenance' = { file = 'pages/moved.html' } }\n"
+    site.apply(OVERLAYS.replace(pin, pin + moved))
+    site.overlay("activate", "pinned")
+    assert eventually(lambda: site.seen()["release"] == "r1")
+
+    def switched() -> int:
+        return site.daemon.events().count("traffic.switched")
+
+    before = switched()
+    page.unlink()
+    refused = site.overlay("promote", "pinned", check=False)
+    assert "overlay pinned was not promoted: the edge refused the snapshot" in refused, refused
+    assert "active" in site.overlay("list").split("pinned", 1)[1].splitlines()[0]
+    assert {row["release"] for row in site.daemon.releases("clients") if row["serving"]} == {
+        "clients@r2"
+    }
+    assert site.state("r2") == "ready"
+    assert site.seen()["release"] == "r1"
+    events = site.daemon.muructl("events").stdout
+    assert not [
+        line for line in events.splitlines() if "overlay.promoted" in line and "pinned" in line
+    ]
+    assert switched() == before
+    site.overlay("end", "pinned")
+    assert eventually(lambda: site.seen()["release"] == "r2")
+
+    # A base page that goes while an overlay is active: its schedule's end
+    # restores a base the edge refuses, which nothing can put back, and
+    # a warning says so.
+
+    base = site.base / "pages" / "base.html"
+    base.write_text("<p>Base</p>")
+    route = "error_pages = { '503:maintenance' = { file = 'pages/base.html' } }\n"
+    window = f"""
+[overlay.window]
+routes.root = {{ mode = 'window' }}
+trigger = {{ schedule = {{ start = '{at(2)}', end = '{at(6)}' }} }}
+"""
+    site.apply(window, prune=True, route=route)
+    assert eventually(lambda: site.seen()["mode"] == "window")
+    base.unlink()
+    assert eventually(lambda: "overlay.end_refused" in site.daemon.events(), timeout=20)
+    events = site.daemon.muructl("events").stdout
+    warning = next(line for line in events.splitlines() if "overlay.end_refused" in line)
+    assert "window" in warning and "the edge refused the snapshot" in warning, warning
+    assert "nothing can be put back" in warning, warning
+    assert site.seen()["mode"] == "window"
+    site.apply(OVERLAYS, prune=True)
+    assert eventually(lambda: site.seen()["mode"] is None)
 
 
 def test_an_applications_mode_reaches_each_of_its_routes(site: Site) -> None:

@@ -705,6 +705,50 @@ pub struct OverlayOutcome {
     pub files: Vec<String>,
 }
 
+/// What following a condition did to its overlay (issue 689).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Followed {
+    /// Nothing changed.
+    Stayed,
+    /// The condition activated it.
+    Activated,
+    /// The condition ended it.
+    Ended,
+}
+
+/// Issue 790: what a promotion changed, to put back when the edge
+/// refuses the result.
+#[derive(Debug, Default)]
+struct PromotionUndo {
+    /// The overlay's state before.
+    state: Option<crate::model::OverlayState>,
+    /// Each application whose serving release it switched.
+    serving: Vec<PromotedSwitch>,
+    /// Each route it wrote, by host and key, as it was, or none for a
+    /// route it added.
+    routes: Vec<(String, String, Option<muru_config::Route>)>,
+    /// Each application's maintenance before, since when, in the store
+    /// and in memory.
+    maintenance: Vec<(String, Option<u64>, Option<u64>)>,
+}
+
+/// Issue 790: an application whose serving release a promotion switched,
+/// with what it replaced.
+#[derive(Debug)]
+struct PromotedSwitch {
+    app: String,
+    /// The release that serves now.
+    release: String,
+    /// The serving release in memory before.
+    serving: Option<String>,
+    /// Whether the release was held before.
+    held: bool,
+    /// The application's current and previous releases in the store
+    /// before.
+    current: Option<String>,
+    previous: Option<String>,
+}
+
 /// What a person asks of an overlay (section 9.10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayAction {
@@ -4190,6 +4234,11 @@ impl Daemon {
         let now = now_unix_ms();
         let mut changed = false;
 
+        // Issue 790: the overlays this pass ends, with the event kind and
+        // the reason, for a warning should the edge refuse the result.
+
+        let mut ended: Vec<(&'static str, String, String)> = Vec::new();
+
         for (name, overlay) in &overlays {
             let subject = format!("overlay {name}");
 
@@ -4214,13 +4263,14 @@ impl Daemon {
                         let _ = self.store.delete_overlay(name);
                     }
 
-                    let kind = if crate::overlays::is_schedule(name) {
-                        "schedule.expired"
+                    let (kind, refused) = if crate::overlays::is_schedule(name) {
+                        ("schedule.expired", "schedule.end_refused")
                     } else {
-                        "overlay.ended"
+                        ("overlay.ended", "overlay.end_refused")
                     };
                     self.events
                         .emit(kind, &subject, "notice", &format!("ended: {reason}"));
+                    ended.push((refused, subject, reason.to_string()));
                     changed = true;
                 }
                 crate::overlays::Step::Begin { until } => {
@@ -4314,7 +4364,7 @@ impl Daemon {
 
         for (name, overlay) in &overlays {
             if let Some(condition) = crate::overlays::condition(overlay) {
-                changed |= self
+                let followed = self
                     .follow_condition(
                         name,
                         overlay,
@@ -4324,6 +4374,16 @@ impl Daemon {
                         now,
                     )
                     .await;
+
+                if followed == Followed::Ended {
+                    ended.push((
+                        "overlay.end_refused",
+                        format!("overlay {name}"),
+                        format!("its condition {condition} resolved"),
+                    ));
+                }
+
+                changed |= followed != Followed::Stayed;
             }
         }
 
@@ -4372,6 +4432,22 @@ impl Daemon {
 
             if let Err(error) = self.push_snapshot().await {
                 tracing::error!(%error, "pushing the snapshot for an overlay failed");
+
+                // Issue 790: an end restores the base configuration, so
+                // there is nothing to put back when the edge refuses it.
+
+                for (kind, subject, reason) in &ended {
+                    self.events.emit(
+                        kind,
+                        subject,
+                        "warning",
+                        &format!(
+                            "ended: {reason}, but {error}; the edge keeps serving with the \
+                             overlay in force, and nothing can be put back, since what it \
+                             refused is the base configuration: correct that and apply it again"
+                        ),
+                    );
+                }
             }
         }
     }
@@ -4382,7 +4458,7 @@ impl Daemon {
     /// it is while it is unknown. An activation the cooldown after the
     /// last end, the cap on activations an hour or a precondition holds
     /// back is skipped, with one event while the condition keeps firing.
-    /// Gives whether the overlay changed.
+    /// Gives what changed.
     async fn follow_condition(
         &mut self,
         name: &str,
@@ -4391,7 +4467,7 @@ impl Daemon {
         status: Option<&crate::conditions::Status>,
         state: Option<&crate::model::OverlayState>,
         now: u64,
-    ) -> bool {
+    ) -> Followed {
         use crate::conditions::State;
 
         let subject = format!("overlay {name}");
@@ -4423,7 +4499,7 @@ impl Daemon {
         };
 
         match step {
-            crate::overlays::ConditionStep::Stay => false,
+            crate::overlays::ConditionStep::Stay => Followed::Stayed,
             crate::overlays::ConditionStep::Skip(why) => {
                 if self.condition_skips.insert(name.to_owned()) {
                     self.events.emit(
@@ -4434,7 +4510,7 @@ impl Daemon {
                     );
                 }
 
-                false
+                Followed::Stayed
             }
             crate::overlays::ConditionStep::End { held_until } => {
                 let held = held_until.map(|until| crate::model::OverlayState {
@@ -4451,7 +4527,7 @@ impl Daemon {
                     "notice",
                     &format!("ended: its condition {condition} resolved{figures}"),
                 );
-                true
+                Followed::Ended
             }
             crate::overlays::ConditionStep::Activate => {
                 let state = crate::model::OverlayState {
@@ -4487,7 +4563,7 @@ impl Daemon {
                             crate::overlays::describe_wait(wait.as_millis() as u64)
                         ),
                     );
-                    return false;
+                    return Followed::Stayed;
                 }
 
                 let _ = self.store.record_overlay_activation(name, now);
@@ -4497,7 +4573,7 @@ impl Daemon {
                     "notice",
                     &format!("activated: its condition {condition} is firing{figures}"),
                 );
-                true
+                Followed::Activated
             }
         }
     }
@@ -4789,8 +4865,9 @@ impl Daemon {
     /// as after a deploy, so later deploys replace it; the routes take
     /// the rest of what the overlay sets, and the applications its
     /// maintenance. A split is refused, being a route's traffic policy.
-    /// The outcome carries what the applied files must say for the next
-    /// apply to keep the promotion.
+    /// Issue 790: a promotion the edge refuses is put back whole and
+    /// refused with the edge's reason. The outcome carries what the
+    /// applied files must say for the next apply to keep the promotion.
     async fn promote_overlay(
         &mut self,
         name: &str,
@@ -4813,54 +4890,165 @@ impl Daemon {
             }
         }
 
+        // Issue 790: the edge has no way to check a snapshot without
+        // applying it, so every change is made, the result pushed once,
+        // and the changes put back when the edge refuses it. Nothing
+        // drains, and no event is raised, until it has taken it.
+
+        let mut undo = PromotionUndo::default();
+        let changed = self.promote_changes(name, overlay, &promotion, &mut undo);
+
+        let pushed = match changed {
+            Ok(()) => self.push_snapshot().await,
+            Err(error) => Err(error),
+        };
+
+        if let Err(error) = pushed {
+            self.undo_promotion(name, undo);
+
+            if let Err(again) = self.push_snapshot().await {
+                tracing::error!(error = %again, "pushing the snapshot without overlay {name}'s promotion failed");
+            }
+
+            return Err(refused(error));
+        }
+
+        // The edge serves the pinned releases now, so the releases that
+        // served before drain, unless something else still names them.
+
+        let mut message = "promoted: its changes are now the base configuration".to_owned();
+        let referenced = self.referenced_releases();
+
+        for switch in &undo.serving {
+            let subject = format!("{}@{}", switch.app, switch.release);
+            self.mark_ready(&switch.app, &switch.release, "");
+            self.events.emit(
+                "traffic.switched",
+                &subject,
+                "notice",
+                "traffic moved to the release",
+            );
+
+            match &switch.current {
+                Some(current) => message.push_str(&format!(
+                    "; {}@{} serves in place of {}@{current}, which is retained",
+                    switch.app, switch.release, switch.app
+                )),
+                None => message.push_str(&format!("; {subject} serves")),
+            }
+
+            if let Some(previous) = &switch.current
+                && !referenced.contains(&(switch.app.clone(), previous.clone()))
+            {
+                self.drain(&switch.app, previous, Retention::default())
+                    .await;
+            }
+        }
+
+        self.events.emit(
+            "overlay.promoted",
+            &format!("overlay {name}"),
+            "notice",
+            &message,
+        );
+        self.reconcile_traffic().await;
+        Ok(OverlayOutcome {
+            message,
+            files: crate::overlays::promotion_files(&promotion),
+        })
+    }
+
+    /// Issue 790: make a promotion's changes, recording in `undo` what
+    /// each replaced: the pinned releases serve, in memory and in the
+    /// store, the routes take what the overlay sets, the applications its
+    /// maintenance, and the overlay is recorded promoted. Nothing is
+    /// pushed to the edge.
+    fn promote_changes(
+        &mut self,
+        name: &str,
+        overlay: &muru_config::Overlay,
+        promotion: &crate::overlays::Promotion,
+        undo: &mut PromotionUndo,
+    ) -> Result<(), String> {
         let now = now_unix_ms();
 
-        // The switch first, while the pin still sends the traffic there,
-        // so the edge never sees the old release serve again.
-
-        let mut switched = Vec::new();
+        undo.state = self
+            .store
+            .overlay_states()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|state| state.name == name);
 
         for (app, release) in &promotion.serving {
-            let current = self
-                .store
-                .app(app)
-                .map_err(|error| error.to_string())?
-                .current;
+            let record = self.store.app(app).map_err(|error| error.to_string())?;
 
-            if current.as_deref() == Some(release.as_str()) {
+            if record.current.as_deref() == Some(release.as_str()) {
                 continue;
             }
 
-            self.promote_switch(app, release, Retention::default())
-                .await?;
-            switched.push(match current {
-                Some(current) => {
-                    format!("{app}@{release} serves in place of {app}@{current}, which is retained")
-                }
-                None => format!("{app}@{release} serves"),
+            let key = (app.clone(), release.clone());
+            let held = self.running.get(&key).is_some_and(|running| running.held);
+
+            undo.serving.push(PromotedSwitch {
+                app: app.clone(),
+                release: release.clone(),
+                serving: self.serving.get(app).cloned(),
+                held,
+                current: record.current.clone(),
+                previous: record.previous.clone(),
             });
+            self.serving.insert(app.clone(), release.clone());
+
+            if let Some(running) = self.running.get_mut(&key) {
+                running.held = false;
+            }
+
+            self.store
+                .set_app_releases(app, Some(release), record.current.as_deref())
+                .map_err(|error| error.to_string())?;
         }
 
+        let routes = self.store.routes().map_err(|error| error.to_string())?;
+
         for route in &promotion.routes {
+            let before = routes
+                .iter()
+                .find(|old| old.host == route.host && old.key() == route.key())
+                .cloned();
+            undo.routes.push((route.host.clone(), route.key(), before));
             self.store
                 .put_route(route)
                 .map_err(|error| error.to_string())?;
         }
 
-        for (app, change) in &overlay.apps {
-            if let Some(on) = change.maintenance {
-                let since = on.then_some(now);
-                self.store
-                    .set_maintenance(app, since)
-                    .map_err(|error| error.to_string())?;
+        let stored: HashMap<String, u64> = self
+            .store
+            .maintenance()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .collect();
 
-                match since {
-                    Some(since) => {
-                        self.maintenance.entry(app.clone()).or_insert(since);
-                    }
-                    None => {
-                        self.maintenance.remove(app);
-                    }
+        for (app, change) in &overlay.apps {
+            let Some(on) = change.maintenance else {
+                continue;
+            };
+
+            let since = on.then_some(now);
+            undo.maintenance.push((
+                app.clone(),
+                stored.get(app).copied(),
+                self.maintenance.get(app).copied(),
+            ));
+            self.store
+                .set_maintenance(app, since)
+                .map_err(|error| error.to_string())?;
+
+            match since {
+                Some(since) => {
+                    self.maintenance.entry(app.clone()).or_insert(since);
+                }
+                None => {
+                    self.maintenance.remove(app);
                 }
             }
         }
@@ -4874,26 +5062,55 @@ impl Daemon {
         };
         self.store
             .set_overlay_state(name, Some(&held))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())
+    }
 
-        let mut message = "promoted: its changes are now the base configuration".to_owned();
+    /// Issue 790: put back what a promotion the edge refused changed, as
+    /// `undo` recorded it, latest first.
+    fn undo_promotion(&mut self, name: &str, undo: PromotionUndo) {
+        let _ = self.store.set_overlay_state(name, undo.state.as_ref());
 
-        for line in &switched {
-            message.push_str(&format!("; {line}"));
+        for (app, stored, kept) in undo.maintenance.into_iter().rev() {
+            let _ = self.store.set_maintenance(&app, None);
+            let _ = self.store.set_maintenance(&app, stored);
+
+            match kept {
+                Some(since) => {
+                    self.maintenance.insert(app, since);
+                }
+                None => {
+                    self.maintenance.remove(&app);
+                }
+            }
         }
 
-        self.events.emit(
-            "overlay.promoted",
-            &format!("overlay {name}"),
-            "notice",
-            &message,
-        );
-        self.reconcile_traffic().await;
-        self.push_snapshot().await?;
-        Ok(OverlayOutcome {
-            message,
-            files: crate::overlays::promotion_files(&promotion),
-        })
+        for (host, key, before) in undo.routes.into_iter().rev() {
+            let _ = match before {
+                Some(route) => self.store.put_route(&route),
+                None => self.store.delete_route(&host, &key),
+            };
+        }
+
+        for switch in undo.serving.into_iter().rev() {
+            let _ = self.store.set_app_releases(
+                &switch.app,
+                switch.current.as_deref(),
+                switch.previous.as_deref(),
+            );
+
+            match switch.serving {
+                Some(serving) => {
+                    self.serving.insert(switch.app.clone(), serving);
+                }
+                None => {
+                    self.serving.remove(&switch.app);
+                }
+            }
+
+            if let Some(running) = self.running.get_mut(&(switch.app, switch.release)) {
+                running.held = switch.held;
+            }
+        }
     }
 
     /// Section 4.14: read the client classes' list files again when one

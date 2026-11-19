@@ -63,7 +63,18 @@ activated, and the overlay is not recorded as active: `muructl overlay
 activate` fails with the edge's reason, and an activation by schedule or
 condition is skipped with an `overlay.skipped` warning saying why. A
 condition that is still firing tries again once the overlay's cooldown,
-or a minute if that is shorter, has passed.
+or a minute if that is shorter, has passed. A promotion the edge refuses
+the same way changes nothing: the overlay stays active, the release
+that served before still does, and `muructl overlay promote` fails
+with the edge's reason.
+
+A file the base configuration names, such as a route's own error page,
+can go while an overlay is active. When the overlay then ends, by its
+schedule or its condition, the edge refuses the base configuration it
+returns to and keeps serving with the overlay in force. The overlay is
+recorded as ended, since there is nothing to put back, and an
+`overlay.end_refused` warning gives the edge's reason. Put the file back,
+or correct the configuration, and apply it again.
 
 An overlay can also give a client class a route of its own while it is
 active, such as sending crawlers to a static snapshot when they become a
@@ -401,4 +412,5 @@ shop@r42                 ready      yes      2 (2x4)             48.0MB /srv/sho
 
 Activations, ends, skips, advisory windows, warm-ups and promotions are
 the events `overlay.activated`, `overlay.ended`, `overlay.skipped`,
-`overlay.would_activate`, `overlay.warming` and `overlay.promoted`.
+`overlay.would_activate`, `overlay.warming` and `overlay.promoted`, and
+an end the edge refuses is the warning `overlay.end_refused`.
