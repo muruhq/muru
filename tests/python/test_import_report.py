@@ -160,12 +160,15 @@ def test_a_module_loaded_by_a_from_import_is_counted_and_advised_only_in_own_cod
 
 
 def test_an_import_under_the_check_names_its_statement_and_import_a_b_as_c_is_not_advised(
-    project: Path,
+    project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Issue 751: unwrapt finds the statement's own frame, so the entry
     # point's line is kept, and `import a.b as c`, which unwrapt cannot
-    # defer, is read from the statement and not advised as an entry.
+    # defer, is read from the statement and not advised as an entry. The
+    # rewrite such a form needs is advised from a time a slow runner can
+    # reach, so it is put out of reach (issue 798).
 
+    monkeypatch.setattr(_import_report, "REWRITE_MIN_MS", 1000.0)
     package = project / "shop_pkg"
     package.mkdir()
     (package / "__init__.py").write_text("")
