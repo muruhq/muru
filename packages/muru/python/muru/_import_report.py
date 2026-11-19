@@ -108,6 +108,9 @@ def analyse(
         for row in unwrapt_report.candidates(report, min_ms=CANDIDATE_MIN_MS, packages=None)
     ]
 
+    candidates.extend(_extension_rows(edges.values()))
+    candidates.sort(key=lambda row: (-row["cum_ms"], row["edge"]))
+
     for candidate in candidates:
         candidate["target"] = target(candidate["edge"])
 
@@ -119,6 +122,8 @@ def analyse(
         *_deferrals(candidates, edges, root, preloaded, workers),
         *(_used_before_fork(used) if outcome == "fork" else ()),
     ]
+
+    _mark_shown(candidates, edges, root, findings)
 
     return {
         "version": PAYLOAD_VERSION,
@@ -134,6 +139,88 @@ def analyse(
         "findings": findings,
         "targets": [dict(entry) for entry in targets],
     }
+
+
+def _extension_rows(edges: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    # The imports compiled extension modules made as they loaded, as
+    # rows of the table that nothing can defer (issue 784). unwrapt
+    # leaves them out of its candidates, having no statement to change,
+    # and they are shown only when every row is asked for.
+
+    return [
+        {
+            "edge": edge["id"],
+            "imported": edge["imported"],
+            "submodules": list(edge.get("submodules") or ()),
+            "importer": edge["importer"],
+            "cum_ms": edge["cum_ms"],
+            "self_ms": edge["self_ms"],
+            "native": False,
+            "unwrapt": False,
+            "reason": "extension-module",
+            "declared_lazy": False,
+            "already_lazy": False,
+            "used_at_load": False,
+            "shared": [],
+            "saving_ms": 0.0,
+        }
+        for edge in edges
+        if edge["defer"]["reason"] == "extension-module"
+        and edge["loaded"]
+        and edge["cum_ms"] >= CANDIDATE_MIN_MS
+    ]
+
+
+def _mark_shown(
+    candidates: list[dict[str, Any]],
+    edges: dict[int, dict[str, Any]],
+    root: str,
+    findings: list[dict[str, Any]],
+) -> None:
+    # Issue 784: the rows the table shows unless every row is asked for,
+    # those a reader can act on. That is an import the advice names, one
+    # whose deferral saves something, and one that would save but for
+    # another module importing the same module eagerly, which the table
+    # names. A row inside the load of one that saves, which deferring the
+    # outer one covers, and a row nothing can defer, are left out, except
+    # that a row the advice names is always shown.
+
+    advised = {(row["module"], row["importer"]) for row in findings}
+    saving = {candidate["edge"] for candidate in candidates if round(candidate["saving_ms"], 1) > 0}
+
+    for candidate in candidates:
+        listed = candidate["edge"] in saving or (
+            bool(candidate["shared"])
+            and not candidate["already_lazy"]
+            and not candidate["used_at_load"]
+            and (
+                candidate["unwrapt"]
+                or (candidate["native"] and _own(edges.get(candidate["edge"]), root))
+            )
+        )
+        candidate["shown"] = (candidate["imported"], candidate["importer"]) in advised or (
+            listed and not _inside(candidate["edge"], saving, edges)
+        )
+
+
+def _inside(edge_id: int, outer: set[int], edges: dict[int, dict[str, Any]]) -> bool:
+    # Whether an import call ran inside one of the outer ones. The walk is
+    # bounded, as the parents of a recorded tree always are.
+
+    edge = edges.get(edge_id)
+
+    for _ in range(len(edges)):
+        parent = edge.get("parent_id") if edge is not None else None
+
+        if parent is None:
+            return False
+
+        if parent in outer:
+            return True
+
+        edge = edges.get(parent)
+
+    return False
 
 
 def _application(importer: str | None) -> bool:

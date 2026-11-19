@@ -79,10 +79,15 @@ def test_the_import_report_reaches_debug_imports_and_muructl_check(tmp_path: Pat
         '[tool.muru]\nentrypoint = "report_app:page"\nimport_report = true\n'
     )
     server = support.start(None, chdir=tmp_path, workers=1, env={"MURU_RUN_DIR": str(runtime)})
+
+    # Every row, since report_pkg's from-import saves nothing unwrapt can
+    # count and is below the time a rewrite is advised at (issue 784).
+
     muructl = [
         str(support.muructl_path()),
         "debug",
         "imports",
+        "--all",
         "--json",
         "--socket",
         f"{runtime}/runs/{server.port}/admin.sock",

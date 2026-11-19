@@ -1256,6 +1256,12 @@ pub struct ImportsArgs {
     /// in place of the tables.
     #[arg(long, value_name = "NAME")]
     module: Option<String>,
+
+    /// Every row of the imports table, with those nothing can be done
+    /// about: imports inside a listed import's load, and those no way of
+    /// deferring can defer, such as an extension module's.
+    #[arg(long)]
+    all: bool,
 }
 
 impl ImportsArgs {
@@ -1267,6 +1273,7 @@ impl ImportsArgs {
             min_ms: self.min_ms,
             packages: self.package.clone(),
             module: self.module.clone(),
+            all: self.all,
         }
     }
 }

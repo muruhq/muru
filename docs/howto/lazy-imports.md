@@ -223,12 +223,24 @@ Imports that loaded a module, by cumulative time
   CUM MS SAVES MS IMPORTED      IMPORTED BY     LOADING    3.15 UNWRAPT NOTES
    140.2    140.2 shop.reports  shop.views      entrypoint yes  yes
     96.4     96.4 openpyxl      shop.reports    entrypoint yes  yes
-...
+    24.1      0.0 pandas        shop.charts     entrypoint yes  yes     also imported eagerly by shop.stats
+  183 more rows with nothing to act on; --all lists them
 ```
 
 - **The summary** is unwrapt's: the time the load spent importing, the
   modules it loaded, and a conservative estimate of what deferring every
   import that can be deferred would save.
+
+- **The table** lists the imports there is something to do about: each
+  one whose deferral would save time, and each one that would save but
+  for another module importing the same module eagerly, which NOTES
+  names as `also imported eagerly by shop.stats`. An import made inside
+  the load of a listed one is covered by deferring that one and is left
+  out, unless the advice names it, and so is an import nothing can
+  defer. A line below the table counts the rows left out, and `--all`
+  lists them. Among them are the imports a compiled extension module
+  makes as it loads, such as those between pandas' own extensions,
+  noted `extension module`: they have no statement to change.
 
 - **The advice** names the imports deferring which saves the most, each
   with who pays for the module and the configuration to write. An import
@@ -277,6 +289,7 @@ The options narrow it:
 | `--min-ms MS` | Rows that took at least MS milliseconds |
 | `--package NAME` | Modules and importers under a top-level package; repeatable |
 | `--module NAME` | The chain of imports that brought one module in, outermost first, with the best place to cut it |
+| `--all` | Every row of the imports table, those with nothing to act on too |
 | `--worker N` | A worker's own report, when it loaded the application itself, with `preload = false` or after the fallback to per-worker imports |
 | `--json` | The same as JSON |
 

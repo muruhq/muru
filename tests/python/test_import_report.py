@@ -10,6 +10,7 @@ import json
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -237,3 +238,94 @@ def test_a_worker_reports_its_own_load_and_the_modules_it_loaded_since(project: 
     loads = {load["module"]: load for load in answer["modules"]["loads"]}
     assert loads["json.tool"]["request"] == "R7"
     assert loads["json.tool"]["deferred"] is False
+
+
+def edge(id: int, importer: str, imported: str, cum_ms: float, **fields: Any) -> dict[str, Any]:
+    """One edge of a schema 4 unwrapt report: a module-level import that loaded its module."""
+
+    record: dict[str, Any] = {
+        "id": id,
+        "parent_id": None,
+        "importer": importer,
+        "imported": imported,
+        "written": imported,
+        "submodules": [],
+        "file": None,
+        "line": None,
+        "kind": "import",
+        "level": "module",
+        "relative": False,
+        "loaded": True,
+        "count": 1,
+        "cum_ms": cum_ms,
+        "self_ms": cum_ms,
+        "self_modules": 1,
+        "defer": {"native": True, "unwrapt": True, "reason": None},
+        "declared_lazy": False,
+        "already_lazy": False,
+        "native_lazy": False,
+        "deferred": False,
+        "resolution": None,
+        "resolves": None,
+        "used_in": None,
+        "labels": 0,
+    }
+    record.update(fields)
+    return record
+
+
+def report(*edges: dict[str, Any]) -> Any:
+    """An unwrapt report of the edges given."""
+
+    return unwrapt.report.Report.from_dict(
+        {
+            "schema": 4,
+            "unwrapt": unwrapt.__version__,
+            "python": "3.14.0",
+            "labels": {},
+            "label_sets": [{}],
+            "filters": {"min_ms": 0.0, "packages": None, "rows": 20},
+            "edges": list(edges),
+        }
+    )
+
+
+def test_the_table_marks_the_rows_to_act_on_and_keeps_extension_modules_imports_apart() -> None:
+    # Issue 784: a row that saves is shown, and one inside its load is not
+    # unless the advice names it; a row whose saving another module's
+    # eager import takes is shown; an extension module's import is a row
+    # nothing can defer, never shown by default nor advised.
+
+    payload = _import_report.analyse(
+        report(
+            edge(1, "shop_app", "heavy", 20.0),
+            edge(2, "heavy", "heavy_part", 10.0, parent_id=1),
+            edge(6, "heavy", "heavy_bit", 0.8, parent_id=1),
+            edge(3, "shop_app", "pandas", 30.0),
+            edge(
+                4,
+                "pandas",
+                "pandas._libs.missing",
+                5.0,
+                parent_id=3,
+                defer={"native": False, "unwrapt": False, "reason": "extension-module"},
+            ),
+            edge(5, "shop_stats", "pandas", 0.1, loaded=False, self_modules=0),
+        ),
+        outcome=_instrumentation.FORK,
+        workers=2,
+    )
+
+    rows = {row["imported"]: row for row in payload["candidates"]}
+    assert {name: row["shown"] for name, row in rows.items()} == {
+        "heavy": True,
+        "heavy_part": True,
+        "heavy_bit": False,
+        "pandas": True,
+        "pandas._libs.missing": False,
+    }
+    assert rows["pandas"]["shared"] == ["shop_stats"] and rows["pandas"]["saving_ms"] == 0.0
+    assert rows["pandas._libs.missing"]["reason"] == "extension-module"
+    assert {row["module"] for row in payload["findings"]} == {"heavy", "heavy_part"}
+    assert payload["summary"]["modules_loaded"] == 5
+    assert payload["summary"]["packages_loaded"] == 4

@@ -912,6 +912,7 @@ fn specs() -> Vec<Spec> {
                 "min_ms": {"type": "number", "description": "Only rows that took at least this many milliseconds"},
                 "package": {"type": "string", "description": "Only modules and importers under this top-level package"},
                 "module": {"type": "string", "description": "The chain of imports that brought this module in"},
+                "all": {"type": "boolean", "description": "Every row of the imports table, not only those there is something to do about"},
             }),
             required: &[],
             command: |arguments| {
@@ -921,6 +922,10 @@ fn specs() -> Vec<Spec> {
                 command.extend(option(arguments, "load_target", "--target"));
                 command.extend(option(arguments, "package", "--package"));
                 command.extend(option(arguments, "module", "--module"));
+
+                if flag(arguments, "all") {
+                    command.push("--all".to_owned());
+                }
 
                 if let Some(top) = arguments.get("top").and_then(Value::as_u64) {
                     command.extend(["--top".to_owned(), top.to_string()]);

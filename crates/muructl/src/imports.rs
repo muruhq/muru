@@ -31,6 +31,8 @@ pub struct Filters {
     /// The chain of imports that brought this module in, in place of the
     /// tables.
     pub module: Option<String>,
+    /// Every row of the imports table, not only those a reader can act on.
+    pub all: bool,
 }
 
 /// The rows each table keeps unless `--top` says otherwise.
@@ -163,13 +165,35 @@ fn analysis(report: &Value, filters: &Filters) -> Value {
     // A deferred import never used has no time, so only the packages
     // apply to it.
 
+    // Issue 784: the imports table keeps the rows the analysis marked as
+    // ones to act on, unless every row is asked for, and says how many it
+    // left out.
+
+    let kept: Vec<&Value> = report["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| filters.keeps(row, "cum_ms"))
+        .collect();
+    let shown: Vec<Value> = kept
+        .iter()
+        .filter(|row| filters.all || row["shown"].as_bool() != Some(false))
+        .take(top)
+        .map(|row| (*row).clone())
+        .collect();
+    let hidden = kept
+        .iter()
+        .filter(|row| !filters.all && row["shown"].as_bool() == Some(false))
+        .count();
+
     let mut found = json!({
         "labels": report["labels"],
         "workers": report["workers"],
         "summary": report["summary"],
         "findings": rows("findings", "ms"),
         "targets": report["targets"],
-        "candidates": rows("candidates", "cum_ms"),
+        "candidates": shown,
+        "candidates_hidden": hidden,
         "deferred_used": rows("deferred_used", "load_ms"),
         "deferred_unused": Value::Array(
             report["deferred_unused"]
@@ -763,6 +787,16 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
         );
     }
 
+    let hidden = report["candidates_hidden"].as_u64().unwrap_or(0);
+
+    if hidden > 0 {
+        let rows = if hidden == 1 { "row" } else { "rows" };
+        let _ = writeln!(
+            out,
+            "  {hidden} more {rows} with nothing to act on; --all lists them"
+        );
+    }
+
     if let Some(used) = report["deferred_used"]
         .as_array()
         .filter(|rows| !rows.is_empty())
@@ -805,21 +839,47 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
     }
 }
 
-/// What a row of the imports table notes: an import already deferred,
-/// and one made while the host loaded one of the `preload_modules`,
-/// which is not advised to be deferred (issue 785).
+/// What a row of the imports table notes: an import already deferred;
+/// one made while the host loaded one of the `preload_modules`, which is
+/// not advised to be deferred (issue 785); one an extension module made
+/// as it loaded, which nothing can defer; and the other modules that
+/// import the same module eagerly, which keep its saving at nothing
+/// (issue 784).
 fn notes(row: &Value) -> String {
     let mut notes = Vec::new();
 
     if row["already_lazy"].as_bool() == Some(true) {
-        notes.push("already lazy");
+        notes.push("already lazy".to_owned());
+    }
+
+    if row["reason"].as_str() == Some("extension-module") {
+        notes.push("extension module".to_owned());
     }
 
     if row["target"]
         .as_str()
         .is_some_and(|target| target.starts_with("module:"))
     {
-        notes.push("preload_modules");
+        notes.push("preload_modules".to_owned());
+    }
+
+    let shared: Vec<&str> = row["shared"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+
+    if !shared.is_empty() && format!("{:.1}", row["saving_ms"].as_f64().unwrap_or(0.0)) == "0.0" {
+        let more = match shared.len() {
+            0..=3 => String::new(),
+            count => format!(" and {} more", count - 3),
+        };
+
+        notes.push(format!(
+            "also imported eagerly by {}{more}",
+            shared[..shared.len().min(3)].join(", ")
+        ));
     }
 
     notes.join(", ")
@@ -1237,6 +1297,48 @@ mod tests {
             text.contains("The counts cover the requests served so far"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn the_imports_table_shows_what_can_be_acted_on_unless_all_is_asked() {
+        // Issue 784: a row whose saving another module's eager import
+        // takes names that module, and an extension module's import is
+        // left out unless every row is asked for.
+
+        let mut host = host();
+        host["candidates"] = json!([
+            {"edge": 2, "imported": "pandas", "importer": "shop.reports", "target": "entrypoint",
+             "cum_ms": 90.0, "saving_ms": 0.0, "native": true, "unwrapt": true, "already_lazy": false,
+             "shared": ["shop.stats"], "shown": true},
+            {"edge": 3, "imported": "pandas._libs.missing", "importer": "pandas._libs.hashtable",
+             "target": "entrypoint", "cum_ms": 18.5, "saving_ms": 0.0, "native": false,
+             "unwrapt": false, "reason": "extension-module", "already_lazy": false, "shared": [],
+             "shown": false}
+        ]);
+        let answered = pb::DebugResponse {
+            host_json: host.to_string(),
+            ..response(&[])
+        };
+
+        let text = render(&document(&answered, None, &Filters::default()).unwrap());
+        assert!(
+            text.contains("also imported eagerly by shop.stats"),
+            "{text}"
+        );
+        assert!(!text.contains("pandas._libs.missing"), "{text}");
+        assert!(
+            text.contains("1 more row with nothing to act on; --all lists them"),
+            "{text}"
+        );
+
+        let every = Filters {
+            all: true,
+            ..Filters::default()
+        };
+        let text = render(&document(&answered, None, &every).unwrap());
+        assert!(text.contains("pandas._libs.missing"), "{text}");
+        assert!(text.contains("extension module"), "{text}");
+        assert!(!text.contains("--all lists them"), "{text}");
     }
 
     #[test]
