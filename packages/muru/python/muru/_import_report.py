@@ -24,7 +24,9 @@ unwrapt configuration:
   any of them, by an instrumentation module, ``on_load`` or ``pre_fork``.
 
 - **Deferrals that gain nothing.** A deferred import used before the
-  fork was loaded in the host anyway.
+  fork was loaded in the host anyway, and one its importer uses as it
+  loads, which unwrapt finds, saves nothing wherever it loads, so it is
+  never advised.
 
 - **The preload_modules.** The project lists a module there to have it
   loaded before the fork, so nothing loaded for an entry is advised to
@@ -138,7 +140,7 @@ def analyse(
         "labels": dict(report.labels),
         "workers": workers,
         "report": data,
-        "summary": unwrapt_report.summary(report),
+        "summary": unwrapt_report.summary(report, min_ms=CANDIDATE_MIN_MS, packages=None),
         "candidates": candidates,
         "chains": unwrapt_report.chains(report),
         "heavy": unwrapt_report.heavy_modules(report),
@@ -402,9 +404,13 @@ def _deferrals(
     chosen: list[tuple[float, dict[str, Any]]] = []
 
     for candidate in candidates:
+        # An import its importer uses as it loads saves nothing deferred
+        # (issue 789).
+
         if (
             not _application(candidate["importer"])
             or candidate["already_lazy"]
+            or candidate["used_at_load"]
             or _preloaded(candidate["target"])
         ):
             continue
@@ -478,6 +484,15 @@ def _fork_safety(
                 f"it is loaded before the fork for preload_modules; {finding.advice}",
                 "",
             )
+        elif candidate and candidate.get("used_at_load"):
+            # Issue 789: deferring an import its importer uses as it
+            # loads moves nothing after the fork.
+
+            advice, config = (
+                f"{importer} uses it as it loads, so deferring it there saves nothing; "
+                f"{finding.advice}",
+                "",
+            )
         elif candidate and candidate.get("declared_lazy"):
             advice, config = _declared(candidate, settings)
         elif importer:
@@ -513,6 +528,19 @@ def _used_before_fork(used: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for deferral in used:
         where = deferral["used_in"] or "the load"
         line = f" line {deferral['line']}" if deferral["line"] else ""
+        advice = (
+            f"already deferred in {deferral['importer']} but used before the fork, "
+            "so deferring it gains nothing; stop deferring it, or defer what uses it"
+        )
+
+        # One used while its importer was still loading saves nothing
+        # wherever the importer loads (issue 789).
+
+        if deferral.get("used_at_load"):
+            advice = (
+                f"deferred in {deferral['importer']} but used as {deferral['importer']} loads, "
+                "so deferring it saves nothing; remove the entry"
+            )
 
         findings.append(
             {
@@ -523,10 +551,7 @@ def _used_before_fork(used: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "ms": deferral["load_ms"],
                 "saving_ms": 0.0,
                 "pays": f"the host, before the fork: {where}{line} used it",
-                "advice": (
-                    f"already deferred in {deferral['importer']} but used before the fork, "
-                    "so deferring it gains nothing; stop deferring it, or defer what uses it"
-                ),
+                "advice": advice,
                 "config": "",
             }
         )

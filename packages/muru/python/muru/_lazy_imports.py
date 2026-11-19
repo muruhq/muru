@@ -347,7 +347,8 @@ def _resolved(resolution: Any) -> None:
     # loaded it first.
 
     if resolution.loaded:
-        _imports.mark_deferred(resolution.module)
+        used_at = f"{resolution.file}:{resolution.line}" if resolution.file else ""
+        _imports.mark_deferred(resolution.module, resolution.importer, used_at)
 
 
 def _key() -> str:

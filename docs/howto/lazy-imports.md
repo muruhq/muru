@@ -255,6 +255,15 @@ Imports that loaded a module, by cumulative time
   the fork, in the worker that uses it. A deferred import the load used
   anyway is named too, since deferring it gains nothing.
 
+- **An import used as its module loads** is never advised: when the
+  importing module's own code uses the name at module level, in a class
+  body, a decorator or a default argument, a deferred import resolves
+  before that module has finished loading, and deferring it saves
+  nothing. Its row says `used at load, deferring saves nothing`, and
+  `--all` lists it. A deferral already in place that the load used this
+  way is noted the same in "Deferred but used during the load", and the
+  advice is to remove the entry.
+
 - **An import declared deferred that loaded eagerly**, one a module's
   `__lazy_modules__` or unwrapt's `lazy_modules` names in a load with
   `lazy_imports` off, keeps its cost and its saving, is noted `declared
@@ -326,7 +335,11 @@ workers that answered, the first request that loaded it and its time, with
 deferred modules marked. A module every worker loads is better loaded
 before the fork, and one only some of them load pays off loaded on first
 use. A module loaded only inside another's load comes with it and is not
-listed.
+listed, unless it was deferred and its use came as the module deferring
+it loaded: that deferral saved nothing, and its row says where, as
+`deferred in openpyxl.compat.numbers: used as openpyxl.compat.numbers
+loads, at openpyxl/compat/numbers.py:16; deferring it saves nothing,
+remove the entry`.
 
 Each import the host's load deferred is listed whatever its depth, with
 how many of the workers have loaded it so far, which settles whether the

@@ -240,6 +240,24 @@ def test_nothing_a_preload_modules_entry_loads_is_advised_and_its_cost_is_kept(
     assert costs["module:shop_reports"] >= 5.0 + 3.0
 
 
+def test_an_import_its_importer_uses_as_it_loads_is_not_advised(project: Path) -> None:
+    # Issue 789: unwrapt reads shop_views' source, which uses shop_slow at
+    # module level, so deferring it saves nothing and is not advised.
+
+    (project / "shop_views.py").write_text(
+        "import vendored\nimport shop_slow\n\nT = shop_slow.time\n"
+    )
+    _lazy_imports.configure({"defer": False, "report": True, "workers": 2})
+    load(Context(), _instrumentation.FORK)
+    payload = _lazy_imports.payload()
+
+    assert payload is not None
+    row = next(row for row in payload["candidates"] if row["imported"] == "shop_slow")
+    assert row["used_at_load"] and row["saving_ms"] == 0.0
+    advised = {row["module"] for row in payload["findings"]}
+    assert "shop_slow" not in advised and "vendored_part" in advised
+
+
 def test_a_deferral_used_before_the_fork_gains_nothing(project: Path) -> None:
     (project / "unwrapt.toml").write_text('[lazy_modules]\n"shop_views" = ["vendored"]\n')
     (project / "shop_app.py").write_text("import shop_views\nshop_views.vendored.__name__\n")

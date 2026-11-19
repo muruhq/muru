@@ -330,6 +330,7 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
         ms: Vec<f64>,
         deferred: bool,
         depth: u64,
+        used_at_load: Option<(String, String)>,
     }
 
     let mut modules: BTreeMap<String, Seen> = BTreeMap::new();
@@ -373,6 +374,13 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
             seen.ms.push(load["ms"].as_f64().unwrap_or(0.0));
             seen.deferred |= load["deferred"].as_bool().unwrap_or(false);
             seen.depth = seen.depth.min(load["depth"].as_u64().unwrap_or(0));
+
+            if let Some(importer) = load["used_at_load"].as_str() {
+                seen.used_at_load = Some((
+                    importer.to_owned(),
+                    load["used_at"].as_str().unwrap_or_default().to_owned(),
+                ));
+            }
         }
     }
 
@@ -400,10 +408,14 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
             let ms = seen.ms.iter().copied().fold(0.0, f64::max);
 
             // A module loaded only inside another's load comes with it,
-            // unless the host deferred it, and Muru's own modules are not
-            // the application's to move.
+            // unless the host deferred it or its deferral saved nothing,
+            // used as the module deferring it loaded (issue 789), and
+            // Muru's own modules are not the application's to move.
 
-            (seen.depth == 0 || filters.module.is_some() || host_deferred.contains_key(module))
+            (seen.depth == 0
+                || filters.module.is_some()
+                || host_deferred.contains_key(module)
+                || seen.used_at_load.is_some())
                 && !module.starts_with("muru.")
                 && filters.under(module)
                 && ms >= filters.min_ms
@@ -417,7 +429,17 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
             let (at, request, worker) = seen.first.unwrap_or_default();
             let listed = public_module(&module, &worker, &parents);
 
-            let advice = if host_deferred.contains_key(&module) {
+            let advice = if let Some((importer, at)) = &seen.used_at_load {
+                let at = if at.is_empty() {
+                    String::new()
+                } else {
+                    format!(", at {at}")
+                };
+
+                format!(
+                    "deferred in {importer}: used as {importer} loads{at}; deferring it saves nothing, remove the entry"
+                )
+            } else if host_deferred.contains_key(&module) {
                 deferral_advice(seen.workers.len(), asked, &module, listed.as_deref())
             } else {
                 worker_advice(
@@ -439,6 +461,7 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
                 "ms": ms,
                 "outermost": seen.depth == 0,
                 "deferred": seen.deferred,
+                "used_at_load": seen.used_at_load.as_ref().map(|(importer, _)| importer),
                 "advice": advice,
             })
         })
@@ -860,15 +883,27 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
                     row["line"]
                         .as_u64()
                         .map_or("-".to_owned(), |line| line.to_string()),
+                    if row["used_at_load"].as_bool() == Some(true) {
+                        "used at load, deferring saves nothing".to_owned()
+                    } else {
+                        String::new()
+                    },
                 ]
             })
             .collect();
 
         table(
             out,
-            &["LOAD MS", "MODULE", "DEFERRED IN", "USED IN", "LINE"],
+            &[
+                "LOAD MS",
+                "MODULE",
+                "DEFERRED IN",
+                "USED IN",
+                "LINE",
+                "NOTES",
+            ],
             &rows,
-            &[true, false, false, false, true],
+            &[true, false, false, false, true, false],
         );
     }
 
@@ -891,8 +926,9 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
 /// not advised to be deferred (issue 785); one an extension module made
 /// as it loaded, which nothing can defer; and the other modules that
 /// import the same module eagerly, which keep its saving at nothing
-/// (issue 784); and one declared deferred that loaded eagerly (issue
-/// 786).
+/// (issue 784); one declared deferred that loaded eagerly (issue 786);
+/// and one its importer uses as it loads, which deferring cannot help
+/// (issue 789).
 fn notes(row: &Value) -> String {
     let mut notes = Vec::new();
 
@@ -904,6 +940,10 @@ fn notes(row: &Value) -> String {
 
     if row["reason"].as_str() == Some("extension-module") {
         notes.push("extension module".to_owned());
+    }
+
+    if row["used_at_load"].as_bool() == Some(true) {
+        notes.push("used at load, deferring saves nothing".to_owned());
     }
 
     if row["target"]
@@ -1413,6 +1453,32 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("preload_modules entry"), "{text}");
+    }
+
+    #[test]
+    fn a_deferral_used_as_its_importer_loads_has_a_row_whatever_its_depth() {
+        // Issue 789: numpy, deferred in openpyxl.compat.numbers and used
+        // as that module loaded, inside openpyxl's load.
+
+        let worker = json!({
+            "modules": {"loads": [
+                {"module": "openpyxl", "request": "R1", "ms": 40.0, "depth": 0,
+                 "deferred": true, "at_unix_ms": 1000},
+                {"module": "numpy", "request": "R1", "ms": 25.0, "depth": 2,
+                 "deferred": true, "at_unix_ms": 1000, "parent": "openpyxl.compat.numbers",
+                 "used_at_load": "openpyxl.compat.numbers", "used_at": "openpyxl/compat/numbers.py:16"}
+            ], "loaded": 2},
+            "report": null,
+        });
+        let found = document(&response(&[(0, worker)]), None, &Filters::default()).unwrap();
+        let modules = found["workers"]["modules"].as_array().unwrap();
+        let numpy = modules.iter().find(|row| row["module"] == "numpy").unwrap();
+
+        assert_eq!(
+            numpy["advice"],
+            "deferred in openpyxl.compat.numbers: used as openpyxl.compat.numbers loads, \
+             at openpyxl/compat/numbers.py:16; deferring it saves nothing, remove the entry"
+        );
     }
 
     #[test]

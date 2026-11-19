@@ -108,6 +108,27 @@ def test_a_deferred_module_a_request_loads_is_marked_in_its_record(project: Path
     assert marked["json.tool"][1] is False
 
 
+def test_a_deferral_used_as_its_importer_loads_in_a_worker_names_both(project: Path) -> None:
+    # Issue 789: the importer is first loaded after the fork and uses the
+    # deferred import at module level, so the deferral saved nothing; the
+    # worker's load of it says so, with the line, whatever its nesting.
+
+    (project / "importer.py").write_text("import heavy\n\nCOPY = heavy.VALUE\n")
+    _lazy_imports.load_started(Context())
+    _lazy_imports.load_finished(Context(), _instrumentation.FORK)
+    _imports.install()
+    _lazy_imports.worker_started(Context(worker_id=0))
+
+    import importer
+
+    assert importer.COPY == 42
+    loads = {load["module"]: load for load in _imports.worker_loads()["loads"]}
+    assert loads["heavy"]["deferred"] is True
+    assert loads["heavy"]["used_at_load"] == "importer"
+    assert loads["heavy"]["used_at"] == "importer.py:3"
+    assert "used_at_load" not in loads["importer"]
+
+
 def test_a_configuration_unwrapt_cannot_use_is_an_error_with_the_reason(project: Path) -> None:
     (project / "unwrapt.toml").write_text("lazy_modules = 3\n")
 

@@ -125,9 +125,10 @@ _counting = threading.Lock()
 # Each module this worker has loaded since the finder went in, for the
 # import report's section on the workers (issue 741): the module, the
 # request it ran under, its milliseconds, its depth, whether it resolved
-# a deferred import, when it ended, and the load it was nested in
-# (issue 763), the first WORKER_LOADS_KEPT to
-# start; one still under way has no end yet.
+# a deferred import, when it ended, the load it was nested in (issue
+# 763), and for a deferred import used while the module deferring it was
+# still loading, that module and the line that used it (issue 789), the
+# first WORKER_LOADS_KEPT to start; one still under way has no end yet.
 
 _worker: dict[str, list[Any]] = {}
 
@@ -293,9 +294,12 @@ def worker_loads() -> dict[str, Any]:
     Each is its module, the request it ran under (empty outside one),
     its milliseconds, its depth beneath other loads, whether it resolved
     a deferred import, when it ended in Unix milliseconds, and the load it
-    was nested in (empty for an outermost one), the first
-    ``WORKER_LOADS_KEPT`` to start, leaving out one still under way; with
-    how many loads there were in all.
+    was nested in (empty for an outermost one); and for a deferred import
+    used while the module deferring it was still loading, which saves
+    nothing, that module as ``used_at_load`` and the line that used it as
+    ``used_at``. The first ``WORKER_LOADS_KEPT`` to start are given,
+    leaving out one still under way, with how many loads there were in
+    all.
     """
 
     with _counting:
@@ -308,8 +312,9 @@ def worker_loads() -> dict[str, Any]:
                 "deferred": deferred,
                 "at_unix_ms": at,
                 "parent": parent,
+                **({"used_at_load": at_load[0], "used_at": at_load[1]} if at_load else {}),
             }
-            for module, (request, ms, depth, deferred, at, parent) in _worker.items()
+            for module, (request, ms, depth, deferred, at, parent, at_load) in _worker.items()
             if at
         ]
         count = _counts[0]
@@ -317,18 +322,26 @@ def worker_loads() -> dict[str, Any]:
     return {"loads": loads, "loaded": count}
 
 
-def mark_deferred(module: str) -> None:
+def mark_deferred(module: str, importer: str | None = None, used_at: str = "") -> None:
     """Mark the current request's load of `module` as the resolution of a deferred import.
 
     Called once the module is imported, in the thread whose use of the
     deferred import loaded it, so the load is in the record already.
+    `importer` is the module that deferred it and `used_at` the file and
+    line of the use: when that module is still loading in this thread, the
+    use came as it loaded, and deferring the import saved nothing (issue
+    789).
     """
+
+    loading: list[str] = getattr(_local, "loading", None) or []
+    at_load = (importer, _short(used_at)) if importer and importer in loading else None
 
     with _counting:
         load = _worker.get(module)
 
         if load is not None:
             load[3] = True
+            load[6] = at_load
 
     current = request_id()
     kept = _requests.get(current) if current is not None else None
@@ -548,7 +561,7 @@ class _Timed:
             if len(_worker) < WORKER_LOADS_KEPT and name not in _worker:
                 loading = getattr(_local, "loading", None)
                 parent = loading[-1] if loading else ""
-                entry = [current or "", 0.0, depth, False, 0, parent]
+                entry = [current or "", 0.0, depth, False, 0, parent, None]
                 self._worker_entry = _worker[name] = entry
 
         kept = self._kept
