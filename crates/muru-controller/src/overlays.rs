@@ -162,6 +162,10 @@ pub enum ConditionStep {
     },
 }
 
+/// Why a promoted overlay is not activated again, by its condition or
+/// otherwise, until an apply changes it (issue 776).
+pub const PROMOTED: &str = "it was promoted, and its changes are already the base configuration";
+
 /// What an overlay following its condition should do at `now`: active
 /// while the condition fires, ended once it resolves after `min_active`,
 /// held as it is while the condition is unknown. Only an activation by the
@@ -196,10 +200,14 @@ pub fn condition_step(
                 held_until: (cooldown > 0).then_some(now + cooldown),
             }
         }
+        Some(held) if condition == Some(State::Firing) && held.source == "promoted" => {
+            ConditionStep::Skip(PROMOTED.to_owned())
+        }
         Some(held) if condition == Some(State::Firing) => {
             let why = match held.source.as_str() {
                 "cooldown" => "its cooldown after it last ended",
                 "ended" => "it was ended by hand, and its cooldown",
+                "skipped" => "the wait after the edge refused its activation",
                 _ => "its hold",
             };
 
@@ -250,6 +258,30 @@ pub fn describe_wait(millis: u64) -> String {
         (0, minutes) => format!("{minutes}m"),
         (hours, 0) => format!("{hours}h"),
         (hours, minutes) => format!("{hours}h{minutes}m"),
+    }
+}
+
+/// How long the daemon may take to see that a warm-up's lead has begun:
+/// it looks every second, and a busy loop looks a moment later.
+const WARM_UP_SLACK_MS: u64 = 5_000;
+
+/// The time until an overlay's window, `starts` milliseconds away, as its
+/// warm-up says it: the `lead` as the overlay declares it when the
+/// warm-up began as the lead did, since the daemon sees that a moment
+/// late, and the wait itself when it began later, after an apply or a
+/// restart within the lead (issue 756).
+pub fn warming_wait(overlay: &Overlay, starts: u64) -> String {
+    let lead = overlay.warm_up.as_ref().and_then(|warm_up| {
+        muru_config::parse_duration(&warm_up.lead)
+            .ok()
+            .map(|parsed| (warm_up.lead.as_str(), parsed.as_millis() as u64))
+    });
+
+    match lead {
+        Some((written, lead)) if starts <= lead && lead - starts <= WARM_UP_SLACK_MS => {
+            written.to_owned()
+        }
+        _ => describe_wait(starts),
     }
 }
 
@@ -363,8 +395,9 @@ pub fn step(overlay: &Overlay, state: Option<&OverlayState>, now: u64) -> Step {
 /// so that the overlay is judged again at its next window. A skip and
 /// an advisory window's record go with any change, since the change may
 /// be the fix; an end by hand within the window goes only with a new
-/// trigger, whose window is not the one it was ended in. An active
-/// overlay, a promoted one and a condition's cooldown are kept.
+/// trigger, whose window is not the one it was ended in. A promotion goes
+/// with any change too, which makes the overlay a new one (issue 776).
+/// An active overlay and a condition's cooldown are kept.
 pub fn cleared_by_change(
     before: &Overlay,
     after: &Overlay,
@@ -379,6 +412,7 @@ pub fn cleared_by_change(
     match state.source.as_str() {
         "skipped" => Some("its skip is cleared"),
         "advised" => Some("its advisory window is cleared"),
+        "promoted" => Some("its promotion is cleared, so it is a new overlay"),
         "ended" if before.trigger != after.trigger => Some("its end by hand is cleared"),
         _ => None,
     }
@@ -1609,11 +1643,20 @@ mod tests {
             Some("its end by hand is cleared")
         );
 
-        // What is active, promoted or cooling down is kept.
+        // Issue 776: a change makes a promoted overlay a new one, which
+        // can be activated again.
+
+        let promoted = state(false, "promoted", None);
+        assert_eq!(cleared_by_change(&before, &before, Some(&promoted)), None);
+        assert_eq!(
+            cleared_by_change(&before, &repinned, Some(&promoted)),
+            Some("its promotion is cleared, so it is a new overlay")
+        );
+
+        // What is active or cooling down is kept.
 
         for kept in [
             state(true, "schedule", None),
-            state(false, "promoted", None),
             state(false, "cooldown", Some(1)),
         ] {
             assert_eq!(cleared_by_change(&before, &moved, Some(&kept)), None);
@@ -1817,7 +1860,18 @@ mod tests {
         assert_eq!(describe_wait(59 * 60_000), "59m");
         assert_eq!(describe_wait(HOUR * 3 / 2), "1h30m");
 
-        // Issue 756: a lead looked at a moment after it began is the lead.
+        // Issue 756: a warm-up begun as its lead began says the lead as
+        // declared; one begun later says the wait.
+
+        let led: Overlay = toml::from_str(
+            "trigger = { schedule = { start = '2026-01-01T02:00:00Z' } }\nwarm_up = { lead = '1m' }",
+        )
+        .unwrap();
+        assert_eq!(warming_wait(&led, 59_000), "1m");
+        assert_eq!(warming_wait(&led, 60_000), "1m");
+        assert_eq!(warming_wait(&led, 30_000), "30s");
+
+        // A lead looked at a moment after it began is the lead.
 
         assert_eq!(describe_wait(59_400), "59s");
         assert_eq!(describe_wait(59_600), "1m");
@@ -2370,6 +2424,19 @@ mod tests {
         assert_eq!(
             condition_step(&overlay, Some(Resolved), Some(&cooling), 0, 6 * minute),
             ConditionStep::Stay
+        );
+
+        // Issue 776: a promoted overlay is not activated again.
+
+        let promoted = OverlayState {
+            active: false,
+            source: "promoted".to_owned(),
+            until_unix_ms: None,
+            ..on.clone()
+        };
+        assert_eq!(
+            condition_step(&overlay, Some(Firing), Some(&promoted), 0, 6 * minute),
+            ConditionStep::Skip(PROMOTED.to_owned())
         );
 
         let ConditionStep::Skip(why) = condition_step(&overlay, Some(Firing), None, 2, 0) else {

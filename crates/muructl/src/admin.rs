@@ -1256,6 +1256,12 @@ pub struct ImportsArgs {
     /// in place of the tables.
     #[arg(long, value_name = "NAME")]
     module: Option<String>,
+
+    /// Every row of the imports table, with those nothing can be done
+    /// about: imports inside a listed import's load, and those no way of
+    /// deferring can defer, such as an extension module's.
+    #[arg(long)]
+    all: bool,
 }
 
 impl ImportsArgs {
@@ -1267,6 +1273,7 @@ impl ImportsArgs {
             min_ms: self.min_ms,
             packages: self.package.clone(),
             module: self.module.clone(),
+            all: self.all,
         }
     }
 }
@@ -3099,6 +3106,16 @@ fn request_text(record: &pb::RequestRecord) -> String {
 
             for row in &table.rows {
                 match row.cells.as_slice() {
+                    // Issue 780: a value of several lines, such as a
+                    // stack, goes below its name, every line indented, as
+                    // a panel's own values do.
+                    [name, value] if value.contains('\n') => {
+                        let _ = writeln!(text, "    {name}");
+
+                        for line in value.lines() {
+                            let _ = writeln!(text, "      {line}");
+                        }
+                    }
                     [name, value] => {
                         let _ = writeln!(text, "    {name}: {value}");
                     }
@@ -7594,6 +7611,14 @@ fn resolve_paths(document: &mut muru_config::Document, base: &Path) {
             for root in &mut release.sendfile_roots {
                 *root = absolute(root);
             }
+
+            for root in release
+                .mounts
+                .values_mut()
+                .flat_map(|mount| mount.sendfile_roots.iter_mut().flatten())
+            {
+                *root = absolute(root);
+            }
         }
     }
 
@@ -7621,11 +7646,16 @@ fn resolve_paths(document: &mut muru_config::Document, base: &Path) {
         if let Some(tls) = &mut upstream.tls {
             resolve(&mut tls.ca);
         }
+
+        for root in &mut upstream.sendfile_roots {
+            *root = absolute(root);
+        }
     }
 
     for class in &mut document.client_class {
         resolve(&mut class.user_agent_list);
         resolve(&mut class.address_list);
+        resolve(&mut class.ja4_list);
     }
 }
 
@@ -10894,6 +10924,95 @@ mod tests {
     }
 
     #[test]
+    fn every_relative_path_in_an_applied_file_is_taken_from_its_directory() {
+        let mut document = muru_config::Document::parse(
+            r#"
+[app.shop.release.r1]
+source = "src"
+cwd = "run"
+python = ".venv/bin/python"
+sendfile_roots = ["media"]
+mounts.api = { path = "/api", entrypoint = "api:app", sendfile_roots = ["api-media"] }
+error_pages = { 503 = { file = "pages/own.html" } }
+
+[host.shop]
+names = ["shop.test"]
+tls = { certificate = "tls/cert.pem", key = "tls/key.pem" }
+error_pages = { 404 = { file = "pages/404.html" } }
+
+[[route]]
+name = "root"
+host = "shop"
+path = "/"
+static = "site"
+error_pages = { 500 = { file = "/srv/500.html" } }
+
+[overlay.down]
+routes.root = { target = { static = "snapshot" }, error_pages = { 503 = { file = "pages/down.html" } } }
+
+[upstream.legacy]
+addresses = ["127.0.0.1:9000"]
+sendfile_roots = ["legacy"]
+tls = { ca = "ca.pem" }
+"#,
+        )
+        .unwrap();
+        super::resolve_paths(&mut document, std::path::Path::new("/base"));
+
+        let release = &document.app["shop"].release["r1"];
+        assert_eq!(release.source.as_deref(), Some("/base/src"));
+        assert_eq!(release.cwd.as_deref(), Some("/base/run"));
+        assert_eq!(release.python.as_deref(), Some("/base/.venv/bin/python"));
+        assert_eq!(release.sendfile_roots, ["/base/media"]);
+        assert_eq!(
+            release.mounts["api"].sendfile_roots.as_deref(),
+            Some(&["/base/api-media".to_owned()][..])
+        );
+
+        // A release's own pages are its source directory's.
+
+        assert_eq!(
+            release.error_pages["503"].file.as_deref(),
+            Some("pages/own.html")
+        );
+
+        let host = &document.host["shop"];
+        let tls = host.tls.as_ref().unwrap();
+        assert_eq!(
+            (tls.certificate.as_str(), tls.key.as_str()),
+            ("/base/tls/cert.pem", "/base/tls/key.pem")
+        );
+        assert_eq!(
+            host.error_pages["404"].file.as_deref(),
+            Some("/base/pages/404.html")
+        );
+
+        let route = &document.route[0];
+        assert_eq!(route.static_dir.as_deref(), Some("/base/site"));
+        assert_eq!(
+            route.error_pages["500"].file.as_deref(),
+            Some("/srv/500.html")
+        );
+
+        let overlay = &document.overlay["down"].routes["root"];
+        assert_eq!(
+            overlay.target.as_ref().unwrap().static_dir.as_deref(),
+            Some("/base/snapshot")
+        );
+        assert_eq!(
+            overlay.error_pages.as_ref().unwrap()["503"].file.as_deref(),
+            Some("/base/pages/down.html")
+        );
+
+        let upstream = &document.upstream["legacy"];
+        assert_eq!(upstream.sendfile_roots, ["/base/legacy"]);
+        assert_eq!(
+            upstream.tls.as_ref().unwrap().ca.as_deref(),
+            Some("/base/ca.pem")
+        );
+    }
+
+    #[test]
     fn the_limits_are_printed_as_the_guide_shows_them() {
         let limits = pb::CgroupLimits {
             cgroup: "/sys/fs/cgroup".to_owned(),
@@ -11423,6 +11542,54 @@ mod logs_list_tests {
         assert!(lines[4].ends_with("  at 2.5ms"), "{text}");
         assert!(
             lines[5].ends_with("1.0ms in 2 segments  from 1.0ms"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_capture_s_stack_is_indented_below_its_name() {
+        let row = |name: &str, value: &str| pb::PanelRow {
+            cells: vec![name.to_owned(), value.to_owned()],
+        };
+        let record = pb::RequestRecord {
+            panels: vec![pb::Panel {
+                title: "Errors".to_owned(),
+                tables: vec![pb::PanelTable {
+                    caption: "request.soft_timeout at 14:26:36.016".to_owned(),
+                    columns: vec!["name".to_owned(), "value".to_owned()],
+                    rows: vec![
+                        row("worker", "0"),
+                        row(
+                            "stack",
+                            "  File \"shop.py\", line 180, in report\n    total += 1\n",
+                        ),
+                        row(
+                            "thread pool-1",
+                            "  File \"a.py\", line 1, in run\n    wait()",
+                        ),
+                    ],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // Issue 780: every line of a value of several lines sits under
+        // its name, as the panel's own values do.
+
+        let text = super::request_text(&record);
+        let lines: Vec<&str> = text.lines().skip_while(|line| *line != "Errors").collect();
+        assert_eq!(
+            lines[1..8],
+            [
+                "  request.soft_timeout at 14:26:36.016",
+                "    worker: 0",
+                "    stack",
+                "        File \"shop.py\", line 180, in report",
+                "          total += 1",
+                "    thread pool-1",
+                "        File \"a.py\", line 1, in run",
+            ],
             "{text}"
         );
     }

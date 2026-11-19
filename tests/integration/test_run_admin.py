@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -666,6 +667,71 @@ def test_a_blocked_event_loop_is_on_the_requests_record(runtime: Path) -> None:
         server.stop()
 
 
+WAITING_APP = """
+import threading
+
+loading = threading.Event()
+
+
+def app(environ, start_response):
+    # /load loads the slow module; /wait asks for it once that has begun.
+
+    if environ["PATH_INFO"] == "/wait":
+        loading.wait(10)
+
+    import waiting_slow  # noqa: F401
+
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    return [b"ok"]
+"""
+
+
+def test_a_request_waiting_on_another_requests_import_says_so(
+    tmp_path: Path, runtime: Path
+) -> None:
+    """Issue 787: a request that asks for a module another request is
+    still loading waits on it; its record and Server-Timing say so, with
+    the module and the request loading it."""
+
+    (tmp_path / "waiting_app.py").write_text(WAITING_APP)
+    (tmp_path / "waiting_slow.py").write_text(
+        "import time\n\nimport waiting_app\n\nwaiting_app.loading.set()\ntime.sleep(0.3)\n"
+    )
+    (tmp_path / "pyproject.toml").write_text('[tool.muru]\nentrypoint = "waiting_app:app"\n')
+    server = support.start(
+        None, chdir=tmp_path, workers=1, threads=2, env={"MURU_RUN_DIR": str(runtime)}
+    )
+
+    try:
+        loaded: list[Any] = []
+        loader = threading.Thread(target=lambda: loaded.append(server.get("/load")))
+        loader.start()
+        waited = server.get("/wait")
+        loader.join()
+
+        timing = waited.header("server-timing") or ""
+        assert "import_wait;dur=" in timing and "import;dur=" not in timing, timing
+        assert "import;dur=" in (loaded[0].header("server-timing") or "")
+
+        request_id = waited.header("x-request-id")
+        deadline = time.monotonic() + 10
+
+        while (found := json.loads(server.get(f"/_muru/requests/{request_id}.json").body))[
+            "in_progress"
+        ]:
+            assert time.monotonic() < deadline, found
+            time.sleep(0.05)
+
+        waits = found["from_worker"]["import_waits"]
+        assert [(wait["module"], wait["loader"]) for wait in waits] == [
+            ("waiting_slow", loaded[0].header("x-request-id"))
+        ], found["from_worker"]
+        panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html").body.decode()
+        assert ">waiting for an import</td>" in panel, panel
+    finally:
+        server.stop()
+
+
 def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
     port = support.free_port()
     server = start(runtime, port=port)
@@ -678,6 +744,15 @@ def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
     try:
         assert server.wait_for_log(f"dashboard on http://127.0.0.1:{port}/")
         assert 'href="workers?release=plain-wsgi@r1"' in read("/fragment/overview")
+
+        # Issue 764: the run's process id is printed, and written beside
+        # its admin socket.
+
+        written = re.search(r"pid (\d+), written to (\S+)", server.log())
+        assert written, server.log()
+        assert int(written.group(1)) == server.process.pid
+        assert Path(written.group(2)).read_text() == f"{server.process.pid}\n"
+        assert Path(written.group(2)).parent == runtime / "runs" / str(server.port)
         page = read("/workers?release=plain-wsgi@r1")
         assert "<title>Muru: plain-wsgi@r1 workers</title>" in page
         assert '<a href="./">run</a>' in page
@@ -728,7 +803,9 @@ def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
             ).stdout.strip()
             for process in [root, host, *host["children"]]
         }
-        assert titles[root["pid"]] == "muru run plain-wsgi", titles
+        assert titles[root["pid"]] == (
+            f"muru run plain-wsgi 127.0.0.1:{server.port} dashboard 127.0.0.1:{port}"
+        ), titles
         assert titles[host["pid"]] == "muru host plain-wsgi@r1", titles
         assert titles[host["children"][0]["pid"]] == "muru relay plain-wsgi@r1", titles
         assert titles[host["children"][2]["pid"]] == "muru worker plain-wsgi@r1 default/1", titles

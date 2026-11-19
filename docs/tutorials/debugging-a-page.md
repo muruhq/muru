@@ -264,8 +264,8 @@ pick the oldest `GET /`, from before its fixes, and open its Hints:
 ![The Hints panel of the list from before its fixes](images/debugging-a-page/hints.png)
 
 It names both faults of the list: the statement run once per book, and
-the stock endpoint called once per book. The list as it is now has no
-hints. The [toolbar guide](../howto/toolbar.md#hints) lists every hint
+the stock endpoint called once per book. The list as it is now has
+neither of them. The [toolbar guide](../howto/toolbar.md#hints) lists every hint
 and when it is shown.
 
 ## Without a browser

@@ -13,6 +13,8 @@
 <header>
   <h1><a href="../" title="The dashboard's front page">Muru</a></h1>
   <span>{{ app }}</span>
+  {% if !project.is_empty() %}<span title="The project this run serves">{{ project }}</span>{% endif %}
+  {% if !started.is_empty() %}<span title="When this run started">started {{ started }}</span>{% endif %}
   <span>request {{ request_id }}</span>
 </header>
 <main>

@@ -23,7 +23,7 @@ A page is one of:
 
 | Key | Meaning |
 | --- | --- |
-| `file` | a file sent as the body, with the content type its name implies; a release's file may be relative to its source directory, elsewhere the path is absolute. The file is read when the configuration is applied, so a change needs a new release or another apply |
+| `file` | a file sent as the body, with the content type its name implies. A release's own page may be relative to its source directory, and a host's, route's or overlay's page in a file given to `muructl apply` relative to that file's directory; in the daemon's own file the path is absolute. The file is read when the configuration is applied, so a change needs a new release or another apply |
 | `template` | text the edge renders, with the placeholders below filled in; `content_type` sets its type (default `text/html; charset=utf-8`), and values are HTML-escaped when the type is HTML |
 | `path` | a path of the application, which the edge asks for the page as an internal sub-request |
 
@@ -225,7 +225,7 @@ application's requests on a host that is not in maintenance.
 
 `muructl apply` refuses a table it cannot use: a key that is not a
 status, a page with none or more than one of `file`, `template` and
-`path`, a relative file outside a release, a release file that does not
-exist, an unknown `when`, or a malformed exemption. The daemon refuses
+`path`, a file that does not exist, an unknown `when`, or a malformed
+exemption. The daemon refuses
 to start on a bad `[error_pages]` table in its own file, as it does for
 `[proxy]`.

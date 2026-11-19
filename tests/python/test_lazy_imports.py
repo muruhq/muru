@@ -98,7 +98,7 @@ def test_a_deferred_module_a_request_loads_is_marked_in_its_record(project: Path
     finally:
         _request_id.reset(token)
 
-    loads, _count, _ms = _imports._take("R1")
+    loads, _count, _ms, _waits = _imports._take("R1")
     marked = {name: (trigger, deferred) for _at, _ms, name, trigger, depth, deferred in loads}
 
     # The line that used the deferred import is its trigger, past
@@ -106,6 +106,27 @@ def test_a_deferred_module_a_request_loads_is_marked_in_its_record(project: Path
 
     assert marked["heavy"] == ("importer.py:4", True)
     assert marked["json.tool"][1] is False
+
+
+def test_a_deferral_used_as_its_importer_loads_in_a_worker_names_both(project: Path) -> None:
+    # Issue 789: the importer is first loaded after the fork and uses the
+    # deferred import at module level, so the deferral saved nothing; the
+    # worker's load of it says so, with the line, whatever its nesting.
+
+    (project / "importer.py").write_text("import heavy\n\nCOPY = heavy.VALUE\n")
+    _lazy_imports.load_started(Context())
+    _lazy_imports.load_finished(Context(), _instrumentation.FORK)
+    _imports.install()
+    _lazy_imports.worker_started(Context(worker_id=0))
+
+    import importer
+
+    assert importer.COPY == 42
+    loads = {load["module"]: load for load in _imports.worker_loads()["loads"]}
+    assert loads["heavy"]["deferred"] is True
+    assert loads["heavy"]["used_at_load"] == "importer"
+    assert loads["heavy"]["used_at"] == "importer.py:3"
+    assert "used_at_load" not in loads["importer"]
 
 
 def test_a_configuration_unwrapt_cannot_use_is_an_error_with_the_reason(project: Path) -> None:
@@ -129,3 +150,20 @@ def test_without_unwrapt_the_error_says_to_add_it(
 
         with pytest.raises(RuntimeError, match="needs the unwrapt package"):
             _lazy_imports.load_started(Context())
+
+
+def test_an_unwrapt_too_old_is_an_error_naming_both_versions(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(unwrapt, "__version_info__", ("1", "0", "0", "a4"))
+    monkeypatch.setattr(unwrapt, "__version__", "1.0.0a4")
+
+    with pytest.raises(RuntimeError, match=r"needs unwrapt 1\.0\.0a5 or later.*has 1\.0\.0a4"):
+        _lazy_imports.load_started(Context())
+
+    # A later release, and a release candidate of the next, are new enough.
+
+    assert _lazy_imports._version(("1", "0", "0", "a10")) > _lazy_imports._version(
+        ("1", "0", "0", "a5")
+    )
+    assert _lazy_imports._version(("1", "0", "0")) > _lazy_imports._version(("1", "0", "0", "rc1"))

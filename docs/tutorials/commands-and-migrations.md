@@ -124,7 +124,7 @@ muructl command run catalog add-product --input name=cup --input price=4
 ```
 
 ```
-Error: add-product input price: "4" does not match [0-9]+[.][0-9][0-9]
+muru: error: add-product input price: "4" does not match [0-9]+[.][0-9][0-9]
 ```
 
 ```
@@ -193,7 +193,7 @@ muructl deploy catalog .
 ```
 
 ```
-Error: the before_fork gate migrate exited with status 1 after 19ms
+muru: error: the before_fork gate migrate exited with status 1 after 19ms
 ```
 
 The new release failed before any of its workers forked, so nothing of
@@ -264,7 +264,7 @@ muructl command run catalog backup
 ```
 
 ```
-Error: backup runs one at a time for catalog, and run 5 is under way
+muru: error: backup runs one at a time for catalog, and run 5 is under way
 ```
 
 The first finishes:

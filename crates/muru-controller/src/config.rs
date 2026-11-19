@@ -2189,6 +2189,19 @@ fn plan_overlays(
                     }
                 }
 
+                // Issue 779: a page file is checked here, as a route's and
+                // a host's are, rather than by the edge at activation.
+
+                for (key, page) in change.error_pages.iter().flatten() {
+                    if let Some(file) = &page.file
+                        && !Path::new(file).is_file()
+                    {
+                        errors.push(format!(
+                            "overlay {name}: {field}.error_pages.{key}: {file} is not a file"
+                        ));
+                    }
+                }
+
                 let Some(target) = &change.target else {
                     continue;
                 };
@@ -2457,8 +2470,9 @@ fn describe_upstream(upstream: &UpstreamTable) -> String {
 }
 
 /// Section 4.12: a host's or route's error pages and override, whose
-/// files must be absolute paths to files that exist, so a missing page is
-/// refused here rather than by the edge when the snapshot reaches it.
+/// files must exist, so a missing page is refused here rather than by the
+/// edge when the snapshot reaches it. muructl apply has made a relative
+/// file absolute, from the applied file's directory (issue 778).
 fn check_error_tables(
     pages: &BTreeMap<String, muru_config::ErrorPage>,
     override_: Option<&muru_config::ErrorOverride>,

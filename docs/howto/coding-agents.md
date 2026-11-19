@@ -183,3 +183,23 @@ the agent has them and through `muructl --json` when it does not.
 An agent with a shell can run `muructl` directly. Add `--json` to any
 command that reports something, and it prints the admin API's answer as
 JSON, or `{"error": ...}` when it fails, with the same exit status.
+
+## A run in the background
+
+A script or an agent that starts `muructl run` in the background stops
+it by its process id. The run prints the id at start-up and writes it to
+`pid` in its run directory, beside its admin socket:
+
+```console
+$ muructl run --port 18631 > run.log 2>&1 &
+$ grep 'pid' run.log
+muru: pid 4211, written to /run/user/1000/muru/runs/18631/pid
+$ kill -INT "$(cat /run/user/1000/muru/runs/18631/pid)"
+```
+
+`$!` in the shell that started it is the same id. The run's process
+title names its application, its address and its dashboard's, `muru run
+shop 127.0.0.1:18631 dashboard 127.0.0.1:8081`, so `pgrep -f 18631`
+finds it. The arguments it was started with are not in the title, so a
+pattern taken from them, such as `pkill -f "muructl run --port 18631"`,
+matches nothing.

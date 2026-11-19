@@ -124,6 +124,9 @@ pub struct Trace {
     gc_before: [(u64, u64); 4],
     /// The request's first-time module loads so far, in nanoseconds.
     imports: Arc<AtomicU64>,
+    /// Its waits so far on modules other threads were loading, in
+    /// nanoseconds (issue 787).
+    import_waits: Arc<AtomicU64>,
     state: Mutex<State>,
 }
 
@@ -175,6 +178,7 @@ impl Trace {
             started_wall: SystemTime::now() - elapsed,
             gc_before: crate::gc::totals(),
             imports: Arc::default(),
+            import_waits: Arc::default(),
             state: Mutex::new(State {
                 default_source,
                 ..State::default()
@@ -214,6 +218,12 @@ impl Trace {
     /// the first time, the outermost loads summed.
     pub fn imports_ms(&self) -> f64 {
         self.imports.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    }
+
+    /// The milliseconds the request has spent so far waiting on modules
+    /// other threads were loading for the first time.
+    pub fn import_wait_ms(&self) -> f64 {
+        self.import_waits.load(Ordering::Relaxed) as f64 / 1_000_000.0
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -425,6 +435,7 @@ impl Trace {
             module_loads: logs.module_loads,
             modules_loaded: logs.modules_loaded,
             modules_ms: logs.modules_ms,
+            import_waits: logs.import_waits,
         }
     }
 }
@@ -458,6 +469,7 @@ pub struct Logs {
     module_loads: Vec<pb::ModuleLoad>,
     modules_loaded: u32,
     modules_ms: f64,
+    import_waits: Vec<pb::ImportWait>,
 }
 
 fn capture(py: Python<'_>) -> PyResult<&Capture> {
@@ -486,8 +498,11 @@ pub fn start_logs(request_id: &str, trace: &Trace) {
             capture.panels_start.call1(py, (request_id,))?;
 
             let tally = Py::new(py, ImportTally(Arc::clone(&trace.imports)))?;
+            let waits = Py::new(py, ImportTally(Arc::clone(&trace.import_waits)))?;
             let since = trace.started.elapsed().as_secs_f64();
-            capture.imports_start.call1(py, (request_id, tally, since))
+            capture
+                .imports_start
+                .call1(py, (request_id, tally, since, waits))
         });
 
         if let Err(error) = started {
@@ -518,7 +533,7 @@ pub fn take_logs(request_id: &str) -> Logs {
                 Vec::new()
             });
 
-        let (loads, modules_loaded, modules_ms) = capture
+        let (loads, modules_loaded, modules_ms, waits) = capture
             .imports_take
             .call1(py, (request_id,))
             .and_then(|taken| taken.extract::<TakenLoads>(py))
@@ -546,14 +561,30 @@ pub fn take_logs(request_id: &str) -> Logs {
                 .collect(),
             modules_loaded,
             modules_ms,
+            import_waits: waits
+                .into_iter()
+                .map(|(at, ms, module, loader)| pb::ImportWait {
+                    module,
+                    at,
+                    ms,
+                    loader,
+                })
+                .collect(),
         }
     })
 }
 
 /// A request's loads as `muru._imports._take` gives them: each one's
 /// start, length, module, trigger, depth and whether it resolved a
-/// deferred import; how many in all; and the outermost loads' time.
-type TakenLoads = (Vec<(f64, f64, String, String, u32, bool)>, u32, f64);
+/// deferred import; how many in all; the outermost loads' time; and its
+/// waits on other threads' loads, each one's start, length, module and
+/// the request loading it.
+type TakenLoads = (
+    Vec<(f64, f64, String, String, u32, bool)>,
+    u32,
+    f64,
+    Vec<(f64, f64, String, String)>,
+);
 
 /// One panel as `muru.panels._take` gives it: its name, title, spans,
 /// values, tables (caption, columns, rows), how many entries it dropped,

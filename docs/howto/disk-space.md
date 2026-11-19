@@ -83,7 +83,7 @@ refused:
 
 ```console
 $ muructl release remove shop@r5
-Error: shop@r5 cannot be removed: it serves the application's traffic
+muru: error: shop@r5 cannot be removed: it serves the application's traffic
 ```
 
 ## Removing an application

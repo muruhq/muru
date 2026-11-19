@@ -74,10 +74,18 @@ impl File {
                  share one format. A file in this format kept beside a project's code is \
                  named `muru.daemon.toml`, since `muru.toml` there is the project's \
                  settings, which have other keys. Listeners, limits, the proxy, compression, secret \
-                 stores, logs, shutdown, metrics, events, the dashboard, the overlay \
-                 webhook, client classes and rate limits belong to the daemon's own file; \
-                 an applied file that sets them is refused. Applications, their releases, \
-                 hosts, routes, upstreams and overlays may be in either."
+                 stores, logs, shutdown, metrics, events, the dashboard and the overlay \
+                 webhook belong to the daemon's own file; an apply leaves them out, with \
+                 a warning. Applications, their releases, hosts, routes, upstreams, \
+                 overlays, conditions, client classes and rate limits may be in either, \
+                 and an applied file may not redefine a client class or rate limit the \
+                 daemon's own file defines. \
+                 A relative path in a file `muructl apply` reads is taken from that \
+                 file's directory, except a release's own static directories and \
+                 error pages, which are taken from its source directory; apply sends \
+                 the daemon the absolute paths. In the daemon's own file, the client \
+                 classes' list files are taken from its directory, and every other \
+                 path is absolute."
             }
             File::Project => {
                 "The keys an application ships with: the `[tool.muru]` table of its \

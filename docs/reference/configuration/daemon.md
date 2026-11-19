@@ -2,7 +2,7 @@
 
 # The daemon's configuration and applied files
 
-The keys of the daemon's configuration file, `muru.toml` in its configuration directory, and of the files `muructl apply` reads, which share one format. A file in this format kept beside a project's code is named `muru.daemon.toml`, since `muru.toml` there is the project's settings, which have other keys. Listeners, limits, the proxy, compression, secret stores, logs, shutdown, metrics, events, the dashboard, the overlay webhook, client classes and rate limits belong to the daemon's own file; an applied file that sets them is refused. Applications, their releases, hosts, routes, upstreams and overlays may be in either.
+The keys of the daemon's configuration file, `muru.toml` in its configuration directory, and of the files `muructl apply` reads, which share one format. A file in this format kept beside a project's code is named `muru.daemon.toml`, since `muru.toml` there is the project's settings, which have other keys. Listeners, limits, the proxy, compression, secret stores, logs, shutdown, metrics, events, the dashboard and the overlay webhook belong to the daemon's own file; an apply leaves them out, with a warning. Applications, their releases, hosts, routes, upstreams, overlays, conditions, client classes and rate limits may be in either, and an applied file may not redefine a client class or rate limit the daemon's own file defines. A relative path in a file `muructl apply` reads is taken from that file's directory, except a release's own static directories and error pages, which are taken from its source directory; apply sends the daemon the absolute paths. In the daemon's own file, the client classes' list files are taken from its directory, and every other path is absolute.
 
 The JSON Schema of the same keys, for an editor that checks TOML against one, is `https://docs.muruhq.dev/en/latest/schema/daemon.schema.json`.
 
@@ -12,7 +12,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `app` | table of tables, {ref}`[app.NAME] <config-daemon-app-name>` |  | Applications by name. |
-| `client_class` | array of tables, {ref}`[[client_class]] <config-daemon-client-class>` |  | Client classification rules, in order, from the daemon's own file. |
+| `client_class` | array of tables, {ref}`[[client_class]] <config-daemon-client-class>` |  | Client classification rules, in order, from the daemon's own file or an applied one. |
 | `compression` | table, {ref}`[compression] <config-daemon-compression>` |  | How responses are compressed. |
 | `condition` | table of tables, {ref}`[condition.NAME] <config-daemon-condition-name>` |  | Named conditions over Muru's own signals, from the daemon's own file or an applied one. |
 | `daemon` | table, {ref}`[daemon] <config-daemon-daemon>` |  | How the daemon itself runs. |
@@ -29,7 +29,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `overlay` | table of tables, {ref}`[overlay.NAME] <config-daemon-overlay-name>` |  | Overlays by name: partial configuration laid over the routes and applications while active. |
 | `overlay_webhook` | table, {ref}`[overlay_webhook] <config-daemon-overlay-webhook>` |  | The overlays' external trigger. |
 | `proxy` | table, {ref}`[proxy] <config-daemon-proxy>` |  | Trusted proxies and the headers taken from them. |
-| `rate_limit` | table of tables, {ref}`[rate_limit.NAME] <config-daemon-rate-limit-name>` |  | Rate limits by name, from the daemon's own file. |
+| `rate_limit` | table of tables, {ref}`[rate_limit.NAME] <config-daemon-rate-limit-name>` |  | Rate limits by name, from the daemon's own file or an applied one. |
 | `route` | array of tables, {ref}`[[route]] <config-daemon-route>` |  | Routes, in the order written. |
 | `secrets` | table, {ref}`[secrets] <config-daemon-secrets>` |  | Secret stores. |
 | `shutdown` | table, {ref}`[shutdown] <config-daemon-shutdown>` |  | What SIGTERM means to the daemon, and how a shutdown runs. |
@@ -69,7 +69,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `command` | array of strings |  | The command an `http` release runs, with `{bind}` where the server takes its address; without `{bind}` the profile adds the server's own flags. |
 | `commands` | table of tables, {ref}`[app.NAME.release.ID.commands.NAME] <config-daemon-app-name-release-id-commands-name>` |  | Commands the application declares, by name: run with the release on request, with inputs. |
 | `concurrency` | integer | `1000` | Requests an ASGI worker's event loop takes at once. |
-| `cwd` | string | `source` | The directory an `http` release's command runs in; `source` when absent, and one of the two is required. |
+| `cwd` | string | `source` | The directory an `http` release's command runs in; `source` when absent, and one of the two is required. A relative path is taken from the file's directory. |
 | `entrypoint` | string | the source's `[tool.muru]` | The application as module:callable, else from the source's `[tool.muru]` table. |
 | `env` | table of strings or tables, {ref}`[app.NAME.release.ID.env.NAME] <config-daemon-app-name-release-id-env-name>` |  | Environment variables for the workers: a value, or a secret reference resolved when the release starts. |
 | `error_override` | table, {ref}`[error_override] <config-daemon-error-override>` |  | Replace the application's own error responses with error pages. |
@@ -97,12 +97,12 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `preload_modules` | array of strings |  | Modules the host imports after the entrypoint and the mounts, so they are loaded once before the fork; when given, they replace the list in the source's `[tool.muru]` table. |
 | `processes` | integer | `1` | The default group's worker processes. |
 | `profile` | string |  | The server an `http` release runs: gunicorn, uvicorn, granian, mod_wsgi-express, uwsgi or generic. `gunicorn`: gunicorn: `--bind unix:PATH` or `--bind HOST:PORT`, stopped by TERM. `uvicorn`: uvicorn: `--uds PATH` or `--host HOST --port PORT`, stopped by TERM. `granian`: Granian: `--uds PATH` or `--host HOST --port PORT`, stopped by TERM. `mod_wsgi-express`: mod_wsgi-express: `--host HOST --port PORT`, stopped by TERM. `uwsgi`: uWSGI: `--http-socket PATH` or `--http-socket HOST:PORT`, with `--master` and a hook that makes TERM a graceful stop, which in uWSGI 2.0 would otherwise reload. `generic`: Any server: the command binds through `{bind}` and `stop_signal` says how it is stopped. |
-| `python` | string | found at start | The interpreter: a path, or a request in uv's syntax. |
+| `python` | string | found at start | The interpreter: a path, or a request in uv's syntax. A relative path with a directory in it, such as `.venv/bin/python`, is taken from the file's directory. |
 | `readiness` | table, {ref}`[app.NAME.release.ID.readiness] <config-daemon-app-name-release-id-readiness>` |  | How an `http` release's instances are known to be ready. |
 | `reflection` | boolean | `false` | Serve gRPC server reflection for the services the release's gRPC mounts register (default false). |
 | `scaling` | table, {ref}`[app.NAME.release.ID.scaling] <config-daemon-app-name-release-id-scaling>` |  | How the default group is scaled; static when absent. |
 | `sendfile_header` | string |  | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile` for the frameworks that send that one. |
-| `sendfile_roots` | array of strings |  | Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file, for the default mount and any mount that does not say otherwise; with none every hint is refused. |
+| `sendfile_roots` | array of strings |  | Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file, for the default mount and any mount that does not say otherwise; with none every hint is refused. A relative path is taken from the file's directory. |
 | `source` | string |  | The source directory. A relative path is taken from the file's directory. Required by `muructl apply` for a `workers` release. |
 | `static` | array of tables, {ref}`[[app.NAME.release.ID.static]] <config-daemon-app-name-release-id-static>` |  | The application's own static directories, served by the edge from the release's source, which is the project directory under `muructl run`. |
 | `stop_signal` | string | the profile's, `TERM` | The signal that stops an `http` release's instance gracefully: TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. Required by the generic profile; the other profiles know their server's. |
@@ -266,7 +266,7 @@ A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` ta
 | `max_connections` | integer |  | Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; each holds a request slot when absent. |
 | `path` | string |  | The path prefix; the longest wins, on segment boundaries. A gRPC mount has none: its calls are matched by service name. |
 | `sendfile_header` | string | the release's | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
-| `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. |
+| `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. In a file `muructl apply` reads, a relative path is taken from the file's directory; in a project's settings each is absolute. |
 | `threads` | integer or table, {ref}`[app.NAME.release.ID.mounts.NAME.threads] <config-daemon-app-name-release-id-mounts-name-threads>` |  | Threads of the mount's own, for a WSGI or gRPC mount; it shares the worker's pool when absent. |
 | `tracing_middleware` | boolean | `false` | Wrap the mount's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for. |
 
@@ -478,7 +478,7 @@ The same keys apply at `[host.NAME.error_pages.STATUS]`, `[route.error_pages.STA
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `content_type` | string | `"text/html; charset=utf-8"` | The content type of a template. |
-| `file` | string |  | A file sent as the body, with the content type its name implies. A release's page may be a path relative to its source directory; elsewhere the path is absolute. |
+| `file` | string |  | A file sent as the body, with the content type its name implies. A relative path is taken from the source directory for a release's own page (in `[tool.muru]`, `muru.toml` or the release's table), and from the file's directory for any other page in a file `muructl apply` reads; in the daemon's own file the path is absolute. |
 | `path` | string |  | An application path the edge asks for the page, as an internal sub-request that sees `REDIRECT_STATUS` and `muru.error_reason`. |
 | `template` | string |  | A template the edge renders, with `{status}`, `{title}`, `{reason}`, `{description}`, `{request_id}`, `{retry_after}`, `{host}` and `{path}` filled in. |
 
@@ -794,7 +794,7 @@ What serves a route under an overlay: one of an application, a static directory 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `app` | string |  | An application. |
-| `static` | string |  | A directory the edge serves. |
+| `static` | string |  | A directory the edge serves. A relative path is taken from the file's directory. |
 | `upstream` | string |  | An HTTP upstream. |
 
 (config-daemon-overlay-name-routes-name-traffic)=
@@ -928,7 +928,7 @@ A route, one of the `[[route]]` entries: a path prefix of a virtual host to an a
 | `request_headers` | table, {ref}`[host.NAME.request_headers] <config-daemon-host-name-request-headers>` |  | Headers removed from, and set on, the route's requests before anything is asked to serve them, after the host's. |
 | `response_headers` | table, {ref}`[host.NAME.response_headers] <config-daemon-host-name-response-headers>` |  | Headers removed from, set on and added to every response to the route's requests, after the host's. |
 | `spool_quota` | string | `"10GB"` | What the application's stored uploads may hold at once when a request on the route arrives. |
-| `static` | string |  | The directory served by the edge, instead of an application. |
+| `static` | string |  | The directory served by the edge, instead of an application. A relative path is taken from the file's directory. |
 | `timeouts` | table, {ref}`[host.NAME.timeouts] <config-daemon-host-name-timeouts>` |  | The timeouts of the route's requests, each replacing the host's, or else the daemon's `[limits]` value. |
 | `traffic` | table, {ref}`[route.traffic] <config-daemon-route-traffic>` |  | How requests are shared between the application's releases; without it every request goes to the serving release. |
 | `upload` | string |  | `multipart` or `raw` makes the edge receive and store uploads before the application sees the request; off without it. |
@@ -1065,7 +1065,7 @@ An HTTP upstream, one of the `[upstream.NAME]` tables: an unmanaged HTTP server 
 | `health` | table, {ref}`[upstream.NAME.health] <config-daemon-upstream-name-health>` |  | Active health checks and passive ejection. |
 | `protocol` | string | `"http1"` | `http1` (the default), `h2c` (HTTP/2 in the clear, by prior knowledge) or `h2` (HTTP/2 over TLS). |
 | `sendfile_header` | string |  | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
-| `sendfile_roots` | array of strings |  | Directories a path in a trusted `X-Muru-Sendfile` response header must lie in for the edge to serve the file; with none every hint is refused. |
+| `sendfile_roots` | array of strings |  | Directories a path in a trusted `X-Muru-Sendfile` response header must lie in for the edge to serve the file; with none every hint is refused. A relative path is taken from the file's directory. |
 | `tls` | table, {ref}`[upstream.NAME.tls] <config-daemon-upstream-name-tls>` |  | Connect with TLS; `h2` implies it. |
 | `trust_muru_headers` | boolean | `false` | Honour X-Muru-Redirect from the upstream, as from an application: its X-Muru-* response headers are otherwise removed. |
 
@@ -1091,6 +1091,6 @@ How an upstream's TLS connections are made.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `ca` | string |  | A PEM file of the certificates trusted, by absolute path; the public roots without it. |
+| `ca` | string |  | A PEM file of the certificates trusted; the public roots without it. A relative path is taken from the file's directory. |
 | `server_name` | string | the address's host | The name the certificate must carry, sent as SNI; the address's host without it. |
 | `verify` | boolean | `true` | Check the certificate. |

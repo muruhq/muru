@@ -13,6 +13,8 @@
   <span>{{ data.app }}</span>
   <span>release r{{ data.release }}</span>
   {% if data.development %}<span>development mode</span>{% endif %}
+  {% if !data.project.is_empty() %}<span title="The project this run serves">{{ data.project }}</span>{% endif %}
+  {% if !data.started.is_empty() %}<span title="When this run started">started {{ data.started }}</span>{% endif %}
   <span>up {{ data.uptime }}</span>
   <span>http://{{ data.listen }}</span>
   {% if let Some(https) = data.https %}<span>https://{{ https }}</span>{% endif %}

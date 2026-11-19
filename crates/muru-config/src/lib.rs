@@ -404,7 +404,9 @@ pub struct Mount {
     pub cgi_local_redirect: Option<bool>,
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the edge to serve the file (section 4.9); the
-    /// release's when absent, and an empty list refuses every hint.
+    /// release's when absent, and an empty list refuses every hint. In
+    /// a file `muructl apply` reads, a relative path is taken from the
+    /// file's directory; in a project's settings each is absolute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "the release's"))]
     pub sendfile_roots: Option<Vec<String>>,
@@ -918,7 +920,8 @@ pub struct Release {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
     /// The directory an `http` release's command runs in; `source` when
-    /// absent, and one of the two is required.
+    /// absent, and one of the two is required. A relative path is taken
+    /// from the file's directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "`source`"))]
     pub cwd: Option<String>,
@@ -976,6 +979,8 @@ pub struct Release {
     #[schemars(extend("default" = "worker"))]
     pub factory_phase: Option<FactoryPhase>,
     /// The interpreter: a path, or a request in uv's syntax (section 8.1).
+    /// A relative path with a directory in it, such as
+    /// `.venv/bin/python`, is taken from the file's directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "found at start"))]
     pub python: Option<String>,
@@ -1087,7 +1092,8 @@ pub struct Release {
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the edge to serve the file (section 4.9), for the
     /// default mount and any mount that does not say otherwise; with
-    /// none every hint is refused.
+    /// none every hint is refused. A relative path is taken from the
+    /// file's directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sendfile_roots: Vec<String>,
     /// A second response header honoured as `X-Muru-Sendfile` is, such
@@ -2608,7 +2614,7 @@ pub struct Route {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub upstream: String,
     /// The directory served by the edge (section 4.9), instead of an
-    /// application.
+    /// application. A relative path is taken from the file's directory.
     #[serde(rename = "static", default, skip_serializing_if = "Option::is_none")]
     pub static_dir: Option<String>,
     /// The files tried, in order, when a directory is requested.
@@ -3025,7 +3031,8 @@ pub struct RouteTarget {
     /// An application.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
-    /// A directory the edge serves (section 4.9).
+    /// A directory the edge serves (section 4.9). A relative path is
+    /// taken from the file's directory.
     #[serde(rename = "static", default, skip_serializing_if = "Option::is_none")]
     pub static_dir: Option<String>,
     /// An HTTP upstream (section 4.13).
@@ -4414,6 +4421,7 @@ pub fn lazy_imports_instrumentation(
         lazy_imports == Some(true),
         import_report == Some(true),
         workers,
+        "",
     ))
 }
 
@@ -4421,8 +4429,16 @@ pub fn lazy_imports_instrumentation(
 /// records the import report (sections 6.17 and 6.18), or None when it
 /// does neither. Its settings say which it does, and how many workers the
 /// release starts with, for the report's analysis; unwrapt finds its own
-/// configuration.
-pub fn lazy_imports_entry(defer: bool, report: bool, workers: usize) -> Option<Instrumentation> {
+/// configuration. `lazy_from` names where `lazy_imports` was set, a file
+/// name or "the release's settings", empty when it was not set, for the
+/// report's advice on an import declared deferred that nothing deferred
+/// (issue 786).
+pub fn lazy_imports_entry(
+    defer: bool,
+    report: bool,
+    workers: usize,
+    lazy_from: &str,
+) -> Option<Instrumentation> {
     if !defer && !report {
         return None;
     }
@@ -4431,6 +4447,10 @@ pub fn lazy_imports_entry(defer: bool, report: bool, workers: usize) -> Option<I
     settings.insert("defer".to_owned(), serde_json::json!(defer));
     settings.insert("report".to_owned(), serde_json::json!(report));
     settings.insert("workers".to_owned(), serde_json::json!(workers));
+
+    if report && !lazy_from.is_empty() {
+        settings.insert("lazy_imports_from".to_owned(), serde_json::json!(lazy_from));
+    }
 
     Some(Instrumentation {
         module: LAZY_IMPORTS_MODULE.to_owned(),
@@ -4546,8 +4566,11 @@ fn root_path() -> String {
 #[serde(deny_unknown_fields)]
 pub struct ErrorPage {
     /// A file sent as the body, with the content type its name implies.
-    /// A release's page may be a path relative to its source directory;
-    /// elsewhere the path is absolute.
+    /// A relative path is taken from the source directory for a
+    /// release's own page (in `[tool.muru]`, `muru.toml` or the
+    /// release's table), and from the file's directory for any other
+    /// page in a file `muructl apply` reads; in the daemon's own file
+    /// the path is absolute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     /// A template the edge renders, with `{status}`, `{title}`,
@@ -4845,7 +4868,8 @@ pub struct Upstream {
     pub trust_muru_headers: bool,
     /// Directories a path in a trusted `X-Muru-Sendfile` response header
     /// must lie in for the edge to serve the file (section 4.9); with
-    /// none every hint is refused.
+    /// none every hint is refused. A relative path is taken from the
+    /// file's directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sendfile_roots: Vec<String>,
     /// A second response header honoured as `X-Muru-Sendfile` is, such
@@ -4862,8 +4886,8 @@ pub struct Upstream {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamTls {
-    /// A PEM file of the certificates trusted, by absolute path; the
-    /// public roots without it.
+    /// A PEM file of the certificates trusted; the public roots without
+    /// it. A relative path is taken from the file's directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca: Option<String>,
     /// The name the certificate must carry, sent as SNI; the address's
@@ -5341,10 +5365,11 @@ pub struct Document {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub host: BTreeMap<String, Host>,
     /// Client classification rules, in order (section 4.14), from the
-    /// daemon's own file.
+    /// daemon's own file or an applied one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_class: Vec<ClientClass>,
-    /// Rate limits by name (section 4.15), from the daemon's own file.
+    /// Rate limits by name (section 4.15), from the daemon's own file or
+    /// an applied one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rate_limit: BTreeMap<String, RateLimit>,
     /// Overlays by name (section 9.10): partial configuration laid over
@@ -7667,6 +7692,12 @@ traffic = { classes = { ai-crawler = 'r1' } }"
             .unwrap();
         assert_eq!(report.settings["defer"], false);
         assert_eq!(report.settings["report"], true);
+
+        // Issue 786: the report is told where lazy_imports was set.
+
+        let told = lazy_imports_entry(false, true, 2, "muru.local.toml").unwrap();
+        assert_eq!(told.settings["lazy_imports_from"], "muru.local.toml");
+        assert!(!report.settings.contains_key("lazy_imports_from"));
         assert_eq!(
             parse_local("import_report = true\n", None)
                 .unwrap()

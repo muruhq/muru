@@ -163,8 +163,8 @@ def load_finished(context, outcome):
   it, and modules Muru's host imported before the application cost
   nothing. A file a timer writes needs a name that is unique to its
   process, since the host and each worker may write one. Under preload
-  the import check also does a little work around each first import,
-  which shows in the importing module's own time.
+  the import check also does a little work around each module's first
+  load, which shows in that module's own time.
 
 ## Wrapping an entry point's application
 

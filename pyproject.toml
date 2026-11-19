@@ -20,7 +20,7 @@ dev = [
     "ruff>=0.9",
     "towncrier>=24.8",
     # Deferring imports (lazy_imports), which the Python unit tests use.
-    "unwrapt>=1.0.0a2",
+    "unwrapt>=1.0.0a5",
     "zstandard>=0.25.0",
 ]
 fixtures = [

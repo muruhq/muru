@@ -252,7 +252,7 @@ pub struct RunState {
     /// The events the run's hosts raised.
     pub events: Arc<RunEvents>,
     /// The settings in force, each with where it came from.
-    pub settings: Arc<crate::print_config::Settings>,
+    pub settings: Arc<std::sync::RwLock<crate::print_config::Settings>>,
     /// What `muructl status --processes` lists (section 13.10).
     pub processes: Arc<RunProcesses>,
     /// The request records a development run keeps (section 11.7); none
@@ -1006,6 +1006,15 @@ impl Registration {
             directory: Some(directory),
             socket,
         })
+    }
+
+    /// Write the run's process id to `pid` in its directory, as a script
+    /// reads it to stop the run (issue 764); the file's path, or none
+    /// for `muructl serve` or when it could not be written.
+    pub fn write_pid(&self, pid: u32) -> Option<PathBuf> {
+        let path = self.directory.as_ref()?.join("pid");
+        std::fs::write(&path, format!("{pid}\n")).ok()?;
+        Some(path)
     }
 
     /// Record another runtime library directory the run uses, when a
@@ -1844,7 +1853,11 @@ impl Admin for Service {
                 .map_or(0, |since| since.as_millis() as u64),
             state_version: 0,
             attributions: Vec::new(),
-            layers: state.settings.layers(&format!("{}@{release}", state.app)),
+            layers: state
+                .settings
+                .read()
+                .expect("settings poisoned")
+                .layers(&format!("{}@{release}", state.app)),
         }))
     }
 

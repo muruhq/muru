@@ -310,7 +310,7 @@
           "type": "string"
         },
         "file": {
-          "description": "A file sent as the body, with the content type its name implies. A release's page may be a path relative to its source directory; elsewhere the path is absolute.",
+          "description": "A file sent as the body, with the content type its name implies. A relative path is taken from the source directory for a release's own page (in `[tool.muru]`, `muru.toml` or the release's table), and from the file's directory for any other page in a file `muructl apply` reads; in the daemon's own file the path is absolute.",
           "type": "string"
         },
         "path": {
@@ -706,7 +706,7 @@
           "x-default": "the release's"
         },
         "sendfile_roots": {
-          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint.",
+          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. In a file `muructl apply` reads, a relative path is taken from the file's directory; in a project's settings each is absolute.",
           "items": {
             "type": "string"
           },

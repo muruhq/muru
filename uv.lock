@@ -1300,7 +1300,7 @@ dev = [
     { name = "pytest", specifier = ">=8.3" },
     { name = "ruff", specifier = ">=0.9" },
     { name = "towncrier", specifier = ">=24.8" },
-    { name = "unwrapt", specifier = ">=1.0.0a2" },
+    { name = "unwrapt", specifier = ">=1.0.0a5" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
 docs = [
@@ -2124,14 +2124,14 @@ wheels = [
 
 [[package]]
 name = "unwrapt"
-version = "1.0.0a2"
+version = "1.0.0a5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "wrapt" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a4/83/06890569fb479e468dd4b331bc963f156f3f01b16f7973dc06798f1abc2c/unwrapt-1.0.0a2.tar.gz", hash = "sha256:835538e98e6d9d393322c527d90ee58d01b825581954fb23f9c1895bab4c472c", size = 72223, upload-time = "2026-11-17T00:22:40.217Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6d/39/19eeeb7fd85bb3a4a4b584da521596fd23ceadba696cf9d24db865b3e505/unwrapt-1.0.0a5.tar.gz", hash = "sha256:35ddf4a338e669c538afa81cb6040acdbe18f0c56633af3b3e4f3d0e00c6e319", size = 91656, upload-time = "2026-11-19T04:10:57.497Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c9/1a/bb30771711c1df42fe5dcb225a12ba2b8ac5f8a99f4e004ab2b84e7577af/unwrapt-1.0.0a2-py3-none-any.whl", hash = "sha256:61ce88f40f73da1fb1059214eacb6dec2dae089c72a4093e65fee3a5e7f46d93", size = 47020, upload-time = "2026-11-17T00:22:38.87Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/1d/8ddb8d05203cba9d959aeef28aa9f5ca1795af791fe2294aa0970be77623/unwrapt-1.0.0a5-py3-none-any.whl", hash = "sha256:995e73991eeb9140e85f888056b23a6a8dcbb9e725f0ead87ac0f7d459f08544", size = 57962, upload-time = "2026-11-19T04:10:55.928Z" },
 ]
 
 [[package]]

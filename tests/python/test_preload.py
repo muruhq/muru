@@ -228,20 +228,24 @@ def test_import_statements_are_attributed(modules: Path) -> None:
 
     with preload.ImportRecorder() as recorder:
         # The outer module is imported through importlib, the inner one by
-        # its import statement, which the wrapped __import__ sees.
+        # its import statement; each load is attributed by its loader.
 
         recorder.import_module("via_statement_mod")
 
     assert {finding.module for finding in recorder.findings()} == {"inner_socket_mod"}
 
 
-def test_recorder_restores_import() -> None:
+def test_recorder_leaves_import_alone_and_takes_its_finder_out() -> None:
     import builtins
 
     original = builtins.__import__
+    finders = list(sys.meta_path)
+
     with preload.ImportRecorder():
-        assert builtins.__import__ is not original
-    assert builtins.__import__ is original
+        assert builtins.__import__ is original
+        assert len(sys.meta_path) == len(finders) + 1
+
+    assert sys.meta_path == finders
 
 
 def test_socket_closed_before_the_end_is_not_reported(modules: Path) -> None:

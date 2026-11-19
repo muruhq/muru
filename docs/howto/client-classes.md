@@ -84,8 +84,8 @@ Confirmed names are remembered for 24 hours and failures for an hour.
 List files hold one entry a line; blank lines and lines starting with
 `#` are ignored. An input whose only entries come from a list that holds
 none matches nothing, so its rule matches nothing until the list has
-entries. A path in the daemon's file is relative to its
-directory, and one in an applied file is absolute. A list that changes
+entries. A relative path is taken from the directory of the file that
+names the list, the daemon's own or an applied one. A list that changes
 is read again within a second, which
 the `client_class.list_reloaded` event records. Community lists of AI
 crawler user agents or a provider's address ranges can be dropped in as
@@ -248,7 +248,7 @@ applied, and `muructl config export` writes them out. An applied class's
 rule keeps its place among the applied rules when it changes, and a new
 one goes after them; with `--prune` they take the file's order, and
 those the file leaves out are removed. A name the daemon's file defines
-is refused, and a list file must be an absolute path:
+is refused:
 
 ```toml
 [[client_class]]

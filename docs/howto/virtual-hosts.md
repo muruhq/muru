@@ -94,7 +94,7 @@ to paste:
 
 ```console
 $ muructl deploy blog ./blog
-Error: refused: with no hosts declared, every request goes to shop; declare hosts and routes for blog and shop before blog serves, or deploy blog with --hold
+muru: error: refused: with no hosts declared, every request goes to shop; declare hosts and routes for blog and shop before blog serves, or deploy blog with --hold
 
 [host.blog]
 names = ["blog.example.com"]

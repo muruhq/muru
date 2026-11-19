@@ -279,3 +279,41 @@ def test_included_patterns_add_to_the_default(project: Path) -> None:
         wait_for_version(server, "two")
     finally:
         server.stop()
+
+
+GREETING_APP = """
+import os
+
+
+def application(environ, start_response):
+    body = os.environ["GREETING"].encode()
+    start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))])
+    return [body]
+"""
+
+
+def test_a_changed_settings_file_starts_the_release_with_its_settings(tmp_path: Path) -> None:
+    """Issue 783: the new release takes the settings as the file now has
+    them, and one only a restart applies is named."""
+
+    (tmp_path / "greeting_app.py").write_text(GREETING_APP)
+    settings = '[tool.muru]\nentrypoint = "greeting_app:application"\n\n[tool.muru.env]\n'
+    (tmp_path / "pyproject.toml").write_text(settings + 'GREETING = "one"\n')
+    server = support.start(None, workers=1, chdir=tmp_path, args=["--reload"])
+
+    try:
+        assert server.wait_for_log("watching")
+        assert server.get("/").body == b"one"
+
+        server.mark_log()
+        (tmp_path / "pyproject.toml").write_text(
+            settings + 'GREETING = "two!"\n\n[tool.muru.run]\ntoolbar = true\n'
+        )
+        assert server.wait_for_log("switched to release r", timeout=30), server.log()
+        assert server.get("/").body == b"two!"
+        assert (
+            "muru: pyproject.toml changed toolbar; restart the run for it to take effect"
+            in server.log()
+        )
+    finally:
+        server.stop()
