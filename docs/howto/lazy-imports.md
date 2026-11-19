@@ -290,18 +290,25 @@ status` asks for its status:
 Modules loaded for the first time since the fork, by the 4 workers that answered
   MODULE          LOADED BY FIRST REQUEST               MS ADVICE
   shop.export     4 of 4    01M7KQB0T2RJAQ4CG18KYPG80D 41.0 every worker loads it: load it before the fork with preload_modules = ["shop.export"]
-  pandas (deferred) 1 of 4  01M7KQC4YV3M8T5WQ0J1E9X2HB 310.2 deferral pays off: only some workers load it
-  matplotlib (deferred in shop.charts): never needed: deferring it saves it in every worker
+  pandas (deferred) 1 of 4  01M7KQC4YV3M8T5WQ0J1E9X2HB 310.2 deferred in the host; loaded by 1 of 4 workers: loading on first use pays off: only some workers load it
+  matplotlib, imported by shop.charts: deferred in the host; loaded by 0 of 4 workers: the deferral is paying off
+  The counts cover the requests served so far; read them after representative traffic.
 ```
 
 Each row is a module a worker loaded while it served, by how many of the
 workers that answered, the first request that loaded it and its time, with
 deferred modules marked. A module every worker loads is better loaded
-before the fork; one only some of them load pays off loaded on first use,
-or deferred; and a deferred import of the host's load that no worker has
-used is never needed. The figures grow as the workers serve, so read them
-after the application has seen representative traffic. A module loaded
-only inside another's load comes with it and is not listed.
+before the fork, and one only some of them load pays off loaded on first
+use. A module loaded only inside another's load comes with it and is not
+listed.
+
+Each import the host's load deferred is listed whatever its depth, with
+how many of the workers have loaded it so far, which settles whether the
+deferral is worth keeping: loaded by none of them, the deferral is paying
+off; by some, loading on first use pays off; by every one, the module
+costs each worker on a real request and its memory is not shared, so it
+is better loaded before the fork. The figures grow as the workers serve,
+so read them after the application has seen representative traffic.
 
 A private module, one with a part of its name starting with an
 underscore such as `_osx_support`, is never suggested for

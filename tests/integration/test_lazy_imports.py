@@ -184,3 +184,70 @@ def test_the_import_report_reaches_debug_imports_and_muructl_check(tmp_path: Pat
 
     assert checked.returncode == 0, checked.stdout + checked.stderr
     assert "Import report of the host's load of report_app@dev: outcome check" in checked.stdout
+
+
+DEFERRING_APP = """
+import heavy
+import unused_heavy  # noqa: F401
+
+
+def page(environ, start_response):
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    return [str(heavy.VALUE).encode()]
+"""
+
+
+def test_the_workers_section_says_which_deferrals_pay_off(tmp_path: Path) -> None:
+    """Issue 793: of two imports the host deferred, the one the view uses
+    is advised for preload_modules once every worker loaded it, and the
+    one nothing uses is paying off."""
+
+    runtime = support.short_dir("muru-rt-")
+    (tmp_path / "deferring_app.py").write_text(DEFERRING_APP)
+    (tmp_path / "heavy.py").write_text("VALUE = 42\n")
+    (tmp_path / "unused_heavy.py").write_text("")
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.muru]\nentrypoint = "deferring_app:page"\nlazy_imports = true\n'
+        "import_report = true\n\n"
+        '[tool.unwrapt.lazy_modules]\n"deferring_app" = ["heavy", "unused_heavy"]\n'
+    )
+    server = support.start(None, chdir=tmp_path, workers=1, env={"MURU_RUN_DIR": str(runtime)})
+    muructl = [
+        str(support.muructl_path()),
+        "debug",
+        "imports",
+        "--json",
+        "--socket",
+        f"{runtime}/runs/{server.port}/admin.sock",
+    ]
+
+    try:
+        assert server.wait_for_log("admin socket"), server.log()
+        assert server.get("/").body == b"42"
+
+        # The host sends its report once the run connects to it.
+
+        deadline = time.monotonic() + 30.0
+        found: dict[str, Any] = {}
+
+        while time.monotonic() < deadline:
+            answered = subprocess.run(muructl, capture_output=True, text=True, timeout=60)
+            found = json.loads(answered.stdout)
+
+            if found.get("report"):
+                break
+
+            time.sleep(0.1)
+
+        workers = found["workers"]
+        modules = {row["module"]: row["advice"] for row in workers["modules"]}
+        assert modules["heavy"] == (
+            "deferred in the host; loaded by 1 of 1 worker: "
+            'load it before the fork with preload_modules = ["heavy"]'
+        ), workers
+        never = {row["module"]: row["advice"] for row in workers["never_used"]}
+        assert never["unused_heavy"] == (
+            "deferred in the host; loaded by 0 of 1 worker: the deferral is paying off"
+        ), workers
+    finally:
+        server.stop()

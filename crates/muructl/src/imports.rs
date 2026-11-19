@@ -337,15 +337,33 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
     }
 
     let asked = workers.len();
+
+    // Issue 793: the imports the host's load deferred, each of which the
+    // section says how many workers have loaded, so a deferral that pays
+    // off shows as well as one that does not.
+
+    let host_deferred: BTreeMap<String, String> = host
+        .and_then(|host| host["deferred_unused"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            Some((
+                row["module"].as_str()?.to_owned(),
+                row["importer"].as_str().unwrap_or_default().to_owned(),
+            ))
+        })
+        .collect();
+
     let mut rows: Vec<Value> = modules
         .into_iter()
         .filter(|(module, seen)| {
             let ms = seen.ms.iter().copied().fold(0.0, f64::max);
 
             // A module loaded only inside another's load comes with it,
-            // and Muru's own modules are not the application's to move.
+            // unless the host deferred it, and Muru's own modules are not
+            // the application's to move.
 
-            (seen.depth == 0 || filters.module.is_some())
+            (seen.depth == 0 || filters.module.is_some() || host_deferred.contains_key(module))
                 && !module.starts_with("muru.")
                 && filters.under(module)
                 && ms >= filters.min_ms
@@ -358,13 +376,18 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
             let ms = seen.ms.iter().sum::<f64>() / seen.ms.len().max(1) as f64;
             let (at, request, worker) = seen.first.unwrap_or_default();
             let listed = public_module(&module, &worker, &parents);
-            let advice = worker_advice(
-                seen.workers.len(),
-                asked,
-                seen.deferred,
-                &module,
-                listed.as_deref(),
-            );
+
+            let advice = if host_deferred.contains_key(&module) {
+                deferral_advice(seen.workers.len(), asked, &module, listed.as_deref())
+            } else {
+                worker_advice(
+                    seen.workers.len(),
+                    asked,
+                    seen.deferred,
+                    &module,
+                    listed.as_deref(),
+                )
+            };
 
             json!({
                 "module": module,
@@ -388,32 +411,24 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
             .total_cmp(&left["ms"].as_f64().unwrap_or(0.0))
     });
 
-    // A deferral the host's load made that no worker has used saves its
-    // module in every worker.
+    // A deferral the host's load made that no worker has loaded is paying
+    // off, so far.
 
     let loaded: Vec<String> = rows
         .iter()
         .filter_map(|row| row["module"].as_str().map(str::to_owned))
         .collect();
-    let never: Vec<Value> = host
-        .and_then(|host| host["deferred_unused"].as_array())
-        .map(|unused| {
-            unused
-                .iter()
-                .filter(|row| {
-                    let module = row["module"].as_str().unwrap_or_default();
-                    !loaded.iter().any(|seen| seen == module) && filters.under(module)
-                })
-                .map(|row| {
-                    json!({
-                        "module": row["module"],
-                        "importer": row["importer"],
-                        "advice": "never needed: deferring it saves it in every worker",
-                    })
-                })
-                .collect()
+    let never: Vec<Value> = host_deferred
+        .iter()
+        .filter(|(module, _)| !loaded.contains(module) && filters.under(module))
+        .map(|(module, importer)| {
+            json!({
+                "module": module,
+                "importer": importer,
+                "advice": deferral_advice(0, asked, module, Some(module)),
+            })
         })
-        .unwrap_or_default();
+        .collect();
 
     let top = if filters.top == 0 {
         DEFAULT_TOP
@@ -509,6 +524,33 @@ fn worker_advice(
         "deferral pays off: only some workers load it".to_owned()
     } else {
         "loading on first use pays off: only some workers load it".to_owned()
+    }
+}
+
+/// What to say of an import the host's load deferred that `loaded_by`
+/// of `asked` workers have loaded (issue 793): none, paying off; some,
+/// loading on first use pays off; every one, better loaded before the
+/// fork, naming `listed` in `preload_modules` when there is one.
+fn deferral_advice(loaded_by: usize, asked: usize, module: &str, listed: Option<&str>) -> String {
+    let noun = if asked == 1 { "worker" } else { "workers" };
+    let counted = format!("deferred in the host; loaded by {loaded_by} of {asked} {noun}");
+
+    if loaded_by == 0 {
+        return format!("{counted}: the deferral is paying off");
+    }
+
+    if loaded_by < asked {
+        return format!("{counted}: loading on first use pays off: only some workers load it");
+    }
+
+    match listed {
+        Some(listed) if listed == module => {
+            format!("{counted}: load it before the fork with preload_modules = [\"{listed}\"]")
+        }
+        Some(listed) => format!(
+            "{counted}: load it before the fork with preload_modules = [\"{listed}\"], whose load loads it"
+        ),
+        None => format!("{counted}, so deferring it gains nothing"),
     }
 }
 
@@ -911,10 +953,26 @@ fn render_workers(out: &mut String, workers: &Value) {
     for row in &never {
         let _ = writeln!(
             out,
-            "  {} (deferred in {}): {}",
+            "  {}, imported by {}: {}",
             text(&row["module"]),
             text(&row["importer"]),
             text(&row["advice"])
+        );
+    }
+
+    // The counts grow as the workers serve.
+
+    let deferrals = !never.is_empty()
+        || modules.iter().any(|row| {
+            row["advice"]
+                .as_str()
+                .is_some_and(|advice| advice.starts_with("deferred in the host"))
+        });
+
+    if deferrals {
+        let _ = writeln!(
+            out,
+            "  The counts cover the requests served so far; read them after representative traffic."
         );
     }
 }
@@ -1128,6 +1186,55 @@ mod tests {
             text.contains(
                 "The worker that answered has loaded no module for the first time since the fork."
             ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_deferral_the_host_made_says_how_many_workers_loaded_it() {
+        let mut answered = response(&[
+            (0, loads(&[("xlsx", "R1", true), ("charts", "R2", true)])),
+            (1, loads(&[("xlsx", "R3", true)])),
+        ]);
+        let mut host = host();
+        host["deferred_unused"] = json!([
+            {"module": "pandas", "importer": "shop.views"},
+            {"module": "xlsx", "importer": "shop.export"},
+            {"module": "charts", "importer": "shop.views"}
+        ]);
+        answered.host_json = host.to_string();
+        let found = document(&answered, None, &Filters::default()).unwrap();
+        let advice = |module: &str| {
+            found["workers"]["modules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["module"] == module)
+                .map(|row| row["advice"].as_str().unwrap().to_owned())
+        };
+
+        // Issue 793: every worker, some, or none.
+
+        assert_eq!(
+            advice("xlsx").unwrap(),
+            "deferred in the host; loaded by 2 of 2 workers: load it before the fork with preload_modules = [\"xlsx\"]"
+        );
+        assert_eq!(
+            advice("charts").unwrap(),
+            "deferred in the host; loaded by 1 of 2 workers: loading on first use pays off: only some workers load it"
+        );
+        assert_eq!(
+            found["workers"]["never_used"][0]["advice"],
+            "deferred in the host; loaded by 0 of 2 workers: the deferral is paying off"
+        );
+
+        let text = render(&found);
+        assert!(
+            text.contains("  pandas, imported by shop.views: deferred in the host; loaded by 0 of 2 workers: the deferral is paying off\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("The counts cover the requests served so far"),
             "{text}"
         );
     }
