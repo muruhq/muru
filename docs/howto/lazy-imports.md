@@ -251,11 +251,15 @@ Imports that loaded a module, by cumulative time
 
 - **3.15** and **UNWRAPT** say whether each way of deferring can defer the
   import's form: `from x import y` defers on Python 3.15 alone, and below
-  it only once rewritten as `import x`.
+  it only once rewritten as `import x`. A module first loaded by a `from`
+  import is counted, with its time, like any other. Its SAVES MS is 0,
+  since unwrapt cannot defer it, and the advice names it only when it is
+  in the project's own code and its load takes at least 10 ms, with the
+  rewrite it needs below 3.15. A `from` import in a package the project
+  depends on is never advised.
 
 An import that takes less than half a millisecond is not kept as a
-candidate. The line of an import made while the host loads under preload
-is not known, so the chains give its file alone.
+candidate.
 
 The options narrow it:
 

@@ -55,6 +55,7 @@ def test_an_import_unwrapt_defers_loads_in_the_worker_on_first_use(tmp_path: Pat
 
 VIEWS = """
 import report_slow  # noqa: F401
+from report_pkg import part  # noqa: F401
 
 
 def page(environ, start_response):
@@ -71,6 +72,9 @@ def test_the_import_report_reaches_debug_imports_and_muructl_check(tmp_path: Pat
     runtime = support.short_dir("muru-rt-")
     (tmp_path / "report_app.py").write_text(VIEWS)
     (tmp_path / "report_slow.py").write_text("import time\n\ntime.sleep(0.005)\n")
+    (tmp_path / "report_pkg").mkdir()
+    (tmp_path / "report_pkg" / "__init__.py").write_text("")
+    (tmp_path / "report_pkg" / "part.py").write_text("import time\n\ntime.sleep(0.005)\n")
     (tmp_path / "pyproject.toml").write_text(
         '[tool.muru]\nentrypoint = "report_app:page"\nimport_report = true\n'
     )
@@ -110,6 +114,18 @@ def test_the_import_report_reaches_debug_imports_and_muructl_check(tmp_path: Pat
         assert targets["report_slow"] == "entrypoint", report["candidates"]
         modules = {row["module"]: row for row in found["workers"]["modules"]}
         assert modules["csv"]["loaded_by"] == 1, found["workers"]
+
+        # Issue 788: a package loaded by a from-import is in the report,
+        # and --module finds the statement that loaded it.
+
+        assert targets["report_pkg"] == "entrypoint", report["candidates"]
+        chain = subprocess.run(
+            [*muructl[:-3], "--module", "report_pkg", *muructl[-2:]],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        ).stdout
+        assert "report_app -> report_pkg" in chain and "report_app.py:3" in chain, chain
 
         # Issue 753: the load is an event with the report's figures, its
         # time a metric, and the worker's loads counted once it reports.

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from muru import _imports, _instrumentation, _lazy_imports
+from muru import _import_report, _imports, _instrumentation, _lazy_imports, preload
 from muru._context import Context, _request_id
 from muru._instrumentation import Target
 
@@ -59,17 +59,18 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
 
 
 def load(context: Context, outcome: str) -> None:
-    """Load the project as a host does, the hooks and the entrypoint each bracketed."""
+    """Load the project as a host does, under the import check, each entry point bracketed."""
 
     _lazy_imports.load_started(context)
 
-    for target, module in (
-        (Target("hooks", "", "shop_hooks"), "shop_hooks"),
-        (Target("entrypoint", "", "shop_app:app"), "shop_app"),
-    ):
-        _lazy_imports.before_import(context, target)
-        __import__(module)
-        _lazy_imports.after_import(context, target)
+    with preload.ImportRecorder() as recorder:
+        for target, module in (
+            (Target("hooks", "", "shop_hooks"), "shop_hooks"),
+            (Target("entrypoint", "", "shop_app:app"), "shop_app"),
+        ):
+            _lazy_imports.before_import(context, target)
+            recorder.import_module(module)
+            _lazy_imports.after_import(context, target)
 
     _lazy_imports.load_finished(context, outcome)
 
@@ -115,6 +116,40 @@ def test_the_hosts_load_is_labelled_by_target_and_the_advice_is_configuration(
     taken = _lazy_imports.take_payload()
     assert taken is not None and json.loads(taken)["labels"]["role"] == "host"
     assert _lazy_imports.payload() is None
+
+
+def test_a_module_loaded_by_a_from_import_is_counted_and_advised_only_in_own_code(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue 788: the import check no longer hides what a from-import
+    # loads. A package from outside the project, imported only by from
+    # statements, is counted; a from-import of the project's own is
+    # advised once it takes long enough, a library's never.
+
+    package = project.parent / "vendor" / "vendored_pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("from vendored_pkg import part\n")
+    (package / "part.py").write_text("import time\ntime.sleep(0.004)\n")
+    (project / "shop_app.py").write_text(
+        "from vendored_pkg import part\nfrom shop_slow import time\n"
+    )
+    monkeypatch.setattr(_import_report, "REWRITE_MIN_MS", 4.0)
+    _lazy_imports.configure({"defer": False, "report": True, "workers": 2})
+    load(Context(), _instrumentation.FORK)
+    payload = _lazy_imports.payload()
+
+    assert payload is not None
+    edges = [edge for edge in payload["report"]["edges"] if edge["importer"] == "shop_app"]
+    loaded = {edge["imported"]: edge for edge in edges if edge["loaded"]}
+    assert loaded["vendored_pkg"]["kind"] == "from"
+    assert loaded["vendored_pkg"]["file"].endswith("shop_app.py")
+    assert loaded["vendored_pkg"]["line"] == 1
+    assert loaded["vendored_pkg"]["cum_ms"] >= 4.0
+    assert payload["summary"]["total_import_ms"] >= 4.0 + 5.0
+
+    advice = {row["module"]: row for row in payload["findings"] if row["kind"] == "defer"}
+    assert "vendored_pkg" not in advice
+    assert "below it only once rewritten as import shop_slow" in advice["shop_slow"]["advice"]
 
 
 def test_a_deferral_used_before_the_fork_gains_nothing(project: Path) -> None:

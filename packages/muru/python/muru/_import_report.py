@@ -36,13 +36,22 @@ import sys
 from collections.abc import Iterable
 from typing import Any
 
-__all__ = ["DEFER_MIN_MS", "DEFER_SHOWN", "analyse"]
+__all__ = ["DEFER_MIN_MS", "DEFER_SHOWN", "REWRITE_MIN_MS", "analyse"]
 
 DEFER_MIN_MS = 1.0
 """The least a candidate must save for the analysis to advise deferring it."""
 
 DEFER_SHOWN = 10
 """The most candidates the analysis advises deferring."""
+
+REWRITE_MIN_MS = 10.0
+"""The least a from-import in the project's own code must take for the analysis to advise it.
+
+unwrapt cannot defer ``from X import Y``, so below Python 3.15 deferring
+it means rewriting the statement as ``import X``, which is worth asking
+of a project only for a large saving. A from-import in a library is
+never advised: the project cannot rewrite it.
+"""
 
 CANDIDATE_MIN_MS = 0.5
 """The least an import must take to be kept as a candidate.
@@ -213,18 +222,33 @@ def _deferrals(
 ) -> list[dict[str, Any]]:
     # The candidates deferring which saves the most, each with how.
 
-    chosen = [
-        candidate
-        for candidate in candidates
-        if _application(candidate["importer"])
-        and not candidate["already_lazy"]
-        and (candidate["unwrapt"] or candidate["native"])
-        and candidate["saving_ms"] >= DEFER_MIN_MS
-    ]
-    chosen.sort(key=lambda candidate: (-candidate["saving_ms"], candidate["edge"]))
+    chosen: list[tuple[float, dict[str, Any]]] = []
+
+    for candidate in candidates:
+        if not _application(candidate["importer"]) or candidate["already_lazy"]:
+            continue
+
+        if candidate["unwrapt"]:
+            if candidate["saving_ms"] >= DEFER_MIN_MS:
+                chosen.append((candidate["saving_ms"], candidate))
+
+            continue
+
+        # A form unwrapt cannot defer, a from-import above all, which
+        # unwrapt gives no saving: in the project's own code, and when
+        # nothing else imports the module eagerly, deferring it saves
+        # its whole load (issue 788).
+
+        own = _own(edges.get(candidate["edge"]), root)
+        saving = 0.0 if candidate["shared"] else candidate["cum_ms"]
+
+        if candidate["native"] and own and saving >= REWRITE_MIN_MS:
+            chosen.append((saving, candidate))
+
+    chosen.sort(key=lambda pair: (-pair[0], pair[1]["edge"]))
     findings = []
 
-    for candidate in chosen[:DEFER_SHOWN]:
+    for saving, candidate in chosen[:DEFER_SHOWN]:
         importer, imported = candidate["importer"], candidate["imported"]
         advice, config = _advice(importer, imported, _own(edges.get(candidate["edge"]), root))
 
@@ -244,8 +268,8 @@ def _deferrals(
                 "importer": importer,
                 "target": candidate["target"],
                 "ms": candidate["cum_ms"],
-                "saving_ms": candidate["saving_ms"],
-                "pays": _pays(preloaded, workers, candidate["saving_ms"]),
+                "saving_ms": saving,
+                "pays": _pays(preloaded, workers, saving),
                 "advice": advice,
                 "config": config,
             }

@@ -41,6 +41,7 @@ from muru._context import request_id
 __all__ = [
     "LOADS_KEPT",
     "WORKER_LOADS_KEPT",
+    "find_after",
     "install",
     "loaded",
     "mark_deferred",
@@ -230,6 +231,39 @@ def _trigger() -> str:
     return f"{frame.f_code.co_filename}:{frame.f_lineno}"
 
 
+def find_after(
+    finder: object, name: str, path: Sequence[str] | None, target: ModuleType | None
+) -> ModuleSpec | None:
+    """Find a module through the finders after `finder` on ``sys.meta_path``.
+
+    The finders are asked as the import system asks them, in order, and
+    the first spec found is returned; None when none of them finds it.
+    The import check's finder (``muru.preload``) uses this too.
+    """
+
+    found = False
+
+    for other in list(sys.meta_path):
+        if other is finder:
+            found = True
+            continue
+
+        if not found:
+            continue
+
+        find = getattr(other, "find_spec", None)
+
+        if find is None:
+            continue
+
+        spec: ModuleSpec | None = find(name, path, target)
+
+        if spec is not None:
+            return spec
+
+    return None
+
+
 class _Finder:
     """The finder first on ``sys.meta_path``, which times the loads of the others."""
 
@@ -285,29 +319,7 @@ class _Finder:
     def _search(
         self, name: str, path: Sequence[str] | None, target: ModuleType | None
     ) -> ModuleSpec | None:
-        # The finders after this one, as the import system asks them.
-
-        found = False
-
-        for finder in list(sys.meta_path):
-            if finder is self:
-                found = True
-                continue
-
-            if not found:
-                continue
-
-            find = getattr(finder, "find_spec", None)
-
-            if find is None:
-                continue
-
-            spec: ModuleSpec | None = find(name, path, target)
-
-            if spec is not None:
-                return spec
-
-        return None
+        return find_after(self, name, path, target)
 
     def invalidate_caches(self) -> None:
         """Nothing is cached here."""
