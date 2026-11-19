@@ -172,11 +172,13 @@ def test_the_runtime_times_the_outermost_loads_alone(
 def test_a_request_waiting_on_another_threads_load_is_kept_with_who_loads_it(
     source: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Issue 787: the waiting thread never reaches the finder; it waits in
-    # the import system's _lock_unlock_module, which the runtime wraps.
+    # Issue 787: the waiting thread never reaches the finder; it waits on
+    # the module's lock, whose class the runtime replaces (issue 800).
     # That is private API, so this fails if it moves.
 
-    assert importlib._bootstrap._lock_unlock_module is _imports._waiting  # type: ignore[attr-defined]
+    bootstrap: Any = importlib._bootstrap
+    assert _imports._module_lock is not None
+    assert issubclass(bootstrap._ModuleLock, _imports._module_lock)
     monkeypatch.setattr(_imports, "WAIT_MIN_MS", 0.0)
 
     (source / "gate.py").write_text(
@@ -187,20 +189,19 @@ def test_a_request_waiting_on_another_threads_load_is_kept_with_who_loads_it(
     (source / "circle_b.py").write_text("import circle_a\n")
     import gate
 
-    # The real function, told when the waiting thread is in it, so the
-    # load is let go only once the other request waits.
+    # The module's lock, as the waiting thread is about to block on it,
+    # lets the load go.
 
     waiting = threading.Event()
-    original = _imports._lock_unlock
-    assert original is not None
+    get_module_lock = bootstrap._get_module_lock
 
-    def entered(name: str) -> None:
-        if name == "slow":
+    def lock_for(module: str) -> Any:
+        if module == "slow" and _request_id.get() == "R2":
             waiting.set()
 
-        original(name)
+        return get_module_lock(module)
 
-    monkeypatch.setattr(_imports, "_lock_unlock", entered)
+    monkeypatch.setattr(bootstrap, "_get_module_lock", lock_for)
     waits: list[float] = []
     _imports._start("R1")
     _imports._start("R2", wait_tally=waits.append)
@@ -245,13 +246,13 @@ def test_a_request_waiting_on_another_threads_load_is_kept_with_who_loads_it(
 def test_a_wait_through_import_module_is_kept_once(
     source: Path, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
-    # Issue 794: importlib.import_module blocks in the module lock manager
-    # _find_and_load enters, which the runtime replaces, before it calls
-    # _lock_unlock_module, which must not count the wait again. Python
-    # 3.15 locks a dotted name through a hierarchical lock manager.
+    # Issue 794: importlib.import_module blocks on the module's lock in
+    # _find_and_load, through a lock manager on Python 3.11 to 3.15.1 (a
+    # hierarchical one for a dotted name on 3.15) and directly from 3.15.2
+    # (issue 800), and on 3.15.1 and before then takes the lock again
+    # through _lock_unlock_module, which must not count the wait twice.
 
     bootstrap: Any = importlib._bootstrap
-    assert issubclass(bootstrap._ModuleLockManager, _imports._lock_managers["_ModuleLockManager"])
     monkeypatch.setattr(_imports, "WAIT_MIN_MS", 0.0)
 
     (source / "gate.py").write_text(
