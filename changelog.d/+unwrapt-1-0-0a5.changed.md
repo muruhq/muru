@@ -1,0 +1,1 @@
+`lazy_imports` and `import_report` now need unwrapt 1.0.0a5 or later in the project's environment, and a release with an older one starts without deferral or a report, with the two versions in the log.

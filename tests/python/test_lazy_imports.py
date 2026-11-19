@@ -129,3 +129,20 @@ def test_without_unwrapt_the_error_says_to_add_it(
 
         with pytest.raises(RuntimeError, match="needs the unwrapt package"):
             _lazy_imports.load_started(Context())
+
+
+def test_an_unwrapt_too_old_is_an_error_naming_both_versions(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(unwrapt, "__version_info__", ("1", "0", "0", "a4"))
+    monkeypatch.setattr(unwrapt, "__version__", "1.0.0a4")
+
+    with pytest.raises(RuntimeError, match=r"needs unwrapt 1\.0\.0a5 or later.*has 1\.0\.0a4"):
+        _lazy_imports.load_started(Context())
+
+    # A later release, and a release candidate of the next, are new enough.
+
+    assert _lazy_imports._version(("1", "0", "0", "a10")) > _lazy_imports._version(
+        ("1", "0", "0", "a5")
+    )
+    assert _lazy_imports._version(("1", "0", "0")) > _lazy_imports._version(("1", "0", "0", "rc1"))

@@ -57,7 +57,7 @@ entrypoint = "shop.app:app"
 lazy_imports = true
 ```
 
-`lazy_imports` needs unwrapt 1.0.0a2 or later in the project's
+`lazy_imports` needs unwrapt 1.0.0a5 or later in the project's
 environment. Muru imports unwrapt only when `lazy_imports` is on.
 
 ## Imports in code the project does not own
@@ -95,7 +95,7 @@ With none of them, only each module's own `__lazy_modules__` is
 deferred. `muructl run --print-config` and `muructl serve --print-config`
 show `lazy_imports` and the file the host finds.
 
-A missing unwrapt, one older than 1.0.0a2, and a configuration file
+A missing unwrapt, one older than 1.0.0a5, and a configuration file
 unwrapt cannot use are logged with the reason, and the release starts
 without deferral.
 

@@ -73,6 +73,10 @@ __all__ = [
 
 NAMED = 10
 
+# The oldest unwrapt the module works with, as its __version_info__.
+
+UNWRAPT_LEAST = ("1", "0", "0", "a5")
+
 # The settings Muru gives the module.
 
 _defer = True
@@ -369,15 +373,36 @@ def _module() -> Any:
             f"add it to the project's dependencies ({error})"
         ) from error
 
-    # install() taking a configuration, deferred(), on_resolve(), the
-    # scopes and stop_profile() returning the report arrived in 1.0.0a2.
+    # The import report reads what 1.0.0a5 added: the statement's own
+    # place under a wrapping hook, extension modules' imports, declared
+    # and deferred laziness apart, and use at load (section 6.18).
 
-    if not all(
-        hasattr(module, name) for name in ("on_resolve", "deferred", "push_scope", "stop_profile")
-    ):
+    if _version(getattr(module, "__version_info__", ())) < _version(UNWRAPT_LEAST):
         raise RuntimeError(
-            f"{_key()} needs unwrapt 1.0.0a2 or later, and the environment has "
-            f"{getattr(module, '__version__', 'an older one')}"
+            f"{_key()} needs unwrapt {'.'.join(UNWRAPT_LEAST[:3])}{UNWRAPT_LEAST[3]} or later, "
+            f"and the environment has {getattr(module, '__version__', 'an older one')}"
         )
 
     return module
+
+
+def _version(info: tuple[str, ...]) -> tuple[int, int, int, int, int]:
+    # unwrapt's __version_info__, such as ("1", "0", "0", "a5"), as a key
+    # that sorts as the releases do: an alpha before a beta before a
+    # release candidate before the release. Anything unreadable sorts
+    # first, as too old.
+
+    try:
+        major, minor, micro = (int(part) for part in info[:3])
+    except ValueError:
+        return (0, 0, 0, 0, 0)
+
+    suffix = info[3] if len(info) > 3 else ""
+
+    for rank, tag in enumerate(("a", "b", "rc")):
+        number = suffix[len(tag) :]
+
+        if suffix.startswith(tag) and number.isdigit():
+            return (major, minor, micro, rank, int(number))
+
+    return (major, minor, micro, 3, 0)
