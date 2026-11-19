@@ -146,6 +146,10 @@ def test_a_record_past_its_limit_keeps_the_first_loads_to_start(
     assert [load["module"] for load in worker["loads"]] == ["report", "part0", "part1"]
     assert worker["loads"][0]["depth"] == 0 and worker["loaded"] == 6
 
+    # Issue 763: each load names the one it was nested in.
+
+    assert [load["parent"] for load in worker["loads"]] == ["", "report", "report"]
+
 
 def test_the_runtime_times_the_outermost_loads_alone(
     source: Path, monkeypatch: pytest.MonkeyPatch

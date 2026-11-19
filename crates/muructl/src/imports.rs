@@ -294,6 +294,11 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
 
     let mut modules: BTreeMap<String, Seen> = BTreeMap::new();
 
+    // Each worker's loads with the load each was nested in, for a private
+    // module's nearest public ancestor (issue 763).
+
+    let mut parents: BTreeMap<(String, String), String> = BTreeMap::new();
+
     for (name, result) in workers {
         let loads = result["modules"]["loads"]
             .as_array()
@@ -311,6 +316,10 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
             });
             let at = load["at_unix_ms"].as_u64().unwrap_or(u64::MAX);
             let request = load["request"].as_str().unwrap_or_default().to_owned();
+            parents.insert(
+                (name.clone(), module.to_owned()),
+                load["parent"].as_str().unwrap_or_default().to_owned(),
+            );
 
             if seen
                 .first
@@ -347,8 +356,15 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
         })
         .map(|(module, seen)| {
             let ms = seen.ms.iter().sum::<f64>() / seen.ms.len().max(1) as f64;
-            let advice = worker_advice(seen.workers.len(), asked, seen.deferred, &module);
             let (at, request, worker) = seen.first.unwrap_or_default();
+            let listed = public_module(&module, &worker, &parents);
+            let advice = worker_advice(
+                seen.workers.len(),
+                asked,
+                seen.deferred,
+                &module,
+                listed.as_deref(),
+            );
 
             json!({
                 "module": module,
@@ -413,25 +429,80 @@ fn workers_section(workers: &[(String, Value)], host: Option<&Value>, filters: &
     })
 }
 
-/// What to do about a module `loaded_by` of `asked` workers loaded on
-/// first use.
-fn worker_advice(loaded_by: usize, asked: usize, deferred: bool, module: &str) -> String {
-    if loaded_by >= asked && asked > 1 {
-        if deferred {
-            return format!(
-                "every worker loads it, so deferring it gains nothing: load it before the fork with preload_modules = [\"{module}\"]"
-            );
+/// Whether a module is private: a part of its name starts with an
+/// underscore, as `_osx_support` or `_sysconfigdata_t_darwin_darwin`,
+/// whose names often change with the platform and the build.
+fn private(module: &str) -> bool {
+    module.split('.').any(|part| part.starts_with('_'))
+}
+
+/// The module to list in `preload_modules` for one a worker loaded: the
+/// module itself, or for a private one the nearest public module whose
+/// load it was part of in that worker; none when there is none (issue
+/// 763).
+fn public_module(
+    module: &str,
+    worker: &str,
+    parents: &BTreeMap<(String, String), String>,
+) -> Option<String> {
+    let mut current = module.to_owned();
+
+    // A chain of loads is as deep as the imports nest, which a bound
+    // keeps finite whatever the answers say.
+
+    for _ in 0..64 {
+        if !private(&current) {
+            return Some(current);
         }
 
-        return format!(
-            "every worker loads it: load it before the fork with preload_modules = [\"{module}\"]"
-        );
+        current = parents
+            .get(&(worker.to_owned(), current))
+            .filter(|parent| !parent.is_empty())?
+            .clone();
+    }
+
+    None
+}
+
+/// What to do about a module `loaded_by` of `asked` workers loaded on
+/// first use, with `listed` the module to name in `preload_modules`: the
+/// module itself, the public module that loaded a private one, or none.
+fn worker_advice(
+    loaded_by: usize,
+    asked: usize,
+    deferred: bool,
+    module: &str,
+    listed: Option<&str>,
+) -> String {
+    let preload = match listed {
+        Some(listed) if listed == module => {
+            format!("load it before the fork with preload_modules = [\"{listed}\"]")
+        }
+        Some(listed) => format!(
+            "load it before the fork with preload_modules = [\"{listed}\"], whose load loads it"
+        ),
+        None => String::new(),
+    };
+
+    if loaded_by >= asked && asked > 1 {
+        return match (deferred, preload.is_empty()) {
+            (_, true) => {
+                "every worker loads it; a private module is not one to list in preload_modules"
+                    .to_owned()
+            }
+            (true, false) => {
+                format!("every worker loads it, so deferring it gains nothing: {preload}")
+            }
+            (false, false) => format!("every worker loads it: {preload}"),
+        };
     }
 
     if loaded_by >= asked {
-        return format!(
-            "the worker loaded it on first use: load it before the fork with preload_modules = [\"{module}\"] if most requests need it"
-        );
+        if preload.is_empty() {
+            return "the worker loaded it on first use; a private module is not one to list in preload_modules".to_owned();
+        }
+
+        return format!("the worker loaded it on first use: {preload} if most requests need it");
     }
 
     if deferred {
@@ -712,6 +783,16 @@ fn notes(row: &Value) -> String {
     notes.join(", ")
 }
 
+/// Text with its first letter a capital.
+fn capitalised(text: &str) -> String {
+    let mut characters = text.chars();
+
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
 fn yes(value: &Value) -> String {
     if value.as_bool() == Some(true) {
         "yes".to_owned()
@@ -775,17 +856,25 @@ fn render_workers(out: &mut String, workers: &Value) {
         .unwrap_or_default();
     let noun = if asked == 1 { "worker" } else { "workers" };
 
+    let answered = if asked == 1 {
+        "the worker that answered".to_owned()
+    } else {
+        format!("the {asked} {noun} that answered")
+    };
+
     if modules.is_empty() && never.is_empty() {
+        let have = if asked == 1 { "has" } else { "have" };
         let _ = writeln!(
             out,
-            "\nThe {asked} {noun} asked have loaded no module for the first time since the fork."
+            "\n{} {have} loaded no module for the first time since the fork.",
+            capitalised(&answered)
         );
         return;
     }
 
     let _ = writeln!(
         out,
-        "\nModules the {asked} {noun} asked loaded for the first time since the fork"
+        "\nModules loaded for the first time since the fork, by {answered}"
     );
     let rows: Vec<Vec<String>> = modules
         .iter()
@@ -976,6 +1065,70 @@ mod tests {
         assert!(
             row.ends_with("module:shop.stats yes  yes     preload_modules"),
             "{row}"
+        );
+    }
+
+    #[test]
+    fn a_private_module_is_suggested_through_its_public_ancestor_or_not_at_all() {
+        let worker = json!({
+            "modules": {
+                "loads": [
+                    {"module": "_sysconfigdata_t_darwin_darwin", "request": "R1", "ms": 0.5, "depth": 0,
+                     "deferred": false, "at_unix_ms": 1000, "parent": ""},
+                    {"module": "urllib.request", "request": "R1", "ms": 5.0, "depth": 0,
+                     "deferred": false, "at_unix_ms": 1001, "parent": ""},
+                    {"module": "_osx_support", "request": "R1", "ms": 0.1, "depth": 1,
+                     "deferred": false, "at_unix_ms": 1002, "parent": "urllib.request"}
+                ],
+                "loaded": 3,
+            },
+            "report": null,
+        });
+        let answered = response(&[(0, worker.clone()), (1, worker)]);
+        let advice = |module: &str| {
+            let filters = Filters {
+                module: Some(module.to_owned()),
+                ..Filters::default()
+            };
+            let found = document(&answered, None, &filters).unwrap();
+            found["workers"]["modules"][0]["advice"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+
+        // Issue 763: a private module is never listed; the public module
+        // whose load it was part of is, and with none there is no entry.
+
+        assert_eq!(
+            advice("_osx_support"),
+            "every worker loads it: load it before the fork with preload_modules = [\"urllib.request\"], whose load loads it"
+        );
+        assert_eq!(
+            advice("_sysconfigdata_t_darwin_darwin"),
+            "every worker loads it; a private module is not one to list in preload_modules"
+        );
+
+        // The heading says whose loads they are.
+
+        let text = render(&document(&answered, None, &Filters::default()).unwrap());
+        assert!(
+            text.contains(
+                "\nModules loaded for the first time since the fork, by the 2 workers that answered\n"
+            ),
+            "{text}"
+        );
+        let one = response(&[(0, loads(&[]))]);
+        let nothing = Filters {
+            packages: vec!["absent".to_owned()],
+            ..Filters::default()
+        };
+        let text = render(&document(&one, None, &nothing).unwrap());
+        assert!(
+            text.contains(
+                "The worker that answered has loaded no module for the first time since the fork."
+            ),
+            "{text}"
         );
     }
 

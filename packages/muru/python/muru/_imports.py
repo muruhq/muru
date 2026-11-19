@@ -125,7 +125,8 @@ _counting = threading.Lock()
 # Each module this worker has loaded since the finder went in, for the
 # import report's section on the workers (issue 741): the module, the
 # request it ran under, its milliseconds, its depth, whether it resolved
-# a deferred import, and when it ended, the first WORKER_LOADS_KEPT to
+# a deferred import, when it ended, and the load it was nested in
+# (issue 763), the first WORKER_LOADS_KEPT to
 # start; one still under way has no end yet.
 
 _worker: dict[str, list[Any]] = {}
@@ -291,7 +292,8 @@ def worker_loads() -> dict[str, Any]:
 
     Each is its module, the request it ran under (empty outside one),
     its milliseconds, its depth beneath other loads, whether it resolved
-    a deferred import, and when it ended in Unix milliseconds, the first
+    a deferred import, when it ended in Unix milliseconds, and the load it
+    was nested in (empty for an outermost one), the first
     ``WORKER_LOADS_KEPT`` to start, leaving out one still under way; with
     how many loads there were in all.
     """
@@ -305,8 +307,9 @@ def worker_loads() -> dict[str, Any]:
                 "depth": depth,
                 "deferred": deferred,
                 "at_unix_ms": at,
+                "parent": parent,
             }
-            for module, (request, ms, depth, deferred, at) in _worker.items()
+            for module, (request, ms, depth, deferred, at, parent) in _worker.items()
             if at
         ]
         count = _counts[0]
@@ -516,11 +519,18 @@ class _Timed:
             self._begin()
 
         _local.depth = self._depth + 1
+        loading: list[str] | None = getattr(_local, "loading", None)
+
+        if loading is None:
+            loading = _local.loading = []
+
+        loading.append(self._spec.name)
 
         try:
             loader.exec_module(module)
         finally:
             _local.depth = self._depth
+            loading.pop()
             self._note(time.perf_counter())
 
     def _begin(self) -> None:
@@ -536,7 +546,10 @@ class _Timed:
 
         with _counting:
             if len(_worker) < WORKER_LOADS_KEPT and name not in _worker:
-                self._worker_entry = _worker[name] = [current or "", 0.0, depth, False, 0]
+                loading = getattr(_local, "loading", None)
+                parent = loading[-1] if loading else ""
+                entry = [current or "", 0.0, depth, False, 0, parent]
+                self._worker_entry = _worker[name] = entry
 
         kept = self._kept
 

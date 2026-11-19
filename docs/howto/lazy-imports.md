@@ -287,7 +287,7 @@ it has loaded for the first time since the fork, as `muructl debug
 status` asks for its status:
 
 ```
-Modules the 4 workers asked loaded for the first time since the fork
+Modules loaded for the first time since the fork, by the 4 workers that answered
   MODULE          LOADED BY FIRST REQUEST               MS ADVICE
   shop.export     4 of 4    01M7KQB0T2RJAQ4CG18KYPG80D 41.0 every worker loads it: load it before the fork with preload_modules = ["shop.export"]
   pandas (deferred) 1 of 4  01M7KQC4YV3M8T5WQ0J1E9X2HB 310.2 deferral pays off: only some workers load it
@@ -295,13 +295,20 @@ Modules the 4 workers asked loaded for the first time since the fork
 ```
 
 Each row is a module a worker loaded while it served, by how many of the
-workers asked, the first request that loaded it and its time, with
+workers that answered, the first request that loaded it and its time, with
 deferred modules marked. A module every worker loads is better loaded
 before the fork; one only some of them load pays off loaded on first use,
 or deferred; and a deferred import of the host's load that no worker has
 used is never needed. The figures grow as the workers serve, so read them
 after the application has seen representative traffic. A module loaded
 only inside another's load comes with it and is not listed.
+
+A private module, one with a part of its name starting with an
+underscore such as `_osx_support`, is never suggested for
+`preload_modules`: its name often changes with the platform and the
+build. The suggestion names instead the nearest public module whose load
+it was part of in that worker, and a private module with none has no
+suggestion.
 
 ### Checking a change
 
