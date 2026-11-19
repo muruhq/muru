@@ -98,7 +98,7 @@ def test_a_deferred_module_a_request_loads_is_marked_in_its_record(project: Path
     finally:
         _request_id.reset(token)
 
-    loads, _count, _ms = _imports._take("R1")
+    loads, _count, _ms, _waits = _imports._take("R1")
     marked = {name: (trigger, deferred) for _at, _ms, name, trigger, depth, deferred in loads}
 
     # The line that used the deferred import is its trigger, past

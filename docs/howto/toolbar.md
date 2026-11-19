@@ -224,6 +224,12 @@ Server-Timing: queue;dur=0.21, app;dur=17.93, muru;desc="01JCZ8X4R3T5V6W7Y8Z9A0B
   modules each one imported in turn included. A module is loaded once in
   each worker, so the entry is on the first request that needed it.
 
+- `import_wait`, when the request asked for a module another request in
+  the same worker was still loading for the first time, is how long it
+  waited for that load to finish before its response head. The time is
+  the other request's load, so it is not in `import`, and adding up
+  `import` across requests counts each load once.
+
 - `muru` carries the request's ID, the same as `X-Request-ID`.
 
 The browser's developer tools show the figures with no setup: in the
@@ -304,6 +310,15 @@ stands out in the rest, which [has a section of its own](#hints):
   what the [`preload_modules`](../explanation/preload.md#modules-loaded-on-first-use)
   setting does.
 
+  - **waiting for an import**, each wait for a module another request
+    in the worker was still loading for the first time, as a segment
+    named by the module, with the request loading it. The import system
+    holds back every other thread that asks for a module until its load
+    is done, so a request that needs the module while another loads it
+    waits for that load rather than loading it itself. A wait of less
+    than a millisecond is not shown, and neither is a wait through
+    `importlib.import_module`, which the import system makes elsewhere.
+
   A row of several waits, stretches or modules draws each of them as a
   segment on its one line, says how many under Starts and gives their
   total under Takes; a row of one draws it as an ordinary bar. The first
@@ -328,7 +343,10 @@ stands out in the rest, which [has a section of its own](#hints):
   first use" below it opens to list each of them in the order they
   began: when it started, how long it took and the file and line whose
   import asked for it, a module imported by another indented beneath it.
-  A record lists the first 200 and counts the rest. With
+  A record lists the first 200 to start and counts the rest. The
+  table's "waiting for an import" row gives the request's waits on
+  other requests' loads, each with its module and the request loading
+  it. With
   [`lazy_imports`](lazy-imports.md) on, a module whose deferred import the
   request used is marked "(deferred)", and its file and line are those of
   the code that used it.
@@ -417,7 +435,7 @@ and change nothing. Each has a threshold, at or past which it is shown:
 | a long wait for a worker | Timing | the request waited 100 ms or more for a worker, which says the run had too few for the page's requests; the hint names `processes` (`--processes`) |
 | a long wait for a thread | Timing | a WSGI request waited 100 ms or more for a thread of its worker; the hint names `threads` (`--threads`) |
 | garbage collection | Timing | collections during the request took 50 ms or more in all, or there were 20 or more of them |
-| modules loaded on first use | Timing | the modules the worker loaded for the first time during the request took 25% or more of its total time, and at least 50 ms; the hint names the longest and `preload_modules`, which loads them before the worker serves |
+| modules loaded on first use | Timing | the modules the worker loaded for the first time during the request, with the request's waits on modules other requests were loading, took 25% or more of its total time, and at least 50 ms; the hint names the longest and `preload_modules`, which loads them before the worker serves |
 | an answer of Muru's own | Errors | Muru answered the request itself for a timeout or a size limit, such as 504 `deadline` or 413 `body_too_large`; the hint names the setting, such as `request_deadline` (`--timeout deadline=` for a run) |
 
 At most 3 hints of one kind are shown, the strongest first. The same

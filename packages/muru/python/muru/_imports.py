@@ -22,10 +22,21 @@ The time of the outermost loads is also told to the runtime as each
 ends, for the response head's ``Server-Timing``. A load that resolved an
 import deferred by ``lazy_imports`` (section 6.17) is marked as deferred,
 as unwrapt tells ``muru._lazy_imports`` of it.
+
+A request can also wait on a load another thread has under way: the
+import system holds the module's lock while it loads, and a thread that
+asks for the module meanwhile blocks on the lock and then finds it in
+``sys.modules``, never reaching the finder (issue 787). For that the
+runtime wraps ``importlib._bootstrap._lock_unlock_module``, which the
+import system calls only when the module asked for is still being
+initialised, and keeps each wait of at least ``WAIT_MIN_MS`` in the
+waiting request's record, naming the module and the request loading it,
+its time told to the runtime apart from the loads' time.
 """
 
 from __future__ import annotations
 
+import importlib._bootstrap
 import os
 import sys
 import threading
@@ -40,6 +51,8 @@ from muru._context import request_id
 
 __all__ = [
     "LOADS_KEPT",
+    "WAITS_KEPT",
+    "WAIT_MIN_MS",
     "WORKER_LOADS_KEPT",
     "find_after",
     "install",
@@ -61,6 +74,12 @@ WORKER_LOADS_KEPT = 2000
 The rest are counted.
 """
 
+WAITS_KEPT = 50
+"""The most waits on another thread's load one request's record keeps; the rest are dropped."""
+
+WAIT_MIN_MS = 1.0
+"""The least a wait on another thread's load must take to be kept."""
+
 # The import system's own frames, and this module's, which are passed
 # over to find the line that triggered a load, and the packages whose
 # frames stand between an import statement and the import system when
@@ -79,12 +98,16 @@ _PASSED_OVER_PACKAGES = ("unwrapt", "wrapt")
 @dataclass
 class _Loads:
     # One recorded request's loads, on its clock, and its runtime's tally
-    # of the outermost loads' time for the response head.
+    # of the outermost loads' time for the response head; and its waits
+    # on other threads' loads, each its start, length, module and the
+    # request loading it, with their own tally.
 
     started: float
     tally: Callable[[float], None] | None
+    wait_tally: Callable[[float], None] | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
     kept: list[list[Any]] = field(default_factory=list)
+    waits: list[tuple[float, float, str, str]] = field(default_factory=list)
     deferred: set[str] = field(default_factory=set)
     count: int = 0
     outermost_ms: float = 0.0
@@ -106,6 +129,16 @@ _counting = threading.Lock()
 # start; one still under way has no end yet.
 
 _worker: dict[str, list[Any]] = {}
+
+# The loads under way, each module's with the request it runs under
+# (empty outside one) and its thread, for a wait on it to name.
+
+_loading: dict[str, tuple[str, int]] = {}
+
+# The import system's function a thread waits in for another's load,
+# while it is wrapped.
+
+_lock_unlock: Callable[[str], None] | None = None
 
 # Each thread's depth of loads under way, and the names it is searching
 # for, so a finder after this one that imports while it searches does not
@@ -154,6 +187,7 @@ def install() -> None:
 
     _finder = _Finder()
     sys.meta_path.insert(0, _finder)
+    _wrap_lock_unlock()
 
 
 def uninstall() -> None:
@@ -169,6 +203,87 @@ def uninstall() -> None:
     _requests.clear()
     _missing.clear()
     _worker.clear()
+    _loading.clear()
+    _unwrap_lock_unlock()
+
+
+def _wrap_lock_unlock() -> None:
+    # The import system calls _lock_unlock_module by its name in
+    # importlib._bootstrap (the C import code included), and only for a
+    # module still being initialised, so the common path pays nothing.
+
+    global _lock_unlock
+
+    original = getattr(importlib._bootstrap, "_lock_unlock_module", None)
+
+    if original is None or _lock_unlock is not None:
+        return
+
+    _lock_unlock = original
+    importlib._bootstrap._lock_unlock_module = _waiting  # type: ignore[attr-defined]
+
+
+def _unwrap_lock_unlock() -> None:
+    global _lock_unlock
+
+    if _lock_unlock is not None:
+        importlib._bootstrap._lock_unlock_module = _lock_unlock  # type: ignore[attr-defined]
+
+    _lock_unlock = None
+
+
+def _waiting(name: str) -> None:
+    # The import system's wait for a module another thread is loading,
+    # timed. A wait on the thread's own load, as in a circular import,
+    # does not block and is left alone.
+
+    original = _lock_unlock
+
+    if original is None:
+        return
+
+    loading = _loading.get(name)
+
+    if loading is not None and loading[1] == threading.get_ident():
+        original(name)
+        return
+
+    started = time.perf_counter()
+
+    try:
+        original(name)
+    finally:
+        _waited(name, loading[0] if loading is not None else "", started, time.perf_counter())
+
+
+def _waited(module: str, loader: str, started: float, ended: float) -> None:
+    # A wait that ended, kept for the waiting request when that is
+    # recorded. One inside a load of the request's own is part of that
+    # load's time already.
+
+    ms = (ended - started) * 1000.0
+    current = request_id()
+    depth: int = getattr(_local, "depth", 0)
+
+    if ms < WAIT_MIN_MS or current is None or depth > 0:
+        return
+
+    kept = _requests.get(current)
+
+    if kept is None:
+        return
+
+    with kept.lock:
+        if kept.taken:
+            return
+
+        if len(kept.waits) < WAITS_KEPT:
+            kept.waits.append(((started - kept.started) * 1000.0, ms, module, loader))
+
+        tally = kept.wait_tally
+
+    if tally is not None:
+        tally(ms)
 
 
 def worker_loads() -> dict[str, Any]:
@@ -417,6 +532,8 @@ class _Timed:
         current = request_id()
         name = self._spec.name
 
+        _loading[name] = (current or "", threading.get_ident())
+
         with _counting:
             if len(_worker) < WORKER_LOADS_KEPT and name not in _worker:
                 self._worker_entry = _worker[name] = [current or "", 0.0, depth, False, 0]
@@ -439,6 +556,7 @@ class _Timed:
         current = request_id()
         ms = (ended - self._started) * 1000.0
         depth = self._depth
+        _loading.pop(self._spec.name, None)
 
         with _counting:
             _counts[0] += 1
@@ -482,34 +600,46 @@ class _Timed:
 # records and as it builds the worker's part of the record.
 
 
-def _start(request: str, tally: Callable[[float], None] | None = None, since: float = 0.0) -> None:
+def _start(
+    request: str,
+    tally: Callable[[float], None] | None = None,
+    since: float = 0.0,
+    wait_tally: Callable[[float], None] | None = None,
+) -> None:
     """Start keeping a request's loads, on its clock from `since` seconds ago.
 
-    `tally` is told each outermost load's milliseconds as it ends.
+    `tally` is told each outermost load's milliseconds as it ends, and
+    `wait_tally` each wait on another thread's load.
     """
 
     if _finder is None:
         return
 
-    _requests[request] = _Loads(time.perf_counter() - since, tally)
+    _requests[request] = _Loads(time.perf_counter() - since, tally, wait_tally)
 
 
 def _take(
     request: str,
-) -> tuple[list[tuple[float, float, str, str, int, bool]], int, float]:
+) -> tuple[
+    list[tuple[float, float, str, str, int, bool]],
+    int,
+    float,
+    list[tuple[float, float, str, str]],
+]:
     """Stop keeping a request's loads, and return them for the runtime to send.
 
     The loads kept, each its start on the request's clock, its length in
     milliseconds, the module, the line that triggered it, its depth
     beneath other loads and whether it resolved a deferred import, in the
-    order they began; how many loads there were in all; and the outermost
-    loads' milliseconds summed.
+    order they began; how many loads there were in all; the outermost
+    loads' milliseconds summed; and the waits on other threads' loads,
+    each its start, length, module and the request loading it, in order.
     """
 
     kept = _requests.pop(request, None)
 
     if kept is None:
-        return [], 0, 0.0
+        return [], 0, 0.0, []
 
     # The loads were kept in the order they began; one still under way,
     # on a thread the request started, has no length and is left out.
@@ -519,6 +649,7 @@ def _take(
         loads = [tuple(load) for load in kept.kept if load[1] is not None]
         deferred = set(kept.deferred)
         count, outermost_ms = kept.count, kept.outermost_ms
+        waits = list(kept.waits)
 
     return (
         [
@@ -527,6 +658,7 @@ def _take(
         ],
         count,
         outermost_ms,
+        waits,
     )
 
 

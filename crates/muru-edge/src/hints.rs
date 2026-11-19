@@ -389,46 +389,89 @@ fn collected(hints: &mut Vec<Hint>, worker: &admin::WorkerPart) {
     });
 }
 
-/// Modules loaded for the first time in the worker that took at least
-/// `IMPORT_MS` and `IMPORT_SHARE` of the request, naming the longest of
-/// the outermost loads (issue 738).
+/// Modules loaded for the first time in the worker, and waits on modules
+/// other requests were loading (issue 787), that took at least
+/// `IMPORT_MS` and `IMPORT_SHARE` of the request between them, naming the
+/// longest of the outermost loads and the waits (issue 738), since
+/// `preload_modules` removes both.
 fn imported(hints: &mut Vec<Hint>, record: &admin::RequestRecord, worker: &admin::WorkerPart) {
-    if record.total_ms <= 0.0
-        || worker.modules_ms < IMPORT_MS
-        || worker.modules_ms < IMPORT_SHARE * record.total_ms
-    {
+    let waited_ms: f64 = worker.import_waits.iter().map(|wait| wait.ms).sum();
+    let ms = worker.modules_ms + waited_ms;
+
+    if record.total_ms <= 0.0 || ms < IMPORT_MS || ms < IMPORT_SHARE * record.total_ms {
         return;
     }
 
-    let mut outermost: Vec<&admin::ModuleLoad> = worker
+    let mut longest: Vec<(f64, &str)> = worker
         .module_loads
         .iter()
         .filter(|load| load.depth == 0)
+        .map(|load| (load.ms, load.module.as_str()))
+        .chain(
+            worker
+                .import_waits
+                .iter()
+                .map(|wait| (wait.ms, wait.module.as_str())),
+        )
         .collect();
-    outermost.sort_by(|one, other| other.ms.total_cmp(&one.ms));
-    let longest: Vec<&str> = outermost
-        .iter()
-        .take(PER_KIND)
-        .map(|load| load.module.as_str())
-        .collect();
+    longest.sort_by(|one, other| other.0.total_cmp(&one.0));
 
-    let modules = if worker.modules_loaded == 1 {
-        "1 module".to_owned()
-    } else {
-        format!("{} modules", worker.modules_loaded)
+    let mut named: Vec<&str> = Vec::new();
+
+    for (_, module) in longest {
+        if named.len() < PER_KIND && !named.contains(&module) {
+            named.push(module);
+        }
+    }
+
+    let modules = |count: usize| {
+        if count == 1 {
+            "1 module".to_owned()
+        } else {
+            format!("{count} modules")
+        }
+    };
+
+    let mut waited_on: Vec<&str> = worker
+        .import_waits
+        .iter()
+        .map(|wait| wait.module.as_str())
+        .collect();
+    waited_on.sort_unstable();
+    waited_on.dedup();
+
+    let what = match (worker.modules_loaded > 0, !waited_on.is_empty()) {
+        (_, false) => format!(
+            "the worker loaded {} for the first time during the request",
+            modules(worker.modules_loaded as usize)
+        ),
+        (false, true) => format!(
+            "the request waited on {} another request was loading for the first time in the worker",
+            modules(waited_on.len())
+        ),
+        (true, true) => format!(
+            "the worker loaded {} for the first time during the request, and it waited on {} another request was loading",
+            modules(worker.modules_loaded as usize),
+            modules(waited_on.len())
+        ),
     };
 
     hints.push(Hint {
         text: format!(
-            "the worker loaded {modules} for the first time during the request, {:.0}% of its time, which each worker does again for the first request that needs them; list the longest in preload_modules to load them before the worker serves: {}",
-            worker.modules_ms * 100.0 / record.total_ms,
-            longest.join(", ")
+            "{what}, {:.0}% of its time, which each worker does again for the first request that needs them; list the longest in preload_modules to load them before the worker serves: {}",
+            ms * 100.0 / record.total_ms,
+            named.join(", ")
         ),
         panel: "Timing",
         figure: format!(
-            "{} of {} loading modules",
-            millis(worker.modules_ms),
-            millis(record.total_ms)
+            "{} of {} {}",
+            millis(ms),
+            millis(record.total_ms),
+            if waited_on.is_empty() {
+                "loading modules"
+            } else {
+                "loading and waiting for modules"
+            }
         ),
     });
 }
@@ -736,6 +779,29 @@ mod tests {
             "preload_modules to load them before the worker serves: openpyxl, shop.reports"
         ));
         assert_eq!(found[0][2], "50ms of 100ms loading modules");
+
+        // Issue 787: a wait on another request's load counts too, and is
+        // named among the longest.
+
+        let mut waiting = record();
+        let worker = waiting.from_worker.as_mut().unwrap();
+        worker.import_waits = vec![admin::ImportWait {
+            module: "shop.reports".to_owned(),
+            ms: IMPORT_MS,
+            loader: "R1".to_owned(),
+            ..Default::default()
+        }];
+        let found = hinted(&waiting, &[]);
+        assert_eq!(found.len(), 1);
+        assert!(
+            found[0][0].starts_with(
+                "the request waited on 1 module another request was loading for the first time in the worker, 50% of its time"
+            ),
+            "{}",
+            found[0][0]
+        );
+        assert!(found[0][0].ends_with("before the worker serves: shop.reports"));
+        assert_eq!(found[0][2], "50ms of 100ms loading and waiting for modules");
     }
 
     #[test]

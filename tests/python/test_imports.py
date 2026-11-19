@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -50,7 +51,7 @@ def test_a_requests_loads_are_kept_nested_with_what_triggered_them(source: Path)
     finally:
         _request_id.reset(token)
 
-    loads, count, outermost_ms = _imports._take("R1")
+    loads, count, outermost_ms, _waits = _imports._take("R1")
     names = [(name, depth) for _, _, name, _, depth, _ in loads]
 
     # The package, the module and the one it imports, nested; the second
@@ -77,7 +78,7 @@ def test_a_requests_loads_are_kept_nested_with_what_triggered_them(source: Path)
     import later  # noqa: F401
 
     assert _imports.loaded() == (5, 1)
-    assert _imports._take("R1") == ([], 0, 0.0)
+    assert _imports._take("R1") == ([], 0, 0.0, [])
 
 
 def test_a_record_keeps_up_to_its_limit_and_a_missing_module_is_searched_once(
@@ -97,7 +98,7 @@ def test_a_record_keeps_up_to_its_limit_and_a_missing_module_is_searched_once(
     finally:
         _request_id.reset(token)
 
-    loads, count, _ = _imports._take("R1")
+    loads, count, _, _ = _imports._take("R1")
     assert ([load[2] for load in loads], count) == (["one"], 2)
 
     # A module that is not there is left to the import system from then
@@ -134,7 +135,7 @@ def test_a_record_past_its_limit_keeps_the_first_loads_to_start(
     finally:
         _request_id.reset(token)
 
-    loads, count, outermost_ms = _imports._take("R1")
+    loads, count, outermost_ms, _waits = _imports._take("R1")
     kept = [(name, depth) for _, _, name, _, depth, _ in loads]
     assert kept == [("report", 0), ("part0", 1), ("part1", 1)]
     assert count == 6
@@ -161,3 +162,75 @@ def test_the_runtime_times_the_outermost_loads_alone(
 
     assert len(noted) == 2
     assert noted[0] == 0.0 and noted[1] > 0.0
+
+
+def test_a_request_waiting_on_another_threads_load_is_kept_with_who_loads_it(
+    source: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue 787: the waiting thread never reaches the finder; it waits in
+    # the import system's _lock_unlock_module, which the runtime wraps.
+    # That is private API, so this fails if it moves.
+
+    assert importlib._bootstrap._lock_unlock_module is _imports._waiting  # type: ignore[attr-defined]
+    monkeypatch.setattr(_imports, "WAIT_MIN_MS", 0.0)
+
+    (source / "gate.py").write_text(
+        "import threading\nstarted = threading.Event()\nrelease = threading.Event()\n"
+    )
+    (source / "slow.py").write_text("import gate\ngate.started.set()\ngate.release.wait(10)\n")
+    (source / "circle_a.py").write_text("import circle_b\n")
+    (source / "circle_b.py").write_text("import circle_a\n")
+    import gate
+
+    # The real function, told when the waiting thread is in it, so the
+    # load is let go only once the other request waits.
+
+    waiting = threading.Event()
+    original = _imports._lock_unlock
+    assert original is not None
+
+    def entered(name: str) -> None:
+        if name == "slow":
+            waiting.set()
+
+        original(name)
+
+    monkeypatch.setattr(_imports, "_lock_unlock", entered)
+    waits: list[float] = []
+    _imports._start("R1")
+    _imports._start("R2", wait_tally=waits.append)
+
+    def request(name: str) -> None:
+        token = _request_id.set(name)
+
+        try:
+            import slow  # noqa: F401
+        finally:
+            _request_id.reset(token)
+
+    loading = threading.Thread(target=request, args=("R1",))
+    loading.start()
+    assert gate.started.wait(10)
+    waiter = threading.Thread(target=request, args=("R2",))
+    waiter.start()
+    assert waiting.wait(10)
+    gate.release.set()
+    loading.join()
+    waiter.join()
+
+    # A circular import on the request's own thread is no wait.
+
+    token = _request_id.set("R2")
+
+    try:
+        import circle_a  # noqa: F401
+    finally:
+        _request_id.reset(token)
+
+    loaded = _imports._take("R1")
+    assert [load[2] for load in loaded[0]] == ["slow"] and loaded[3] == []
+
+    loads, _count, _outermost_ms, kept = _imports._take("R2")
+    assert [load[2] for load in loads] == ["circle_a", "circle_b"]
+    assert [(module, loader) for _, _, module, loader in kept] == [("slow", "R1")]
+    assert waits == [kept[0][1]]

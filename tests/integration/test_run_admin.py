@@ -667,6 +667,71 @@ def test_a_blocked_event_loop_is_on_the_requests_record(runtime: Path) -> None:
         server.stop()
 
 
+WAITING_APP = """
+import threading
+
+loading = threading.Event()
+
+
+def app(environ, start_response):
+    # /load loads the slow module; /wait asks for it once that has begun.
+
+    if environ["PATH_INFO"] == "/wait":
+        loading.wait(10)
+
+    import waiting_slow  # noqa: F401
+
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    return [b"ok"]
+"""
+
+
+def test_a_request_waiting_on_another_requests_import_says_so(
+    tmp_path: Path, runtime: Path
+) -> None:
+    """Issue 787: a request that asks for a module another request is
+    still loading waits on it; its record and Server-Timing say so, with
+    the module and the request loading it."""
+
+    (tmp_path / "waiting_app.py").write_text(WAITING_APP)
+    (tmp_path / "waiting_slow.py").write_text(
+        "import time\n\nimport waiting_app\n\nwaiting_app.loading.set()\ntime.sleep(0.3)\n"
+    )
+    (tmp_path / "pyproject.toml").write_text('[tool.muru]\nentrypoint = "waiting_app:app"\n')
+    server = support.start(
+        None, chdir=tmp_path, workers=1, threads=2, env={"MURU_RUN_DIR": str(runtime)}
+    )
+
+    try:
+        loaded: list[Any] = []
+        loader = threading.Thread(target=lambda: loaded.append(server.get("/load")))
+        loader.start()
+        waited = server.get("/wait")
+        loader.join()
+
+        timing = waited.header("server-timing") or ""
+        assert "import_wait;dur=" in timing and "import;dur=" not in timing, timing
+        assert "import;dur=" in (loaded[0].header("server-timing") or "")
+
+        request_id = waited.header("x-request-id")
+        deadline = time.monotonic() + 10
+
+        while (found := json.loads(server.get(f"/_muru/requests/{request_id}.json").body))[
+            "in_progress"
+        ]:
+            assert time.monotonic() < deadline, found
+            time.sleep(0.05)
+
+        waits = found["from_worker"]["import_waits"]
+        assert [(wait["module"], wait["loader"]) for wait in waits] == [
+            ("waiting_slow", loaded[0].header("x-request-id"))
+        ], found["from_worker"]
+        panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html").body.decode()
+        assert ">waiting for an import</td>" in panel, panel
+    finally:
+        server.stop()
+
+
 def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
     port = support.free_port()
     server = start(runtime, port=port)

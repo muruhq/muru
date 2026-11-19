@@ -44,6 +44,9 @@ pub struct Timing {
     /// What the worker spent before the head loading modules for the
     /// first time, as its head says (issue 738).
     pub imports: Duration,
+    /// What it spent before the head waiting on modules other threads
+    /// were loading for the first time (issue 787).
+    pub import_wait: Duration,
 }
 
 /// One connection a listener accepted: its ID, given at accept from
@@ -343,8 +346,9 @@ impl Links {
 
 /// The value of `Server-Timing` for a response: `queue` and `app` in
 /// milliseconds when a worker or an upstream answered, `import` when the
-/// worker loaded modules for the first time before the head, and the
-/// request ID as `muru`'s description in every case. There is no total,
+/// worker loaded modules for the first time before the head,
+/// `import_wait` when it waited on modules other threads were loading,
+/// and the request ID as `muru`'s description in every case. There is no total,
 /// since the head goes out before the body is complete.
 pub fn server_timing(request_id: &str, timing: Option<Timing>) -> String {
     let mut value = String::new();
@@ -358,6 +362,10 @@ pub fn server_timing(request_id: &str, timing: Option<Timing>) -> String {
 
         if !timing.imports.is_zero() {
             value.push_str(&format!("import;dur={}, ", millis(timing.imports)));
+        }
+
+        if !timing.import_wait.is_zero() {
+            value.push_str(&format!("import_wait;dur={}, ", millis(timing.import_wait)));
         }
     }
 
@@ -490,6 +498,7 @@ mod tests {
             queue: Duration::from_micros(210),
             application: Duration::from_micros(17_930),
             imports: Duration::ZERO,
+            import_wait: Duration::ZERO,
         };
 
         assert_eq!(
@@ -506,6 +515,17 @@ mod tests {
         assert_eq!(
             server_timing("A1", Some(importing)),
             "queue;dur=0.21, app;dur=17.93, import;dur=12.50, muru;desc=\"A1\""
+        );
+
+        // Issue 787: a wait on another request's load is its own entry.
+
+        let waiting = Timing {
+            import_wait: Duration::from_micros(98_000),
+            ..timing
+        };
+        assert_eq!(
+            server_timing("A1", Some(waiting)),
+            "queue;dur=0.21, app;dur=17.93, import_wait;dur=98.00, muru;desc=\"A1\""
         );
 
         // A response the edge produced itself names only the request,
@@ -539,11 +559,13 @@ mod tests {
             queue: Duration::from_millis(1),
             application: Duration::from_millis(2),
             imports: Duration::ZERO,
+            import_wait: Duration::ZERO,
         };
         let last = Timing {
             queue: Duration::from_millis(3),
             application: Duration::from_millis(4),
             imports: Duration::ZERO,
+            import_wait: Duration::ZERO,
         };
         request.note(first);
         request.note(last);
