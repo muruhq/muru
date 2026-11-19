@@ -2080,10 +2080,23 @@ impl Resolved {
                 .values()
                 .map(|group| group.processes.unwrap_or(self.processes))
                 .sum::<usize>();
+
+        // Where lazy_imports was set, by its file's name, for the
+        // report's advice (issue 786).
+
+        let lazy_from = match (&self.lazy_imports_from_local, &self.source) {
+            (Some(local), _) => local.file_name(),
+            (None, Some(source)) if self.lazy_imports.is_some() => source.file_name(),
+            _ => None,
+        }
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
         let lazy = muru_config::lazy_imports_entry(
             self.lazy_imports == Some(true),
             report || self.import_report == Some(true),
             workers,
+            &lazy_from,
         );
 
         lazy.iter()

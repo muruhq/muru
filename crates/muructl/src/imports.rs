@@ -216,6 +216,22 @@ fn analysis(report: &Value, filters: &Filters) -> Value {
         found["chain"] = chain(report, module);
     }
 
+    // Issue 786: --target narrows the summary as it narrows the tables,
+    // keeping the whole load's figures beside it.
+
+    if let Some(target) = &filters.target {
+        let label = if target == "none" {
+            ""
+        } else {
+            target.as_str()
+        };
+
+        found["target"] = json!(target);
+        found["target_summary"] = report["by_target"].get(label).cloned().unwrap_or_else(
+            || json!({"total_import_ms": 0.0, "modules_loaded": 0, "import_calls": 0}),
+        );
+    }
+
     found
 }
 
@@ -678,23 +694,54 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
         text(&labels["python"]),
         if workers == 1 { "worker" } else { "workers" },
     );
-    let _ = writeln!(
-        out,
-        "  {} ms importing, {} modules loaded, {} import calls; deferring what can be deferred would save about {} ms",
-        ms(&summary["total_import_ms"]),
-        summary["modules_loaded"].as_u64().unwrap_or(0),
-        summary["import_calls"].as_u64().unwrap_or(0),
-        ms(&summary["estimated_saving_ms"]),
-    );
+
+    // With --target, the target's own figures, the whole load's time
+    // beside them and its saving, which is the plan's for the whole load.
+
+    match (report["target"].as_str(), report.get("target_summary")) {
+        (Some(target), Some(narrowed)) => {
+            let what = if target == "none" {
+                "outside the targets".to_owned()
+            } else {
+                format!("for {target}")
+            };
+
+            let _ = writeln!(
+                out,
+                "  {} ms importing {what}, of {} ms, {} modules loaded, {} import calls; deferring what can be deferred in the whole load would save about {} ms",
+                ms(&narrowed["total_import_ms"]),
+                ms(&summary["total_import_ms"]),
+                narrowed["modules_loaded"].as_u64().unwrap_or(0),
+                narrowed["import_calls"].as_u64().unwrap_or(0),
+                ms(&summary["estimated_saving_ms"]),
+            );
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "  {} ms importing, {} modules loaded, {} import calls; deferring what can be deferred would save about {} ms",
+                ms(&summary["total_import_ms"]),
+                summary["modules_loaded"].as_u64().unwrap_or(0),
+                summary["import_calls"].as_u64().unwrap_or(0),
+                ms(&summary["estimated_saving_ms"]),
+            );
+        }
+    }
 
     // Issue 785: each of the preload_modules' own cost, as Muru timed
-    // its load, for someone weighing it against the reload time.
+    // its load, for someone weighing it against the reload time; with
+    // --target, the target's alone.
+
+    let asked = report["target"].as_str();
 
     for target in report["targets"].as_array().into_iter().flatten() {
-        if let Some(module) = target["target"]
-            .as_str()
-            .and_then(|label| label.strip_prefix("module:"))
-        {
+        let label = target["target"].as_str().unwrap_or_default();
+
+        if asked.is_some_and(|asked| asked != label) {
+            continue;
+        }
+
+        if let Some(module) = label.strip_prefix("module:") {
             let _ = writeln!(
                 out,
                 "  preload_modules entry {module}: {} ms in {of}",
@@ -844,12 +891,15 @@ fn render_report(out: &mut String, report: &Value, release: &str, of: &str) {
 /// not advised to be deferred (issue 785); one an extension module made
 /// as it loaded, which nothing can defer; and the other modules that
 /// import the same module eagerly, which keep its saving at nothing
-/// (issue 784).
+/// (issue 784); and one declared deferred that loaded eagerly (issue
+/// 786).
 fn notes(row: &Value) -> String {
     let mut notes = Vec::new();
 
     if row["already_lazy"].as_bool() == Some(true) {
         notes.push("already lazy".to_owned());
+    } else if row["declared_lazy"].as_bool() == Some(true) {
+        notes.push("declared lazy, loaded eagerly".to_owned());
     }
 
     if row["reason"].as_str() == Some("extension-module") {
@@ -1339,6 +1389,30 @@ mod tests {
         assert!(text.contains("pandas._libs.missing"), "{text}");
         assert!(text.contains("extension module"), "{text}");
         assert!(!text.contains("--all lists them"), "{text}");
+    }
+
+    #[test]
+    fn target_narrows_the_summary_and_keeps_the_whole_load_beside_it() {
+        let mut host = host();
+        host["by_target"] = json!({
+            "entrypoint": {"total_import_ms": 41.2, "modules_loaded": 3, "import_calls": 12},
+            "hooks": {"total_import_ms": 8.8, "modules_loaded": 6, "import_calls": 28}
+        });
+        let answered = pb::DebugResponse {
+            host_json: host.to_string(),
+            ..response(&[])
+        };
+        let filters = Filters {
+            target: Some("entrypoint".to_owned()),
+            ..Filters::default()
+        };
+
+        let text = render(&document(&answered, None, &filters).unwrap());
+        assert!(
+            text.contains("41.2 ms importing for entrypoint, of 50.0 ms, 3 modules loaded, 12 import calls; deferring what can be deferred in the whole load would save about 30.0 ms"),
+            "{text}"
+        );
+        assert!(!text.contains("preload_modules entry"), "{text}");
     }
 
     #[test]

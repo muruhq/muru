@@ -255,6 +255,19 @@ Imports that loaded a module, by cumulative time
   the fork, in the worker that uses it. A deferred import the load used
   anyway is named too, since deferring it gains nothing.
 
+- **An import declared deferred that loaded eagerly**, one a module's
+  `__lazy_modules__` or unwrapt's `lazy_modules` names in a load with
+  `lazy_imports` off, keeps its cost and its saving, is noted `declared
+  lazy, loaded eagerly`, and the advice names what is missing and where
+  the setting is off:
+
+  ```
+  defer: openpyxl imported by shop.export, 72.3 ms, loading entrypoint
+    paid by the host, once before the fork, shared by the 4 workers; deferred, each worker that uses it loads it on first use
+    shop.export names it in __lazy_modules__, but nothing defers it: Python 3.14 needs lazy_imports = true (it is false in muru.local.toml)
+      lazy_imports = true
+  ```
+
 - **LOADING** says which of the host's targets the import was made while
   loading: `hooks`, `entrypoint`, `mount:NAME`, or `module:NAME` for one
   of the `preload_modules`. A module several targets need is paid for by
@@ -284,7 +297,7 @@ The options narrow it:
 
 | Option | Keeps |
 | --- | --- |
-| `--target TARGET` | The imports made while loading one target, or `none` for those outside any |
+| `--target TARGET` | The imports made while loading one target, or `none` for those outside any, with the summary narrowed to them and the whole load's time beside it, as `41.2 ms importing for entrypoint, of 260.3 ms` |
 | `--top N` | The first N rows of each table (20 by default) |
 | `--min-ms MS` | Rows that took at least MS milliseconds |
 | `--package NAME` | Modules and importers under a top-level package; repeatable |

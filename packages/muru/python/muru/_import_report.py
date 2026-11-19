@@ -36,7 +36,8 @@ The result is plain data, ready to send to the controller as JSON.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+import sys
+from collections.abc import Callable, Container, Iterable
 from typing import Any
 
 __all__ = ["DEFER_MIN_MS", "DEFER_SHOWN", "REWRITE_MIN_MS", "analyse"]
@@ -77,6 +78,8 @@ def analyse(
     found: Iterable[Any] = (),
     root: str = "",
     targets: Iterable[dict[str, Any]] = (),
+    deferring: bool = False,
+    lazy_from: str = "",
 ) -> dict[str, Any]:
     """Build the document Muru keeps for a load from its unwrapt report.
 
@@ -84,7 +87,10 @@ def analyse(
     how many workers the release starts with, `found` the import check's
     findings, `root` the directory the host runs in, under which a
     module is the project's own, and `targets` each entry point's label
-    and the milliseconds its import took, timed by Muru.
+    and the milliseconds its import took, timed by Muru. `deferring` is
+    whether lazy_imports is on, and `lazy_from` where it was set, empty
+    when it was not, for the advice on an import declared deferred that
+    loaded eagerly.
     """
 
     from unwrapt import report as unwrapt_report
@@ -117,9 +123,11 @@ def analyse(
     used: list[dict[str, Any]] = [dict(row) for row in unwrapt_report.deferred_used(report)]
     preloaded = outcome in ("fork", "fallback", "refused", "check")
 
+    settings = (deferring, lazy_from)
+
     findings = [
-        *_fork_safety(found, candidates, root),
-        *_deferrals(candidates, edges, root, preloaded, workers),
+        *_fork_safety(found, candidates, settings),
+        *_deferrals(candidates, edges, root, preloaded, workers, settings),
         *(_used_before_fork(used) if outcome == "fork" else ()),
     ]
 
@@ -138,7 +146,34 @@ def analyse(
         "deferred_unused": unwrapt_report.deferred_unused(report),
         "findings": findings,
         "targets": [dict(entry) for entry in targets],
+        "by_target": _by_target(edges, target),
     }
+
+
+def _by_target(
+    edges: dict[int, dict[str, Any]], target: Callable[[int | None], str]
+) -> dict[str, dict[str, Any]]:
+    # Issue 786: the summary's figures for each target's imports, keyed
+    # by its label, empty for those outside any, so that `--target` can
+    # narrow the summary as it narrows the tables. A target's time is
+    # that of its outermost import calls, so a nest counts once.
+
+    figures: dict[str, dict[str, Any]] = {}
+
+    for edge in edges.values():
+        label = target(edge["id"])
+        found = figures.setdefault(
+            label, {"total_import_ms": 0.0, "modules_loaded": 0, "import_calls": 0}
+        )
+        found["modules_loaded"] += max(int(edge.get("self_modules") or 0), 0)
+        found["import_calls"] += int(edge.get("count") or 1)
+
+        parent = edge.get("parent_id")
+
+        if parent is None or parent not in edges or target(parent) != label:
+            found["total_import_ms"] += edge["cum_ms"]
+
+    return figures
 
 
 def _extension_rows(edges: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -271,6 +306,68 @@ def _advice(importer: str | None, imported: str, own: bool) -> tuple[str, str]:
     )
 
 
+def _declared(candidate: dict[str, Any], settings: tuple[bool, str]) -> tuple[str, str]:
+    # Issue 786: what to do about an import declared deferred that the
+    # load imported eagerly, in Muru's own settings: the declaration is
+    # there, and what is missing is what acts on it.
+
+    importer, imported = candidate["importer"], candidate["imported"]
+    deferring, lazy_from = settings
+    lazy_modules = getattr(sys.modules.get(importer or ""), "__lazy_modules__", None)
+
+    in_module = (
+        isinstance(lazy_modules, Container)
+        and not isinstance(lazy_modules, str)
+        and imported in lazy_modules
+    )
+    named = (
+        f"{importer} names it in __lazy_modules__"
+        if in_module
+        else f"unwrapt's lazy_modules names it for {importer}"
+    )
+
+    if not candidate["unwrapt"]:
+        return (
+            f"{named}, but unwrapt cannot defer this form ({candidate['reason']}): it defers "
+            f"natively from Python 3.15, and below it only once rewritten as import {imported}",
+            "",
+        )
+
+    if deferring:
+        return f"{named}, but it loaded eagerly", ""
+
+    version = f"Python {sys.version_info.major}.{sys.version_info.minor}"
+    needs = version if in_module else "the table"
+    where = f"it is false in {lazy_from}" if lazy_from else "it is not set"
+    config = "[tool.muru]\nlazy_imports = true"
+
+    if lazy_from == "muru.local.toml":
+        config = "lazy_imports = true"
+
+    return f"{named}, but nothing defers it: {needs} needs lazy_imports = true ({where})", config
+
+
+def _how(candidate: dict[str, Any], own: bool, settings: tuple[bool, str]) -> tuple[str, str]:
+    # How to defer one candidate, as a sentence and the configuration to
+    # write: what acts on a declaration already there, else a declaration
+    # to add, with the rewrite below 3.15 a form unwrapt cannot defer
+    # needs.
+
+    if candidate.get("declared_lazy"):
+        return _declared(candidate, settings)
+
+    importer, imported = candidate["importer"], candidate["imported"]
+    advice, config = _advice(importer, imported, own)
+
+    if not candidate["unwrapt"]:
+        advice += (
+            f"; it defers natively from Python 3.15, and below it only once "
+            f"rewritten as import {imported} ({candidate['reason']})"
+        )
+
+    return advice, config
+
+
 def _pays(preloaded: bool, workers: int, ms: float) -> str:
     # Who pays for a module's load, as the release loads.
 
@@ -298,6 +395,7 @@ def _deferrals(
     root: str,
     preloaded: bool,
     workers: int,
+    settings: tuple[bool, str],
 ) -> list[dict[str, Any]]:
     # The candidates deferring which saves the most, each with how.
 
@@ -333,16 +431,7 @@ def _deferrals(
 
     for saving, candidate in chosen[:DEFER_SHOWN]:
         importer, imported = candidate["importer"], candidate["imported"]
-        advice, config = _advice(importer, imported, _own(edges.get(candidate["edge"]), root))
-
-        # A form unwrapt cannot defer is deferred natively from 3.15
-        # only, and needs a rewrite below it.
-
-        if not candidate["unwrapt"]:
-            advice += (
-                f"; it defers natively from Python 3.15, and below it only once "
-                f"rewritten as import {imported} ({candidate['reason']})"
-            )
+        advice, config = _how(candidate, _own(edges.get(candidate["edge"]), root), settings)
 
         findings.append(
             {
@@ -362,7 +451,7 @@ def _deferrals(
 
 
 def _fork_safety(
-    found: Iterable[Any], candidates: list[dict[str, Any]], root: str
+    found: Iterable[Any], candidates: list[dict[str, Any]], settings: tuple[bool, str]
 ) -> list[dict[str, Any]]:
     # The import check's findings, each a strong candidate for deferral:
     # moved after the fork, its import no longer leaves anything in the
@@ -389,6 +478,8 @@ def _fork_safety(
                 f"it is loaded before the fork for preload_modules; {finding.advice}",
                 "",
             )
+        elif candidate and candidate.get("declared_lazy"):
+            advice, config = _declared(candidate, settings)
         elif importer:
             advice, config = _advice(importer, module, False)
         else:

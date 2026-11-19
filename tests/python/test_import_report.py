@@ -186,6 +186,38 @@ def test_an_import_under_the_check_names_its_statement_and_import_a_b_as_c_is_no
     assert "shop_pkg.part" not in {row["module"] for row in payload["findings"]}
 
 
+def test_an_import_declared_deferred_that_loaded_eagerly_is_advised_in_muru_settings(
+    project: Path,
+) -> None:
+    # Issue 786: with lazy_imports off, an import unwrapt's table names
+    # loads eagerly; its cost is kept, and the advice names the setting
+    # that is missing and where it is off. The figures of each target's
+    # imports are kept for --target.
+
+    (project / "unwrapt.toml").write_text('[lazy_modules]\n"shop_views" = ["shop_slow"]\n')
+    _lazy_imports.configure(
+        {"defer": False, "report": True, "workers": 2, "lazy_imports_from": "muru.local.toml"}
+    )
+    load(Context(), _instrumentation.FORK)
+    payload = _lazy_imports.payload()
+
+    assert payload is not None
+    row = next(row for row in payload["candidates"] if row["imported"] == "shop_slow")
+    assert row["declared_lazy"] and not row["already_lazy"] and row["saving_ms"] >= 5.0
+
+    advice = {row["module"]: row for row in payload["findings"] if row["kind"] == "defer"}
+    assert advice["shop_slow"]["advice"] == (
+        "unwrapt's lazy_modules names it for shop_views, but nothing defers it: "
+        "the table needs lazy_imports = true (it is false in muru.local.toml)"
+    )
+    assert advice["shop_slow"]["config"] == "lazy_imports = true"
+
+    entrypoint = payload["by_target"]["entrypoint"]
+    assert entrypoint["total_import_ms"] >= 5.0 + 3.0
+    assert entrypoint["total_import_ms"] < payload["summary"]["total_import_ms"]
+    assert entrypoint["modules_loaded"] == 4
+
+
 def test_nothing_a_preload_modules_entry_loads_is_advised_and_its_cost_is_kept(
     project: Path,
 ) -> None:

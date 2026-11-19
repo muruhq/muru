@@ -5,7 +5,8 @@ report with ``import_report = true``, or both, and the release's
 instrumentation list then starts with this module (section 6.15), ahead
 of tracing's, so the imports of the modules after it can be deferred and
 recorded too. Its settings say which: ``defer`` and ``report``, with
-``workers``, how many workers the release starts with, for the report's
+``workers``, how many workers the release starts with, and
+``lazy_imports_from``, where ``lazy_imports`` was set, for the report's
 analysis. unwrapt is the application's dependency, not Muru's: it is
 imported only here, only when a key is on, from the project's
 environment.
@@ -82,6 +83,7 @@ UNWRAPT_LEAST = ("1", "0", "0", "a5")
 _defer = True
 _report = False
 _workers = 1
+_lazy_from = ""
 
 # unwrapt, once load_started installed it; None until then or when it
 # failed, so the later callbacks do nothing.
@@ -116,11 +118,12 @@ _unsubscribe: Callable[[], None] | None = None
 def configure(settings: dict[str, Any]) -> None:
     """Take the settings Muru built from the release's lazy_imports and import_report keys."""
 
-    global _defer, _report, _workers
+    global _defer, _report, _workers, _lazy_from
 
     _defer = bool(settings.get("defer", True))
     _report = bool(settings.get("report", False))
     _workers = max(1, int(settings.get("workers", 1) or 1))
+    _lazy_from = str(settings.get("lazy_imports_from", "") or "")
 
 
 def load_started(context: Any) -> None:
@@ -303,6 +306,8 @@ def _record(context: Any, outcome: str) -> None:
         found=preload.latest_findings() if worker is None else (),
         root=os.getcwd(),
         targets=targets,
+        deferring=_defer,
+        lazy_from=_lazy_from,
     )
 
 
