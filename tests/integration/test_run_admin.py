@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -678,6 +679,15 @@ def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
     try:
         assert server.wait_for_log(f"dashboard on http://127.0.0.1:{port}/")
         assert 'href="workers?release=plain-wsgi@r1"' in read("/fragment/overview")
+
+        # Issue 764: the run's process id is printed, and written beside
+        # its admin socket.
+
+        written = re.search(r"pid (\d+), written to (\S+)", server.log())
+        assert written, server.log()
+        assert int(written.group(1)) == server.process.pid
+        assert Path(written.group(2)).read_text() == f"{server.process.pid}\n"
+        assert Path(written.group(2)).parent == runtime / "runs" / str(server.port)
         page = read("/workers?release=plain-wsgi@r1")
         assert "<title>Muru: plain-wsgi@r1 workers</title>" in page
         assert '<a href="./">run</a>' in page
@@ -728,7 +738,9 @@ def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
             ).stdout.strip()
             for process in [root, host, *host["children"]]
         }
-        assert titles[root["pid"]] == "muru run plain-wsgi", titles
+        assert titles[root["pid"]] == (
+            f"muru run plain-wsgi 127.0.0.1:{server.port} dashboard 127.0.0.1:{port}"
+        ), titles
         assert titles[host["pid"]] == "muru host plain-wsgi@r1", titles
         assert titles[host["children"][0]["pid"]] == "muru relay plain-wsgi@r1", titles
         assert titles[host["children"][2]["pid"]] == "muru worker plain-wsgi@r1 default/1", titles

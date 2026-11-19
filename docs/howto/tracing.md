@@ -56,10 +56,23 @@ config = "tracing/wrapture.toml"
 A relative path is relative to the project's directory. `tracing = false`
 turns tracing off and leaves the configuration in place.
 
+When the release loads, its start-up says where the configuration came
+from and what it instruments, once, from the host, or from the first
+worker when each worker imports the application for itself:
+
+```
+muru.host[4821]: tracing on: wrapture configuration from [tool.wrapture] in ./pyproject.toml, instrumenting flask, sqlite3
+```
+
 Tracing needs Python 3.12 or later and wrapture 1.0.0b5 or later in the
 project's environment. When either is missing, or no configuration is
-found, or the configuration cannot be applied, the reason is logged with
-its traceback and the release serves untraced.
+found, or the configuration cannot be applied, the release serves
+untraced, and its start-up says so in one line, followed by the reason
+logged with its traceback:
+
+```
+muru.host[4821]: warning: the release is served untraced: tracing needs the wrapture package in the project's environment; add it to the project's dependencies (No module named 'wrapture')
+```
 
 ## Requests
 

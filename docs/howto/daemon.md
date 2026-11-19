@@ -618,7 +618,7 @@ wrote to `daemon.log`, the last twenty of them:
 
 ```console
 $ muructl daemon start
-Error: the daemon exited before it answered (exit status: 1); from /var/log/muru/daemon.log:
+muru: error: the daemon exited before it answered (exit status: 1); from /var/log/muru/daemon.log:
   2026-11-02T05:40:11.204Z muru: config: /etc/muru/muru.toml (default)
   2026-11-02T05:40:11.204Z muru: state: /var/lib/muru (default)
   2026-11-02T05:40:11.204Z muru: run: /run/muru (default)
@@ -761,7 +761,7 @@ apart:
 | --- | --- |
 | The daemon | `muru daemon user`, `muru daemon system`, or `muru daemon DIR` |
 | The edge | `muru edge user`, `muru edge system`, or `muru edge DIR` |
-| A development run, or `muructl serve` | `muru run APP`, `muru serve APP` |
+| A development run, or `muructl serve` | `muru run APP ADDRESS dashboard ADDRESS` (without a dashboard, `muru run APP ADDRESS`), `muru serve APP ADDRESS` |
 | A release's host | `muru host APP@RELEASE` |
 | Its log relay | `muru relay APP@RELEASE` |
 | A worker | `muru worker APP@RELEASE GROUP/INDEX` |
@@ -773,7 +773,7 @@ told apart. An edge left running while its daemon restarts has the
 init process as its parent, and its title still says whose it is.
 
 A title longer than the command line the process was started with,
-such as `muru serve shop` for a process started as `muructl serve`,
+such as `muru serve shop 0.0.0.0:8080` for a process started as `muructl serve`,
 takes the room of the environment strings that follow it, which the
 process keeps a copy of, so the environment it and the processes it
 starts see is unchanged, while `/proc/PID/environ` shows the title in

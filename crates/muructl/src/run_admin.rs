@@ -1008,6 +1008,15 @@ impl Registration {
         })
     }
 
+    /// Write the run's process id to `pid` in its directory, as a script
+    /// reads it to stop the run (issue 764); the file's path, or none
+    /// for `muructl serve` or when it could not be written.
+    pub fn write_pid(&self, pid: u32) -> Option<PathBuf> {
+        let path = self.directory.as_ref()?.join("pid");
+        std::fs::write(&path, format!("{pid}\n")).ok()?;
+        Some(path)
+    }
+
     /// Record another runtime library directory the run uses, when a
     /// rebuild moved it to a different interpreter. Earlier ones stay
     /// listed, since a release may still be draining on them.

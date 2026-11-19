@@ -37,6 +37,7 @@ Muru runs the atexit callbacks in each worker as it stops.
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 from collections.abc import Mapping
 from typing import Any
@@ -80,20 +81,78 @@ def load_started(context: Any) -> None:
 
     global _applied
 
-    wrapture = _wrapture()
-    source = _config or wrapture.find_config()
+    # Issue 781: the start-up says whether tracing applies, once for the
+    # release: in the host that loads it, or the first worker where each
+    # loads it for itself.
 
-    if source is None:
-        raise RuntimeError(
-            "tracing is on but no wrapture configuration was found: name the file with "
-            "config in the [tracing] table, set WRAPTURE_CONFIG, or provide wrapture.toml "
-            "or a [tool.wrapture] table in pyproject.toml in the project's directory"
-        )
+    first = context.worker_id in (None, 0)
 
-    _applied = wrapture.load_config(source).apply(start=False)
+    try:
+        wrapture = _wrapture()
+        source = _config or wrapture.find_config()
+
+        if source is None:
+            raise RuntimeError(
+                "tracing is on but no wrapture configuration was found: name the file with "
+                "config in the [tracing] table, set WRAPTURE_CONFIG, or provide wrapture.toml "
+                "or a [tool.wrapture] table in pyproject.toml in the project's directory"
+            )
+
+        config = wrapture.load_config(source)
+        _applied = config.apply(start=False)
+    except Exception as error:
+        if first:
+            _write(f"warning: the release is served untraced: {error}")
+
+        raise
+
+    if first:
+        _write(f"tracing on: {describe(source, config)}")
 
     if context.worker_id is not None:
         _start(wrapture)
+
+
+def describe(source: str, config: Any) -> str:
+    """Say where a wrapture configuration came from and what it sets up."""
+
+    name = str(source)
+    path = name if name.startswith(("/", ".")) else f"./{name}"
+
+    if _config is not None:
+        where = path
+    elif os.environ.get("WRAPTURE_CONFIG"):
+        where = f"{path}, named by WRAPTURE_CONFIG"
+    elif os.path.basename(name) == "pyproject.toml":
+        where = f"[tool.wrapture] in {path}"
+    else:
+        where = path
+
+    instrumented = [
+        str(getattr(entry, "name", entry)) for entry in getattr(config, "instrument", ())
+    ]
+    observed = len(getattr(config, "observe", ()))
+    parts = []
+
+    if instrumented:
+        parts.append("instrumenting " + ", ".join(instrumented))
+
+    if observed:
+        parts.append(f"observing {observed} target{'' if observed == 1 else 's'}")
+
+    doing = " and ".join(parts) if parts else "with nothing to instrument or observe"
+    return f"wrapture configuration from {where}, {doing}"
+
+
+def _write(line: str) -> None:
+    # One line of the host's own, or the worker's, on standard error,
+    # which the host tags.
+
+    try:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
 
 
 def worker_started(context: Any) -> None:

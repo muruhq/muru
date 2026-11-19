@@ -115,7 +115,7 @@ muructl deploy hello v2
 ```
 
 ```
-Error: the host exited with exit status: 1 before its workers were ready: cannot load app:application: KeyError: 'GREETING'
+muru: error: the host exited with exit status: 1 before its workers were ready: cannot load app:application: KeyError: 'GREETING'
 ```
 
 The new release never took traffic. `curl` still gets

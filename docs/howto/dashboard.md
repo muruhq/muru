@@ -28,6 +28,19 @@ relay and the workers as [`muructl status
 asked for. `/metrics` on the same address is the Prometheus exposition
 the [metrics guide](metrics.md) describes.
 
+A run whose dashboard address is taken, most often by another
+`muructl run`, does not start, as for its HTTP port. The message names
+the process that holds the address when it can be found:
+
+```console
+$ muructl run
+muru: error: the dashboard's address 127.0.0.1:8081 is in use by muructl (pid 4211); choose another address with --dashboard ADDRESS, or turn it off with --dashboard off, or stop that process
+```
+
+The banner of the run's pages names the project directory it serves and
+when it started, so a tab left open on another run's dashboard is told
+apart.
+
 Each recent request links to its page, `request/ID`, which shows the
 run's record of it: its timing, where it was routed, its response and
 headers, with secret values masked, and its connection. `/v1/requests/ID`

@@ -73,6 +73,11 @@ pub struct Data {
     pub release: u32,
     /// How long the run has been up, already formatted.
     pub uptime: String,
+    /// The project directory the run serves, which the header names so
+    /// that a tab on another run's dashboard is told apart (issue 750).
+    pub project: String,
+    /// When the run started, as a full UTC time.
+    pub started: String,
     /// Whether this is a development run, which the header says.
     pub development: bool,
     /// The address the application is served on.
@@ -639,6 +644,9 @@ struct LogsFragment<'a> {
 #[template(path = "request.html")]
 struct RequestPage<'a> {
     app: &'a str,
+    /// The run's project directory and start, as the front page has them.
+    project: &'a str,
+    started: &'a str,
     request_id: &'a str,
     view: Option<&'a RequestView>,
     /// Why there is no record, when there is none.
@@ -982,9 +990,12 @@ fn request_paths(path: &str, source: &Source, requests: &RequestSource) -> Optio
         Err(error) => (None, error.as_str()),
     };
 
+    let data = source();
     let mut response = page(
         RequestPage {
-            app: &source().app,
+            app: &data.app,
+            project: &data.project,
+            started: &data.started,
             request_id,
             view,
             error,

@@ -47,13 +47,23 @@ and reach routes by the route's `name`.
 | `apps.NAME.freeze_deploys` | Refuse the application's [deploys and rollouts](rollouts.md#deploy-freezes) |
 
 An overlay can choose the page people see while it is active, such as a
-notice for a planned upgrade; a page's file must be an absolute path:
+notice for a planned upgrade. A relative file is taken from the
+directory of the file the overlay is applied from, here
+`pages/upgrade.html` beside it:
 
 ```toml
 [overlay.db-upgrade]
 apps.shop = { maintenance = true }
-routes.shop-root.error_pages = { '503:maintenance' = { file = '/srv/shop/upgrade.html' } }
+routes.shop-root.error_pages = { '503:maintenance' = { file = 'pages/upgrade.html' } }
 ```
+
+`muructl apply` refuses an overlay whose page file does not exist. If
+the file goes after the apply, the edge refuses the overlay when it is
+activated, and the overlay is not recorded as active: `muructl overlay
+activate` fails with the edge's reason, and an activation by schedule or
+condition is skipped with an `overlay.skipped` warning saying why. A
+condition that is still firing tries again once the overlay's cooldown,
+or a minute if that is shorter, has passed.
 
 An overlay can also give a client class a route of its own while it is
 active, such as sending crawlers to a static snapshot when they become a
@@ -370,6 +380,11 @@ serving = "r43"
 An overlay that changes a route's mode, say, prints the route as it now
 is, under `# route shop-root, in place of its table in the files`. Put
 the blocks in the files and remove the overlay from them.
+
+A promoted overlay stays `promoted` in `muructl overlay list` and is not
+activated again, by hand, by the webhook, by its schedule or by its
+condition, until an apply removes it or changes it. A changed one is a
+new overlay, and the apply report says its promotion is cleared.
 
 While a route's traffic is split, by its own policy or an overlay's,
 `muructl release list` shows each release's share of it under the

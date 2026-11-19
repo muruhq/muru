@@ -119,6 +119,15 @@ def test_tracing_applies_in_the_host_starts_in_each_worker_and_wraps_what_it_is_
 
         assert lines[0] == f"TRACE apply pyproject.toml start=False pid={server.host_pid()}", lines
         assert {line.split()[-1] for line in lines if line.startswith("TRACE start")} == workers
+
+        # Issue 781: the start-up says so, once, from the host.
+
+        said = [line for line in server.log().splitlines() if "tracing on:" in line]
+        assert len(said) == 1, said
+        assert said[0].endswith(
+            f"muru.host[{server.host_pid()}]: tracing on: wrapture configuration from "
+            "[tool.wrapture] in ./pyproject.toml, with nothing to instrument or observe"
+        ), said
     finally:
         server.stop()
 

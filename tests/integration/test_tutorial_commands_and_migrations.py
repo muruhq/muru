@@ -107,7 +107,9 @@ def test_the_commands_and_migrations_tutorial(tmp_path: Path) -> None:
         assert "gate migrate before_fork passed" in text(daemon, "release", "show", "catalog@r2")
         shutil.copy(CATALOG / "broken" / "0003_restock.sql", project / "migrations")
         failed = text(daemon, "deploy", "catalog", str(project), check=False)
-        assert "Error: the before_fork gate migrate exited with status 1 after" in failed, failed
+        assert "muru: error: the before_fork gate migrate exited with status 1 after" in failed, (
+            failed
+        )
         releases = text(daemon, "release", "list", "catalog")
         assert "catalog@r3               failed" in releases, releases
         assert daemon.get().body == b"teapot  12.50\n"
@@ -126,7 +128,9 @@ def test_the_commands_and_migrations_tutorial(tmp_path: Path) -> None:
         )
         wait_for(lambda: "under way" in text(daemon, "command", "runs", "catalog", "backup"))
         second = text(daemon, "command", "run", "catalog", "backup", check=False)
-        assert "Error: backup runs one at a time for catalog, and run 5 is under way" in second
+        assert (
+            "muru: error: backup runs one at a time for catalog, and run 5 is under way" in second
+        )
         output = holder.communicate(timeout=30)[0]
         assert "copied 4 of 4" in output and "backed up to backups/catalog-" in output, output
 

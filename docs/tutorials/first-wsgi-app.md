@@ -75,6 +75,7 @@ muru.host[12345]: worker 0 (pid 12346) is ready
 muru: serving app:application on http://127.0.0.1:8080 with 1 worker of 4 threads
 muru: development mode: error pages show tracebacks, nothing is persisted, the run reloads on change and only loopback is served; production runs under the daemon (muructl daemon start)
 muru: dashboard on http://127.0.0.1:8081/
+muru: pid 12340, written to /run/user/1000/muru/runs/8080/pid
 muru: admin socket /run/user/1000/muru/runs/8080/admin.sock
 muru: watching /home/dev/hello for changes to **/*.py
 ```

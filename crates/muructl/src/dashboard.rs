@@ -39,6 +39,10 @@ pub struct Inputs {
     pub https: Option<SocketAddr>,
     /// When the run started.
     pub started: Instant,
+    /// The same moment by the clock, for the header.
+    pub started_at: SystemTime,
+    /// The project directory the run serves.
+    pub project: std::path::PathBuf,
     /// The current release number.
     pub release: Arc<AtomicU32>,
     /// The worker pools.
@@ -55,8 +59,8 @@ pub struct Inputs {
     pub recorder: Option<Arc<muru_edge::recorder::Recorder>>,
 }
 
-/// Bind the dashboard and serve it in the background. Returns its address.
-pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> {
+/// Bind the dashboard's address, which must be on loopback.
+pub async fn bind(address: &str) -> anyhow::Result<tokio::net::TcpListener> {
     let address: SocketAddr = address
         .parse()
         .map_err(|_| anyhow::anyhow!("{address:?} is not an address such as 127.0.0.1:8081"))?;
@@ -64,7 +68,15 @@ pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> 
         address.ip().is_loopback(),
         "the dashboard is only served on loopback addresses"
     );
-    let listener = muru_dashboard::bind(address).await?;
+    muru_dashboard::bind(address).await
+}
+
+/// Serve the dashboard on `listener` in the background. Returns its
+/// address.
+pub async fn start(
+    listener: tokio::net::TcpListener,
+    inputs: Inputs,
+) -> anyhow::Result<SocketAddr> {
     let bound = listener.local_addr()?;
     let pools = Arc::clone(&inputs.pools);
     let access_log = Arc::clone(&inputs.access_log);
@@ -289,6 +301,8 @@ fn collect(inputs: &Inputs) -> Data {
         ),
         release: inputs.release.load(Ordering::Relaxed),
         uptime: muru_dashboard::uptime(inputs.started.elapsed()),
+        project: inputs.project.display().to_string(),
+        started: muru_common::log::full(inputs.started_at),
         development: inputs.development,
         listen: inputs.listen.to_string(),
         https: inputs.https.map(|address| address.to_string()),
