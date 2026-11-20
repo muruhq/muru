@@ -124,6 +124,51 @@ script can check that nothing was left running:
 $ muructl instance list --orphans --label nightly > /dev/null || echo "something was left running"
 ```
 
+## Cleaning up
+
+`muructl instance prune` removes stale entries and stops orphaned
+processes. It lists what it will do and asks first:
+
+```console
+$ muructl instance prune
+remove   run run:8123 (stale, 9b21c4e0)
+stop     host 61234: muru host blog@r1 (run:8123) (its instance is stale)
+keep     daemon 7f3a9c2e: it is detached and its processes keep serving; --detached stops them
+remove 1 entry and stop 1 process? [y/N] y
+muru: removed 1 entry and stopped 1 process
+```
+
+- **Stale entries** are removed only while their lock is free, so an
+  instance that is alive is never touched. A development run's own
+  directory goes with its entry.
+
+- **Orphans**, as `--orphans` lists them, are stopped: SIGTERM, then
+  after a grace period of 5 seconds, or `--grace DURATION`, SIGKILL for
+  what remains. Hosts are stopped before their log relays, and workers end
+  with their host. Before each signal the process's start time is checked
+  against the one it was found with, so a pid the system has since given
+  to another process is never signalled.
+
+- **A detached instance's processes**, such as the edge and hosts a
+  daemon leaves serving when it detaches for the next daemon to take
+  over, are kept unless `--detached` is given, which stops them and
+  removes the instance's entry.
+
+`--yes` goes ahead without asking, and without a terminal the command
+refuses unless it is given. `--dry-run` lists and changes nothing.
+`--json` reports what was `removed`, `stopped`, `kept` and `failed`, each
+with why.
+
+`--label LABEL` prunes only what carries the label, which is how a script
+or a test session cleans up after itself; `--instance NAME|ID` only one
+instance's leftovers, by its name or its instance ID (or the ID's first 8
+hex digits); `--entries-only` removes stale entries and stops nothing.
+
+`muructl instance prune` works on your own registry and processes. As
+root it also works on the system daemon's registry, and with
+`--all-users` on every user's. A process you may not signal is reported
+and left.
+
 On macOS the environment of a subprocess that runs one of the system's
 own programs, such as `/bin/sleep`, cannot be read, so such a process is
 found only while its worker or host is alive.

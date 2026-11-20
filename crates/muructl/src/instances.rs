@@ -24,6 +24,53 @@ pub enum InstanceCommand {
     /// runs and serves, running, detached or stale, and with --orphans
     /// the Muru processes no live instance accounts for.
     List(ListArgs),
+
+    /// Remove stale registry entries and stop orphaned Muru processes,
+    /// after listing them and asking.
+    Prune(PruneArgs),
+}
+
+/// What `instance prune` takes.
+#[derive(Args)]
+pub struct PruneArgs {
+    /// Only what carries this label.
+    #[arg(long, value_name = "LABEL")]
+    pub label: Option<String>,
+
+    /// Only the leftovers of one instance, by its name, tag or ID (in
+    /// full, or its first 8 hex digits).
+    #[arg(long = "instance", value_name = "NAME|ID")]
+    pub only: Option<String>,
+
+    /// Also stop the processes of detached instances, such as the edge
+    /// and hosts a daemon that detached left serving, and remove their
+    /// entries.
+    #[arg(long)]
+    pub detached: bool,
+
+    /// Remove stale entries and stop nothing.
+    #[arg(long)]
+    pub entries_only: bool,
+
+    /// How long a process has after SIGTERM before it is killed.
+    #[arg(long, value_name = "DURATION", default_value = "5s", value_parser = muru_config::parse_duration)]
+    pub grace: Duration,
+
+    /// Also other users' registries and processes (root only).
+    #[arg(long)]
+    pub all_users: bool,
+
+    /// Only list what would be removed and stopped.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Report what was removed, stopped and kept as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// A kind of instance, for --kind.
@@ -754,6 +801,405 @@ fn print_orphans(orphans: &[Orphan]) {
     print_table(&table);
 }
 
+/// A process prune stops, with what it was found as.
+#[derive(Debug, Clone, Serialize)]
+pub struct Stopping {
+    /// Its pid.
+    pub pid: u32,
+    /// Its role.
+    pub role: String,
+    /// Its title.
+    pub title: String,
+    /// Its instance's tag, when it names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// Why it is stopped.
+    pub why: String,
+    /// When it started, so a reused pid is never signalled.
+    #[serde(skip)]
+    started_unix_ms: Option<u64>,
+    /// Its parent, so a worker goes with its host.
+    #[serde(skip)]
+    parent: u32,
+}
+
+/// An entry prune removes.
+#[derive(Debug, Clone, Serialize)]
+pub struct Removing {
+    /// The instance, by its tag.
+    pub instance: String,
+    /// Its kind.
+    pub kind: String,
+    /// Its ID.
+    pub id: String,
+    /// Its state.
+    pub state: String,
+    #[serde(skip)]
+    registry: PathBuf,
+    #[serde(skip)]
+    run_dir: Option<PathBuf>,
+}
+
+/// Something prune leaves, and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct Kept {
+    /// What it is.
+    pub what: String,
+    /// Why it is left.
+    pub why: String,
+}
+
+/// What prune would do, and then what it did.
+#[derive(Debug, Default, Serialize)]
+pub struct Plan {
+    /// The entries removed.
+    pub removed: Vec<Removing>,
+    /// The processes stopped.
+    pub stopped: Vec<Stopping>,
+    /// What was left, with why.
+    pub kept: Vec<Kept>,
+    /// What could not be done, with why.
+    pub failed: Vec<Kept>,
+}
+
+/// Whether `row` is the instance `wanted` names: by its name, tag, full ID
+/// or the first hex digits of it.
+fn named(row: &Row, wanted: &str) -> bool {
+    let id = row.record.id.to_string();
+
+    row.record.name.as_deref() == Some(wanted)
+        || row.tag() == wanted
+        || (wanted.len() >= 8 && id.starts_with(wanted))
+}
+
+/// Work out what prune removes and stops.
+pub async fn plan(args: &PruneArgs) -> anyhow::Result<Plan> {
+    let registries = registries(args.all_users)?;
+    let processes = muru_controller::lookup::muru_processes();
+    let all = rows(&registries, &processes);
+    let mut plan = Plan::default();
+
+    let wanted_row = |row: &Row| {
+        args.label
+            .as_ref()
+            .is_none_or(|label| row.record.label.as_ref() == Some(label))
+            && args.only.as_deref().is_none_or(|only| named(row, only))
+    };
+
+    // The entries whose owners are gone; a detached one only with
+    // --detached, once its processes are stopped.
+
+    for (row, path) in all.iter().zip(registry_paths(&all, &registries)) {
+        if !wanted_row(row) {
+            continue;
+        }
+
+        let removing = Removing {
+            instance: row.tag(),
+            kind: row.record.kind.word().to_owned(),
+            id: row.record.id.to_string(),
+            state: row.state.word().to_owned(),
+            registry: path,
+            run_dir: (row.record.kind == Kind::Run).then(|| row.record.run_dir.clone()),
+        };
+
+        match row.state {
+            State::Stale => plan.removed.push(removing),
+            State::Detached if args.detached && !args.entries_only => plan.removed.push(removing),
+            State::Detached => plan.kept.push(Kept {
+                what: format!("{} {}", row.record.kind.word(), row.tag()),
+                why: "it is detached and its processes keep serving; --detached stops them"
+                    .to_owned(),
+            }),
+            State::Running => {}
+        }
+    }
+
+    if args.entries_only {
+        return Ok(plan);
+    }
+
+    // The orphans, and with --detached the processes of the detached
+    // instances asked for.
+
+    let orphans = orphans(&all, &processes).await;
+
+    for orphan in orphans {
+        let owner = processes.iter().find(|process| process.pid == orphan.pid);
+        let row = owner.and_then(|process| all.iter().find(|row| row.owns(process)));
+
+        let wanted = match row {
+            Some(row) => wanted_row(row),
+            None => {
+                args.only.is_none()
+                    && args
+                        .label
+                        .as_ref()
+                        .is_none_or(|label| orphan.label.as_ref() == Some(label))
+            }
+        };
+
+        if wanted {
+            plan.stopped.push(Stopping {
+                pid: orphan.pid,
+                role: orphan.role.clone(),
+                title: orphan.title.clone(),
+                instance: orphan.instance.clone(),
+                why: orphan.why.clone(),
+                started_unix_ms: orphan.started_unix_ms,
+                parent: orphan.parent_pid,
+            });
+        }
+    }
+
+    for row in all
+        .iter()
+        .filter(|row| row.state == State::Detached && wanted_row(row))
+    {
+        for process in processes.iter().filter(|process| row.owns(process)) {
+            if !args.detached {
+                plan.kept.push(Kept {
+                    what: format!("{} {} ({})", process.role, process.pid, process.title),
+                    why: format!("it serves for the detached instance {}", row.tag()),
+                });
+                continue;
+            }
+
+            plan.stopped.push(Stopping {
+                pid: process.pid,
+                role: process.role.clone(),
+                title: process.title.clone(),
+                instance: process.tag.clone(),
+                why: format!("its instance {} is detached", row.tag()),
+                started_unix_ms: process.started_unix_ms,
+                parent: process.parent,
+            });
+        }
+    }
+
+    Ok(plan)
+}
+
+/// The registry each row came from, by where its entry is.
+fn registry_paths(rows: &[Row], registries: &[PathBuf]) -> Vec<PathBuf> {
+    rows.iter()
+        .map(|row| {
+            registries
+                .iter()
+                .find(|registry| registry.join(row.record.id.to_string()).is_dir())
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The order processes are stopped in: hosts and everything else before
+/// relays, which carry the hosts' last output, and workers whose host is
+/// being stopped are left to end with it.
+fn stage(stopping: &Stopping, pids: &HashSet<u32>) -> u8 {
+    match stopping.role.as_str() {
+        "worker" | "process" if pids.contains(&stopping.parent) => 1,
+        "relay" => 1,
+        _ => 0,
+    }
+}
+
+/// Signal `stopping` when it is still the process found.
+fn signal(stopping: &Stopping, signal: i32) -> Result<bool, String> {
+    if !muru_controller::lookup::still_the_same(stopping.pid, stopping.started_unix_ms) {
+        return Ok(false);
+    }
+
+    // SAFETY: kill sends a signal and touches no memory; the pid was just
+    // checked to be the process found, by its start time.
+
+    let sent = unsafe { libc::kill(stopping.pid as libc::pid_t, signal) };
+
+    if sent == 0 {
+        return Ok(true);
+    }
+
+    let error = std::io::Error::last_os_error();
+
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        _ => Err(error.to_string()),
+    }
+}
+
+/// Stop the processes: SIGTERM, the grace period, then SIGKILL, a stage
+/// at a time; each pid checked against its start time before every
+/// signal. Those the caller may not signal are reported and left.
+async fn stop(plan: &mut Plan, grace: Duration) {
+    let pids: HashSet<u32> = plan.stopped.iter().map(|stopping| stopping.pid).collect();
+    let mut refused: Vec<(usize, String)> = Vec::new();
+
+    for wanted in [0, 1] {
+        let staged: Vec<usize> = (0..plan.stopped.len())
+            .filter(|index| stage(&plan.stopped[*index], &pids) == wanted)
+            .collect();
+
+        for index in &staged {
+            if let Err(error) = signal(&plan.stopped[*index], libc::SIGTERM) {
+                refused.push((*index, error));
+            }
+        }
+
+        // The stage's processes get the grace period to exit.
+
+        let deadline = std::time::Instant::now() + grace;
+
+        while std::time::Instant::now() < deadline
+            && staged.iter().any(|index| {
+                let stopping = &plan.stopped[*index];
+                muru_controller::lookup::still_the_same(stopping.pid, stopping.started_unix_ms)
+            })
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // Whatever outlived its grace period is killed.
+
+    for stopping in &plan.stopped {
+        let _ = signal(stopping, libc::SIGKILL);
+    }
+
+    for (index, why) in refused.iter().rev() {
+        let stopping = plan.stopped.remove(*index);
+        plan.failed.push(Kept {
+            what: format!("{} {} ({})", stopping.role, stopping.pid, stopping.title),
+            why: why.clone(),
+        });
+    }
+}
+
+/// Remove the entries, each only while its lock can be taken, and a
+/// run's own directory with it.
+fn remove(plan: &mut Plan) {
+    let mut removed = Vec::new();
+
+    for removing in plan.removed.drain(..) {
+        let Ok(id) = removing.id.parse() else {
+            continue;
+        };
+
+        match registry::remove_stale(&removing.registry, id) {
+            Ok(true) => {
+                if let Some(run_dir) = &removing.run_dir
+                    && run_dir
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with("run-"))
+                {
+                    let _ = std::fs::remove_dir_all(run_dir);
+                }
+
+                removed.push(removing);
+            }
+            Ok(false) => plan.kept.push(Kept {
+                what: format!("{} {}", removing.kind, removing.instance),
+                why: "its owner holds its lock again".to_owned(),
+            }),
+            Err(error) => plan.failed.push(Kept {
+                what: format!("{} {}", removing.kind, removing.instance),
+                why: error.to_string(),
+            }),
+        }
+    }
+
+    plan.removed = removed;
+}
+
+/// What prune is about to do, for the question and --dry-run.
+fn print_plan(plan: &Plan) {
+    for removing in &plan.removed {
+        println!(
+            "remove   {} {} ({}, {})",
+            removing.kind,
+            removing.instance,
+            removing.state,
+            &removing.id[..8]
+        );
+    }
+
+    for stopping in &plan.stopped {
+        println!(
+            "stop     {} {}: {} ({})",
+            stopping.role, stopping.pid, stopping.title, stopping.why
+        );
+    }
+
+    for kept in &plan.kept {
+        println!("keep     {}: {}", kept.what, kept.why);
+    }
+}
+
+/// `muructl instance prune`.
+pub async fn prune(args: PruneArgs) -> anyhow::Result<()> {
+    let mut plan = plan(&args).await?;
+
+    if plan.removed.is_empty() && plan.stopped.is_empty() {
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        } else {
+            print_plan(&plan);
+            println!("muru: nothing to prune");
+        }
+
+        return Ok(());
+    }
+
+    if args.dry_run {
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        } else {
+            print_plan(&plan);
+            println!("muru: nothing was changed (--dry-run)");
+        }
+
+        return Ok(());
+    }
+
+    if !args.json {
+        print_plan(&plan);
+    }
+
+    let question = format!(
+        "remove {} and stop {}?",
+        counted(plan.removed.len(), "entry", "entries"),
+        counted(plan.stopped.len(), "process", "processes")
+    );
+
+    if !crate::admin::confirm(&question, args.yes)? {
+        println!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    stop(&mut plan, args.grace).await;
+    remove(&mut plan);
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        println!(
+            "muru: removed {} and stopped {}",
+            counted(plan.removed.len(), "entry", "entries"),
+            counted(plan.stopped.len(), "process", "processes")
+        );
+
+        for failed in &plan.failed {
+            println!("muru: left {}: {}", failed.what, failed.why);
+        }
+    }
+
+    Ok(())
+}
+
+/// `count` with the singular or plural noun.
+fn counted(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
 /// How many instances `instance list` shows that run or were left
 /// running, for `muructl status` to say when it finds nothing listening.
 pub fn count_alive() -> usize {
@@ -840,6 +1286,38 @@ mod tests {
                 (9100, "other", "configured", None),
             ]
         );
+    }
+
+    #[test]
+    fn a_pid_with_another_start_time_is_never_signalled() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep started");
+        let started = muru_controller::processes::read(child.id())
+            .and_then(|found| found.started_unix_ms)
+            .expect("its start time");
+        let pid = child.id();
+        let stopping = |started_unix_ms| Stopping {
+            pid,
+            role: "host".to_owned(),
+            title: String::new(),
+            instance: None,
+            why: String::new(),
+            started_unix_ms,
+            parent: 1,
+        };
+
+        // A start time a minute out is another process that has the pid.
+
+        assert_eq!(
+            signal(&stopping(Some(started + 60_000)), libc::SIGTERM),
+            Ok(false)
+        );
+        assert!(child.try_wait().expect("waited").is_none());
+
+        assert_eq!(signal(&stopping(Some(started)), libc::SIGTERM), Ok(true));
+        assert!(child.wait().expect("waited").code().is_none());
     }
 
     #[test]

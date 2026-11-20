@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from support import server as support
-from support.daemon import start_daemon
+from support.daemon import SHOP, start_daemon
 
 
 def muructl(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -214,3 +215,53 @@ def test_a_port_another_instance_holds_names_that_instance(tmp_path: Path) -> No
         ], ports
     finally:
         run.stop()
+
+
+def test_prune_removes_what_is_stale_and_stops_a_detached_daemon_only_when_asked(
+    tmp_path: Path,
+) -> None:
+    # Issue 809: a run killed outright leaves a stale entry, a daemon that
+    # detaches leaves its edge and host serving; prune removes the first
+    # and keeps the second until --detached.
+
+    label = f"test-{uuid.uuid4().hex[:8]}"
+    (tmp_path / "daemon").mkdir()
+    daemon = start_daemon(tmp_path / "daemon", env={"MURU_INSTANCE_LABEL": label})
+    run = support.start(
+        "plain_wsgi:application", workers=1, threads=1, env={"MURU_INSTANCE_LABEL": label}
+    )
+
+    try:
+        daemon.deploy("shop", SHOP, "--processes", "1")
+        run.process.send_signal(signal.SIGKILL)
+        run.process.wait(timeout=10)
+        daemon.stop(shutdown=False)
+
+        def states() -> dict[str, str]:
+            return {row["kind"]: row["state"] for row in listed(label)["instances"]}
+
+        wait_for(lambda: states() == {"daemon": "detached", "run": "stale"}, timeout=20)
+        assert daemon.get("/").status == 200
+
+        pruned = json.loads(
+            muructl("instance", "prune", "--label", label, "--yes", "--json").stdout
+        )
+        assert [entry["kind"] for entry in pruned["removed"]] == ["run"], pruned
+        assert {kept["why"] for kept in pruned["kept"]} >= {
+            "it is detached and its processes keep serving; --detached stops them"
+        }, pruned
+        assert states() == {"daemon": "detached"}
+        assert daemon.get("/").status == 200
+
+        pruned = json.loads(
+            muructl("instance", "prune", "--label", label, "--detached", "--yes", "--json").stdout
+        )
+        assert {stopped["role"] for stopped in pruned["stopped"]} >= {"edge", "host"}, pruned
+        assert [entry["kind"] for entry in pruned["removed"]] == ["daemon"], pruned
+        assert listed(label)["instances"] == []
+        assert listed(label, "--orphans")["orphans"] == []
+    finally:
+        run.stop()
+
+        if daemon.process.poll() is None:
+            daemon.stop()

@@ -9779,7 +9779,7 @@ fn print_archives(report: &pb::ListLogsResponse) {
 /// Ask a yes or no question on the terminal, on standard error so that
 /// standard output stays the command's answer. `--yes` answers without
 /// asking; with no terminal to ask on, the command is refused.
-fn confirm(question: &str, yes: bool) -> anyhow::Result<bool> {
+pub(crate) fn confirm(question: &str, yes: bool) -> anyhow::Result<bool> {
     use std::io::{IsTerminal as _, Write as _};
 
     if yes {
