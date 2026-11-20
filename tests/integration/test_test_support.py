@@ -1,30 +1,45 @@
-"""The tests' own clean-up: what a failed test leaves running is ended."""
+"""The tests' own clean-up (design specification section 15): every
+instance the session starts carries the session's label, and what a test
+leaves running is found through the instance registry."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
-import time
+import uuid
 
+from support import instances
 from support import server as support
 
 
-def test_what_runs_from_a_short_directory_is_ended() -> None:
-    directory = support.short_dir("muru-run-")
+def test_a_labelled_leftover_is_found_and_stopped() -> None:
+    # A process carrying the ID of an instance that is gone and a label of
+    # its own stands for what a failed test leaves behind.
+
+    label = f"test-{uuid.uuid4().hex[:8]}"
     process = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(300)", str(directory)]
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        env={
+            **os.environ,
+            "MURU_INSTANCE_ID": uuid.uuid4().hex,
+            "MURU_INSTANCE": "gone",
+            instances.LABEL_VARIABLE: label,
+        },
     )
 
     try:
-        deadline = time.monotonic() + 5
+        rows, orphans = instances.leftovers(label, set(), allow_detached=False)
+        assert rows == [] and [orphan["pid"] for orphan in orphans] == [process.pid], orphans
+        assert f"pid {process.pid}" in instances.describe(rows, orphans)
 
-        while not subprocess.run(
-            ["pgrep", "-f", str(directory)], capture_output=True, text=True, check=False
-        ).stdout:
-            assert time.monotonic() < deadline, "the process never appeared"
-            time.sleep(0.05)
-
-        support.end_processes_using(directory)
-        assert process.wait(timeout=5) != 0
+        instances.end(rows, label)
+        assert process.wait(timeout=10) != 0
+        assert instances.leftovers(label, set(), allow_detached=False) == ([], [])
     finally:
         process.kill()
+
+
+def test_the_session_labels_what_it_starts() -> None:
+    assert instances.label().startswith("pytest-"), instances.label()
+    assert support.muructl_path() is not None

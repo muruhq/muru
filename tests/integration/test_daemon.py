@@ -19,6 +19,7 @@ import time
 import tomllib
 from pathlib import Path
 
+from support import instances
 from support import server as support
 from support.daemon import FACTORY, SHOP, Daemon, start_daemon
 from support.daemon import daemon as daemon_fixture
@@ -323,11 +324,11 @@ def test_detached_daemon_leaves_traffic_flowing_and_is_readopted(tmp_path: Path)
     finally:
         if second is None:
             second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
-        ours = support.recorded_pids(first.run_dir)
+        ours = instances.pids_of(first.run_dir / "admin.sock") - {second.process.pid}
         second.stop(shutdown=True)
 
     # Nothing is left: nothing that names the run directory, and none of
-    # the edge, hosts and relays the records named, which carry titles.
+    # the edge, hosts and relays it supervised, which carry titles.
 
     listing = subprocess.run(
         ["ps", "-ax", "-o", "command="], capture_output=True, text=True, check=False

@@ -39,6 +39,19 @@ design specification and are added as the features they cover land:
 - `test_subreaper.py` (Linux only): the host collecting and stopping
   what a killed worker, or a stopping one, leaves behind.
 
+- `test_instances.py`: the instance registry, `muructl instance list`
+  with its orphans and ports, `instance prune`, named instances and
+  reaching one from a checkout's `muru.local.toml`.
+
+- `test_test_support.py`: the session's labels and the check that fails
+  a test which leaves Muru running.
+
+Every instance a session starts carries the session's label,
+`MURU_INSTANCE_LABEL=pytest-PID`, and a test that leaves one running, or a
+process of one, fails in its teardown, naming what it left, which is then
+stopped. A test that leaves a daemon detached on purpose carries
+`pytest.mark.leaves_detached`, and the session's end stops it.
+
 - `test_containers.py` (marked requires_docker): muructl as a container's
   main process, in an image built from the working tree with
   `images/test/Dockerfile`: PID 1 as the built-in init, no zombies after a
