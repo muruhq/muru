@@ -569,12 +569,15 @@ fn open_lock(directory: &Path, create: bool, mode: u32) -> std::io::Result<File>
         .open(directory.join(LOCK))
 }
 
-/// How many times a lock held only for a moment, by a reader testing it,
-/// is tried again before it counts as held by an owner.
+/// How many times a lock held only for a moment is tried again before it
+/// counts as held by an owner. A reader testing an entry holds a shared
+/// lock for an instant, and a process forked by the lock's holder keeps
+/// a copy of it until it runs its program, since a `flock` belongs to the
+/// open file and close-on-exec descriptors stay open until the exec.
 const LOCK_TRIES: u32 = 20;
 
-/// Take an exclusive lock, trying again for a moment, since a reader's
-/// test holds a shared lock for an instant.
+/// Take an exclusive lock, trying again for a moment, so that a hold
+/// that lasts an instant (see [`LOCK_TRIES`]) is waited out.
 fn lock_exclusive(file: &File) -> std::io::Result<bool> {
     for _ in 0..LOCK_TRIES {
         if fdpass::try_lock(file.as_raw_fd(), true)? {
@@ -811,8 +814,9 @@ fn is_live(directory: &Path) -> bool {
 
 /// Remove the entry of `id` when its owner is gone: take its lock, which
 /// succeeds only then, and rename it aside and delete it while holding
-/// it. True when it was removed; an entry whose lock is held is never
-/// touched.
+/// it. A lock held for an instant, by a reader or a forked process, is
+/// waited out as a takeover waits it out (issue 818). True when it was
+/// removed; an entry whose lock stays held is never touched.
 pub fn remove_stale(registry: &Path, id: InstanceId) -> std::io::Result<bool> {
     let directory = registry.join(id.to_string());
 
@@ -822,7 +826,7 @@ pub fn remove_stale(registry: &Path, id: InstanceId) -> std::io::Result<bool> {
         Err(error) => return Err(error),
     };
 
-    if !fdpass::try_lock(lock.as_raw_fd(), true)? {
+    if !lock_exclusive(&lock)? {
         return Ok(false);
     }
 
@@ -896,6 +900,32 @@ mod tests {
         drop(entry);
         assert!(read(&registry).is_empty());
         assert_eq!(std::fs::read_dir(&registry).expect("listed").count(), 0);
+    }
+
+    #[test]
+    fn a_stale_entry_held_for_a_moment_is_still_pruned() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let registry = directory.path().join("registry");
+        let entry = Entry::publish(&registry, record(Kind::Run, 8000)).expect("published");
+        let id = entry.record().id;
+        entry.keep();
+        drop(entry);
+
+        // A shared lock held for a moment, as a reader's test or a forked
+        // child's copy holds one, is waited out rather than taken for an
+        // owner (issue 818).
+
+        let held = open_lock(&registry.join(id.to_string()), false, 0).expect("opened");
+        assert!(fdpass::try_lock(held.as_raw_fd(), false).expect("locked"));
+
+        let releasing = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+        });
+
+        assert!(remove_stale(&registry, id).expect("pruned"));
+        releasing.join().expect("released");
+        assert!(read(&registry).is_empty());
     }
 
     #[test]
@@ -1010,10 +1040,11 @@ mod tests {
                             .expect("published");
                         let id = entry.record().id;
 
-                        // Every other process prunes what it can see while
-                        // this one's entry is live.
+                        // Every other process prunes what it reads as
+                        // stale, as instance prune does, while this one's
+                        // entry is live.
 
-                        for found in read(&registry) {
+                        for found in read(&registry).into_iter().filter(|found| !found.live) {
                             let _ = remove_stale(&registry, found.record.id);
                         }
 
