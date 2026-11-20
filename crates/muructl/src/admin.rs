@@ -966,9 +966,6 @@ fn upgrade_arguments() -> Vec<std::ffi::OsString> {
 /// Run the daemon in the foreground.
 pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     let locations = args.locations.resolve()?;
-    locations
-        .check_run_dir()
-        .map_err(|error| anyhow::anyhow!(error))?;
     check_defined(&locations)?;
     require_local("daemon run", locations.instance.as_deref())?;
 
