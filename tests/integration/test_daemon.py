@@ -221,6 +221,53 @@ def test_current_release_is_started_again_after_a_shutdown(tmp_path: Path) -> No
         second.stop()
 
 
+def test_a_second_daemon_on_a_running_daemons_directories_is_refused(daemon: Daemon) -> None:
+    # Issue 804: a daemon owns its state and run directories, so a second
+    # one on either is refused before it touches the first's socket.
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    socket_path = daemon.run_dir / "admin.sock"
+    inode = socket_path.stat().st_ino
+    other_state = support.short_dir("muru-st-")
+
+    for state in (daemon.base / "state", other_state):
+        refused = subprocess.run(
+            [
+                str(muructl),
+                "daemon",
+                "run",
+                "--state-dir",
+                str(state),
+                "--run-dir",
+                str(daemon.run_dir),
+                "--log-dir",
+                str(daemon.base / "logs"),
+                "--cache-dir",
+                str(daemon.base / "cache"),
+                "--config",
+                str(daemon.base / "muru.toml"),
+                "--listen",
+                f"127.0.0.1:{support.free_port()}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        directory = "state directory" if state == daemon.base / "state" else "run directory"
+        assert refused.returncode != 0
+        assert (
+            f"another daemon (pid {daemon.process.pid}) is using the {directory}" in refused.stderr
+        ), refused.stderr
+        assert f"its admin socket is {socket_path}" in refused.stderr, refused.stderr
+
+    # The first keeps its socket and answers on it.
+
+    assert socket_path.stat().st_ino == inode
+    assert f"daemon   pid {daemon.process.pid} " in daemon.muructl("daemon", "status").stdout
+
+
 def edge_pid_of(daemon: Daemon) -> int:
     """The edge process pid from the status output."""
 
@@ -667,9 +714,13 @@ def test_the_daemons_file_is_named_only_where_it_is_read(daemon: Daemon, tmp_pat
 
     muructl = support.muructl_path()
     assert muructl is not None
+
+    # Directories of its own: the fixture's daemon owns its state
+    # directory, and another daemon on it would be refused first.
+
     where = {
-        "MURU_STATE_DIR": str(tmp_path / "state"),
-        "MURU_LOG_DIR": str(tmp_path / "logs"),
+        "MURU_STATE_DIR": str(tmp_path / "other-state"),
+        "MURU_LOG_DIR": str(tmp_path / "other-logs"),
         "MURU_RUN_DIR": str(support.short_dir("muru-rt-")),
         "MURU_CACHE_DIR": str(tmp_path / "cache"),
     }

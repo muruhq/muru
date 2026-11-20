@@ -244,6 +244,9 @@ pub struct Config {
     /// How often the log files are checked for a rename, when
     /// `reopen_on_rename` is on: `RENAME_CHECK` but in tests.
     pub rename_check: Duration,
+    /// The locks on the state and run directories, taken before anything
+    /// else and held for the life of the process (issue 804).
+    pub ownership: crate::ownership::Ownership,
 }
 
 /// How often the daemon checks whether a log file was renamed away
@@ -2671,7 +2674,25 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         // exec returns only when it failed; the hosts and the edge are
         // still serving, so this daemon leaves as a detached one does.
 
-        let error = exec_daemon(&upgrade.executable, &config.upgrade_arguments);
+        // The locks on the directories are kept through the exec, so
+        // there is no moment when another daemon could take them.
+
+        let mut arguments = config.upgrade_arguments.clone();
+        let held = config.ownership.keep_across_exec();
+
+        if !held.is_empty() {
+            arguments.push(crate::ownership::HELD_LOCKS_FLAG.into());
+            arguments.push(
+                held.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+                    .into(),
+            );
+        }
+
+        let error = exec_daemon(&upgrade.executable, &arguments);
+        config.ownership.close_on_exec();
         remove_pid_file(&daemon.locations);
         daemon.events.emit(
             "daemon.detached",

@@ -627,6 +627,21 @@ muru: error: the daemon exited before it answered (exit status: 1); from /var/lo
   2026-11-02T05:40:11.209Z muru: error: cannot listen on 0.0.0.0:80: Address already in use (os error 98)
 ```
 
+A daemon owns its state directory and its run directory for as long as
+it runs, through a lock on `daemon.lock` in each. A second daemon given
+either of them, by the same flags or by different ones that share a
+directory, is refused before it touches anything, naming the daemon that
+has it:
+
+```console
+$ muructl daemon run --state-dir /srv/muru/state
+muru: error: another daemon (pid 4242) is using the run directory /run/muru; its admin socket is /run/muru/admin.sock
+```
+
+`muructl daemon start` reports the same refusal. The locks go with the
+process however it ends, so a daemon that was killed leaves nothing in
+the way of the next.
+
 The daemon writes its pid to `daemon.pid` in the runtime directory and
 removes the file when it exits. `muructl up` does the same and is harmless when one already runs. `muructl daemon
 status` and `muructl status` show the daemon, its edge process, its

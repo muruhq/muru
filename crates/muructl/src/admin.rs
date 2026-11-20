@@ -574,22 +574,31 @@ pub struct DaemonRunArgs {
     #[arg(long, hide = true, value_name = "VERSION")]
     upgraded_from: Option<String>,
 
+    /// Set by a daemon that re-executed itself for an upgrade: the
+    /// descriptors that hold its locks on the state and run directories.
+    #[arg(long, hide = true, value_name = "FDS")]
+    held_locks: Option<String>,
+
     #[command(flatten)]
     locations: LocationArgs,
 }
 
 /// The arguments a daemon re-executes itself with on an upgrade: its own,
 /// with --upgraded-from naming this version in place of any earlier one.
+/// The descriptors that hold its locks are added when it re-executes, in
+/// place of any it was given.
 fn upgrade_arguments() -> Vec<std::ffi::OsString> {
     let mut arguments: Vec<std::ffi::OsString> =
         muru_common::title::args_os().into_iter().skip(1).collect();
 
-    if let Some(at) = arguments
-        .iter()
-        .position(|argument| argument == "--upgraded-from")
-    {
-        let end = (at + 2).min(arguments.len());
-        arguments.drain(at..end);
+    for flag in [
+        "--upgraded-from",
+        muru_controller::ownership::HELD_LOCKS_FLAG,
+    ] {
+        if let Some(at) = arguments.iter().position(|argument| argument == flag) {
+            let end = (at + 2).min(arguments.len());
+            arguments.drain(at..end);
+        }
     }
 
     arguments.push("--upgraded-from".into());
@@ -600,6 +609,18 @@ fn upgrade_arguments() -> Vec<std::ffi::OsString> {
 /// Run the daemon in the foreground.
 pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     let locations = args.locations.resolve()?;
+    locations
+        .check_run_dir()
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+    // Issue 804: the daemon owns its state and run directories before it
+    // does anything else, so a second daemon on either is refused before
+    // it can take over the first's socket or edge.
+
+    let held = muru_controller::ownership::parse_held(args.held_locks.as_deref().unwrap_or(""))
+        .map_err(anyhow::Error::msg)?;
+    let ownership = muru_controller::ownership::Ownership::take(&locations, &held)
+        .map_err(anyhow::Error::msg)?;
 
     // Section 2.1: the daemon's process title, which names whose daemon
     // it is, as its edge's does.
@@ -649,6 +670,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         upgrade_arguments: upgrade_arguments(),
         upgraded_from: args.upgraded_from.clone(),
         rename_check: rename_check(),
+        ownership,
     })
     .await
 }
@@ -671,12 +693,26 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         .check_run_dir()
         .map_err(|error| anyhow::anyhow!(error))?;
     let socket = locations.admin_socket();
+
+    // A daemon answering on this socket is this one when it uses the same
+    // state directory, and another daemon on the run directory when not.
+
     if let Ok(mut client) = client::connect(&socket).await
         && let Ok(status) = client.get_status(pb::GetStatusRequest {}).await
     {
         let status = status.into_inner();
-        println!("muru: the daemon is already running (pid {})", status.pid);
-        return Ok(());
+
+        if Path::new(&status.state_dir) == locations.state.path {
+            println!("muru: the daemon is already running (pid {})", status.pid);
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "another daemon (pid {}) is using the run directory {}; its admin socket is {}",
+            status.pid,
+            locations.run.path.display(),
+            socket.display()
+        );
     }
 
     std::fs::create_dir_all(&locations.logs.path)
@@ -751,10 +787,20 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         }
 
         if let Some(exited) = child.try_wait().context("waiting for the daemon")? {
-            anyhow::bail!(
-                "the daemon exited before it answered ({exited}); {}",
-                daemon_log_since(&locations.daemon_log(), written_before)
-            );
+            // Issue 804: a daemon refused its directories says so, and
+            // that is the whole of the answer.
+
+            let written = daemon_log_since(&locations.daemon_log(), written_before);
+
+            if let Some(refusal) = written
+                .lines()
+                .find(|line| muru_controller::ownership::is_refusal(line))
+                .and_then(|line| line.split_once("error: "))
+            {
+                anyhow::bail!("{}", refusal.1);
+            }
+
+            anyhow::bail!("the daemon exited before it answered ({exited}); {written}");
         }
 
         tokio::time::sleep(Duration::from_millis(100)).await;
