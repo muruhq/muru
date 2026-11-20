@@ -590,6 +590,17 @@ fn lock_exclusive(file: &File) -> std::io::Result<bool> {
     Ok(false)
 }
 
+/// Whether `file` is the file at `path`, rather than one renamed away
+/// from it since it was opened.
+fn is_at(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(open), Ok(there)) => open.dev() == there.dev() && open.ino() == there.ino(),
+        _ => false,
+    }
+}
+
 /// Remove an entry's directory by renaming it aside first, so a reader
 /// never sees it half deleted.
 fn remove_entry(registry: &Path, directory: &Path, id: InstanceId) -> std::io::Result<()> {
@@ -671,10 +682,21 @@ impl Entry {
         let lock = match open_lock(&directory, true, mode) {
             Ok(lock) => lock,
 
+            // A pruner removed the entry since it was seen, so it is
+            // published afresh (issue 819).
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Self::publish(registry, record);
+            }
+
             // An entry with no lock file is a broken one: it is put aside
             // and published afresh.
             Err(_) => {
-                remove_entry(registry, &directory, record.id)?;
+                match remove_entry(registry, &directory, record.id) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+
                 return Self::publish(registry, record);
             }
         };
@@ -685,6 +707,16 @@ impl Entry {
                 record.id,
                 directory.display()
             )));
+        }
+
+        // A pruner that held the lock first has renamed the entry aside, so
+        // the lock taken is on a file no longer at the entry's path: the
+        // entry is published afresh rather than owned where no reader
+        // looks (issue 819).
+
+        if !is_at(&lock, &directory.join(LOCK)) {
+            drop(lock);
+            return Self::publish(registry, record);
         }
 
         write_record(&directory, &record, mode)?;
@@ -827,6 +859,15 @@ pub fn remove_stale(registry: &Path, id: InstanceId) -> std::io::Result<bool> {
     };
 
     if !lock_exclusive(&lock)? {
+        return Ok(false);
+    }
+
+    // The lock may be on a file renamed away while this waited for it, its
+    // entry removed by its owner or another pruner, and the path may now
+    // hold the owner's entry published afresh: only the entry whose lock
+    // this holds is removed (issue 819).
+
+    if !is_at(&lock, &directory.join(LOCK)) {
         return Ok(false);
     }
 
@@ -1035,10 +1076,17 @@ mod tests {
                 let registry = registry.clone();
 
                 std::thread::spawn(move || {
+                    // One instance per worker, so that an entry it left
+                    // stale is taken over again, as a restarted daemon
+                    // takes over its own, while the others prune it.
+
+                    let mine = record(Kind::Daemon, 9000 + worker);
+
                     for round in 0..25 {
-                        let entry = Entry::publish(&registry, record(Kind::Run, 9000 + worker))
-                            .expect("published");
-                        let id = entry.record().id;
+                        let entry =
+                            Entry::publish(&registry, mine.clone()).unwrap_or_else(|error| {
+                                panic!("worker {worker} round {round}: {error}")
+                            });
 
                         // Every other process prunes what it reads as
                         // stale, as instance prune does, while this one's
@@ -1051,7 +1099,7 @@ mod tests {
                         assert!(
                             read(&registry)
                                 .iter()
-                                .any(|found| found.record.id == id && found.live),
+                                .any(|found| found.record.id == mine.id && found.live),
                             "worker {worker} round {round} lost its live entry"
                         );
 
