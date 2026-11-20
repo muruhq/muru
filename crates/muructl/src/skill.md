@@ -10,6 +10,11 @@ run `muructl` in a shell and add `--json` to any command that reports
 something: it prints the same JSON the tools return, or `{"error": ...}`
 with a non-zero exit status when it fails.
 
+When the machine runs several daemons, each is a named instance. The
+project's `muru.local.toml` may name the one it uses, `instance = "dev"`;
+otherwise pass `--instance NAME` to `muructl`, or start the MCP server
+with it, and the tools reach that instance.
+
 ## What the objects are
 
 - **Application**: a name, such as `shop`, with its routes.
@@ -134,6 +139,12 @@ directory and `deploy`'s settings, without the daemon.
   table, with its inputs; it can be run from the next release deployed.
   `docs` with `howto/commands` describes the table. Give a secret input
   in `secret_inputs` as `STORE/KEY`, never as a value.
+
+- `instances` lists every Muru instance on the machine, daemons and
+  development runs alike, with whether each is running, detached or
+  stale; with `orphans`, also the Muru processes nothing accounts for.
+  Check it before starting a run, and after stopping one, to see what
+  was left running.
 
 - Do not stop, upgrade or reconfigure the daemon unless asked: other
   applications may share it.

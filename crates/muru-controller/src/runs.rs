@@ -608,6 +608,7 @@ async fn spawn_relay(
     }
 
     command.envs(prepared.env.iter().map(|(name, value)| (name, value)));
+    command.envs(crate::instance::variables());
     crate::host::own_session(&mut command, prepared.identity);
 
     let mut relay = command.spawn().context("running muructl relay")?;

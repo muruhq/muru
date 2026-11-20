@@ -31,7 +31,42 @@ pub struct Options {
     pub cache_dir: Option<PathBuf>,
     /// The system locations, whoever runs the daemon.
     pub system: bool,
+    /// A named instance, whose locations all follow from its name
+    /// (section 13.8, issue 810); `user` and `system` name the default
+    /// daemons.
+    pub instance: Option<String>,
 }
+
+/// The longest an instance's name may be, so it fits in titles and keeps
+/// socket paths within the platform's limit.
+pub const NAME_LIMIT: usize = 24;
+
+/// The names of the default daemons, which no named instance may have.
+pub const RESERVED_NAMES: [&str; 2] = ["user", "system"];
+
+/// Check an instance's name: 1 to 24 characters of `[a-z0-9-]`, starting
+/// with a letter.
+pub fn check_name(name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= NAME_LIMIT
+        && name.starts_with(|first: char| first.is_ascii_lowercase())
+        && name
+            .chars()
+            .all(|char| char.is_ascii_lowercase() || char.is_ascii_digit() || char == '-');
+
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name:?} is not an instance name: 1 to {NAME_LIMIT} lowercase letters, digits and \
+             hyphens, starting with a letter"
+        ))
+    }
+}
+
+/// The directory, under a location's area, that a named instance's
+/// locations go in.
+pub const INSTANCES_DIR: &str = "instances";
 
 /// The variable that names the daemon's configuration file.
 pub const CONFIG_VARIABLE: &str = "MURU_DAEMON_CONFIG";
@@ -69,6 +104,8 @@ pub struct Location {
 pub struct Locations {
     /// The mode the defaults came from.
     pub mode: Mode,
+    /// The named instance the defaults are for, when there is one.
+    pub instance: Option<String>,
     /// The daemon configuration file, which need not exist.
     pub config: Location,
     /// The state store, built environments and other durable files.
@@ -131,36 +168,45 @@ impl Locations {
 
     /// Resolve every location for the given options and environment.
     pub fn resolve(options: &Options) -> Self {
-        let mode = if options.system || is_root() {
+        // `system` as an instance's name is the system daemon, and `user`
+        // the default one of whoever runs.
+
+        let named = options
+            .instance
+            .clone()
+            .filter(|name| !RESERVED_NAMES.contains(&name.as_str()));
+
+        let mode = if options.system || is_root() || options.instance.as_deref() == Some("system") {
             Mode::System
         } else {
             Mode::User
         };
         let home = env::var_os("HOME").map(PathBuf::from);
+        let name = named.as_deref();
 
         let state = pick(
             options.state_dir.as_ref(),
             "MURU_STATE_DIR",
             "STATE_DIRECTORY",
-            || default_state(mode, home.as_deref()),
+            || named_state(mode, home.as_deref(), name),
         );
         let config = pick(
             options.config.as_ref(),
             CONFIG_VARIABLE,
             "CONFIGURATION_DIRECTORY",
-            || default_config(mode, home.as_deref()),
+            || named_config(mode, home.as_deref(), name),
         );
         let run = pick(
             options.run_dir.as_ref(),
             "MURU_RUN_DIR",
             "RUNTIME_DIRECTORY",
-            || default_run(mode),
+            || named_under(default_run(mode), name),
         );
         let logs = pick(
             options.log_dir.as_ref(),
             "MURU_LOG_DIR",
             "LOGS_DIRECTORY",
-            || default_logs(mode, home.as_deref()),
+            || named_under(default_logs(mode, home.as_deref()), name),
         );
         let cache = pick(
             options.cache_dir.as_ref(),
@@ -190,6 +236,7 @@ impl Locations {
 
         Self {
             mode,
+            instance: named,
             config,
             state,
             run,
@@ -205,13 +252,40 @@ impl Locations {
     /// apart.
     pub fn scope(&self) -> String {
         let home = env::var_os("HOME").map(PathBuf::from);
-        let default = std::path::absolute(default_state(self.mode, home.as_deref()));
+        let default = std::path::absolute(named_state(
+            self.mode,
+            home.as_deref(),
+            self.instance.as_deref(),
+        ));
 
         if default.is_ok_and(|default| default == self.state.path) {
-            self.mode_word().to_owned()
+            self.instance
+                .clone()
+                .unwrap_or_else(|| self.mode_word().to_owned())
         } else {
             self.state.path.display().to_string()
         }
+    }
+
+    /// The instance's name in the registry (section 13.8): `user` or
+    /// `system` for the default daemon of the mode, none for a daemon
+    /// whose locations were given by flags.
+    pub fn instance_name(&self) -> Option<String> {
+        let scope = self.scope();
+        let named = self.instance.as_deref().unwrap_or(self.mode_word());
+        (scope == named).then_some(scope)
+    }
+
+    /// The directory holding a named instance's definition, its
+    /// `instance.toml` and `muru.toml`; none for a default daemon.
+    pub fn definition_dir(&self) -> Option<PathBuf> {
+        let home = env::var_os("HOME").map(PathBuf::from);
+        let name = self.instance.as_deref()?;
+        Some(
+            config_area(self.mode, home.as_deref())
+                .join(INSTANCES_DIR)
+                .join(name),
+        )
     }
 
     /// `user` or `system`, for the mode.
@@ -331,6 +405,57 @@ fn xdg(variable: &str, home: Option<&std::path::Path>, fallback: &str) -> PathBu
         .unwrap_or_else(|| home_or_cwd(home).join(fallback))
 }
 
+/// The configuration area of the mode: where the default daemon's file
+/// is, and the catalogue of named instances under `instances`.
+pub fn config_area(mode: Mode, home: Option<&std::path::Path>) -> PathBuf {
+    default_config(mode, home)
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+/// The configuration area of whoever runs, or the system's.
+pub fn caller_config_area(system: bool) -> PathBuf {
+    let mode = if system || is_root() {
+        Mode::System
+    } else {
+        Mode::User
+    };
+    config_area(mode, env::var_os("HOME").map(PathBuf::from).as_deref())
+}
+
+/// A location's default, under `instances/NAME` for a named instance.
+fn named_under(path: PathBuf, name: Option<&str>) -> PathBuf {
+    match name {
+        Some(name) => path.join(INSTANCES_DIR).join(name),
+        None => path,
+    }
+}
+
+/// The configuration file's default: `CONFIG/instances/NAME/muru.toml`
+/// for a named instance.
+fn named_config(mode: Mode, home: Option<&std::path::Path>, name: Option<&str>) -> PathBuf {
+    match name {
+        Some(name) => config_area(mode, home)
+            .join(INSTANCES_DIR)
+            .join(name)
+            .join("muru.toml"),
+        None => default_config(mode, home),
+    }
+}
+
+/// The state directory's default: on macOS a named instance's needs a
+/// `state` directory of its own, since the default configuration and
+/// state locations are one directory there.
+fn named_state(mode: Mode, home: Option<&std::path::Path>, name: Option<&str>) -> PathBuf {
+    match name {
+        Some(name) if mode == Mode::User && cfg!(target_os = "macos") => {
+            named_under(default_state(mode, home), Some(name)).join("state")
+        }
+        name => named_under(default_state(mode, home), name),
+    }
+}
+
 fn default_config(mode: Mode, home: Option<&std::path::Path>) -> PathBuf {
     match mode {
         Mode::System => PathBuf::from("/etc/muru/muru.toml"),
@@ -349,6 +474,13 @@ fn default_state(mode: Mode, home: Option<&std::path::Path>) -> PathBuf {
         }
         Mode::User => xdg("XDG_STATE_HOME", home, ".local/state").join("muru"),
     }
+}
+
+/// The default runtime location for whoever runs: the system one for
+/// root, the user's otherwise, whatever an option or variable says. The
+/// instance registry lives there (section 13.8).
+pub fn default_runtime() -> PathBuf {
+    default_run(if is_root() { Mode::System } else { Mode::User })
 }
 
 fn default_run(mode: Mode) -> PathBuf {
@@ -426,6 +558,62 @@ mod tests {
         assert_eq!(locations.cache.path, here.join("muru/cache"));
         assert_eq!(locations.state.rule, "option");
         assert!(locations.check_run_dir().is_err());
+    }
+
+    #[test]
+    fn a_named_instance_puts_every_location_under_its_name() {
+        let named = Locations::resolve(&Options {
+            instance: Some("dev".to_owned()),
+            ..Options::default()
+        });
+        let default = Locations::resolve(&Options::default());
+
+        // Unless a variable or systemd already decides the location.
+
+        for (location, base) in [(&named.run, &default.run), (&named.logs, &default.logs)] {
+            if location.rule == "default" {
+                assert_eq!(location.path, base.path.join("instances/dev"));
+            }
+        }
+
+        if named.state.rule == "default" {
+            let expected = if cfg!(target_os = "macos") {
+                default.state.path.join("instances/dev/state")
+            } else {
+                default.state.path.join("instances/dev")
+            };
+            assert_eq!(named.state.path, expected);
+            assert_eq!(named.scope(), "dev");
+            assert_eq!(named.instance_name().as_deref(), Some("dev"));
+        }
+
+        assert_eq!(named.cache.path, default.cache.path);
+        assert!(
+            named
+                .definition_dir()
+                .expect("a definition")
+                .ends_with("instances/dev")
+        );
+
+        // `user` is the default daemon.
+
+        let user = Locations::resolve(&Options {
+            instance: Some("user".to_owned()),
+            ..Options::default()
+        });
+        assert_eq!(user.state.path, default.state.path);
+        assert!(user.definition_dir().is_none());
+    }
+
+    #[test]
+    fn names_are_short_lowercase_and_start_with_a_letter() {
+        assert!(check_name("dev").is_ok());
+        assert!(check_name("staging-2").is_ok());
+        assert!(check_name("").is_err());
+        assert!(check_name("2dev").is_err());
+        assert!(check_name("Dev").is_err());
+        assert!(check_name("dev_1").is_err());
+        assert!(check_name(&"a".repeat(25)).is_err());
     }
 
     #[test]

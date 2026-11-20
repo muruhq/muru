@@ -27,6 +27,15 @@
   {% endfor %}
   {% endfor %}
 </table>
+{% if data.has_urls() %}
+<h3>Addresses</h3>
+<table>
+  <tr><th>Application</th><th>Reached at, best first, as muructl open --list gives it</th></tr>
+  {% for app in data.apps %}{% if !app.urls.is_empty() %}
+  <tr><td>{{ app.name }}</td><td>{% for url in app.urls %}{% if !loop.first %}, {% endif %}<code>{{ url }}</code>{% endfor %}</td></tr>
+  {% endif %}{% endfor %}
+</table>
+{% endif %}
 {% include "websockets.html" %}
 {% if !data.rollouts.is_empty() %}
 <h3>Rollouts</h3>

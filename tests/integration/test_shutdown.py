@@ -17,21 +17,22 @@ import threading
 import time
 from pathlib import Path
 
+from support import instances
 from support import server as support
 from support.daemon import SHOP, Daemon, start_daemon
 
 
 def nothing_left_of(daemon: Daemon, ours: set[int]) -> bool:
     """Whether no process of the daemon's run directory remains: none that
-    names it on its command line, and none of `ours`, the edge, hosts and
-    relays its records named before it stopped, which carry titles in
-    place of their command lines."""
+    names it on its command line, and none of `ours`, the processes it
+    supervised before it stopped, which carry titles in place of their
+    command lines."""
 
     listing = subprocess.run(
         ["ps", "-ax", "-o", "command="], capture_output=True, text=True, check=False
     ).stdout
     named = any(daemon.run_dir.name in line for line in listing.splitlines())
-    assert ours, "the daemon's records named none of its processes"
+    assert ours, "the daemon supervised no processes"
     return not named and not support.still_running(ours)
 
 
@@ -89,7 +90,7 @@ def test_sigterm_shuts_down_under_the_table_and_a_request_in_flight_finishes(
 
     try:
         daemon.deploy("shop", SHOP, "--processes", "1")
-        ours = support.recorded_pids(daemon.run_dir)
+        ours = instances.pids_of(daemon.run_dir / "admin.sock")
         thread, outcome = request_in_the_background(daemon, "/slow?ms=2000")
         time.sleep(0.5)
 
@@ -118,7 +119,7 @@ def test_the_delay_closes_connections_while_the_edge_still_accepts(tmp_path: Pat
 
     try:
         daemon.deploy("shop", SHOP, "--processes", "1")
-        ours = support.recorded_pids(daemon.run_dir)
+        ours = instances.pids_of(daemon.run_dir / "admin.sock")
 
         # A keep-alive connection, served as usual before the signal.
 
@@ -164,7 +165,7 @@ def test_what_outruns_the_budget_is_killed(tmp_path: Path) -> None:
 
     try:
         daemon.deploy("shop", SHOP, "--processes", "1")
-        ours = support.recorded_pids(daemon.run_dir)
+        ours = instances.pids_of(daemon.run_dir / "admin.sock")
         thread, outcome = request_in_the_background(daemon, "/slow?ms=30000")
         time.sleep(0.5)
 
@@ -192,7 +193,7 @@ def test_daemon_stop_shutdown_runs_the_same_sequence(tmp_path: Path) -> None:
 
     try:
         daemon.deploy("shop", SHOP, "--processes", "1")
-        ours = support.recorded_pids(daemon.run_dir)
+        ours = instances.pids_of(daemon.run_dir / "admin.sock")
         thread, outcome = request_in_the_background(daemon, "/slow?ms=2000")
         time.sleep(0.5)
         started = time.monotonic()
@@ -214,7 +215,7 @@ def test_reload_applies_the_shutdown_table(tmp_path: Path) -> None:
 
     try:
         daemon.deploy("shop", SHOP, "--processes", "1")
-        ours = support.recorded_pids(daemon.run_dir)
+        ours = instances.pids_of(daemon.run_dir / "admin.sock")
         config = tmp_path / "muru.toml"
         config.write_text(
             config.read_text().replace(

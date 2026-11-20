@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -85,11 +86,30 @@ def test_port_auto_picks_free_ports_and_prints_them(
 
 
 def test_a_port_in_use_is_reported_with_its_holder(server: support.Server) -> None:
+    # Another instance of Muru's is named as an instance (issue 808).
+
     with pytest.raises(RuntimeError) as failure:
         support.start("plain_wsgi:application", args=["--port", str(server.port)])
     message = str(failure.value)
-    assert f"port {server.port} on 127.0.0.1 is in use" in message
-    assert "--port" in message
+    assert (
+        f"port {server.port} on 127.0.0.1 is in use by the development run of plain-wsgi in "
+        in message
+    ), message
+    assert f"(pid {server.process.pid}" in message and "--port" in message
+
+    # Another program is named by what lsof or ss say of it.
+
+    with socket.socket() as held:
+        held.bind(("127.0.0.1", 0))
+        held.listen()
+        port = held.getsockname()[1]
+
+        with pytest.raises(RuntimeError) as failure:
+            support.start("plain_wsgi:application", args=["--port", str(port)])
+
+    message = str(failure.value)
+    assert f"port {port} on 127.0.0.1 is in use" in message, message
+
     if shutil.which("lsof") or shutil.which("ss"):
         assert re.search(r"in use by \S+ \(pid \d+\)", message), message
 

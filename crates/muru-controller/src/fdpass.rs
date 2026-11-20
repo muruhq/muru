@@ -136,6 +136,71 @@ pub fn take_inherited(fd: RawFd) -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(fd) }
 }
 
+/// Try to take a `flock` lock on `fd` without waiting: exclusive or
+/// shared. False when another open file holds a lock that conflicts.
+///
+/// `flock` rather than `fcntl` locks, since an `fcntl` lock is dropped
+/// when the process closes any descriptor to the file, and a `flock` one
+/// only when the last descriptor to its open file is closed, which the
+/// kernel does however the process ends.
+pub fn try_lock(fd: RawFd, exclusive: bool) -> io::Result<bool> {
+    let operation = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+
+    // SAFETY: flock on a descriptor the caller holds open changes only
+    // the lock on its open file.
+
+    if unsafe { libc::flock(fd, operation | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+
+    let error = io::Error::last_os_error();
+
+    match error.raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Ok(false),
+        _ => Err(error),
+    }
+}
+
+/// Release a `flock` lock taken with [`try_lock`].
+pub fn unlock(fd: RawFd) {
+    // SAFETY: as for try_lock.
+
+    unsafe {
+        libc::flock(fd, libc::LOCK_UN);
+    }
+}
+
+/// Set or clear a descriptor's close-on-exec flag.
+pub fn set_close_on_exec(fd: RawFd, close: bool) -> io::Result<()> {
+    let flags = if close { libc::FD_CLOEXEC } else { 0 };
+
+    // SAFETY: fcntl F_SETFD on a descriptor the caller holds open sets
+    // only its flags.
+
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+/// Take ownership of a descriptor this process inherited across an exec
+/// of itself, when one is open under that number; none when it is not.
+pub fn adopt_inherited(fd: RawFd) -> Option<OwnedFd> {
+    // SAFETY: fcntl F_GETFD only reads the descriptor's flags, failing
+    // for a number that is not open.
+
+    if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return None;
+    }
+
+    Some(take_inherited(fd))
+}
+
 /// Room for one control message carrying one descriptor.
 const CONTROL_LEN: usize = 32;
 

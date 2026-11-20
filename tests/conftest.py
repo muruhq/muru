@@ -1,11 +1,12 @@
-"""Shared pytest configuration: skip Linux-only tests on other platforms,
-give the tests a run directory of their own, and leave nothing behind:
-what a test leaves running is ended when it ends, and the short directories
-under /tmp, the session's temporary directory and temporary logs go when
-the session does. A test that fails with a daemon or `muructl run` server
-running, or stopped on the way out, reports what it saw, and under the
-"failed" retention policy only the temporary directories of the test files
-that had a failure are kept."""
+"""Shared pytest configuration: skip Linux-only tests on other platforms, give
+the tests a run directory of their own, and leave nothing behind: every
+instance the session starts carries its label, what a test leaves running is
+found through the instance registry, ended and failed as that test's, and
+the short directories under /tmp, the session's temporary directory and
+temporary logs go when the session does. A test that fails with a daemon or
+`muructl run` server running, or stopped on the way out, reports what it
+saw, and under the "failed" retention policy only the temporary directories
+of the test files that had a failure are kept."""
 
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from pathlib import Path
 
 import pytest
 from support import daemon as daemons
-from support import server
+from support import instances, server
 
 # The directories under pytest's base temporary directory that fixtures
 # wider than a test made, by the test file that set them up ("" for the
@@ -60,6 +61,21 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     tempfile.gettempdir()
     os.environ.setdefault("MURU_RUN_DIR", str(server.short_dir("muru-rt-")))
     os.environ["TMPDIR"] = str(server.short_dir("muru-tmp-"))
+
+    # Issue 812: every instance the session starts is labelled, so what
+    # it leaves behind is found by the label.
+
+    os.environ.setdefault(instances.LABEL_VARIABLE, f"pytest-{os.getpid()}")
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Name the marker of a test that leaves an instance detached on
+    purpose."""
+
+    config.addinivalue_line(
+        "markers",
+        "leaves_detached: the test leaves a detached instance for the session's end to stop",
+    )
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -111,23 +127,54 @@ def pytest_fixture_setup(
 
 
 @pytest.fixture(autouse=True)
-def ended_processes() -> Iterator[None]:
-    """End what a test left running from the directories it made.
+def nothing_left_running(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Fail a test that leaves an instance running, or a process of one.
 
-    A directory a module's daemon uses was made before this fixture runs,
-    so it is left for the session's end. Fixtures finish before this one,
-    so a daemon stopped by its fixture is already gone.
+    The session's instances in the registry before the test, a module's
+    or the session's fixtures' among them, are left alone; fixtures of the
+    test's own finish before this one, so a daemon its fixture stopped is
+    gone. With nothing started and no new entry the check is a directory
+    listing. What was left is stopped and pruned, then named in the
+    test's error.
     """
 
-    made = server.short_dirs_made()
+    label = instances.label()
+    before = instances.labelled_ids(label)
+    known = {id(started) for started in [*daemons.STARTED, *server.STARTED]}
     yield
-    server.end_processes_since(made)
+
+    new = instances.labelled_ids(label) - before
+    started_now = any(id(started) not in known for started in [*daemons.STARTED, *server.STARTED])
+
+    if not new and not started_now:
+        return
+
+    allow_detached = request.node.get_closest_marker("leaves_detached") is not None
+    rows, orphans = instances.leftovers(label, new, allow_detached)
+
+    if rows or orphans:
+        instances.end(rows, label)
+        pytest.fail(f"the test left Muru running:\n{instances.describe(rows, orphans)}")
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """End what still runs and remove what the tests made, and, under the
     "failed" retention policy, the directories of skipped tests and the
     wider fixtures' directories of the test files that had no failure."""
+
+    # Whatever is still labelled for the session, detached instances
+    # left on purpose among them, is stopped and its entries removed.
+
+    swept = instances.sweep(instances.label())
+
+    if swept and (swept.get("stopped") or swept.get("removed")):
+        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+
+        if reporter is not None:
+            reporter.write_line(
+                f"muru: the session's end stopped {len(swept['stopped'])} processes and "
+                f"removed {len(swept['removed'])} registry entries"
+            )
 
     server.remove_short_dirs()
 

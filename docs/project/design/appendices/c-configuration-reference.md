@@ -34,6 +34,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | `[app.NAME.release.ID.mounts.NAME]` | application files | mounts |
 | `[[app.NAME.release.ID.static]]` | application files, or `[[tool.muru.static]]` | the release's own directories of files (section 4.9) |
 | `[app.NAME.release.ID.groups.NAME]` | application files | worker groups |
+| `kind`, `description` | `instance.toml` in a named instance's directory, `CONFIG/instances/NAME/` | what the definition is (`daemon`) and a description of its own; the daemon's settings are its `muru.toml` beside it (section 13.8) |
 | `[tool.muru]` | the application's pyproject.toml or muru.toml | application-shipped defaults |
 | `[tool.muru.run]`, `[run]` | the application's pyproject.toml or muru.toml, and muru.local.toml | how `muructl run` serves the project (section 13.1): a key for each flag of the command that describes the serving, ignored by the daemon |
 | `[tool.muru.commands.NAME]`, `[app.NAME.release.ID.commands.NAME]` | the application's pyproject.toml or muru.toml, or a release's table, which replaces the source's | commands the application declares (section 9.12) |

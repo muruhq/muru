@@ -101,7 +101,9 @@ impl File {
                  the project, which is not committed. Its `[run]` table holds the keys of \
                  `[tool.muru.run]` and takes precedence over them; lists add to the \
                  project's. Its `[[instrumentation]]` entries come before the project's, \
-                 and its `tracing`, `lazy_imports` and `import_report` take the place of the project's."
+                 and its `tracing`, `lazy_imports` and `import_report` take the place of the project's. \
+                 Its `instance` names the instance the other muructl commands run in the \
+                 checkout reach."
             }
         }
     }
@@ -130,6 +132,12 @@ struct LocalFile {
     /// The import report for this machine's runs, in place of the
     /// project's `import_report`.
     import_report: Option<bool>,
+    /// The named instance the muructl commands run in this checkout
+    /// reach, such as `muructl deploy` and `muructl status`, unless
+    /// `--instance`, `--socket`, `MURU_INSTANCE` or `MURU_SOCKET` names
+    /// another; a development run of the checkout still answers the
+    /// commands it can. A key of this file alone, never of the project's.
+    instance: Option<String>,
 }
 
 /// The `[build]` table of muru.local.toml.

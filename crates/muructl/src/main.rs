@@ -8,14 +8,17 @@
 //! pages and the CLI reference (section 14.4 and Appendix A).
 
 mod admin;
+mod browser;
 mod dashboard;
 mod devcert;
 mod diagnostics;
 mod edge;
 mod imports;
 mod init;
+mod instances;
 mod log_format;
 mod mcp;
+mod open;
 mod print_config;
 mod processes;
 mod project_commands;
@@ -236,12 +239,23 @@ enum Command {
         command: admin::SecretCommand,
     },
 
+    /// Open the project's application, an application on a daemon, or an
+    /// instance's dashboard in the browser on this machine.
+    Open(Box<open::OpenArgs>),
+
     /// Look into a release's workers (status, stacks, tasks, inspect),
     /// and collect diagnostics: a report for a bug report, a bundle of
     /// the system for triage.
     Debug {
         #[command(subcommand)]
         command: admin::DebugCommand,
+    },
+
+    /// The Muru instances on this machine: daemons, development runs and
+    /// serves, and what they left behind.
+    Instance {
+        #[command(subcommand)]
+        command: instances::InstanceCommand,
     },
 
     /// The runtime library on its own: unpack it for an image.
@@ -676,6 +690,11 @@ struct RunArgs {
     #[arg(long, value_name = "ADDRESS")]
     dashboard: Option<String>,
 
+    /// Open the application in the browser on this machine once the run
+    /// first answers; not again when it reloads.
+    #[arg(long)]
+    open: bool,
+
     /// Do not compress responses; they are compressed for
     /// clients that accept br, zstd or gzip otherwise.
     #[arg(long)]
@@ -939,6 +958,16 @@ fn explain_bind_error(error: anyhow::Error, https: SocketAddr) -> anyhow::Error 
         "--port"
     };
 
+    // Section 13.8: another instance of Muru's is named as an instance,
+    // and only another program by what lsof or ss say of it.
+
+    if let Some(message) = muru_controller::registry::in_use_by_instance(
+        address,
+        &format!("choose another with {flag}"),
+    ) {
+        return anyhow::anyhow!(message);
+    }
+
     match port_holder(port) {
         Some(holder) => anyhow::anyhow!(
             "port {port} on {} is in use by {holder}; choose another with {flag}, or stop it",
@@ -965,12 +994,24 @@ fn explain_dashboard_error(error: anyhow::Error, address: &str) -> anyhow::Error
         return error.context(format!("the dashboard cannot be served on {address}"));
     }
 
-    let holder = address
-        .parse::<SocketAddr>()
-        .ok()
-        .and_then(|bound| port_holder(bound.port()));
+    let parsed = address.parse::<SocketAddr>().ok();
     let instead = "choose another address with --dashboard ADDRESS, or turn it off with \
                    --dashboard off";
+
+    if let Some(holder) = parsed.and_then(|bound| {
+        muru_controller::registry::holder_of(
+            &muru_controller::registry::readable_registries(),
+            bound,
+        )
+    }) {
+        return anyhow::anyhow!(
+            "the dashboard's address {address} is in use by {}; {instead}, or {}",
+            holder.describe(),
+            holder.stop_hint()
+        );
+    }
+
+    let holder = parsed.and_then(|bound| port_holder(bound.port()));
 
     match holder {
         Some(holder) => anyhow::anyhow!(
@@ -1019,6 +1060,67 @@ fn port_holder(port: u16) -> Option<String> {
 enum Link {
     Unix,
     Tcp,
+}
+
+/// What a command is, for choosing its instance (section 13.8): whether
+/// only a daemon answers it, so a development run of the directory is not
+/// preferred over muru.local.toml, and what it changes, said when a name
+/// chose the instance.
+fn running(command: &Command) -> admin::Running {
+    let words: Vec<String> = std::env::args()
+        .skip(1)
+        .take_while(|word| !word.starts_with('-'))
+        .take(2)
+        .collect();
+    let change = |changes: bool| changes.then(|| format!("sending muructl {}", words.join(" ")));
+
+    match command {
+        Command::Deploy(args) => admin::Running {
+            daemon_only: true,
+            change: Some(format!("deploying {}", args.app())),
+            project: Some(args.source()),
+        },
+        Command::Apply(_)
+        | Command::Rollback { .. }
+        | Command::Drain { .. }
+        | Command::Maintenance { .. } => admin::Running {
+            daemon_only: true,
+            change: change(true),
+            project: None,
+        },
+        Command::App { .. }
+        | Command::Release { .. }
+        | Command::Rollout { .. }
+        | Command::Overlay { .. }
+        | Command::Secret { .. } => {
+            let reads = matches!(
+                words.get(1).map(String::as_str),
+                Some("list" | "show" | "status" | "wait" | "preview")
+            );
+
+            admin::Running {
+                daemon_only: true,
+                change: change(!reads),
+                project: None,
+            }
+        }
+        Command::Host { .. }
+        | Command::Route { .. }
+        | Command::Upstream { .. }
+        | Command::Condition { .. } => admin::Running {
+            daemon_only: true,
+            ..admin::Running::default()
+        },
+        Command::Open(args) => admin::Running {
+            daemon_only: args.app().is_some(),
+            ..admin::Running::default()
+        },
+        Command::Scale(_) | Command::Restart(_) | Command::Logging { .. } => admin::Running {
+            change: change(words.get(1).map(String::as_str) != Some("status")),
+            ..admin::Running::default()
+        },
+        _ => admin::Running::default(),
+    }
 }
 
 /// What muructl logs when MURU_LOG does not say: its own lines and
@@ -1087,6 +1189,11 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli = Cli::parse();
+
+    // Section 13.8: what the command is, for choosing the instance it
+    // reaches and saying where a change went.
+
+    admin::set_running(running(&cli.command));
 
     // Section 13.9: nothing muructl serve runs installs or downloads.
 
@@ -1182,6 +1289,13 @@ fn main() -> anyhow::Result<()> {
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
         Command::Debug { command } => runtime.block_on(admin::debug(command)),
+        Command::Open(args) => runtime.block_on(open::open(*args)),
+        Command::Instance { command } => match command {
+            instances::InstanceCommand::List(args) => exit_with(runtime, instances::list(args)),
+            instances::InstanceCommand::Prune(args) => runtime.block_on(instances::prune(args)),
+            instances::InstanceCommand::Create(args) => instances::create(args),
+            instances::InstanceCommand::Remove(args) => instances::remove_instance(args),
+        },
         Command::Cache { command } => runtime.block_on(async move {
             match command {
                 admin::CacheCommand::List(args) => admin::cache_list(*args).await,
@@ -1256,11 +1370,31 @@ fn main() -> anyhow::Result<()> {
             processes,
             output,
         } => runtime.block_on(async move {
-            if processes.processes {
-                processes::show(&socket.socket()?, &processes, output.json).await
+            let shown = if processes.processes {
+                processes::show(&socket.endpoint()?, &processes, output.json).await
             } else {
-                admin::show_status(&socket.socket()?, output.json).await
+                admin::show_status(&socket.endpoint()?, output.json).await
+            };
+
+            // With nothing where it looked, how many instances the machine
+            // has, so nothing running is told from nothing here.
+
+            if let Err(error) = &shown
+                && error.to_string().starts_with("nothing is listening")
+                && !output.json
+            {
+                match instances::count_alive() {
+                    0 => {}
+                    1 => muru_common::muru_eprintln!(
+                        "muructl instance list shows 1 instance on this machine"
+                    ),
+                    count => muru_common::muru_eprintln!(
+                        "muructl instance list shows {count} instances on this machine"
+                    ),
+                }
             }
+
+            shown
         }),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
         Command::Config { command } => match command {
@@ -3884,12 +4018,61 @@ async fn run_with(
         }
     }
 
-    let run_dir = match &serve {
-        Some(mode) => {
-            serve::make_run_dir(&mode.run_dir)?;
-            mode.run_dir.join("release")
+    // Section 13.8: the run registers in the instance registry before
+    // anything starts, so whatever it starts carries its ID. A run's own
+    // directory under the run directory, named by the ID, holds its admin
+    // socket and its releases' run directories, and nothing is written
+    // into the project.
+
+    if let Some(mode) = &serve {
+        serve::make_run_dir(&mode.run_dir)?;
+    }
+
+    let runtime = muru_controller::locations::Locations::resolve(&Default::default())
+        .run
+        .path;
+    let project = resolved
+        .project
+        .canonicalize()
+        .unwrap_or_else(|_| resolved.project.clone());
+    let (planned_http, planned_https) = addresses(&args, &resolved.serving);
+    let planned =
+        run_admin::configured_listeners(planned_http, tls.is_some().then_some(planned_https));
+
+    let registered = match &serve {
+        Some(mode) => run_admin::Registration::for_serve(
+            &mode.run_dir.join(serve::ADMIN_SOCKET),
+            &label,
+            &project,
+            planned,
+        ),
+        None => run_admin::Registration::for_run(
+            &runtime,
+            &label,
+            &project,
+            planned,
+            &resolved.serving.hosts,
+        ),
+    };
+
+    let registration = match registered {
+        Ok(registration) => Some(registration),
+        Err(error) => {
+            muru_common::muru_println!("no admin socket: {error:#}");
+            None
         }
-        None => std::env::temp_dir().join(format!("muru-{}", std::process::id())),
+    };
+
+    // Section 13.10: what the run starts says it belongs to this instance.
+
+    if let Some(registration) = &registration {
+        muru_controller::instance::set(registration.id, &registration.tag());
+    }
+
+    let run_dir = match (&serve, registration.as_ref().and_then(|r| r.directory())) {
+        (Some(mode), _) => mode.run_dir.join("release"),
+        (None, Some(directory)) => directory.to_path_buf(),
+        (None, None) => std::env::temp_dir().join(format!("muru-{}", std::process::id())),
     };
 
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
@@ -4448,36 +4631,23 @@ async fn run_with(
         }
     }
 
-    // Section 13.1: the admin socket, in the user runtime directory so
-    // nothing is written into the project, named by the port so two runs
-    // never share one; muructl finds it from the file beside it.
+    // Section 13.1: the admin socket, in the run's own directory; muructl
+    // finds it through the run's registry entry.
 
     let (admin_stop_tx, admin_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let commands = muru_controller::commands::Underway::default();
     let mut admin_serving = None;
-    let runtime = muru_controller::locations::Locations::resolve(&Default::default())
-        .run
-        .path;
-    let project = resolved
-        .project
-        .canonicalize()
-        .unwrap_or_else(|_| resolved.project.clone());
 
-    let registered = match &serve {
-        Some(mode) => run_admin::Registration::at(
-            &mode.run_dir.join(serve::ADMIN_SOCKET),
-            edge.local_addr(),
-            &label,
-            &project,
-        ),
-        None => run_admin::Registration::new(
-            &runtime,
-            edge.local_addr(),
-            &label,
-            &project,
-            library.pythonpath.as_deref(),
-        ),
-    };
+    if let Some(registration) = &registration {
+        let bound: Vec<SocketAddr> = std::iter::once(edge.local_addr())
+            .chain(edge.https_addr())
+            .collect();
+        registration.served(&bound, dashboard_address);
+
+        if let Some(directory) = &library.pythonpath {
+            registration.note_runtime(directory);
+        }
+    }
 
     // Section 13.8: commands run from the project directory, or from
     // where this run was started, reach it.
@@ -4492,14 +4662,6 @@ async fn run_with(
             _ => project.display().to_string(),
         }
     });
-
-    let registration = match registered {
-        Ok(registration) => Some(registration),
-        Err(error) => {
-            muru_common::muru_println!("no admin socket: {error:#}");
-            None
-        }
-    };
 
     // Issue 764: once the addresses are known, the title names them too,
     // so `pgrep -f` finds a run by its port, and a development run says
@@ -4539,6 +4701,7 @@ async fn run_with(
             project: project.clone(),
             run_dir: run_dir.clone(),
             socket: registration.socket.clone(),
+            instance_id: registration.id.to_string(),
             listeners,
             dashboard: dashboard_address,
             started_unix_ms: std::time::SystemTime::now()
@@ -4586,6 +4749,20 @@ async fn run_with(
                 admin_serving = Some(tokio::spawn(serving));
             }
             Err(error) => muru_common::muru_println!("no admin socket: {error:#}"),
+        }
+    }
+
+    // Issue 815: the browser opens on the run's own URL once, now that it
+    // answers, and not on later reloads.
+
+    if args.open && serve.is_none() {
+        let url = registration
+            .as_ref()
+            .and_then(run_admin::Registration::record)
+            .and_then(|record| open::record_choices(&record).into_iter().next());
+
+        if let Some(url) = url {
+            std::thread::spawn(move || browser::open(&url.url));
         }
     }
 

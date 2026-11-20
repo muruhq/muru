@@ -4,7 +4,6 @@
 //! figures, once, or redrawn with `--watch` until interrupted.
 
 use std::io::{IsTerminal as _, Write as _};
-use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use clap::Args;
@@ -60,7 +59,11 @@ pub fn request(args: &ProcessArgs) -> pb::ListProcessesRequest {
 }
 
 /// Show the processes, once or with `--watch` until interrupted.
-pub async fn show(socket: &Path, args: &ProcessArgs, json: bool) -> anyhow::Result<()> {
+pub async fn show(
+    socket: &muru_controller::client::Endpoint,
+    args: &ProcessArgs,
+    json: bool,
+) -> anyhow::Result<()> {
     let request = request(args);
     let mut client = muru_controller::client::connect(socket).await?;
 
@@ -455,6 +458,8 @@ fn uptime(milliseconds: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     fn process(pid: u32, role: &str, what: &str, children: Vec<pb::Process>) -> pb::Process {

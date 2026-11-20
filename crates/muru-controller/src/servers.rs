@@ -454,7 +454,7 @@ fn process_spec(
 fn instance_spec(spec: &HttpServerSpec, index: u32, bind: &Bind) -> InstanceSpec {
     let mut env = vec![
         ("MURU_HTTP_BIND".to_owned(), bind.address()),
-        ("MURU_INSTANCE".to_owned(), index.to_string()),
+        ("MURU_SERVER_INDEX".to_owned(), index.to_string()),
     ];
 
     let stale = match bind {

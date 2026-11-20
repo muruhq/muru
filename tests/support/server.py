@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import http.client
-import json
 import os
 import re
 import shutil
@@ -17,7 +16,6 @@ import sys
 import sysconfig
 import tempfile
 import time
-import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -133,46 +131,16 @@ def tail(path: Path) -> str:
     return "\n".join([f"... {left_out} earlier lines", *lines[-REPORT_TAIL_LINES:]])
 
 
-def short_dirs_made() -> int:
-    """How many directories short_dir has made so far, for
-    end_processes_since."""
+def user_registry() -> Path:
+    """The user's instance registry (design specification section 13.8),
+    in the default runtime location whatever MURU_RUN_DIR says."""
 
-    return len(_short_dirs)
+    if os.geteuid() == 0:
+        return Path("/run/muru/registry")
 
-
-def recorded_pids(directory: Path) -> set[int]:
-    """The pids Muru's records under a directory name that are still one of
-    Muru's processes: the edge's, each host's and each relay's records, and
-    each development run's. A process sets a title in place of its command
-    line, so the directory is not on it; the title says the pid has not
-    passed to another process since the record was written."""
-
-    pids: set[int] = set()
-
-    for record in directory.glob("runs/*/run.json"):
-        try:
-            pids.add(json.loads(record.read_text())["pid"])
-        except (OSError, ValueError, KeyError):
-            continue
-
-    for record in directory.rglob("*.toml"):
-        try:
-            pid = tomllib.loads(record.read_text()).get("pid")
-        except (OSError, ValueError):
-            continue
-
-        if isinstance(pid, int) and pid > 0:
-            command = subprocess.run(
-                ["ps", "-o", "command=", "-p", str(pid)],
-                capture_output=True,
-                text=True,
-                check=False,
-            ).stdout.strip()
-
-            if command.startswith(("muru edge ", "muru host ", "muru relay ")):
-                pids.add(pid)
-
-    return pids
+    runtime = os.environ.get("XDG_RUNTIME_DIR") if sys.platform.startswith("linux") else None
+    base = Path(runtime) / "muru" if runtime else Path(f"/tmp/muru-{os.getuid()}")
+    return base / "registry"
 
 
 def still_running(pids: set[int]) -> set[int]:
@@ -193,47 +161,12 @@ def still_running(pids: set[int]) -> set[int]:
     return running
 
 
-def end_processes_using(directory: Path) -> None:
-    """End whatever still runs from a directory of the tests.
-
-    A test that fails before it stops what it started leaves it running: a
-    daemon told to detach leaves its edge and hosts, and a development run
-    that was not reached leaves its own process. What names the directory
-    on its command line is found by it, and an edge, a host, a relay or a
-    development run by its record under it (a host's workers end with it).
-    None gets a grace period, since a test is over and nothing depends on
-    what it was doing.
-    """
-
-    found = subprocess.run(
-        ["pgrep", "-f", str(directory)], capture_output=True, text=True, check=False
-    )
-    pids = {int(line) for line in found.stdout.split()} | recorded_pids(directory)
-    pids.discard(os.getpid())
-
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-
-
-def end_processes_since(made: int) -> None:
-    """End whatever still runs from the directories made since `made`
-    of them existed, so that one test's failure does not outlive it."""
-
-    for directory in _short_dirs[made:]:
-        end_processes_using(directory)
-
-
 def remove_short_dirs() -> None:
-    """End whatever still runs from every directory short_dir made, then
-    remove them and the temporary logs."""
+    """Remove every directory short_dir made and the temporary logs, once
+    what ran from them has been stopped."""
 
     while _short_dirs:
-        directory = _short_dirs.pop()
-        end_processes_using(directory)
-        shutil.rmtree(directory, ignore_errors=True)
+        shutil.rmtree(_short_dirs.pop(), ignore_errors=True)
 
     while _temporary_files:
         _temporary_files.pop().unlink(missing_ok=True)
@@ -343,6 +276,22 @@ class Server:
 
     def __post_init__(self) -> None:
         STARTED.append(self)
+
+    def admin_socket(self, timeout: float = 10.0) -> Path:
+        """The run's admin socket, from the line it prints once it serves
+        the admin protocol, in its own directory under the run directory."""
+
+        deadline = time.monotonic() + timeout
+
+        while True:
+            for line in self.log().splitlines():
+                if " admin socket " in f" {line}":
+                    return Path(line.split("admin socket ", 1)[1].strip())
+
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"the run named no admin socket:\n{self.log()}")
+
+            time.sleep(0.05)
 
     def failure_report(self) -> list[tuple[str, str]]:
         """The section for the report of a test that failed with this

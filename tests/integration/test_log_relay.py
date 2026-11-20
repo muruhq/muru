@@ -110,7 +110,7 @@ def test_a_relay_is_replaced_under_single(tmp_path: Path) -> None:
     try:
         assert server.get("/first").status == 200
         assert server.wait_for_log("echo /first"), server.log()
-        record = Path(os.environ["TMPDIR"]) / f"muru-{server.process.pid}" / "r1" / "relay.toml"
+        record = server.admin_socket().parent / "r1" / "relay.toml"
         first = int(record.read_text().split("=")[1])
 
         os.kill(first, signal.SIGKILL)

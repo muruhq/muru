@@ -116,6 +116,17 @@ def test_what_the_workers_leave_running_goes_with_the_host(tmp_path: Path) -> No
         assert server.get(f"/spawn?pidfile={pidfile}").status == 200
         child = int(pidfile.read_text())
         assert process_state(child) not in (None, "Z")
+
+        # The child has no title of Muru's, and its environment names the
+        # instance it belongs to (issue 806).
+
+        environ = dict(
+            entry.split("=", 1)
+            for entry in Path(f"/proc/{child}/environ").read_text().split("\0")
+            if "=" in entry
+        )
+        assert environ["MURU_INSTANCE"] == f"run:{server.port}", environ
+        assert len(environ["MURU_INSTANCE_ID"]) == 32, environ
     finally:
         # Stopping the server stops the worker, whose child comes to the
         # host and is stopped in turn, so the host does not wait on the
