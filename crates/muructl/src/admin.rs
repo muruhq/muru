@@ -363,8 +363,8 @@ pub fn resolve_name(name: &str, system: bool) -> anyhow::Result<client::Endpoint
 
         if names.is_empty() {
             anyhow::bail!(
-                "no instance {name} is defined, and none are; define one with muructl instance \
-                 create {name}"
+                "no instance {name} is defined, and no named instances are defined at all; \
+                 define it with muructl instance create {name} --listen ADDRESS"
             );
         }
 
