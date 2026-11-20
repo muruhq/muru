@@ -62,7 +62,7 @@ class Handler(BaseHTTPRequestHandler):
                 for name in (
                     "MURU_HTTP_BIND",
                     "PORT",
-                    "MURU_INSTANCE",
+                    "MURU_SERVER_INDEX",
                     "LEGACY_SETTING",
                     "INHERITED_ONLY",
                     "PASSED_ON",

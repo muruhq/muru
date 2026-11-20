@@ -137,7 +137,38 @@ fn fits(length: usize, title: &str, arguments: usize) -> bool {
 
 /// `title` cut to at most `room` bytes, at the last space that leaves it
 /// whole words, or at a character's end when it has no space to cut at.
-fn cut(title: &str, room: usize) -> &str {
+/// A title ending in its instance's tag in parentheses, `muru host
+/// shop@r3 (dev)`, keeps the tag and is cut before it, so the tag is the
+/// last thing to go (section 13.10).
+fn cut(title: &str, room: usize) -> std::borrow::Cow<'_, str> {
+    if title.len() <= room {
+        return title.into();
+    }
+
+    if let Some(open) = title.rfind(" (").filter(|_| title.ends_with(')')) {
+        let tag = &title[open..];
+
+        // Only whole words of what comes before it are kept with it.
+
+        if tag.len() < room {
+            let whole = &title[..open];
+            let body = cut_words(whole, room - tag.len());
+            let at_a_word = whole
+                .as_bytes()
+                .get(body.len())
+                .is_none_or(|byte| *byte == b' ');
+
+            if !body.is_empty() && at_a_word {
+                return format!("{body}{tag}").into();
+            }
+        }
+    }
+
+    cut_words(title, room).into()
+}
+
+/// `title` cut to at most `room` bytes, at a space when it has one.
+fn cut_words(title: &str, room: usize) -> &str {
     if title.len() <= room {
         return title;
     }
@@ -171,7 +202,8 @@ fn write_long_title(area: &mut [u8], title: &str, arguments: usize) {
         return;
     };
 
-    let title = cut(title, room).as_bytes();
+    let title = cut(title, room);
+    let title = title.as_bytes();
     area[..title.len()].copy_from_slice(title);
     area[title.len()..].fill(0);
 
@@ -195,7 +227,8 @@ fn write_title(area: &mut [u8], title: &str, arguments: usize) {
         return;
     };
 
-    let bytes = cut(title, room).as_bytes();
+    let bytes = cut(title, room);
+    let bytes = bytes.as_bytes();
     let length = bytes.len();
     area[..length].copy_from_slice(bytes);
 
@@ -443,6 +476,18 @@ mod tests {
         assert_eq!(cut("muru serve shop", 15), "muru serve shop");
         assert_eq!(cut("murudaemon", 4), "muru");
         assert_eq!(cut("muru é", 6), "muru");
+
+        // The instance's tag is the last thing cut.
+
+        assert_eq!(
+            cut("muru worker shop@r3 web/0 (run:8000)", 28),
+            "muru worker (run:8000)"
+        );
+        assert_eq!(
+            cut("muru worker shop@r3 (dev)", 25),
+            "muru worker shop@r3 (dev)"
+        );
+        assert_eq!(cut("muru host shop@r3 (dev)", 9), "muru host");
 
         // The room `muructl serve` gives, 13 bytes and a NUL.
 

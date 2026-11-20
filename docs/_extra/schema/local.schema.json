@@ -223,6 +223,10 @@
       "description": "The import report for this machine's runs, in place of the project's `import_report`.",
       "type": "boolean"
     },
+    "instance": {
+      "description": "The named instance the muructl commands run in this checkout reach, such as `muructl deploy` and `muructl status`, unless `--instance`, `--socket`, `MURU_INSTANCE` or `MURU_SOCKET` names another; a development run of the checkout still answers the commands it can. A key of this file alone, never of the project's.",
+      "type": "string"
+    },
     "instrumentation": {
       "description": "Instrumentation modules for this machine's runs, before the project's own.",
       "items": {

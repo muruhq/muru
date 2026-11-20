@@ -620,6 +620,17 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
 
     trailer.extend(unwrapt_note(resolved));
 
+    // Section 13.8: the instance this checkout's commands reach, which
+    // the run does not read but its layer does say.
+
+    if let Ok(Some((path, name))) = muru_config::local_instance(&resolved.project) {
+        trailer.push(format!(
+            "instance = {name:?} (from {}): the instance muructl's other commands in this \
+             checkout reach, which a development run of it answers first where it can.",
+            path.display()
+        ));
+    }
+
     // What the run's .env file sets, by name and never by value.
 
     if let Some(file) = &serving.env_file {

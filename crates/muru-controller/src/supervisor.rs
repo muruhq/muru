@@ -946,7 +946,8 @@ impl Supervisor {
             .stderr(log)
             .env_clear()
             .envs(self.spec.env.iter().cloned())
-            .envs(instance.spec.env.iter().cloned());
+            .envs(instance.spec.env.iter().cloned())
+            .envs(crate::instance::variables());
         crate::host::own_session(&mut command, self.spec.identity);
         let child = command
             .spawn()
@@ -1026,7 +1027,8 @@ impl Supervisor {
             .stderr(log)
             .env_clear()
             .envs(self.spec.env.iter().cloned())
-            .envs(instance.spec.env.iter().cloned());
+            .envs(instance.spec.env.iter().cloned())
+            .envs(crate::instance::variables());
         crate::host::own_session(&mut command, self.spec.identity);
 
         let mut child = command.spawn().context("running muructl relay")?;

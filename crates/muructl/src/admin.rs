@@ -30,14 +30,55 @@ pub struct InstanceArgs {
     /// whoever runs the command.
     #[arg(long, global = true)]
     system: bool,
+
+    /// A named instance, whose locations all follow from its name (default:
+    /// MURU_INSTANCE); user and system name the default daemons.
+    #[arg(long, global = true, value_name = "NAME", value_parser = parse_instance_name)]
+    instance: Option<String>,
+}
+
+/// Check an instance's name as --instance takes it: a named instance's,
+/// or `user` or `system`.
+fn parse_instance_name(text: &str) -> Result<String, String> {
+    muru_controller::locations::check_name(text)?;
+    Ok(text.to_owned())
+}
+
+/// The variable that names the instance a command reaches.
+pub const INSTANCE_VARIABLE: &str = muru_controller::instance::TAG_VARIABLE;
+
+/// The instance `MURU_INSTANCE` names, when it names one by its name. The
+/// same variable carries the tag of the instance a process belongs to,
+/// which for a development run or a serve, or a daemon kept apart by its
+/// own --state-dir, is not a name: a value that is the short form of
+/// `MURU_INSTANCE_ID` beside it, or not a name at all, names nothing.
+pub fn instance_from_environment() -> Option<String> {
+    let value = std::env::var(INSTANCE_VARIABLE).ok()?;
+    let value = value.trim();
+    let id = std::env::var(muru_controller::instance::ID_VARIABLE).unwrap_or_default();
+
+    if value.is_empty()
+        || muru_controller::locations::check_name(value).is_err()
+        || (!id.is_empty() && id.starts_with(value))
+    {
+        return None;
+    }
+
+    Some(value.to_owned())
 }
 
 impl InstanceArgs {
+    /// The named instance the options or the environment give.
+    pub fn instance(&self) -> Option<String> {
+        self.instance.clone().or_else(instance_from_environment)
+    }
+
     /// Resolve the locations for these options and the environment.
     pub fn resolve(&self) -> Locations {
         Locations::resolve(&Options {
             run_dir: self.run_dir.clone(),
             system: self.system,
+            instance: self.instance(),
             ..Options::default()
         })
     }
@@ -45,6 +86,11 @@ impl InstanceArgs {
     /// The same options, for a muructl command run on this one's behalf.
     pub fn as_arguments(&self) -> Vec<String> {
         let mut arguments = Vec::new();
+
+        if let Some(name) = &self.instance {
+            arguments.push("--instance".to_owned());
+            arguments.push(name.clone());
+        }
 
         if let Some(path) = &self.run_dir {
             arguments.push("--run-dir".to_owned());
@@ -141,6 +187,22 @@ impl LocationArgs {
     /// configuration and say nothing.
     pub fn resolve(&self) -> anyhow::Result<Locations> {
         muru_controller::locations::check_renamed().map_err(anyhow::Error::msg)?;
+        let instance = self.instance.instance();
+
+        // A name with every location given by a flag would decide nothing.
+
+        if self.instance.instance.is_some()
+            && self.files.config.is_some()
+            && self.files.state_dir.is_some()
+            && self.instance.run_dir.is_some()
+            && self.files.log_dir.is_some()
+        {
+            anyhow::bail!(
+                "--instance decides the configuration file and the state, run and log \
+                 directories, and every one is given by a flag; leave out --instance or one of \
+                 the flags"
+            );
+        }
 
         Ok(Locations::resolve(&Options {
             config: self.files.config.clone(),
@@ -149,6 +211,7 @@ impl LocationArgs {
             log_dir: self.files.log_dir.clone(),
             cache_dir: self.files.cache_dir.clone(),
             system: self.instance.system,
+            instance,
         }))
     }
 
@@ -171,18 +234,300 @@ pub struct JsonArgs {
 /// How to reach a daemon or a development run: its admin socket.
 #[derive(Args, Clone, Default)]
 pub struct SocketArgs {
-    /// The admin socket (default: MURU_SOCKET, else a development run
+    /// The admin socket (default: MURU_SOCKET, else the instance
+    /// MURU_INSTANCE or muru.local.toml names, else a development run
     /// whose project is the current directory or that was started from
     /// it, else the user daemon's socket in the runtime directory, else
     /// the one development run listening).
-    #[arg(long, global = true, value_name = "PATH", env = "MURU_SOCKET")]
+    #[arg(long, global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
 
     #[command(flatten)]
     locations: InstanceArgs,
 }
 
+/// The variable that names an admin socket.
+const SOCKET_VARIABLE: &str = "MURU_SOCKET";
+
+/// Where a name that chose the instance came from (section 13.8, issue
+/// 811), for saying so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChosenBy {
+    /// `--instance`.
+    Flag,
+    /// `MURU_INSTANCE`.
+    Variable,
+    /// `instance` in a muru.local.toml.
+    LocalFile(PathBuf),
+}
+
+/// What the command being run is, for choosing its instance: whether
+/// only a daemon answers it, so a development run of the directory is
+/// not preferred, what it changes, said when a name chose the instance,
+/// and the project whose muru.local.toml is read.
+#[derive(Debug, Default)]
+pub struct Running {
+    /// Only a daemon answers it.
+    pub daemon_only: bool,
+    /// What it does, when it changes something, such as `deploying shop`.
+    pub change: Option<String>,
+    /// The directory whose muru.local.toml is read, when not the current
+    /// one, as `muructl deploy APP PATH` reads PATH's.
+    pub project: Option<PathBuf>,
+}
+
+/// The command being run, set once by main.
+static RUNNING: std::sync::OnceLock<Running> = std::sync::OnceLock::new();
+
+/// The instance name the command reached, for `--json` output.
+static REACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Say what the command being run is, before it chooses its instance.
+pub fn set_running(running: Running) {
+    let _ = RUNNING.set(running);
+}
+
+/// The instance name the command reached by name, if it did.
+pub fn reached_instance() -> Option<&'static str> {
+    REACHED.get().map(String::as_str)
+}
+
+/// The commands that work on this machine's processes and files rather
+/// than through the admin API (section 13.8, issue 811), marked here and
+/// nowhere else. Each refuses an instance that is not on this machine,
+/// through [`require_local`]; every other command goes through the admin
+/// API and works on any endpoint.
+pub const LOCAL_ONLY: [&str; 8] = [
+    "open",
+    "instance prune",
+    "instance list --orphans and --ports",
+    "daemon start",
+    "daemon run",
+    "the logs commands on files",
+    "cache",
+    "secret",
+];
+
+/// Refuse a local-only command, one of [`LOCAL_ONLY`], for an instance
+/// that is not on this machine.
+pub fn require_local(what: &str, name: Option<&str>) -> anyhow::Result<()> {
+    debug_assert!(
+        LOCAL_ONLY.contains(&what),
+        "{what} is not marked local-only"
+    );
+
+    let Some(name) = name else {
+        return Ok(());
+    };
+
+    let defined = [false, true]
+        .map(muru_controller::locations::caller_config_area)
+        .iter()
+        .find_map(|area| muru_controller::catalogue::find(area, name));
+
+    match defined {
+        Some(definition) if !definition.is_local() => anyhow::bail!(
+            "instance {name} is not on this machine; {what} works only on local instances"
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// The endpoint of the instance `name` names: the default daemons by
+/// their locations, a named instance from the catalogue of definitions
+/// and then its live registry entry. A remote definition would give its
+/// endpoint here, with nothing else changing.
+pub fn resolve_name(name: &str, system: bool) -> anyhow::Result<client::Endpoint> {
+    if muru_controller::locations::RESERVED_NAMES.contains(&name) {
+        let locations = Locations::resolve(&Options {
+            system,
+            instance: Some(name.to_owned()),
+            ..Options::default()
+        });
+        return Ok(client::Endpoint::unix(locations.admin_socket()));
+    }
+
+    let areas = [false, true].map(muru_controller::locations::caller_config_area);
+    let defined = areas
+        .iter()
+        .find_map(|area| muru_controller::catalogue::find(area, name));
+
+    let Some(definition) = defined else {
+        let mut names: Vec<String> = areas
+            .iter()
+            .flat_map(|area| muru_controller::catalogue::read(area).0)
+            .map(|definition| definition.name)
+            .collect();
+        names.sort();
+        names.dedup();
+
+        if names.is_empty() {
+            anyhow::bail!(
+                "no instance {name} is defined, and no named instances are defined at all; \
+                 define it with muructl instance create {name} --listen ADDRESS"
+            );
+        }
+
+        anyhow::bail!(
+            "no instance {name} is defined; the defined instances are {}",
+            names.join(", ")
+        );
+    };
+
+    let live = muru_controller::registry::readable_registries()
+        .iter()
+        .flat_map(|registry| muru_controller::registry::live(registry))
+        .find(|record| record.name.as_deref() == Some(definition.name.as_str()));
+
+    match live {
+        Some(record) => Ok(record.admin),
+        None => anyhow::bail!(
+            "instance {name} is not running; start it with muructl daemon start --instance {name}"
+        ),
+    }
+}
+
 impl SocketArgs {
+    /// The socket the command line or `MURU_SOCKET` names, if either does.
+    pub fn given_socket(&self) -> Option<PathBuf> {
+        self.socket.clone().or_else(|| {
+            std::env::var_os(SOCKET_VARIABLE)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+    }
+
+    /// Choose the instance to reach (section 13.8, issue 811): `--socket`
+    /// or `--instance`, then `MURU_SOCKET` or `MURU_INSTANCE`, then
+    /// `instance` in muru.local.toml, then discovery. A development run of
+    /// this directory still wins over the local file for a command both
+    /// answer, with a note; a flag or variable is explicit and wins.
+    pub fn choose(&self) -> anyhow::Result<client::Endpoint> {
+        let system = self.locations.system;
+
+        match (&self.socket, &self.locations.instance) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("--socket and --instance both name what to reach; give one")
+            }
+            (Some(socket), None) => return Ok(client::Endpoint::unix(socket)),
+            (None, Some(name)) => return self.chosen_by_name(name, ChosenBy::Flag, system),
+            (None, None) => {}
+        }
+
+        let variable_socket = std::env::var_os(SOCKET_VARIABLE).filter(|value| !value.is_empty());
+
+        match (variable_socket, instance_from_environment()) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "{SOCKET_VARIABLE} and {INSTANCE_VARIABLE} are both set, and both name what to \
+                 reach; unset one"
+            ),
+            (Some(socket), None) => return Ok(client::Endpoint::unix(PathBuf::from(socket))),
+            (None, Some(name)) => return self.chosen_by_name(&name, ChosenBy::Variable, system),
+            (None, None) => {}
+        }
+
+        // The checkout's own file, unless a development run of this
+        // directory answers a command it can.
+
+        let running = RUNNING.get();
+        let directory = running
+            .and_then(|running| running.project.clone())
+            .or_else(|| std::env::current_dir().ok());
+
+        if let Some(directory) = directory
+            && let Some((file, name)) =
+                muru_config::local_instance(&directory).map_err(anyhow::Error::msg)?
+        {
+            let daemon_only = running.is_some_and(|running| running.daemon_only);
+
+            if !daemon_only && let Some(run) = self.run_here() {
+                static NOTED: std::sync::Once = std::sync::Once::new();
+
+                NOTED.call_once(|| {
+                    muru_common::muru_eprintln!(
+                        "reaching the development run of {} on http://{}; {} names instance \
+                         {name}, pass --instance {name} to reach it",
+                        run.app,
+                        run.listen,
+                        muru_config::LOCAL_FILE
+                    );
+                });
+
+                return Ok(client::Endpoint::unix(run.socket));
+            }
+
+            return self.chosen_by_name(&name, ChosenBy::LocalFile(file), system);
+        }
+
+        Ok(client::Endpoint::unix(self.socket()?))
+    }
+
+    /// The instance a name chooses, by the flag, the variable or the
+    /// checkout's muru.local.toml, without reaching it: what `muructl mcp
+    /// serve` settles once at start.
+    pub fn named(&self) -> anyhow::Result<Option<String>> {
+        if self.socket.is_some() {
+            return Ok(None);
+        }
+
+        if let Some(name) = &self.locations.instance {
+            return Ok(Some(name.clone()));
+        }
+
+        if std::env::var_os(SOCKET_VARIABLE).is_some_and(|value| !value.is_empty()) {
+            return Ok(None);
+        }
+
+        if let Some(name) = instance_from_environment() {
+            return Ok(Some(name));
+        }
+
+        let directory = std::env::current_dir()?;
+        Ok(muru_config::local_instance(&directory)
+            .map_err(anyhow::Error::msg)?
+            .map(|(_, name)| name))
+    }
+
+    /// The newest development run whose project is the current directory,
+    /// or that was started from it, when one listens.
+    fn run_here(&self) -> Option<crate::run_admin::RunInfo> {
+        let here = std::env::current_dir()
+            .and_then(|directory| directory.canonicalize())
+            .ok()?;
+        let runs = crate::run_admin::runs(&self.locations.resolve().run.path);
+
+        runs.into_iter()
+            .filter(|run| {
+                run.project == here || run.started_from.as_deref() == Some(here.as_path())
+            })
+            .max_by_key(|run| run.started_unix_ms)
+    }
+
+    /// The instance `name` names, said when the command changes something.
+    fn chosen_by_name(
+        &self,
+        name: &str,
+        by: ChosenBy,
+        system: bool,
+    ) -> anyhow::Result<client::Endpoint> {
+        let endpoint = resolve_name(name, system)?;
+        let _ = REACHED.set(name.to_owned());
+
+        if let Some(change) = RUNNING.get().and_then(|running| running.change.as_deref()) {
+            static SAID: std::sync::Once = std::sync::Once::new();
+
+            let from = match &by {
+                ChosenBy::LocalFile(_) => format!(" (from {})", muru_config::LOCAL_FILE),
+                ChosenBy::Variable => format!(" (from {INSTANCE_VARIABLE})"),
+                _ => String::new(),
+            };
+
+            SAID.call_once(|| muru_common::muru_eprintln!("{change} to instance {name}{from}"));
+        }
+
+        Ok(endpoint)
+    }
+
     /// The same options, for a muructl command run on this one's behalf,
     /// which then reaches the same daemon.
     pub fn as_arguments(&self) -> Vec<String> {
@@ -208,6 +553,7 @@ impl SocketArgs {
             system: self.locations.system,
             log_dir: files.log_dir.clone(),
             state_dir: files.state_dir.clone(),
+            instance: self.locations.instance(),
             ..Options::default()
         })
         .daemon_log()
@@ -269,14 +615,26 @@ impl SocketArgs {
         }
     }
 
+    /// The admin endpoint to connect to (design specification section
+    /// 13.8), as [`SocketArgs::choose`] decides it.
+    pub fn endpoint(&self) -> anyhow::Result<client::Endpoint> {
+        self.choose()
+    }
+
     /// The socket to connect to (design specification section 13.8): as
     /// given, else a muructl serve's in its run directory, else a
     /// development run's from this project, else the daemon's when it
     /// listens, else the one run listening; several runs and no daemon
     /// are named, so one can be chosen.
     pub fn socket(&self) -> anyhow::Result<PathBuf> {
-        if let Some(socket) = &self.socket {
-            return Ok(socket.clone());
+        if let Some(socket) = self.given_socket() {
+            return Ok(socket);
+        }
+
+        // A named instance's socket is where its name puts it.
+
+        if self.locations.instance().is_some() {
+            return Ok(self.locations.resolve().admin_socket());
         }
 
         // Section 13.9: inside a container, the serve that runs there.
@@ -574,22 +932,31 @@ pub struct DaemonRunArgs {
     #[arg(long, hide = true, value_name = "VERSION")]
     upgraded_from: Option<String>,
 
+    /// Set by a daemon that re-executed itself for an upgrade: the
+    /// descriptors that hold its locks on the state and run directories.
+    #[arg(long, hide = true, value_name = "FDS")]
+    held_locks: Option<String>,
+
     #[command(flatten)]
     locations: LocationArgs,
 }
 
 /// The arguments a daemon re-executes itself with on an upgrade: its own,
 /// with --upgraded-from naming this version in place of any earlier one.
+/// The descriptors that hold its locks are added when it re-executes, in
+/// place of any it was given.
 fn upgrade_arguments() -> Vec<std::ffi::OsString> {
     let mut arguments: Vec<std::ffi::OsString> =
         muru_common::title::args_os().into_iter().skip(1).collect();
 
-    if let Some(at) = arguments
-        .iter()
-        .position(|argument| argument == "--upgraded-from")
-    {
-        let end = (at + 2).min(arguments.len());
-        arguments.drain(at..end);
+    for flag in [
+        "--upgraded-from",
+        muru_controller::ownership::HELD_LOCKS_FLAG,
+    ] {
+        if let Some(at) = arguments.iter().position(|argument| argument == flag) {
+            let end = (at + 2).min(arguments.len());
+            arguments.drain(at..end);
+        }
     }
 
     arguments.push("--upgraded-from".into());
@@ -600,11 +967,42 @@ fn upgrade_arguments() -> Vec<std::ffi::OsString> {
 /// Run the daemon in the foreground.
 pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     let locations = args.locations.resolve()?;
+    check_defined(&locations)?;
+    require_local("daemon run", locations.instance.as_deref())?;
+
+    // Issue 804: the daemon owns its state and run directories before it
+    // does anything else, so a second daemon on either is refused before
+    // it can take over the first's socket or edge.
+
+    let held = muru_controller::ownership::parse_held(args.held_locks.as_deref().unwrap_or(""))
+        .map_err(anyhow::Error::msg)?;
+    let ownership = muru_controller::ownership::Ownership::take(&locations, &held)
+        .map_err(anyhow::Error::msg)?;
 
     // Section 2.1: the daemon's process title, which names whose daemon
     // it is, as its edge's does.
 
-    muru_common::title::set(&format!("muru daemon {}", locations.scope()), "muru-daemon");
+    // Section 13.10: the instance's ID, kept in the state directory, and
+    // its tag, which the daemon's processes carry.
+
+    let id = muru_controller::registry::InstanceId::kept_in(
+        &locations
+            .state
+            .path
+            .join(muru_controller::daemon::INSTANCE_ID_FILE),
+    )
+    .with_context(|| {
+        format!(
+            "keeping the instance ID in {}",
+            locations.state.path.display()
+        )
+    })?;
+    let tag = locations.instance_name().unwrap_or_else(|| id.short());
+    muru_controller::instance::set(id, &tag);
+    muru_common::title::set(
+        &muru_controller::instance::scoped_title("daemon", &locations.scope(), Some(&tag)),
+        "muru-daemon",
+    );
 
     // The file is read the same way here and on every reload, with the
     // command line's settings laid over it.
@@ -649,6 +1047,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         upgrade_arguments: upgrade_arguments(),
         upgraded_from: args.upgraded_from.clone(),
         rename_check: rename_check(),
+        ownership,
     })
     .await
 }
@@ -670,14 +1069,35 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
     locations
         .check_run_dir()
         .map_err(|error| anyhow::anyhow!(error))?;
+    check_defined(&locations)?;
+    require_local("daemon start", locations.instance.as_deref())?;
     let socket = locations.admin_socket();
-    if let Ok(mut client) = client::connect(&socket).await
+
+    // A daemon answering on this socket is this one when it uses the same
+    // state directory, and another daemon on the run directory when not.
+
+    if let Ok(mut client) = client::connect(&client::Endpoint::unix(&socket)).await
         && let Ok(status) = client.get_status(pb::GetStatusRequest {}).await
     {
         let status = status.into_inner();
-        println!("muru: the daemon is already running (pid {})", status.pid);
-        return Ok(());
+
+        if Path::new(&status.state_dir) == locations.state.path {
+            println!("muru: the daemon is already running (pid {})", status.pid);
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "another daemon (pid {}) is using the run directory {}; its admin socket is {}",
+            status.pid,
+            locations.run.path.display(),
+            socket.display()
+        );
     }
+
+    // Issue 808: a listener the daemon would bind that another instance
+    // holds is refused before anything starts, naming that instance.
+
+    refuse_held_addresses(&args, &locations)?;
 
     std::fs::create_dir_all(&locations.logs.path)
         .with_context(|| format!("creating {}", locations.logs.path.display()))?;
@@ -737,7 +1157,7 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
     let started = Instant::now();
 
     while started.elapsed() < Duration::from_secs(30) {
-        if let Ok(mut client) = client::connect(&socket).await
+        if let Ok(mut client) = client::connect(&client::Endpoint::unix(&socket)).await
             && let Ok(status) = client.get_status(pb::GetStatusRequest {}).await
         {
             let status = status.into_inner();
@@ -751,10 +1171,20 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         }
 
         if let Some(exited) = child.try_wait().context("waiting for the daemon")? {
-            anyhow::bail!(
-                "the daemon exited before it answered ({exited}); {}",
-                daemon_log_since(&locations.daemon_log(), written_before)
-            );
+            // Issue 804: a daemon refused its directories says so, and
+            // that is the whole of the answer.
+
+            let written = daemon_log_since(&locations.daemon_log(), written_before);
+
+            if let Some(refusal) = written
+                .lines()
+                .find(|line| muru_controller::ownership::is_refusal(line))
+                .and_then(|line| line.split_once("error: "))
+            {
+                anyhow::bail!("{}", refusal.1);
+            }
+
+            anyhow::bail!("the daemon exited before it answered ({exited}); {written}");
         }
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -764,6 +1194,79 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         "the daemon did not answer within 30 seconds; see {}",
         locations.daemon_log().display()
     )
+}
+
+/// Refuse to start a named instance with no configuration file, naming
+/// the command that defines it; the default daemon starts without one.
+fn check_defined(locations: &Locations) -> anyhow::Result<()> {
+    let Some(name) = &locations.instance else {
+        return Ok(());
+    };
+
+    if !locations.config.path.is_file() {
+        anyhow::bail!(
+            "instance {name} has no configuration file at {}; define it with muructl instance \
+             create {name}",
+            locations.config.path.display()
+        );
+    }
+
+    Ok(())
+}
+
+/// Refuse to start a daemon whose listeners, dashboard or metrics address
+/// a running instance of Muru's holds, naming it. The daemon itself reads
+/// its file again and reports anything else wrong with it.
+fn refuse_held_addresses(args: &DaemonRunArgs, locations: &Locations) -> anyhow::Result<()> {
+    let overrides = muru_controller::settings::Overrides {
+        listen: args.listen,
+        metrics: args.metrics,
+        dashboard: args.dashboard,
+        user: args.user.clone(),
+    };
+    let Ok(settings) = muru_controller::settings::NodeSettings::read(
+        &locations.config.path,
+        &locations.state.path.join("secrets"),
+        &overrides,
+    ) else {
+        return Ok(());
+    };
+
+    let addresses = settings
+        .listeners
+        .iter()
+        .map(|(address, _)| (*address, "listener"))
+        .chain(
+            settings
+                .dashboard
+                .map(|address| (address, "dashboard address")),
+        )
+        .chain(settings.metrics.map(|address| (address, "metrics address")));
+
+    let addresses: Vec<(SocketAddr, &str)> = addresses.collect();
+
+    for (address, what) in &addresses {
+        if let Some(message) = muru_controller::registry::in_use_by_instance(
+            *address,
+            &format!("choose another {what}"),
+        ) {
+            anyhow::bail!(message);
+        }
+    }
+
+    // A clash with a named instance that is not running is only said.
+
+    for (name, configured) in crate::instances::configured_elsewhere(locations) {
+        if let Some((address, _)) = addresses.iter().find(|(address, _)| {
+            muru_controller::registry::clashes(configured.as_str(), &address.to_string())
+        }) {
+            muru_common::muru_eprintln!(
+                "warning: {address} is also configured for instance {name}, which is not running"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// The lines a daemon wrote to its log from `offset` on, the last
@@ -810,7 +1313,7 @@ const STOP_EXCHANGE: Duration = Duration::from_secs(5);
 /// there is no daemon there, it refused, or it did not answer in time.
 async fn status_within(path: &Path, bound: Duration) -> Option<pb::Status> {
     let exchange = async {
-        let mut client = client::connect(path).await.ok()?;
+        let mut client = client::connect(&client::Endpoint::unix(path)).await.ok()?;
         client
             .get_status(pb::GetStatusRequest {})
             .await
@@ -835,7 +1338,8 @@ pub async fn daemon_stop(
     let path = socket.socket()?;
     let started = Instant::now();
     let bound = timeout.min(STOP_EXCHANGE);
-    let connected = tokio::time::timeout(bound, client::connect(&path)).await;
+    let connected =
+        tokio::time::timeout(bound, client::connect(&client::Endpoint::unix(&path))).await;
 
     let mut client = match connected {
         Ok(client) => client?,
@@ -902,7 +1406,7 @@ pub async fn daemon_upgrade(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let path = socket.socket()?;
-    let mut client = client::connect(&path).await?;
+    let mut client = client::connect(&client::Endpoint::unix(&path)).await?;
     let before = client
         .get_status(pb::GetStatusRequest {})
         .await?
@@ -2144,7 +2648,7 @@ struct AccessChange {
 /// Change which requests the access log writes for a period, put the
 /// changes back, or list those in force (section 11.2).
 async fn access_log(change: AccessChange) -> anyhow::Result<()> {
-    let mut client = client::connect(&change.socket.socket()?).await?;
+    let mut client = client::connect(&change.socket.endpoint()?).await?;
     let answer = client
         .override_access_log(pb::OverrideAccessLogRequest {
             mode: change.mode.clone().unwrap_or_default(),
@@ -2215,7 +2719,7 @@ async fn ask(
         None => (target, ""),
     };
 
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let response = client
         .debug(pb::DebugRequest {
             app: app.to_owned(),
@@ -2767,7 +3271,7 @@ fn print_inspect(response: &pb::DebugResponse) {
 
 /// Print the node's metrics as Prometheus text.
 pub async fn metrics(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let text = client
         .get_metrics(pb::GetMetricsRequest {})
         .await?
@@ -2910,7 +3414,7 @@ pub struct WebSocketsArgs {
 /// Show the WebSockets open now: counted by endpoint, where segments
 /// that are identifiers are {id} and many distinct values *, or listed.
 pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let list = client
         .list_web_sockets(pb::ListWebSocketsRequest {
             app: args.app.unwrap_or_default(),
@@ -2981,7 +3485,7 @@ pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
 
 /// Print a development run's record of one request (section 11.7).
 async fn request_record(args: RequestRecordArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let record = client
         .get_request(pb::GetRequestRequest {
             request_id: args.request_id,
@@ -3183,7 +3687,7 @@ pub struct RequestsArgs {
 /// group, queued for a slot, holding a thread or on an event loop, with
 /// the oldest of each; or listed.
 pub async fn requests(args: RequestsArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let list = client
         .list_requests(pb::ListRequestsRequest {
             app: args.app.unwrap_or_default(),
@@ -3307,7 +3811,7 @@ pub async fn requests(args: RequestsArgs) -> anyhow::Result<()> {
 
 /// Re-read the daemon's configuration file.
 pub async fn daemon_reload(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let response = client
         .reload_config(pb::ReloadConfigRequest {})
         .await
@@ -3359,14 +3863,14 @@ pub async fn daemon_status(
         return Ok(NOT_RUNNING);
     }
 
-    show_status(&path, json).await?;
+    show_status(&client::Endpoint::unix(&path), json).await?;
     Ok(0)
 }
 
 /// Show the status of what answers at an admin socket: a daemon or a
 /// development run.
-pub async fn show_status(path: &Path, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(path).await?;
+pub async fn show_status(endpoint: &client::Endpoint, json: bool) -> anyhow::Result<()> {
+    let mut client = client::connect(endpoint).await?;
     let status = client
         .get_status(pb::GetStatusRequest {})
         .await?
@@ -3401,7 +3905,16 @@ pub async fn show_status(path: &Path, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("daemon   pid {} version {}", status.pid, status.version);
+    match status.name.as_str() {
+        "" | "user" | "system" => {
+            println!("daemon   pid {} version {}", status.pid, status.version);
+        }
+        name => println!(
+            "daemon   pid {} version {}, instance {name}",
+            status.pid, status.version
+        ),
+    }
+
     println!("edge     pid {}", status.edge_pid);
     println!("serving  {}", status.listeners.join(", "));
 
@@ -3733,6 +4246,21 @@ pub struct DeployArgs {
     output: JsonArgs,
 }
 
+impl DeployArgs {
+    /// The application deployed.
+    pub fn app(&self) -> &str {
+        &self.app
+    }
+
+    /// The source directory, whose muru.local.toml says which instance the
+    /// deploy goes to.
+    pub fn source(&self) -> PathBuf {
+        self.source
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    }
+}
+
 /// Parse NAME=VALUE for --env.
 fn parse_env_setting(text: &str) -> Result<(String, String), String> {
     let (name, value) = text
@@ -3827,6 +4355,8 @@ pub async fn secret(command: SecretCommand) -> anyhow::Result<()> {
             store, locations, ..
         } => (store.clone(), locations.resolve()?),
     };
+
+    require_local("secret", locations.instance.as_deref())?;
 
     let document = read_config(&locations.config.path)?;
     let stores = muru_controller::secrets::Store::from_document(
@@ -4125,7 +4655,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
     }
 
     args.settings.check()?;
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let python = args
         .settings
         .python
@@ -4777,7 +5307,7 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
             None => ("", ""),
         };
 
-        let mut client = client::connect(&socket.socket()?).await?;
+        let mut client = client::connect(&socket.endpoint()?).await?;
         let status = client
             .get_scale_status(pb::GetScaleStatusRequest {
                 app: app.to_owned(),
@@ -4822,7 +5352,7 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
         (None, None) => 0,
     };
 
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let status = client
         .set_scale(pb::SetScaleRequest {
             app: app.to_owned(),
@@ -5111,7 +5641,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             output,
         } => {
             let (app, id) = split_release(&release)?;
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let rollout = client
                 .start_rollout(pb::StartRolloutRequest {
                     app: app.to_owned(),
@@ -5169,7 +5699,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             output,
         } => {
             let (app, id) = split_release(&release)?;
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let release = client
                 .promote_release(pb::PromoteReleaseRequest {
                     app: app.to_owned(),
@@ -5196,7 +5726,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             socket,
             output,
         } => {
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
 
             if wait {
                 let Some(app) = app else {
@@ -5259,7 +5789,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             socket,
             output,
         } => {
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let rollout = client
                 .pause_rollout(pb::RolloutControlRequest {
                     app,
@@ -5284,7 +5814,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             socket,
             output,
         } => {
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let rollout = client
                 .resume_rollout(pb::RolloutControlRequest {
                     app,
@@ -5310,7 +5840,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             socket,
             output,
         } => {
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let rollout = client
                 .promote_rollout(pb::RolloutControlRequest {
                     app,
@@ -5335,7 +5865,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             socket,
             output,
         } => {
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let rollout = client
                 .abort_rollout(pb::RolloutControlRequest {
                     app,
@@ -5434,7 +5964,7 @@ pub struct AppRemoveArgs {
 
 /// List applications.
 pub async fn app_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client.list_apps(pb::ListAppsRequest {}).await?.into_inner();
 
     if json {
@@ -5493,7 +6023,7 @@ fn maintenance_mark(app: &pb::App) -> String {
 
 /// Remove an application and all its releases.
 pub async fn app_remove(args: AppRemoveArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let request = pb::RemoveAppRequest {
         app: args.app.clone(),
         dry_run: true,
@@ -5581,7 +6111,7 @@ pub async fn condition(command: ConditionCommand) -> anyhow::Result<()> {
         } => (name.clone(), socket, output.json),
     };
 
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client
         .list_conditions(pb::ListConditionsRequest { name: name.clone() })
         .await
@@ -5839,7 +6369,7 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
             socket,
             output,
         } => {
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let preview = client
                 .preview_overlay(pb::PreviewOverlayRequest { name: name.clone() })
                 .await
@@ -5908,7 +6438,7 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
         } => (name, "promote", None, socket, output.json),
     };
 
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let response = client
         .control_overlay(pb::ControlOverlayRequest {
             name: name.clone(),
@@ -5947,7 +6477,7 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
 }
 
 async fn list_overlays(socket: &SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client
         .list_overlays(pb::ListOverlaysRequest {})
         .await
@@ -6096,7 +6626,7 @@ pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
         } => (app, host, false, socket, output.json),
     };
 
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let status = client
         .set_maintenance(pb::SetMaintenanceRequest {
             app: app.unwrap_or_default(),
@@ -6168,7 +6698,7 @@ pub async fn dashboard(command: DashboardCommand) -> anyhow::Result<()> {
         socket,
         output,
     } = command;
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let link = client
         .dashboard_login(pb::DashboardLoginRequest { token })
         .await
@@ -6214,7 +6744,7 @@ pub enum HostCommand {
 
 /// List virtual hosts.
 pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client
         .list_hosts(pb::ListHostsRequest {})
         .await?
@@ -6338,7 +6868,7 @@ pub enum UpstreamCommand {
 
 /// List HTTP upstreams.
 pub async fn upstream_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client
         .list_upstreams(pb::ListUpstreamsRequest {})
         .await?
@@ -6397,7 +6927,7 @@ pub enum RouteCommand {
 
 /// List routes.
 pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client
         .list_routes(pb::ListRoutesRequest {})
         .await?
@@ -6653,7 +7183,7 @@ pub async fn release_list(
     socket: SocketArgs,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client
         .list_releases(pb::ListReleasesRequest {
             app: app.unwrap_or_default(),
@@ -6703,7 +7233,7 @@ pub async fn release_list(
 
 /// Remove old releases.
 pub async fn release_prune(args: ReleasePruneArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let request = pb::PruneReleasesRequest {
         app: args.app.clone().unwrap_or_default(),
         keep: args.keep,
@@ -6742,7 +7272,7 @@ pub async fn release_prune(args: ReleasePruneArgs) -> anyhow::Result<()> {
 /// Remove one release.
 pub async fn release_remove(args: ReleaseRemoveArgs) -> anyhow::Result<()> {
     let (app, id) = split_release(&args.release)?;
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let request = pb::RemoveReleaseRequest {
         app: app.to_owned(),
         release: id.to_owned(),
@@ -6913,7 +7443,7 @@ fn workers_column(release: &pb::Release) -> String {
 /// Show one release.
 pub async fn release_show(release: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let release = client
         .get_release(pb::GetReleaseRequest {
             app: app.to_owned(),
@@ -7243,7 +7773,7 @@ pub async fn release_wait(
     json: bool,
 ) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let release = client
         .wait_release(pb::WaitReleaseRequest {
             app: app.to_owned(),
@@ -7273,7 +7803,7 @@ pub async fn release_wait(
 
 /// Roll an application back to its previous release.
 pub async fn rollback(app: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let release = client
         .rollback(pb::RollbackRequest { app })
         .await
@@ -7294,7 +7824,7 @@ pub async fn rollback(app: String, socket: SocketArgs, json: bool) -> anyhow::Re
 /// Drain a release.
 pub async fn drain(release: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let release = client
         .drain_release(pb::DrainReleaseRequest {
             app: app.to_owned(),
@@ -7370,7 +7900,7 @@ pub struct ApplyArgs {
 /// and 1 for errors.
 pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
     let document = load_documents(&args.file)?;
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let report = client
         .apply_config(pb::ApplyConfigRequest {
             document: document.to_toml().context("writing the configuration")?,
@@ -7456,7 +7986,7 @@ pub async fn config_export(
     json: bool,
     socket: SocketArgs,
 ) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let export = client
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
@@ -7494,7 +8024,7 @@ pub async fn config_show(
     socket: SocketArgs,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let export = client
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
@@ -7552,7 +8082,7 @@ pub async fn config_show(
 /// match, 2 when they differ and 1 for errors.
 pub async fn config_diff(file: PathBuf, json: bool, socket: SocketArgs) -> anyhow::Result<i32> {
     let document = load_documents(&file)?;
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let report = client
         .diff_config(pb::DiffConfigRequest {
             document: document.to_toml().context("writing the configuration")?,
@@ -7871,7 +8401,7 @@ pub async fn events(
     socket: SocketArgs,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
 
     if !follow {
         let answer = client
@@ -7967,8 +8497,8 @@ pub async fn exec(args: RunExecArgs) -> anyhow::Result<i32> {
 enum Place<'a> {
     /// Through an admin socket, with the application and release named.
     Socket {
-        /// The socket.
-        socket: PathBuf,
+        /// The instance's admin endpoint.
+        socket: client::Endpoint,
         /// The application and release, as given.
         target: Option<&'a str>,
     },
@@ -7994,14 +8524,14 @@ impl<'a> Place<'a> {
             }
 
             return Ok(Self::Socket {
-                socket: socket.socket()?,
+                socket: socket.endpoint()?,
                 target: Some(target),
             });
         }
 
-        if let Some(given) = &socket.socket {
+        if let Some(given) = socket.given_socket() {
             return Ok(Self::Socket {
-                socket: given.clone(),
+                socket: client::Endpoint::unix(given),
                 target: None,
             });
         }
@@ -8009,7 +8539,7 @@ impl<'a> Place<'a> {
         Ok(
             match socket.serving(&project.project(), project.chdir.is_some()) {
                 Some(socket) => Self::Socket {
-                    socket,
+                    socket: client::Endpoint::unix(socket),
                     target: None,
                 },
                 None => Self::Own(project),
@@ -8137,7 +8667,7 @@ pub struct CommandLogsArgs {
 
 /// List the runs of an application's commands.
 pub async fn command_runs(args: CommandRunsArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let answer = client
         .list_command_runs(pb::ListCommandRunsRequest {
             app: args.app.clone(),
@@ -8217,7 +8747,7 @@ fn run_state(run: &pb::CommandRunRecord) -> String {
 
 /// Show one run.
 pub async fn command_status(args: RunIdArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let run = client
         .get_command_run(pb::GetCommandRunRequest { run: args.run })
         .await
@@ -8270,7 +8800,7 @@ fn print_run(run: &pb::CommandRunRecord) {
 
 /// Show or follow a run's output.
 pub async fn command_logs(args: CommandLogsArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let mut lines = client
         .tail_command_run(pb::TailCommandRunRequest {
             run: args.run,
@@ -8306,7 +8836,7 @@ pub async fn command_logs(args: CommandLogsArgs) -> anyhow::Result<()> {
 
 /// Stop a run.
 pub async fn command_stop(args: RunIdArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let run = client
         .stop_command_run(pb::StopCommandRunRequest { run: args.run })
         .await
@@ -9207,10 +9737,13 @@ fn host_has_own_file(name: &str, access_log_file: &str, format: &str) -> anyhow:
 /// to be picked out of it. With no daemon listening and no socket named,
 /// they come from the files.
 async fn log_lines(args: &LogsArgs) -> anyhow::Result<(LogLines, Option<String>)> {
-    let path = args.socket.socket()?;
+    let endpoint = args.socket.endpoint()?;
     let locations = daemon_locations(&args.socket, &args.files);
 
-    if path == locations.admin_socket() && no_daemon(&args.socket, &path) {
+    if let Some(path) = endpoint.socket()
+        && path == locations.admin_socket()
+        && no_daemon(&args.socket, path)
+    {
         return file_log_lines(args, &locations);
     }
 
@@ -9223,7 +9756,7 @@ async fn log_lines(args: &LogsArgs) -> anyhow::Result<(LogLines, Option<String>)
         None => (String::new(), String::new()),
     };
 
-    let mut client = client::connect(&path).await?;
+    let mut client = client::connect(&endpoint).await?;
 
     // Section 11.2: a virtual host's records are in the file it names
     // for them, or else among the access log's, where each JSON record
@@ -9403,7 +9936,7 @@ async fn own_log_lines(args: &LogsArgs) -> anyhow::Result<LogLines> {
 
 /// Reopen every log file after an external rotation.
 pub async fn logs_reopen(workers: bool, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let reopened = client
         .reopen_logs(pb::ReopenLogsRequest { workers })
         .await
@@ -9458,6 +9991,7 @@ pub(crate) fn daemon_locations(socket: &SocketArgs, files: &DaemonFileArgs) -> L
         log_dir: files.log_dir.clone(),
         cache_dir: files.cache_dir.clone(),
         system: socket.locations.system,
+        instance: socket.locations.instance(),
     })
 }
 
@@ -9466,7 +10000,7 @@ pub(crate) fn daemon_locations(socket: &SocketArgs, files: &DaemonFileArgs) -> L
 /// refuses the connection, is no daemon. Anything else, such as a
 /// permission refused, is left for the connection to report.
 fn no_daemon(socket: &SocketArgs, path: &Path) -> bool {
-    socket.socket.is_none()
+    socket.given_socket().is_none()
         && match path.try_exists() {
             Ok(false) => true,
             Ok(true) => muru_controller::client::left_behind(path),
@@ -9479,9 +10013,9 @@ fn no_daemon(socket: &SocketArgs, path: &Path) -> bool {
 /// listening it works on the files in the resolved log directory.
 async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result<LogsWay> {
     let locations = daemon_locations(socket, files);
+    require_local("the logs commands on files", locations.instance.as_deref())?;
     let path = socket
-        .socket
-        .clone()
+        .given_socket()
         .unwrap_or_else(|| locations.admin_socket());
 
     if no_daemon(socket, &path) {
@@ -9501,7 +10035,7 @@ async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result
         })));
     }
 
-    let mut client = client::connect(&path).await?;
+    let mut client = client::connect(&client::Endpoint::unix(&path)).await?;
 
     if let Some(asked) = &files.log_dir {
         let answer = client
@@ -9660,7 +10194,7 @@ fn print_archives(report: &pb::ListLogsResponse) {
 /// Ask a yes or no question on the terminal, on standard error so that
 /// standard output stays the command's answer. `--yes` answers without
 /// asking; with no terminal to ask on, the command is refused.
-fn confirm(question: &str, yes: bool) -> anyhow::Result<bool> {
+pub(crate) fn confirm(question: &str, yes: bool) -> anyhow::Result<bool> {
     use std::io::{IsTerminal as _, Write as _};
 
     if yes {
@@ -10092,9 +10626,9 @@ enum CacheWay {
 /// running daemon's is refused rather than worked on behind its back.
 async fn cache_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result<CacheWay> {
     let locations = daemon_locations(socket, files);
+    require_local("cache", locations.instance.as_deref())?;
     let path = socket
-        .socket
-        .clone()
+        .given_socket()
         .unwrap_or_else(|| locations.admin_socket());
 
     if no_daemon(socket, &path) {
@@ -10111,7 +10645,7 @@ async fn cache_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Resul
         return Ok(CacheWay::Files(Box::new(locations), releases));
     }
 
-    let mut client = client::connect(&path).await?;
+    let mut client = client::connect(&client::Endpoint::unix(&path)).await?;
 
     if let Some(asked) = &files.state_dir {
         let answer = client
@@ -10135,33 +10669,43 @@ async fn cache_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Resul
 }
 
 /// What the development runs have of the user cache in use.
-fn user_cache_in_use(socket: &SocketArgs) -> muru_controller::cache::InUse {
+fn user_cache_in_use() -> muru_controller::cache::InUse {
     let mut in_use = muru_controller::cache::InUse::default();
 
-    for run in crate::run_admin::runs(&socket.locations.resolve().run.path) {
-        for directory in run.runtime {
+    // Section 13.8: every live instance of this user says in its registry
+    // entry which runtime library directories it uses, whatever run
+    // directory it was started with.
+
+    for record in muru_controller::registry::live(&muru_controller::registry::user_registry()) {
+        let user = match (&record.kind, &record.app) {
+            (muru_controller::registry::Kind::Run, Some(app)) => {
+                format!("the development run of {app}")
+            }
+            (muru_controller::registry::Kind::Serve, Some(app)) => {
+                format!("muructl serve of {app}")
+            }
+            _ => format!("instance {}", record.tag()),
+        };
+
+        for directory in record.runtime {
             let resolved = std::fs::canonicalize(&directory).unwrap_or(directory);
-            in_use
-                .runtime
-                .insert(resolved, format!("the development run of {}", run.app));
+            in_use.runtime.insert(resolved, user.clone());
         }
     }
 
     in_use
 }
 
-/// The report on the user cache, with what development runs use marked.
-fn user_cache_report(
-    socket: &SocketArgs,
-    files: &DaemonFileArgs,
-) -> anyhow::Result<pb::ListCacheResponse> {
+/// The report on the user cache, with what the user's instances use
+/// marked.
+fn user_cache_report(files: &DaemonFileArgs) -> anyhow::Result<pb::ListCacheResponse> {
     use muru_controller::cache;
 
     let root = user_cache_dir(files)?;
     let mut entries = cache::user_entries(&root);
     cache::mark_in_use(
         &mut entries,
-        &user_cache_in_use(socket),
+        &user_cache_in_use(),
         &crate::provision::version(),
     );
 
@@ -10196,7 +10740,7 @@ pub async fn cache_list(args: CacheListArgs) -> anyhow::Result<()> {
     let user = if args.area == Some(CacheArea::Daemon) {
         None
     } else {
-        Some(user_cache_report(&args.socket, &args.files)?)
+        Some(user_cache_report(&args.files)?)
     };
 
     let daemon = if args.area == Some(CacheArea::User) {
@@ -10254,11 +10798,7 @@ fn user_cache_prune(
         version: args.version.clone(),
         tag: args.tag.clone(),
     };
-    let mut answer = cache::plan_prune(
-        user_cache_report(&args.socket, &args.files)?,
-        &rules,
-        dry_run,
-    );
+    let mut answer = cache::plan_prune(user_cache_report(&args.files)?, &rules, dry_run);
 
     if !dry_run {
         cache::carry_out(&mut answer);
@@ -10301,11 +10841,7 @@ fn user_cache_clear(
 ) -> anyhow::Result<pb::RemoveCacheResponse> {
     use muru_controller::cache;
 
-    let mut answer = cache::plan_clear(
-        user_cache_report(&args.socket, &args.files)?,
-        args.certs,
-        dry_run,
-    );
+    let mut answer = cache::plan_clear(user_cache_report(&args.files)?, args.certs, dry_run);
 
     if !dry_run {
         cache::carry_out(&mut answer);
@@ -10729,7 +11265,17 @@ fn or_dash(text: &str) -> &str {
 /// Print an answer as indented JSON, with the admin API's field names:
 /// what `--json` prints.
 pub fn print_answer<T: serde::Serialize>(answer: &T) -> anyhow::Result<()> {
-    println!("{}", serde_json::to_string_pretty(answer)?);
+    let mut value = serde_json::to_value(answer)?;
+
+    // Section 13.8: an answer from an instance a name chose says which.
+
+    if let (Some(name), Some(object)) = (reached_instance(), value.as_object_mut()) {
+        object
+            .entry("instance")
+            .or_insert_with(|| serde_json::Value::from(name));
+    }
+
+    println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 

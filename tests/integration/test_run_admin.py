@@ -6,9 +6,11 @@ without a flag, and the commands that manage the daemon's state say so."""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -125,7 +127,7 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
         assert status.startswith("run      pid ")
         assert "app      plain-wsgi@r1" in status
         assert f"project  {support.FIXTURES.resolve()}" in status
-        assert f"socket   {runtime}/runs/{server.port}/admin.sock" in status
+        assert f"socket   {server.admin_socket()}" in status
         assert "serving  http://127.0.0.1:" in status
 
         # The debug commands ask the run's workers, by the application
@@ -273,7 +275,7 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
 
     # The run's place in the runtime directory goes with it.
 
-    assert not (runtime / "runs" / str(server.port)).exists()
+    assert not server.admin_socket().parent.exists()
 
 
 def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) -> None:
@@ -286,11 +288,8 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
     try:
         # Each project's directory finds its own run.
 
-        assert (
-            f"runs/{first.port}/admin.sock"
-            in muructl(runtime, "status", cwd=support.FIXTURES).stdout
-        )
-        assert f"runs/{second.port}/admin.sock" in muructl(runtime, "status", cwd=other).stdout
+        assert str(first.admin_socket()) in muructl(runtime, "status", cwd=support.FIXTURES).stdout
+        assert str(second.admin_socket()) in muructl(runtime, "status", cwd=other).stdout
 
         # The directory a run was started from reaches it too, and the run
         # says so at start (issue 592). Both were started from here.
@@ -299,7 +298,7 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
         assert (
             f"muructl commands run from {other.resolve()} or {here} reach this run" in second.log()
         )
-        assert f"{runtime}/runs/" in muructl(runtime, "status", cwd=here).stdout
+        assert f"{runtime}/run-" in muructl(runtime, "status", cwd=here).stdout
 
         # A second run of the first project is the one reached, whichever
         # port it has, and both it and the commands name the older one
@@ -308,11 +307,11 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
         third = start(runtime)
 
         try:
-            older = f"--socket {runtime}/runs/{first.port}/admin.sock"
+            older = f"--socket {first.admin_socket()}"
             assert "another development run of this project is listening" in third.log()
             assert older in third.log(), third.log()
             reached = muructl(runtime, "status", cwd=support.FIXTURES)
-            assert f"runs/{third.port}/admin.sock" in reached.stdout
+            assert str(third.admin_socket()) in reached.stdout
             assert (
                 "2 development runs of this project are listening; reaching the newest"
                 in reached.stderr
@@ -328,13 +327,13 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
         ambiguous = muructl(runtime, "status", cwd=tmp_path, check=False)
         assert ambiguous.returncode != 0
         assert "several development runs are" in ambiguous.stderr
-        assert f"--socket {runtime}/runs/{first.port}/admin.sock" in ambiguous.stderr
-        assert f"--socket {runtime}/runs/{second.port}/admin.sock" in ambiguous.stderr
+        assert f"--socket {first.admin_socket()}" in ambiguous.stderr
+        assert f"--socket {second.admin_socket()}" in ambiguous.stderr
         chosen = muructl(
             runtime,
             "status",
             "--socket",
-            f"{runtime}/runs/{second.port}/admin.sock",
+            str(second.admin_socket()),
             cwd=tmp_path,
         ).stdout
         assert f"project  {other.resolve()}" in chosen
@@ -342,7 +341,7 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
             runtime,
             "status",
             cwd=tmp_path,
-            env={"MURU_SOCKET": f"{runtime}/runs/{first.port}/admin.sock"},
+            env={"MURU_SOCKET": str(first.admin_socket())},
         ).stdout
         assert f"project  {support.FIXTURES.resolve()}" in chosen
     finally:
@@ -356,25 +355,41 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
     assert "no development run (muructl run)" in nothing.stderr
 
     # A run that has gone, whose pid another process has since been given
-    # and whose socket file is still there, is not taken for a live one.
-    # The daemon's socket left behind above is what the command tries.
+    # and whose socket file is still there, is not taken for a live one:
+    # its registry entry's lock is free. The daemon's socket left behind
+    # above is what the command tries.
 
-    gone = runtime / "runs" / "1"
+    gone = runtime / "run-00000000"
     leave_socket_behind(gone / "admin.sock")
-    (gone / "run.json").write_text(
-        json.dumps(
-            {
-                "pid": os.getpid(),
-                "app": "gone",
-                "project": str(tmp_path),
-                "listen": "127.0.0.1:1",
-                "socket": str(gone / "admin.sock"),
-            }
+    entry = support.user_registry() / ("0" * 31 + "1")
+    entry.mkdir(parents=True)
+
+    try:
+        (entry / "lock").touch()
+        (entry / "instance.json").write_text(
+            json.dumps(
+                {
+                    "format": 1,
+                    "id": entry.name,
+                    "host": "here",
+                    "kind": "run",
+                    "scope": "user",
+                    "pid": os.getpid(),
+                    "started_unix_ms": 1,
+                    "muru_version": "1.0.0",
+                    "uid": os.getuid(),
+                    "admin": {"transport": "unix", "path": str(gone / "admin.sock")},
+                    "run_dir": str(gone),
+                    "listeners": [{"name": "http", "configured": "127.0.0.1:1"}],
+                    "app": "gone",
+                    "project": str(tmp_path),
+                }
+            )
         )
-    )
-    nothing = muructl(runtime, "status", cwd=tmp_path, check=False)
-    assert f"nothing is listening at {runtime}/admin.sock" in nothing.stderr
-    assert not gone.exists()
+        nothing = muructl(runtime, "status", cwd=tmp_path, check=False)
+        assert f"nothing is listening at {runtime}/admin.sock" in nothing.stderr
+    finally:
+        shutil.rmtree(entry)
 
 
 def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
@@ -752,7 +767,7 @@ def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
         assert written, server.log()
         assert int(written.group(1)) == server.process.pid
         assert Path(written.group(2)).read_text() == f"{server.process.pid}\n"
-        assert Path(written.group(2)).parent == runtime / "runs" / str(server.port)
+        assert Path(written.group(2)).parent == server.admin_socket().parent
         page = read("/workers?release=plain-wsgi@r1")
         assert "<title>Muru: plain-wsgi@r1 workers</title>" in page
         assert '<a href="./">run</a>' in page
@@ -806,9 +821,12 @@ def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
         assert titles[root["pid"]] == (
             f"muru run plain-wsgi 127.0.0.1:{server.port} dashboard 127.0.0.1:{port}"
         ), titles
-        assert titles[host["pid"]] == "muru host plain-wsgi@r1", titles
-        assert titles[host["children"][0]["pid"]] == "muru relay plain-wsgi@r1", titles
-        assert titles[host["children"][2]["pid"]] == "muru worker plain-wsgi@r1 default/1", titles
+        tag = f"(run:{server.port})"
+        assert titles[host["pid"]] == f"muru host plain-wsgi@r1 {tag}", titles
+        assert titles[host["children"][0]["pid"]] == f"muru relay plain-wsgi@r1 {tag}", titles
+        assert titles[host["children"][2]["pid"]] == (
+            f"muru worker plain-wsgi@r1 default/1 {tag}"
+        ), titles
 
         text = muructl(runtime, "status", "--processes", cwd=support.FIXTURES).stdout
         assert "└─ host" in text and "├─ relay" in text and "└─ worker" in text, text
@@ -995,3 +1013,48 @@ def test_a_runs_access_log_file_is_reopened_after_a_rename(runtime: Path, tmp_pa
         assert "/after-signal" not in (tmp_path / "access.log.2").read_text()
     finally:
         server.stop()
+
+
+def test_a_run_killed_outright_leaves_a_stale_entry_that_is_not_reached(runtime: Path) -> None:
+    # Issue 805: a run registers in the user's instance registry, whatever
+    # its run directory; killed outright, its lock is freed with it, so
+    # its entry reads as stale and discovery passes it over.
+
+    server = start(runtime)
+    socket_path = server.admin_socket()
+    entries = [
+        entry
+        for entry in support.user_registry().iterdir()
+        if not entry.name.startswith(".")
+        and json.loads((entry / "instance.json").read_text())["pid"] == server.process.pid
+    ]
+    assert len(entries) == 1, entries
+    record = json.loads((entries[0] / "instance.json").read_text())
+    assert record["kind"] == "run" and record["app"] == "plain-wsgi"
+    assert record["admin"] == {"transport": "unix", "path": str(socket_path)}
+    assert record["run_dir"] == str(socket_path.parent)
+    assert record["listeners"][0]["bound"] == f"127.0.0.1:{server.port}"
+
+    def locked() -> bool:
+        with (entries[0] / "lock").open("rb") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            return False
+
+    assert locked()
+    assert str(socket_path) in muructl(runtime, "status", cwd=support.FIXTURES).stdout
+
+    try:
+        server.process.send_signal(signal.SIGKILL)
+        server.process.wait(timeout=10)
+        assert not locked()
+        nothing = muructl(runtime, "status", cwd=support.FIXTURES, check=False)
+        assert nothing.returncode != 0
+        assert "nothing is listening at" in nothing.stderr, nothing.stderr
+    finally:
+        server.stop()
+        shutil.rmtree(entries[0], ignore_errors=True)

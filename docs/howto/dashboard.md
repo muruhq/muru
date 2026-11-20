@@ -30,11 +30,12 @@ the [metrics guide](metrics.md) describes.
 
 A run whose dashboard address is taken, most often by another
 `muructl run`, does not start, as for its HTTP port. The message names
-the process that holds the address when it can be found:
+the instance of Muru's that holds the address, or another process when
+it can be found:
 
 ```console
 $ muructl run
-muru: error: the dashboard's address 127.0.0.1:8081 is in use by muructl (pid 4211); choose another address with --dashboard ADDRESS, or turn it off with --dashboard off, or stop that process
+muru: error: the dashboard's address 127.0.0.1:8081 is in use by the development run of shop in ~/src/shop (pid 4211, dashboard http://127.0.0.1:8081/); choose another address with --dashboard ADDRESS, or turn it off with --dashboard off, or stop it
 ```
 
 The banner of the run's pages names the project directory it serves and
@@ -98,6 +99,12 @@ https://example.com/proxy/8090/login?code=3f9c...
 
 The dashboard's pages use relative addresses, so they work under any
 path, and open it with the trailing slash: `https://example.com/proxy/8090/`.
+
+`muructl open --dashboard` asks for the same link and opens it in your
+browser, which is then signed in. The link passes through the command
+line of the program that opens the browser, where other users of the
+machine could see it while that program runs; it works once and only
+for five minutes. `--print` prints it instead of opening it.
 
 ### What the page shows
 

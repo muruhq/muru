@@ -253,6 +253,107 @@ fn timebase() -> (u32, u32) {
     })
 }
 
+/// A process's command line, as `ps` shows it, which for Muru's own
+/// processes is their title, and its environment as it was started with
+/// it (section 13.10). The environment is readable for the caller's own
+/// processes, or every process when root; none when it cannot be read.
+#[cfg(target_os = "linux")]
+pub fn command_and_environment(pid: u32) -> Option<(String, Vec<(String, String)>)> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let line = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+
+    Some((line.trim().to_owned(), environment_pairs(&environ)))
+}
+
+/// A process's command line and environment, from `KERN_PROCARGS2`.
+#[cfg(target_os = "macos")]
+pub fn command_and_environment(pid: u32) -> Option<(String, Vec<(String, String)>)> {
+    let mut size: libc::size_t = 0;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+
+    // SAFETY: with a null buffer sysctl only writes the size it needs
+    // into `size`, which outlives the call.
+
+    let sized = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if sized != 0 || size < 4 {
+        return None;
+    }
+
+    let mut buffer = vec![0u8; size];
+
+    // SAFETY: sysctl writes at most `size` bytes into the buffer, which is
+    // that large and outlives the call, and updates `size` to what it
+    // wrote.
+
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if read != 0 || size < 4 {
+        return None;
+    }
+
+    buffer.truncate(size);
+
+    // The argument count, the executable's path and the NULs that pad
+    // it, then the arguments and the environment, each NUL-terminated.
+
+    let count = i32::from_ne_bytes(buffer[..4].try_into().ok()?).max(0) as usize;
+    let mut strings = buffer[4..].split(|byte| *byte == 0);
+    strings.next()?;
+    let mut strings = strings.skip_while(|string| string.is_empty());
+
+    let arguments: Vec<String> = strings
+        .by_ref()
+        .take(count)
+        .map(|string| String::from_utf8_lossy(string).into_owned())
+        .collect();
+    let environment: Vec<u8> = strings
+        .take_while(|string| !string.is_empty())
+        .flat_map(|string| string.iter().copied().chain([0]))
+        .collect();
+
+    Some((
+        arguments.join(" ").trim().to_owned(),
+        environment_pairs(&environment),
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn command_and_environment(_pid: u32) -> Option<(String, Vec<(String, String)>)> {
+    None
+}
+
+/// The `NAME=VALUE` strings of an environment block, NUL-separated.
+fn environment_pairs(block: &[u8]) -> Vec<(String, String)> {
+    block
+        .split(|byte| *byte == 0)
+        .filter_map(|string| {
+            let text = std::str::from_utf8(string).ok()?;
+            let (name, value) = text.split_once('=')?;
+            Some((name.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn read(_pid: u32) -> Option<OsProcess> {
     None

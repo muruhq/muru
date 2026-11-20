@@ -137,6 +137,14 @@ def test_tools_run_the_commands_they_name(daemon: Daemon) -> None:
         failed, text = client.call("logs", target="shop", lines=5)
         assert not failed and isinstance(json.loads(text), list)
 
+        # Issue 807: the instances on the machine, the daemon among them.
+
+        failed, text = client.call("instances", orphans=True)
+        assert not failed, text
+        listed = json.loads(text)
+        assert any(row["pid"] == daemon.process.pid for row in listed["instances"]), listed
+        assert "orphans" in listed
+
 
 def test_a_failing_command_is_a_tool_error_with_its_sentence(daemon: Daemon) -> None:
     with session(daemon) as (client, _):

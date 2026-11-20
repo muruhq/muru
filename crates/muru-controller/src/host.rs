@@ -1373,6 +1373,11 @@ impl HostProcess {
 
         command.envs(spec.env.iter().map(|(name, value)| (name, value)));
 
+        // Section 13.10: the host and its workers say which instance they
+        // belong to, in their titles and their environment.
+
+        command.envs(crate::instance::variables());
+
         // Section 6.15: the instrumentation list, which the host takes out
         // of its environment before it imports anything.
 
@@ -2432,6 +2437,7 @@ impl RelayLaunch {
             .arg(self.settings.overflow.as_str())
             .arg("--release")
             .arg(&self.release)
+            .envs(crate::instance::variables())
             .stdin(Stdio::null())
             .stdout(Stdio::null());
 

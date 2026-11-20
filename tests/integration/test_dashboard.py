@@ -5,7 +5,6 @@ from __future__ import annotations
 import http.client
 import json
 import re
-import shutil
 import time
 from collections.abc import Iterator
 
@@ -150,11 +149,10 @@ def test_a_dashboard_that_cannot_be_served_stops_the_run(
         )
 
     message = str(failure.value)
-    assert f"the dashboard's address 127.0.0.1:{port} is in use" in message, message
+    assert (
+        f"the dashboard's address 127.0.0.1:{port} is in use by the development run of " in message
+    ), message
     assert "--dashboard off" in message
-
-    if shutil.which("lsof") or shutil.which("ss"):
-        assert re.search(r"in use by \S+ \(pid \d+\)", message), message
 
 
 def test_metrics_are_served_beside_the_pages(dashboard: tuple[support.Server, int]) -> None:

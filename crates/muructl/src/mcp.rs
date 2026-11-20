@@ -101,7 +101,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .collect();
     let server = Server {
         tools: Arc::new(tools),
-        connect: Arc::new(args.socket.as_arguments()),
+        connect: Arc::new(connect_arguments(&args.socket)?),
         muructl,
         read_only: args.read_only,
         skill: crate::skill::status(std::path::Path::new(crate::skill::DEFAULT_DIR)),
@@ -214,6 +214,34 @@ impl Server {
         failure(message)
     }
 
+    /// Run a muructl command about this machine rather than the instance
+    /// the server reaches, with --json and none of the socket options.
+    /// An exit status of 1 that printed its JSON, as `instance list
+    /// --orphans` does when there are orphans, is an answer.
+    async fn local_command(&self, mut command: Vec<String>) -> CallToolResult {
+        command.push("--json".to_owned());
+
+        let output = match tokio::process::Command::new(&self.muructl)
+            .args(&command)
+            .stdin(Stdio::null())
+            .output()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => return failure(format!("running muructl: {error}")),
+        };
+        let printed = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let answer = serde_json::from_str::<Value>(&printed).ok();
+
+        match answer {
+            Some(answer) if answer.get("error").is_none() => {
+                CallToolResult::success(vec![ContentBlock::text(printed)])
+            }
+            Some(answer) => failure(answer["error"].as_str().unwrap_or_default().to_owned()),
+            None => failure(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+        }
+    }
+
     /// The run_command tool. A secret input given as a value is refused,
     /// so a secret never passes through the agent; the command's output
     /// comes back with its exit status, as an error when that is not 0.
@@ -307,6 +335,22 @@ impl Server {
             text.push_str("\n\nThis server is read-only: it offers no tool that changes anything.");
         }
 
+        // Which instance the tools reach, settled when the server started.
+
+        match self.connect.iter().position(|word| word == "--instance") {
+            Some(at) => text.push_str(&format!(
+                "\n\nThe tools reach the named instance {}. To work with another, the server \
+                 is started with --instance NAME, or muru.local.toml in the project names one \
+                 with instance = \"NAME\".",
+                self.connect.get(at + 1).map_or("", String::as_str)
+            )),
+            None => text.push_str(
+                "\n\nWith several daemons on the machine, each a named instance, the server is \
+                 started with --instance NAME, or muru.local.toml in the project names one with \
+                 instance = \"NAME\", and every tool reaches that instance; `instances` lists them.",
+            ),
+        }
+
         // A project whose skill is missing or older than this muructl's
         // hears about it once, with the command that fixes it.
 
@@ -394,6 +438,10 @@ impl ServerHandler for Server {
             "docs" => docs(&arguments),
             "skill_status" => skill_status(),
             "run_command" => self.run_command(&arguments).await,
+            "instances" => match (spec.command)(&arguments) {
+                Ok(command) => self.local_command(command).await,
+                Err(message) => failure(message),
+            },
             _ => match (spec.command)(&arguments) {
                 Ok(command) => {
                     let result = self.command(command).await;
@@ -672,6 +720,23 @@ fn docs(arguments: &JsonObject) -> CallToolResult {
     }
 }
 
+/// The options every command the server runs is given: those it was
+/// started with, or the instance a variable or the checkout's
+/// muru.local.toml names, settled once at start so every tool reaches it
+/// (section 10.11).
+fn connect_arguments(socket: &crate::admin::SocketArgs) -> anyhow::Result<Vec<String>> {
+    let given = socket.as_arguments();
+
+    if !given.is_empty() {
+        return Ok(given);
+    }
+
+    Ok(match socket.named()? {
+        Some(name) => vec!["--instance".to_owned(), name],
+        None => Vec::new(),
+    })
+}
+
 /// Every tool, in the order the agent sees them: few and shaped like
 /// tasks rather than one per API call, since an agent's client puts
 /// every description into its context.
@@ -703,6 +768,51 @@ fn specs() -> Vec<Spec> {
 
                 if arguments.get("all").and_then(serde_json::Value::as_bool) == Some(true) {
                     command.push("--all".to_owned());
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "instances",
+            description: "The Muru instances on this machine, from every daemon, development run and serve the instance registry knows, each with its state (running, detached or stale), listeners, dashboard and where it works from; with orphans, also the Muru processes no live instance accounts for, such as what an agent's earlier run left behind.",
+            changes: false,
+            properties: json!({
+                "orphans": {"type": "boolean", "description": "Also the processes no running or detached instance accounts for"},
+                "label": {"type": "string", "description": "Only the instances with this label"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["instance", "list"]);
+
+                if arguments
+                    .get("orphans")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    command.push("--orphans".to_owned());
+                }
+
+                if let Some(label) = text(arguments, "label") {
+                    command.extend(["--label".to_owned(), label]);
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "urls",
+            description: "Every URL the application can be reached at, best first, each with how it was chosen: a development run's from its listeners and --host names, an application on a daemon's from its routes, virtual hosts and listeners, leaving out names that reach another machine. Opens nothing.",
+            changes: false,
+            properties: json!({
+                "app": {"type": "string", "description": "An application on the daemon; the project's, or the development run's, when left out"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["open", "--list"]);
+
+                if let Some(app) = text(arguments, "app") {
+                    command.push(app);
                 }
 
                 Ok(command)

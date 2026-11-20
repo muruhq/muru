@@ -370,6 +370,11 @@ pub struct NodeData {
 }
 
 impl NodeData {
+    /// Whether any application has an address to show.
+    pub fn has_urls(&self) -> bool {
+        self.apps.iter().any(|app| !app.urls.is_empty())
+    }
+
     /// Whether any release's workers run requests on threads, so the
     /// releases table has that column.
     pub fn has_threads(&self) -> bool {
@@ -410,6 +415,9 @@ pub struct AppRow {
     pub maintenance_overlay: String,
     /// Its releases, newest first.
     pub releases: Vec<ReleaseRow>,
+    /// Where it can be reached, best first, as `muructl open --list`
+    /// gives it.
+    pub urls: Vec<String>,
 }
 
 /// One worker group of a running release, as the autoscaler sees it.
@@ -1439,15 +1447,38 @@ code { font-size: 0.95em; }
 </html>
 ";
 
-/// Redeem a login link: a session cookie and back to the page.
+/// The page a login link goes to once signed in: `next`, when it is a
+/// relative path under the dashboard (letters, digits, `-`, `_`, `.` and
+/// `/`, not starting with `/` and with no `..`), else the front page.
+pub fn after_login(next: Option<&str>) -> String {
+    let decoded = next.map(|next| next.replace("%2F", "/").replace("%2f", "/"));
+
+    match decoded {
+        Some(next)
+            if !next.is_empty()
+                && !next.starts_with('/')
+                && !next.contains("..")
+                && next
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_./".contains(&byte)) =>
+        {
+            format!("./{next}")
+        }
+        _ => "./".to_owned(),
+    }
+}
+
+/// Redeem a login link: a session cookie and on to the page it names, or
+/// back to the front page.
 fn login(request: &Request<Incoming>, sessions: &Sessions) -> Response<Body> {
-    let code = request
-        .uri()
-        .query()
-        .unwrap_or_default()
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("code="))
-        .unwrap_or_default();
+    let query = request.uri().query().unwrap_or_default();
+    let field = |name: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+    };
+    let code = field("code").unwrap_or_default();
+    let next = after_login(field("next"));
 
     let Some(id) = sessions.redeem(code) else {
         return plain(
@@ -1462,7 +1493,11 @@ fn login(request: &Request<Incoming>, sessions: &Sessions) -> Response<Body> {
 
     let mut response = plain(StatusCode::SEE_OTHER, "signed in\n");
     let headers = response.headers_mut();
-    headers.insert(http::header::LOCATION, "./".parse().expect("static"));
+    headers.insert(
+        http::header::LOCATION,
+        next.parse()
+            .unwrap_or_else(|_| "./".parse().expect("static")),
+    );
 
     if let Ok(cookie) = format!(
         "{}={id}; Max-Age=43200; HttpOnly; SameSite=Strict",
@@ -1536,6 +1571,20 @@ fn metrics_response(text: String) -> Response<Body> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_login_link_goes_on_to_a_relative_page_alone() {
+        assert_eq!(
+            super::after_login(Some("request%2Fabc-123")),
+            "./request/abc-123"
+        );
+        assert_eq!(super::after_login(Some("request/abc")), "./request/abc");
+        assert_eq!(super::after_login(Some("/elsewhere")), "./");
+        assert_eq!(super::after_login(Some("../up")), "./");
+        assert_eq!(super::after_login(Some("http:%2F%2Fevil")), "./");
+        assert_eq!(super::after_login(None), "./");
+    }
+
     use super::*;
 
     #[test]

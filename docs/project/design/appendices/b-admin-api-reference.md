@@ -77,7 +77,8 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | DumpStacks | POST /v1/.../workers/{worker}:stacks | Python stacks |
 | NoteBundle | POST /v1/debug:bundle | say that a diagnostic bundle is being made, with what it is limited to and its window, which is recorded as the event debug.bundle (11.9); the collection is the command's own |
 | WatchEvents | GET /v1/events (Server-Sent Events) | event stream from a sequence number |
-| GetStatus | GET /v1/status | daemon, edges, snapshot version, and where the daemon's state, run, log and cache directories and its configuration file are |
+| GetStatus | GET /v1/status | daemon, edges, snapshot version, and where the daemon's state, run, log and cache directories and its configuration file are; the instance's `instance_id`, `name` and `hostname` (section 13.8) |
+| ApplicationUrls | GET /v1/apps/{app}:urls | every URL the application can be reached at, best first, worked out from the routing: each route to it, on each virtual host the route belongs to, under each of the host's names but wildcards, on each listener the host uses; the default route (shortest path) first, a canonical name before the others, HTTPS before HTTP, ties by the listeners' and hosts' order; each with its scheme, name, port, path, route, host, listener, bound address, whether the name is canonical and how it was chosen (issue 815). A development run answers that it needs the daemon, since its URLs come from its registry record |
 | ReloadDaemonConfig | POST /v1/daemon:reload | re-read the daemon configuration |
 | UpgradeDaemon | POST /v1/daemon:upgrade | re-exec and replace edges |
 | Backup, Restore | POST /v1/daemon:backup, :restore | state store |

@@ -1314,8 +1314,7 @@ fn probe_serve(socket: &Path, path: &str) -> (bool, String) {
 /// Ask the daemon over its admin socket.
 fn probe_daemon(args: &ProbeArgs) -> (bool, String) {
     let asked = async {
-        let socket = args.socket.socket()?;
-        let mut client = muru_controller::client::connect(&socket).await?;
+        let mut client = muru_controller::client::connect(&args.socket.endpoint()?).await?;
         let answer = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             client.probe(muru_proto::admin::v1::ProbeRequest {

@@ -45,6 +45,7 @@ flowchart TD
 - Several processes per pool use SO_REUSEPORT. A shared memory table of atomic per-worker in-flight counters keeps least-outstanding balancing exact across processes. Queue and admission limits are divided between processes.
 - Separate pools isolate traffic, for example a public pool and an admin pool, or tenants whose keys must not share a process.
 - Protocols: HTTP/1.1 and HTTP/2 (h2 over TLS, h2c optional) from phase 1. HTTP/3 is deferred (phase 4).
+- A listener whose address another instance of Muru's on the machine holds is refused naming that instance, from the instance registry (section 13.8), and `muructl daemon start` checks the daemon's listeners against the running instances before it starts anything.
 
 **Concurrency model.** Each edge process is event-driven and asynchronous, running on a multi-threaded runtime. Python never runs in the edge, so nothing in it is allowed to block an event loop.
 

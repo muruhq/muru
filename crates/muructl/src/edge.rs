@@ -89,8 +89,9 @@ fn parse_listener(text: &str) -> Result<(i32, bool), String> {
 pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     // Section 2.1: the edge's process title.
 
-    let title = format!("muru edge {}", args.scope);
-    muru_common::title::set(title.trim_end(), "muru-edge");
+    let tag = std::env::var(muru_controller::instance::TAG_VARIABLE).ok();
+    let title = muru_controller::instance::scoped_title("edge", &args.scope, tag.as_deref());
+    muru_common::title::set(&title, "muru-edge");
 
     // The listeners were bound by the daemon and inherited across exec.
 

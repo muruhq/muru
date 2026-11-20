@@ -19,6 +19,7 @@ import time
 import tomllib
 from pathlib import Path
 
+from support import instances
 from support import server as support
 from support.daemon import FACTORY, SHOP, Daemon, start_daemon
 from support.daemon import daemon as daemon_fixture
@@ -33,6 +34,19 @@ def test_status_before_any_release(daemon: Daemon) -> None:
     assert f"http://127.0.0.1:{daemon.port}" in status
     assert "apps     0 (0 releases)" in status
     assert daemon.get("/").status == 503
+
+    # Issue 805: the daemon is in the user's instance registry under the
+    # ID kept in its state directory, which its status reports.
+
+    answer = json.loads(daemon.muructl("status", "--json").stdout)
+    instance_id = (daemon.base / "state" / "instance-id").read_text().strip()
+    assert answer["instance_id"] == instance_id and answer["hostname"]
+    record = json.loads((support.user_registry() / instance_id / "instance.json").read_text())
+    assert record["kind"] == "daemon" and "name" not in record
+    assert record["pid"] == daemon.process.pid
+    assert record["state_dir"] == str(daemon.base / "state")
+    assert record["admin"]["path"] == str(daemon.run_dir / "admin.sock")
+    assert record["listeners"][0]["bound"] == f"127.0.0.1:{daemon.port}"
 
 
 def test_deploy_serves_and_records_the_release(daemon: Daemon) -> None:
@@ -221,6 +235,53 @@ def test_current_release_is_started_again_after_a_shutdown(tmp_path: Path) -> No
         second.stop()
 
 
+def test_a_second_daemon_on_a_running_daemons_directories_is_refused(daemon: Daemon) -> None:
+    # Issue 804: a daemon owns its state and run directories, so a second
+    # one on either is refused before it touches the first's socket.
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    socket_path = daemon.run_dir / "admin.sock"
+    inode = socket_path.stat().st_ino
+    other_state = support.short_dir("muru-st-")
+
+    for state in (daemon.base / "state", other_state):
+        refused = subprocess.run(
+            [
+                str(muructl),
+                "daemon",
+                "run",
+                "--state-dir",
+                str(state),
+                "--run-dir",
+                str(daemon.run_dir),
+                "--log-dir",
+                str(daemon.base / "logs"),
+                "--cache-dir",
+                str(daemon.base / "cache"),
+                "--config",
+                str(daemon.base / "muru.toml"),
+                "--listen",
+                f"127.0.0.1:{support.free_port()}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        directory = "state directory" if state == daemon.base / "state" else "run directory"
+        assert refused.returncode != 0
+        assert (
+            f"another daemon (pid {daemon.process.pid}) is using the {directory}" in refused.stderr
+        ), refused.stderr
+        assert f"its admin socket is {socket_path}" in refused.stderr, refused.stderr
+
+    # The first keeps its socket and answers on it.
+
+    assert socket_path.stat().st_ino == inode
+    assert f"daemon   pid {daemon.process.pid} " in daemon.muructl("daemon", "status").stdout
+
+
 def edge_pid_of(daemon: Daemon) -> int:
     """The edge process pid from the status output."""
 
@@ -263,11 +324,11 @@ def test_detached_daemon_leaves_traffic_flowing_and_is_readopted(tmp_path: Path)
     finally:
         if second is None:
             second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
-        ours = support.recorded_pids(first.run_dir)
+        ours = instances.pids_of(first.run_dir / "admin.sock") - {second.process.pid}
         second.stop(shutdown=True)
 
     # Nothing is left: nothing that names the run directory, and none of
-    # the edge, hosts and relays the records named, which carry titles.
+    # the edge, hosts and relays it supervised, which carry titles.
 
     listing = subprocess.run(
         ["ps", "-ax", "-o", "command="], capture_output=True, text=True, check=False
@@ -667,9 +728,13 @@ def test_the_daemons_file_is_named_only_where_it_is_read(daemon: Daemon, tmp_pat
 
     muructl = support.muructl_path()
     assert muructl is not None
+
+    # Directories of its own: the fixture's daemon owns its state
+    # directory, and another daemon on it would be refused first.
+
     where = {
-        "MURU_STATE_DIR": str(tmp_path / "state"),
-        "MURU_LOG_DIR": str(tmp_path / "logs"),
+        "MURU_STATE_DIR": str(tmp_path / "other-state"),
+        "MURU_LOG_DIR": str(tmp_path / "other-logs"),
         "MURU_RUN_DIR": str(support.short_dir("muru-rt-")),
         "MURU_CACHE_DIR": str(tmp_path / "cache"),
     }

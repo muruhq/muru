@@ -72,8 +72,8 @@ server takes it:
   name `{bind}` or read the environment.
 
 Every instance also has `MURU_HTTP_BIND` (the address as `unix:/path` or
-`127.0.0.1:PORT`), `PORT` when it binds a port, and `MURU_INSTANCE`, its
-index from 0, in its environment.
+`127.0.0.1:PORT`), `PORT` when it binds a port, and `MURU_SERVER_INDEX`,
+its index from 0, in its environment.
 
 ```toml
 [app.api.release.r3]
@@ -171,7 +171,7 @@ Each instance is started by a log relay of its own, which reads the
 instance's standard output and error and writes them to the release's
 log file, shown by `muructl logs APP`. Every line has the full UTC time
 it was read in front, and a tag naming the instance, by its
-`MURU_INSTANCE`, and the stream: `muru.instance[0]:` for standard
+`MURU_SERVER_INDEX`, and the stream: `muru.instance[0]:` for standard
 error and `muru.instance[0].stdout:` for standard output.
 
 ```

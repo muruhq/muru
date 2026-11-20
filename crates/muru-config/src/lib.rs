@@ -5706,6 +5706,60 @@ pub struct LocalFile {
     pub lazy_imports: Option<bool>,
     /// `import_report` (section 6.18), likewise.
     pub import_report: Option<bool>,
+    /// `instance` (section 13.8): the named instance the commands run in
+    /// this checkout reach, a fact about this machine alone.
+    pub instance: Option<String>,
+}
+
+/// What `instance` in a project's committed file is told: which daemon a
+/// checkout uses belongs to one machine.
+const INSTANCE_IS_LOCAL: &str = "instance is a key of muru.local.toml alone, since which \
+                                 daemon a checkout reaches is a fact about one machine; move it \
+                                 there";
+
+/// The `instance` key of a muru.local.toml in `dir`, read on its own, so
+/// that a command which only needs to know where to connect is not
+/// stopped by a mistake elsewhere in the file, which `muructl run`
+/// reports. None when there is no file or no key.
+pub fn local_instance(dir: &Path) -> Result<Option<(PathBuf, String)>, String> {
+    let path = dir.join(LOCAL_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let document: toml::Table = toml::from_str(&text)
+        .map_err(|error| format!("{}: {}", path.display(), error.message()))?;
+
+    match document.get("instance") {
+        None => Ok(None),
+        Some(toml::Value::String(name)) => {
+            check_instance_name(name).map_err(|error| format!("{}: {error}", path.display()))?;
+            Ok(Some((path, name.clone())))
+        }
+        Some(_) => Err(format!(
+            "{}: instance is the name of an instance, a string",
+            path.display()
+        )),
+    }
+}
+
+/// Check the name `instance` gives: 1 to 24 lowercase letters, digits
+/// and hyphens, starting with a letter, as instance names are.
+fn check_instance_name(name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= 24
+        && name.starts_with(|first: char| first.is_ascii_lowercase())
+        && name
+            .chars()
+            .all(|char| char.is_ascii_lowercase() || char.is_ascii_digit() || char == '-');
+
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "instance {name:?} is not an instance name: 1 to 24 lowercase letters, digits and \
+             hyphens, starting with a letter"
+        ))
+    }
 }
 
 /// The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a
@@ -6534,13 +6588,28 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
     if let Some(key) = document.keys().find(|key| {
         !matches!(
             key.as_str(),
-            "run" | "build" | "instrumentation" | "tracing" | "lazy_imports" | "import_report"
+            "run"
+                | "build"
+                | "instrumentation"
+                | "tracing"
+                | "lazy_imports"
+                | "import_report"
+                | "instance"
         )
     }) {
         return Err(format!(
-            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table, the when key of [build], [[instrumentation]], tracing, lazy_imports and import_report; the application's settings belong in {there}"
+            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table, the when key of [build], [[instrumentation]], tracing, lazy_imports, import_report and instance; the application's settings belong in {there}"
         ));
     }
+
+    let instance = match document.get("instance") {
+        Some(toml::Value::String(name)) => {
+            check_instance_name(name)?;
+            Some(name.clone())
+        }
+        Some(_) => return Err("instance is the name of an instance, a string".to_owned()),
+        None => None,
+    };
 
     let run = match document.get("run") {
         Some(run) => run
@@ -6610,11 +6679,18 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
         tracing,
         lazy_imports: flag("lazy_imports")?,
         import_report: flag("import_report")?,
+        instance,
     })
 }
 
 /// Parse a muru.toml: the `[tool.muru]` keys at the top level.
 pub fn parse_muru_toml(text: &str) -> Result<ToolMuru, String> {
+    let table: toml::Table = toml::from_str(text).map_err(|error| error.to_string())?;
+
+    if table.contains_key("instance") {
+        return Err(INSTANCE_IS_LOCAL.to_owned());
+    }
+
     toml::from_str(text).map_err(|error| error.to_string())
 }
 
@@ -6630,6 +6706,17 @@ pub fn parse_pyproject(text: &str) -> Result<Option<ToolMuru>, String> {
         #[serde(default)]
         muru: Option<ToolMuru>,
     }
+    let table: toml::Table = toml::from_str(text).map_err(|error| error.to_string())?;
+
+    if table
+        .get("tool")
+        .and_then(|tool| tool.get("muru"))
+        .and_then(|muru| muru.get("instance"))
+        .is_some()
+    {
+        return Err(format!("[tool.muru] {INSTANCE_IS_LOCAL}"));
+    }
+
     let project: Pyproject = toml::from_str(text).map_err(|error| error.to_string())?;
     Ok(project.tool.muru)
 }
@@ -6637,6 +6724,40 @@ pub fn parse_pyproject(text: &str) -> Result<Option<ToolMuru>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_is_a_key_of_the_local_file_alone() {
+        assert_eq!(
+            parse_local("instance = 'dev'\n", None)
+                .expect("parsed")
+                .instance
+                .as_deref(),
+            Some("dev")
+        );
+        assert!(parse_local("instance = 'Dev'\n", None).is_err());
+        assert!(
+            parse_muru_toml("instance = 'dev'\n")
+                .unwrap_err()
+                .contains("instance is a key of muru.local.toml alone")
+        );
+        assert!(
+            parse_pyproject("[tool.muru]\ninstance = 'dev'\n")
+                .unwrap_err()
+                .starts_with("[tool.muru] instance is a key of muru.local.toml alone")
+        );
+
+        let directory =
+            std::env::temp_dir().join(format!("muru-config-local-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("made");
+        std::fs::write(
+            directory.join(LOCAL_FILE),
+            "instance = 'dev'\n[run]\nport = 9\n",
+        )
+        .expect("written");
+        let found = local_instance(&directory).expect("read");
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(found.map(|(_, name)| name).as_deref(), Some("dev"));
+    }
 
     #[test]
     fn a_group_may_not_set_the_exit_grace() {
