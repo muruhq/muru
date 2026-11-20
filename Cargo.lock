@@ -1440,6 +1440,7 @@ dependencies = [
  "jiff",
  "libc",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

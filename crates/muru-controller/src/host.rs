@@ -1807,15 +1807,13 @@ impl HostProcess {
             return;
         };
 
-        if let Err(error) = std::fs::write(&path, since_epoch.as_millis().to_string()) {
-            tracing::warn!(%error, "could not tell the host when its workers must be gone");
-            return;
-        }
-
         // The host may run as another user than this process.
 
-        let permissions = std::os::unix::fs::PermissionsExt::from_mode(0o644);
-        let _ = std::fs::set_permissions(&path, permissions);
+        let millis = since_epoch.as_millis().to_string();
+
+        if let Err(error) = muru_common::files::write_whole_with_mode(&path, millis, 0o644) {
+            tracing::warn!(%error, "could not tell the host when its workers must be gone");
+        }
     }
 
     /// The pid of the release's log relay, while one runs.
@@ -2484,11 +2482,13 @@ impl RelayLaunch {
         Ok(child)
     }
 
-    /// Say which process the relay is, for a daemon that adopts it.
+    /// Say which process the relay is, for a daemon that adopts it. The
+    /// record is written whole, as the relay writes its own, since a
+    /// daemon may read it while a replacement relay is recorded.
     fn record(&self, pid: u32) {
         let path = self.run_dir.join(crate::relay::RECORD);
 
-        if let Err(error) = std::fs::write(&path, format!("pid = {pid}\n")) {
+        if let Err(error) = muru_common::files::write_whole(&path, format!("pid = {pid}\n")) {
             tracing::warn!(%error, "could not record the release's log relay");
         }
     }

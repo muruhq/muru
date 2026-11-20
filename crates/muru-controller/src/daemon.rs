@@ -2278,7 +2278,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     if owns_log {
         let path = locations.pid_file();
 
-        if let Err(error) = std::fs::write(&path, std::process::id().to_string()) {
+        if let Err(error) = muru_common::files::write_whole(&path, std::process::id().to_string()) {
             tracing::warn!(%error, path = %path.display(), "writing the pid file failed");
         }
     }
@@ -3419,11 +3419,12 @@ fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     toml::from_str(&text).ok()
 }
 
-/// Write a record for the next daemon.
+/// Write a record for the next daemon, whole, so a daemon that reads it
+/// as it is rewritten never takes it for no record.
 fn write_record<T: serde::Serialize>(path: &Path, record: &T) {
     let written = toml::to_string(record)
         .map_err(std::io::Error::other)
-        .and_then(|text| std::fs::write(path, text));
+        .and_then(|text| muru_common::files::write_whole(path, text));
 
     if let Err(error) = written {
         tracing::error!(%error, path = %path.display(), "writing a record failed");

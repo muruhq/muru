@@ -184,12 +184,9 @@ impl ProcessRecord {
 
     /// Write the record, whole or not at all: a reader never sees half.
     fn write(&self, path: &Path) {
-        let partial = path.with_extension("toml.partial");
-
         let written = toml::to_string(self)
             .map_err(std::io::Error::other)
-            .and_then(|text| std::fs::write(&partial, text))
-            .and_then(|()| std::fs::rename(&partial, path));
+            .and_then(|text| muru_common::files::write_whole(path, text));
 
         if let Err(error) = written {
             eprintln!(

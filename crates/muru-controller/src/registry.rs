@@ -105,7 +105,7 @@ impl InstanceId {
         }
 
         let id = Self::generate();
-        std::fs::write(path, format!("{id}\n"))?;
+        muru_common::files::write_whole(path, format!("{id}\n"))?;
         Ok(id)
     }
 }
