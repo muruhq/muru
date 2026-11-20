@@ -89,7 +89,7 @@ new relay. Nothing else is affected.
 Each instance of a [managed HTTP server](managed-servers.md) has a log
 relay of its own, which starts the instance and reads its standard
 output and standard error. Its lines are tagged with the instance's
-number, its `MURU_INSTANCE`, and the stream:
+number, its `MURU_SERVER_INDEX`, and the stream:
 
 ```
 2026-11-02T05:42:22.840Z muru.instance[0]: [INFO] Booting worker with pid: 48230

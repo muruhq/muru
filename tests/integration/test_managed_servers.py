@@ -87,7 +87,7 @@ def test_a_generic_server_is_started_probed_and_served(daemon: Daemon) -> None:
     assert "x-request-id" in seen["headers"]
     assert seen["cwd"] == str(LEGACY)
     assert seen["env"]["MURU_HTTP_BIND"].startswith("unix:")
-    assert seen["env"]["MURU_INSTANCE"] == "0"
+    assert seen["env"]["MURU_SERVER_INDEX"] == "0"
     assert seen["env"]["PORT"] is None
 
     # The release is listed by its server, the server's output is in the
@@ -126,7 +126,7 @@ def test_instances_bind_ports_and_their_count_is_fixed(daemon: Daemon) -> None:
     port = first["env"]["MURU_HTTP_BIND"].rsplit(":", 1)[1]
     assert first["env"]["MURU_HTTP_BIND"].startswith("127.0.0.1:")
     assert first["env"]["PORT"] == port
-    assert {seen["env"]["MURU_INSTANCE"] for seen in reports} == {"0", "1"}
+    assert {seen["env"]["MURU_SERVER_INDEX"] for seen in reports} == {"0", "1"}
 
     # release show names each instance's process and address.
 
