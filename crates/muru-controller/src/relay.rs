@@ -935,6 +935,10 @@ pub fn run(args: RelayArgs) -> anyhow::Result<()> {
             None => format!("muru relay {release}"),
         };
 
+        // Section 13.10: the instance it belongs to, as its starter's
+        // environment names it.
+
+        let title = crate::instance::tagged_from_environment(&title);
         muru_common::title::set(&title, "muru-relay");
     }
 

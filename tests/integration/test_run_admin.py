@@ -821,9 +821,12 @@ def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
         assert titles[root["pid"]] == (
             f"muru run plain-wsgi 127.0.0.1:{server.port} dashboard 127.0.0.1:{port}"
         ), titles
-        assert titles[host["pid"]] == "muru host plain-wsgi@r1", titles
-        assert titles[host["children"][0]["pid"]] == "muru relay plain-wsgi@r1", titles
-        assert titles[host["children"][2]["pid"]] == "muru worker plain-wsgi@r1 default/1", titles
+        tag = f"(run:{server.port})"
+        assert titles[host["pid"]] == f"muru host plain-wsgi@r1 {tag}", titles
+        assert titles[host["children"][0]["pid"]] == f"muru relay plain-wsgi@r1 {tag}", titles
+        assert titles[host["children"][2]["pid"]] == (
+            f"muru worker plain-wsgi@r1 default/1 {tag}"
+        ), titles
 
         text = muructl(runtime, "status", "--processes", cwd=support.FIXTURES).stdout
         assert "└─ host" in text and "├─ relay" in text and "└─ worker" in text, text

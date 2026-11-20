@@ -3929,6 +3929,12 @@ async fn run_with(
         }
     };
 
+    // Section 13.10: what the run starts says it belongs to this instance.
+
+    if let Some(registration) = &registration {
+        muru_controller::instance::set(registration.id, &registration.tag());
+    }
+
     let run_dir = match (&serve, registration.as_ref().and_then(|r| r.directory())) {
         (Some(mode), _) => mode.run_dir.join("release"),
         (None, Some(directory)) => directory.to_path_buf(),

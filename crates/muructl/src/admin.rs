@@ -631,7 +631,27 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     // Section 2.1: the daemon's process title, which names whose daemon
     // it is, as its edge's does.
 
-    muru_common::title::set(&format!("muru daemon {}", locations.scope()), "muru-daemon");
+    // Section 13.10: the instance's ID, kept in the state directory, and
+    // its tag, which the daemon's processes carry.
+
+    let id = muru_controller::registry::InstanceId::kept_in(
+        &locations
+            .state
+            .path
+            .join(muru_controller::daemon::INSTANCE_ID_FILE),
+    )
+    .with_context(|| {
+        format!(
+            "keeping the instance ID in {}",
+            locations.state.path.display()
+        )
+    })?;
+    let tag = locations.instance_name().unwrap_or_else(|| id.short());
+    muru_controller::instance::set(id, &tag);
+    muru_common::title::set(
+        &muru_controller::instance::scoped_title("daemon", &locations.scope(), Some(&tag)),
+        "muru-daemon",
+    );
 
     // The file is read the same way here and on every reload, with the
     // command line's settings laid over it.

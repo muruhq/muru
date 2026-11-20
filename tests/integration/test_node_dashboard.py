@@ -630,12 +630,15 @@ def test_the_processes_are_listed_as_the_daemon_supervises_them(
         ).stdout.strip()
 
     # The daemon's state directory is not the default for a user's, so
-    # the titles name it.
+    # the titles name it, and every title names the instance by its short
+    # ID (issue 806).
 
-    assert title(root["pid"]) == f"muru daemon {state}"
-    assert title(edge["pid"]) == f"muru edge {state}"
-    assert title(host["pid"]) == "muru host shop@r1"
-    assert title(workers[0]["pid"]) == "muru worker shop@r1 default/0"
+    tag = (daemon.base / "state" / "instance-id").read_text().strip()[:8]
+    assert title(root["pid"]) == f"muru daemon {state} ({tag})"
+    assert title(edge["pid"]) == f"muru edge {state} ({tag})"
+    assert title(host["pid"]) == f"muru host shop@r1 ({tag})"
+    assert title(relay["pid"]) == f"muru relay shop@r1 ({tag})"
+    assert title(workers[0]["pid"]) == f"muru worker shop@r1 default/0 ({tag})"
 
     # On Linux the short name too, which top shows.
 

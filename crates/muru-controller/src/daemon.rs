@@ -3472,9 +3472,17 @@ fn command_mentions(pid: u32, path: &Path, title: &str) -> bool {
 /// Whether a command line, as `ps` shows it, is the process a record
 /// names: it mentions `path`, as the process was started, or it is
 /// `title`, which the process set in place of its arguments (section
-/// 2.1), with whatever spaces `ps` shows for the rest of the area.
+/// 2.1), with whatever spaces `ps` shows for the rest of the area, and
+/// the instance's tag in parentheses after it (section 13.10).
 fn names(command: &str, path: &Path, title: &str) -> bool {
-    command.contains(&path.display().to_string()) || command.trim() == title
+    let command = command.trim();
+
+    command.contains(&path.display().to_string())
+        || command == title
+        || command
+            .strip_prefix(title)
+            .and_then(|rest| rest.strip_prefix(" ("))
+            .is_some_and(|tag| tag.ends_with(')') && !tag.contains(' '))
 }
 
 impl Daemon {
@@ -13550,8 +13558,18 @@ mod tests {
             run_dir,
             "muru host shop@r42"
         ));
+        assert!(super::names(
+            "muru host shop@r42 (7f3a9c2e)",
+            run_dir,
+            "muru host shop@r42"
+        ));
         assert!(!super::names(
             "muru host shop@r421",
+            run_dir,
+            "muru host shop@r42"
+        ));
+        assert!(!super::names(
+            "muru host shop@r42 (web) other",
             run_dir,
             "muru host shop@r42"
         ));

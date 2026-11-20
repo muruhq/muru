@@ -1119,6 +1119,13 @@ impl Registration {
         self.directory.as_deref()
     }
 
+    /// The instance's tag, as its processes' titles carry it (section 2.1).
+    pub fn tag(&self) -> String {
+        self.entry
+            .as_ref()
+            .map_or_else(|| self.id.short(), |entry| entry.record().tag())
+    }
+
     /// Write the run's process id to `pid` in its directory, as a script
     /// reads it to stop the run (issue 764); the file's path, or none
     /// for `muructl serve` or when it could not be written.

@@ -299,14 +299,17 @@ impl Record {
     }
 
     /// The instance's tag, which its processes' titles carry: its name,
-    /// `run:PORT` for a run, `serve` for a serve, or the short ID.
+    /// `run:PORT` for a run, with the port it is configured to serve on,
+    /// which is known before anything starts, `serve` for a serve, or the
+    /// short ID; a run on a port picked when it binds, `--port auto`, is
+    /// `run:` and its short ID.
     pub fn tag(&self) -> String {
         if let Some(name) = &self.name {
             return name.clone();
         }
 
         match self.kind {
-            Kind::Run => match self.served_port() {
+            Kind::Run => match self.configured_port() {
                 Some(port) => format!("run:{port}"),
                 None => format!("run:{}", self.id.short()),
             },
@@ -315,12 +318,12 @@ impl Record {
         }
     }
 
-    /// The port the application is served on: the first listener's, bound
-    /// or else configured.
-    pub fn served_port(&self) -> Option<u16> {
+    /// The port the first listener is configured with, when it is not one
+    /// picked at bind time.
+    pub fn configured_port(&self) -> Option<u16> {
         let listener = self.listeners.first()?;
-        let address = listener.bound.as_deref().unwrap_or(&listener.configured);
-        address.rsplit(':').next()?.parse().ok()
+        let port: u16 = listener.configured.rsplit(':').next()?.parse().ok()?;
+        (port != 0).then_some(port)
     }
 }
 

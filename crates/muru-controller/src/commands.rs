@@ -991,6 +991,7 @@ fn process(prepared: &Prepared) -> Command {
         .args(&prepared.argv[1..])
         .current_dir(&prepared.cwd)
         .envs(prepared.env.iter().map(|(name, value)| (name, value)))
+        .envs(crate::instance::variables())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

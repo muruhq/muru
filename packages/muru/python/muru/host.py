@@ -639,12 +639,14 @@ def set_title(title: str, short: str) -> None:
     """Set the process title `ps` shows (section 2.1).
 
     On Linux the short name `top` shows is set too, so the host and each
-    worker tell themselves apart.
+    worker tell themselves apart. The instance the process belongs to, as
+    `MURU_INSTANCE` names it, follows in parentheses (section 13.10).
     """
 
     from muru import _native
 
-    _native.set_title(title, short)
+    tag = os.environ.get("MURU_INSTANCE")
+    _native.set_title(f"{title} ({tag})" if tag else title, short)
 
 
 def process_model(threads: int, interface: str = "wsgi") -> str:

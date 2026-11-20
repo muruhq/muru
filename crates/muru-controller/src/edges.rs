@@ -650,7 +650,8 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         .arg("--spool")
         .arg(&spec.spool)
         .arg("--scope")
-        .arg(&spec.scope);
+        .arg(&spec.scope)
+        .envs(crate::instance::variables());
 
     // Section 4.15: the rate limits' buckets, in the edges' directory,
     // which every generation of the edge maps, so a replacement draws

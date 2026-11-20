@@ -774,18 +774,44 @@ apart:
 
 | Process | Title |
 | --- | --- |
-| The daemon | `muru daemon user`, `muru daemon system`, or `muru daemon DIR` |
-| The edge | `muru edge user`, `muru edge system`, or `muru edge DIR` |
+| The daemon | `muru daemon user`, `muru daemon system`, or `muru daemon DIR (ID)` |
+| The edge | `muru edge user`, `muru edge system`, or `muru edge DIR (ID)` |
 | A development run, or `muructl serve` | `muru run APP ADDRESS dashboard ADDRESS` (without a dashboard, `muru run APP ADDRESS`), `muru serve APP ADDRESS` |
-| A release's host | `muru host APP@RELEASE` |
-| Its log relay | `muru relay APP@RELEASE` |
-| A worker | `muru worker APP@RELEASE GROUP/INDEX` |
+| A release's host | `muru host APP@RELEASE (INSTANCE)` |
+| Its log relay | `muru relay APP@RELEASE (INSTANCE)` |
+| A worker | `muru worker APP@RELEASE GROUP/INDEX (INSTANCE)` |
 
 The daemon's and the edge's titles name the daemon as its row does:
 `user` or `system`, or its state directory when that is not the default
 for its scope, as with `--state-dir`, so two daemons of one user are
 told apart. An edge left running while its daemon restarts has the
 init process as its parent, and its title still says whose it is.
+
+Every title names the instance the process belongs to. A host's,
+relay's and worker's title ends with the instance in parentheses:
+`user` or `system` for the default daemons, `run:8000` for a
+development run on port 8000, `serve` under `muructl serve`, and the
+first 8 hex digits of the daemon's instance ID for a daemon started
+with its own `--state-dir`, which its own title and its edge's carry
+too:
+
+```console
+$ ps -o pid,command -U "$USER" | grep 'muru '
+ 4123 muru daemon user
+ 4130 muru edge user
+ 4144 muru host shop@r3 (user)
+ 4145 muru relay shop@r3 (user)
+ 4150 muru worker shop@r3 default/0 (user)
+ 6001 muru run blog 127.0.0.1:8000 dashboard 127.0.0.1:8001
+ 6012 muru host blog@r1 (run:8000)
+```
+
+When a title is too long for the room it has, the words before the
+instance are cut first. Every process the daemon, a run or a serve
+starts, and every process those start in turn, has `MURU_INSTANCE_ID`,
+the instance's full ID, and `MURU_INSTANCE`, its name as the titles show
+it, in its environment, which is what ties a subprocess a worker started,
+with no title of Muru's, to its instance.
 
 A title longer than the command line the process was started with,
 such as `muru serve shop 0.0.0.0:8080` for a process started as `muructl serve`,
