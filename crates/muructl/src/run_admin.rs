@@ -1089,11 +1089,14 @@ impl Registration {
             started_unix_ms: crate::admin::now_unix_ms(),
         };
         let registration = socket.with_file_name("serve.json");
-        std::fs::write(&registration, serde_json::to_vec(&info)?)?;
 
         // Section 13.9: any user ID with the group may use the serve.
 
-        crate::serve::group_writable(&registration, 0o660);
+        muru_common::files::write_whole_with_mode(
+            &registration,
+            serde_json::to_vec(&info)?,
+            0o660,
+        )?;
 
         let mut record = muru_controller::registry::Record::new(
             id,
@@ -1138,7 +1141,7 @@ impl Registration {
     /// for `muructl serve` or when it could not be written.
     pub fn write_pid(&self, pid: u32) -> Option<PathBuf> {
         let path = self.directory.as_ref()?.join("pid");
-        std::fs::write(&path, format!("{pid}\n")).ok()?;
+        muru_common::files::write_whole(&path, format!("{pid}\n")).ok()?;
         Some(path)
     }
 
