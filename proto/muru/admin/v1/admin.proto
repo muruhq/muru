@@ -73,6 +73,9 @@ service Admin {
   // Section 10.7: a single-use link that signs a browser in to the
   // dashboard, which shows and never changes.
   rpc DashboardLogin(DashboardLoginRequest) returns (DashboardLoginLink);
+  // Every URL an application can be reached at, best first, worked out
+  // from the routing (section 4.3, issue 815).
+  rpc ApplicationUrls(ApplicationUrlsRequest) returns (ApplicationUrlsResponse);
 
   // Events, from a sequence number.
   rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
@@ -895,6 +898,29 @@ message DashboardLoginRequest {
   reserved 1;                       // was actions: the dashboard has none (ADR 0060)
   reserved "actions";
   bool token = 2;                   // a session at once, as a bearer token for scripts, in place of a link
+}
+
+message ApplicationUrlsRequest {
+  string app = 1;
+}
+
+message ApplicationUrlsResponse {
+  string app = 1;
+  repeated ApplicationUrl urls = 2; // best first: the default route, a canonical name, https
+}
+
+message ApplicationUrl {
+  string url = 1;
+  string scheme = 2;                // http or https
+  string name = 3;                  // the name in the URL: a virtual host's, or the listener's address
+  uint32 port = 4;
+  string path = 5;                  // the route's path
+  string route = 6;                 // the route's name, or empty
+  string host = 7;                  // the virtual host, or empty when none is declared
+  string listener = 8;              // the listener's address
+  string bound = 9;                 // the address the listener is bound on
+  bool canonical = 10;              // the name is the host's canonical one
+  string why = 11;                  // how it was chosen, as a phrase
 }
 
 message DashboardLoginLink {

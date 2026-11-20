@@ -297,7 +297,8 @@ pub fn reached_instance() -> Option<&'static str> {
 /// nowhere else. Each refuses an instance that is not on this machine,
 /// through [`require_local`]; every other command goes through the admin
 /// API and works on any endpoint.
-pub const LOCAL_ONLY: [&str; 7] = [
+pub const LOCAL_ONLY: [&str; 8] = [
+    "open",
     "instance prune",
     "instance list --orphans and --ports",
     "daemon start",

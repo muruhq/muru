@@ -2373,6 +2373,36 @@ impl Admin for Service {
         Ok(Response::new(status))
     }
 
+    async fn application_urls(
+        &self,
+        request: Request<pb::ApplicationUrlsRequest>,
+    ) -> Result<Response<pb::ApplicationUrlsResponse>, Status> {
+        let app = request.into_inner().app;
+        let apps = self.handle.store.apps().map_err(internal)?;
+
+        if !apps.iter().any(|known| known.name == app) {
+            return Err(Status::not_found(format!("no application {app}")));
+        }
+
+        let routes = self.handle.store.routes().map_err(internal)?;
+        let hosts = self.handle.store.hosts().map_err(internal)?;
+        let listeners = self
+            .handle
+            .info
+            .listeners
+            .read()
+            .expect("listeners poisoned")
+            .clone();
+
+        Ok(Response::new(pb::ApplicationUrlsResponse {
+            urls: crate::urls::for_app(&app, &routes, &hosts, &listeners)
+                .into_iter()
+                .map(application_url)
+                .collect(),
+            app,
+        }))
+    }
+
     async fn list_hosts(
         &self,
         _: Request<pb::ListHostsRequest>,
@@ -4279,4 +4309,21 @@ fn internal(error: impl std::fmt::Display) -> Status {
 
 fn not_found(error: impl std::fmt::Display) -> Status {
     Status::not_found(error.to_string())
+}
+
+/// An address an application can be reached at, as the admin API gives it.
+pub fn application_url(candidate: crate::urls::Candidate) -> pb::ApplicationUrl {
+    pb::ApplicationUrl {
+        url: candidate.url,
+        scheme: candidate.scheme,
+        name: candidate.name,
+        port: u32::from(candidate.port),
+        path: candidate.path,
+        route: candidate.route,
+        host: candidate.host,
+        listener: candidate.listener,
+        bound: candidate.bound.to_string(),
+        canonical: candidate.canonical,
+        why: candidate.why,
+    }
 }

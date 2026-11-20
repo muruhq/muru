@@ -55,3 +55,4 @@ pub mod sinks;
 pub mod store;
 pub mod supervisor;
 pub mod triggers;
+pub mod urls;

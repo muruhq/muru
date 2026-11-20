@@ -112,7 +112,62 @@ which takes the place of the project's. Any other key is refused with a
 message naming the committed file where the application's settings
 belong. It is never committed: `muructl run` says once per run that it is
 using the file, and if the project's `.gitignore` does not cover it, the
-start-up line says so. `muructl deploy` does not read it.
+start-up line says so. Its `instance` key names the daemon the
+checkout's other commands reach (see [running more than one
+daemon](named-instances.md#reaching-an-instance-from-a-checkout)), which
+is the only key `muructl deploy` reads from it.
+
+## Opening the application in the browser
+
+`--open` opens the application in your browser once the run first
+answers, and not again when it reloads:
+
+```console
+$ muructl run --https --open
+```
+
+From another terminal, `muructl open` in the project directory opens the
+application of the run serving it, and `muructl open --dashboard` its
+dashboard:
+
+```console
+$ muructl open
+muru: opened https://localhost:8443/
+muru: 1 other address: muructl open --list
+$ muructl open /admin/
+$ muructl open --dashboard
+$ muructl open --dashboard --request 01J9Z6T2W3
+```
+
+The URL is https when the run serves HTTPS, under its first `--host`
+name, else `localhost`, on the port it is bound to. `--https` and
+`--http` choose the scheme, and refuse one the run does not serve.
+`--print` prints the URL and opens nothing, `--list` prints every URL
+the application can be reached at, best first, with how each was
+chosen, and `--json` with either prints them as JSON. `--request ID`
+opens a request's page on the dashboard, as the `Muru-Request-Link`
+header names it.
+
+`muructl open APP` opens an application on a daemon instead, with the
+URL worked out from the daemon's routes, virtual hosts and listeners:
+the application's default route first, a virtual host's canonical name
+before its other names, and HTTPS before HTTP. `--route`, `--host` and
+`--listener` choose among them. A virtual host's name may be another
+machine's, as `shop.example.com` usually is the production server's, so
+a name ending in `.localhost` comes first, a name that resolves to an
+address the listener is bound on, or to loopback for a listener on every
+address, is kept, and any other is left out; `--any-name` keeps them.
+When none is left, `muructl open` says which names it left out and why,
+and offers `http://127.0.0.1:PORT/`, which reaches the listener's
+default host. With no APP, the application is the project's, by its
+`[project]` name.
+
+The browser is the program `$BROWSER` names, then `open` on macOS, and
+on Linux `wslview` under WSL, `xdg-open` or `gio open`, given the URL as
+an argument. On Linux with no display, in an SSH session with no
+`$BROWSER`, or with no launcher found, `muructl open` prints the URL and
+says it could not open a browser; in an SSH session the address is the
+remote machine's, so opening it from your own needs port forwarding.
 
 ## Variables from a .env file
 

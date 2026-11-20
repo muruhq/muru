@@ -3594,6 +3594,18 @@ impl Daemon {
             maintenance.insert(app, (since, by));
         }
 
+        // Issue 815: where each application can be reached, as muructl
+        // open --list gives it.
+
+        let routes = self.store.routes().unwrap_or_default();
+        let hosts = self.store.hosts().unwrap_or_default();
+        let listeners = self
+            .info
+            .listeners
+            .read()
+            .expect("listeners poisoned")
+            .clone();
+
         for app in self.store.apps().unwrap_or_default() {
             let mut releases = Vec::new();
 
@@ -3643,6 +3655,10 @@ impl Daemon {
                     .map(|(_, by)| by.clone())
                     .unwrap_or_default(),
                 releases,
+                urls: crate::urls::for_app(&app.name, &routes, &hosts, &listeners)
+                    .into_iter()
+                    .map(|candidate| candidate.url)
+                    .collect(),
             });
         }
 

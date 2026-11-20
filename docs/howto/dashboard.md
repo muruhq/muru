@@ -100,6 +100,12 @@ https://example.com/proxy/8090/login?code=3f9c...
 The dashboard's pages use relative addresses, so they work under any
 path, and open it with the trailing slash: `https://example.com/proxy/8090/`.
 
+`muructl open --dashboard` asks for the same link and opens it in your
+browser, which is then signed in. The link passes through the command
+line of the program that opens the browser, where other users of the
+machine could see it while that program runs; it works once and only
+for five minutes. `--print` prints it instead of opening it.
+
 ### What the page shows
 
 - the node: the daemon's pid and version, its uptime, the listeners, the

@@ -801,6 +801,24 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "urls",
+            description: "Every URL the application can be reached at, best first, each with how it was chosen: a development run's from its listeners and --host names, an application on a daemon's from its routes, virtual hosts and listeners, leaving out names that reach another machine. Opens nothing.",
+            changes: false,
+            properties: json!({
+                "app": {"type": "string", "description": "An application on the daemon; the project's, or the development run's, when left out"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["open", "--list"]);
+
+                if let Some(app) = text(arguments, "app") {
+                    command.push(app);
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "list",
             description: "List one kind of object: apps, releases (of one app, or all), hosts, routes, upstreams, rollouts (of one app, or all) or overlays.",
             changes: false,

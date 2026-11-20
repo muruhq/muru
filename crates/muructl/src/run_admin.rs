@@ -1119,6 +1119,13 @@ impl Registration {
         self.directory.as_deref()
     }
 
+    /// The run's registry record as last written, when it has one.
+    pub fn record(&self) -> Option<muru_controller::registry::Record> {
+        self.entry
+            .as_ref()
+            .map(muru_controller::registry::Entry::record)
+    }
+
     /// The instance's tag, as its processes' titles carry it (section 2.1).
     pub fn tag(&self) -> String {
         self.entry
@@ -2036,6 +2043,7 @@ impl Admin for Service {
         set_maintenance(pb::SetMaintenanceRequest) -> pb::MaintenanceStatus, "muructl maintenance";
         probe(pb::ProbeRequest) -> pb::ProbeAnswer, "muructl probe";
         dashboard_login(pb::DashboardLoginRequest) -> pb::DashboardLoginLink, "muructl dashboard";
+        application_urls(pb::ApplicationUrlsRequest) -> pb::ApplicationUrlsResponse, "muructl open APP";
         shutdown(pb::ShutdownRequest) -> pb::ShutdownResponse, "muructl daemon stop";
         list_hosts(pb::ListHostsRequest) -> pb::ListHostsResponse, "muructl host";
         list_routes(pb::ListRoutesRequest) -> pb::ListRoutesResponse, "muructl route";

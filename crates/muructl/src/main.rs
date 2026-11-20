@@ -8,6 +8,7 @@
 //! pages and the CLI reference (section 14.4 and Appendix A).
 
 mod admin;
+mod browser;
 mod dashboard;
 mod devcert;
 mod diagnostics;
@@ -17,6 +18,7 @@ mod init;
 mod instances;
 mod log_format;
 mod mcp;
+mod open;
 mod print_config;
 mod processes;
 mod project_commands;
@@ -236,6 +238,10 @@ enum Command {
         #[command(subcommand)]
         command: admin::SecretCommand,
     },
+
+    /// Open the project's application, an application on a daemon, or an
+    /// instance's dashboard in the browser on this machine.
+    Open(Box<open::OpenArgs>),
 
     /// Look into a release's workers (status, stacks, tasks, inspect),
     /// and collect diagnostics: a report for a bug report, a bundle of
@@ -684,6 +690,11 @@ struct RunArgs {
     #[arg(long, value_name = "ADDRESS")]
     dashboard: Option<String>,
 
+    /// Open the application in the browser on this machine once the run
+    /// first answers; not again when it reloads.
+    #[arg(long)]
+    open: bool,
+
     /// Do not compress responses; they are compressed for
     /// clients that accept br, zstd or gzip otherwise.
     #[arg(long)]
@@ -1100,6 +1111,10 @@ fn running(command: &Command) -> admin::Running {
             daemon_only: true,
             ..admin::Running::default()
         },
+        Command::Open(args) => admin::Running {
+            daemon_only: args.app().is_some(),
+            ..admin::Running::default()
+        },
         Command::Scale(_) | Command::Restart(_) | Command::Logging { .. } => admin::Running {
             change: change(words.get(1).map(String::as_str) != Some("status")),
             ..admin::Running::default()
@@ -1274,6 +1289,7 @@ fn main() -> anyhow::Result<()> {
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
         Command::Debug { command } => runtime.block_on(admin::debug(command)),
+        Command::Open(args) => runtime.block_on(open::open(*args)),
         Command::Instance { command } => match command {
             instances::InstanceCommand::List(args) => exit_with(runtime, instances::list(args)),
             instances::InstanceCommand::Prune(args) => runtime.block_on(instances::prune(args)),
@@ -4733,6 +4749,20 @@ async fn run_with(
                 admin_serving = Some(tokio::spawn(serving));
             }
             Err(error) => muru_common::muru_println!("no admin socket: {error:#}"),
+        }
+    }
+
+    // Issue 815: the browser opens on the run's own URL once, now that it
+    // answers, and not on later reloads.
+
+    if args.open && serve.is_none() {
+        let url = registration
+            .as_ref()
+            .and_then(run_admin::Registration::record)
+            .and_then(|record| open::record_choices(&record).into_iter().next());
+
+        if let Some(url) = url {
+            std::thread::spawn(move || browser::open(&url.url));
         }
     }
 
