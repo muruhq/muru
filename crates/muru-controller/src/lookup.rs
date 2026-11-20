@@ -39,6 +39,8 @@ pub struct MuruProcess {
     pub tag: Option<String>,
     /// The ID of the instance it belongs to, when its environment says.
     pub id: Option<InstanceId>,
+    /// The label of the instance it belongs to, when its environment says.
+    pub label: Option<String>,
 }
 
 /// Every Muru process of the caller's, or of every user when root, other
@@ -82,6 +84,7 @@ pub fn muru_processes() -> Vec<MuruProcess> {
                 title,
                 tag,
                 id,
+                label: variable(crate::registry::LABEL_VARIABLE).filter(|label| !label.is_empty()),
             })
         })
         .collect()

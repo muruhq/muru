@@ -214,6 +214,34 @@ impl Server {
         failure(message)
     }
 
+    /// Run a muructl command about this machine rather than the instance
+    /// the server reaches, with --json and none of the socket options.
+    /// An exit status of 1 that printed its JSON, as `instance list
+    /// --orphans` does when there are orphans, is an answer.
+    async fn local_command(&self, mut command: Vec<String>) -> CallToolResult {
+        command.push("--json".to_owned());
+
+        let output = match tokio::process::Command::new(&self.muructl)
+            .args(&command)
+            .stdin(Stdio::null())
+            .output()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => return failure(format!("running muructl: {error}")),
+        };
+        let printed = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let answer = serde_json::from_str::<Value>(&printed).ok();
+
+        match answer {
+            Some(answer) if answer.get("error").is_none() => {
+                CallToolResult::success(vec![ContentBlock::text(printed)])
+            }
+            Some(answer) => failure(answer["error"].as_str().unwrap_or_default().to_owned()),
+            None => failure(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+        }
+    }
+
     /// The run_command tool. A secret input given as a value is refused,
     /// so a secret never passes through the agent; the command's output
     /// comes back with its exit status, as an error when that is not 0.
@@ -394,6 +422,10 @@ impl ServerHandler for Server {
             "docs" => docs(&arguments),
             "skill_status" => skill_status(),
             "run_command" => self.run_command(&arguments).await,
+            "instances" => match (spec.command)(&arguments) {
+                Ok(command) => self.local_command(command).await,
+                Err(message) => failure(message),
+            },
             _ => match (spec.command)(&arguments) {
                 Ok(command) => {
                     let result = self.command(command).await;
@@ -703,6 +735,33 @@ fn specs() -> Vec<Spec> {
 
                 if arguments.get("all").and_then(serde_json::Value::as_bool) == Some(true) {
                     command.push("--all".to_owned());
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "instances",
+            description: "The Muru instances on this machine, from every daemon, development run and serve the instance registry knows, each with its state (running, detached or stale), listeners, dashboard and where it works from; with orphans, also the Muru processes no live instance accounts for, such as what an agent's earlier run left behind.",
+            changes: false,
+            properties: json!({
+                "orphans": {"type": "boolean", "description": "Also the processes no running or detached instance accounts for"},
+                "label": {"type": "string", "description": "Only the instances with this label"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["instance", "list"]);
+
+                if arguments
+                    .get("orphans")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    command.push("--orphans".to_owned());
+                }
+
+                if let Some(label) = text(arguments, "label") {
+                    command.extend(["--label".to_owned(), label]);
                 }
 
                 Ok(command)

@@ -14,6 +14,7 @@ mod diagnostics;
 mod edge;
 mod imports;
 mod init;
+mod instances;
 mod log_format;
 mod mcp;
 mod print_config;
@@ -242,6 +243,13 @@ enum Command {
     Debug {
         #[command(subcommand)]
         command: admin::DebugCommand,
+    },
+
+    /// The Muru instances on this machine: daemons, development runs and
+    /// serves, and what they left behind.
+    Instance {
+        #[command(subcommand)]
+        command: instances::InstanceCommand,
     },
 
     /// The runtime library on its own: unpack it for an image.
@@ -1182,6 +1190,9 @@ fn main() -> anyhow::Result<()> {
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
         Command::Debug { command } => runtime.block_on(admin::debug(command)),
+        Command::Instance { command } => match command {
+            instances::InstanceCommand::List(args) => exit_with(runtime, instances::list(args)),
+        },
         Command::Cache { command } => runtime.block_on(async move {
             match command {
                 admin::CacheCommand::List(args) => admin::cache_list(*args).await,
@@ -1256,11 +1267,31 @@ fn main() -> anyhow::Result<()> {
             processes,
             output,
         } => runtime.block_on(async move {
-            if processes.processes {
+            let shown = if processes.processes {
                 processes::show(&socket.endpoint()?, &processes, output.json).await
             } else {
                 admin::show_status(&socket.endpoint()?, output.json).await
+            };
+
+            // With nothing where it looked, how many instances the machine
+            // has, so nothing running is told from nothing here.
+
+            if let Err(error) = &shown
+                && error.to_string().starts_with("nothing is listening")
+                && !output.json
+            {
+                match instances::count_alive() {
+                    0 => {}
+                    1 => muru_common::muru_eprintln!(
+                        "muructl instance list shows 1 instance on this machine"
+                    ),
+                    count => muru_common::muru_eprintln!(
+                        "muructl instance list shows {count} instances on this machine"
+                    ),
+                }
             }
+
+            shown
         }),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
         Command::Config { command } => match command {

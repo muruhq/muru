@@ -12,6 +12,7 @@ ones it names.
 | --- | --- | --- | --- |
 | `status` | reads | `muructl status` | none |
 | `processes` | reads | `muructl status --processes` | `app` (an application, or `app@release`), `all` |
+| `instances` | reads | `muructl instance list`, on this machine rather than the instance the server reaches | `orphans`, `label` |
 | `list` | reads | `muructl app list`, `release list`, `host list`, `route list`, `upstream list`, `rollout status` or `overlay list` | `what` (apps, releases, hosts, routes, upstreams, rollouts, overlays), `app` |
 | `release` | reads | `muructl release show` | `release` (app@release) |
 | `commands` | reads | `muructl command list` | `target` |

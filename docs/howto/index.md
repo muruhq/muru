@@ -43,6 +43,8 @@ Recipes for specific tasks, assuming you already know the basics. The
   daemon.
 - [Disk space](disk-space.md): clearing old releases, applications and
   caches.
+- [See what Muru is running on a machine](instances.md): the daemons,
+  development runs and serves on a machine, and what they left behind.
 
 ## Releases and traffic
 
@@ -151,6 +153,7 @@ containers
 kubernetes
 upgrading
 disk-space
+instances
 traffic
 rollouts
 overlays

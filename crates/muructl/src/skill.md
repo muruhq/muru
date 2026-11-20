@@ -135,5 +135,11 @@ directory and `deploy`'s settings, without the daemon.
   `docs` with `howto/commands` describes the table. Give a secret input
   in `secret_inputs` as `STORE/KEY`, never as a value.
 
+- `instances` lists every Muru instance on the machine, daemons and
+  development runs alike, with whether each is running, detached or
+  stale; with `orphans`, also the Muru processes nothing accounts for.
+  Check it before starting a run, and after stopping one, to see what
+  was left running.
+
 - Do not stop, upgrade or reconfigure the daemon unless asked: other
   applications may share it.

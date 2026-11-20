@@ -19,26 +19,39 @@ pub const ID_VARIABLE: &str = "MURU_INSTANCE_ID";
 /// The variable holding the instance's tag.
 pub const TAG_VARIABLE: &str = "MURU_INSTANCE";
 
-/// This process's instance, once set.
-static IDENTITY: OnceLock<(String, String)> = OnceLock::new();
+/// This process's instance, once set: its ID, its tag and its label.
+static IDENTITY: OnceLock<(String, String, Option<String>)> = OnceLock::new();
 
 /// Say which instance this process is, once, before it starts anything.
+/// The label is `MURU_INSTANCE_LABEL` from this process's environment,
+/// which its processes carry too, so what a test session leaves behind
+/// is known by its label after the instance has gone.
 pub fn set(id: crate::registry::InstanceId, tag: &str) {
-    let _ = IDENTITY.set((id.to_string(), tag.to_owned()));
+    let label = std::env::var(crate::registry::LABEL_VARIABLE)
+        .ok()
+        .filter(|label| !label.is_empty());
+    let _ = IDENTITY.set((id.to_string(), tag.to_owned(), label));
 }
 
 /// This process's instance tag, when it has one.
 pub fn tag() -> Option<&'static str> {
-    IDENTITY.get().map(|(_, tag)| tag.as_str())
+    IDENTITY.get().map(|(_, tag, _)| tag.as_str())
 }
 
 /// The variables every process this instance starts is given; none
 /// before [`set`].
 pub fn variables() -> Vec<(&'static str, String)> {
-    IDENTITY
-        .get()
-        .map(|(id, tag)| vec![(ID_VARIABLE, id.clone()), (TAG_VARIABLE, tag.clone())])
-        .unwrap_or_default()
+    let Some((id, tag, label)) = IDENTITY.get() else {
+        return Vec::new();
+    };
+
+    let mut variables = vec![(ID_VARIABLE, id.clone()), (TAG_VARIABLE, tag.clone())];
+
+    if let Some(label) = label {
+        variables.push((crate::registry::LABEL_VARIABLE, label.clone()));
+    }
+
+    variables
 }
 
 /// A daemon's or an edge's title: `muru ROLE SCOPE`, with the tag after it
