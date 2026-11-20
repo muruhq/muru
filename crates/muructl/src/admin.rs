@@ -741,6 +741,11 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         );
     }
 
+    // Issue 808: a listener the daemon would bind that another instance
+    // holds is refused before anything starts, naming that instance.
+
+    refuse_held_addresses(&args, &locations)?;
+
     std::fs::create_dir_all(&locations.logs.path)
         .with_context(|| format!("creating {}", locations.logs.path.display()))?;
     std::fs::create_dir_all(&locations.run.path)
@@ -836,6 +841,47 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         "the daemon did not answer within 30 seconds; see {}",
         locations.daemon_log().display()
     )
+}
+
+/// Refuse to start a daemon whose listeners, dashboard or metrics address
+/// a running instance of Muru's holds, naming it. The daemon itself reads
+/// its file again and reports anything else wrong with it.
+fn refuse_held_addresses(args: &DaemonRunArgs, locations: &Locations) -> anyhow::Result<()> {
+    let overrides = muru_controller::settings::Overrides {
+        listen: args.listen,
+        metrics: args.metrics,
+        dashboard: args.dashboard,
+        user: args.user.clone(),
+    };
+    let Ok(settings) = muru_controller::settings::NodeSettings::read(
+        &locations.config.path,
+        &locations.state.path.join("secrets"),
+        &overrides,
+    ) else {
+        return Ok(());
+    };
+
+    let addresses = settings
+        .listeners
+        .iter()
+        .map(|(address, _)| (*address, "listener"))
+        .chain(
+            settings
+                .dashboard
+                .map(|address| (address, "dashboard address")),
+        )
+        .chain(settings.metrics.map(|address| (address, "metrics address")));
+
+    for (address, what) in addresses {
+        if let Some(message) = muru_controller::registry::in_use_by_instance(
+            address,
+            &format!("choose another {what}"),
+        ) {
+            anyhow::bail!(message);
+        }
+    }
+
+    Ok(())
 }
 
 /// The lines a daemon wrote to its log from `offset` on, the last

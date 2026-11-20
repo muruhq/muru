@@ -60,6 +60,38 @@ are listed, though commands run outside the session never reach them.
 `muructl status` with nothing listening where it looked says how many
 instances the list shows.
 
+## Ports
+
+When Muru cannot bind a port because another instance of Muru's holds
+it, in `muructl run`, `muructl serve`, the daemon's listeners or a
+dashboard's address, it names the instance, and names another program
+only when no instance holds the port:
+
+```console
+$ muructl run --port 8000
+muru: error: port 8000 on 127.0.0.1 is in use by the development run of shop in ~/src/shop (pid 4123, dashboard http://127.0.0.1:8001/); choose another with --port, or stop it
+```
+
+`muructl daemon start` checks the addresses the daemon would bind before
+it starts anything, and refuses one a running instance holds.
+
+`--ports` lists one row for each port an instance uses, its listeners
+and its dashboard, and for each one it is configured with but has not
+bound. A configured address that would clash with another instance's,
+the same port on an overlapping address, a wildcard address overlapping
+every other, is marked:
+
+```console
+$ muructl instance list --ports
+PORT   ADDRESS     INSTANCE   KIND     USE         STATE
+8000   127.0.0.1   run:8000   run      http        bound
+8001   127.0.0.1   run:8000   run      dashboard   bound
+9000   127.0.0.1   dev        daemon   http        bound
+9000   127.0.0.1   staging    daemon   http        configured   clashes with dev
+```
+
+`--json` gives the same rows under `ports`.
+
 ## Processes left behind
 
 Every process of an instance names its instance, in its title and in

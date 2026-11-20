@@ -2103,6 +2103,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
             for (address, tls) in &settings.listeners {
                 let socket = std::net::TcpListener::bind(address)
+                    .map_err(|error| bind_refused(error, *address, "listener"))
                     .with_context(|| format!("cannot listen on {address}"))?;
                 listeners.push(crate::edges::Listener { socket, tls: *tls });
             }
@@ -2206,6 +2207,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         Some(address) => {
             let listener = tokio::net::TcpListener::bind(address)
                 .await
+                .map_err(|error| bind_refused(error, address, "metrics address"))
                 .with_context(|| format!("cannot listen for metrics on {address}"))?;
             Some(tokio::spawn(crate::metrics::serve(
                 listener,
@@ -2229,6 +2231,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         Some(address) => {
             let listener = tokio::net::TcpListener::bind(address)
                 .await
+                .map_err(|error| bind_refused(error, address, "dashboard address"))
                 .with_context(|| format!("cannot listen for the dashboard on {address}"))?;
             Some(tokio::spawn(crate::dashboard::serve(
                 listener,
@@ -2762,6 +2765,20 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
 
     outcome
+}
+
+/// A bind the daemon was refused, as an error: with the instance of
+/// Muru's that holds the address named when one does (issue 808), as
+/// the error's own message under the context the caller adds.
+fn bind_refused(error: std::io::Error, address: SocketAddr, what: &str) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::AddrInUse
+        && let Some(message) =
+            crate::registry::in_use_by_instance(address, &format!("choose another {what}"))
+    {
+        return anyhow::anyhow!(message);
+    }
+
+    anyhow::Error::from(error)
 }
 
 /// The file in the state directory that keeps a daemon's instance ID.

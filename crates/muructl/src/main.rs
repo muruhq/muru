@@ -947,6 +947,16 @@ fn explain_bind_error(error: anyhow::Error, https: SocketAddr) -> anyhow::Error 
         "--port"
     };
 
+    // Section 13.8: another instance of Muru's is named as an instance,
+    // and only another program by what lsof or ss say of it.
+
+    if let Some(message) = muru_controller::registry::in_use_by_instance(
+        address,
+        &format!("choose another with {flag}"),
+    ) {
+        return anyhow::anyhow!(message);
+    }
+
     match port_holder(port) {
         Some(holder) => anyhow::anyhow!(
             "port {port} on {} is in use by {holder}; choose another with {flag}, or stop it",
@@ -973,12 +983,24 @@ fn explain_dashboard_error(error: anyhow::Error, address: &str) -> anyhow::Error
         return error.context(format!("the dashboard cannot be served on {address}"));
     }
 
-    let holder = address
-        .parse::<SocketAddr>()
-        .ok()
-        .and_then(|bound| port_holder(bound.port()));
+    let parsed = address.parse::<SocketAddr>().ok();
     let instead = "choose another address with --dashboard ADDRESS, or turn it off with \
                    --dashboard off";
+
+    if let Some(holder) = parsed.and_then(|bound| {
+        muru_controller::registry::holder_of(
+            &muru_controller::registry::readable_registries(),
+            bound,
+        )
+    }) {
+        return anyhow::anyhow!(
+            "the dashboard's address {address} is in use by {}; {instead}, or {}",
+            holder.describe(),
+            holder.stop_hint()
+        );
+    }
+
+    let holder = parsed.and_then(|bound| port_holder(bound.port()));
 
     match holder {
         Some(holder) => anyhow::anyhow!(

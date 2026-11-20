@@ -138,3 +138,79 @@ def test_the_list_shows_each_instance_its_state_and_what_is_left_behind(
     # A daemon shut down and a run stopped leave no entries.
 
     assert listed(label)["instances"] == []
+
+
+def test_a_port_another_instance_holds_names_that_instance(tmp_path: Path) -> None:
+    # Issue 808: a bind refused because an instance of Muru's holds the
+    # port says which instance, and the ports list shows what each uses.
+
+    label = f"test-{uuid.uuid4().hex[:8]}"
+    run = support.start(
+        "plain_wsgi:application", workers=1, threads=1, env={"MURU_INSTANCE_LABEL": label}
+    )
+    muructl_path = support.muructl_path()
+    assert muructl_path is not None
+
+    try:
+        second = subprocess.run(
+            [
+                str(muructl_path),
+                "run",
+                "plain_wsgi:application",
+                "--port",
+                str(run.port),
+                "--dashboard",
+                "off",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=support.FIXTURES,
+            check=False,
+        )
+        assert second.returncode != 0
+        assert (
+            f"port {run.port} on 127.0.0.1 is in use by the development run of plain-wsgi in "
+            in second.stderr
+        ), second.stderr
+        assert "choose another with --port, or stop it" in second.stderr
+
+        # A daemon is refused before it starts anything.
+
+        base = tmp_path / "daemon"
+        refused = subprocess.run(
+            [
+                str(muructl_path),
+                "daemon",
+                "start",
+                "--listen",
+                f"127.0.0.1:{run.port}",
+                "--config",
+                str(base / "muru.toml"),
+                "--state-dir",
+                str(base / "state"),
+                "--run-dir",
+                str(support.short_dir("muru-run-")),
+                "--log-dir",
+                str(base / "logs"),
+                "--cache-dir",
+                str(base / "cache"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert refused.returncode != 0
+        assert "in use by the development run of plain-wsgi" in refused.stderr, refused.stderr
+        assert "choose another listener, or stop it" in refused.stderr
+        assert not (base / "state").exists()
+
+        ports = json.loads(
+            muructl("instance", "list", "--ports", "--json", "--label", label).stdout
+        )["ports"]
+        assert [(p["port"], p["use"], p["state"]) for p in ports][:1] == [
+            (run.port, "http", "bound")
+        ], ports
+    finally:
+        run.stop()

@@ -68,6 +68,11 @@ pub struct ListArgs {
     #[arg(long)]
     pub all_users: bool,
 
+    /// One row per port the instances use or are configured to use, with
+    /// the clashes between them.
+    #[arg(long, conflicts_with = "orphans")]
+    pub ports: bool,
+
     /// Print one JSON document: the instances, each record with its
     /// state and location, and with --orphans the orphans.
     #[arg(long)]
@@ -346,6 +351,136 @@ pub async fn orphans(rows: &[Row], processes: &[MuruProcess]) -> Vec<Orphan> {
     found
 }
 
+/// One port an instance uses or is configured to use.
+#[derive(Debug, Clone, Serialize)]
+pub struct Port {
+    /// The port.
+    pub port: u16,
+    /// The address it is on.
+    pub address: String,
+    /// The instance, by its tag.
+    pub instance: String,
+    /// The instance's kind.
+    pub kind: String,
+    /// What it is for: `http`, `https` or `dashboard`.
+    pub r#use: String,
+    /// `bound`, or `configured` when the instance has not bound it.
+    pub state: String,
+    /// The instance it would clash with, for a configured port.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clashes_with: Option<String>,
+}
+
+/// The ports of the instances that run or were left running, and the
+/// configured ones of those that have not bound them, each configured
+/// one with the instance it would clash with.
+pub fn ports(rows: &[Row]) -> Vec<Port> {
+    let mut found: Vec<(Port, String)> = Vec::new();
+
+    for row in rows.iter().filter(|row| row.alive()) {
+        let mut addresses: Vec<(String, String, bool)> = row
+            .record
+            .listeners
+            .iter()
+            .map(|listener| match &listener.bound {
+                Some(bound) => (bound.clone(), listener.name.clone(), true),
+                None => (listener.configured.clone(), listener.name.clone(), false),
+            })
+            .collect();
+
+        if let Some(dashboard) = row
+            .record
+            .dashboard
+            .as_deref()
+            .and_then(|url| url.strip_prefix("http://"))
+        {
+            addresses.push((
+                dashboard.trim_end_matches('/').to_owned(),
+                "dashboard".to_owned(),
+                true,
+            ));
+        }
+
+        for (address, what, bound) in addresses {
+            let Some((host, port)) = address.rsplit_once(':') else {
+                continue;
+            };
+            let Ok(port) = port.parse::<u16>() else {
+                continue;
+            };
+
+            found.push((
+                Port {
+                    port,
+                    address: host
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .to_owned(),
+                    instance: row.tag(),
+                    kind: row.record.kind.word().to_owned(),
+                    r#use: what,
+                    state: if bound { "bound" } else { "configured" }.to_owned(),
+                    clashes_with: None,
+                },
+                address,
+            ));
+        }
+    }
+
+    // A configured port clashes with another instance's bound or
+    // configured one on the same port and an overlapping address.
+
+    let snapshot = found.clone();
+
+    for (port, address) in &mut found {
+        if port.state != "configured" {
+            continue;
+        }
+
+        port.clashes_with = snapshot
+            .iter()
+            .find(|(other, other_address)| {
+                other.instance != port.instance && registry::clashes(address, other_address)
+            })
+            .map(|(other, _)| other.instance.clone());
+    }
+
+    let mut ports: Vec<Port> = found.into_iter().map(|(port, _)| port).collect();
+    ports.sort_by(|a, b| (a.port, &a.address, &a.instance).cmp(&(b.port, &b.address, &b.instance)));
+    ports
+}
+
+/// The ports table.
+fn print_ports(ports: &[Port]) {
+    if ports.is_empty() {
+        println!("muru: no instance uses a port");
+        return;
+    }
+
+    let mut table = vec![
+        ["PORT", "ADDRESS", "INSTANCE", "KIND", "USE", "STATE", ""]
+            .map(str::to_owned)
+            .to_vec(),
+    ];
+
+    for port in ports {
+        table.push(vec![
+            port.port.to_string(),
+            port.address.clone(),
+            port.instance.clone(),
+            port.kind.clone(),
+            port.r#use.clone(),
+            port.state.clone(),
+            port.clashes_with
+                .as_deref()
+                .map(|other| format!("clashes with {other}"))
+                .unwrap_or_default(),
+        ]);
+    }
+
+    print_table(&table);
+}
+
 /// A row as `--json` prints it: the record with its state and location.
 fn row_json(row: &Row) -> serde_json::Value {
     let mut value = serde_json::to_value(&row.record).unwrap_or_default();
@@ -361,16 +496,7 @@ fn row_json(row: &Row) -> serde_json::Value {
 
 /// A path with the home directory shortened to `~`.
 pub fn shortened(path: &Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-
-    match home
-        .as_deref()
-        .and_then(|home| path.strip_prefix(home).ok())
-    {
-        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        Some(rest) => format!("~/{}", rest.display()),
-        None => path.display().to_string(),
-    }
+    registry::home_shortened(path)
 }
 
 /// How long ago `unix_ms` was, as the table shows it: `3d 2h`, `2h 4m`,
@@ -498,6 +624,21 @@ pub async fn list(args: ListArgs) -> anyhow::Result<i32> {
     };
 
     let rows = kept(all, &args);
+
+    if args.ports {
+        let ports = ports(&rows);
+
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "ports": ports }))?
+            );
+        } else {
+            print_ports(&ports);
+        }
+
+        return Ok(0);
+    }
 
     if args.json {
         let mut answer = serde_json::json!({
@@ -655,6 +796,50 @@ mod tests {
             "127.0.0.1:9100 (configured)"
         );
         assert_eq!(listen_column(&[]), "-");
+    }
+
+    #[test]
+    fn a_configured_port_clashes_with_another_instances_bound_one() {
+        let row = |name: &str, configured: &str, bound: Option<&str>| {
+            let mut record = Record::new(
+                registry::InstanceId::generate(),
+                Kind::Daemon,
+                muru_controller::client::Endpoint::unix("/tmp/admin.sock"),
+                PathBuf::from("/tmp/run"),
+            );
+            record.name = Some(name.to_owned());
+            record.listeners = vec![listener(configured, bound, false)];
+            Row {
+                record,
+                state: State::Running,
+            }
+        };
+
+        let listed = ports(&[
+            row("dev", "127.0.0.1:9000", Some("127.0.0.1:9000")),
+            row("staging", "0.0.0.0:9000", None),
+            row("other", "127.0.0.1:9100", None),
+        ]);
+        let shown: Vec<(u16, &str, &str, Option<&str>)> = listed
+            .iter()
+            .map(|port| {
+                (
+                    port.port,
+                    port.instance.as_str(),
+                    port.state.as_str(),
+                    port.clashes_with.as_deref(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            shown,
+            [
+                (9000, "staging", "configured", Some("dev")),
+                (9000, "dev", "bound", None),
+                (9100, "other", "configured", None),
+            ]
+        );
     }
 
     #[test]

@@ -327,6 +327,170 @@ impl Record {
     }
 }
 
+/// A live instance that holds an address, as a bind that failed names
+/// it (section 13.8, issue 808).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Holder {
+    /// The instance's record.
+    pub record: Record,
+    /// What of it holds the address: `http`, `https` or `dashboard`.
+    pub what: String,
+}
+
+impl Holder {
+    /// The instance, as a sentence names it: `the development run of shop
+    /// in ~/src/shop (pid 4123, dashboard http://127.0.0.1:8001/)`, or
+    /// `daemon instance dev (pid 5120)`.
+    pub fn describe(&self) -> String {
+        let record = &self.record;
+        let pid = record.pid;
+
+        match record.kind {
+            Kind::Run => {
+                let project = record
+                    .project
+                    .as_deref()
+                    .map(|project| format!(" in {}", home_shortened(project)))
+                    .unwrap_or_default();
+                let dashboard = record
+                    .dashboard
+                    .as_deref()
+                    .map(|dashboard| format!(", dashboard {dashboard}"))
+                    .unwrap_or_default();
+                format!(
+                    "the development run of {}{project} (pid {pid}{dashboard})",
+                    record.app.as_deref().unwrap_or("an application")
+                )
+            }
+            Kind::Serve => format!(
+                "muructl serve of {} (pid {pid})",
+                record.app.as_deref().unwrap_or("an application")
+            ),
+            Kind::Daemon => match &record.name {
+                Some(name) => format!("daemon instance {name} (pid {pid})"),
+                None => format!(
+                    "the daemon with the state directory {} (pid {pid})",
+                    record
+                        .state_dir
+                        .as_deref()
+                        .map_or_else(|| record.run_dir.display().to_string(), home_shortened)
+                ),
+            },
+        }
+    }
+
+    /// How to stop it: `stop it`, or for a daemon the command that does.
+    pub fn stop_hint(&self) -> String {
+        match (self.record.kind, self.record.name.as_deref()) {
+            (Kind::Daemon, Some("user" | "system")) => {
+                "stop it with muructl daemon stop".to_owned()
+            }
+            (Kind::Daemon, Some(name)) => {
+                format!("stop it with muructl daemon stop --instance {name}")
+            }
+            (Kind::Daemon, None) => format!(
+                "stop it with muructl daemon stop --socket {}",
+                self.record.admin
+            ),
+            _ => "stop it".to_owned(),
+        }
+    }
+}
+
+/// Whether two addresses as written, `HOST:PORT`, would clash: the same
+/// port on addresses that overlap, a wildcard overlapping every address
+/// of its family.
+pub fn clashes(one: &str, other: &str) -> bool {
+    let (Ok(one), Ok(other)) = (
+        one.parse::<std::net::SocketAddr>(),
+        other.parse::<std::net::SocketAddr>(),
+    ) else {
+        return false;
+    };
+
+    one.port() != 0
+        && one.port() == other.port()
+        && (one.ip() == other.ip()
+            || (one.is_ipv4() == other.is_ipv4()
+                && (one.ip().is_unspecified() || other.ip().is_unspecified())))
+}
+
+/// The live instance in `registries` that holds `address`, by a bound
+/// listener or its dashboard, other than this process.
+pub fn holder_of(registries: &[PathBuf], address: std::net::SocketAddr) -> Option<Holder> {
+    let wanted = address.to_string();
+    let me = std::process::id();
+
+    registries
+        .iter()
+        .flat_map(|registry| live(registry))
+        .filter(|record| record.pid != me)
+        .find_map(|record| {
+            let listener = record
+                .listeners
+                .iter()
+                .find(|listener| {
+                    listener
+                        .bound
+                        .as_deref()
+                        .is_some_and(|bound| clashes(bound, &wanted))
+                })
+                .map(|listener| listener.name.clone());
+
+            let dashboard = record
+                .dashboard
+                .as_deref()
+                .and_then(|url| url.strip_prefix("http://"))
+                .map(|rest| rest.trim_end_matches('/'))
+                .filter(|bound| clashes(bound, &wanted))
+                .map(|_| "dashboard".to_owned());
+
+            listener.or(dashboard).map(|what| Holder { record, what })
+        })
+}
+
+/// What to say of a bind refused because `address` is in use, when a
+/// live instance holds it: `port 8000 on 127.0.0.1 is in use by the
+/// development run of shop in ~/src/shop (pid 4123); CHOOSE, or stop it`.
+pub fn in_use_by_instance(address: std::net::SocketAddr, choose: &str) -> Option<String> {
+    let holder = holder_of(&readable_registries(), address)?;
+
+    Some(format!(
+        "port {} on {} is in use by {}; {choose}, or {}",
+        address.port(),
+        address.ip(),
+        holder.describe(),
+        holder.stop_hint()
+    ))
+}
+
+/// The registries every user may hold an address in that the caller can
+/// read: its own and the system daemon's.
+pub fn readable_registries() -> Vec<PathBuf> {
+    let mut found = vec![user_registry()];
+    let system = PathBuf::from(SYSTEM_REGISTRY);
+
+    if !found.contains(&system) {
+        found.push(system);
+    }
+
+    found
+}
+
+/// `path` with the home directory shortened to `~`.
+pub fn home_shortened(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 /// Make the registry directory, private to its user, or readable by
 /// every user for the system registry.
 fn prepare(registry: &Path) -> std::io::Result<()> {
@@ -769,6 +933,54 @@ mod tests {
 
         assert!(remove_stale(&registry, id).expect("pruned"));
         assert!(read(&registry).is_empty());
+    }
+
+    #[test]
+    fn a_bound_address_names_the_instance_holding_it() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let registry = directory.path().join("registry");
+        let mut run = record(Kind::Run, 18_000);
+        run.pid = std::process::id() + 1;
+        run.app = Some("shop".to_owned());
+        run.project = Some(PathBuf::from("/srv/shop"));
+        run.dashboard = Some("http://127.0.0.1:18001/".to_owned());
+        let _entry = Entry::publish(&registry, run).expect("published");
+        let registries = [registry];
+
+        let holder = holder_of(&registries, "127.0.0.1:18000".parse().expect("address"))
+            .expect("held by the run");
+        assert_eq!(holder.what, "http");
+        assert!(
+            holder
+                .describe()
+                .starts_with("the development run of shop in /srv/shop (pid "),
+            "{}",
+            holder.describe()
+        );
+        assert!(
+            holder
+                .describe()
+                .ends_with(", dashboard http://127.0.0.1:18001/)")
+        );
+        assert_eq!(holder.stop_hint(), "stop it");
+
+        let dashboard = holder_of(&registries, "0.0.0.0:18001".parse().expect("address"));
+        assert_eq!(
+            dashboard.map(|holder| holder.what).as_deref(),
+            Some("dashboard")
+        );
+        assert!(holder_of(&registries, "127.0.0.1:18002".parse().expect("address")).is_none());
+    }
+
+    #[test]
+    fn addresses_clash_on_one_port_when_they_overlap() {
+        assert!(clashes("127.0.0.1:9000", "127.0.0.1:9000"));
+        assert!(clashes("0.0.0.0:9000", "127.0.0.1:9000"));
+        assert!(clashes("127.0.0.1:9000", "0.0.0.0:9000"));
+        assert!(!clashes("127.0.0.1:9000", "127.0.0.2:9000"));
+        assert!(!clashes("127.0.0.1:9000", "127.0.0.1:9001"));
+        assert!(!clashes("[::]:9000", "127.0.0.1:9000"));
+        assert!(!clashes("127.0.0.1:0", "127.0.0.1:0"));
     }
 
     #[test]
