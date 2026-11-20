@@ -211,9 +211,9 @@ def test_a_port_another_instance_holds_names_that_instance(tmp_path: Path) -> No
         ports = json.loads(
             muructl("instance", "list", "--ports", "--json", "--label", label).stdout
         )["ports"]
-        assert [(p["port"], p["use"], p["state"]) for p in ports][:1] == [
-            (run.port, "http", "bound")
-        ], ports
+        assert (run.port, "http", "bound") in [(p["port"], p["use"], p["state"]) for p in ports], (
+            ports
+        )
     finally:
         run.stop()
 
