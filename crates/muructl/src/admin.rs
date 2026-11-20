@@ -30,14 +30,55 @@ pub struct InstanceArgs {
     /// whoever runs the command.
     #[arg(long, global = true)]
     system: bool,
+
+    /// A named instance, whose locations all follow from its name (default:
+    /// MURU_INSTANCE); user and system name the default daemons.
+    #[arg(long, global = true, value_name = "NAME", value_parser = parse_instance_name)]
+    instance: Option<String>,
+}
+
+/// Check an instance's name as --instance takes it: a named instance's,
+/// or `user` or `system`.
+fn parse_instance_name(text: &str) -> Result<String, String> {
+    muru_controller::locations::check_name(text)?;
+    Ok(text.to_owned())
+}
+
+/// The variable that names the instance a command reaches.
+pub const INSTANCE_VARIABLE: &str = muru_controller::instance::TAG_VARIABLE;
+
+/// The instance `MURU_INSTANCE` names, when it names one by its name. The
+/// same variable carries the tag of the instance a process belongs to,
+/// which for a development run or a serve, or a daemon kept apart by its
+/// own --state-dir, is not a name: a value that is the short form of
+/// `MURU_INSTANCE_ID` beside it, or not a name at all, names nothing.
+pub fn instance_from_environment() -> Option<String> {
+    let value = std::env::var(INSTANCE_VARIABLE).ok()?;
+    let value = value.trim();
+    let id = std::env::var(muru_controller::instance::ID_VARIABLE).unwrap_or_default();
+
+    if value.is_empty()
+        || muru_controller::locations::check_name(value).is_err()
+        || (!id.is_empty() && id.starts_with(value))
+    {
+        return None;
+    }
+
+    Some(value.to_owned())
 }
 
 impl InstanceArgs {
+    /// The named instance the options or the environment give.
+    pub fn instance(&self) -> Option<String> {
+        self.instance.clone().or_else(instance_from_environment)
+    }
+
     /// Resolve the locations for these options and the environment.
     pub fn resolve(&self) -> Locations {
         Locations::resolve(&Options {
             run_dir: self.run_dir.clone(),
             system: self.system,
+            instance: self.instance(),
             ..Options::default()
         })
     }
@@ -45,6 +86,11 @@ impl InstanceArgs {
     /// The same options, for a muructl command run on this one's behalf.
     pub fn as_arguments(&self) -> Vec<String> {
         let mut arguments = Vec::new();
+
+        if let Some(name) = &self.instance {
+            arguments.push("--instance".to_owned());
+            arguments.push(name.clone());
+        }
 
         if let Some(path) = &self.run_dir {
             arguments.push("--run-dir".to_owned());
@@ -141,6 +187,22 @@ impl LocationArgs {
     /// configuration and say nothing.
     pub fn resolve(&self) -> anyhow::Result<Locations> {
         muru_controller::locations::check_renamed().map_err(anyhow::Error::msg)?;
+        let instance = self.instance.instance();
+
+        // A name with every location given by a flag would decide nothing.
+
+        if self.instance.instance.is_some()
+            && self.files.config.is_some()
+            && self.files.state_dir.is_some()
+            && self.instance.run_dir.is_some()
+            && self.files.log_dir.is_some()
+        {
+            anyhow::bail!(
+                "--instance decides the configuration file and the state, run and log \
+                 directories, and every one is given by a flag; leave out --instance or one of \
+                 the flags"
+            );
+        }
 
         Ok(Locations::resolve(&Options {
             config: self.files.config.clone(),
@@ -149,6 +211,7 @@ impl LocationArgs {
             log_dir: self.files.log_dir.clone(),
             cache_dir: self.files.cache_dir.clone(),
             system: self.instance.system,
+            instance,
         }))
     }
 
@@ -208,6 +271,7 @@ impl SocketArgs {
             system: self.locations.system,
             log_dir: files.log_dir.clone(),
             state_dir: files.state_dir.clone(),
+            instance: self.locations.instance(),
             ..Options::default()
         })
         .daemon_log()
@@ -283,6 +347,12 @@ impl SocketArgs {
     pub fn socket(&self) -> anyhow::Result<PathBuf> {
         if let Some(socket) = &self.socket {
             return Ok(socket.clone());
+        }
+
+        // A named instance's socket is where its name puts it.
+
+        if self.locations.instance().is_some() {
+            return Ok(self.locations.resolve().admin_socket());
         }
 
         // Section 13.9: inside a container, the serve that runs there.
@@ -618,6 +688,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     locations
         .check_run_dir()
         .map_err(|error| anyhow::anyhow!(error))?;
+    check_defined(&locations)?;
 
     // Issue 804: the daemon owns its state and run directories before it
     // does anything else, so a second daemon on either is refused before
@@ -718,6 +789,7 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
     locations
         .check_run_dir()
         .map_err(|error| anyhow::anyhow!(error))?;
+    check_defined(&locations)?;
     let socket = locations.admin_socket();
 
     // A daemon answering on this socket is this one when it uses the same
@@ -843,6 +915,24 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
     )
 }
 
+/// Refuse to start a named instance with no configuration file, naming
+/// the command that defines it; the default daemon starts without one.
+fn check_defined(locations: &Locations) -> anyhow::Result<()> {
+    let Some(name) = &locations.instance else {
+        return Ok(());
+    };
+
+    if !locations.config.path.is_file() {
+        anyhow::bail!(
+            "instance {name} has no configuration file at {}; define it with muructl instance \
+             create {name}",
+            locations.config.path.display()
+        );
+    }
+
+    Ok(())
+}
+
 /// Refuse to start a daemon whose listeners, dashboard or metrics address
 /// a running instance of Muru's holds, naming it. The daemon itself reads
 /// its file again and reports anything else wrong with it.
@@ -872,12 +962,26 @@ fn refuse_held_addresses(args: &DaemonRunArgs, locations: &Locations) -> anyhow:
         )
         .chain(settings.metrics.map(|address| (address, "metrics address")));
 
-    for (address, what) in addresses {
+    let addresses: Vec<(SocketAddr, &str)> = addresses.collect();
+
+    for (address, what) in &addresses {
         if let Some(message) = muru_controller::registry::in_use_by_instance(
-            address,
+            *address,
             &format!("choose another {what}"),
         ) {
             anyhow::bail!(message);
+        }
+    }
+
+    // A clash with a named instance that is not running is only said.
+
+    for (name, configured) in crate::instances::configured_elsewhere(locations) {
+        if let Some((address, _)) = addresses.iter().find(|(address, _)| {
+            muru_controller::registry::clashes(configured.as_str(), &address.to_string())
+        }) {
+            muru_common::muru_eprintln!(
+                "warning: {address} is also configured for instance {name}, which is not running"
+            );
         }
     }
 
@@ -3520,7 +3624,16 @@ pub async fn show_status(endpoint: &client::Endpoint, json: bool) -> anyhow::Res
         return Ok(());
     }
 
-    println!("daemon   pid {} version {}", status.pid, status.version);
+    match status.name.as_str() {
+        "" | "user" | "system" => {
+            println!("daemon   pid {} version {}", status.pid, status.version);
+        }
+        name => println!(
+            "daemon   pid {} version {}, instance {name}",
+            status.pid, status.version
+        ),
+    }
+
     println!("edge     pid {}", status.edge_pid);
     println!("serving  {}", status.listeners.join(", "));
 
@@ -9577,6 +9690,7 @@ pub(crate) fn daemon_locations(socket: &SocketArgs, files: &DaemonFileArgs) -> L
         log_dir: files.log_dir.clone(),
         cache_dir: files.cache_dir.clone(),
         system: socket.locations.system,
+        instance: socket.locations.instance(),
     })
 }
 

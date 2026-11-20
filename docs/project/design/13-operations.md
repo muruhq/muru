@@ -108,6 +108,36 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 ```
 
+**Named instances under systemd (issue 810).** A template unit, `muru@.service`, runs a named instance (section 13.8) as a system or user unit, the name being `%i`:
+
+```
+[Unit]
+Description=Muru instance %i
+After=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/muructl daemon run --instance %i
+ExecReload=/usr/bin/muructl daemon reload --instance %i
+ExecStop=/usr/bin/muructl daemon stop --instance %i --shutdown --timeout 60s
+TimeoutStopSec=90
+ConfigurationDirectory=muru/instances/%i
+StateDirectory=muru/instances/%i
+CacheDirectory=muru
+LogsDirectory=muru/instances/%i
+RuntimeDirectory=muru/instances/%i
+RuntimeDirectoryPreserve=yes
+KillMode=process
+OOMPolicy=continue
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The directory settings name the instance's own locations, so systemd creates them with the right ownership and they agree with what the name gives; `systemctl enable --now muru@dev` starts instance `dev`, whose definition `muructl instance create --system dev` wrote.
+
 **Limits and the OOM killer (issue 624).** Muru sizes nothing from a machine's total memory, since on a shared machine that says nothing of its share; limits come from a cgroup the operator sets, as a container's come from the platform. The unit carries `MemoryMax=` and `CPUQuota=` commented out, for a drop-in (`systemctl edit muru`): with them the node budget's defaults (section 7.4) and the memory guard (section 7.7) work from the unit's cgroup, read when used, so `systemctl set-property` applies without a restart. `OOMPolicy=continue` is set because systemd's default, `stop`, stops the whole unit when the kernel OOM-kills any of its processes: checked on systemd 255 with `MemoryMax=300M` and a worker allocating 400MB, the default ran `ExecStop`, drained and stopped every release and restarted the daemon (`Failed with result 'oom-kill'`), where `continue` left the unit running while the host replaced the worker and reported `worker.oom_killed` (recorded in issue 624). systemd-oomd kills a whole cgroup, so the unit sets no `ManagedOOM*=` and the guide says to leave them unset.
 
 The unit runs the daemon as root, and the daemon keeps root for itself alone: the edge and the applications that name no user run as the service user (ADR 0026), `muru` unless `--user` or the `[daemon]` table names another, which the packages create through sysusers.d and a hand installation creates before the first start; the daemon refuses to start without it. The directory settings let systemd create and own the locations (section 13.8), which the daemon reads from the environment, so no paths are hard-coded. KillMode=process keeps hosts, managed server instances and their log relays running if systemd restarts the daemon, so they can be re-adopted, and RuntimeDirectoryPreserve=yes keeps their sockets in place across that restart. The daemon notifies readiness with sd_notify. Without systemd, muructl daemon start, stop, restart and status manage a background daemon. muructl daemon start waits up to 30 seconds for the admin socket to answer and watches the process it started meanwhile, so a daemon that exits first is reported at once, with its exit status and the last lines it wrote to daemon.log.
@@ -182,6 +212,23 @@ Muru has no fixed paths. Each location is resolved at start-up from the first of
 | Cache | re-creatable files: development certificates, and in development the runtime library directories per interpreter tag (runtime/TAG) | /var/cache/muru | ~/.cache/muru | ~/Library/Caches/muru | the user cache location |
 
 A running daemon holds a lock on `daemon.lock` in its state and run directories (section 13.3), so no second daemon shares either.
+
+**Named instances (issue 810, ADR 0070).** A user, or root, can run more than one daemon, each a named instance whose locations all follow from its name, so `muructl daemon start --instance dev` and `muructl daemon stop --instance dev` need nothing else. `--instance NAME`, or `MURU_INSTANCE`, on the daemon's own commands (the `muructl daemon` commands, `muructl up`, `muructl mcp serve --up`, `muructl secret`, and the `muructl logs` commands on files) puts every location under `instances/NAME` in its area:
+
+| Location | User mode, Linux | User mode, macOS | System mode |
+| --- | --- | --- | --- |
+| Config | `~/.config/muru/instances/NAME/muru.toml` | `~/Library/Application Support/muru/instances/NAME/muru.toml` | `/etc/muru/instances/NAME/muru.toml` |
+| State | `~/.local/state/muru/instances/NAME` | `~/Library/Application Support/muru/instances/NAME/state` | `/var/lib/muru/instances/NAME` |
+| Runtime | `$XDG_RUNTIME_DIR/muru/instances/NAME` | `/tmp/muru-UID/instances/NAME` | `/run/muru/instances/NAME` |
+| Logs | `~/.local/state/muru/logs/instances/NAME` | `~/Library/Logs/muru/instances/NAME` | `/var/log/muru/instances/NAME` |
+| Cache | `~/.cache/muru` (shared) | `~/Library/Caches/muru` (shared) | `/var/cache/muru` (shared) |
+
+On macOS a named instance's state needs a `state` subdirectory, because the default config and state locations are the same directory. The cache stays shared, since everything in it can be re-created. An explicit location flag or variable still overrides one location, and the configuration file, state, run and log directories all given by flags together with `--instance` is an error, since nothing would be left for the name to decide. `MURU_INSTANCE` also carries the tag of the instance a process belongs to (section 2.1), so a value that is not a name, or is the short form of the `MURU_INSTANCE_ID` beside it, names no instance.
+
+- *The definition.* A named instance is defined by its directory in the configuration area, `CONFIG/instances/NAME/`, holding `instance.toml`, which says what the definition is (`kind = "daemon"`, and a `description` of its own; Muru owns it and `muructl instance create` writes it), and `muru.toml`, the daemon's configuration exactly as any daemon's. A directory without an `instance.toml` is not a definition and is ignored, with a warning from `instance list`, as is one with a kind this version does not know. The `kind` key is there so that an instance on another machine can later be defined as `kind = "remote"` in the same place; local and remote instances share one namespace of names. Definitions never hold secrets.
+- *Names.* 1 to 24 characters of `[a-z0-9-]`, starting with a letter, so a name fits in titles and keeps socket paths within 104 bytes on macOS. `user` and `system` are reserved and name the default daemons: `--instance user` is the default daemon, `--instance system` the system one.
+- *Defining, starting and removing.* `muructl instance create NAME --listen ADDR [--listen ADDR ...] [--dashboard ADDR] [--description TEXT] [--system]` writes the definition and a configuration file with those listeners, refusing a name that exists and an address that clashes with another defined instance's configured one or a running instance's bound one (section 13.8, ports); at least one `--listen` is required, since the default daemon's `127.0.0.1:8080` would clash. `muructl daemon start --instance NAME` or `daemon run --instance NAME` for a name with no configuration file refuses and names `muructl instance create`. `muructl instance remove NAME` removes the definition's two files, and with `--state` its state, run and log directories too, after asking (`--yes`, refused without a terminal), and refuses while the instance is running or detached; on macOS, where the state is inside the definition's directory, it is kept unless `--state`. `muructl instance list` shows defined instances with no entry as `stopped`, with their configured listeners, and `--ports` their configured addresses; `muructl daemon start` warns of a clash with a stopped instance's configuration.
+- *Identity.* The daemon's title is `muru daemon NAME`, its edge's `muru edge NAME`, its registry entry has `name` set, its tag is the name, and `muructl daemon status` names the instance at the end of its first line, `daemon   pid 4242 version 1.0.0, instance dev`; GetStatus carries it as `name`.
 
 Linux user-mode defaults follow the XDG base directory conventions (XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_RUNTIME_DIR and XDG_CACHE_HOME are honoured when set). Paths elsewhere in this specification that sit under these locations are relative to them, for example STATE/pycache or RUNTIME/admin.sock.
 

@@ -8,6 +8,7 @@
 pub mod api;
 pub mod budget;
 pub mod cache;
+pub mod catalogue;
 pub mod cgroup;
 pub mod client;
 pub mod clients;

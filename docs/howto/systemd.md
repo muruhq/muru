@@ -55,6 +55,54 @@ $ sudo systemctl enable --now muru
 $ muructl --system status
 ```
 
+## Several instances
+
+A named instance (see [running more than one
+daemon](named-instances.md)) runs under the template unit at
+`packaging/systemd/muru@.service`, as `muru@NAME`:
+
+```
+[Unit]
+Description=Muru instance %i
+After=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/muructl daemon run --instance %i
+ExecReload=/usr/bin/muructl daemon reload --instance %i
+ExecStop=/usr/bin/muructl daemon stop --instance %i --shutdown --timeout 60s
+TimeoutStopSec=90
+ConfigurationDirectory=muru/instances/%i
+StateDirectory=muru/instances/%i
+CacheDirectory=muru
+LogsDirectory=muru/instances/%i
+RuntimeDirectory=muru/instances/%i
+RuntimeDirectoryPreserve=yes
+KillMode=process
+OOMPolicy=continue
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Define the instance in the system area, install the template once, and
+start each instance by its name:
+
+```
+$ sudo muructl instance create --system dev --listen 0.0.0.0:9000
+$ sudo cp packaging/systemd/muru@.service /etc/systemd/system/
+$ sudo systemctl daemon-reload
+$ sudo systemctl enable --now muru@dev
+$ muructl --system status --instance dev
+```
+
+The directory settings name the instance's own locations, so systemd
+creates them with the right ownership. As a user unit, in
+`~/.config/systemd/user/`, the same file runs your own instances with
+`systemctl --user enable --now muru@dev`.
+
 ## What the unit does
 
 The directory settings make systemd create `/etc/muru`, `/var/lib/muru`,

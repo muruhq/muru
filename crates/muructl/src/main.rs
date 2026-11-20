@@ -1215,6 +1215,8 @@ fn main() -> anyhow::Result<()> {
         Command::Instance { command } => match command {
             instances::InstanceCommand::List(args) => exit_with(runtime, instances::list(args)),
             instances::InstanceCommand::Prune(args) => runtime.block_on(instances::prune(args)),
+            instances::InstanceCommand::Create(args) => instances::create(args),
+            instances::InstanceCommand::Remove(args) => instances::remove_instance(args),
         },
         Command::Cache { command } => runtime.block_on(async move {
             match command {

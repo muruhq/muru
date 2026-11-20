@@ -78,6 +78,17 @@ impl InstanceId {
         Self(bytes)
     }
 
+    /// The ID of an instance that has none yet, as a named instance that
+    /// has never run.
+    pub fn nil() -> Self {
+        Self([0; 16])
+    }
+
+    /// The ID kept in `path`, when the file holds one.
+    pub fn read_from(path: &Path) -> Option<Self> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
     /// The first 8 hex digits, as titles and listings show it.
     pub fn short(&self) -> String {
         self.to_string()[..8].to_owned()

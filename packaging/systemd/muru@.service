@@ -1,0 +1,23 @@
+[Unit]
+Description=Muru instance %i
+After=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/muructl daemon run --instance %i
+ExecReload=/usr/bin/muructl daemon reload --instance %i
+ExecStop=/usr/bin/muructl daemon stop --instance %i --shutdown --timeout 60s
+TimeoutStopSec=90
+ConfigurationDirectory=muru/instances/%i
+StateDirectory=muru/instances/%i
+CacheDirectory=muru
+LogsDirectory=muru/instances/%i
+RuntimeDirectory=muru/instances/%i
+RuntimeDirectoryPreserve=yes
+KillMode=process
+OOMPolicy=continue
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

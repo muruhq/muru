@@ -1422,6 +1422,7 @@ impl Admin for Service {
             pid: std::process::id(),
             instance_id: state.instance_id.clone(),
             hostname: muru_controller::processes::hostname(),
+            name: String::new(),
             state_dir: String::new(),
             run_dir: state.run_dir.display().to_string(),
             socket: state.socket.display().to_string(),

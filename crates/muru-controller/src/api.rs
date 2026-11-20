@@ -303,6 +303,7 @@ impl Admin for Service {
             pid: std::process::id(),
             instance_id: info.instance_id.to_string(),
             hostname: crate::processes::hostname(),
+            name: info.locations.instance_name().unwrap_or_default(),
             state_dir: info.locations.state.path.display().to_string(),
             run_dir: info.locations.run.path.display().to_string(),
             socket: info.locations.admin_socket().display().to_string(),

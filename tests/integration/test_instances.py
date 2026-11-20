@@ -265,3 +265,77 @@ def test_prune_removes_what_is_stale_and_stops_a_detached_daemon_only_when_asked
 
         if daemon.process.poll() is None:
             daemon.stop()
+
+
+def test_named_instances_take_their_locations_from_their_names(tmp_path: Path) -> None:
+    # Issue 810: two daemons on one machine, each a named instance whose
+    # locations follow from its name, in a home directory of the test's.
+
+    label = f"test-{uuid.uuid4().hex[:8]}"
+    suffix = uuid.uuid4().hex[:6]
+    dev, staging = f"dev-{suffix}", f"staging-{suffix}"
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in ("MURU_RUN_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
+    }
+    env.update({"HOME": str(home), "MURU_INSTANCE_LABEL": label})
+    path = support.muructl_path()
+    assert path is not None
+
+    def named(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(path), *arguments], capture_output=True, text=True, env=env, timeout=60
+        )
+
+    first, second = support.free_port(), support.free_port()
+    started: list[str] = []
+
+    try:
+        assert named("instance", "create", dev, "--listen", f"127.0.0.1:{first}").returncode == 0
+        clash = named("instance", "create", staging, "--listen", f"127.0.0.1:{first}")
+        assert f"is configured for instance {dev} already" in clash.stderr, clash.stderr
+        assert (
+            named("instance", "create", staging, "--listen", f"127.0.0.1:{second}").returncode == 0
+        )
+        missing = named("daemon", "start", "--instance", "nowhere")
+        assert "define it with muructl instance create nowhere" in missing.stderr, missing.stderr
+
+        rows = {
+            row["name"]: row["state"]
+            for row in json.loads(named("instance", "list", "--json").stdout)["instances"]
+            if row.get("name") in (dev, staging)
+        }
+        assert rows == {dev: "stopped", staging: "stopped"}, rows
+
+        for name in (dev, staging):
+            assert named("daemon", "start", "--instance", name).returncode == 0
+            started.append(name)
+
+        status = named("daemon", "status", "--instance", dev).stdout
+        assert status.splitlines()[0].endswith(f", instance {dev}"), status
+        rows = {row["name"]: row for row in listed(label)["instances"]}
+        assert {name: row["state"] for name, row in rows.items()} == {
+            dev: "running",
+            staging: "running",
+        }
+        assert rows[dev]["listeners"][0]["bound"] == f"127.0.0.1:{first}"
+        title = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(rows[dev]["pid"])],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        assert title == f"muru daemon {dev}", title
+        refused = named("instance", "remove", dev, "--yes")
+        assert f"instance {dev} is running" in refused.stderr, refused.stderr
+    finally:
+        for name in started:
+            named("daemon", "stop", "--instance", name, "--shutdown")
+
+        for name in (dev, staging):
+            named("instance", "remove", name, "--state", "--yes")
+
+    assert listed(label)["instances"] == []

@@ -28,6 +28,73 @@ pub enum InstanceCommand {
     /// Remove stale registry entries and stop orphaned Muru processes,
     /// after listing them and asking.
     Prune(PruneArgs),
+
+    /// Define a named daemon instance: its definition and its daemon
+    /// configuration file, with the listeners given.
+    Create(CreateArgs),
+
+    /// Remove a named instance's definition, and with --state its state
+    /// and logs, after asking. Refused while the instance runs.
+    Remove(RemoveArgs),
+}
+
+/// What `instance create` takes.
+#[derive(Args)]
+pub struct CreateArgs {
+    /// The instance's name: 1 to 24 lowercase letters, digits and hyphens,
+    /// starting with a letter; not user or system.
+    #[arg(value_parser = new_name)]
+    pub name: String,
+
+    /// An address to serve plain HTTP on, as IP:PORT; give it once for
+    /// each listener.
+    #[arg(long = "listen", value_name = "ADDRESS", required = true)]
+    pub listen: Vec<std::net::SocketAddr>,
+
+    /// The loopback address to serve the dashboard on.
+    #[arg(long, value_name = "ADDRESS")]
+    pub dashboard: Option<std::net::SocketAddr>,
+
+    /// What the instance is for, kept in its definition.
+    #[arg(long, value_name = "TEXT")]
+    pub description: Option<String>,
+
+    /// Define it in the system configuration area (/etc/muru), for a
+    /// daemon that runs as root.
+    #[arg(long)]
+    pub system: bool,
+}
+
+/// What `instance remove` takes.
+#[derive(Args)]
+pub struct RemoveArgs {
+    /// The instance's name.
+    pub name: String,
+
+    /// Also remove its state directory, run directory and logs.
+    #[arg(long)]
+    pub state: bool,
+
+    /// The instance in the system configuration area.
+    #[arg(long)]
+    pub system: bool,
+
+    /// Do it without asking.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// Check a new instance's name: a valid name and not a default daemon's.
+fn new_name(text: &str) -> Result<String, String> {
+    muru_controller::locations::check_name(text)?;
+
+    if muru_controller::locations::RESERVED_NAMES.contains(&text) {
+        return Err(format!(
+            "{text} names the default daemon of that name; choose another"
+        ));
+    }
+
+    Ok(text.to_owned())
 }
 
 /// What `instance prune` takes.
@@ -137,6 +204,8 @@ pub enum State {
     Detached,
     /// Its lock is free and nothing of it runs.
     Stale,
+    /// A named instance that is defined and has no entry.
+    Stopped,
 }
 
 impl State {
@@ -146,6 +215,7 @@ impl State {
             Self::Running => "running",
             Self::Detached => "detached",
             Self::Stale => "stale",
+            Self::Stopped => "stopped",
         }
     }
 }
@@ -157,6 +227,8 @@ pub struct Row {
     pub record: Record,
     /// Its state, worked out for its kind.
     pub state: State,
+    /// Its definition, for a named instance.
+    pub definition: Option<muru_controller::catalogue::Definition>,
 }
 
 impl Row {
@@ -252,11 +324,151 @@ pub fn rows(registries: &[PathBuf], processes: &[MuruProcess]) -> Vec<Row> {
             rows.push(Row {
                 state: local_state(&found, processes),
                 record: found.record,
+                definition: None,
             });
         }
     }
 
+    // The named instances defined, which are stopped when they have no
+    // entry; a definition and an entry of the same name are one row.
+
+    for system in [false, true] {
+        let (definitions, warnings) = muru_controller::catalogue::read(
+            &muru_controller::locations::caller_config_area(system),
+        );
+
+        for warning in warnings {
+            muru_common::muru_eprintln!("warning: {warning}");
+        }
+
+        for definition in definitions {
+            let scope = if system { "system" } else { "user" };
+            let entry = rows.iter().position(|row| {
+                row.record.name.as_deref() == Some(definition.name.as_str())
+                    && row.record.scope == scope
+            });
+
+            match entry {
+                Some(at) => rows[at].definition = Some(definition),
+                None => rows.push(stopped_row(definition, system)),
+            }
+        }
+
+        // The system area is the caller's own for root.
+
+        // SAFETY: geteuid has no preconditions and cannot fail.
+
+        if unsafe { libc::geteuid() } == 0 {
+            break;
+        }
+    }
+
     rows
+}
+
+/// The locations a named instance's name gives it.
+pub fn named_locations(name: &str, system: bool) -> muru_controller::locations::Locations {
+    muru_controller::locations::Locations::resolve(&muru_controller::locations::Options {
+        instance: Some(name.to_owned()),
+        system,
+        ..muru_controller::locations::Options::default()
+    })
+}
+
+/// What a named instance's daemon file configures it to listen on, with
+/// its dashboard; nothing when the file cannot be read.
+pub fn configured(locations: &muru_controller::locations::Locations) -> Vec<registry::Listener> {
+    let Ok(settings) = muru_controller::settings::NodeSettings::read(
+        &locations.config.path,
+        &locations.state.path.join("secrets"),
+        &muru_controller::settings::Overrides::default(),
+    ) else {
+        return Vec::new();
+    };
+
+    settings
+        .listeners
+        .iter()
+        .map(|(address, tls)| registry::Listener {
+            name: if *tls { "https" } else { "http" }.to_owned(),
+            configured: address.to_string(),
+            bound: None,
+            tls: *tls,
+        })
+        .chain(settings.dashboard.map(|address| registry::Listener {
+            name: "dashboard".to_owned(),
+            configured: address.to_string(),
+            bound: None,
+            tls: false,
+        }))
+        .collect()
+}
+
+/// The row of a named instance that is defined and has no entry, with
+/// what its file configures.
+fn stopped_row(definition: muru_controller::catalogue::Definition, system: bool) -> Row {
+    let locations = named_locations(&definition.name, system);
+    let id = registry::InstanceId::read_from(
+        &locations
+            .state
+            .path
+            .join(muru_controller::daemon::INSTANCE_ID_FILE),
+    )
+    .unwrap_or_else(registry::InstanceId::nil);
+    let mut record = Record::new(
+        id,
+        Kind::Daemon,
+        muru_controller::client::Endpoint::unix(locations.admin_socket()),
+        locations.run.path.clone(),
+    );
+
+    record.name = Some(definition.name.clone());
+    record.scope = if system { "system" } else { "user" }.to_owned();
+    record.label = None;
+    record.pid = 0;
+    record.process_started_unix_ms = None;
+    record.started_unix_ms = 0;
+    record.state_dir = Some(locations.state.path.clone());
+    record.config = Some(locations.config.path.clone());
+    record.log_dir = Some(locations.logs.path.clone());
+    let (dashboard, listeners): (Vec<_>, Vec<_>) = configured(&locations)
+        .into_iter()
+        .partition(|listener| listener.name == "dashboard");
+    record.listeners = listeners;
+    record.dashboard = dashboard
+        .first()
+        .map(|listener| format!("http://{}/", listener.configured));
+
+    Row {
+        record,
+        state: State::Stopped,
+        definition: Some(definition),
+    }
+}
+
+/// The addresses named instances other than the one at `locations` are
+/// configured with and do not run on, by instance: what a daemon about to
+/// start would clash with only once they start.
+pub fn configured_elsewhere(
+    locations: &muru_controller::locations::Locations,
+) -> Vec<(String, String)> {
+    let processes = muru_controller::lookup::muru_processes();
+    let Ok(registries) = registries(false) else {
+        return Vec::new();
+    };
+
+    rows(&registries, &processes)
+        .into_iter()
+        .filter(|row| row.state == State::Stopped)
+        .filter(|row| row.record.name != locations.instance)
+        .flat_map(|row| {
+            let system = row.record.scope == "system";
+            let name = row.tag();
+            configured(&named_locations(&name, system))
+                .into_iter()
+                .map(move |listener| (name.clone(), listener.configured))
+        })
+        .collect()
 }
 
 /// A Muru process no live instance accounts for.
@@ -424,7 +636,10 @@ pub struct Port {
 pub fn ports(rows: &[Row]) -> Vec<Port> {
     let mut found: Vec<(Port, String)> = Vec::new();
 
-    for row in rows.iter().filter(|row| row.alive()) {
+    for row in rows
+        .iter()
+        .filter(|row| row.alive() || row.state == State::Stopped)
+    {
         let mut addresses: Vec<(String, String, bool)> = row
             .record
             .listeners
@@ -444,7 +659,7 @@ pub fn ports(rows: &[Row]) -> Vec<Port> {
             addresses.push((
                 dashboard.trim_end_matches('/').to_owned(),
                 "dashboard".to_owned(),
-                true,
+                row.alive(),
             ));
         }
 
@@ -533,6 +748,30 @@ fn row_json(row: &Row) -> serde_json::Value {
     let mut value = serde_json::to_value(&row.record).unwrap_or_default();
 
     if let Some(object) = value.as_object_mut() {
+        // A stopped instance has a definition and no record of its own,
+        // so it has no process or start time to give.
+
+        if row.state == State::Stopped {
+            for field in ["pid", "started_unix_ms", "uid", "muru_version", "host"] {
+                object.remove(field);
+            }
+
+            if row.record.id == registry::InstanceId::nil() {
+                object.remove("id");
+            }
+        }
+
+        if let Some(definition) = &row.definition {
+            object.insert(
+                "definition".to_owned(),
+                serde_json::json!({
+                    "kind": definition.file.kind,
+                    "description": definition.file.description,
+                    "directory": definition.directory,
+                }),
+            );
+        }
+
         object.insert("tag".to_owned(), row.tag().into());
         object.insert("state".to_owned(), row.state.word().into());
         object.insert("location".to_owned(), "local".into());
@@ -609,9 +848,15 @@ pub fn listen_column(listeners: &[registry::Listener]) -> String {
     }
 }
 
-/// The WHERE column: a run's or serve's project and application, or a
-/// daemon's state directory.
-fn where_column(record: &Record) -> String {
+/// The WHERE column: a run's or serve's project and application, a named
+/// instance's `instances/NAME`, or a daemon's state directory.
+fn where_column(row: &Row) -> String {
+    let record = &row.record;
+
+    if let Some(definition) = &row.definition {
+        return format!("instances/{}", definition.name);
+    }
+
     match (record.kind, &record.project, &record.app) {
         (Kind::Run | Kind::Serve, Some(project), Some(app)) => {
             format!("{} ({app})", shortened(project))
@@ -711,7 +956,7 @@ pub async fn list(args: ListArgs) -> anyhow::Result<i32> {
 /// The instance table.
 fn print_rows(rows: &[Row]) {
     if rows.is_empty() {
-        println!("muru: no instances are registered on this machine");
+        println!("muru: no instances to list");
         return;
     }
 
@@ -756,7 +1001,7 @@ fn print_rows(rows: &[Row]) {
                 (Some(dashboard), true) => dashboard.clone(),
                 _ => "-".to_owned(),
             },
-            where_column(&row.record),
+            where_column(row),
         ];
 
         if labelled {
@@ -911,7 +1156,7 @@ pub async fn plan(args: &PruneArgs) -> anyhow::Result<Plan> {
                 why: "it is detached and its processes keep serving; --detached stops them"
                     .to_owned(),
             }),
-            State::Running => {}
+            State::Running | State::Stopped => {}
         }
     }
 
@@ -1200,6 +1445,183 @@ fn counted(count: usize, singular: &str, plural: &str) -> String {
     format!("{count} {}", if count == 1 { singular } else { plural })
 }
 
+/// `muructl instance create`: write the definition and the daemon's
+/// file, refusing a name that exists and an address another defined or
+/// running instance uses.
+pub fn create(args: CreateArgs) -> anyhow::Result<()> {
+    let area = muru_controller::locations::caller_config_area(args.system);
+    let directory = area
+        .join(muru_controller::locations::INSTANCES_DIR)
+        .join(&args.name);
+
+    if directory.exists() {
+        anyhow::bail!(
+            "instance {} is already defined, in {}",
+            args.name,
+            directory.display()
+        );
+    }
+
+    // Every address is checked against the instances defined and those
+    // running, so two never clash once both are started.
+
+    let processes = muru_controller::lookup::muru_processes();
+    let all = rows(&registries(false)?, &processes);
+    let addresses: Vec<(std::net::SocketAddr, &str)> = args
+        .listen
+        .iter()
+        .map(|address| (*address, "listener"))
+        .chain(args.dashboard.map(|address| (address, "dashboard address")))
+        .collect();
+
+    for (address, what) in &addresses {
+        if let Some(message) = muru_controller::registry::in_use_by_instance(
+            *address,
+            &format!("choose another {what}"),
+        ) {
+            anyhow::bail!(message);
+        }
+
+        for row in all.iter().filter(|row| row.definition.is_some()) {
+            let system = row.record.scope == "system";
+            let clash = configured(&named_locations(&row.tag(), system))
+                .into_iter()
+                .any(|listener| registry::clashes(&listener.configured, &address.to_string()));
+
+            if clash {
+                anyhow::bail!(
+                    "{address} is configured for instance {} already; choose another {what}",
+                    row.tag()
+                );
+            }
+        }
+    }
+
+    let mut config = format!(
+        "# The daemon configuration of instance {}, which muructl instance create wrote.\n",
+        args.name
+    );
+
+    for address in &args.listen {
+        config.push_str(&format!("\n[[listener]]\naddress = '{address}'\n"));
+    }
+
+    if let Some(dashboard) = args.dashboard {
+        config.push_str(&format!("\n[dashboard]\nlisten = '{dashboard}'\n"));
+    }
+
+    let definition =
+        muru_controller::catalogue::create(&area, &args.name, args.description.as_deref(), &config)
+            .map_err(|error| anyhow::anyhow!("defining instance {}: {error}", args.name))?;
+
+    println!(
+        "muru: instance {} is defined in {}; start it with muructl daemon start --instance {}",
+        args.name,
+        definition.directory.display(),
+        args.name
+    );
+    Ok(())
+}
+
+/// `muructl instance remove`: the definition, and with --state the state,
+/// run and log directories, after asking; refused while the instance runs.
+pub fn remove_instance(args: RemoveArgs) -> anyhow::Result<()> {
+    let area = muru_controller::locations::caller_config_area(args.system);
+    let Some(definition) = muru_controller::catalogue::find(&area, &args.name) else {
+        let (defined, _) = muru_controller::catalogue::read(&area);
+        let names: Vec<String> = defined
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+
+        anyhow::bail!(
+            "no instance {} is defined{}",
+            args.name,
+            if names.is_empty() {
+                String::new()
+            } else {
+                format!("; the defined instances are {}", names.join(", "))
+            }
+        );
+    };
+
+    let processes = muru_controller::lookup::muru_processes();
+    let row = rows(&registries(false)?, &processes)
+        .into_iter()
+        .find(|row| row.definition.as_ref() == Some(&definition));
+
+    if let Some(row) = row.as_ref().filter(|row| row.alive()) {
+        anyhow::bail!(
+            "instance {} is {}; stop it first with muructl daemon stop --instance {} --shutdown",
+            args.name,
+            row.state.word(),
+            args.name
+        );
+    }
+
+    // The definition is its two files; on macOS the instance's state is a
+    // directory beside them, which goes only with --state.
+
+    let locations = named_locations(&args.name, args.system);
+    let mut removed: Vec<PathBuf> = vec![
+        definition
+            .directory
+            .join(muru_controller::catalogue::DEFINITION_FILE),
+        definition.config(),
+    ];
+
+    if args.state {
+        removed.extend([
+            locations.state.path.clone(),
+            locations.run.path.clone(),
+            locations.logs.path.clone(),
+        ]);
+    }
+
+    let removed: Vec<PathBuf> = removed.into_iter().filter(|path| path.exists()).collect();
+
+    for path in &removed {
+        println!("remove   {}", path.display());
+    }
+
+    if !crate::admin::confirm(&format!("remove instance {}?", args.name), args.yes)? {
+        println!("muru: nothing was changed");
+        return Ok(());
+    }
+
+    // A stale entry the instance left goes with it.
+
+    if let Some(row) = row.filter(|row| row.state == State::Stale) {
+        for registry in registries(false)? {
+            let _ = registry::remove_stale(&registry, row.record.id);
+        }
+    }
+
+    for path in &removed {
+        let gone = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        gone.map_err(|error| anyhow::anyhow!("removing {}: {error}", path.display()))?;
+    }
+
+    // The definition's directory goes once nothing is left in it.
+
+    let _ = std::fs::remove_dir(&definition.directory);
+
+    if !args.state && definition.directory.exists() {
+        println!(
+            "muru: instance {} is removed; its state is kept in {}, which --state removes",
+            args.name,
+            locations.state.path.display()
+        );
+    } else {
+        println!("muru: instance {} is removed", args.name);
+    }
+    Ok(())
+}
+
 /// How many instances `instance list` shows that run or were left
 /// running, for `muructl status` to say when it finds nothing listening.
 pub fn count_alive() -> usize {
@@ -1258,6 +1680,7 @@ mod tests {
             Row {
                 record,
                 state: State::Running,
+                definition: None,
             }
         };
 
@@ -1343,6 +1766,7 @@ mod tests {
         let row = Row {
             record,
             state: State::Running,
+            definition: None,
         };
         let process = |id: Option<registry::InstanceId>, tag: Option<&str>| MuruProcess {
             pid: 1,
