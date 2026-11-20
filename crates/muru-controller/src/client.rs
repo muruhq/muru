@@ -1,12 +1,12 @@
-//! The admin API client, for muructl: a gRPC channel over the daemon's
-//! Unix socket.
+//! The admin API client, for muructl: a gRPC channel to an instance's
+//! admin endpoint, which is a Unix socket for every local instance.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use hyper_util::rt::TokioIo;
 use muru_proto::admin::v1::admin_client::AdminClient;
-use tonic::transport::{Channel, Endpoint, Uri};
+use tonic::transport::{Channel, Uri};
 
 /// The largest reply the client takes, in MiB. A `Debug` reply holds
 /// every worker's answer in one message, so tonic's default of 4 MiB is
@@ -14,8 +14,51 @@ use tonic::transport::{Channel, Endpoint, Uri};
 /// client's memory. The servers set no encoding limit.
 pub const MAX_REPLY_MIB: usize = 256;
 
-/// Connect to the daemon's admin socket.
-pub async fn connect(socket: &Path) -> anyhow::Result<AdminClient<Channel>> {
+/// How to reach an instance's admin API (section 13.8, issue 805): the
+/// shape of the `admin` object in a registry record. A Unix socket is the
+/// one transport; another, such as TCP with TLS and a token (section
+/// 10.6), would be a new variant here rather than a change to callers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "transport", rename_all = "lowercase")]
+pub enum Endpoint {
+    /// A Unix socket on this machine.
+    Unix {
+        /// The socket's path.
+        path: PathBuf,
+    },
+}
+
+impl Endpoint {
+    /// A Unix socket endpoint.
+    pub fn unix(path: impl Into<PathBuf>) -> Self {
+        Self::Unix { path: path.into() }
+    }
+
+    /// The socket's path, for an endpoint on this machine.
+    pub fn socket(&self) -> Option<&Path> {
+        match self {
+            Self::Unix { path } => Some(path),
+        }
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unix { path } => write!(f, "{}", path.display()),
+        }
+    }
+}
+
+/// Connect to an instance's admin endpoint.
+pub async fn connect(endpoint: &Endpoint) -> anyhow::Result<AdminClient<Channel>> {
+    match endpoint {
+        Endpoint::Unix { path } => connect_unix(path).await,
+    }
+}
+
+/// Connect to an admin socket.
+async fn connect_unix(socket: &Path) -> anyhow::Result<AdminClient<Channel>> {
     let socket: PathBuf = socket.to_path_buf();
     let found = std::fs::metadata(&socket);
 
@@ -33,7 +76,7 @@ pub async fn connect(socket: &Path) -> anyhow::Result<AdminClient<Channel>> {
     // The URI is required by the channel but never used: the connector
     // opens the Unix socket whatever it says.
 
-    let endpoint = Endpoint::try_from("http://muru.invalid")?;
+    let endpoint = tonic::transport::Endpoint::try_from("http://muru.invalid")?;
     let dialled = socket.clone();
     let channel = endpoint
         .connect_with_connector(tower::service_fn(move |_: Uri| {
@@ -118,7 +161,9 @@ mod tests {
         drop(listener);
         assert!(left_behind(&path));
 
-        let error = connect(&path).await.expect_err("nothing is listening");
+        let error = connect(&Endpoint::unix(&path))
+            .await
+            .expect_err("nothing is listening");
         assert_eq!(error.to_string(), nothing_listening(&path));
     }
 
@@ -139,7 +184,7 @@ mod tests {
         let _listener = tokio::net::UnixListener::bind(&path).expect("bind");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
 
-        let error = connect(&path)
+        let error = connect(&Endpoint::unix(&path))
             .await
             .expect_err("the socket may not be used");
         assert_eq!(

@@ -887,7 +887,7 @@ names the run, its project directory and its socket:
 
 ```console
 $ muructl logs --access --lines 1
-muru: using the daemon; the development run of shop on http://127.0.0.1:8080 is also listening: run the command from /home/me/shop, or pass --socket /run/user/1000/muru/runs/8080/admin.sock, to reach it
+muru: using the daemon; the development run of shop on http://127.0.0.1:8080 is also listening: run the command from /home/me/shop, or pass --socket /run/user/1000/muru/run-7f3a9c2e/admin.sock, to reach it
 ```
 
 With several development runs of one project, the newest is reached,

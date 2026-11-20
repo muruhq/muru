@@ -214,6 +214,14 @@ impl Locations {
         }
     }
 
+    /// The instance's name in the registry (section 13.8): `user` or
+    /// `system` for the default daemon of the mode, none for a daemon
+    /// whose locations were given by flags.
+    pub fn instance_name(&self) -> Option<String> {
+        let scope = self.scope();
+        (scope == self.mode_word()).then_some(scope)
+    }
+
     /// `user` or `system`, for the mode.
     pub fn mode_word(&self) -> &'static str {
         match self.mode {
@@ -349,6 +357,13 @@ fn default_state(mode: Mode, home: Option<&std::path::Path>) -> PathBuf {
         }
         Mode::User => xdg("XDG_STATE_HOME", home, ".local/state").join("muru"),
     }
+}
+
+/// The default runtime location for whoever runs: the system one for
+/// root, the user's otherwise, whatever an option or variable says. The
+/// instance registry lives there (section 13.8).
+pub fn default_runtime() -> PathBuf {
+    default_run(if is_root() { Mode::System } else { Mode::User })
 }
 
 fn default_run(mode: Mode) -> PathBuf {

@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import http.client
-import json
 import os
 import re
 import shutil
@@ -140,6 +139,18 @@ def short_dirs_made() -> int:
     return len(_short_dirs)
 
 
+def user_registry() -> Path:
+    """The user's instance registry (design specification section 13.8),
+    in the default runtime location whatever MURU_RUN_DIR says."""
+
+    if os.geteuid() == 0:
+        return Path("/run/muru/registry")
+
+    runtime = os.environ.get("XDG_RUNTIME_DIR") if sys.platform.startswith("linux") else None
+    base = Path(runtime) / "muru" if runtime else Path(f"/tmp/muru-{os.getuid()}")
+    return base / "registry"
+
+
 def recorded_pids(directory: Path) -> set[int]:
     """The pids Muru's records under a directory name that are still one of
     Muru's processes: the edge's, each host's and each relay's records, and
@@ -149,10 +160,10 @@ def recorded_pids(directory: Path) -> set[int]:
 
     pids: set[int] = set()
 
-    for record in directory.glob("runs/*/run.json"):
+    for record in directory.glob("run-*/pid"):
         try:
-            pids.add(json.loads(record.read_text())["pid"])
-        except (OSError, ValueError, KeyError):
+            pids.add(int(record.read_text()))
+        except (OSError, ValueError):
             continue
 
     for record in directory.rglob("*.toml"):
@@ -343,6 +354,22 @@ class Server:
 
     def __post_init__(self) -> None:
         STARTED.append(self)
+
+    def admin_socket(self, timeout: float = 10.0) -> Path:
+        """The run's admin socket, from the line it prints once it serves
+        the admin protocol, in its own directory under the run directory."""
+
+        deadline = time.monotonic() + timeout
+
+        while True:
+            for line in self.log().splitlines():
+                if " admin socket " in f" {line}":
+                    return Path(line.split("admin socket ", 1)[1].strip())
+
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"the run named no admin socket:\n{self.log()}")
+
+            time.sleep(0.05)
 
     def failure_report(self) -> list[tuple[str, str]]:
         """The section for the report of a test that failed with this

@@ -269,6 +269,12 @@ impl SocketArgs {
         }
     }
 
+    /// The admin endpoint to connect to (design specification section
+    /// 13.8).
+    pub fn endpoint(&self) -> anyhow::Result<client::Endpoint> {
+        self.socket().map(client::Endpoint::unix)
+    }
+
     /// The socket to connect to (design specification section 13.8): as
     /// given, else a muructl serve's in its run directory, else a
     /// development run's from this project, else the daemon's when it
@@ -697,7 +703,7 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
     // A daemon answering on this socket is this one when it uses the same
     // state directory, and another daemon on the run directory when not.
 
-    if let Ok(mut client) = client::connect(&socket).await
+    if let Ok(mut client) = client::connect(&client::Endpoint::unix(&socket)).await
         && let Ok(status) = client.get_status(pb::GetStatusRequest {}).await
     {
         let status = status.into_inner();
@@ -773,7 +779,7 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
     let started = Instant::now();
 
     while started.elapsed() < Duration::from_secs(30) {
-        if let Ok(mut client) = client::connect(&socket).await
+        if let Ok(mut client) = client::connect(&client::Endpoint::unix(&socket)).await
             && let Ok(status) = client.get_status(pb::GetStatusRequest {}).await
         {
             let status = status.into_inner();
@@ -856,7 +862,7 @@ const STOP_EXCHANGE: Duration = Duration::from_secs(5);
 /// there is no daemon there, it refused, or it did not answer in time.
 async fn status_within(path: &Path, bound: Duration) -> Option<pb::Status> {
     let exchange = async {
-        let mut client = client::connect(path).await.ok()?;
+        let mut client = client::connect(&client::Endpoint::unix(path)).await.ok()?;
         client
             .get_status(pb::GetStatusRequest {})
             .await
@@ -881,7 +887,8 @@ pub async fn daemon_stop(
     let path = socket.socket()?;
     let started = Instant::now();
     let bound = timeout.min(STOP_EXCHANGE);
-    let connected = tokio::time::timeout(bound, client::connect(&path)).await;
+    let connected =
+        tokio::time::timeout(bound, client::connect(&client::Endpoint::unix(&path))).await;
 
     let mut client = match connected {
         Ok(client) => client?,
@@ -948,7 +955,7 @@ pub async fn daemon_upgrade(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let path = socket.socket()?;
-    let mut client = client::connect(&path).await?;
+    let mut client = client::connect(&client::Endpoint::unix(&path)).await?;
     let before = client
         .get_status(pb::GetStatusRequest {})
         .await?
@@ -2190,7 +2197,7 @@ struct AccessChange {
 /// Change which requests the access log writes for a period, put the
 /// changes back, or list those in force (section 11.2).
 async fn access_log(change: AccessChange) -> anyhow::Result<()> {
-    let mut client = client::connect(&change.socket.socket()?).await?;
+    let mut client = client::connect(&change.socket.endpoint()?).await?;
     let answer = client
         .override_access_log(pb::OverrideAccessLogRequest {
             mode: change.mode.clone().unwrap_or_default(),
@@ -2261,7 +2268,7 @@ async fn ask(
         None => (target, ""),
     };
 
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let response = client
         .debug(pb::DebugRequest {
             app: app.to_owned(),
@@ -2813,7 +2820,7 @@ fn print_inspect(response: &pb::DebugResponse) {
 
 /// Print the node's metrics as Prometheus text.
 pub async fn metrics(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let text = client
         .get_metrics(pb::GetMetricsRequest {})
         .await?
@@ -2956,7 +2963,7 @@ pub struct WebSocketsArgs {
 /// Show the WebSockets open now: counted by endpoint, where segments
 /// that are identifiers are {id} and many distinct values *, or listed.
 pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let list = client
         .list_web_sockets(pb::ListWebSocketsRequest {
             app: args.app.unwrap_or_default(),
@@ -3027,7 +3034,7 @@ pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
 
 /// Print a development run's record of one request (section 11.7).
 async fn request_record(args: RequestRecordArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let record = client
         .get_request(pb::GetRequestRequest {
             request_id: args.request_id,
@@ -3229,7 +3236,7 @@ pub struct RequestsArgs {
 /// group, queued for a slot, holding a thread or on an event loop, with
 /// the oldest of each; or listed.
 pub async fn requests(args: RequestsArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let list = client
         .list_requests(pb::ListRequestsRequest {
             app: args.app.unwrap_or_default(),
@@ -3353,7 +3360,7 @@ pub async fn requests(args: RequestsArgs) -> anyhow::Result<()> {
 
 /// Re-read the daemon's configuration file.
 pub async fn daemon_reload(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let response = client
         .reload_config(pb::ReloadConfigRequest {})
         .await
@@ -3405,14 +3412,14 @@ pub async fn daemon_status(
         return Ok(NOT_RUNNING);
     }
 
-    show_status(&path, json).await?;
+    show_status(&client::Endpoint::unix(&path), json).await?;
     Ok(0)
 }
 
 /// Show the status of what answers at an admin socket: a daemon or a
 /// development run.
-pub async fn show_status(path: &Path, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(path).await?;
+pub async fn show_status(endpoint: &client::Endpoint, json: bool) -> anyhow::Result<()> {
+    let mut client = client::connect(endpoint).await?;
     let status = client
         .get_status(pb::GetStatusRequest {})
         .await?
@@ -4171,7 +4178,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
     }
 
     args.settings.check()?;
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let python = args
         .settings
         .python
@@ -4823,7 +4830,7 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
             None => ("", ""),
         };
 
-        let mut client = client::connect(&socket.socket()?).await?;
+        let mut client = client::connect(&socket.endpoint()?).await?;
         let status = client
             .get_scale_status(pb::GetScaleStatusRequest {
                 app: app.to_owned(),
@@ -4868,7 +4875,7 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
         (None, None) => 0,
     };
 
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let status = client
         .set_scale(pb::SetScaleRequest {
             app: app.to_owned(),
@@ -5157,7 +5164,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             output,
         } => {
             let (app, id) = split_release(&release)?;
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let rollout = client
                 .start_rollout(pb::StartRolloutRequest {
                     app: app.to_owned(),
@@ -5215,7 +5222,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             output,
         } => {
             let (app, id) = split_release(&release)?;
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let release = client
                 .promote_release(pb::PromoteReleaseRequest {
                     app: app.to_owned(),
@@ -5242,7 +5249,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             socket,
             output,
         } => {
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
 
             if wait {
                 let Some(app) = app else {
@@ -5305,7 +5312,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             socket,
             output,
         } => {
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let rollout = client
                 .pause_rollout(pb::RolloutControlRequest {
                     app,
@@ -5330,7 +5337,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             socket,
             output,
         } => {
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let rollout = client
                 .resume_rollout(pb::RolloutControlRequest {
                     app,
@@ -5356,7 +5363,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             socket,
             output,
         } => {
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let rollout = client
                 .promote_rollout(pb::RolloutControlRequest {
                     app,
@@ -5381,7 +5388,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             socket,
             output,
         } => {
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let rollout = client
                 .abort_rollout(pb::RolloutControlRequest {
                     app,
@@ -5480,7 +5487,7 @@ pub struct AppRemoveArgs {
 
 /// List applications.
 pub async fn app_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client.list_apps(pb::ListAppsRequest {}).await?.into_inner();
 
     if json {
@@ -5539,7 +5546,7 @@ fn maintenance_mark(app: &pb::App) -> String {
 
 /// Remove an application and all its releases.
 pub async fn app_remove(args: AppRemoveArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let request = pb::RemoveAppRequest {
         app: args.app.clone(),
         dry_run: true,
@@ -5627,7 +5634,7 @@ pub async fn condition(command: ConditionCommand) -> anyhow::Result<()> {
         } => (name.clone(), socket, output.json),
     };
 
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client
         .list_conditions(pb::ListConditionsRequest { name: name.clone() })
         .await
@@ -5885,7 +5892,7 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
             socket,
             output,
         } => {
-            let mut client = client::connect(&socket.socket()?).await?;
+            let mut client = client::connect(&socket.endpoint()?).await?;
             let preview = client
                 .preview_overlay(pb::PreviewOverlayRequest { name: name.clone() })
                 .await
@@ -5954,7 +5961,7 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
         } => (name, "promote", None, socket, output.json),
     };
 
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let response = client
         .control_overlay(pb::ControlOverlayRequest {
             name: name.clone(),
@@ -5993,7 +6000,7 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
 }
 
 async fn list_overlays(socket: &SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client
         .list_overlays(pb::ListOverlaysRequest {})
         .await
@@ -6142,7 +6149,7 @@ pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
         } => (app, host, false, socket, output.json),
     };
 
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let status = client
         .set_maintenance(pb::SetMaintenanceRequest {
             app: app.unwrap_or_default(),
@@ -6214,7 +6221,7 @@ pub async fn dashboard(command: DashboardCommand) -> anyhow::Result<()> {
         socket,
         output,
     } = command;
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let link = client
         .dashboard_login(pb::DashboardLoginRequest { token })
         .await
@@ -6260,7 +6267,7 @@ pub enum HostCommand {
 
 /// List virtual hosts.
 pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client
         .list_hosts(pb::ListHostsRequest {})
         .await?
@@ -6384,7 +6391,7 @@ pub enum UpstreamCommand {
 
 /// List HTTP upstreams.
 pub async fn upstream_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client
         .list_upstreams(pb::ListUpstreamsRequest {})
         .await?
@@ -6443,7 +6450,7 @@ pub enum RouteCommand {
 
 /// List routes.
 pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client
         .list_routes(pb::ListRoutesRequest {})
         .await?
@@ -6699,7 +6706,7 @@ pub async fn release_list(
     socket: SocketArgs,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let answer = client
         .list_releases(pb::ListReleasesRequest {
             app: app.unwrap_or_default(),
@@ -6749,7 +6756,7 @@ pub async fn release_list(
 
 /// Remove old releases.
 pub async fn release_prune(args: ReleasePruneArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let request = pb::PruneReleasesRequest {
         app: args.app.clone().unwrap_or_default(),
         keep: args.keep,
@@ -6788,7 +6795,7 @@ pub async fn release_prune(args: ReleasePruneArgs) -> anyhow::Result<()> {
 /// Remove one release.
 pub async fn release_remove(args: ReleaseRemoveArgs) -> anyhow::Result<()> {
     let (app, id) = split_release(&args.release)?;
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let request = pb::RemoveReleaseRequest {
         app: app.to_owned(),
         release: id.to_owned(),
@@ -6959,7 +6966,7 @@ fn workers_column(release: &pb::Release) -> String {
 /// Show one release.
 pub async fn release_show(release: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let release = client
         .get_release(pb::GetReleaseRequest {
             app: app.to_owned(),
@@ -7289,7 +7296,7 @@ pub async fn release_wait(
     json: bool,
 ) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let release = client
         .wait_release(pb::WaitReleaseRequest {
             app: app.to_owned(),
@@ -7319,7 +7326,7 @@ pub async fn release_wait(
 
 /// Roll an application back to its previous release.
 pub async fn rollback(app: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let release = client
         .rollback(pb::RollbackRequest { app })
         .await
@@ -7340,7 +7347,7 @@ pub async fn rollback(app: String, socket: SocketArgs, json: bool) -> anyhow::Re
 /// Drain a release.
 pub async fn drain(release: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let release = client
         .drain_release(pb::DrainReleaseRequest {
             app: app.to_owned(),
@@ -7416,7 +7423,7 @@ pub struct ApplyArgs {
 /// and 1 for errors.
 pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
     let document = load_documents(&args.file)?;
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let report = client
         .apply_config(pb::ApplyConfigRequest {
             document: document.to_toml().context("writing the configuration")?,
@@ -7502,7 +7509,7 @@ pub async fn config_export(
     json: bool,
     socket: SocketArgs,
 ) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let export = client
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
@@ -7540,7 +7547,7 @@ pub async fn config_show(
     socket: SocketArgs,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let export = client
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
@@ -7598,7 +7605,7 @@ pub async fn config_show(
 /// match, 2 when they differ and 1 for errors.
 pub async fn config_diff(file: PathBuf, json: bool, socket: SocketArgs) -> anyhow::Result<i32> {
     let document = load_documents(&file)?;
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let report = client
         .diff_config(pb::DiffConfigRequest {
             document: document.to_toml().context("writing the configuration")?,
@@ -7917,7 +7924,7 @@ pub async fn events(
     socket: SocketArgs,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
 
     if !follow {
         let answer = client
@@ -8013,8 +8020,8 @@ pub async fn exec(args: RunExecArgs) -> anyhow::Result<i32> {
 enum Place<'a> {
     /// Through an admin socket, with the application and release named.
     Socket {
-        /// The socket.
-        socket: PathBuf,
+        /// The instance's admin endpoint.
+        socket: client::Endpoint,
         /// The application and release, as given.
         target: Option<&'a str>,
     },
@@ -8040,14 +8047,14 @@ impl<'a> Place<'a> {
             }
 
             return Ok(Self::Socket {
-                socket: socket.socket()?,
+                socket: socket.endpoint()?,
                 target: Some(target),
             });
         }
 
         if let Some(given) = &socket.socket {
             return Ok(Self::Socket {
-                socket: given.clone(),
+                socket: client::Endpoint::unix(given),
                 target: None,
             });
         }
@@ -8055,7 +8062,7 @@ impl<'a> Place<'a> {
         Ok(
             match socket.serving(&project.project(), project.chdir.is_some()) {
                 Some(socket) => Self::Socket {
-                    socket,
+                    socket: client::Endpoint::unix(socket),
                     target: None,
                 },
                 None => Self::Own(project),
@@ -8183,7 +8190,7 @@ pub struct CommandLogsArgs {
 
 /// List the runs of an application's commands.
 pub async fn command_runs(args: CommandRunsArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let answer = client
         .list_command_runs(pb::ListCommandRunsRequest {
             app: args.app.clone(),
@@ -8263,7 +8270,7 @@ fn run_state(run: &pb::CommandRunRecord) -> String {
 
 /// Show one run.
 pub async fn command_status(args: RunIdArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let run = client
         .get_command_run(pb::GetCommandRunRequest { run: args.run })
         .await
@@ -8316,7 +8323,7 @@ fn print_run(run: &pb::CommandRunRecord) {
 
 /// Show or follow a run's output.
 pub async fn command_logs(args: CommandLogsArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let mut lines = client
         .tail_command_run(pb::TailCommandRunRequest {
             run: args.run,
@@ -8352,7 +8359,7 @@ pub async fn command_logs(args: CommandLogsArgs) -> anyhow::Result<()> {
 
 /// Stop a run.
 pub async fn command_stop(args: RunIdArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()?).await?;
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
     let run = client
         .stop_command_run(pb::StopCommandRunRequest { run: args.run })
         .await
@@ -9269,7 +9276,7 @@ async fn log_lines(args: &LogsArgs) -> anyhow::Result<(LogLines, Option<String>)
         None => (String::new(), String::new()),
     };
 
-    let mut client = client::connect(&path).await?;
+    let mut client = client::connect(&client::Endpoint::unix(&path)).await?;
 
     // Section 11.2: a virtual host's records are in the file it names
     // for them, or else among the access log's, where each JSON record
@@ -9449,7 +9456,7 @@ async fn own_log_lines(args: &LogsArgs) -> anyhow::Result<LogLines> {
 
 /// Reopen every log file after an external rotation.
 pub async fn logs_reopen(workers: bool, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(&socket.endpoint()?).await?;
     let reopened = client
         .reopen_logs(pb::ReopenLogsRequest { workers })
         .await
@@ -9547,7 +9554,7 @@ async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result
         })));
     }
 
-    let mut client = client::connect(&path).await?;
+    let mut client = client::connect(&client::Endpoint::unix(&path)).await?;
 
     if let Some(asked) = &files.log_dir {
         let answer = client
@@ -10157,7 +10164,7 @@ async fn cache_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Resul
         return Ok(CacheWay::Files(Box::new(locations), releases));
     }
 
-    let mut client = client::connect(&path).await?;
+    let mut client = client::connect(&client::Endpoint::unix(&path)).await?;
 
     if let Some(asked) = &files.state_dir {
         let answer = client
@@ -10181,33 +10188,43 @@ async fn cache_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Resul
 }
 
 /// What the development runs have of the user cache in use.
-fn user_cache_in_use(socket: &SocketArgs) -> muru_controller::cache::InUse {
+fn user_cache_in_use() -> muru_controller::cache::InUse {
     let mut in_use = muru_controller::cache::InUse::default();
 
-    for run in crate::run_admin::runs(&socket.locations.resolve().run.path) {
-        for directory in run.runtime {
+    // Section 13.8: every live instance of this user says in its registry
+    // entry which runtime library directories it uses, whatever run
+    // directory it was started with.
+
+    for record in muru_controller::registry::live(&muru_controller::registry::user_registry()) {
+        let user = match (&record.kind, &record.app) {
+            (muru_controller::registry::Kind::Run, Some(app)) => {
+                format!("the development run of {app}")
+            }
+            (muru_controller::registry::Kind::Serve, Some(app)) => {
+                format!("muructl serve of {app}")
+            }
+            _ => format!("instance {}", record.tag()),
+        };
+
+        for directory in record.runtime {
             let resolved = std::fs::canonicalize(&directory).unwrap_or(directory);
-            in_use
-                .runtime
-                .insert(resolved, format!("the development run of {}", run.app));
+            in_use.runtime.insert(resolved, user.clone());
         }
     }
 
     in_use
 }
 
-/// The report on the user cache, with what development runs use marked.
-fn user_cache_report(
-    socket: &SocketArgs,
-    files: &DaemonFileArgs,
-) -> anyhow::Result<pb::ListCacheResponse> {
+/// The report on the user cache, with what the user's instances use
+/// marked.
+fn user_cache_report(files: &DaemonFileArgs) -> anyhow::Result<pb::ListCacheResponse> {
     use muru_controller::cache;
 
     let root = user_cache_dir(files)?;
     let mut entries = cache::user_entries(&root);
     cache::mark_in_use(
         &mut entries,
-        &user_cache_in_use(socket),
+        &user_cache_in_use(),
         &crate::provision::version(),
     );
 
@@ -10242,7 +10259,7 @@ pub async fn cache_list(args: CacheListArgs) -> anyhow::Result<()> {
     let user = if args.area == Some(CacheArea::Daemon) {
         None
     } else {
-        Some(user_cache_report(&args.socket, &args.files)?)
+        Some(user_cache_report(&args.files)?)
     };
 
     let daemon = if args.area == Some(CacheArea::User) {
@@ -10300,11 +10317,7 @@ fn user_cache_prune(
         version: args.version.clone(),
         tag: args.tag.clone(),
     };
-    let mut answer = cache::plan_prune(
-        user_cache_report(&args.socket, &args.files)?,
-        &rules,
-        dry_run,
-    );
+    let mut answer = cache::plan_prune(user_cache_report(&args.files)?, &rules, dry_run);
 
     if !dry_run {
         cache::carry_out(&mut answer);
@@ -10347,11 +10360,7 @@ fn user_cache_clear(
 ) -> anyhow::Result<pb::RemoveCacheResponse> {
     use muru_controller::cache;
 
-    let mut answer = cache::plan_clear(
-        user_cache_report(&args.socket, &args.files)?,
-        args.certs,
-        dry_run,
-    );
+    let mut answer = cache::plan_clear(user_cache_report(&args.files)?, args.certs, dry_run);
 
     if !dry_run {
         cache::carry_out(&mut answer);

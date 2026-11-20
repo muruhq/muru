@@ -188,13 +188,15 @@ JSON, or `{"error": ...}` when it fails, with the same exit status.
 
 A script or an agent that starts `muructl run` in the background stops
 it by its process id. The run prints the id at start-up and writes it to
-`pid` in its run directory, beside its admin socket:
+`pid` in its own directory, beside its admin socket. The directory is
+named by the run's instance ID, which is new each time, so the path is
+taken from the line the run prints:
 
 ```console
 $ muructl run --port 18631 > run.log 2>&1 &
 $ grep 'pid' run.log
-muru: pid 4211, written to /run/user/1000/muru/runs/18631/pid
-$ kill -INT "$(cat /run/user/1000/muru/runs/18631/pid)"
+muru: pid 4211, written to /run/user/1000/muru/run-7f3a9c2e/pid
+$ kill -INT 4211
 ```
 
 `$!` in the shell that started it is the same id. The run's process

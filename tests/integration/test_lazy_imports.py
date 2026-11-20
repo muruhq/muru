@@ -90,7 +90,7 @@ def test_the_import_report_reaches_debug_imports_and_muructl_check(tmp_path: Pat
         "--all",
         "--json",
         "--socket",
-        f"{runtime}/runs/{server.port}/admin.sock",
+        str(server.admin_socket()),
     ]
 
     try:
@@ -135,7 +135,7 @@ def test_the_import_report_reaches_debug_imports_and_muructl_check(tmp_path: Pat
         # Issue 753: the load is an event with the report's figures, its
         # time a metric, and the worker's loads counted once it reports.
 
-        socket = ["--socket", f"{runtime}/runs/{server.port}/admin.sock"]
+        socket = ["--socket", str(server.admin_socket())]
         events = subprocess.run(
             [str(support.muructl_path()), "events", *socket],
             capture_output=True,
@@ -223,7 +223,7 @@ def test_the_workers_section_says_which_deferrals_pay_off(tmp_path: Path) -> Non
         "imports",
         "--json",
         "--socket",
-        f"{runtime}/runs/{server.port}/admin.sock",
+        str(server.admin_socket()),
     ]
 
     try:

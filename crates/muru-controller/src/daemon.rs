@@ -943,6 +943,9 @@ pub struct Info {
     /// Sections 7.7 and 13.9: the daemon's cgroup limits as last read,
     /// and the memory guard, for status.
     pub cgroup_limits: std::sync::Mutex<Option<muru_proto::admin::v1::CgroupLimits>>,
+    /// The instance's ID, kept in the state directory so it is the same
+    /// across restarts (section 13.8, issue 805).
+    pub instance_id: crate::registry::InstanceId,
 }
 
 /// What runs for one release now, for the API.
@@ -1992,6 +1995,36 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             .with_context(|| format!("creating {}", location.path.display()))?;
     }
 
+    // Section 13.8: the daemon registers in the instance registry, under
+    // the ID kept in its state directory, taking over the entry it left
+    // when it detached or was killed. It is written again once the edge
+    // is up, and whenever what it says changes.
+
+    let instance_id =
+        crate::registry::InstanceId::kept_in(&locations.state.path.join(INSTANCE_ID_FILE))
+            .with_context(|| {
+                format!(
+                    "keeping the instance ID in {}",
+                    locations.state.path.display()
+                )
+            })?;
+    let registered = match crate::registry::Entry::publish(
+        &crate::registry::user_registry(),
+        daemon_record(
+            instance_id,
+            &locations,
+            &settings.listeners,
+            settings.dashboard,
+            None,
+        ),
+    ) {
+        Ok(entry) => Some(entry),
+        Err(error) => {
+            tracing::warn!(%error, "registering in the instance registry failed");
+            None
+        }
+    };
+
     // ADR 0026: a daemon that is root starts everything else as the
     // service user, and does not start without one.
 
@@ -2101,6 +2134,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     tracing::info!("{}", provisioning.describe_uv());
     write_edge_record(&locations.run.path, &edge);
 
+    if let Some(entry) = &registered {
+        entry.update(|record| {
+            *record = daemon_record(
+                instance_id,
+                &locations,
+                &edge.listeners(),
+                dashboard,
+                edge.pid(),
+            );
+        });
+    }
+
     // The admin API on its socket.
 
     let (commands, mut inbox) = mpsc::channel::<Command>(64);
@@ -2137,6 +2182,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         started: std::sync::atomic::AtomicBool::new(false),
         stopping: std::sync::atomic::AtomicBool::new(false),
         cgroup_limits: std::sync::Mutex::new(None),
+        instance_id,
     });
     let underway = crate::commands::Underway::default();
     let runs = crate::runs::Runs::new(
@@ -2470,6 +2516,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 break served.map_err(anyhow::Error::from).and_then(|result| result);
             }
             _ = tick.tick() => {
+                if let Some(entry) = &registered {
+                    refresh_record(entry, &daemon.info);
+                }
+
                 daemon.check_edge().await;
                 daemon.check_hosts().await;
                 daemon.run_schedules().await;
@@ -2619,6 +2669,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     } else if upgrade_to.is_none() {
         daemon.detach();
         daemon.runs.release();
+        keep_record(registered.as_ref());
         daemon.events.emit(
             "daemon.detached",
             "daemon",
@@ -2628,6 +2679,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     } else {
         daemon.detach();
         daemon.runs.release();
+        keep_record(registered.as_ref());
     }
 
     // The API answers the Shutdown call that brought the daemon here
@@ -2710,6 +2762,76 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
 
     outcome
+}
+
+/// The file in the state directory that keeps a daemon's instance ID.
+pub const INSTANCE_ID_FILE: &str = "instance-id";
+
+/// A daemon's registry record (section 13.8): where it is, what it
+/// listens on, and its edge.
+fn daemon_record(
+    id: crate::registry::InstanceId,
+    locations: &Locations,
+    listeners: &[(SocketAddr, bool)],
+    dashboard: Option<SocketAddr>,
+    edge_pid: Option<u32>,
+) -> crate::registry::Record {
+    let mut record = crate::registry::Record::new(
+        id,
+        crate::registry::Kind::Daemon,
+        crate::client::Endpoint::unix(locations.admin_socket()),
+        locations.run.path.clone(),
+    );
+
+    record.name = locations.instance_name();
+    record.scope = locations.mode_word().to_owned();
+    record.state_dir = Some(locations.state.path.clone());
+    record.config = Some(locations.config.path.clone());
+    record.log_dir = Some(locations.logs.path.clone());
+    record.dashboard = dashboard.map(|address| format!("http://{address}/"));
+    record.edge_pid = edge_pid.filter(|pid| *pid != 0);
+
+    // Before the edge is up the listeners are as configured; once it is,
+    // as it serves them.
+
+    record.listeners = listeners
+        .iter()
+        .map(|(address, tls)| crate::registry::Listener {
+            name: if *tls { "https" } else { "http" }.to_owned(),
+            configured: address.to_string(),
+            bound: edge_pid.map(|_| address.to_string()),
+            tls: *tls,
+        })
+        .collect();
+
+    record
+}
+
+/// Write a daemon's record again when its listeners or edge changed.
+fn refresh_record(entry: &crate::registry::Entry, info: &Info) {
+    let listeners = info.listeners.read().expect("listeners poisoned").clone();
+    let edge_pid = info.edge_pid.load(std::sync::atomic::Ordering::Relaxed);
+    let record = daemon_record(
+        info.instance_id,
+        &info.locations,
+        &listeners,
+        info.dashboard,
+        Some(edge_pid),
+    );
+
+    entry.update(|current| {
+        current.listeners = record.listeners;
+        current.edge_pid = record.edge_pid;
+    });
+}
+
+/// Leave the daemon's registry entry for the next daemon to take over,
+/// when it detaches or upgrades: the edge and hosts it leaves serving
+/// belong to it.
+fn keep_record(entry: Option<&crate::registry::Entry>) {
+    if let Some(entry) = entry {
+        entry.keep();
+    }
 }
 
 /// Numbers each command run's directory of secret files.

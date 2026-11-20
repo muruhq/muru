@@ -34,6 +34,7 @@ pub mod ownership;
 pub mod probes;
 pub mod processes;
 pub mod provision;
+pub mod registry;
 pub mod relay;
 pub mod reload;
 pub mod removal;

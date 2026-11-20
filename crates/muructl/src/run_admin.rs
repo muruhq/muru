@@ -3,8 +3,9 @@
 //! daemon does, so the commands that look into a release's workers or
 //! read the edge's figures work against a run unchanged, and refuses the
 //! ones that manage state a run does not have. The socket sits in the
-//! user runtime directory beside a file that names the run, which is how
-//! a command finds it without a flag.
+//! run's own directory under the run directory, and the run's entry in
+//! the instance registry names it, which is how a command finds it
+//! without a flag.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -228,6 +229,8 @@ pub struct RunState {
     pub run_dir: PathBuf,
     /// The admin socket.
     pub socket: PathBuf,
+    /// The instance's ID, as its registry entry has it.
+    pub instance_id: String,
     /// The addresses the edge serves, as URLs.
     pub listeners: Vec<String>,
     /// Where the dashboard is served, when it is.
@@ -922,8 +925,9 @@ pub fn metrics_text(
     render(&aggregate(samples))
 }
 
-/// What a run writes beside its socket, so a command can find it and
-/// say which run it found (section 13.8).
+/// A development run as discovery sees it (section 13.8), from its
+/// registry record; and what `muructl serve` writes beside its socket, so
+/// a command in its container finds it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunInfo {
     /// The run's pid.
@@ -951,61 +955,168 @@ pub struct RunInfo {
     pub started_unix_ms: u64,
 }
 
-/// The run's place in the user runtime directory, removed when dropped.
+impl RunInfo {
+    /// What a run's registry record says of it, when it is a run reached
+    /// through a socket.
+    pub fn from_record(record: &muru_controller::registry::Record) -> Option<Self> {
+        let listen = record.listeners.first().map(|listener| {
+            listener
+                .bound
+                .clone()
+                .unwrap_or_else(|| listener.configured.clone())
+        })?;
+
+        Some(Self {
+            pid: record.pid,
+            app: record.app.clone()?,
+            project: record.project.clone()?,
+            started_from: record.started_from.clone(),
+            listen,
+            socket: record.admin.socket()?.to_path_buf(),
+            runtime: record.runtime.clone(),
+            started_unix_ms: record.started_unix_ms,
+        })
+    }
+}
+
+/// A run's or a serve's place on the machine (section 13.8): its
+/// instance ID, its entry in the instance registry, and for a run its
+/// own directory under the run directory, named by the ID, which holds
+/// its admin socket, its pid file and its releases' run directories. All
+/// of it is removed when dropped.
 pub struct Registration {
+    /// The instance's ID, new for every start.
+    pub id: muru_controller::registry::InstanceId,
     /// The run's own directory, or none for `muructl serve`, whose socket
     /// sits in the container's run directory.
     directory: Option<PathBuf>,
-    /// The admin socket inside it.
+    /// The admin socket.
     pub socket: PathBuf,
+    /// The registry entry, when it could be written.
+    entry: Option<muru_controller::registry::Entry>,
+}
+
+/// The listeners a run or serve is configured with, before they are bound.
+pub fn configured_listeners(
+    http: SocketAddr,
+    https: Option<SocketAddr>,
+) -> Vec<muru_controller::registry::Listener> {
+    std::iter::once((http, false))
+        .chain(https.map(|address| (address, true)))
+        .map(|(address, tls)| muru_controller::registry::Listener {
+            name: if tls { "https" } else { "http" }.to_owned(),
+            configured: address.to_string(),
+            bound: None,
+            tls,
+        })
+        .collect()
 }
 
 impl Registration {
-    /// Make the run's directory under `runs` in the runtime directory,
-    /// named by the port the application is served on so two runs never
-    /// share one, and write the file that names the run.
-    pub fn new(
+    /// Make a run's own directory under `runtime`, named by a new ID, and
+    /// register the run, with the listeners it is configured with.
+    pub fn for_run(
         runtime: &Path,
-        listen: SocketAddr,
         app: &str,
         project: &Path,
-        library: Option<&Path>,
+        listeners: Vec<muru_controller::registry::Listener>,
+        names: &[String],
     ) -> anyhow::Result<Self> {
-        let runs = runtime.join("runs");
-        std::fs::create_dir_all(&runs).with_context(|| format!("creating {}", runs.display()))?;
-        let directory = runs.join(listen.port().to_string());
-        let _ = std::fs::remove_dir_all(&directory);
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let id = muru_controller::registry::InstanceId::generate();
+        std::fs::create_dir_all(runtime)
+            .with_context(|| format!("creating {}", runtime.display()))?;
+        let directory = runtime.join(format!("run-{}", id.short()));
         std::fs::create_dir(&directory)
             .with_context(|| format!("creating {}", directory.display()))?;
 
         // The socket admits whoever may enter the directory, which is its
         // owner alone, as the daemon's runtime directory is.
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-        }
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
 
         let socket = directory.join("admin.sock");
+        let mut record = muru_controller::registry::Record::new(
+            id,
+            muru_controller::registry::Kind::Run,
+            muru_controller::client::Endpoint::unix(&socket),
+            directory.clone(),
+        );
+        record.app = Some(app.to_owned());
+        record.project = Some(project.to_path_buf());
+        record.started_from = std::env::current_dir()
+            .and_then(|directory| directory.canonicalize())
+            .ok();
+        record.listeners = listeners;
+        record.names = names.to_vec();
+
+        Ok(Self {
+            id,
+            directory: Some(directory),
+            socket,
+            entry: publish(record),
+        })
+    }
+
+    /// The admin socket of `muructl serve` at `socket`, in its run
+    /// directory (section 13.9), with the file that names the run beside
+    /// it, and its registry entry. Only the socket and the file are
+    /// removed when dropped, since the directory is the container's
+    /// volume.
+    pub fn for_serve(
+        socket: &Path,
+        app: &str,
+        project: &Path,
+        listeners: Vec<muru_controller::registry::Listener>,
+    ) -> anyhow::Result<Self> {
+        let id = muru_controller::registry::InstanceId::generate();
+        let _ = std::fs::remove_file(socket);
+        let run_dir = socket.parent().map(Path::to_path_buf).unwrap_or_default();
+        let listen = listeners
+            .first()
+            .map(|listener| listener.configured.clone())
+            .unwrap_or_default();
+
         let info = RunInfo {
             pid: std::process::id(),
             app: app.to_owned(),
             project: project.to_path_buf(),
-            started_from: std::env::current_dir()
-                .and_then(|directory| directory.canonicalize())
-                .ok(),
-            listen: listen.to_string(),
-            socket: socket.clone(),
-            runtime: library.map(Path::to_path_buf).into_iter().collect(),
+            started_from: None,
+            listen,
+            socket: socket.to_path_buf(),
+            runtime: Vec::new(),
             started_unix_ms: crate::admin::now_unix_ms(),
         };
-        std::fs::write(directory.join("run.json"), serde_json::to_vec(&info)?)?;
+        let registration = socket.with_file_name("serve.json");
+        std::fs::write(&registration, serde_json::to_vec(&info)?)?;
+
+        // Section 13.9: any user ID with the group may use the serve.
+
+        crate::serve::group_writable(&registration, 0o660);
+
+        let mut record = muru_controller::registry::Record::new(
+            id,
+            muru_controller::registry::Kind::Serve,
+            muru_controller::client::Endpoint::unix(socket),
+            run_dir,
+        );
+        record.app = Some(app.to_owned());
+        record.project = Some(project.to_path_buf());
+        record.listeners = listeners;
+
         Ok(Self {
-            directory: Some(directory),
-            socket,
+            id,
+            directory: None,
+            socket: socket.to_path_buf(),
+            entry: publish(record),
         })
+    }
+
+    /// The run's own directory, where its releases' run directories go;
+    /// none for `muructl serve`.
+    pub fn directory(&self) -> Option<&Path> {
+        self.directory.as_deref()
     }
 
     /// Write the run's process id to `pid` in its directory, as a script
@@ -1017,66 +1128,59 @@ impl Registration {
         Some(path)
     }
 
+    /// Record the addresses bound and the dashboard, once they are known.
+    pub fn served(&self, bound: &[SocketAddr], dashboard: Option<SocketAddr>) {
+        let Some(entry) = &self.entry else {
+            return;
+        };
+
+        entry.update(|record| {
+            for (listener, address) in record.listeners.iter_mut().zip(bound) {
+                listener.bound = Some(address.to_string());
+            }
+
+            record.dashboard = dashboard.map(|address| format!("http://{address}/"));
+        });
+    }
+
     /// Record another runtime library directory the run uses, when a
     /// rebuild moved it to a different interpreter. Earlier ones stay
     /// listed, since a release may still be draining on them.
     pub fn note_runtime(&self, library: &Path) {
-        let Some(directory) = &self.directory else {
-            return;
-        };
-        let path = directory.join("run.json");
-        let Some(mut info) = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<RunInfo>(&bytes).ok())
-        else {
+        let Some(entry) = &self.entry else {
             return;
         };
 
-        if !info.runtime.iter().any(|known| known == library) {
-            info.runtime.push(library.to_path_buf());
-
-            if let Ok(bytes) = serde_json::to_vec(&info) {
-                let _ = std::fs::write(path, bytes);
+        entry.update(|record| {
+            if !record.runtime.iter().any(|known| known == library) {
+                record.runtime.push(library.to_path_buf());
             }
-        }
+        });
     }
+}
 
-    /// The admin socket of `muructl serve` at `socket`, in its run
-    /// directory (section 13.9), with the file that names the run beside
-    /// it. Only the socket and the file are removed when dropped, since
-    /// the directory is the container's volume.
-    pub fn at(
-        socket: &Path,
-        listen: SocketAddr,
-        app: &str,
-        project: &Path,
-    ) -> anyhow::Result<Self> {
-        let _ = std::fs::remove_file(socket);
-        let info = RunInfo {
-            pid: std::process::id(),
-            app: app.to_owned(),
-            project: project.to_path_buf(),
-            started_from: None,
-            listen: listen.to_string(),
-            socket: socket.to_path_buf(),
-            runtime: Vec::new(),
-            started_unix_ms: crate::admin::now_unix_ms(),
-        };
-        let registration = socket.with_file_name("serve.json");
-        std::fs::write(&registration, serde_json::to_vec(&info)?)?;
+/// Publish a run's or serve's record, saying so when it cannot be: the
+/// instance still serves, but `muructl instance list` cannot see it and
+/// commands find it only by its socket.
+fn publish(record: muru_controller::registry::Record) -> Option<muru_controller::registry::Entry> {
+    let registry = muru_controller::registry::user_registry();
 
-        // Section 13.9: any user ID with the group may use the serve.
-
-        crate::serve::group_writable(&registration, 0o660);
-        Ok(Self {
-            directory: None,
-            socket: socket.to_path_buf(),
-        })
+    match muru_controller::registry::Entry::publish(&registry, record) {
+        Ok(entry) => Some(entry),
+        Err(error) => {
+            muru_common::muru_println!(
+                "could not register in the instance registry {}: {error}",
+                registry.display()
+            );
+            None
+        }
     }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
+        drop(self.entry.take());
+
         match &self.directory {
             Some(directory) => {
                 let _ = std::fs::remove_dir_all(directory);
@@ -1089,34 +1193,20 @@ impl Drop for Registration {
     }
 }
 
-/// The development runs listening now, from the runtime directory; the
-/// leavings of a run that is gone are removed on the way. The socket is
-/// tried because the pid of a run that is gone can come to belong to
-/// another process.
+/// The development runs listening now under the run directory `runtime`,
+/// from the instance registry: live entries of runs whose own directory
+/// is inside it, so a test session's runs under its own run directory
+/// are never reached from outside it.
 pub fn runs(runtime: &Path) -> Vec<RunInfo> {
-    let Ok(entries) = std::fs::read_dir(runtime.join("runs")) else {
-        return Vec::new();
-    };
-    let mut found = Vec::new();
-
-    for entry in entries.flatten() {
-        let info = std::fs::read(entry.path().join("run.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<RunInfo>(&bytes).ok());
-
-        match info {
-            Some(info)
-                if muru_controller::host::alive(info.pid)
-                    && info.socket.exists()
-                    && !muru_controller::client::left_behind(&info.socket) =>
-            {
-                found.push(info);
-            }
-            _ => {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
-    }
+    let mut found: Vec<RunInfo> =
+        muru_controller::registry::live(&muru_controller::registry::user_registry())
+            .iter()
+            .filter(|record| {
+                record.kind == muru_controller::registry::Kind::Run
+                    && record.run_dir.starts_with(runtime)
+            })
+            .filter_map(RunInfo::from_record)
+            .collect();
 
     found.sort_by(|a, b| a.listen.cmp(&b.listen));
     found
@@ -1323,6 +1413,8 @@ impl Admin for Service {
         Ok(Response::new(pb::Status {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             pid: std::process::id(),
+            instance_id: state.instance_id.clone(),
+            hostname: muru_controller::processes::hostname(),
             state_dir: String::new(),
             run_dir: state.run_dir.display().to_string(),
             socket: state.socket.display().to_string(),

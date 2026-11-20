@@ -1257,9 +1257,9 @@ fn main() -> anyhow::Result<()> {
             output,
         } => runtime.block_on(async move {
             if processes.processes {
-                processes::show(&socket.socket()?, &processes, output.json).await
+                processes::show(&socket.endpoint()?, &processes, output.json).await
             } else {
-                admin::show_status(&socket.socket()?, output.json).await
+                admin::show_status(&socket.endpoint()?, output.json).await
             }
         }),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
@@ -3884,12 +3884,55 @@ async fn run_with(
         }
     }
 
-    let run_dir = match &serve {
-        Some(mode) => {
-            serve::make_run_dir(&mode.run_dir)?;
-            mode.run_dir.join("release")
+    // Section 13.8: the run registers in the instance registry before
+    // anything starts, so whatever it starts carries its ID. A run's own
+    // directory under the run directory, named by the ID, holds its admin
+    // socket and its releases' run directories, and nothing is written
+    // into the project.
+
+    if let Some(mode) = &serve {
+        serve::make_run_dir(&mode.run_dir)?;
+    }
+
+    let runtime = muru_controller::locations::Locations::resolve(&Default::default())
+        .run
+        .path;
+    let project = resolved
+        .project
+        .canonicalize()
+        .unwrap_or_else(|_| resolved.project.clone());
+    let (planned_http, planned_https) = addresses(&args, &resolved.serving);
+    let planned =
+        run_admin::configured_listeners(planned_http, tls.is_some().then_some(planned_https));
+
+    let registered = match &serve {
+        Some(mode) => run_admin::Registration::for_serve(
+            &mode.run_dir.join(serve::ADMIN_SOCKET),
+            &label,
+            &project,
+            planned,
+        ),
+        None => run_admin::Registration::for_run(
+            &runtime,
+            &label,
+            &project,
+            planned,
+            &resolved.serving.hosts,
+        ),
+    };
+
+    let registration = match registered {
+        Ok(registration) => Some(registration),
+        Err(error) => {
+            muru_common::muru_println!("no admin socket: {error:#}");
+            None
         }
-        None => std::env::temp_dir().join(format!("muru-{}", std::process::id())),
+    };
+
+    let run_dir = match (&serve, registration.as_ref().and_then(|r| r.directory())) {
+        (Some(mode), _) => mode.run_dir.join("release"),
+        (None, Some(directory)) => directory.to_path_buf(),
+        (None, None) => std::env::temp_dir().join(format!("muru-{}", std::process::id())),
     };
 
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
@@ -4448,36 +4491,23 @@ async fn run_with(
         }
     }
 
-    // Section 13.1: the admin socket, in the user runtime directory so
-    // nothing is written into the project, named by the port so two runs
-    // never share one; muructl finds it from the file beside it.
+    // Section 13.1: the admin socket, in the run's own directory; muructl
+    // finds it through the run's registry entry.
 
     let (admin_stop_tx, admin_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let commands = muru_controller::commands::Underway::default();
     let mut admin_serving = None;
-    let runtime = muru_controller::locations::Locations::resolve(&Default::default())
-        .run
-        .path;
-    let project = resolved
-        .project
-        .canonicalize()
-        .unwrap_or_else(|_| resolved.project.clone());
 
-    let registered = match &serve {
-        Some(mode) => run_admin::Registration::at(
-            &mode.run_dir.join(serve::ADMIN_SOCKET),
-            edge.local_addr(),
-            &label,
-            &project,
-        ),
-        None => run_admin::Registration::new(
-            &runtime,
-            edge.local_addr(),
-            &label,
-            &project,
-            library.pythonpath.as_deref(),
-        ),
-    };
+    if let Some(registration) = &registration {
+        let bound: Vec<SocketAddr> = std::iter::once(edge.local_addr())
+            .chain(edge.https_addr())
+            .collect();
+        registration.served(&bound, dashboard_address);
+
+        if let Some(directory) = &library.pythonpath {
+            registration.note_runtime(directory);
+        }
+    }
 
     // Section 13.8: commands run from the project directory, or from
     // where this run was started, reach it.
@@ -4492,14 +4522,6 @@ async fn run_with(
             _ => project.display().to_string(),
         }
     });
-
-    let registration = match registered {
-        Ok(registration) => Some(registration),
-        Err(error) => {
-            muru_common::muru_println!("no admin socket: {error:#}");
-            None
-        }
-    };
 
     // Issue 764: once the addresses are known, the title names them too,
     // so `pgrep -f` finds a run by its port, and a development run says
@@ -4539,6 +4561,7 @@ async fn run_with(
             project: project.clone(),
             run_dir: run_dir.clone(),
             socket: registration.socket.clone(),
+            instance_id: registration.id.to_string(),
             listeners,
             dashboard: dashboard_address,
             started_unix_ms: std::time::SystemTime::now()

@@ -34,6 +34,19 @@ def test_status_before_any_release(daemon: Daemon) -> None:
     assert "apps     0 (0 releases)" in status
     assert daemon.get("/").status == 503
 
+    # Issue 805: the daemon is in the user's instance registry under the
+    # ID kept in its state directory, which its status reports.
+
+    answer = json.loads(daemon.muructl("status", "--json").stdout)
+    instance_id = (daemon.base / "state" / "instance-id").read_text().strip()
+    assert answer["instance_id"] == instance_id and answer["hostname"]
+    record = json.loads((support.user_registry() / instance_id / "instance.json").read_text())
+    assert record["kind"] == "daemon" and "name" not in record
+    assert record["pid"] == daemon.process.pid
+    assert record["state_dir"] == str(daemon.base / "state")
+    assert record["admin"]["path"] == str(daemon.run_dir / "admin.sock")
+    assert record["listeners"][0]["bound"] == f"127.0.0.1:{daemon.port}"
+
 
 def test_deploy_serves_and_records_the_release(daemon: Daemon) -> None:
     assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"

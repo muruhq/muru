@@ -112,7 +112,7 @@ impl Installation {
         let mut locations = crate::admin::daemon_locations(socket, files);
 
         let answered = tokio::time::timeout(ASK, async {
-            let mut client = client::connect(&path).await?;
+            let mut client = client::connect(&client::Endpoint::unix(&path)).await?;
             let status = client
                 .get_status(pb::GetStatusRequest {})
                 .await?

@@ -301,6 +301,8 @@ message Status {
   string log_dir = 21;              // the daemon's log directory; empty for a run, which writes no log files
   string cache_dir = 22;            // the daemon's cache directory; empty for a run
   CgroupLimits limits = 23;         // the cgroup's limits and the memory guard, when there is a cgroup v2
+  string instance_id = 24;          // the instance's ID, 32 hex digits, as its registry entry has it (section 13.8), so a client can check it reached the instance it meant
+  string hostname = 25;             // the machine's hostname
 }
 
 message ListWebSocketsRequest {

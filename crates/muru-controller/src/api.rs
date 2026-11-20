@@ -301,6 +301,8 @@ impl Admin for Service {
         Ok(Response::new(pb::Status {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             pid: std::process::id(),
+            instance_id: info.instance_id.to_string(),
+            hostname: crate::processes::hostname(),
             state_dir: info.locations.state.path.display().to_string(),
             run_dir: info.locations.run.path.display().to_string(),
             socket: info.locations.admin_socket().display().to_string(),
