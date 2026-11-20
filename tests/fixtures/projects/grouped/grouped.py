@@ -3,7 +3,8 @@
 The response says which group and worker served it, and the group the
 environment names, so a test can see paths reach the right workers. A
 query string of ms=N holds the request for that long, for the group
-timeouts.
+timeouts, in steps of 10 ms, so that a soft timeout's interrupt is
+raised soon after it is set rather than when one long sleep ends.
 """
 
 from __future__ import annotations
@@ -23,7 +24,10 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
     query = environ.get("QUERY_STRING", "")
 
     if query.startswith("ms="):
-        time.sleep(int(query[3:]) / 1000)
+        until = time.monotonic() + int(query[3:]) / 1000
+
+        while time.monotonic() < until:
+            time.sleep(0.01)
 
     body = json.dumps(
         {

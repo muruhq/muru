@@ -119,9 +119,12 @@ def test_render_writes_the_groups() -> None:
 
 def test_a_group_has_timeouts_of_its_own(development: support.Server) -> None:
     # Section 7.1: the slow group's soft timeout interrupts its request;
-    # the default group, with none, serves a request as long.
+    # the default group, with none, serves a request past that timeout.
+    # The slow request is held for three times the timeout, so a runner
+    # that stalls before the watchdog acts still sees it interrupted
+    # (issue 803).
 
-    slow = development.get("/slow/report?ms=1500", headers={"Accept": "application/json"})
+    slow = development.get("/slow/report?ms=3000", headers={"Accept": "application/json"})
     assert slow.status == 504, slow.body
     assert json.loads(slow.body)["reason"] == "soft_timeout"
     assert served_by(development.get("/?ms=1500"))["group"] == "default"
