@@ -101,7 +101,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .collect();
     let server = Server {
         tools: Arc::new(tools),
-        connect: Arc::new(args.socket.as_arguments()),
+        connect: Arc::new(connect_arguments(&args.socket)?),
         muructl,
         read_only: args.read_only,
         skill: crate::skill::status(std::path::Path::new(crate::skill::DEFAULT_DIR)),
@@ -333,6 +333,22 @@ impl Server {
 
         if self.read_only {
             text.push_str("\n\nThis server is read-only: it offers no tool that changes anything.");
+        }
+
+        // Which instance the tools reach, settled when the server started.
+
+        match self.connect.iter().position(|word| word == "--instance") {
+            Some(at) => text.push_str(&format!(
+                "\n\nThe tools reach the named instance {}. To work with another, the server \
+                 is started with --instance NAME, or muru.local.toml in the project names one \
+                 with instance = \"NAME\".",
+                self.connect.get(at + 1).map_or("", String::as_str)
+            )),
+            None => text.push_str(
+                "\n\nWith several daemons on the machine, each a named instance, the server is \
+                 started with --instance NAME, or muru.local.toml in the project names one with \
+                 instance = \"NAME\", and every tool reaches that instance; `instances` lists them.",
+            ),
         }
 
         // A project whose skill is missing or older than this muructl's
@@ -702,6 +718,23 @@ fn docs(arguments: &JsonObject) -> CallToolResult {
             "no page named {wanted}; call docs without a page for the list"
         )),
     }
+}
+
+/// The options every command the server runs is given: those it was
+/// started with, or the instance a variable or the checkout's
+/// muru.local.toml names, settled once at start so every tool reaches it
+/// (section 10.11).
+fn connect_arguments(socket: &crate::admin::SocketArgs) -> anyhow::Result<Vec<String>> {
+    let given = socket.as_arguments();
+
+    if !given.is_empty() {
+        return Ok(given);
+    }
+
+    Ok(match socket.named()? {
+        Some(name) => vec!["--instance".to_owned(), name],
+        None => Vec::new(),
+    })
 }
 
 /// Every tool, in the order the agent sees them: few and shaped like

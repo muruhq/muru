@@ -234,18 +234,299 @@ pub struct JsonArgs {
 /// How to reach a daemon or a development run: its admin socket.
 #[derive(Args, Clone, Default)]
 pub struct SocketArgs {
-    /// The admin socket (default: MURU_SOCKET, else a development run
+    /// The admin socket (default: MURU_SOCKET, else the instance
+    /// MURU_INSTANCE or muru.local.toml names, else a development run
     /// whose project is the current directory or that was started from
     /// it, else the user daemon's socket in the runtime directory, else
     /// the one development run listening).
-    #[arg(long, global = true, value_name = "PATH", env = "MURU_SOCKET")]
+    #[arg(long, global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
 
     #[command(flatten)]
     locations: InstanceArgs,
 }
 
+/// The variable that names an admin socket.
+const SOCKET_VARIABLE: &str = "MURU_SOCKET";
+
+/// Where a name that chose the instance came from (section 13.8, issue
+/// 811), for saying so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChosenBy {
+    /// `--instance`.
+    Flag,
+    /// `MURU_INSTANCE`.
+    Variable,
+    /// `instance` in a muru.local.toml.
+    LocalFile(PathBuf),
+}
+
+/// What the command being run is, for choosing its instance: whether
+/// only a daemon answers it, so a development run of the directory is
+/// not preferred, what it changes, said when a name chose the instance,
+/// and the project whose muru.local.toml is read.
+#[derive(Debug, Default)]
+pub struct Running {
+    /// Only a daemon answers it.
+    pub daemon_only: bool,
+    /// What it does, when it changes something, such as `deploying shop`.
+    pub change: Option<String>,
+    /// The directory whose muru.local.toml is read, when not the current
+    /// one, as `muructl deploy APP PATH` reads PATH's.
+    pub project: Option<PathBuf>,
+}
+
+/// The command being run, set once by main.
+static RUNNING: std::sync::OnceLock<Running> = std::sync::OnceLock::new();
+
+/// The instance name the command reached, for `--json` output.
+static REACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Say what the command being run is, before it chooses its instance.
+pub fn set_running(running: Running) {
+    let _ = RUNNING.set(running);
+}
+
+/// The instance name the command reached by name, if it did.
+pub fn reached_instance() -> Option<&'static str> {
+    REACHED.get().map(String::as_str)
+}
+
+/// The commands that work on this machine's processes and files rather
+/// than through the admin API (section 13.8, issue 811), marked here and
+/// nowhere else. Each refuses an instance that is not on this machine,
+/// through [`require_local`]; every other command goes through the admin
+/// API and works on any endpoint.
+pub const LOCAL_ONLY: [&str; 7] = [
+    "instance prune",
+    "instance list --orphans and --ports",
+    "daemon start",
+    "daemon run",
+    "the logs commands on files",
+    "cache",
+    "secret",
+];
+
+/// Refuse a local-only command, one of [`LOCAL_ONLY`], for an instance
+/// that is not on this machine.
+pub fn require_local(what: &str, name: Option<&str>) -> anyhow::Result<()> {
+    debug_assert!(
+        LOCAL_ONLY.contains(&what),
+        "{what} is not marked local-only"
+    );
+
+    let Some(name) = name else {
+        return Ok(());
+    };
+
+    let defined = [false, true]
+        .map(muru_controller::locations::caller_config_area)
+        .iter()
+        .find_map(|area| muru_controller::catalogue::find(area, name));
+
+    match defined {
+        Some(definition) if !definition.is_local() => anyhow::bail!(
+            "instance {name} is not on this machine; {what} works only on local instances"
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// The endpoint of the instance `name` names: the default daemons by
+/// their locations, a named instance from the catalogue of definitions
+/// and then its live registry entry. A remote definition would give its
+/// endpoint here, with nothing else changing.
+pub fn resolve_name(name: &str, system: bool) -> anyhow::Result<client::Endpoint> {
+    if muru_controller::locations::RESERVED_NAMES.contains(&name) {
+        let locations = Locations::resolve(&Options {
+            system,
+            instance: Some(name.to_owned()),
+            ..Options::default()
+        });
+        return Ok(client::Endpoint::unix(locations.admin_socket()));
+    }
+
+    let areas = [false, true].map(muru_controller::locations::caller_config_area);
+    let defined = areas
+        .iter()
+        .find_map(|area| muru_controller::catalogue::find(area, name));
+
+    let Some(definition) = defined else {
+        let mut names: Vec<String> = areas
+            .iter()
+            .flat_map(|area| muru_controller::catalogue::read(area).0)
+            .map(|definition| definition.name)
+            .collect();
+        names.sort();
+        names.dedup();
+
+        if names.is_empty() {
+            anyhow::bail!(
+                "no instance {name} is defined, and none are; define one with muructl instance \
+                 create {name}"
+            );
+        }
+
+        anyhow::bail!(
+            "no instance {name} is defined; the defined instances are {}",
+            names.join(", ")
+        );
+    };
+
+    let live = muru_controller::registry::readable_registries()
+        .iter()
+        .flat_map(|registry| muru_controller::registry::live(registry))
+        .find(|record| record.name.as_deref() == Some(definition.name.as_str()));
+
+    match live {
+        Some(record) => Ok(record.admin),
+        None => anyhow::bail!(
+            "instance {name} is not running; start it with muructl daemon start --instance {name}"
+        ),
+    }
+}
+
 impl SocketArgs {
+    /// The socket the command line or `MURU_SOCKET` names, if either does.
+    pub fn given_socket(&self) -> Option<PathBuf> {
+        self.socket.clone().or_else(|| {
+            std::env::var_os(SOCKET_VARIABLE)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+    }
+
+    /// Choose the instance to reach (section 13.8, issue 811): `--socket`
+    /// or `--instance`, then `MURU_SOCKET` or `MURU_INSTANCE`, then
+    /// `instance` in muru.local.toml, then discovery. A development run of
+    /// this directory still wins over the local file for a command both
+    /// answer, with a note; a flag or variable is explicit and wins.
+    pub fn choose(&self) -> anyhow::Result<client::Endpoint> {
+        let system = self.locations.system;
+
+        match (&self.socket, &self.locations.instance) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("--socket and --instance both name what to reach; give one")
+            }
+            (Some(socket), None) => return Ok(client::Endpoint::unix(socket)),
+            (None, Some(name)) => return self.chosen_by_name(name, ChosenBy::Flag, system),
+            (None, None) => {}
+        }
+
+        let variable_socket = std::env::var_os(SOCKET_VARIABLE).filter(|value| !value.is_empty());
+
+        match (variable_socket, instance_from_environment()) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "{SOCKET_VARIABLE} and {INSTANCE_VARIABLE} are both set, and both name what to \
+                 reach; unset one"
+            ),
+            (Some(socket), None) => return Ok(client::Endpoint::unix(PathBuf::from(socket))),
+            (None, Some(name)) => return self.chosen_by_name(&name, ChosenBy::Variable, system),
+            (None, None) => {}
+        }
+
+        // The checkout's own file, unless a development run of this
+        // directory answers a command it can.
+
+        let running = RUNNING.get();
+        let directory = running
+            .and_then(|running| running.project.clone())
+            .or_else(|| std::env::current_dir().ok());
+
+        if let Some(directory) = directory
+            && let Some((file, name)) =
+                muru_config::local_instance(&directory).map_err(anyhow::Error::msg)?
+        {
+            let daemon_only = running.is_some_and(|running| running.daemon_only);
+
+            if !daemon_only && let Some(run) = self.run_here() {
+                static NOTED: std::sync::Once = std::sync::Once::new();
+
+                NOTED.call_once(|| {
+                    muru_common::muru_eprintln!(
+                        "reaching the development run of {} on http://{}; {} names instance \
+                         {name}, pass --instance {name} to reach it",
+                        run.app,
+                        run.listen,
+                        muru_config::LOCAL_FILE
+                    );
+                });
+
+                return Ok(client::Endpoint::unix(run.socket));
+            }
+
+            return self.chosen_by_name(&name, ChosenBy::LocalFile(file), system);
+        }
+
+        Ok(client::Endpoint::unix(self.socket()?))
+    }
+
+    /// The instance a name chooses, by the flag, the variable or the
+    /// checkout's muru.local.toml, without reaching it: what `muructl mcp
+    /// serve` settles once at start.
+    pub fn named(&self) -> anyhow::Result<Option<String>> {
+        if self.socket.is_some() {
+            return Ok(None);
+        }
+
+        if let Some(name) = &self.locations.instance {
+            return Ok(Some(name.clone()));
+        }
+
+        if std::env::var_os(SOCKET_VARIABLE).is_some_and(|value| !value.is_empty()) {
+            return Ok(None);
+        }
+
+        if let Some(name) = instance_from_environment() {
+            return Ok(Some(name));
+        }
+
+        let directory = std::env::current_dir()?;
+        Ok(muru_config::local_instance(&directory)
+            .map_err(anyhow::Error::msg)?
+            .map(|(_, name)| name))
+    }
+
+    /// The newest development run whose project is the current directory,
+    /// or that was started from it, when one listens.
+    fn run_here(&self) -> Option<crate::run_admin::RunInfo> {
+        let here = std::env::current_dir()
+            .and_then(|directory| directory.canonicalize())
+            .ok()?;
+        let runs = crate::run_admin::runs(&self.locations.resolve().run.path);
+
+        runs.into_iter()
+            .filter(|run| {
+                run.project == here || run.started_from.as_deref() == Some(here.as_path())
+            })
+            .max_by_key(|run| run.started_unix_ms)
+    }
+
+    /// The instance `name` names, said when the command changes something.
+    fn chosen_by_name(
+        &self,
+        name: &str,
+        by: ChosenBy,
+        system: bool,
+    ) -> anyhow::Result<client::Endpoint> {
+        let endpoint = resolve_name(name, system)?;
+        let _ = REACHED.set(name.to_owned());
+
+        if let Some(change) = RUNNING.get().and_then(|running| running.change.as_deref()) {
+            static SAID: std::sync::Once = std::sync::Once::new();
+
+            let from = match &by {
+                ChosenBy::LocalFile(_) => format!(" (from {})", muru_config::LOCAL_FILE),
+                ChosenBy::Variable => format!(" (from {INSTANCE_VARIABLE})"),
+                _ => String::new(),
+            };
+
+            SAID.call_once(|| muru_common::muru_eprintln!("{change} to instance {name}{from}"));
+        }
+
+        Ok(endpoint)
+    }
+
     /// The same options, for a muructl command run on this one's behalf,
     /// which then reaches the same daemon.
     pub fn as_arguments(&self) -> Vec<String> {
@@ -334,9 +615,9 @@ impl SocketArgs {
     }
 
     /// The admin endpoint to connect to (design specification section
-    /// 13.8).
+    /// 13.8), as [`SocketArgs::choose`] decides it.
     pub fn endpoint(&self) -> anyhow::Result<client::Endpoint> {
-        self.socket().map(client::Endpoint::unix)
+        self.choose()
     }
 
     /// The socket to connect to (design specification section 13.8): as
@@ -345,8 +626,8 @@ impl SocketArgs {
     /// listens, else the one run listening; several runs and no daemon
     /// are named, so one can be chosen.
     pub fn socket(&self) -> anyhow::Result<PathBuf> {
-        if let Some(socket) = &self.socket {
-            return Ok(socket.clone());
+        if let Some(socket) = self.given_socket() {
+            return Ok(socket);
         }
 
         // A named instance's socket is where its name puts it.
@@ -689,6 +970,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         .check_run_dir()
         .map_err(|error| anyhow::anyhow!(error))?;
     check_defined(&locations)?;
+    require_local("daemon run", locations.instance.as_deref())?;
 
     // Issue 804: the daemon owns its state and run directories before it
     // does anything else, so a second daemon on either is refused before
@@ -790,6 +1072,7 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         .check_run_dir()
         .map_err(|error| anyhow::anyhow!(error))?;
     check_defined(&locations)?;
+    require_local("daemon start", locations.instance.as_deref())?;
     let socket = locations.admin_socket();
 
     // A daemon answering on this socket is this one when it uses the same
@@ -3965,6 +4248,21 @@ pub struct DeployArgs {
     output: JsonArgs,
 }
 
+impl DeployArgs {
+    /// The application deployed.
+    pub fn app(&self) -> &str {
+        &self.app
+    }
+
+    /// The source directory, whose muru.local.toml says which instance the
+    /// deploy goes to.
+    pub fn source(&self) -> PathBuf {
+        self.source
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    }
+}
+
 /// Parse NAME=VALUE for --env.
 fn parse_env_setting(text: &str) -> Result<(String, String), String> {
     let (name, value) = text
@@ -4059,6 +4357,8 @@ pub async fn secret(command: SecretCommand) -> anyhow::Result<()> {
             store, locations, ..
         } => (store.clone(), locations.resolve()?),
     };
+
+    require_local("secret", locations.instance.as_deref())?;
 
     let document = read_config(&locations.config.path)?;
     let stores = muru_controller::secrets::Store::from_document(
@@ -8231,7 +8531,7 @@ impl<'a> Place<'a> {
             });
         }
 
-        if let Some(given) = &socket.socket {
+        if let Some(given) = socket.given_socket() {
             return Ok(Self::Socket {
                 socket: client::Endpoint::unix(given),
                 target: None,
@@ -9439,10 +9739,13 @@ fn host_has_own_file(name: &str, access_log_file: &str, format: &str) -> anyhow:
 /// to be picked out of it. With no daemon listening and no socket named,
 /// they come from the files.
 async fn log_lines(args: &LogsArgs) -> anyhow::Result<(LogLines, Option<String>)> {
-    let path = args.socket.socket()?;
+    let endpoint = args.socket.endpoint()?;
     let locations = daemon_locations(&args.socket, &args.files);
 
-    if path == locations.admin_socket() && no_daemon(&args.socket, &path) {
+    if let Some(path) = endpoint.socket()
+        && path == locations.admin_socket()
+        && no_daemon(&args.socket, path)
+    {
         return file_log_lines(args, &locations);
     }
 
@@ -9455,7 +9758,7 @@ async fn log_lines(args: &LogsArgs) -> anyhow::Result<(LogLines, Option<String>)
         None => (String::new(), String::new()),
     };
 
-    let mut client = client::connect(&client::Endpoint::unix(&path)).await?;
+    let mut client = client::connect(&endpoint).await?;
 
     // Section 11.2: a virtual host's records are in the file it names
     // for them, or else among the access log's, where each JSON record
@@ -9699,7 +10002,7 @@ pub(crate) fn daemon_locations(socket: &SocketArgs, files: &DaemonFileArgs) -> L
 /// refuses the connection, is no daemon. Anything else, such as a
 /// permission refused, is left for the connection to report.
 fn no_daemon(socket: &SocketArgs, path: &Path) -> bool {
-    socket.socket.is_none()
+    socket.given_socket().is_none()
         && match path.try_exists() {
             Ok(false) => true,
             Ok(true) => muru_controller::client::left_behind(path),
@@ -9712,9 +10015,9 @@ fn no_daemon(socket: &SocketArgs, path: &Path) -> bool {
 /// listening it works on the files in the resolved log directory.
 async fn logs_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result<LogsWay> {
     let locations = daemon_locations(socket, files);
+    require_local("the logs commands on files", locations.instance.as_deref())?;
     let path = socket
-        .socket
-        .clone()
+        .given_socket()
         .unwrap_or_else(|| locations.admin_socket());
 
     if no_daemon(socket, &path) {
@@ -10325,9 +10628,9 @@ enum CacheWay {
 /// running daemon's is refused rather than worked on behind its back.
 async fn cache_way(socket: &SocketArgs, files: &DaemonFileArgs) -> anyhow::Result<CacheWay> {
     let locations = daemon_locations(socket, files);
+    require_local("cache", locations.instance.as_deref())?;
     let path = socket
-        .socket
-        .clone()
+        .given_socket()
         .unwrap_or_else(|| locations.admin_socket());
 
     if no_daemon(socket, &path) {
@@ -10964,7 +11267,17 @@ fn or_dash(text: &str) -> &str {
 /// Print an answer as indented JSON, with the admin API's field names:
 /// what `--json` prints.
 pub fn print_answer<T: serde::Serialize>(answer: &T) -> anyhow::Result<()> {
-    println!("{}", serde_json::to_string_pretty(answer)?);
+    let mut value = serde_json::to_value(answer)?;
+
+    // Section 13.8: an answer from an instance a name chose says which.
+
+    if let (Some(name), Some(object)) = (reached_instance(), value.as_object_mut()) {
+        object
+            .entry("instance")
+            .or_insert_with(|| serde_json::Value::from(name));
+    }
+
+    println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 

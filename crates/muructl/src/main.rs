@@ -1051,6 +1051,63 @@ enum Link {
     Tcp,
 }
 
+/// What a command is, for choosing its instance (section 13.8): whether
+/// only a daemon answers it, so a development run of the directory is not
+/// preferred over muru.local.toml, and what it changes, said when a name
+/// chose the instance.
+fn running(command: &Command) -> admin::Running {
+    let words: Vec<String> = std::env::args()
+        .skip(1)
+        .take_while(|word| !word.starts_with('-'))
+        .take(2)
+        .collect();
+    let change = |changes: bool| changes.then(|| format!("sending muructl {}", words.join(" ")));
+
+    match command {
+        Command::Deploy(args) => admin::Running {
+            daemon_only: true,
+            change: Some(format!("deploying {}", args.app())),
+            project: Some(args.source()),
+        },
+        Command::Apply(_)
+        | Command::Rollback { .. }
+        | Command::Drain { .. }
+        | Command::Maintenance { .. } => admin::Running {
+            daemon_only: true,
+            change: change(true),
+            project: None,
+        },
+        Command::App { .. }
+        | Command::Release { .. }
+        | Command::Rollout { .. }
+        | Command::Overlay { .. }
+        | Command::Secret { .. } => {
+            let reads = matches!(
+                words.get(1).map(String::as_str),
+                Some("list" | "show" | "status" | "wait" | "preview")
+            );
+
+            admin::Running {
+                daemon_only: true,
+                change: change(!reads),
+                project: None,
+            }
+        }
+        Command::Host { .. }
+        | Command::Route { .. }
+        | Command::Upstream { .. }
+        | Command::Condition { .. } => admin::Running {
+            daemon_only: true,
+            ..admin::Running::default()
+        },
+        Command::Scale(_) | Command::Restart(_) | Command::Logging { .. } => admin::Running {
+            change: change(words.get(1).map(String::as_str) != Some("status")),
+            ..admin::Running::default()
+        },
+        _ => admin::Running::default(),
+    }
+}
+
 /// What muructl logs when MURU_LOG does not say: its own lines and
 /// every crate's warnings, the MCP library's chatter left out.
 const DEFAULT_LOG: &str = "info,rmcp=warn";
@@ -1117,6 +1174,11 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli = Cli::parse();
+
+    // Section 13.8: what the command is, for choosing the instance it
+    // reaches and saying where a change went.
+
+    admin::set_running(running(&cli.command));
 
     // Section 13.9: nothing muructl serve runs installs or downloads.
 

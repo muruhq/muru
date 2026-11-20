@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -337,5 +338,102 @@ def test_named_instances_take_their_locations_from_their_names(tmp_path: Path) -
 
         for name in (dev, staging):
             named("instance", "remove", name, "--state", "--yes")
+
+    assert listed(label)["instances"] == []
+
+
+def test_a_checkout_reaches_the_instance_its_local_file_names(tmp_path: Path) -> None:
+    # Issue 811: the instance a command reaches comes from --instance,
+    # MURU_INSTANCE or muru.local.toml, never a machine-wide setting; a
+    # development run of the checkout still answers what it can first.
+
+    label = f"test-{uuid.uuid4().hex[:8]}"
+    name = f"dev-{uuid.uuid4().hex[:6]}"
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("MURU_RUN_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
+    }
+    env.update({"HOME": str(home), "MURU_INSTANCE_LABEL": label})
+    checkout = tmp_path / "checkout"
+    shutil.copytree(SHOP, checkout)
+    path = support.muructl_path()
+    assert path is not None
+
+    def here(
+        *arguments: str, cwd: Path = checkout, **extra: str
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(path), *arguments],
+            capture_output=True,
+            text=True,
+            env={**env, **extra},
+            cwd=cwd,
+            timeout=120,
+        )
+
+    port = support.free_port()
+    assert here("instance", "create", name, "--listen", f"127.0.0.1:{port}").returncode == 0
+    (checkout / "muru.local.toml").write_text(f"instance = '{name}'\n")
+
+    # Defined, not running.
+
+    stopped = here("status")
+    assert (
+        f"instance {name} is not running; start it with muructl daemon start --instance {name}"
+        in stopped.stderr
+    ), stopped.stderr
+
+    try:
+        assert here("daemon", "start", "--instance", name).returncode == 0
+
+        status = here("status")
+        assert status.stdout.splitlines()[0].endswith(f", instance {name}"), status.stdout
+
+        deployed = here(
+            "deploy", "shop", str(checkout), "--python", sys.executable, "--json", cwd=tmp_path
+        )
+        assert deployed.returncode == 0, deployed.stderr
+        assert f"deploying shop to instance {name} (from muru.local.toml)" in deployed.stderr
+        assert json.loads(deployed.stdout)["instance"] == name
+
+        # A name nothing defines, and two ways at once, are refused.
+
+        unknown = here("status", MURU_INSTANCE="nowhere")
+        assert (
+            f"no instance nowhere is defined; the defined instances are {name}" in unknown.stderr
+        ), unknown.stderr
+        both = here("status", "--socket", "/tmp/x.sock", "--instance", name)
+        assert "--socket and --instance both name what to reach" in both.stderr
+        both = here("status", MURU_SOCKET="/tmp/x.sock", MURU_INSTANCE=name)
+        assert "MURU_SOCKET and MURU_INSTANCE are both set" in both.stderr
+
+        # A development run of the checkout answers first, saying so.
+
+        (checkout / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+        run = support.start(
+            "app:application",
+            workers=1,
+            threads=1,
+            chdir=checkout,
+            env={"MURU_INSTANCE_LABEL": label},
+        )
+
+        try:
+            # The run is under the session's run directory, as a shell
+            # running both would have it.
+
+            session = {"MURU_RUN_DIR": os.environ["MURU_RUN_DIR"]}
+            status = here("status", **session)
+            assert status.stdout.startswith("run      pid "), status.stdout
+            assert f"muru.local.toml names instance {name}, pass --instance {name}" in status.stderr
+            assert here("status", "--instance", name, **session).stdout.startswith("daemon ")
+        finally:
+            run.stop()
+    finally:
+        here("daemon", "stop", "--instance", name, "--shutdown")
+        here("instance", "remove", name, "--state", "--yes")
 
     assert listed(label)["instances"] == []

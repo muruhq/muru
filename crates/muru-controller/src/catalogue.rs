@@ -41,6 +41,14 @@ pub struct Definition {
 }
 
 impl Definition {
+    /// Whether the instance is on this machine, which every kind this
+    /// version knows is; a definition of an instance elsewhere would not
+    /// be, and the commands that work on local processes and files refuse
+    /// it.
+    pub fn is_local(&self) -> bool {
+        self.file.kind == "daemon"
+    }
+
     /// The daemon's configuration file, beside `instance.toml`.
     pub fn config(&self) -> PathBuf {
         self.directory.join("muru.toml")

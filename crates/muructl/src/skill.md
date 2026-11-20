@@ -10,6 +10,11 @@ run `muructl` in a shell and add `--json` to any command that reports
 something: it prints the same JSON the tools return, or `{"error": ...}`
 with a non-zero exit status when it fails.
 
+When the machine runs several daemons, each is a named instance. The
+project's `muru.local.toml` may name the one it uses, `instance = "dev"`;
+otherwise pass `--instance NAME` to `muructl`, or start the MCP server
+with it, and the tools reach that instance.
+
 ## What the objects are
 
 - **Application**: a name, such as `shop`, with its routes.

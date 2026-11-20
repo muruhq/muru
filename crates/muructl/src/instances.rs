@@ -1119,6 +1119,7 @@ fn named(row: &Row, wanted: &str) -> bool {
 
 /// Work out what prune removes and stops.
 pub async fn plan(args: &PruneArgs) -> anyhow::Result<Plan> {
+    crate::admin::require_local("instance prune", args.only.as_deref())?;
     let registries = registries(args.all_users)?;
     let processes = muru_controller::lookup::muru_processes();
     let all = rows(&registries, &processes);

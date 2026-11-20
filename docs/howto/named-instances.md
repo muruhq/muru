@@ -91,6 +91,66 @@ $ muructl deploy shop ./shop --instance staging
 $ muructl release list --instance staging
 ```
 
+## Reaching an instance from a checkout
+
+A checkout can say which instance its commands reach, in its
+`muru.local.toml`, the file of settings for this machine alone that is
+never committed:
+
+```toml
+instance = "dev"
+```
+
+`muructl deploy`, `muructl status` and every other command run in that
+directory, or `muructl deploy APP PATH` given that directory, then reach
+`dev` without a flag. A command that changes something says where it
+went:
+
+```console
+$ muructl deploy shop .
+muru: deploying shop to instance dev (from muru.local.toml)
+muru: release shop@r2 is ready and serving
+```
+
+With `--json`, the answer has an `instance` field. Nothing machine-wide
+records a current instance, so two terminals in two checkouts reach two
+daemons at once.
+
+The instance a command reaches is the first of these that applies:
+
+1. `--socket` or `--instance` on the command line;
+2. `MURU_SOCKET` or `MURU_INSTANCE` in the environment;
+3. `instance` in the current directory's `muru.local.toml`;
+4. a development run of the current directory, then the default
+   daemon, as without named instances.
+
+Giving `--socket` and `--instance` together is refused, and so is
+setting both variables. A name that no instance has is refused with the
+names that are defined, and one that is defined and not running says
+how to start it:
+
+```console
+$ muructl status
+muru: error: instance dev is not running; start it with muructl daemon start --instance dev
+```
+
+A development run of the checkout still answers the commands it can,
+such as `status`, `logs`, `events` and `debug`, before the instance the
+file names, and says so; `--instance dev` reaches the daemon:
+
+```console
+$ muructl status
+muru: reaching the development run of shop on http://127.0.0.1:8000; muru.local.toml names instance dev, pass --instance dev to reach it
+```
+
+Commands only a daemon answers, such as `deploy`, `release`, `rollout`
+and `overlay`, always go to the instance. `instance` belongs in
+`muru.local.toml` alone: in the project's `muru.toml` or `[tool.muru]`
+table it is refused.
+
+`muructl mcp serve` settles its instance in the same way once, when it
+starts, and every tool reaches it.
+
 ## Listing them
 
 `muructl instance list` shows every defined instance, running or not,
