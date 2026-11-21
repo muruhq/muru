@@ -256,7 +256,8 @@ The run table's settings (the port, HTTPS, the dashboard, the reload
 patterns, the access log, the toolbar and the rest), `python` and the
 limits on a request (`max_body_size` and the request timeouts) apply only
 as the run starts. A change to one of them is named on a line of its own,
-and the run keeps the value it started with:
+once, against the file it changed in, and the run keeps the value it
+started with until it is restarted:
 
 ```
 muru: reloading, ./pyproject.toml changed

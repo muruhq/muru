@@ -315,5 +315,13 @@ def test_a_changed_settings_file_starts_the_release_with_its_settings(tmp_path: 
             "muru: pyproject.toml changed toolbar; restart the run for it to take effect"
             in server.log()
         )
+
+        # Issue 839: the next settings change to a file that changes no
+        # restart-only setting does not name the waiting one again.
+
+        server.mark_log()
+        (tmp_path / "muru.local.toml").write_text("[run]\ntoolbar = true\n")
+        assert server.wait_for_log("switched to release r", timeout=30), server.log()
+        assert "restart the run" not in server.log_since_mark(), server.log_since_mark()
     finally:
         server.stop()
