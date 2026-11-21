@@ -13,9 +13,11 @@ behaviour, from an application, a trusted upstream or a managed server.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import http.client
 import json
+import os
 import shutil
 import socket
 import sys
@@ -32,6 +34,7 @@ FILES = support.ROOT / "tests" / "fixtures" / "projects" / "files"
 
 BIG = bytes(range(256)) * 4096 * 3  # 3 MiB
 SMALL = b"a small file of text\n"
+SCRIPT = b"console.log('a script with a precompressed variant');\n" * 64
 
 
 def write_files(directory: Path) -> None:
@@ -40,17 +43,22 @@ def write_files(directory: Path) -> None:
     (directory / "small.txt").write_bytes(SMALL)
     (directory / "nested").mkdir(exist_ok=True)
     (directory / "nested" / "inner.txt").write_bytes(b"inner\n")
+    (directory / "app.js").write_bytes(SCRIPT)
+    (directory / "app.js.gz").write_bytes(gzip.compress(SCRIPT))
 
 
 def write_project(project: Path, roots: Path) -> None:
-    """Copy the fixture module and write a muru.toml naming `roots`."""
+    """Copy the fixture module and write a muru.toml naming `roots`, and
+    `reports`, a root relative to the project with a file in it."""
 
     project.mkdir(parents=True, exist_ok=True)
     shutil.copy(FILES / "files.py", project / "files.py")
+    (project / "reports").mkdir(exist_ok=True)
+    (project / "reports" / "report.txt").write_bytes(b"a report\n")
     (project / "muru.toml").write_text(
         f"""entrypoint = "files:wsgi_app"
 threads = 2
-sendfile_roots = ['{roots}']
+sendfile_roots = ['{roots}', 'reports']
 
 [mounts.asgi]
 path = "/asgi"
@@ -80,6 +88,11 @@ def layout(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path, Path]:
     outside = base / "outside"
     outside.mkdir()
     (outside / "secret.txt").write_bytes(b"not for serving\n")
+
+    # A link inside the roots that stays inside, and one that leaves.
+
+    os.symlink("nested/inner.txt", files / "alias.txt")
+    os.symlink("../outside/secret.txt", files / "escape.txt")
     project = base / "project"
     write_project(project, files)
     return files, outside, project
@@ -259,10 +272,34 @@ def test_a_path_hint_is_served_as_a_static_file(
     # A nested path, the type guessed when the application set none, and
     # any other status going out as the application chose, with the file.
 
+    # The worker opens the variant the edge would serve beside the file,
+    # and a range is served from the file itself.
+
+    script = development.get(
+        "/sendfile-path?path=" + str(layout[0] / "app.js"), {"Accept-Encoding": "gzip"}
+    )
+    assert script.header("Content-Encoding") == "gzip"
+    assert script.header("Vary") == "Accept-Encoding"
+    assert gzip.decompress(script.body) == SCRIPT
+    assert script.header("Content-Type") == "text/javascript; charset=utf-8"
+    ranged = development.get(
+        "/sendfile-path?path=" + str(layout[0] / "app.js"),
+        {"Accept-Encoding": "gzip", "Range": "bytes=0-6"},
+    )
+    assert (ranged.status, ranged.body) == (206, SCRIPT[:7])
+    assert ranged.header("Content-Encoding") is None
+
     created = development.get("/sendfile-status/nested/inner.txt")
     assert created.status == 201
     assert created.body == b"inner\n"
     assert created.header("Content-Type") == "text/plain; charset=utf-8"
+
+    # A relative root is taken from the project's directory.
+
+    project = layout[2]
+    report = development.get(f"/sendfile-path?path={project / 'reports' / 'report.txt'}")
+    assert report.status == 200
+    assert report.body == b"a report\n"
 
 
 def test_paths_outside_the_roots_are_refused_and_missing_files_are_404(
@@ -281,6 +318,12 @@ def test_paths_outside_the_roots_are_refused_and_missing_files_are_404(
     assert development.get("/sendfile-path?path=small.txt").status == 500
     climbing = files / ".." / "outside" / "secret.txt"
     assert development.get(f"/sendfile-path?path={climbing}").status == 500
+
+    # A link beneath a root is followed while it stays beneath; one that
+    # leads out is refused, though its path lies under the root.
+
+    assert development.get("/sendfile/alias.txt").body == b"inner\n"
+    assert development.get("/sendfile/escape.txt").status == 500
 
     missing = development.get("/sendfile/nowhere.txt")
     assert missing.status == 404
@@ -365,6 +408,8 @@ def test_hints_from_a_release_and_a_trusted_upstream_under_the_daemon(
         assert served.status == 200
         assert served.body == SMALL
         assert daemon.get(f"/sendfile-path?path={outside / 'secret.txt'}").status == 500
+        report = daemon.get(f"/sendfile-path?path={project / 'reports' / 'report.txt'}")
+        assert report.body == b"a report\n", "a relative root is the source's"
         assert daemon.get("/compat/small.txt").body == SMALL
         assert daemon.get("/asgi/pathsend/small.txt").body == SMALL
         assert daemon.get("/wrapper/small.txt").body == SMALL
@@ -372,7 +417,7 @@ def test_hints_from_a_release_and_a_trusted_upstream_under_the_daemon(
         # The applied keys round-trip through the export.
 
         exported = daemon.muructl("config", "export").stdout
-        assert f'sendfile_roots = ["{files}"]' in exported
+        assert f'sendfile_roots = [\n    "{files}",\n    "reports",\n]' in exported
         assert 'sendfile_header = "X-Sendfile"' in exported
 
         config = tmp_path / "upstreams.toml"

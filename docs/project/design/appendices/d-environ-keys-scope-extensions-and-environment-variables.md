@@ -52,12 +52,14 @@ Standard ASGI 3.0 keys (type, asgi, http_version, method, scheme, path, raw_path
 | MURU_APP, MURU_RELEASE | application and release, also for a command run with the release (section 9.12); a command muructl runs itself for a project has no MURU_RELEASE |
 | MURU_GROUP, MURU_WORKER_ID | worker group and worker id, set after fork |
 | MURU_RELEASE_DIR, MURU_RUN_DIR | release source (also the working directory) and run directory |
+| MURU_DATA_DIR, MURU_MEDIA_DIR, MURU_UPLOADS_DIR | the application's data directory, shared by every release, and its media part (served by file hints and `media:` static entries) and uploads part (never served, `upload.save()`'s default) (section 13.8, issue 849); unset under muructl serve without a data directory |
+| MURU_STATIC_DIR | the release's own directory of built static files, `static:` in static entries (section 13.8, issue 850) |
 | MURU_INTERFACE, MURU_PROCESSES, MURU_THREADS | default mount interface and process model |
 | MURU_LOG_LEVEL, MURU_LOG_FORMAT | Python logging defaults |
 | MURU_DEVELOPMENT | set to 1 in muructl run |
 | MURU_UNDER_INIT | set to 1 by the built-in init of a container's PID 1 for the command it runs (section 6.10), which a daemon takes as the reason to shut down on SIGTERM |
 
-MURU_* variables cannot be overridden by application or release settings.
+MURU_* variables cannot be overridden by application or release settings. MURU_DATA_DIR, MURU_MEDIA_DIR, MURU_UPLOADS_DIR and MURU_STATIC_DIR are never read by muructl as configuration, and under muructl run and muructl serve, which pass on the environment they were started with, one the process has no place for is removed rather than inherited.
 
 ## D.4 Environment variables read by muructl
 
@@ -69,7 +71,7 @@ MURU_* variables cannot be overridden by application or release settings.
 | MURU_LOG | muructl's own log filter (tracing syntax); `info,rmcp=warn` when unset |
 | MURU_NO_INIT | set to 1, muructl as a container's PID 1 runs the command itself instead of forking the built-in init (section 6.10), for images that bring tini or use `docker run --init` |
 | NO_COLOR | disable coloured output |
-| MURU_STATE_DIR, MURU_RUN_DIR, MURU_LOG_DIR, MURU_CACHE_DIR | override file locations (section 13.8) |
-| MURU_SERVE_CONFIG, MURU_SERVE_* | a project settings file muructl serve, and a command run for the project, read in place of the one beside the code, and one variable per setting of serve's, the flag's name in upper snake case (sections 13.9 and 9.12) |
+| MURU_STATE_DIR, MURU_RUN_DIR, MURU_LOG_DIR, MURU_CACHE_DIR | override file locations (section 13.8); MURU_STATE_DIR is also the user state location a development run keeps its places under |
+| MURU_SERVE_CONFIG, MURU_SERVE_* | a project settings file muructl serve, and a command run for the project, read in place of the one beside the code, and one variable per setting of serve's, the flag's name in upper snake case (sections 13.9 and 9.12); a command run for the project on its own takes its data and static directories from MURU_SERVE_DATA_DIR, MURU_SERVE_MEDIA_DIR, MURU_SERVE_UPLOADS_DIR and MURU_SERVE_STATIC_DIR, and the serve table's are not read for it |
 | STATE_DIRECTORY, RUNTIME_DIRECTORY, LOGS_DIRECTORY, CACHE_DIRECTORY, CONFIGURATION_DIRECTORY | set by systemd from the unit's directory settings and used when present |
 | XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_RUNTIME_DIR, XDG_CACHE_HOME | user-mode defaults on Linux |

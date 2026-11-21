@@ -10,6 +10,7 @@ every command and option.
 :maxdepth: 1
 
 configuration/index
+environment-variables
 wsgi-environ
 asgi-scope
 errors

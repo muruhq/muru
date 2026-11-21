@@ -1,7 +1,12 @@
+import os
 import sqlite3
 from pathlib import Path
 
-DATABASE = Path(__file__).parent / "catalog.db"
+# The application's data directory, which every release shares; beside
+# the code when it runs outside Muru.
+
+DATA = Path(os.environ.get("MURU_DATA_DIR", Path(__file__).parent))
+DATABASE = DATA / "catalog.db"
 
 
 def application(environ, start_response):

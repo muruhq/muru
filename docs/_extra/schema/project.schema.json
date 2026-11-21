@@ -706,7 +706,7 @@
           "x-default": "the release's"
         },
         "sendfile_roots": {
-          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. In a file `muructl apply` reads, a relative path is taken from the file's directory; in a project's settings each is absolute.",
+          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served; the release's when absent, and an empty list refuses every hint. A relative path is taken from the release's source directory.",
           "items": {
             "type": "string"
           },
@@ -849,6 +849,11 @@
           "description": "The dashboard's address, or `off`.",
           "type": "string",
           "x-default": "`127.0.0.1:8081`; off under `--allow-public`"
+        },
+        "data_dir": {
+          "description": "The application's data directory, shared by every run of the project, a relative one taken from the project; its media and uploads parts are made in it.",
+          "type": "string",
+          "x-default": "runs/NAME-HASH/data in the user state directory, never in the project"
         },
         "env_file": {
           "description": "A `.env` file whose variables the run starts with, relative to the project. Its values override `[tool.muru.env]`. None is read unless this names one.",
@@ -1136,6 +1141,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "data_dir": {
+          "description": "The application's data directory, normally a mounted volume, which must exist and be writable; its media and uploads parts are made in it. With none, the application is given no data directory.",
+          "type": "string",
+          "x-default": "none"
+        },
         "entrypoint": {
           "description": "The application as module:callable.",
           "type": "string"
@@ -1199,6 +1209,11 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "media_dir": {
+          "default": "media",
+          "description": "The media part, the one part ever served, a relative one taken from the data directory.",
+          "type": "string"
         },
         "memory": {
           "description": "The memory policy as KEY=VALUE.",
@@ -1266,6 +1281,11 @@
           },
           "type": "array"
         },
+        "static_dir": {
+          "default": "staticfiles",
+          "description": "The directory of built static files, given as `MURU_STATIC_DIR` and named `static:` in static entries, a relative one taken from the project.",
+          "type": "string"
+        },
         "sync_threads": {
           "default": 8,
           "description": "Threads for synchronous code called from an ASGI application.",
@@ -1299,6 +1319,11 @@
           },
           "type": "array",
           "x-default": "loopback peers, for their forwarding headers alone"
+        },
+        "uploads_dir": {
+          "default": "uploads",
+          "description": "The uploads part, never served, a relative one taken from the data directory.",
+          "type": "string"
         }
       },
       "type": "object"
@@ -1317,7 +1342,7 @@
           "type": "string"
         },
         "dir": {
-          "description": "The directory, relative to the source directory, or absolute.",
+          "description": "The directory: relative to the source directory, absolute, `static:` for the release's built static files or `media:` for the application's media part, each with an optional directory inside it after the colon.",
           "type": "string"
         },
         "fallback": {
@@ -1631,7 +1656,7 @@
       "type": "string"
     },
     "sendfile_roots": {
-      "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file, for the default mount and any mount that does not say otherwise; with none every hint is refused.",
+      "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. A relative path is taken from the project's directory, the release's source.",
       "items": {
         "type": "string"
       },

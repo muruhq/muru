@@ -218,19 +218,25 @@ pub struct RedirectFlags {
 /// managed server's responses may give.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sendfile {
-    /// Directories a hinted path must lie in, compared by canonical path
-    /// when the hint arrives; with none every path hint is refused.
-    pub roots: Vec<std::path::PathBuf>,
+    /// Directories a hinted path must lie in, held open once used, a
+    /// hinted file opened beneath its root; with none every path hint is
+    /// refused.
+    pub roots: Vec<Arc<muru_common::beneath::Root>>,
     /// A second response header honoured as X-Muru-Sendfile is, in lower
     /// case: `x-sendfile` for the frameworks that send that one.
     pub header: Option<String>,
 }
 
 impl Sendfile {
-    /// The policy a snapshot's roots and header name describe.
+    /// The policy a snapshot's roots and header name describe. The roots
+    /// are absolute: the daemon or muructl resolves a release's relative
+    /// ones against its source before they reach the edge.
     pub fn new(roots: &[String], header: &str) -> Arc<Self> {
         Arc::new(Self {
-            roots: roots.iter().map(std::path::PathBuf::from).collect(),
+            roots: roots
+                .iter()
+                .map(|root| Arc::new(muru_common::beneath::Root::new(root)))
+                .collect(),
             header: (!header.is_empty()).then(|| header.to_ascii_lowercase()),
         })
     }
@@ -275,8 +281,6 @@ pub struct MountPath {
     pub accel_redirect: bool,
     /// A 200 with a local Location and no body is an internal redirect.
     pub cgi_local_redirect: bool,
-    /// The file hints by path the mount may give (section 4.9).
-    pub sendfile: Arc<Sendfile>,
     /// The mount's own limits on a request (section 4.6), over its
     /// group's and its release's.
     pub limits: crate::RequestLimits,
@@ -310,8 +314,8 @@ pub struct Selection {
     pub script_name: String,
     /// Which response forms from the mount are internal redirects.
     pub redirects: RedirectFlags,
-    /// The file hints by path the mount, upstream or server may give
-    /// (section 4.9).
+    /// The file hints by path the upstream or managed server may give
+    /// (section 4.9), which the edge opens; a worker opens its own.
     pub sendfile: Arc<Sendfile>,
     /// Maintenance mode, when the application is in it (section 4.12).
     pub maintenance: Option<Arc<Maintenance>>,
@@ -710,8 +714,6 @@ pub struct AppPools {
     statics: Vec<StaticPath>,
     /// The default mount's redirect forms (section 4.10).
     redirects: RedirectFlags,
-    /// The default mount's file hints by path (section 4.9).
-    sendfile: Arc<Sendfile>,
     /// The release's error pages and override (section 4.12).
     errors: Arc<ErrorPolicy>,
     /// Maintenance mode, when the application is in it.
@@ -867,7 +869,6 @@ impl AppPools {
                 accept_redirects_from: mount.accept_redirects_from.clone(),
                 accel_redirect: mount.accel_redirect,
                 cgi_local_redirect: mount.cgi_local_redirect,
-                sendfile: Arc::clone(&mount.sendfile),
                 limits: mount.limits,
             })
             .collect();
@@ -881,7 +882,6 @@ impl AppPools {
             mounts,
             statics: Vec::new(),
             redirects,
-            sendfile: Arc::default(),
             errors: Arc::new(ErrorPolicy::default()),
             maintenance: None,
             server: None,
@@ -900,7 +900,6 @@ impl AppPools {
             mounts: Vec::new(),
             statics: Vec::new(),
             redirects: RedirectFlags::default(),
-            sendfile: Arc::default(),
             errors: Arc::new(ErrorPolicy::default()),
             maintenance: None,
             server: None,
@@ -914,13 +913,6 @@ impl AppPools {
         self.statics = statics;
         self.statics
             .sort_by_key(|entry| std::cmp::Reverse(entry.prefix.len()));
-        self
-    }
-
-    /// The same pools with the default mount's file hints by path
-    /// (section 4.9).
-    pub fn with_sendfile(mut self, sendfile: Arc<Sendfile>) -> Self {
-        self.sendfile = sendfile;
         self
     }
 
@@ -995,7 +987,7 @@ impl AppPools {
                 mount: String::new(),
                 script_name: String::new(),
                 redirects: RedirectFlags::default(),
-                sendfile: Arc::clone(&self.sendfile),
+                sendfile: server.sendfile(),
                 maintenance: self.maintenance.clone(),
                 upstream: Some(Arc::clone(server)),
                 grpc_web: Arc::default(),
@@ -1060,10 +1052,7 @@ impl AppPools {
                 accel_redirect: mount.accel_redirect,
                 cgi_local_redirect: mount.cgi_local_redirect,
             }),
-            sendfile: mount.map_or_else(
-                || Arc::clone(&self.sendfile),
-                |mount| Arc::clone(&mount.sendfile),
-            ),
+            sendfile: Arc::default(),
             maintenance: self.maintenance.clone(),
             upstream: None,
             grpc_web: Arc::clone(&self.grpc_web),
@@ -1435,7 +1424,6 @@ impl Routing {
             .with_errors(Arc::new(errors))
             .with_maintenance(maintenance)
             .with_limits(crate::RequestLimits::from_message(app.limits.as_ref()))
-            .with_sendfile(Sendfile::new(&app.sendfile_roots, &app.sendfile_header))
             .with_waking(&app.waking_groups)
             .with_grpc_web(&app.grpc_web_origins)
             .with_static_dirs(static_paths_of(app)?);
@@ -2410,7 +2398,6 @@ fn mounts_of(app: &pb::AppWorkers) -> Vec<MountPath> {
             accept_redirects_from: mount.accept_redirects_from.clone(),
             accel_redirect: mount.accel_redirect,
             cgi_local_redirect: mount.cgi_local_redirect,
-            sendfile: Sendfile::new(&mount.sendfile_roots, &mount.sendfile_header),
             limits: crate::RequestLimits::from_message(mount.limits.as_ref()),
         })
         .collect()

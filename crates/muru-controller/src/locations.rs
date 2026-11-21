@@ -476,6 +476,22 @@ fn default_state(mode: Mode, home: Option<&std::path::Path>) -> PathBuf {
     }
 }
 
+/// The user state location (section 13.8, issue 849): where a user's own
+/// daemon keeps its state, `MURU_STATE_DIR` when it is set, whoever runs,
+/// root included. `muructl run` keeps each project's data and static
+/// directories under it, never in the project.
+pub fn user_state() -> PathBuf {
+    env::var_os("MURU_STATE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            default_state(
+                Mode::User,
+                env::var_os("HOME").map(PathBuf::from).as_deref(),
+            )
+        })
+}
+
 /// The default runtime location for whoever runs: the system one for
 /// root, the user's otherwise, whatever an option or variable says. The
 /// instance registry lives there (section 13.8).

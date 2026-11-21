@@ -1,8 +1,11 @@
 # Disk space
 
 Every `muructl deploy` adds a release, and a release keeps files: usually
-an environment under the state directory, its bytecode, and a log. Muru
-removes these only when asked.
+an environment under the state directory, its bytecode, its static
+directory and a log. Muru removes these only when asked. The
+application's [data directory](data-directory.md), which every release
+shares, is not a release's and goes only with the application, when
+asked.
 
 ## Seeing what releases take
 
@@ -16,7 +19,8 @@ shop@r2                  failed              - (4x8)             40.1KB /srv/sho
 shop@r1                  stopped             - (4x8)            196.2MB /srv/shop
 ```
 
-`DISK` counts a release's environment, bytecode, log and log archives,
+`DISK` counts a release's environment, bytecode, static directory, log
+and log archives,
 with each hard-linked file counted once. With `--json`, `disk_freed_bytes`
 says what removing the release would give back, which is less when uv's
 cache also holds its environment's files. A release's source directory is
@@ -62,9 +66,10 @@ failed deploys does not push out good releases.
 A release that applied files declare stays unless `--force` is given,
 since the next `muructl apply` would create it again.
 
-With the release go its environment, its bytecode and its log and log
-archives. `--keep-logs` leaves the log and archives. A release's source
-directory is never touched.
+With the release go its environment, its bytecode, its static directory
+and its log and log archives. `--keep-logs` leaves the log and archives.
+A release's source directory is never touched, nor is the application's
+data directory.
 
 ## Removing one release
 
@@ -89,15 +94,23 @@ muru: error: shop@r5 cannot be removed: it serves the application's traffic
 ## Removing an application
 
 `muructl app remove` removes a whole application: it drains whatever is
-running and removes every release, with its environment, bytecode and logs,
-and the output of its command runs.
+running and removes every release, with its environment, bytecode,
+static directory and logs, and the output of its command runs. It keeps
+the application's data directory and says where it is; `--data` removes
+that too, with every database and file the releases shared:
 
 ```console
 $ muructl app remove shop
   shop@r5 (ready, 218.4MB)
   shop@r4 (stopped, 218.4MB)
-Remove application shop and its 2 releases, freeing 436.8MB? [y/N]
+Remove application shop and its 2 releases, freeing 436.8MB? [y/N] y
+muru: removed, freeing 436.8MB
+muru: the data directory /var/lib/muru/data/shop is kept; muructl app remove shop --data removes it too
 ```
+
+A part of the data directory kept elsewhere, by `media_dir` or
+`uploads_dir` or through a symbolic link, is not removed with it, and
+the command says where it is.
 
 It asks in the same way, with `--yes` and `--dry-run`. It is refused while
 a route still sends traffic to the application, while a rollout of it is

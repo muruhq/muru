@@ -657,8 +657,9 @@ def test_a_memory_table_round_trips_through_export(daemon: Daemon, tmp_path: Pat
 def test_relative_paths_are_taken_from_the_file(daemon: Daemon) -> None:
     """Every path in an applied file is resolved from the file's directory,
     as `source` is, since the daemon runs elsewhere (here, the test's own
-    working directory): static directories, file hint roots, a host's and a
-    route's error page files, and an overlay's static target."""
+    working directory): static directories, an upstream's file hint roots,
+    a host's and a route's error page files, and an overlay's static
+    target. A release's own file hint roots are its source's instead."""
 
     site = daemon.base / "site"
 
@@ -673,6 +674,9 @@ def test_relative_paths_are_taken_from_the_file(daemon: Daemon) -> None:
 source = '{SHOP}'
 python = '{sys.executable}'
 processes = 1
+
+[upstream.legacy]
+addresses = ['127.0.0.1:9']
 sendfile_roots = ['reports']
 
 [host.site]
@@ -721,16 +725,14 @@ routes.files.target = {{ static = 'snapshot' }}
 def test_a_file_named_by_a_relative_path_gives_absolute_paths(daemon: Daemon) -> None:
     """The paths resolved from an applied file's directory come out absolute
     whether `-f` named the file by an absolute or a relative path, since
-    the daemon checks some of them, `sendfile_roots` among them, for being
-    absolute."""
+    the daemon checks some of them, an upstream's `sendfile_roots` among
+    them, for being absolute."""
 
     site = daemon.base / "relative"
     (site / "reports").mkdir(parents=True)
     (site / "site.toml").write_text(
-        f"""[app.shop.release.r1]
-source = '{SHOP}'
-python = '{sys.executable}'
-processes = 1
+        """[upstream.legacy]
+addresses = ['127.0.0.1:9']
 sendfile_roots = ['reports']
 """
     )

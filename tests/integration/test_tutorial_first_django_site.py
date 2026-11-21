@@ -126,17 +126,19 @@ def test_the_django_tutorial(tmp_path: Path) -> None:
     finally:
         server.stop()
 
-    # Production settings, collected static files declared in the project,
-    # and a deploy: the static files come from the edge.
-
-    production = {"DJANGO_SETTINGS_MODULE": "mysite.production", "DJANGO_SECRET_KEY": "x"}
-    manage(project, "collectstatic", "--noinput", **production)
-    assert (project / "static" / "admin" / "css" / "base.css").is_file()
+    # Production settings, the release's static directory declared in the
+    # project with collectstatic as a gate, and a deploy: the gate fills
+    # the release's own directory and the static files come from the edge.
 
     with (project / "pyproject.toml").open("a") as pyproject:
         pyproject.write(
-            '\n[[tool.muru.static]]\npath = "/static/"\ndir = "static"\n'
-            'cache = { max_age = "1h" }\n'
+            '\n[[tool.muru.static]]\npath = "/static/"\ndir = "static:"\n'
+            'cache = { max_age = "1h" }\n\n'
+            "[tool.muru.commands.collectstatic]\n"
+            'description = "Collect the static files"\n'
+            'run = ["python", "manage.py", "collectstatic", "--noinput"]\n'
+            "before_fork = true\n"
+            'timeout = "5m"\n'
         )
 
     (tmp_path / "daemon").mkdir()
@@ -158,5 +160,9 @@ def test_the_django_tutorial(tmp_path: Path) -> None:
         access = daemon.muructl("logs", "--access").stdout
         assert f"200 GET {stylesheet}" in access
         assert "reason=static" in access
+        collected = tmp_path / "daemon" / "state" / "static" / "mysite" / "r1"
+        assert (collected / "admin" / "css" / "base.css").is_file()
+        assert not (project / "staticfiles").exists()
+        assert "gate:before_fork" in daemon.muructl("command", "runs", "mysite").stdout
     finally:
         daemon.stop()

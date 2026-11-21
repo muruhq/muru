@@ -9,6 +9,107 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a34 (2026-11-22)
+
+### Added
+
+- Added an application data directory shared by every release, given to the
+  release's host, workers and commands as `MURU_DATA_DIR`, with a media part
+  (`MURU_MEDIA_DIR`), which is a file hint root of every mount and is named
+  `media:` in `sendfile_roots` and static entries, and an uploads part
+  (`MURU_UPLOADS_DIR`), never served and where `upload.save()` now puts a
+  file by default. It is `STATE/data/APP` under the daemon (`[app.NAME]
+  data_dir`, `media_dir` and `uploads_dir` move it), `runs/NAME-HASH/data`
+  in the user state directory under `muructl run` (`--data-dir`), and a
+  volume named with `--data-dir` under `muructl serve`; `muructl data show`,
+  `muructl data check` and `muructl status --app` report it, and `muructl
+  app remove --data` removes it.
+  ([#849](https://github.com/muruhq/muru/issues/849))
+- Added a directory of each release's own for built static files, given as
+  `MURU_STATIC_DIR` and named `static:` in a static entry, so
+  `collectstatic` run as a `before_fork` gate never writes into a shared
+  source directory: `STATE/static/APP/RELEASE` under the daemon, made empty
+  with the release and removed with it, beside the run's data directory
+  under `muructl run`, and `staticfiles` in the project under `muructl
+  serve` (`--static-dir`).
+  ([#850](https://github.com/muruhq/muru/issues/850))
+
+### Changed
+
+- On a terminal, `muructl status --processes` fits the terminal's width:
+  figure columns empty in every row are left out, a long WHAT is cut with
+  an ellipsis, columns that still do not fit are left out and named, and
+  the instance's figures wrap. A daemon's state directory is on a line of
+  its own above the table, and in `--json` as `state_dir`, so the daemon's
+  row is `user daemon` or `system daemon`. ([#840](https://github.com/muruhq/muru/issues/840))
+- `muructl status --processes` names a managed server's instance by the
+  program its command runs, such as `gunicorn`, rather than its
+  interpreter, and lists the processes the instance started, such as
+  gunicorn's workers, without `--all`, under the role `server-worker`. ([#841](https://github.com/muruhq/muru/issues/841))
+- A relative `sendfile_roots` entry is now taken from the release's source
+  directory, in `[tool.muru]`, in `--sendfile-root` and in an applied
+  release table alike, and must be a directory there when the release is
+  deployed or `muructl run` starts; a root may be a symbolic link, and is
+  opened afresh when it is pointed somewhere else.
+  ([#847](https://github.com/muruhq/muru/issues/847))
+- A path hint (`X-Muru-Sendfile`, or `X-Sendfile` in compatibility mode)
+  from an application Muru's workers serve is now opened by the worker as
+  the application's user, within the mount's `sendfile_roots`, and handed to
+  the edge open, so the edge's user needs no access to the file and one
+  written `0600` is served; it keeps Range, conditional requests, ETag,
+  Last-Modified and HEAD, and now gets a precompressed `.br`, `.zst` or
+  `.gz` variant beside the file as a static route does.
+  ([#848](https://github.com/muruhq/muru/issues/848))
+- The data directory, the uploads part and any directory containing either
+  are refused as a `sendfile_roots` entry or a static directory, and `data:`
+  and `uploads:` with them, and `muructl run` no longer says that nothing is
+  persisted. ([#849](https://github.com/muruhq/muru/issues/849))
+
+### Fixed
+
+- A daemon adopting a release whose log relay was just replaced finds the
+  relay, where before it could read the relay's record while it was being
+  rewritten and take the release for one with no relay. The daemon's other
+  records, its pid file, its instance ID, the run's `pid` file and a
+  serve's `serve.json` are written the same way, whole or not at all. ([#833](https://github.com/muruhq/muru/issues/833))
+- In a development run, the GIL stall timeout again answers every request
+  the stalled worker held at once, `502` with the reason `worker_stalled`.
+  A request that reached the worker while the GIL was held had waited for
+  the worker to be killed and was answered `worker_crashed`. ([#836](https://github.com/muruhq/muru/issues/836))
+- A daemon listener that cannot bind its address names the program and pid
+  holding it, as `muructl run` does, when that program is not Muru's, and
+  so does a listener a reload adds. ([#837](https://github.com/muruhq/muru/issues/837))
+- When a run reloads, the lines the new release's workers write while they
+  start, such as those of `post_fork` and `on_ready` hooks, are printed
+  before `switched to release rN`, rather than sometimes after it and after
+  the old release's `on_drain` lines. ([#838](https://github.com/muruhq/muru/issues/838))
+- After a settings file changes under `muructl run`, a setting only a
+  restart applies is named once, against the file it changed in. A later
+  reload no longer names it again against whichever settings file changed
+  last. ([#839](https://github.com/muruhq/muru/issues/839))
+- The GIL stall timeout answers an ASGI request that reached the worker
+  while the GIL was held at once too, `502` with the reason
+  `worker_stalled`, rather than when the worker is killed with
+  `worker_crashed`. Two such requests no longer hold up every other
+  connection to the worker until the GIL is free. ([#842](https://github.com/muruhq/muru/issues/842))
+- The host logs `preloaded APP in N ms` once the application is imported
+  and before its `on_load` hook runs, with N the import's time alone, so
+  the hook's output follows the line rather than coming before it. A
+  hooks module's `on_load` and `pre_fork` each get a line of their own
+  once they return, such as `on_load hook ran in 500 ms`.
+  `muru_release_load_seconds` still counts the `on_load` hook. ([#846](https://github.com/muruhq/muru/issues/846))
+
+### Security
+
+- Static files and files named by `X-Muru-Sendfile` are now opened beneath
+  their directory's open descriptor and read from that open file, so nothing
+  that can write inside the directory can swap a path for a symbolic link
+  and lead the edge out of it between a check and the open; a symbolic link
+  inside is followed only when its target is relative and stays inside, so
+  an absolute link is no longer served even when it names a file inside the
+  directory. ([#847](https://github.com/muruhq/muru/issues/847))
+
+
 ## 0.1.0a33 (2026-11-20)
 
 ### Added

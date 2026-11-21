@@ -3863,21 +3863,46 @@ pub async fn daemon_status(
         return Ok(NOT_RUNNING);
     }
 
-    show_status(&client::Endpoint::unix(&path), json).await?;
+    show_status(&client::Endpoint::unix(&path), None, false, json).await?;
     Ok(0)
 }
 
 /// Show the status of what answers at an admin socket: a daemon or a
 /// development run.
-pub async fn show_status(endpoint: &client::Endpoint, json: bool) -> anyhow::Result<()> {
+pub async fn show_status(
+    endpoint: &client::Endpoint,
+    app: Option<&str>,
+    sizes: bool,
+    json: bool,
+) -> anyhow::Result<()> {
     let mut client = client::connect(endpoint).await?;
     let status = client
         .get_status(pb::GetStatusRequest {})
         .await?
         .into_inner();
 
+    // Issue 849: a run's or a serve's data directory, and an application's
+    // under the daemon when one is named.
+
+    let data = if status.kind == "run" || app.is_some() {
+        Some(app_data(endpoint, app.unwrap_or_default(), sizes).await?)
+    } else {
+        None
+    };
+
     if json {
-        return print_answer(&status);
+        #[derive(serde::Serialize)]
+        struct WithData<'a> {
+            #[serde(flatten)]
+            status: &'a pb::Status,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            data: Option<&'a pb::AppData>,
+        }
+
+        return print_answer(&WithData {
+            status: &status,
+            data: data.as_ref(),
+        });
     }
 
     // A development run says what it runs and from where; it has no
@@ -3900,6 +3925,10 @@ pub async fn show_status(endpoint: &client::Endpoint, json: bool) -> anyhow::Res
 
         if let Some(limits) = &status.limits {
             print_limits(limits);
+        }
+
+        if let Some(data) = &data {
+            print!("{}", data_lines(data, false));
         }
 
         return Ok(());
@@ -3946,6 +3975,11 @@ pub async fn show_status(endpoint: &client::Endpoint, json: bool) -> anyhow::Res
 
     if let Some(limits) = &status.limits {
         print_limits(limits);
+    }
+
+    if let Some(data) = &data {
+        println!("app      {}", data.app);
+        print!("{}", data_lines(data, false));
     }
 
     Ok(())
@@ -4164,7 +4198,8 @@ pub struct ReleaseArgs {
     pub(crate) stop_signal: Option<String>,
 
     /// A directory a path in an X-Muru-Sendfile response header must lie
-    /// in for the edge to serve the file; repeatable (default the table's).
+    /// in for the file to be served, relative to the source unless
+    /// absolute; repeatable (default the table's).
     #[arg(long = "sendfile-root", value_name = "DIR")]
     pub(crate) sendfile_roots: Vec<String>,
 
@@ -5935,9 +5970,9 @@ pub enum AppCommand {
     },
 
     /// Remove an application: drain whatever runs and remove every
-    /// release with its environment, bytecode and logs. Refused while a
-    /// route sends it traffic. Asks first; without a terminal it needs
-    /// --yes.
+    /// release with its environment, bytecode, static directory and logs.
+    /// Its data directory is kept unless --data. Refused while a route
+    /// sends it traffic. Asks first; without a terminal it needs --yes.
     Remove(Box<AppRemoveArgs>),
 }
 
@@ -5946,6 +5981,12 @@ pub enum AppCommand {
 pub struct AppRemoveArgs {
     /// The application.
     app: String,
+
+    /// Remove its data directory too, with the databases and files every
+    /// release shared; a part kept elsewhere, by configuration or through
+    /// a symbolic link, stays.
+    #[arg(long)]
+    data: bool,
 
     /// Only say what would go.
     #[arg(long)]
@@ -6027,6 +6068,7 @@ pub async fn app_remove(args: AppRemoveArgs) -> anyhow::Result<()> {
     let request = pb::RemoveAppRequest {
         app: args.app.clone(),
         dry_run: true,
+        data: args.data,
     };
 
     let plan = client
@@ -6050,11 +6092,16 @@ pub async fn app_remove(args: AppRemoveArgs) -> anyhow::Result<()> {
     }
 
     let question = format!(
-        "Remove application {} and its {} release{}, freeing {}?",
+        "Remove application {} and its {} release{}, freeing {}{}?",
         args.app,
         plan.removed.len(),
         if plan.removed.len() == 1 { "" } else { "s" },
-        human_size(plan.freed)
+        human_size(plan.freed),
+        if plan.data_removed {
+            format!(", and its data directory {}", plan.data_dir)
+        } else {
+            String::new()
+        }
     );
 
     if !confirm(&question, args.yes)? {
@@ -6071,7 +6118,198 @@ pub async fn app_remove(args: AppRemoveArgs) -> anyhow::Result<()> {
         .map_err(explain)?
         .into_inner();
 
-    finish_removal(&answer, args.output.json)
+    let finished = finish_removal(&answer, args.output.json);
+
+    // Issue 849: where the data directory is, kept or removed, and the
+    // parts a removal leaves.
+
+    if !args.output.json && !answer.data_dir.is_empty() {
+        if answer.data_removed {
+            println!("muru: removed the data directory {}", answer.data_dir);
+        } else {
+            println!(
+                "muru: the data directory {} is kept; muructl app remove {} --data removes it too",
+                answer.data_dir, args.app
+            );
+        }
+
+        for part in &answer.data_kept {
+            println!("muru: the {part} is outside the data directory and is kept");
+        }
+    }
+
+    finished
+}
+
+/// The `muructl data` subcommands (issue 849).
+#[derive(Subcommand)]
+pub enum DataCommand {
+    /// Where an application's data directory and its media and uploads
+    /// parts are, where each leads, its owner, mode and file system,
+    /// which is a file hint root, and whether uploads share the upload
+    /// spool's file system.
+    Show(Box<DataArgs>),
+
+    /// Warn of a database file in the media part, a part on a network
+    /// file system and a part not owned by the application's user;
+    /// exits 1 when there is any.
+    Check(Box<DataArgs>),
+}
+
+/// What `muructl data show` and `check` take.
+#[derive(Args)]
+pub struct DataArgs {
+    /// The application; none for a development run's or a serve's own.
+    app: Option<String>,
+
+    /// Add what each part holds, which walks it.
+    #[arg(long)]
+    sizes: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// Ask for an application's data directory.
+async fn app_data(
+    endpoint: &client::Endpoint,
+    app: &str,
+    sizes: bool,
+) -> anyhow::Result<pb::AppData> {
+    let mut client = client::connect(endpoint).await?;
+    Ok(client
+        .get_app_data(pb::GetAppDataRequest {
+            app: app.to_owned(),
+            sizes,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner())
+}
+
+/// `muructl data show`: each part in full.
+pub async fn data_show(args: DataArgs) -> anyhow::Result<()> {
+    let data = app_data(
+        &args.socket.endpoint()?,
+        args.app.as_deref().unwrap_or_default(),
+        args.sizes,
+    )
+    .await?;
+
+    if args.output.json {
+        return print_answer(&data);
+    }
+
+    print!("{}", data_lines(&data, true));
+    Ok(())
+}
+
+/// `muructl data check`: the warnings, exiting 1 when there is any.
+pub async fn data_check(args: DataArgs) -> anyhow::Result<i32> {
+    let data = app_data(
+        &args.socket.endpoint()?,
+        args.app.as_deref().unwrap_or_default(),
+        false,
+    )
+    .await?;
+
+    if args.output.json {
+        print_answer(&data.warnings)?;
+    } else if data.warnings.is_empty() {
+        if data.none.is_empty() {
+            println!(
+                "muru: the data directory of {} has nothing to warn of",
+                data.app
+            );
+        } else {
+            println!("muru: {}", data.none);
+        }
+    } else {
+        for warning in &data.warnings {
+            println!("warning: {warning}");
+        }
+    }
+
+    Ok(i32::from(!data.warnings.is_empty()))
+}
+
+/// An application's data directory as lines: one per part, and in full
+/// its owner, mode and file system, and whether uploads share the
+/// spool's file system.
+pub fn data_lines(data: &pb::AppData, full: bool) -> String {
+    use muru_config::format_size_approx as size;
+
+    let mut text = String::new();
+
+    if data.parts.is_empty() {
+        text.push_str(&format!("data     none: {}\n", data.none));
+        return text;
+    }
+
+    for part in &data.parts {
+        let mut line = format!("{:<8} {}", part.name, part.path);
+
+        if !part.resolved.is_empty() {
+            line.push_str(&format!(" -> {}", part.resolved));
+        }
+
+        if !part.exists {
+            line.push_str(", not there yet");
+        } else {
+            let owner = if part.owner.is_empty() {
+                format!("uid {}", part.owner_uid)
+            } else {
+                part.owner.clone()
+            };
+            line.push_str(&format!(", {owner}"));
+
+            if full {
+                line.push_str(&format!(" {:04o}", part.mode));
+
+                if !part.filesystem.is_empty() {
+                    line.push_str(&format!(", {}", part.filesystem));
+
+                    if part.network {
+                        line.push_str(" (network)");
+                    }
+                }
+            }
+        }
+
+        if part.root {
+            line.push_str(", a file hint root");
+        }
+
+        if let Some(bytes) = part.bytes {
+            line.push_str(&format!(", {}", size(bytes)));
+        }
+
+        text.push_str(&line);
+        text.push('\n');
+    }
+
+    if full && !data.spool.is_empty() {
+        text.push_str(&format!(
+            "spool    {}, {}\n",
+            data.spool,
+            if data.spool_shared {
+                "on the uploads part's file system, so upload.save() links"
+            } else {
+                "on another file system from the uploads part, so upload.save() copies"
+            }
+        ));
+    }
+
+    if full {
+        for warning in &data.warnings {
+            text.push_str(&format!("warning: {warning}\n"));
+        }
+    }
+
+    text
 }
 
 /// The `muructl condition` subcommands (section 9.10).
@@ -8138,17 +8376,9 @@ fn resolve_paths(document: &mut muru_config::Document, base: &Path) {
                 release.python = Some(absolute_interpreter(Path::new(python), Some(base)));
             }
 
-            for root in &mut release.sendfile_roots {
-                *root = absolute(root);
-            }
-
-            for root in release
-                .mounts
-                .values_mut()
-                .flat_map(|mount| mount.sendfile_roots.iter_mut().flatten())
-            {
-                *root = absolute(root);
-            }
+            // A release's sendfile_roots, its mounts' among them, are
+            // taken from its source rather than the file, as its error
+            // pages are, so they mean the same in every release.
         }
     }
 
@@ -11509,13 +11739,15 @@ tls = { ca = "ca.pem" }
         assert_eq!(release.source.as_deref(), Some("/base/src"));
         assert_eq!(release.cwd.as_deref(), Some("/base/run"));
         assert_eq!(release.python.as_deref(), Some("/base/.venv/bin/python"));
-        assert_eq!(release.sendfile_roots, ["/base/media"]);
+
+        // A release's own pages and sendfile_roots are its source
+        // directory's.
+
+        assert_eq!(release.sendfile_roots, ["media"]);
         assert_eq!(
             release.mounts["api"].sendfile_roots.as_deref(),
-            Some(&["/base/api-media".to_owned()][..])
+            Some(&["api-media".to_owned()][..])
         );
-
-        // A release's own pages are its source directory's.
 
         assert_eq!(
             release.error_pages["503"].file.as_deref(),

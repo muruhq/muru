@@ -200,20 +200,30 @@ def test_hidden_climbing_and_differently_cased_paths_are_not_served(static: Stat
     assert response.header("Allow") == "GET, HEAD"
 
 
-def test_a_symbolic_link_leaving_the_directory_is_refused(tmp_path: Path) -> None:
+def test_a_symbolic_link_is_followed_only_while_it_stays_beneath_the_directory(
+    tmp_path: Path,
+) -> None:
     site = tmp_path / "site"
-    site.mkdir()
+    (site / "nested").mkdir(parents=True)
     (site / "inside.txt").write_text("inside\n")
     outside = tmp_path / "outside.txt"
     outside.write_text("outside\n")
     os.symlink(outside, site / "escape.txt")
-    os.symlink(site / "inside.txt", site / "alias.txt")
-    instance = serve_static(site)
+    os.symlink("../outside.txt", site / "climbing.txt")
+    os.symlink(site / "inside.txt", site / "absolute.txt")
+    os.symlink("../inside.txt", site / "nested" / "alias.txt")
+
+    # The directory itself may be a link an operator placed.
+
+    os.symlink(site, tmp_path / "linked")
+    instance = serve_static(tmp_path / "linked")
 
     try:
         assert instance.get("/inside.txt").body == b"inside\n"
-        assert instance.get("/alias.txt").body == b"inside\n"
+        assert instance.get("/nested/alias.txt").body == b"inside\n"
         assert instance.get("/escape.txt").status == 404
+        assert instance.get("/climbing.txt").status == 404
+        assert instance.get("/absolute.txt").status == 404, "an absolute link, even inside"
     finally:
         instance.stop()
 

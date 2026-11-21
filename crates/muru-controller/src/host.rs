@@ -781,6 +781,48 @@ pub struct HostSpec {
     /// The user and group the host runs as, and its umask, when the
     /// daemon is root and the application names them (section 10.9).
     pub identity: Option<Identity>,
+    /// Section 4.9: the default mount's path hint roots, each absolute,
+    /// beneath which its workers open a hinted file.
+    pub sendfile_roots: Vec<String>,
+    /// A second header the default mount's workers honour as
+    /// X-Muru-Sendfile.
+    pub sendfile_header: Option<String>,
+    /// The roots Muru provides that must be owned by a user, each with
+    /// its uid (issue 849): the application's media part under a root
+    /// daemon, so a link in its place cannot lead a worker into a
+    /// directory of another user's.
+    pub owned_roots: Vec<(String, u32)>,
+}
+
+/// The `--sendfile` argument: each mount's roots, the roots among them
+/// that must be owned by a user, and its second header, as a JSON object
+/// by mount name, the default mount's under "".
+fn sendfile_argument(spec: &HostSpec) -> String {
+    let entry = |roots: &[String], header: &Option<String>| {
+        let owned: serde_json::Map<String, serde_json::Value> = spec
+            .owned_roots
+            .iter()
+            .filter(|(root, _)| roots.contains(root))
+            .map(|(root, uid)| (root.clone(), serde_json::Value::from(*uid)))
+            .collect();
+
+        serde_json::json!({ "roots": roots, "owned": owned, "header": header })
+    };
+
+    let mut mounts = serde_json::Map::new();
+    mounts.insert(
+        String::new(),
+        entry(&spec.sendfile_roots, &spec.sendfile_header),
+    );
+
+    for mount in &spec.mounts {
+        mounts.insert(
+            mount.name.clone(),
+            entry(&mount.sendfile_roots, &mount.sendfile_header),
+        );
+    }
+
+    serde_json::Value::Object(mounts).to_string()
 }
 
 impl HostSpec {
@@ -921,6 +963,13 @@ impl Identity {
         unsafe { libc::geteuid() == 0 }
     }
 
+    /// The effective user this process runs as.
+    pub fn current_uid() -> u32 {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+
+        unsafe { libc::geteuid() }
+    }
+
     /// Give a path to the identity's user and group.
     pub fn own(&self, path: &Path) -> std::io::Result<()> {
         std::os::unix::fs::chown(path, Some(self.uid), Some(self.gid))
@@ -951,6 +1000,10 @@ pub struct HostMount {
     pub max_connections: Option<usize>,
     /// The interface the mount's requests may be handed to (section 6.14).
     pub handoff: Option<muru_config::Handoff>,
+    /// Section 4.9: the mount's path hint roots, each absolute.
+    pub sendfile_roots: Vec<String>,
+    /// A second header the mount's workers honour as X-Muru-Sendfile.
+    pub sendfile_header: Option<String>,
 }
 
 /// A named worker group's sizes, as the host forks it.
@@ -1199,6 +1252,11 @@ impl HostProcess {
             }
         }
 
+        // Section 4.9 (issue 848): each mount's path hint settings, which
+        // its workers enforce, the default mount's under "".
+
+        command.arg("--sendfile").arg(sendfile_argument(spec));
+
         for group in &spec.groups {
             command.arg("--group").arg(format!(
                 "{}={},{},{},{}",
@@ -1375,6 +1433,14 @@ impl HostProcess {
         }
 
         for name in crate::commands::not_inherited(spec.bytecode) {
+            command.env_remove(name);
+        }
+
+        // Issues 849 and 850: the places are Muru's to name, so a value
+        // inherited from the shell that started muructl never reaches the
+        // application; those it has are in its environment.
+
+        for name in muru_config::places::VARIABLES {
             command.env_remove(name);
         }
 

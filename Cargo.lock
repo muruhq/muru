@@ -1604,6 +1604,7 @@ dependencies = [
  "prost",
  "pyo3",
  "signal-hook-registry",
+ "tempfile",
  "tokio",
  "tracing",
 ]

@@ -1,6 +1,6 @@
 [package]
 name = "muru-common"
-description = "Shared pieces of Muru: the writing of its own log lines and the times on them, and process titles."
+description = "Shared pieces of Muru: the writing of its own log lines and the times on them, process titles, and files opened beneath a root directory."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
