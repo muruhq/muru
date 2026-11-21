@@ -100,6 +100,27 @@ def test_a_group_recycles_by_its_own_settings_else_the_releases(tmp_path: Path) 
             host.parse_group_recycle(text)
 
 
+def test_each_mounts_path_hint_settings_are_read_from_one_argument() -> None:
+    """Section 4.9: the roots a mount's workers open hinted files beneath,
+    and its second header, by mount name, the default mount's under ""."""
+
+    parsed = host.parse_sendfile(
+        '{"": {"roots": ["/srv/media"], "header": null},'
+        ' "api": {"roots": [], "header": "X-Sendfile"}}'
+    )
+    assert parsed == [("", ["/srv/media"], None), ("api", [], "X-Sendfile")]
+    assert host.parse_args(["--app", "a:b", "--socket-dir", "/tmp"]).sendfile == []
+
+    for text in (
+        "[]",
+        "not json",
+        '{"": {"roots": ["media"]}}',
+        '{"": {"roots": [], "header": 1}}',
+    ):
+        with pytest.raises(argparse.ArgumentTypeError):
+            host.parse_sendfile(text)
+
+
 def test_workers_message_lists_the_routed_sockets_by_group(tmp_path: Path) -> None:
     release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
     api = host.Group("api", 1, 1, 1, 1)

@@ -13,6 +13,7 @@ mod link;
 mod memory;
 mod pool;
 mod record;
+mod sendfile;
 mod signals;
 mod startup_signals;
 mod uploads;
@@ -88,12 +89,14 @@ type MountArgument = (
 /// attach to the interpreter, for that long. `handoff` says the default
 /// mount's requests may be handed to the other interface (section 6.14).
 /// `worker` is the worker's index within its group, which HELLO gives
-/// the edge to name it by.
+/// the edge to name it by. `sendfile` is each mount's path hint settings
+/// (section 4.9) as (mount, roots, second header) tuples, the default
+/// mount's named `""`; a mount without one refuses every path hint.
 ///
 /// The arguments are the Python signature, keyword by keyword.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new(), loop_stall_timeout_ms=None, websocket_drain_ms=0, drain_ms=5000, exit_grace_ms=2000, gil_stall_timeout_ms=None, handoff=false, sync_threads=0, worker=0))]
+#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new(), loop_stall_timeout_ms=None, websocket_drain_ms=0, drain_ms=5000, exit_grace_ms=2000, gil_stall_timeout_ms=None, handoff=false, sync_threads=0, worker=0, sendfile=Vec::new()))]
 fn serve(
     py: Python<'_>,
     socket_path: String,
@@ -124,6 +127,7 @@ fn serve(
     handoff: bool,
     sync_threads: usize,
     worker: u32,
+    sendfile: Vec<(String, Vec<String>, Option<String>)>,
 ) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
 
@@ -211,6 +215,15 @@ fn serve(
     .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     shared.handoff = handoff;
     shared.worker = worker;
+    shared.sendfile = sendfile
+        .into_iter()
+        .map(|(mount, roots, header)| {
+            (
+                mount,
+                Arc::new(sendfile::Hints::new(&roots, header.as_deref())),
+            )
+        })
+        .collect();
     shared.loop_stall = loop_stall_timeout_ms
         .filter(|&ms| ms > 0 && shared.asgi.is_some())
         .map(std::time::Duration::from_millis);

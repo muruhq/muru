@@ -22,6 +22,7 @@ from support import server as support
 from support.daemon import Daemon, start_daemon
 
 PLAIN = support.FIXTURES
+FILES = support.ROOT / "tests" / "fixtures" / "projects" / "files"
 
 
 def test_a_declared_user_is_recorded_and_reported_as_not_applied_without_root(
@@ -271,5 +272,39 @@ def test_a_root_daemon_runs_the_edge_and_applications_as_the_service_user() -> N
         events = daemon.muru("events").stdout
         assert "app.user_is_root" in events
         assert "runs as root, which is not recommended" in events
+
+        # Section 4.9 (issue 848): a path hint is opened by the worker, as
+        # the application's user, so a file only that user can read is
+        # served though the edge, as the service user, cannot read it.
+
+        media = daemon.base / "media"
+        subprocess.run(
+            ["sudo", "-n", "install", "-d", "-o", "daemon", "-m", "0700", str(media)], check=True
+        )
+        subprocess.run(
+            [
+                "sudo",
+                "-n",
+                "-u",
+                "daemon",
+                "sh",
+                "-c",
+                f"umask 077; printf private > {media}/own.txt",
+            ],
+            check=True,
+        )
+        daemon.apply(
+            "[app.plain]\nuser = 'daemon'\n\n[app.plain.release.r4]\n"
+            f"source = '{FILES}'\n"
+            "entrypoint = 'files:wsgi_app'\n"
+            f"python = '{sys.executable}'\n"
+            "processes = 1\n"
+            f"sendfile_roots = ['{media}']\n"
+            f"env = {{ FILES_DIR = '{media}' }}\n"
+        )
+        hinted = Daemon.request_static(daemon.port, f"/sendfile-path?path={media}/own.txt")
+        assert (hinted.status, hinted.body) == (200, b"private"), hinted
+        refused = Daemon.request_static(daemon.port, "/sendfile-path?path=/etc/passwd")
+        assert refused.status == 500
     finally:
         daemon.stop()

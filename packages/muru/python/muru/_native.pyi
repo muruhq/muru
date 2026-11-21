@@ -44,6 +44,7 @@ def serve(
     handoff: bool = False,
     sync_threads: int = 0,
     worker: int = 0,
+    sendfile: list[tuple[str, list[str], str | None]] = ...,
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 
@@ -64,7 +65,11 @@ def serve(
     mounts registered, as (path, mount, client streaming, server streaming)
     tuples, which HELLO declares to the edge. handoff, and the last item
     of each mount, say whether its requests may be handed to the other
-    interface.
+    interface. sendfile is each mount's path hint settings as (mount,
+    roots, second header) tuples, the default mount's named "": the
+    absolute directories a hinted file is opened beneath, and a header
+    honoured as X-Muru-Sendfile is; a mount without one refuses every
+    path hint.
     """
 
 def memory_usage() -> dict[str, int] | None:

@@ -6,6 +6,9 @@ forms. By descriptor, the application's own open file is passed to the
 edge, which sends exactly the range the application chose with the
 status and headers it set. By path, a response header names a file, and
 the edge serves it the way it serves a [static file](static-files.md).
+Either way, for an application Muru's workers serve, the file is opened
+in the worker, as the application's user, and handed to the edge open,
+so the edge's user needs no access to the application's files.
 
 ## By descriptor
 
@@ -54,14 +57,32 @@ and length.
 A response with an `X-Muru-Sendfile` header naming an absolute path has
 its body replaced by that file, sent by the edge with static-file
 behaviour: `Content-Length`, `ETag`, `Last-Modified`, `Accept-Ranges`,
-conditional requests answered 304 and `Range` requests answered 206.
-The response's own status and headers go with the file: a
-`Content-Type` the application set replaces the guessed one, and a
-status other than 200 sends the whole file with that status. The
-`X-Muru-Sendfile` header itself never reaches the client.
+conditional requests answered 304, `Range` requests answered 206 (416
+past the end), `HEAD` answered with the headers alone, and
+`Content-Type` from the file's name. The response's own status and
+headers go with the file: a `Content-Type` the application set replaces
+the guessed one, and a status other than 200 sends the whole file with
+that status. Any body the application sent with the header is
+discarded, and the `X-Muru-Sendfile` header itself never reaches the
+client. The application changes nothing for this under WSGI
+(`start_response` headers) or ASGI (`http.response.start` headers).
 
-The edge opens the path as its own user, and only within the
-directories the mount's `sendfile_roots` lists. A relative root is
+Muru's runtime in the worker takes the header from the response, opens
+the file as the application's user, and passes the open file to the
+edge, which reads its length, `ETag` and `Last-Modified` from it. The
+file needs to be readable by the application's user alone: one written
+`0600` is served as well as one written `0644`, and the edge's user
+needs nothing. Where a file with a `.br`, `.zst` or `.gz` suffix lies
+beside the hinted file in an encoding the client accepts and
+[compression](compression.md) allows, the worker opens that variant
+too, and the edge sends it with `Content-Encoding` and `Vary`, as it
+does for a static route; a `Range` request is answered from the file
+itself.
+
+The worker opens a hinted file only within the directories the mount's
+`sendfile_roots` lists. They catch a hint built from a request
+parameter by mistake (`?file=../../settings.py`, `.env`), and keep what
+a hint may name the same whatever answers the route. A relative root is
 taken from the release's source directory, so the setting travels with
 the project and means the same in every release and under `muructl
 run`, `muructl serve` and the daemon; an absolute root is used as
@@ -105,7 +126,8 @@ the root's own open directory, and is never opened again by its path:
 A path that is relative, outside the roots, or leaves its root is
 answered 500 `sendfile_refused` and logged with the path; a path that
 names nothing, or not a regular file, or a file or root that cannot be
-opened, is 404 `sendfile_missing`. `muructl deploy --sendfile-root
+opened, is 404 `sendfile_missing`, and a file the application's user
+cannot read is logged with the reason in the application's output. `muructl deploy --sendfile-root
 DIR` sets the release's roots from the command line, a relative one
 taken from the source, and `muructl run` reads `sendfile_roots` from
 the project's `[tool.muru]` table. In a file `muructl apply` reads, a
@@ -122,7 +144,10 @@ the command line.
 
 An [upstream](upstreams.md) with `trust_muru_headers = true` may give
 path hints too, within its own `sendfile_roots` and with its own
-`sendfile_header`:
+`sendfile_header`. The edge opens these files itself, as its own user,
+beneath the roots in the same way, so they must be readable by the
+edge's user, which the operator arranges; they are served without
+precompressed variants:
 
 ```toml
 [upstream.legacy]
@@ -137,4 +162,5 @@ relative one is taken from the file's directory.
 
 A [managed HTTP server](managed-servers.md) release is trusted as an
 upstream, and its release's `sendfile_roots`, relative ones taken from
-its source, and `sendfile_header` apply to the server's responses.
+its source, and `sendfile_header` apply to the server's responses; the
+edge opens those files as it does an upstream's.

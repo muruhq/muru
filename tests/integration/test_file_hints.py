@@ -13,6 +13,7 @@ behaviour, from an application, a trusted upstream or a managed server.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import http.client
 import json
@@ -33,6 +34,7 @@ FILES = support.ROOT / "tests" / "fixtures" / "projects" / "files"
 
 BIG = bytes(range(256)) * 4096 * 3  # 3 MiB
 SMALL = b"a small file of text\n"
+SCRIPT = b"console.log('a script with a precompressed variant');\n" * 64
 
 
 def write_files(directory: Path) -> None:
@@ -41,6 +43,8 @@ def write_files(directory: Path) -> None:
     (directory / "small.txt").write_bytes(SMALL)
     (directory / "nested").mkdir(exist_ok=True)
     (directory / "nested" / "inner.txt").write_bytes(b"inner\n")
+    (directory / "app.js").write_bytes(SCRIPT)
+    (directory / "app.js.gz").write_bytes(gzip.compress(SCRIPT))
 
 
 def write_project(project: Path, roots: Path) -> None:
@@ -267,6 +271,23 @@ def test_a_path_hint_is_served_as_a_static_file(
 
     # A nested path, the type guessed when the application set none, and
     # any other status going out as the application chose, with the file.
+
+    # The worker opens the variant the edge would serve beside the file,
+    # and a range is served from the file itself.
+
+    script = development.get(
+        "/sendfile-path?path=" + str(layout[0] / "app.js"), {"Accept-Encoding": "gzip"}
+    )
+    assert script.header("Content-Encoding") == "gzip"
+    assert script.header("Vary") == "Accept-Encoding"
+    assert gzip.decompress(script.body) == SCRIPT
+    assert script.header("Content-Type") == "text/javascript; charset=utf-8"
+    ranged = development.get(
+        "/sendfile-path?path=" + str(layout[0] / "app.js"),
+        {"Accept-Encoding": "gzip", "Range": "bytes=0-6"},
+    )
+    assert (ranged.status, ranged.body) == (206, SCRIPT[:7])
+    assert ranged.header("Content-Encoding") is None
 
     created = development.get("/sendfile-status/nested/inner.txt")
     assert created.status == 201

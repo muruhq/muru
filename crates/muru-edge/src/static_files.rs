@@ -365,6 +365,21 @@ pub async fn serve_hint(
         .await
         .unwrap_or(Err(Located::Missing));
 
+    serve_located(path, located, method, headers, head, strip).await
+}
+
+/// Serve a hinted file already looked for: by the edge beneath an
+/// upstream's roots, or by a worker beneath its mount's, whose descriptor
+/// came on the link (section 4.9). A refusal or a missing file is the
+/// problem the client is answered with, logged with the path.
+pub(crate) async fn serve_located(
+    path: &str,
+    located: Result<Found, Located>,
+    method: &Method,
+    headers: &HeaderMap,
+    head: &muru_proto::worker::v1::ResponseHead,
+    strip: &[&str],
+) -> Result<Outcome, crate::errors::Problem> {
     let found = match located {
         Ok(found) => found,
         Err(Located::Refused) => {
@@ -372,19 +387,11 @@ pub async fn serve_hint(
                 path,
                 "the application named a file outside the mount's sendfile_roots; refused"
             );
-            return Err(crate::errors::Problem::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "sendfile_refused",
-                "The application named a file the edge may not send.",
-            ));
+            return Err(refused());
         }
         Err(Located::Missing) => {
             tracing::warn!(path, "the application named a file that is not there");
-            return Err(crate::errors::Problem::new(
-                StatusCode::NOT_FOUND,
-                "sendfile_missing",
-                "The file the application named is not there.",
-            ));
+            return Err(missing());
         }
     };
 
@@ -443,6 +450,25 @@ pub async fn serve_hint(
     }
 
     Ok(outcome)
+}
+
+/// The answer to a hint naming a file it may not.
+fn refused() -> crate::errors::Problem {
+    crate::errors::Problem::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "sendfile_refused",
+        "The application named a file the edge may not send.",
+    )
+}
+
+/// The answer to a hint naming a file that is not there, or that cannot
+/// be read.
+pub(crate) fn missing() -> crate::errors::Problem {
+    crate::errors::Problem::new(
+        StatusCode::NOT_FOUND,
+        "sendfile_missing",
+        "The file the application named is not there.",
+    )
 }
 
 /// The path's components below the route, percent-decoded and

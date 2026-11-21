@@ -938,6 +938,41 @@ class Group:
         return cls(name, processes, threads, sync_threads, concurrency)
 
 
+def parse_sendfile(text: str) -> list[tuple[str, list[str], str | None]]:
+    """Parse --sendfile, each mount's path hint settings (section 4.9).
+
+    The argument is a JSON object by mount name, each with `roots`,
+    absolute directories, and `header`, a second header honoured as
+    X-Muru-Sendfile or null.
+    """
+
+    try:
+        mounts = json.loads(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"{text!r} is not JSON: {error}") from None
+
+    if not isinstance(mounts, dict):
+        raise argparse.ArgumentTypeError(f"{text!r} is not an object of mounts")
+
+    parsed: list[tuple[str, list[str], str | None]] = []
+
+    for name, settings in mounts.items():
+        roots = settings.get("roots") if isinstance(settings, dict) else None
+        header = settings.get("header") if isinstance(settings, dict) else None
+
+        if not isinstance(roots, list) or not all(
+            isinstance(root, str) and os.path.isabs(root) for root in roots
+        ):
+            raise argparse.ArgumentTypeError(f"mount {name!r}: roots are not absolute paths")
+
+        if header is not None and not isinstance(header, str):
+            raise argparse.ArgumentTypeError(f"mount {name!r}: header is not a header name")
+
+        parsed.append((name, roots, header))
+
+    return parsed
+
+
 def parse_mount_handoff(text: str) -> tuple[str, tuple[str, int | None]]:
     """Parse NAME=INTERFACE[,THREADS]: where a mount's requests may be handed.
 
@@ -1274,11 +1309,17 @@ class Host:
         reflection: bool = False,
         handoff: str | None = None,
         cgroup: str | None = None,
+        sendfile: list[tuple[str, list[str], str | None]] | None = None,
     ) -> None:
         self.release = release
         self.mounts = mounts or []
         self.reflection = reflection
         self.handoff = handoff
+
+        # Section 4.9: each mount's path hint roots and second header, the
+        # default mount's named "", which the workers enforce.
+
+        self.sendfile = sendfile or []
         self.socket_dir = socket_dir
         self.tcp_base_port = tcp_base_port
         self.detach = detach
@@ -2236,6 +2277,7 @@ class Host:
                 grpc_methods=grpc_methods,
                 handoff=self.handoff is not None,
                 worker=within,
+                sendfile=self.sendfile,
                 **asgi_arguments,
                 **timeout_arguments,
             )
@@ -5284,6 +5326,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="the interface the default mount's requests may be handed to",
     )
     parser.add_argument(
+        "--sendfile",
+        type=parse_sendfile,
+        default=[],
+        metavar="JSON",
+        help="each mount's path hint roots and second header, by mount name, the default mount's "
+        'under ""',
+    )
+    parser.add_argument(
         "--mount-handoff",
         action="append",
         default=[],
@@ -5894,6 +5944,7 @@ def _main(argv: list[str] | None) -> int:
         reflection=args.reflection,
         handoff=args.handoff,
         cgroup=args.cgroup,
+        sendfile=args.sendfile,
     )
 
     # Section 6.18: the load's import report, or the one a host that fell

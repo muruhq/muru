@@ -7199,8 +7199,15 @@ impl Daemon {
                     concurrency: mount.concurrency.map(|value| value as usize),
                     max_connections: mount.max_connections.map(|value| value as usize),
                     handoff: mount.handoff,
+                    sendfile_roots: muru_config::sendfile_root_paths(
+                        &mount.sendfile_roots,
+                        &spec.source,
+                    ),
+                    sendfile_header: mount.sendfile_header.clone(),
                 })
                 .collect(),
+            sendfile_roots: muru_config::sendfile_root_paths(&spec.sendfile_roots, &spec.source),
+            sendfile_header: spec.sendfile_header.clone(),
         };
 
         // What the host writes from here on is what says why, if it fails.
@@ -8261,14 +8268,6 @@ impl Daemon {
                                     accept_redirects_from: mount.accept_redirects_from.clone(),
                                     accel_redirect: mount.accel_redirect,
                                     cgi_local_redirect: mount.cgi_local_redirect,
-                                    sendfile_roots: muru_config::sendfile_root_paths(
-                                        &mount.sendfile_roots,
-                                        &release.spec.source,
-                                    ),
-                                    sendfile_header: mount
-                                        .sendfile_header
-                                        .clone()
-                                        .unwrap_or_default(),
                                 })
                                 .collect()
                         })
@@ -8281,22 +8280,6 @@ impl Daemon {
                         .store
                         .release(name, id)
                         .is_ok_and(|release| release.spec.cgi_local_redirect),
-                    sendfile_roots: self
-                        .store
-                        .release(name, id)
-                        .map(|release| {
-                            muru_config::sendfile_root_paths(
-                                &release.spec.sendfile_roots,
-                                &release.spec.source,
-                            )
-                        })
-                        .unwrap_or_default(),
-                    sendfile_header: self
-                        .store
-                        .release(name, id)
-                        .ok()
-                        .and_then(|release| release.spec.sendfile_header.clone())
-                        .unwrap_or_default(),
                     error_pages: self
                         .store
                         .release(name, id)

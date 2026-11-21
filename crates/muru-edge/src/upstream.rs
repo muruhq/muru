@@ -1223,7 +1223,16 @@ pub async fn handle(
     {
         drop(response);
         return Handled::Response(
-            link::serve_hint(&path, parts, context, &head, &failing, recording.take()).await,
+            link::serve_hint(
+                &path,
+                parts,
+                context,
+                &head,
+                &failing,
+                recording.take(),
+                None,
+            )
+            .await,
         );
     }
 

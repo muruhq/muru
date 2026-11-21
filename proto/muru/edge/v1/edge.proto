@@ -431,8 +431,7 @@ message AppWorkers {
   ErrorOverride error_override = 10;
   Maintenance maintenance = 11;         // maintenance mode and its exemptions; off when absent
   Upstream server = 12;                 // section 9.9: a managed HTTP release's instances, routed as an upstream; no sockets then
-  repeated string sendfile_roots = 13;  // section 4.9: directories the default mount's X-Muru-Sendfile paths must lie in
-  string sendfile_header = 14;          // a second header honoured as X-Muru-Sendfile is; none when empty
+  reserved 13, 14;                      // the default mount's file hint keys, which its workers enforce now (issue 848)
   repeated string waking_groups = 15;   // section 7.4: groups, "default" among them, whose requests wait to be woken when they have no workers
   repeated string grpc_web_origins = 16; // section 6.13: the origins whose pages may call it through gRPC-Web, or *; no CORS when empty
   repeated StaticDir static_dirs = 17;  // section 4.9: the release's own directories of files, by path prefix
@@ -462,8 +461,7 @@ message Mount {
   repeated string accept_redirects_from = 4; // other applications whose redirects may reach an internal mount
   bool accel_redirect = 5;              // X-Accel-Redirect from the mount is an internal redirect
   bool cgi_local_redirect = 6;          // a 200 with a local Location and no body is an internal redirect
-  repeated string sendfile_roots = 7;   // section 4.9: directories the mount's X-Muru-Sendfile paths must lie in
-  string sendfile_header = 8;           // a second header honoured as X-Muru-Sendfile is; none when empty
+  reserved 7, 8;                        // the mount's file hint keys, which its workers enforce now (issue 848)
   RequestLimits limits = 9;             // section 4.6: the mount's own limits on a request, over its group's and release's
 }
 

@@ -489,7 +489,6 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         static_dirs: Vec::new(),
         accel_redirect: false,
         cgi_local_redirect: false,
-        sendfile: Arc::default(),
         grpc_web_origins: Vec::new(),
         errors: Arc::new(muru_edge::errors::ErrorPolicy::default()),
         development: true,
@@ -2815,20 +2814,6 @@ fn mount_paths(resolved: &Resolved) -> Vec<muru_edge::routing::MountPath> {
             cgi_local_redirect: mount
                 .cgi_local_redirect
                 .unwrap_or(resolved.cgi_local_redirect),
-            sendfile: muru_edge::routing::Sendfile::new(
-                &muru_config::sendfile_root_paths(
-                    mount
-                        .sendfile_roots
-                        .as_deref()
-                        .unwrap_or(&resolved.sendfile_roots),
-                    &resolved.project,
-                ),
-                mount
-                    .sendfile_header
-                    .as_deref()
-                    .or(resolved.sendfile_header.as_deref())
-                    .unwrap_or_default(),
-            ),
         })
         .collect()
 }
@@ -3486,6 +3471,17 @@ fn host_spec(
                 concurrency: mount.concurrency,
                 max_connections: mount.max_connections,
                 handoff: mount.handoff,
+                sendfile_roots: muru_config::sendfile_root_paths(
+                    mount
+                        .sendfile_roots
+                        .as_deref()
+                        .unwrap_or(&resolved.sendfile_roots),
+                    &resolved.project,
+                ),
+                sendfile_header: mount
+                    .sendfile_header
+                    .clone()
+                    .or_else(|| resolved.sendfile_header.clone()),
             })
             .collect(),
         logging: resolved
@@ -3508,6 +3504,11 @@ fn host_spec(
         env,
         shown_env: resolved.env.keys().cloned().collect(),
         identity: None,
+        sendfile_roots: muru_config::sendfile_root_paths(
+            &resolved.sendfile_roots,
+            &resolved.project,
+        ),
+        sendfile_header: resolved.sendfile_header.clone(),
     };
 
     // Section 11.8: under serve --log-format json, Python logging writes
@@ -3556,15 +3557,6 @@ fn redirect_flags(resolved: &Resolved) -> muru_edge::routing::RedirectFlags {
         accel_redirect: resolved.accel_redirect,
         cgi_local_redirect: resolved.cgi_local_redirect,
     }
-}
-
-/// Which files the edge sends for a response that names one, as the
-/// project says.
-fn sendfile(resolved: &Resolved) -> Arc<muru_edge::routing::Sendfile> {
-    muru_edge::routing::Sendfile::new(
-        &muru_config::sendfile_root_paths(&resolved.sendfile_roots, &resolved.project),
-        resolved.sendfile_header.as_deref().unwrap_or_default(),
-    )
 }
 
 /// The settings a run takes only as it starts, each its key and value,
@@ -4079,7 +4071,6 @@ async fn run_with(
     let mut group_tables = resolved.groups.clone();
     let mut mounts = mount_paths(&resolved);
     let mut redirect_flags = redirect_flags(&resolved);
-    let mut sendfile = sendfile(&resolved);
 
     // Section 13.9: the admin port and the probe socket answer while the
     // application loads, the startup and readiness probes failing until
@@ -4244,7 +4235,6 @@ async fn run_with(
         static_dirs: static_paths.clone(),
         accel_redirect: resolved.accel_redirect,
         cgi_local_redirect: resolved.cgi_local_redirect,
-        sendfile: Arc::clone(&sendfile),
         grpc_web_origins: resolved.grpc_web_origins.clone(),
         errors: Arc::clone(&error_policy),
         development,
@@ -4898,7 +4888,6 @@ async fn run_with(
                         .map(|pools| {
                             pools
                                 .with_errors(Arc::clone(&error_policy))
-                                .with_sendfile(Arc::clone(&sendfile))
                                 .with_grpc_web(&resolved.grpc_web_origins)
                                 .with_static_dirs(static_paths.clone())
                                 .with_waking(&waiting)
@@ -5048,7 +5037,6 @@ async fn run_with(
                     group_tables = next.resolved.groups.clone();
                     mounts = mount_paths(&next.resolved);
                     redirect_flags = self::redirect_flags(&next.resolved);
-                    sendfile = self::sendfile(&next.resolved);
                     resolved = next.resolved.keeping_restart_only(resolved);
 
                     if serve.is_none() {
@@ -5143,7 +5131,6 @@ async fn run_with(
                                 .map(|pools| {
                                     pools
                                         .with_errors(Arc::clone(&error_policy))
-                                        .with_sendfile(Arc::clone(&sendfile))
                                         .with_grpc_web(&resolved.grpc_web_origins)
                                 .with_static_dirs(static_paths.clone())
                                 });

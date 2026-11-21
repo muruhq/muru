@@ -162,7 +162,6 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             static_dirs: Vec::new(),
             accel_redirect: false,
             cgi_local_redirect: false,
-            sendfile: Arc::default(),
             grpc_web_origins: Vec::new(),
             errors: Arc::new(muru_edge::errors::ErrorPolicy::default()),
             development: false,

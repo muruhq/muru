@@ -1342,6 +1342,7 @@ async fn handle_request(
 
     let trace = shared.request_trace(request_id);
     let edge_id = head.request_id.clone();
+    let hint = shared.hint_context(&head);
     let job_trace = trace.clone();
     let job_edge_id = edge_id.clone();
 
@@ -1503,7 +1504,8 @@ async fn handle_request(
         }
     };
     let write_side = async {
-        let result = write_response_after(first, out_rx, writer, trace.as_deref()).await;
+        let result =
+            write_response_after(first, out_rx, writer, trace.as_deref(), Some(&hint)).await;
 
         if let Some(channel) = slot.channel() {
             channel.complete();
@@ -1569,9 +1571,10 @@ impl Output {
         self,
         writer: &mut Writer,
         trace: Option<&record::Trace>,
+        hint: Option<&crate::pool::HintContext>,
     ) -> io::Result<()> {
         match self {
-            Self::Open(first, rx) => write_response_after(first, rx, writer, trace).await,
+            Self::Open(first, rx) => write_response_after(first, rx, writer, trace, hint).await,
             Self::Ended(written) => written,
         }
     }
@@ -1678,7 +1681,8 @@ async fn handle_asgi_request(
     let (started, output) = match begun {
         Begun::Started(started) => (started, Output::Open(None, out_rx)),
         Begun::Sent(Some(abort @ Outgoing::Abort { .. })) => {
-            let written = write_response_after(Some(abort), out_rx, writer, trace.as_deref()).await;
+            let written =
+                write_response_after(Some(abort), out_rx, writer, trace.as_deref(), None).await;
             ((&mut start).await, Output::Ended(written))
         }
         Begun::Sent(item) => ((&mut start).await, Output::Open(item, out_rx)),
@@ -1777,7 +1781,10 @@ async fn handle_asgi_request(
         }
     };
     let write_side = async {
-        let result = output.write_response(writer, trace.as_deref()).await;
+        let hint = shared.hint_context(&head);
+        let result = output
+            .write_response(writer, trace.as_deref(), Some(&hint))
+            .await;
         channel.complete();
         done.notify_one();
         result
@@ -1897,7 +1904,7 @@ async fn handle_websocket(
         }
     };
     let write_side = async {
-        let result = output.write_response(writer, None).await;
+        let result = output.write_response(writer, None, None).await;
         channel.complete();
         done.notify_one();
         result
@@ -2004,6 +2011,65 @@ async fn handle_grpc(
     Ok(early)
 }
 
+/// Answer a path hint (section 4.9): open the file beneath the mount's
+/// roots on the blocking pool, and send the head saying how that went,
+/// with the END flag when it was not opened, or followed by the file's
+/// descriptor and its variant's, each on a FILE frame with the PATH_HINT
+/// flag.
+async fn write_hinted(
+    writer: &mut Writer,
+    mut head: pb::ResponseHead,
+    hint: &crate::pool::HintContext,
+    path: String,
+) -> io::Result<()> {
+    let hints = Arc::clone(&hint.hints);
+    let encodings = hint.encodings.clone();
+    let asked = path.clone();
+    let opened = tokio::task::spawn_blocking(move || hints.open(&asked, &encodings))
+        .await
+        .unwrap_or(Err(pb::PathHintOutcome::Missing));
+
+    let outcome = match &opened {
+        Ok(_) => pb::PathHintOutcome::Opened,
+        Err(outcome) => *outcome,
+    };
+
+    head.path_hint = Some(pb::PathHint {
+        path,
+        outcome: outcome as i32,
+    });
+
+    let Ok(opened) = opened else {
+        return frame::write(
+            writer,
+            kind::RESPONSE,
+            flag::END,
+            head.encode_to_vec().into(),
+        )
+        .await;
+    };
+
+    frame::write(writer, kind::RESPONSE, 0, head.encode_to_vec().into()).await?;
+
+    let files: Vec<(String, std::fs::File)> = std::iter::once((String::new(), opened.file))
+        .chain(opened.variant)
+        .collect();
+    let last = files.len() - 1;
+
+    for (index, (encoding, file)) in files.into_iter().enumerate() {
+        let flags = flag::PATH_HINT | if index == last { flag::END } else { 0 };
+        let hint = pb::FileHint {
+            encoding,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let encoded = frame::encode(kind::FILE, flags, &hint);
+        muru_proto::descriptors::write_with_fd(writer, &encoded, file.as_fd()).await?;
+    }
+
+    Ok(())
+}
+
 /// Turn a gRPC call's output into frames as it comes, each message on its
 /// own: the head, the messages, and an END with the trailers or the
 /// application's failure. `first`, when given, was already taken from
@@ -2080,12 +2146,15 @@ async fn write_grpc_response(
 }
 
 /// Turn the application's output into frames, coalescing small chunks.
-/// `first`, when given, was already taken from the channel.
+/// `first`, when given, was already taken from the channel. `hint` is how
+/// a path hint in the response's headers is answered (section 4.9); none
+/// for a WebSocket's or a response that cannot carry one.
 async fn write_response_after(
     mut first: Option<Outgoing>,
     mut rx: mpsc::Receiver<Outgoing>,
     writer: &mut Writer,
     trace: Option<&record::Trace>,
+    hint: Option<&crate::pool::HintContext>,
 ) -> io::Result<()> {
     let mut pending_head: Option<Bytes> = None;
     let mut head_written = false;
@@ -2197,9 +2266,16 @@ async fn write_response_after(
             Some(Some(Outgoing::Head {
                 status,
                 reason,
-                headers,
+                mut headers,
                 flush,
             })) => {
+                // Section 4.9 (issue 848): a path hint is taken from the
+                // headers and answered with the file, opened here.
+
+                let hinted = hint
+                    .filter(|_| status != 101)
+                    .and_then(|hint| Some((hint, hint.hints.take(&mut headers)?)));
+
                 immediate = flush == pb::FlushPolicy::Immediate;
                 content_length = headers
                     .iter()
@@ -2218,7 +2294,18 @@ async fn write_response_after(
                     flush: flush as i32,
                     imports_ms: trace.map_or(0.0, record::Trace::imports_ms),
                     import_wait_ms: trace.map_or(0.0, record::Trace::import_wait_ms),
+                    path_hint: None,
                 };
+
+                // The file replaces whatever body the application sends
+                // with the hint, which is read and dropped.
+
+                if let Some((hint, path)) = hinted {
+                    write_hinted(writer, head, hint, path).await?;
+                    head_written = true;
+                    ended = true;
+                    continue;
+                }
 
                 if status == 101 {
                     // The WebSocket is accepted: the head goes out now and
@@ -2331,7 +2418,12 @@ async fn write_response_after(
 
                 sent += length;
                 let end = !more || content_length == Some(sent);
-                let hint = pb::FileHint { offset, length }.encode_to_vec();
+                let hint = pb::FileHint {
+                    offset,
+                    length,
+                    ..Default::default()
+                }
+                .encode_to_vec();
                 let flags = if end { flag::END } else { 0 };
                 let encoded = frame::encode(kind::FILE, flags, &hint);
                 muru_proto::descriptors::write_with_fd(writer, &encoded, fd.as_fd()).await?;
