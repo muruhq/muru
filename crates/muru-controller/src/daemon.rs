@@ -863,6 +863,7 @@ pub async fn processes(
         mode: "daemon".to_owned(),
         started_unix_ms: info.started_unix_ms,
         limits: info.cgroup_limits.lock().expect("limits poisoned").clone(),
+        state_dir: crate::registry::home_shortened(&info.locations.state.path),
     };
 
     Some(
@@ -12615,10 +12616,7 @@ impl Daemon {
         let mut known = vec![Known {
             pid: daemon,
             role: "daemon",
-            what: crate::processes::daemon_phrase(
-                self.locations.mode_word(),
-                &self.locations.state.path,
-            ),
+            what: crate::processes::daemon_phrase(self.locations.mode_word()),
             ..Known::default()
         }];
 

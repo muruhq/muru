@@ -551,21 +551,10 @@ pub fn addresses(listeners: &[(std::net::SocketAddr, bool)]) -> String {
         .join(", ")
 }
 
-/// What the daemon is, as its row says: whose daemon, `user` or `system`,
-/// and its state directory, with the home directory as `~`, the same
-/// identity its process title gives.
-pub fn daemon_phrase(mode: &str, state: &std::path::Path) -> String {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-
-    let shown = match home
-        .as_deref()
-        .and_then(|home| state.strip_prefix(home).ok())
-    {
-        Some(below) if !below.as_os_str().is_empty() => format!("~/{}", below.display()),
-        _ => state.display().to_string(),
-    };
-
-    format!("{mode} daemon, state {shown}")
+/// What the daemon is, as its row says: whose daemon, `user` or
+/// `system`. Its state directory is said above the table (issue 840).
+pub fn daemon_phrase(mode: &str) -> String {
+    format!("{mode} daemon")
 }
 
 /// What a host is, as its row says: its release, then the release's part
@@ -617,6 +606,9 @@ pub struct Header {
     /// The cgroup's limits and the memory guard, when there is a cgroup
     /// v2 (sections 7.7 and 13.9).
     pub limits: Option<pb::CgroupLimits>,
+    /// A daemon's state directory, with the home directory as `~`;
+    /// empty for a run or serve.
+    pub state_dir: String,
 }
 
 /// The answer to ListProcesses: the known processes as a tree, narrowed
@@ -693,6 +685,7 @@ pub async fn snapshot(
         root: tree(&known, &os, &cpu, &others, &figures),
         figures: Some(figures.instance),
         limits: header.limits,
+        state_dir: header.state_dir,
     }
 }
 
@@ -1650,7 +1643,7 @@ mod tests {
             Known {
                 pid: 10,
                 role: "daemon",
-                what: daemon_phrase("user", std::path::Path::new("/srv/muru/state")),
+                what: daemon_phrase("user"),
                 ..Known::default()
             },
             Known {

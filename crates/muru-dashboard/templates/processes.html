@@ -1,4 +1,5 @@
 <h2>Processes</h2>
+{% if !state_dir.is_empty() %}<p class="muted">The daemon's state directory is {{ state_dir }}</p>{% endif %}
 {% if rows.is_empty() %}
 <p class="muted">{% if error.is_empty() %}No processes to show.{% else %}{{ error }}{% endif %}</p>
 {% else %}

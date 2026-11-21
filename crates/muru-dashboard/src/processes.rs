@@ -56,6 +56,9 @@ pub struct ProcessesFragment<'a> {
     pub rows: &'a [ProcessRow],
     /// Whether the user column is shown: under the daemon.
     pub with_user: bool,
+    /// The daemon's state directory, said above the table; empty for a
+    /// run or serve (issue 840).
+    pub state_dir: &'a str,
     /// Why there are no rows, or empty.
     pub error: &'a str,
     /// Whether a row's figures count a worker no longer listed, which a
@@ -282,7 +285,7 @@ mod tests {
     fn a_worker_links_to_its_page_and_a_readopted_host_says_so() {
         let answer = serde_json::json!({
             "root": {
-                "pid": 10, "role": "daemon", "what": "user daemon, state ~/.local/state/muru",
+                "pid": 10, "role": "daemon", "what": "user daemon",
                 "children": [{
                     "pid": 20, "role": "host", "what": "shop@r1", "app": "shop", "release": "r1",
                     "readopted": true, "os_parent_pid": 1,

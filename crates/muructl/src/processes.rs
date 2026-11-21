@@ -78,7 +78,7 @@ pub async fn show(
             return crate::admin::print_answer(&answer);
         }
 
-        print!("{}", render(&answer, None));
+        print!("{}", render(&answer, None, terminal_width()));
         return Ok(());
     };
 
@@ -99,10 +99,13 @@ pub async fn show(
         } else if redraw {
             // Home and clear, then the frame: drawn in place.
 
-            format!("\x1b[H\x1b[2J{}", render(&answer, Some(every)))
+            format!(
+                "\x1b[H\x1b[2J{}",
+                render(&answer, Some(every), terminal_width())
+            )
         } else {
             let gap = if first { "" } else { "\n" };
-            format!("{gap}{}", render(&answer, Some(every)))
+            format!("{gap}{}", render(&answer, Some(every), None))
         };
 
         // A reader that has gone ends the watch, as it ends `head`.
@@ -129,19 +132,58 @@ struct Row {
     interface: String,
 }
 
+/// The columns of standard output when it is a terminal, for fitting
+/// the view to it (issue 840); none for a pipe or a file.
+fn terminal_width() -> Option<usize> {
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+
+    terminal_size::terminal_size().map(|(width, _)| usize::from(width.0))
+}
+
+/// The narrowest WHAT column fitting the view cuts it to.
+const NARROWEST_WHAT: usize = 24;
+
+/// The columns a fitted table never leaves out.
+const KEPT_COLUMNS: [&str; 3] = ["PID", "ROLE", "WHAT"];
+
+/// How a table was fitted to a terminal: the spaces between its columns,
+/// and the columns left out for want of room.
+struct Fitted {
+    gap: usize,
+    left_out: Vec<String>,
+}
+
+impl Default for Fitted {
+    fn default() -> Self {
+        Self {
+            gap: 3,
+            left_out: Vec::new(),
+        }
+    }
+}
+
 /// The view as text: with `every`, a line naming the instance, the time
-/// and the interval first; then the instance's figures, and the table.
-pub fn render(answer: &pb::Processes, every: Option<Duration>) -> String {
+/// and the interval first; then the daemon's state directory and the
+/// instance's figures, and the table. With `width`, a terminal's
+/// columns, the view is fitted to them.
+pub fn render(answer: &pb::Processes, every: Option<Duration>, width: Option<usize>) -> String {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64);
 
-    render_at(answer, every, now)
+    render_at(answer, every, now, width)
 }
 
 /// The view as `render` draws it, with `now`, in Unix milliseconds, as
 /// the time the uptimes are counted to.
-fn render_at(answer: &pb::Processes, every: Option<Duration>, now: u64) -> String {
+fn render_at(
+    answer: &pb::Processes,
+    every: Option<Duration>,
+    now: u64,
+    width: Option<usize>,
+) -> String {
     let mut text = String::new();
 
     if let Some(every) = every {
@@ -158,20 +200,37 @@ fn render_at(answer: &pb::Processes, every: Option<Duration>, now: u64) -> Strin
         ));
     }
 
+    // Issue 840: the daemon's state directory has a line of its own, so
+    // its length widens no row.
+
+    if !answer.state_dir.is_empty() {
+        text.push_str(&format!("daemon  state {}\n", answer.state_dir));
+    }
+
     if let Some(figures) = &answer.figures {
-        text.push_str(&format!(
-            "edge  {} req/s  {} err/s  p50 {} ms  p95 {} ms  in flight {}  ws {}  conns {}  tls {}/s  in {}/s  out {}/s\n\n",
-            rate(figures.requests_per_second),
-            rate(figures.errors_per_second),
-            milliseconds(figures.p50_ms),
-            milliseconds(figures.p95_ms),
-            thousands(figures.in_flight),
-            thousands(figures.websockets),
-            thousands(figures.connections),
-            rate(figures.tls_handshakes_per_second),
-            crate::admin::human_size(figures.received_bytes_per_second as u64),
-            crate::admin::human_size(figures.sent_bytes_per_second as u64),
-        ));
+        let parts = [
+            format!("{} req/s", rate(figures.requests_per_second)),
+            format!("{} err/s", rate(figures.errors_per_second)),
+            format!("p50 {} ms", milliseconds(figures.p50_ms)),
+            format!("p95 {} ms", milliseconds(figures.p95_ms)),
+            format!("in flight {}", thousands(figures.in_flight)),
+            format!("ws {}", thousands(figures.websockets)),
+            format!("conns {}", thousands(figures.connections)),
+            format!("tls {}/s", rate(figures.tls_handshakes_per_second)),
+            format!(
+                "in {}/s",
+                crate::admin::human_size(figures.received_bytes_per_second as u64)
+            ),
+            format!(
+                "out {}/s",
+                crate::admin::human_size(figures.sent_bytes_per_second as u64)
+            ),
+        ];
+        text.push_str(&wrapped("edge  ", &parts, width));
+    }
+
+    if !answer.state_dir.is_empty() || answer.figures.is_some() {
+        text.push('\n');
     }
 
     let mut rows = Vec::new();
@@ -216,16 +275,16 @@ fn render_at(answer: &pb::Processes, every: Option<Duration>, now: u64) -> Strin
         })
         .collect();
 
-    let header: Vec<String> = header.into_iter().map(str::to_owned).collect();
-    let widths: Vec<usize> = (0..header.len())
-        .map(|column| {
-            std::iter::once(&header)
-                .chain(&table)
-                .map(|cells| cells[column].chars().count())
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
+    let mut header: Vec<String> = header.into_iter().map(str::to_owned).collect();
+    let mut table = table;
+
+    let fitted = match width {
+        Some(width) => fit(&mut header, &mut table, width),
+        None => Fitted::default(),
+    };
+
+    let widths = column_widths(&header, &table);
+    let gap = " ".repeat(fitted.gap);
 
     // Text columns are aligned left, figures right.
 
@@ -245,14 +304,140 @@ fn render_at(answer: &pb::Processes, every: Option<Duration>, now: u64) -> Strin
                 }
             })
             .collect();
-        text.push_str(line.join("   ").trim_end());
+        let line = line.join(&gap);
+        let line = line.trim_end();
+
+        // What still does not fit is cut at the terminal's edge, as ps
+        // cuts its lines.
+
+        match width {
+            Some(width) if line.chars().count() > width => {
+                text.extend(line.chars().take(width));
+            }
+            _ => text.push_str(line),
+        }
+
         text.push('\n');
+    }
+
+    if !fitted.left_out.is_empty() {
+        text.push_str(&format!(
+            "left out to fit: {}\n",
+            crate::and_list(&fitted.left_out)
+        ));
     }
 
     if marked(answer.root.as_ref()) {
         text.push_str("* counts the last second of a worker that has exited and is not listed\n");
     }
 
+    text
+}
+
+/// Each column's width: its widest cell, the header's among them.
+fn column_widths(header: &[String], table: &[Vec<String>]) -> Vec<usize> {
+    (0..header.len())
+        .map(|column| {
+            std::iter::once(header)
+                .chain(table.iter().map(Vec::as_slice))
+                .map(|cells| cells[column].chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// Fit the table to a terminal `width` columns wide (issue 840), each
+/// step only while it is still too wide: the figure columns empty in
+/// every row are left out; the columns close up to two spaces apart;
+/// the WHAT column is cut, each cut cell ending in an ellipsis, as far
+/// as `NARROWEST_WHAT`; and the last columns are left out, from the
+/// right, but never PID, ROLE or WHAT.
+fn fit(header: &mut Vec<String>, table: &mut [Vec<String>], width: usize) -> Fitted {
+    let figures = ["REQ/S", "BUSY", "QUEUE", "P95", "GIL/LAG"];
+    let empty: Vec<usize> = (0..header.len())
+        .filter(|column| figures.contains(&header[*column].as_str()))
+        .filter(|column| table.iter().all(|cells| cells[*column].is_empty()))
+        .collect();
+
+    for column in empty.into_iter().rev() {
+        remove_column(header, table, column);
+    }
+
+    let mut fitted = Fitted::default();
+    let total = |header: &[String], table: &[Vec<String>], gap: usize| {
+        let widths = column_widths(header, table);
+        widths.iter().sum::<usize>() + gap * widths.len().saturating_sub(1)
+    };
+
+    if total(header, table, fitted.gap) <= width {
+        return fitted;
+    }
+
+    fitted.gap = 2;
+
+    if let Some(what) = header.iter().position(|name| name == "WHAT") {
+        let current = total(header, table, fitted.gap);
+        let others = current - column_widths(header, table)[what];
+        let room = width.saturating_sub(others).max(NARROWEST_WHAT);
+
+        for cells in table.iter_mut() {
+            if cells[what].chars().count() > room {
+                let kept: String = cells[what].chars().take(room - 1).collect();
+                cells[what] = format!("{kept}\u{2026}");
+            }
+        }
+    }
+
+    while total(header, table, fitted.gap) > width
+        && header
+            .last()
+            .is_some_and(|name| !KEPT_COLUMNS.contains(&name.as_str()))
+    {
+        let last = header.len() - 1;
+        fitted.left_out.insert(0, header[last].clone());
+        remove_column(header, table, last);
+    }
+
+    fitted
+}
+
+/// Leave one column out of the header and every row.
+fn remove_column(header: &mut Vec<String>, table: &mut [Vec<String>], column: usize) {
+    header.remove(column);
+
+    for cells in table.iter_mut() {
+        cells.remove(column);
+    }
+}
+
+/// A line of `parts` after `lead`, two spaces apart, wrapped to `width`
+/// columns when there is one, each further line indented under the
+/// first part.
+fn wrapped(lead: &str, parts: &[String], width: Option<usize>) -> String {
+    let indent = " ".repeat(lead.chars().count());
+    let mut text = String::new();
+    let mut line = lead.to_owned();
+    let mut first = true;
+
+    for part in parts {
+        let gap = if first { "" } else { "  " };
+        let longer = line.chars().count() + gap.len() + part.chars().count();
+
+        if !first && width.is_some_and(|width| longer > width) {
+            text.push_str(&line);
+            text.push('\n');
+            line = format!("{indent}{part}");
+        } else {
+            line.push_str(gap);
+            line.push_str(part);
+        }
+
+        first = false;
+    }
+
+    text.push_str(&line);
+    text.push('\n');
     text
 }
 
@@ -498,13 +683,13 @@ mod tests {
             root: Some(process(
                 4242,
                 "daemon",
-                "system daemon, state /var/lib/muru",
+                "system daemon",
                 vec![process(4250, "edge", "listening on :80", vec![]), host],
             )),
             ..pb::Processes::default()
         };
 
-        let text = render(&answer, None);
+        let text = render(&answer, None, None);
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[0].starts_with("PID"), "{text}");
         assert!(
@@ -763,7 +948,7 @@ mod tests {
                 4242,
                 0,
                 "daemon",
-                &muru_controller::processes::daemon_phrase("system", Path::new("/var/lib/muru")),
+                &muru_controller::processes::daemon_phrase("system"),
             ),
             1,
             "muru",
@@ -982,7 +1167,9 @@ mod tests {
             sent_bytes_per_second: 46.4 * 1024.0 * 1024.0,
         };
 
-        example.answer("daemon")
+        let mut answer = example.answer("daemon");
+        answer.state_dir = "/var/lib/muru".to_owned();
+        answer
     }
 
     /// The architecture page's example: a development run of one
@@ -1093,7 +1280,7 @@ mod tests {
         for (name, answer) in pages {
             let path = root.join(name);
             let page = std::fs::read_to_string(&path).expect("the page");
-            let printed = render_at(&answer, None, NOW);
+            let printed = render_at(&answer, None, NOW, None);
             let example = shown(&page);
 
             if write {
@@ -1112,7 +1299,7 @@ mod tests {
     #[test]
     fn figures_counting_a_worker_that_has_gone_are_marked_and_explained() {
         let mut answer = daemon_example();
-        let shown = render_at(&answer, None, NOW);
+        let shown = render_at(&answer, None, NOW, None);
         assert!(!shown.contains("* counts"), "{shown}");
 
         let host = answer
@@ -1125,7 +1312,7 @@ mod tests {
             figures.departed = 1;
         }
 
-        let shown = render_at(&answer, None, NOW);
+        let shown = render_at(&answer, None, NOW, None);
         assert!(
             shown.ends_with(
                 "* counts the last second of a worker that has exited and is not listed\n"
@@ -1133,6 +1320,98 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("203*"), "{shown}");
+    }
+
+    #[test]
+    fn on_a_terminal_the_view_is_fitted_to_its_width() {
+        let mut answer = daemon_example();
+        answer.state_dir = "~/workshops/deploying-without-downtime/work/muru/state".to_owned();
+
+        if let Some(root) = answer.root.as_mut() {
+            root.children[0].what = format!("listening on {}", ["127.0.0.1:8080"; 6].join(", "));
+        }
+
+        let piped = render_at(&answer, None, NOW, None);
+        assert!(
+            piped.lines().any(|line| line.chars().count() > 80),
+            "{piped}"
+        );
+
+        // Issue 840: every line fits, the daemon's state directory is on
+        // a line of its own, whole, the edge's figures wrap under their
+        // first, and WHAT is cut with an ellipsis.
+
+        let fitted = render_at(&answer, None, NOW, Some(80));
+
+        for line in fitted.lines() {
+            assert!(line.chars().count() <= 80, "{line:?} in\n{fitted}");
+        }
+
+        let lines: Vec<&str> = fitted.lines().collect();
+        assert_eq!(
+            lines[0],
+            "daemon  state ~/workshops/deploying-without-downtime/work/muru/state"
+        );
+        assert!(lines[1].starts_with("edge  1,284 req/s"), "{fitted}");
+        assert!(lines[2].starts_with("      "), "{fitted}");
+        assert!(
+            fitted.contains("listening on 127.0.0.1:\u{2026}"),
+            "{fitted}"
+        );
+        assert!(
+            fitted.contains("4242  daemon        system daemon "),
+            "{fitted}"
+        );
+
+        // The columns with no room are left out whole, and named.
+
+        assert!(lines[4].ends_with("RSS  REQ/S"), "{fitted}");
+        assert!(
+            fitted.ends_with("left out to fit: BUSY, QUEUE, P95 and GIL/LAG\n"),
+            "{fitted}"
+        );
+    }
+
+    #[test]
+    fn on_a_terminal_figure_columns_empty_in_every_row_are_left_out() {
+        fn clear(process: &mut pb::Process) {
+            if let Some(figures) = process.figures.as_mut() {
+                *figures = pb::Figures {
+                    busy: figures.busy,
+                    slots: figures.slots,
+                    ..pb::Figures::default()
+                };
+            }
+
+            for group in &mut process.groups {
+                group.figures = None;
+            }
+
+            process.children.iter_mut().for_each(clear);
+        }
+
+        let mut answer = run_example();
+
+        if let Some(root) = answer.root.as_mut() {
+            clear(root);
+        }
+
+        let header = |text: &str| {
+            text.lines()
+                .find(|line| line.starts_with("PID"))
+                .map(str::to_owned)
+        };
+        let piped = header(&render_at(&answer, None, NOW, None)).expect("a header");
+        let fitted = header(&render_at(&answer, None, NOW, Some(200))).expect("a header");
+        assert!(
+            piped.contains("REQ/S") && piped.contains("QUEUE"),
+            "{piped}"
+        );
+        assert!(fitted.contains("BUSY"), "{fitted}");
+
+        for left_out in ["REQ/S", "QUEUE", "P95", "GIL/LAG"] {
+            assert!(!fitted.contains(left_out), "{fitted}");
+        }
     }
 
     #[test]

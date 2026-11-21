@@ -208,6 +208,7 @@ message Processes {
   InstanceFigures figures = 6;      // the instance's last second
   Process root = 7;                 // the daemon, run or serve, with the rest beneath it
   CgroupLimits limits = 8;          // the cgroup's limits and the memory guard, when there is a cgroup v2
+  string state_dir = 9;             // a daemon's state directory, the home directory as ~; empty for a run or serve
 }
 
 // A cgroup v2's limits as last read, and the memory guard watching its

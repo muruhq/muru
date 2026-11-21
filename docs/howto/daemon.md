@@ -684,10 +684,11 @@ figures over the last second:
 
 ```console
 $ muructl status --processes
+daemon  state /var/lib/muru
 edge  1,284 req/s  3.0 err/s  p50 4.0 ms  p95 38 ms  in flight 41  ws 212  conns 1,903  tls 12/s  in 2.1MB/s  out 46.4MB/s
 
 PID    ROLE           WHAT                                   USER      UP     CPU       RSS   REQ/S    BUSY   QUEUE      P95   GIL/LAG
-4242   daemon         system daemon, state /var/lib/muru     muru    3d2h    0.3%    38.0MB
+4242   daemon         system daemon                          muru    3d2h    0.3%    38.0MB
 4250   ├─ edge        listening on :80, :443                 muru    3d2h    2.1%    61.0MB   1,284
 4400   ├─ relay       blog@r3 output to apps/blog/r3.log     blog    1d0h    0.0%     7.0MB
 4401   │  └─ server   blog@r3 instance 0: gunicorn           blog    1d0h    0.8%    74.0MB
@@ -709,8 +710,8 @@ PID    ROLE           WHAT                                   USER      UP     CP
 4311      └─ worker   group default, worker 1                shop   2h03m   11.8%   138.0MB     508   13/16            42 ms    2.2 ms
 ```
 
-The first line is the instance's last second: requests and 5xx
-responses per second, the median and 95th percentile total time,
+The first line names the daemon's state directory. The next is the
+instance's last second: requests and 5xx responses per second, the median and 95th percentile total time,
 requests in flight, WebSockets and connections open, TLS handshakes per
 second and the body bytes received and sent per second.
 
@@ -723,8 +724,7 @@ while it runs). The tree is the one Muru supervises: a host adopted
 again after the daemon restarted has the init process as its parent
 in `ps`, which its row says.
 
-The daemon's row says whose daemon it is, `user` or `system`, and its
-state directory. A host's row gives its release's part in routing after
+The daemon's row says whose daemon it is, `user` or `system`. A host's row gives its release's part in routing after
 its name, so an idle instance shows which release serves:
 
 | Shown | The release |
@@ -754,6 +754,13 @@ A worker that exits within a second after it served, as one scaled in
 does, still counts in its host's or group's figures for that second,
 though it is no longer listed. Such a row's REQ/S is marked `*`, and a
 line under the table says why; `--json` gives the count as `departed`.
+
+On a terminal the view fits the terminal's width. The figure columns
+empty in every row are left out, the columns close up, and a long WHAT
+is cut short with an ellipsis; when that is still too wide, the last
+columns are left out, and a line under the table names them. The
+instance's figures wrap onto a second line. Output to a pipe or a file,
+and `--json`, have every column in full.
 
 - `--app APP[@RELEASE]` shows the daemon and one application's
   processes, or one release's.
