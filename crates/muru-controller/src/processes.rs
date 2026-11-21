@@ -533,6 +533,55 @@ pub struct Known {
     /// For a host: its release's part in routing, `serving`, `canary`,
     /// `held`, `draining` or `retained`, or its state while it starts.
     pub state: String,
+    /// For a managed server's instance: the program its release's
+    /// command runs, as `program_of` names it (issue 841).
+    pub program: String,
+}
+
+/// The program a command runs, as a row names it (issue 841): the file
+/// name of its first word, past `env` and its variables; or, when that
+/// is a Python interpreter, the module after `-m` or the script it runs,
+/// so `python3.14 .../bin/gunicorn` is `gunicorn`. None for no command.
+pub fn program_of<S: AsRef<str>>(command: &[S]) -> Option<String> {
+    let file_name = |word: &str| {
+        std::path::Path::new(word).file_name().map_or_else(
+            || word.to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    };
+    let mut words = command.iter().map(AsRef::as_ref);
+    let mut first = words.next()?;
+
+    if file_name(first) == "env" {
+        first = words
+            .by_ref()
+            .find(|word| !word.contains('=') && !word.starts_with('-'))?;
+    }
+
+    let name = file_name(first);
+    let interpreter = name.starts_with("python") || name.starts_with("pypy");
+
+    if !interpreter {
+        return Some(name);
+    }
+
+    // The interpreter's own options come before what it runs; -X and -W
+    // take a value of their own.
+
+    while let Some(word) = words.next() {
+        match word {
+            "-m" => return Some(words.next().map_or(name, str::to_owned)),
+            "-c" | "-" => return Some(name),
+            "-X" | "-W" => {
+                words.next();
+            }
+            module if module.starts_with("-m") => return Some(module[2..].to_owned()),
+            option if option.starts_with('-') => {}
+            script => return Some(file_name(script)),
+        }
+    }
+
+    Some(name)
 }
 
 /// The addresses listened on, as a phrase: `:80, :443` for every
@@ -653,7 +702,17 @@ pub async fn snapshot(
                 .collect();
         }
 
-        let table = if request.all { all() } else { Vec::new() };
+        let servers = known.iter().any(|process| process.role == "server");
+
+        // Issue 841: a managed server's own processes are listed without
+        // --all, so the table is read whenever there is a server.
+
+        let table = if request.all || servers {
+            all()
+        } else {
+            Vec::new()
+        };
+
         let now = Instant::now();
         let cpu: HashMap<u32, f64> = os
             .values()
@@ -665,15 +724,16 @@ pub async fn snapshot(
             .collect();
 
         let narrow = !request.app.is_empty();
-        (known, os, table, cpu, left_out, narrow)
+        (known, os, table, cpu, left_out, narrow, request.all)
     })
     .await;
 
-    let (known, os, table, cpu, left_out, narrow) = read.unwrap_or_default();
+    let (known, os, table, cpu, left_out, narrow, every) = read.unwrap_or_default();
     let others = Others {
         table: &table,
         left_out: &left_out,
         narrow,
+        all: every,
     };
 
     pb::Processes {
@@ -691,17 +751,25 @@ pub async fn snapshot(
 
 /// The tree `snapshot` answers with, from known processes and readings
 /// given rather than taken: what the operating system says of each, its
-/// CPU and the live figures. The guides' examples are built with it.
+/// CPU and the live figures. A reading of a process not known is one the
+/// operating system lists, such as a managed server's worker. The
+/// guides' examples are built with it.
 pub fn tree_from(
     known: &[Known],
     os: &HashMap<u32, OsProcess>,
     cpu: &HashMap<u32, f64>,
     figures: &Figures,
 ) -> Option<pb::Process> {
+    let table: Vec<OsProcess> = os
+        .values()
+        .filter(|found| !known.iter().any(|process| process.pid == found.pid))
+        .cloned()
+        .collect();
     let others = Others {
-        table: &[],
+        table: &table,
         left_out: &HashSet::new(),
         narrow: false,
+        all: false,
     };
 
     tree(known, os, cpu, &others, figures)
@@ -734,6 +802,9 @@ struct Others<'a> {
     table: &'a [OsProcess],
     left_out: &'a HashSet<u32>,
     narrow: bool,
+    /// Whether every descendant is added, as with --all, rather than a
+    /// managed server's own processes alone (issue 841).
+    all: bool,
 }
 
 /// The order a process's role sorts in beneath its parent.
@@ -768,6 +839,7 @@ fn tree(
         .collect();
 
     let mut nodes: HashMap<u32, (u32, pb::Process)> = HashMap::new();
+    let mut programs: HashMap<u32, String> = HashMap::new();
 
     for process in known {
         if !known_pids.contains(&process.pid) {
@@ -794,14 +866,23 @@ fn tree(
         };
         node.readopted = process.parent != 0 && found.is_some() && os_parent != expected;
 
-        // A managed server's instance says which program it runs.
+        // A managed server's instance says which program it runs: the one
+        // its release's command names, or else what the operating system
+        // says it runs (issue 841).
 
-        if process.role == "server"
-            && let Some(program) = found
-                .and_then(|found| found.name.split_whitespace().next())
-                .and_then(|first| std::path::Path::new(first).file_name())
-        {
-            node.what = format!("{}: {}", process.what, program.to_string_lossy());
+        if process.role == "server" {
+            let program = Some(process.program.clone())
+                .filter(|program| !program.is_empty())
+                .or_else(|| {
+                    found.and_then(|found| {
+                        program_of(&found.name.split_whitespace().collect::<Vec<_>>())
+                    })
+                });
+
+            if let Some(program) = program {
+                node.what = format!("{}: {program}", process.what);
+                programs.insert(process.pid, program);
+            }
         }
 
         node.figures = match process.role {
@@ -920,7 +1001,14 @@ fn tree(
     }
 
     // Section 13.10: with --all, what descends from a known process and is
-    // not one of them, beneath its operating system parent.
+    // not one of them, beneath its operating system parent; without it,
+    // a managed server's own processes, its workers (issue 841).
+
+    let servers: HashMap<u32, (String, String)> = known
+        .iter()
+        .filter(|process| process.role == "server" && nodes.contains_key(&process.pid))
+        .map(|process| (process.pid, (process.app.clone(), process.release.clone())))
+        .collect();
 
     let parents: HashMap<u32, u32> = others
         .table
@@ -946,10 +1034,27 @@ fn tree(
             continue;
         }
 
+        let server = servers.get(&found.parent);
+
+        if server.is_none() && !others.all {
+            continue;
+        }
+
         let mut node = node(found.pid, Some(found), cpu);
         node.os_parent_pid = found.parent;
         node.role = "other".to_owned();
         node.what.clone_from(&found.name);
+
+        if let Some((app, release)) = server {
+            node.role = "server-worker".to_owned();
+            node.app.clone_from(app);
+            node.release.clone_from(release);
+            node.what = match programs.get(&found.parent) {
+                Some(program) => format!("{program} worker"),
+                None => "worker".to_owned(),
+            };
+        }
+
         nodes.insert(found.pid, (found.parent, node));
     }
 
@@ -1549,6 +1654,7 @@ mod tests {
             table: &[],
             left_out: &none,
             narrow: false,
+            all: false,
         };
         let root = tree(&known, &found, &HashMap::new(), &nothing, &figures).expect("a root");
         let host = &root.children[0];
@@ -1596,6 +1702,7 @@ mod tests {
             table: &[],
             left_out: &none,
             narrow: false,
+            all: false,
         };
         let root = tree(
             &known,
@@ -1714,6 +1821,7 @@ mod tests {
             table: &[],
             left_out: &none,
             narrow: false,
+            all: false,
         };
         let root = tree(&known, &found, &HashMap::new(), &nothing, &figures).expect("a root");
         assert_eq!(root.pid, 10);
@@ -1753,6 +1861,7 @@ mod tests {
             table: &table,
             left_out: &none,
             narrow: false,
+            all: true,
         };
         let root = tree(&known, &found, &HashMap::new(), &others, &figures).expect("a root");
         let worker = &root.children[1].children[1];
@@ -1772,6 +1881,130 @@ mod tests {
             .map(|process| process.pid)
             .collect();
         assert_eq!(kept, [10, 20, 21, 22]);
+    }
+
+    #[test]
+    fn a_server_is_named_by_the_program_its_command_runs() {
+        let program = |command: &str| program_of(&command.split_whitespace().collect::<Vec<_>>());
+
+        assert_eq!(
+            program("gunicorn --workers 2 orders:application").as_deref(),
+            Some("gunicorn")
+        );
+        assert_eq!(
+            program("/srv/.venv/bin/uvicorn app:app").as_deref(),
+            Some("uvicorn")
+        );
+        assert_eq!(
+            program("/usr/bin/python3.14 /srv/.venv/bin/gunicorn --workers 2").as_deref(),
+            Some("gunicorn")
+        );
+        assert_eq!(
+            program("python -X dev -m granian app:app").as_deref(),
+            Some("granian")
+        );
+        assert_eq!(
+            program("python3 -mhypercorn app:app").as_deref(),
+            Some("hypercorn")
+        );
+        assert_eq!(
+            program("env PORT=1 FOO=2 waitress-serve app:app").as_deref(),
+            Some("waitress-serve")
+        );
+        assert_eq!(program("python3 -c print()").as_deref(), Some("python3"));
+        assert_eq!(program(""), None);
+    }
+
+    #[test]
+    fn a_managed_server_s_workers_are_listed_without_all() {
+        let known = vec![
+            Known {
+                pid: 10,
+                role: "daemon",
+                what: daemon_phrase("user"),
+                ..Known::default()
+            },
+            Known {
+                pid: 11,
+                parent: 10,
+                role: "relay",
+                app: "orders".to_owned(),
+                release: "r1".to_owned(),
+                ..Known::default()
+            },
+            Known {
+                pid: 12,
+                parent: 11,
+                role: "server",
+                what: "orders@r1 instance 0".to_owned(),
+                app: "orders".to_owned(),
+                release: "r1".to_owned(),
+                program: "gunicorn".to_owned(),
+                ..Known::default()
+            },
+        ];
+        let os = |pid: u32, parent: u32, name: &str| OsProcess {
+            pid,
+            parent,
+            name: name.to_owned(),
+            ..OsProcess::default()
+        };
+        let found: HashMap<u32, OsProcess> =
+            [os(10, 1, ""), os(11, 10, ""), os(12, 11, "python3.14")]
+                .into_iter()
+                .map(|found| (found.pid, found))
+                .collect();
+        let table = vec![
+            os(13, 12, "python3.14"),
+            os(14, 12, "python3.14"),
+            os(15, 13, "sh -c date"),
+        ];
+        let none = HashSet::new();
+        let listed = |all: bool| {
+            let others = Others {
+                table: &table,
+                left_out: &none,
+                narrow: false,
+                all,
+            };
+            let root = tree(
+                &known,
+                &found,
+                &HashMap::new(),
+                &others,
+                &Figures::default(),
+            )
+            .expect("a root");
+            root.children[0].children[0].clone()
+        };
+
+        // Issue 841: the instance is named by its program, its workers are
+        // beneath it without --all, and what they run is theirs only
+        // with it.
+
+        let server = listed(false);
+        assert_eq!(server.what, "orders@r1 instance 0: gunicorn");
+        let roles: Vec<(&str, &str, &str)> = server
+            .children
+            .iter()
+            .map(|child| (child.role.as_str(), child.what.as_str(), child.app.as_str()))
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                ("server-worker", "gunicorn worker", "orders"),
+                ("server-worker", "gunicorn worker", "orders")
+            ]
+        );
+        assert!(
+            server
+                .children
+                .iter()
+                .all(|child| child.children.is_empty())
+        );
+
+        let server = listed(true);
+        assert_eq!(server.children[0].children[0].role, "other");
     }
 
     #[test]

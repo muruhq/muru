@@ -12761,6 +12761,7 @@ impl Daemon {
                             app: app.clone(),
                             release: id.clone(),
                             index: Some(instance.index),
+                            program: servers.program().to_owned(),
                             ..Known::default()
                         });
                     }

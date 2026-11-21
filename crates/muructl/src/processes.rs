@@ -769,6 +769,32 @@ mod tests {
             self.known.push(known);
         }
 
+        /// A process Muru did not start, such as a managed server's
+        /// worker, which only the operating system lists.
+        fn unknown(
+            &mut self,
+            pid: u32,
+            parent: u32,
+            user: &'static str,
+            up_s: u64,
+            cpu: f64,
+            rss_mb: f64,
+        ) {
+            self.os.insert(
+                pid,
+                OsProcess {
+                    pid,
+                    parent,
+                    started_unix_ms: Some(NOW - up_s * 1000),
+                    rss: Some((rss_mb * 1024.0 * 1024.0) as u64),
+                    name: "/srv/blog/.venv/bin/python3.14 /srv/blog/.venv/bin/gunicorn".to_owned(),
+                    ..OsProcess::default()
+                },
+            );
+            self.cpu.insert(pid, cpu);
+            self.users.insert(pid, user);
+        }
+
         /// A worker's figures over the last second, with its GIL wait and
         /// its loop's lag.
         #[allow(clippy::too_many_arguments)]
@@ -1145,6 +1171,7 @@ mod tests {
                 app: "blog".to_owned(),
                 release: "r3".to_owned(),
                 index: Some(0),
+                program: "gunicorn".to_owned(),
                 ..known(4401, 4400, "server", "blog@r3 instance 0")
             },
             4400,
@@ -1153,6 +1180,8 @@ mod tests {
             0.8,
             74.0,
         );
+        example.unknown(4402, 4401, "blog", day, 2.4, 96.0);
+        example.unknown(4403, 4401, "blog", day, 2.2, 95.0);
 
         example.figures.instance = pb::InstanceFigures {
             requests_per_second: 1284.0,
@@ -1359,15 +1388,15 @@ mod tests {
             "{fitted}"
         );
         assert!(
-            fitted.contains("4242  daemon        system daemon "),
+            fitted.contains("4242  daemon                  system daemon "),
             "{fitted}"
         );
 
         // The columns with no room are left out whole, and named.
 
-        assert!(lines[4].ends_with("RSS  REQ/S"), "{fitted}");
+        assert!(lines[4].ends_with("UP    CPU"), "{fitted}");
         assert!(
-            fitted.ends_with("left out to fit: BUSY, QUEUE, P95 and GIL/LAG\n"),
+            fitted.ends_with("left out to fit: RSS, REQ/S, BUSY, QUEUE, P95 and GIL/LAG\n"),
             "{fitted}"
         );
     }
