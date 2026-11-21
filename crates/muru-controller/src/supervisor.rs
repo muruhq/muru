@@ -395,6 +395,7 @@ fn watch_relay(
                     message: event.message,
                 }),
                 crate::relay::Report::Reopened => reopens.send_modify(|count| *count += 1),
+                crate::relay::Report::Flushed => {}
             })
             .await;
 

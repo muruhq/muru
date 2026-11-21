@@ -2543,7 +2543,12 @@ class Host:
         self.relay_outgoing.clear()
 
     def read_relay(self) -> None:
-        """Read which pipes the relay has read to their end, and close them."""
+        """Read which pipes the relay has read to their end, and close them.
+
+        A flush the relay asks for is answered behind every offer already
+        queued for it, so the relay has every pipe held once it reads the
+        answer (issue 838).
+        """
 
         assert self.relay is not None
 
@@ -2564,12 +2569,19 @@ class Host:
             line, _, self.relay_buffer = self.relay_buffer.partition(b"\n")
 
             try:
-                number = json.loads(line).get("ended")
+                message = json.loads(line)
+                number = message.get("ended")
+                flush = message.get("flush")
             except (ValueError, AttributeError):
                 continue
 
             if isinstance(number, int):
                 self.release_pipe(number)
+
+            if isinstance(flush, int):
+                answer = json.dumps({"flushed": flush}, separators=(",", ":")).encode() + b"\n"
+                self.relay_outgoing.append((answer, None))
+                self.flush_relay()
 
     def release_pipe(self, number: int) -> None:
         """Close a held pipe once a relay has read it to its end."""

@@ -6,6 +6,7 @@ import argparse
 import io
 import os
 import signal
+import socket
 import subprocess
 import sys
 import textwrap
@@ -225,6 +226,49 @@ def test_a_request_past_its_deadline_is_one_event_until_it_ends(tmp_path: Path) 
     assert ended["kind"] == "request.ended"
     assert ended["evidence"] == {"worker": "0", "pid": 4242, "requests": ["r-1"]}
     assert "has ended in worker 0 (pid 4242)" in str(ended["message"])
+
+
+def test_a_relays_flush_is_answered_after_the_pipes_queued_for_it(tmp_path: Path) -> None:
+    """Issue 838: the relay asks, and the answer follows every offer the
+    host has queued, so the relay has the pipes by the time it is told."""
+
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1)
+    ours, relay = socket.socketpair()
+    read_end, write_end = os.pipe()
+
+    try:
+        ours.setblocking(False)
+        instance.relay = ours
+        instance.held[0] = host.HeldPipe(0, read_end, 0, "stderr")
+
+        # An offer the socket has not taken yet waits ahead of the answer.
+
+        offer = b'{"pipe":0,"stream":"stderr"}\n'
+        instance.relay_outgoing.append((offer, 0))
+        relay.sendall(b'{"flush":3}\n')
+        instance.read_relay()
+
+        data = b""
+        descriptors: list[int] = []
+        relay.settimeout(5)
+
+        while not data.endswith(b"\n") or data.count(b"\n") < 2:
+            more, fds, _flags, _address = socket.recv_fds(relay, 4096, 4)
+            assert more, data
+            data += more
+            descriptors += fds
+
+        assert data == offer + b'{"flushed":3}\n'
+        assert len(descriptors) == 1
+
+        for fd in descriptors:
+            os.close(fd)
+    finally:
+        ours.close()
+        relay.close()
+        os.close(read_end)
+        os.close(write_end)
 
 
 def replacing_host(
