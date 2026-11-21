@@ -18,9 +18,9 @@ pub struct ProcessArgs {
     #[arg(long)]
     pub processes: bool,
 
-    /// With --processes, only one application's processes, or one
-    /// release's as APP@RELEASE.
-    #[arg(long, value_name = "APP[@RELEASE]", requires = "processes")]
+    /// One application: its data directory beside the status, or with
+    /// --processes only its processes, or one release's as APP@RELEASE.
+    #[arg(long, value_name = "APP[@RELEASE]")]
     pub app: Option<String>,
 
     /// With --processes, also the processes Muru did not start, such as

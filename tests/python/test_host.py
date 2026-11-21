@@ -105,10 +105,13 @@ def test_each_mounts_path_hint_settings_are_read_from_one_argument() -> None:
     and its second header, by mount name, the default mount's under ""."""
 
     parsed = host.parse_sendfile(
-        '{"": {"roots": ["/srv/media"], "header": null},'
+        '{"": {"roots": ["/srv/media"], "owned": {"/srv/media": 1001}, "header": null},'
         ' "api": {"roots": [], "header": "X-Sendfile"}}'
     )
-    assert parsed == [("", ["/srv/media"], None), ("api", [], "X-Sendfile")]
+    assert parsed == [
+        ("", ["/srv/media"], None, {"/srv/media": 1001}),
+        ("api", [], "X-Sendfile", {}),
+    ]
     assert host.parse_args(["--app", "a:b", "--socket-dir", "/tmp"]).sendfile == []
 
     for text in (
@@ -116,6 +119,8 @@ def test_each_mounts_path_hint_settings_are_read_from_one_argument() -> None:
         "not json",
         '{"": {"roots": ["media"]}}',
         '{"": {"roots": [], "header": 1}}',
+        '{"": {"roots": [], "owned": {"/srv/media": 1001}}}',
+        '{"": {"roots": ["/srv/media"], "owned": {"/srv/media": "x"}}}',
     ):
         with pytest.raises(argparse.ArgumentTypeError):
             host.parse_sendfile(text)

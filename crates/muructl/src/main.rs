@@ -19,6 +19,7 @@ mod instances;
 mod log_format;
 mod mcp;
 mod open;
+mod places;
 mod print_config;
 mod processes;
 mod project_commands;
@@ -124,6 +125,13 @@ enum Command {
         command: admin::AppCommand,
     },
 
+    /// An application's data directory, shared by its releases: where
+    /// each part is and what may be wrong with it.
+    Data {
+        #[command(subcommand)]
+        command: admin::DataCommand,
+    },
+
     /// Manage releases.
     Release {
         #[command(subcommand)]
@@ -212,8 +220,14 @@ enum Command {
         command: admin::DashboardCommand,
     },
 
-    /// Show the status of the daemon or the development run.
+    /// Show the status of the daemon or the development run, with an
+    /// application's data directory when --app names one, and a run's
+    /// own.
     Status {
+        /// Add what each part of the data directory holds, which walks it.
+        #[arg(long)]
+        sizes: bool,
+
         #[command(flatten)]
         socket: admin::SocketArgs,
 
@@ -844,6 +858,13 @@ struct RunArgs {
     #[arg(long)]
     chdir: Option<PathBuf>,
 
+    /// The application's data directory, given to it as MURU_DATA_DIR
+    /// with its media and uploads parts made in it, a relative one taken
+    /// from the project (default: runs/NAME-HASH/data in the user state
+    /// directory, kept between runs and never in the project).
+    #[arg(long, value_name = "DIR")]
+    data_dir: Option<PathBuf>,
+
     /// Edge-to-worker link: unix (sockets in a run directory) or tcp
     /// (loopback ports from --tcp-base-port), the latter for experiments.
     #[arg(long, default_value = "unix")]
@@ -1271,6 +1292,12 @@ fn main() -> anyhow::Result<()> {
                 admin::AppCommand::Remove(args) => admin::app_remove(*args).await,
             }
         }),
+        Command::Data {
+            command: admin::DataCommand::Show(args),
+        } => runtime.block_on(admin::data_show(*args)),
+        Command::Data {
+            command: admin::DataCommand::Check(args),
+        } => exit_with(runtime, admin::data_check(*args)),
         Command::Release { command } => runtime.block_on(async move {
             match command {
                 admin::ReleaseCommand::List {
@@ -1321,6 +1348,7 @@ fn main() -> anyhow::Result<()> {
         Command::Overlay { command } => runtime.block_on(admin::overlay(command)),
         Command::Condition { command } => runtime.block_on(admin::condition(command)),
         Command::Status {
+            sizes,
             socket,
             processes,
             output,
@@ -1328,7 +1356,11 @@ fn main() -> anyhow::Result<()> {
             let shown = if processes.processes {
                 processes::show(&socket.endpoint()?, &processes, output.json).await
             } else {
-                admin::show_status(&socket.endpoint()?, output.json).await
+                let app = processes
+                    .app
+                    .as_deref()
+                    .map(|app| app.split_once('@').map_or(app, |(app, _)| app));
+                admin::show_status(&socket.endpoint()?, app, sizes, output.json).await
             };
 
             // With nothing where it looked, how many instances the machine
@@ -1929,6 +1961,8 @@ struct Serving {
     timestamps: bool,
     /// The muru.local.toml read, when there was one.
     local: Option<PathBuf>,
+    /// The application's data directory, when one is named (issue 849).
+    data_dir: Option<PathBuf>,
 }
 
 impl Serving {
@@ -2029,6 +2063,10 @@ impl Serving {
             timestamps: !args.no_timestamps
                 && (args.timestamps || settings.timestamps == Some(true)),
             local,
+            data_dir: args
+                .data_dir
+                .clone()
+                .or_else(|| settings.data_dir.as_deref().map(PathBuf::from)),
         })
     }
 
@@ -2133,6 +2171,9 @@ struct Resolved {
     env_file_names: Vec<String>,
     /// How the run serves (section 13.1).
     serving: Serving,
+    /// The places the application is given (issue 849): its data
+    /// directory.
+    places: muru_controller::places::Places,
     /// The tables as they were read, for --print-config.
     layers: print_config::Layers,
 }
@@ -2143,6 +2184,7 @@ impl Resolved {
     /// and the limits on a request (issue 783).
     fn keeping_restart_only(mut self, mut running: Resolved) -> Resolved {
         std::mem::swap(&mut self.serving, &mut running.serving);
+        std::mem::swap(&mut self.places, &mut running.places);
         std::mem::swap(&mut self.python, &mut running.python);
         std::mem::swap(&mut self.layers.run, &mut running.layers.run);
         std::mem::swap(&mut self.layers.local, &mut running.layers.local);
@@ -2369,7 +2411,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
 
     let from_table = entrypoint.is_none();
 
-    let entrypoint = match entrypoint.or(table.entrypoint) {
+    let entrypoint = match entrypoint.or_else(|| table.entrypoint.clone()) {
         Some(entrypoint) => entrypoint,
         None => match &source {
             Some(path) => anyhow::bail!(
@@ -2462,6 +2504,25 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         });
     }
 
+    // Issue 849: the places the application is given, and what
+    // it serves checked against them, as a deploy checks a release.
+
+    let absolute = project.canonicalize().unwrap_or_else(|_| project.clone());
+
+    let places = match serve {
+        Some(mode) => places::for_serve(&absolute, &mode.places)?,
+        None => places::for_run(
+            &absolute,
+            &args
+                .name
+                .clone()
+                .unwrap_or_else(|| app_name(&absolute, &entrypoint)),
+            serving.data_dir.as_deref(),
+        ),
+    };
+
+    check_places(&places, &absolute, &table, &static_dirs)?;
+
     // Section 4.6: the table's own limits on a request, and those of
     // its groups and mounts.
 
@@ -2553,8 +2614,61 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         env,
         env_file_names,
         serving,
+        places,
         layers,
     })
+}
+
+/// Check what a run serves against its places (issue 849): the layout,
+/// every file hint root of every mount, the media part among them, and
+/// every static entry's directory, so only the media part is served.
+fn check_places(
+    places: &muru_controller::places::Places,
+    project: &Path,
+    table: &muru_config::ToolMuru,
+    static_dirs: &[muru_config::StaticDir],
+) -> anyhow::Result<()> {
+    let Some(dirs) = &places.data else {
+        return Ok(());
+    };
+
+    dirs.check().map_err(anyhow::Error::msg)?;
+
+    let mounts = std::iter::once(("", &table.sendfile_roots)).chain(table.mounts.iter().map(
+        |(name, mount)| {
+            (
+                name.as_str(),
+                mount
+                    .sendfile_roots
+                    .as_ref()
+                    .unwrap_or(&table.sendfile_roots),
+            )
+        },
+    ));
+
+    for (mount, roots) in mounts {
+        let label = if mount.is_empty() {
+            "[tool.muru] sendfile_roots".to_owned()
+        } else {
+            format!("[tool.muru] mount {mount}: sendfile_roots")
+        };
+
+        for root in roots {
+            if let Some(path) = muru_config::sendfile_root(root, project, places.media()) {
+                muru_config::places::check_served(&label, &path, dirs)
+                    .map_err(anyhow::Error::msg)?;
+            }
+        }
+    }
+
+    for entry in static_dirs {
+        let (dir, _) = places::static_directory(&entry.dir, project, places)
+            .map_err(|error| anyhow::anyhow!("static {}: {error}", entry.path))?;
+        muru_config::places::check_served(&format!("static {}", entry.path), &dir, dirs)
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    Ok(())
 }
 
 /// A host's named groups as the edge connects them: each group's sockets
@@ -2754,13 +2868,15 @@ fn static_paths(resolved: &Resolved) -> anyhow::Result<Vec<muru_edge::routing::S
         .static_dirs
         .iter()
         .map(|entry| {
-            let directory = if Path::new(&entry.dir).is_absolute() {
-                PathBuf::from(&entry.dir)
-            } else {
-                resolved.project.join(&entry.dir)
-            };
+            // Issue 849: a directory Muru provides may be empty or missing
+            // until the application fills it, its requests reaching the
+            // application meanwhile; any other must be there.
+
+            let (directory, within) =
+                places::static_directory(&entry.dir, &resolved.project, &resolved.places)
+                    .map_err(|error| anyhow::anyhow!("static {}: {error}", entry.path))?;
             anyhow::ensure!(
-                directory.is_dir(),
+                within.is_some() || directory.is_dir(),
                 "static {}: {} is not a directory",
                 entry.path,
                 directory.display()
@@ -2788,6 +2904,7 @@ fn static_paths(resolved: &Resolved) -> anyhow::Result<Vec<muru_edge::routing::S
                     cache_except: &except,
                     no_redirect_slash: entry.redirect_slash == Some(false),
                     case_insensitive: entry.case.as_deref() == Some("insensitive"),
+                    owner: None,
                 })
                 .map_err(|error| anyhow::anyhow!("static {}: {error}", entry.path))?;
             Ok(muru_edge::routing::StaticPath {
@@ -3128,6 +3245,29 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
         );
     }
 
+    // Issue 849: what muructl data check says of the data directory a
+    // run of the project uses, when there is one yet.
+
+    if let Some(dirs) = resolved
+        .places
+        .data
+        .as_ref()
+        .filter(|dirs| dirs.data.exists())
+    {
+        let data = muru_controller::places::describe(
+            &resolved.project.display().to_string(),
+            Some(dirs),
+            "",
+            muru_controller::host::Identity::current_uid(),
+            None,
+            false,
+        );
+
+        for warning in &data.warnings {
+            println!("muru: check: warning: {warning}");
+        }
+    }
+
     // The application, loaded in the interpreter under the import check.
 
     let mut command = tokio::process::Command::new(&python.python);
@@ -3431,6 +3571,15 @@ fn host_spec(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
+    // Issue 849: the places, which Muru alone names, over what
+    // the project's variables say.
+
+    let mut env: Vec<(String, String)> = env
+        .into_iter()
+        .filter(|(name, _)| !muru_config::places::VARIABLES.contains(&name.as_str()))
+        .collect();
+    env.extend(resolved.places.variables());
+
     let mut spec = HostSpec {
         python,
         pythonpath,
@@ -3471,12 +3620,13 @@ fn host_spec(
                 concurrency: mount.concurrency,
                 max_connections: mount.max_connections,
                 handoff: mount.handoff,
-                sendfile_roots: muru_config::sendfile_root_paths(
+                sendfile_roots: muru_config::worker_root_paths(
                     mount
                         .sendfile_roots
                         .as_deref()
                         .unwrap_or(&resolved.sendfile_roots),
                     &resolved.project,
+                    resolved.places.media(),
                 ),
                 sendfile_header: mount
                     .sendfile_header
@@ -3504,11 +3654,13 @@ fn host_spec(
         env,
         shown_env: resolved.env.keys().cloned().collect(),
         identity: None,
-        sendfile_roots: muru_config::sendfile_root_paths(
+        sendfile_roots: muru_config::worker_root_paths(
             &resolved.sendfile_roots,
             &resolved.project,
+            resolved.places.media(),
         ),
         sendfile_header: resolved.sendfile_header.clone(),
+        owned_roots: Vec::new(),
     };
 
     // Section 11.8: under serve --log-format json, Python logging writes
@@ -3741,7 +3893,7 @@ async fn run_with(
     if !args.bind.ip.is_loopback() && development {
         anyhow::bail!(
             "muructl run serves loopback addresses only, because it is development mode: error \
-             pages show tracebacks and nothing is persisted. --allow-public serves {} with those \
+             pages show tracebacks and no releases are kept. --allow-public serves {} with those \
              behaviours off, but production is the daemon's job (muructl daemon start)",
             args.bind.ip
         );
@@ -3913,6 +4065,24 @@ async fn run_with(
     } else {
         None
     };
+
+    // Issue 849: serve's data directory is a volume it is given;
+    // what is missing of the places is made, as the daemon makes them,
+    // serve's group-writable since it runs under an arbitrary user with
+    // group 0 (section 13.9).
+
+    if serve.is_some() {
+        places::check_volume(&resolved.places)?;
+    }
+
+    places::make(
+        &resolved.places,
+        if serve.is_some() {
+            0o770
+        } else {
+            muru_controller::places::DATA_MODE
+        },
+    )?;
 
     // Section 4.9: the application's own directories of files, under
     // the project, each checked to exist before anything starts.
@@ -4330,11 +4500,27 @@ async fn run_with(
         muru_common::muru_println!("mount {name} {}", mount_serves(mount));
     }
 
+    for line in places::lines(&resolved.places) {
+        muru_common::muru_println!("{line}");
+    }
+
     for entry in &static_paths {
+        let root = entry.route.root.path();
+
+        // A directory Muru provides that is empty, such as a part of media
+        // nothing has been saved in yet, has its requests reach the
+        // application until something is put there.
+
+        let empty = if places::is_empty(root) {
+            ", empty for now: its requests reach the application until files are put there"
+        } else {
+            ""
+        };
+
         muru_common::muru_println!(
-            "static {}/ from {}",
+            "static {}/ from {}{empty}",
             entry.prefix.trim_end_matches('/'),
-            entry.route.root.path().display()
+            root.display()
         );
     }
 
@@ -4368,7 +4554,7 @@ async fn run_with(
         // Section 13.9: a container's production command needs no warning.
     } else if development {
         muru_common::muru_println!(
-            "development mode: error pages show tracebacks, nothing is persisted{} and only \
+            "development mode: error pages show tracebacks, no releases are kept{} and only \
              loopback is served; production runs under the daemon (muructl daemon start)",
             if resolved.serving.reload {
                 ", the run reloads on change"
@@ -4685,6 +4871,8 @@ async fn run_with(
             processes: Arc::clone(&run_processes),
             recorder: recorder.clone(),
             imports: Arc::clone(&import_reports),
+            places: resolved.places.clone(),
+            spool: serve.as_ref().map(|mode| mode.run_dir.join("spool")),
         });
 
         match run_admin::serve(state, admin_stop_rx).await {

@@ -19,6 +19,7 @@ mod startup_signals;
 mod uploads;
 mod wsgi;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
@@ -43,6 +44,11 @@ type MountArgument = (
     Option<(usize, usize)>,
     bool,
 );
+
+/// One mount's path hint settings as the host passes them: its name, its
+/// roots, a second header and the roots that must be owned by a user,
+/// by path with the uid (sections 4.9 and 6.6).
+type MountHints = (String, Vec<String>, Option<String>, HashMap<String, u32>);
 
 /// Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 ///
@@ -90,8 +96,10 @@ type MountArgument = (
 /// mount's requests may be handed to the other interface (section 6.14).
 /// `worker` is the worker's index within its group, which HELLO gives
 /// the edge to name it by. `sendfile` is each mount's path hint settings
-/// (section 4.9) as (mount, roots, second header) tuples, the default
-/// mount's named `""`; a mount without one refuses every path hint.
+/// (section 4.9) as (mount, roots, second header, owned roots) tuples,
+/// the default mount's named `""`, the owned roots those Muru provides
+/// that must be owned by a user (issue 849); a mount without roots
+/// refuses every path hint.
 ///
 /// The arguments are the Python signature, keyword by keyword.
 #[allow(clippy::too_many_arguments)]
@@ -127,7 +135,7 @@ fn serve(
     handoff: bool,
     sync_threads: usize,
     worker: u32,
-    sendfile: Vec<(String, Vec<String>, Option<String>)>,
+    sendfile: Vec<MountHints>,
 ) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
 
@@ -163,7 +171,7 @@ fn serve(
         (None, None) => None,
     };
 
-    let mut named = std::collections::HashMap::new();
+    let mut named = HashMap::new();
 
     for (name, app, runner, threads, limits, handoff) in mounts {
         if runner.is_some() && asgi.is_none() {
@@ -217,10 +225,10 @@ fn serve(
     shared.worker = worker;
     shared.sendfile = sendfile
         .into_iter()
-        .map(|(mount, roots, header)| {
+        .map(|(mount, roots, header, owned)| {
             (
                 mount,
-                Arc::new(sendfile::Hints::new(&roots, header.as_deref())),
+                Arc::new(sendfile::Hints::new(&roots, header.as_deref(), &owned)),
             )
         })
         .collect();

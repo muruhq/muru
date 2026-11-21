@@ -850,6 +850,11 @@
           "type": "string",
           "x-default": "`127.0.0.1:8081`; off under `--allow-public`"
         },
+        "data_dir": {
+          "description": "The application's data directory, shared by every run of the project, a relative one taken from the project; its media and uploads parts are made in it.",
+          "type": "string",
+          "x-default": "runs/NAME-HASH/data in the user state directory, never in the project"
+        },
         "env_file": {
           "description": "A `.env` file whose variables the run starts with, relative to the project. Its values override `[tool.muru.env]`. None is read unless this names one.",
           "type": "string"
@@ -1136,6 +1141,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "data_dir": {
+          "description": "The application's data directory, normally a mounted volume, which must exist and be writable; its media and uploads parts are made in it. With none, the application is given no data directory.",
+          "type": "string",
+          "x-default": "none"
+        },
         "entrypoint": {
           "description": "The application as module:callable.",
           "type": "string"
@@ -1199,6 +1209,11 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "media_dir": {
+          "default": "media",
+          "description": "The media part, the one part ever served, a relative one taken from the data directory.",
+          "type": "string"
         },
         "memory": {
           "description": "The memory policy as KEY=VALUE.",
@@ -1299,6 +1314,11 @@
           },
           "type": "array",
           "x-default": "loopback peers, for their forwarding headers alone"
+        },
+        "uploads_dir": {
+          "default": "uploads",
+          "description": "The uploads part, never served, a relative one taken from the data directory.",
+          "type": "string"
         }
       },
       "type": "object"
@@ -1317,7 +1337,7 @@
           "type": "string"
         },
         "dir": {
-          "description": "The directory, relative to the source directory, or absolute.",
+          "description": "The directory: relative to the source directory, absolute, or `media:` for the application's media part, with an optional directory inside it after the colon.",
           "type": "string"
         },
         "fallback": {

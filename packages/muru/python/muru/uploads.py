@@ -10,9 +10,14 @@ with an empty body. The files themselves are reached through this module::
     from muru import uploads
 
     for upload in uploads.files(environ):
-        upload.save(f"/srv/media/{upload.ref}")
+        upload.save()
 
     avatar = uploads.get(environ, form["avatar.ref"])
+    avatar.save(os.path.join(os.environ["MURU_MEDIA_DIR"], "avatars", user.id))
+
+``save()`` with no destination, or a relative one, puts the file in the
+application's uploads directory, ``MURU_UPLOADS_DIR``, which no client
+reaches; a file to be served is saved into ``MURU_MEDIA_DIR`` instead.
 
 Upload objects belong to their request: the files they describe are closed
 when the request ends, and a file that was not saved disappears. Outside
@@ -31,6 +36,15 @@ from collections.abc import Mapping
 from typing import Any
 
 __all__ = ["Upload", "files", "get", "is_precheck"]
+
+# The variable naming the application's uploads directory, which Muru
+# sets (issue 849).
+
+_UPLOADS_VARIABLE = "MURU_UPLOADS_DIR"
+
+# The longest suffix of a client's file name a generated name keeps.
+
+_SUFFIX_LENGTH = 16
 
 # How much a copy moves at a time.
 
@@ -143,8 +157,16 @@ class Upload:
 
         return io.BufferedReader(_Reader(self._fd, self.name))
 
-    def save(self, dest: str | os.PathLike[str], overwrite: bool = False) -> str:
+    def save(self, dest: str | os.PathLike[str] | None = None, overwrite: bool = False) -> str:
         """Give the file a permanent name and return it.
+
+        With no destination the file goes in the application's uploads
+        directory, ``MURU_UPLOADS_DIR``, under a name made for it: random
+        hex digits with the extension of the client's file name. A
+        relative destination is taken from that directory too, and may
+        not climb out of it. Without the variable, as outside Muru, a
+        relative destination is taken from the working directory and no
+        destination raises ``ValueError``.
 
         The file is linked into place when the destination is on the
         spool's file system and the worker may link it, which takes no
@@ -153,7 +175,7 @@ class Upload:
         true, in which case it is replaced in one step.
         """
 
-        target = os.fspath(dest)
+        target = _destination(dest, self.name)
 
         if not overwrite and os.path.lexists(target):
             raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), target)
@@ -208,6 +230,49 @@ class Upload:
 
         if overwrite:
             os.replace(destination, target)
+
+
+def _destination(dest: str | os.PathLike[str] | None, name: str) -> str:
+    """Where save() puts a file.
+
+    That is the destination given, a relative one in the uploads
+    directory, or a name made for it there.
+    """
+
+    uploads = os.environ.get(_UPLOADS_VARIABLE) or None
+
+    if dest is None:
+        if uploads is None:
+            raise ValueError(
+                f"save() needs a destination: {_UPLOADS_VARIABLE} is not set, so there is no "
+                "uploads directory to put the file in"
+            )
+
+        return os.path.join(uploads, secrets.token_hex(16) + _suffix(name))
+
+    target = os.fspath(dest)
+
+    if os.path.isabs(target) or uploads is None:
+        return target
+
+    if os.pardir in target.split(os.sep):
+        raise ValueError(f"{target!r} climbs out of the uploads directory")
+
+    return os.path.join(uploads, target)
+
+
+def _suffix(name: str) -> str:
+    """Give the extension of a client's file name, for a name save() makes.
+
+    Only a short one of letters and digits is kept.
+    """
+
+    _, suffix = os.path.splitext(os.path.basename(name.replace("\\", "/")))
+
+    if 1 < len(suffix) <= _SUFFIX_LENGTH and suffix[1:].isascii() and suffix[1:].isalnum():
+        return suffix.lower()
+
+    return ""
 
 
 def _link(source: str, target: str, overwrite: bool) -> None:

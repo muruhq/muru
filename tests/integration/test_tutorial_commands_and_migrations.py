@@ -95,6 +95,8 @@ def test_the_commands_and_migrations_tutorial(tmp_path: Path) -> None:
         )
         assert 'add-product input price: "4" does not match [0-9]+[.][0-9][0-9]' in refused
         assert daemon.get().body == b"teapot  12.50\n"
+        data = tmp_path / "daemon" / "state" / "data" / "catalog"
+        assert (data / "catalog.db").is_file() and not (project / "catalog.db").exists()
 
         # A migration as a gate: it passes with the second migration, and
         # a third that fails refuses the release, the one serving going on.

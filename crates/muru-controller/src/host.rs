@@ -787,12 +787,27 @@ pub struct HostSpec {
     /// A second header the default mount's workers honour as
     /// X-Muru-Sendfile.
     pub sendfile_header: Option<String>,
+    /// The roots Muru provides that must be owned by a user, each with
+    /// its uid (issue 849): the application's media part under a root
+    /// daemon, so a link in its place cannot lead a worker into a
+    /// directory of another user's.
+    pub owned_roots: Vec<(String, u32)>,
 }
 
-/// The `--sendfile` argument: each mount's roots and second header, as a
-/// JSON object by mount name, the default mount's under "".
+/// The `--sendfile` argument: each mount's roots, the roots among them
+/// that must be owned by a user, and its second header, as a JSON object
+/// by mount name, the default mount's under "".
 fn sendfile_argument(spec: &HostSpec) -> String {
-    let entry = |roots: &[String], header: &Option<String>| serde_json::json!({ "roots": roots, "header": header });
+    let entry = |roots: &[String], header: &Option<String>| {
+        let owned: serde_json::Map<String, serde_json::Value> = spec
+            .owned_roots
+            .iter()
+            .filter(|(root, _)| roots.contains(root))
+            .map(|(root, uid)| (root.clone(), serde_json::Value::from(*uid)))
+            .collect();
+
+        serde_json::json!({ "roots": roots, "owned": owned, "header": header })
+    };
 
     let mut mounts = serde_json::Map::new();
     mounts.insert(
@@ -946,6 +961,13 @@ impl Identity {
         // SAFETY: geteuid has no preconditions.
 
         unsafe { libc::geteuid() == 0 }
+    }
+
+    /// The effective user this process runs as.
+    pub fn current_uid() -> u32 {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+
+        unsafe { libc::geteuid() }
     }
 
     /// Give a path to the identity's user and group.
@@ -1411,6 +1433,14 @@ impl HostProcess {
         }
 
         for name in crate::commands::not_inherited(spec.bytecode) {
+            command.env_remove(name);
+        }
+
+        // Issue 849: the places are Muru's to name, so a value
+        // inherited from the shell that started muructl never reaches the
+        // application; those it has are in its environment.
+
+        for name in muru_config::places::VARIABLES {
             command.env_remove(name);
         }
 

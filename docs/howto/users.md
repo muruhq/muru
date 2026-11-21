@@ -65,6 +65,16 @@ the service user's group, and opens to those two alone, so the edge
 reaches the workers' sockets and nothing else does. The admin socket and
 the daemon's own files stay the daemon's.
 
+The application's [data directory](data-directory.md) and its media and
+uploads parts are made for the application's user, mode `0700`, the
+first time a release needs them, and are left as they are after that:
+a release that runs as another user is not refused, and fails where its
+code cannot write, which `muructl data show APP` makes plain by printing
+each part's owner. Files the application saves there are its own, and
+[file hints](file-hints.md) to them are opened by its workers, so the
+edge's user needs no access to them. A media part moved behind a
+symbolic link must lead to a directory the application's user owns.
+
 `user = 'root'` is allowed, since it is explicit, and is not recommended:
 a compromised application would have the node. Each release of such an
 application that starts records an `app.user_is_root` warning event.

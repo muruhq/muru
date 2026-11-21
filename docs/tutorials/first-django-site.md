@@ -168,6 +168,13 @@ against the same database, so a migration should leave the schema usable
 by the release before it as well: add a column in one release, start
 using it in the next, and remove the old one after that.
 
+The database here is `db.sqlite3` beside the code, which the daemon
+reads from the project directory you deployed. A project deployed from
+a new directory each time, as a checkout per release is, keeps its
+database in the application's data directory, which every release
+shares; [keeping data between releases](../howto/data-directory.md#django)
+has the settings.
+
 ## Clean up
 
 ```

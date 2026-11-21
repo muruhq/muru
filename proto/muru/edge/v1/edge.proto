@@ -452,6 +452,7 @@ message StaticDir {
   repeated string cache_except = 7;     // patterns of files that get no-cache instead
   bool no_redirect_slash = 8;           // do not redirect a directory to its slash form
   bool case_insensitive = 9;            // accept names that differ from the file's on disk
+  optional uint32 owner = 10;           // a directory Muru provides, which must be this user's (issue 849)
 }
 
 message Mount {

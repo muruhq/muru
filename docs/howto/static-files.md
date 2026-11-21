@@ -66,6 +66,27 @@ answers with its own assets, and a rollback brings the old ones back
 with the old code. `muructl run` prints each entry at start-up and
 refuses a directory that does not exist, as a deploy does.
 
+## Files from the media part
+
+`media:SUBDIR` serves a directory in the application's media part, the
+files it saved for clients, to everyone:
+
+```toml
+[[tool.muru.static]]
+path = '/media/'
+dir = 'media:public'
+```
+
+`media:` names the whole part. Every file under such an entry is
+public. Under a daemon whose applications run as [their own
+users](users.md) the edge reads these files as its own user, so they
+must be readable by the edge's user, which you arrange. The rest of the
+media part is served through [file hints](file-hints.md) alone, after
+the application's own checks, and the rest of the data directory never
+is; see [keeping data between releases](data-directory.md#what-is-served).
+A `media:` entry whose directory is empty or not there yet is served as
+any other: its requests find no file and reach the application.
+
 ## Mixing files and an application
 
 Routes match by longest path prefix, so a site can be files with the

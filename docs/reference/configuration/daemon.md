@@ -45,13 +45,16 @@ An application's table and its releases.
 | --- | --- | --- | --- |
 | `access_log` | string | the `[logs]` table's | Which of the application's requests the access log writes, over the `[logs]` table's choice: `on`, `errors` or `off`. |
 | `access_log_exclude` | array of strings |  | Paths whose requests to the application the access log leaves out, besides those the `[logs]` table names. |
+| `data_dir` | string | STATE/data/APP | The application's data directory, shared by every release, an absolute path; its media and uploads parts are made in it. |
 | `group` | string | the user's primary group | The group, else the user's primary group. |
+| `media_dir` | string | `"media"` | The media part, the one part ever served, a relative one taken from `data_dir`. |
 | `priority` | integer | `0` | Which applications' scale-ups the node's budget admits first, the highest first. |
 | `release` | table of tables, {ref}`[app.NAME.release.ID] <config-daemon-app-name-release-id>` |  | Releases by identifier. |
 | `schedule` | array of tables, {ref}`[[app.NAME.schedule]] <config-daemon-app-name-schedule>` |  | Scheduled capacity. |
 | `serving` | string | the last release in id order an apply adds, else the one that serves | The release that serves the application's traffic, a declared one or one the daemon has. The other releases an apply adds are started held, and naming a release the daemon has promotes it. |
 | `slow` | string | the `[logs]` table's | How slow one of the application's requests is to be written under `access_log = "errors"`. |
 | `umask` | string | the daemon's own umask | The file creation mask, in octal, for example 027. |
+| `uploads_dir` | string | `"uploads"` | The uploads part, never served, a relative one taken from `data_dir`. |
 | `user` | string | the daemon's own user | The user the application's hosts and workers run as, when the daemon runs as root. |
 
 (config-daemon-app-name-release-id)=
@@ -326,7 +329,7 @@ A directory of an application's own files, an entry of the `[[tool.muru.static]]
 | --- | --- | --- | --- |
 | `cache` | table, {ref}`[route.cache] <config-daemon-route-cache>` |  | The cache headers files are sent with. |
 | `case` | string | `"strict"` | `strict` (the default), which matches names as they are on disk, or `insensitive`. |
-| `dir` | string | required | The directory, relative to the source directory, or absolute. |
+| `dir` | string | required | The directory: relative to the source directory, absolute, or `media:` for the application's media part, with an optional directory inside it after the colon. |
 | `fallback` | string |  | The file served for paths with no file of their own, for a single-page application under the prefix. |
 | `index` | array of strings | `["index.html"]` | The files tried, in order, when a directory is requested. |
 | `path` | string | required | The path prefix, such as `/static/`; the longest wins, on segment boundaries, and `/` is not allowed, since every path would then be looked up as a file first. |

@@ -130,14 +130,63 @@ pub struct StaticSpec {
     pub redirect_slash: bool,
     /// Whether names may differ from the file's on disk in case.
     pub case_insensitive: bool,
+    /// The directory Muru provides that `dir` lies in, which is then
+    /// relative to it (issue 849): the application's media part.
+    /// Resolved each time the edge is given the entry, since the media
+    /// part may move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within: Option<Within>,
+}
+
+/// A directory Muru provides that a static entry names by its prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Within {
+    /// `media:`, the application's media part.
+    Media,
+}
+
+impl Within {
+    /// The prefix configuration names it by.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::Media => "media:",
+        }
+    }
 }
 
 impl StaticSpec {
-    /// The entry as the snapshot carries it.
-    pub fn message(&self) -> muru_proto::edge::v1::StaticDir {
-        muru_proto::edge::v1::StaticDir {
+    /// The directory served: `dir` itself, or `dir` inside the place
+    /// Muru provides, or none when the release does not have it.
+    pub fn directory(&self, places: &crate::places::Places) -> Option<PathBuf> {
+        let base = match self.within {
+            None => return Some(self.dir.clone()),
+            Some(Within::Media) => places.data.as_ref().map(|dirs| dirs.media.clone())?,
+        };
+
+        Some(if self.dir.as_os_str().is_empty() {
+            base
+        } else {
+            base.join(&self.dir)
+        })
+    }
+
+    /// The entry as the snapshot carries it, or none when it names a
+    /// place the release does not have. An entry in the media part is
+    /// marked with the user it must belong to, under a daemon whose
+    /// applications run as their own users.
+    pub fn message(
+        &self,
+        places: &crate::places::Places,
+    ) -> Option<muru_proto::edge::v1::StaticDir> {
+        let dir = self.directory(places)?;
+
+        Some(muru_proto::edge::v1::StaticDir {
+            owner: (self.within == Some(Within::Media))
+                .then_some(places.owner)
+                .flatten(),
             path: self.path.clone(),
-            dir: self.dir.display().to_string(),
+            dir: dir.display().to_string(),
             index: self.index.clone(),
             fallback_file: self.fallback_file.clone().unwrap_or_default(),
             cache_max_age_s: self.cache_max_age_s.unwrap_or(0),
@@ -145,15 +194,18 @@ impl StaticSpec {
             cache_except: self.cache_except.clone(),
             no_redirect_slash: !self.redirect_slash,
             case_insensitive: self.case_insensitive,
-        }
+        })
     }
 
     /// The entry as a declared release's table has it, the directory
-    /// absolute.
+    /// absolute or by the prefix of the place Muru provides.
     pub fn table(&self) -> muru_config::StaticDir {
         muru_config::StaticDir {
             path: self.path.clone(),
-            dir: self.dir.display().to_string(),
+            dir: match self.within {
+                Some(within) => format!("{}{}", within.prefix(), self.dir.display()),
+                None => self.dir.display().to_string(),
+            },
             index: self.index.clone(),
             fallback: self.fallback_file.clone(),
             cache: (self.cache_max_age_s.is_some()
@@ -1569,6 +1621,13 @@ pub struct App {
     pub priority: i32,
     /// The application's own access log choice (section 11.2).
     pub access_log: AccessLogSpec,
+    /// Where its data directory is, when not `STATE/data/APP` (issue
+    /// 849).
+    pub data_dir: Option<String>,
+    /// Where its media part is, a relative one in the data directory.
+    pub media_dir: Option<String>,
+    /// Where its uploads part is, a relative one in the data directory.
+    pub uploads_dir: Option<String>,
 }
 
 impl App {

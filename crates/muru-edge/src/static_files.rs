@@ -85,6 +85,9 @@ pub struct Settings<'a> {
     pub no_redirect_slash: bool,
     /// Accept names that differ from the file's on disk.
     pub case_insensitive: bool,
+    /// The user the directory must be owned by, for one Muru provides
+    /// (issue 849), such as an application's media part.
+    pub owner: Option<u32>,
 }
 
 impl StaticRoute {
@@ -103,6 +106,7 @@ impl StaticRoute {
             cache_except: &route.cache_except,
             no_redirect_slash: route.no_redirect_slash,
             case_insensitive: route.case_insensitive,
+            owner: None,
         })?))
     }
 
@@ -117,6 +121,7 @@ impl StaticRoute {
             cache_except: &entry.cache_except,
             no_redirect_slash: entry.no_redirect_slash,
             case_insensitive: entry.case_insensitive,
+            owner: entry.owner,
         })
     }
 
@@ -142,7 +147,10 @@ impl StaticRoute {
         };
 
         Ok(Self {
-            root: Root::new(settings.directory),
+            root: match settings.owner {
+                Some(owner) => Root::owned_by(settings.directory, owner),
+                None => Root::new(settings.directory),
+            },
             index: if settings.index.is_empty() {
                 vec!["index.html".to_owned()]
             } else {

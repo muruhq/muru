@@ -79,23 +79,37 @@ too, and the edge sends it with `Content-Encoding` and `Vary`, as it
 does for a static route; a `Range` request is answered from the file
 itself.
 
-The worker opens a hinted file only within the directories the mount's
-`sendfile_roots` lists. They catch a hint built from a request
+## What a hint may name
+
+The worker opens a hinted file only within the mount's roots: the
+application's media part, `MURU_MEDIA_DIR` in its [data
+directory](data-directory.md), and the directories the mount's
+`sendfile_roots` lists. The roots catch a hint built from a request
 parameter by mistake (`?file=../../settings.py`, `.env`), and keep what
-a hint may name the same whatever answers the route. A relative root is
-taken from the release's source directory, so the setting travels with
-the project and means the same in every release and under `muructl
-run`, `muructl serve` and the daemon; an absolute root is used as
-written:
+a hint may name the same whatever answers the route.
+
+The media part is a root of every mount wherever it lives, so a file
+saved there is served by a hint with nothing configured:
+
+```python
+path = os.path.join(os.environ["MURU_MEDIA_DIR"], "reports", name)
+start_response("200 OK", [("X-Muru-Sendfile", path)])
+```
+
+`sendfile_roots` adds others. `media:` names the media part and
+`media:SUBDIR` a directory in it; a relative root is taken from the
+release's source directory, so the setting travels with the project and
+means the same in every release and under `muructl run`, `muructl
+serve` and the daemon; an absolute root is used as written:
 
 ```toml
 [tool.muru]
-sendfile_roots = ['media', 'build/reports']
+sendfile_roots = ['build/reports']
 
 [tool.muru.mounts.archive]
 path = '/archive'
 entrypoint = 'media.archive:application'
-sendfile_roots = ['/srv/archive']
+sendfile_roots = ['media:archive', '/srv/archive']
 ```
 
 A relative root must be a directory in the release's source when the
@@ -104,9 +118,20 @@ entry's directory; `muructl run` refuses to start without it. An
 absolute root may be made or mounted later. The source directory as a
 whole is never a root unless it is named.
 
+The rest of the data directory is never served, whatever the
+configuration says. The data directory itself holds the application's
+databases, with their `-wal` and `-shm` files, and its caches, and the
+uploads part holds files kept but never handed out, so neither, nor any
+directory containing either, can be a root or a static directory:
+`data:` and `uploads:` are refused, and so is a path that leads there,
+by its name or through a symbolic link, with a deploy failing and
+`muructl run` refusing to start, saying why. A directory whose name
+really starts with `media:` is written `./media:x`.
+
 The release's roots apply to its default mount and to every mount that
-does not list its own; without any, every path hint is refused. The
-hint must name an absolute path, under a root by its leading
+does not list its own; without any, and with no data directory, as
+under `muructl serve` without `--data-dir`, every path hint is refused.
+The hint must name an absolute path, under a root by its leading
 components, either the root as configured or the directory it leads
 to. The file is then opened beneath the root, one name at a time from
 the root's own open directory, and is never opened again by its path:
@@ -121,7 +146,11 @@ the root's own open directory, and is never opened again by its path:
   it: an operator can move a root to another disk and leave a link in
   its place, with no change of configuration. Each hint checks that the
   root's path still leads to the directory being used, and opens the
-  new one when it has been moved.
+  new one when it has been moved. Under a daemon whose applications run
+  as [their own users](users.md), the media part must lead to a
+  directory the application's user owns, or every hint beneath it is
+  refused and the reason written to the application's output, so an
+  application cannot point its media part at another user's files.
 
 A path that is relative, outside the roots, or leaves its root is
 answered 500 `sendfile_refused` and logged with the path; a path that

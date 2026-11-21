@@ -182,7 +182,10 @@ muru: the command exited with status 1 after 2s
 
 The command runs in the release's source directory with the release's
 environment variables; `MURU_APP`, `MURU_RELEASE` and `MURU_RELEASE_DIR`
-say what it runs with. It gets no input and no terminal, so an
+say what it runs with, and `MURU_DATA_DIR`, `MURU_MEDIA_DIR` and
+`MURU_UPLOADS_DIR` where the application keeps its data, as the
+release's workers have them (see [keeping data between
+releases](data-directory.md)). It gets no input and no terminal, so an
 interactive program such as `manage.py shell` cannot be run this way.
 
 `--json` prints each line of output, and last how the command ended, as
@@ -428,7 +431,12 @@ Where the command runs depends on what is running:
   starts the command and waits for it. Nothing else needs to be running,
   which is what a Kubernetes Job, an init container, a Helm hook or a
   step of a CI job needs. Its output goes to standard output and
-  standard error alone, and `MURU_RELEASE` is not set.
+  standard error alone, and `MURU_RELEASE` is not set. Its data
+  directory is the one a `muructl run` of the project uses, so a
+  migration run beside `muructl run` migrates the database it serves,
+  unless `MURU_SERVE_DATA_DIR`, `MURU_SERVE_MEDIA_DIR` or
+  `MURU_SERVE_UPLOADS_DIR` names another, as in a container where they
+  name its volumes.
 
 `--chdir DIR` names the project from another directory, as it does for
 `muructl run`. A command `muructl` runs itself finds the rest as

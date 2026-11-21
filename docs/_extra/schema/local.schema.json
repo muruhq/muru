@@ -101,6 +101,11 @@
           "type": "string",
           "x-default": "`127.0.0.1:8081`; off under `--allow-public`"
         },
+        "data_dir": {
+          "description": "The application's data directory, shared by every run of the project, a relative one taken from the project; its media and uploads parts are made in it.",
+          "type": "string",
+          "x-default": "runs/NAME-HASH/data in the user state directory, never in the project"
+        },
         "env_file": {
           "description": "A `.env` file whose variables the run starts with, relative to the project. Its values override `[tool.muru.env]`. None is read unless this names one.",
           "type": "string"

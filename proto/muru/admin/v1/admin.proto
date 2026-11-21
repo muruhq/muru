@@ -24,6 +24,9 @@ service Admin {
   rpc GetApp(GetAppRequest) returns (App);
   // Remove an application and every release it has, or say what would go.
   rpc RemoveApp(RemoveAppRequest) returns (RemoveReleasesResponse);
+  // Issue 849: an application's data directory and its parts, where each
+  // leads, whose it is and what may be wrong with it.
+  rpc GetAppData(GetAppDataRequest) returns (AppData);
 
   // Create a release from a source directory and apply the application's
   // default strategy (blue/green): start it, move traffic when it is
@@ -777,6 +780,40 @@ message PruneReleasesRequest {
 message RemoveAppRequest {
   string app = 1;
   bool dry_run = 2;                 // only say what would go
+  bool data = 3;                    // remove its data directory too (issue 849)
+}
+
+// Issue 849: what GetAppData asks about.
+message GetAppDataRequest {
+  string app = 1;                   // none for a run's or a serve's own application
+  bool sizes = 2;                   // measure what each part holds, which walks it
+}
+
+// One part of an application's data directory.
+message DataPart {
+  string name = 1;                  // data, media or uploads
+  string path = 2;                  // as the application is given it
+  string resolved = 3;              // where it leads through symbolic links, when that differs
+  bool exists = 4;
+  uint32 owner_uid = 5;
+  string owner = 6;                 // the owner's name, when the system has one
+  uint32 mode = 7;                  // the permission bits
+  string filesystem = 8;            // the type of the file system it is on
+  bool network = 9;                 // a network file system, where SQLite's locks do not hold
+  bool root = 10;                   // a file hint root of every mount
+  optional uint64 bytes = 11;       // what it holds, when sizes were asked for
+}
+
+// Issue 849: an application's data directory.
+message AppData {
+  string app = 1;
+  repeated DataPart parts = 2;      // none when the application has no data directory
+  uint32 expected_uid = 3;          // the user the application runs as
+  string expected_owner = 4;        // that user's name, when it has one
+  string spool = 5;                 // the upload spool's directory, when there is one
+  bool spool_shared = 6;            // the uploads part is on the spool's file system, so save() links
+  repeated string warnings = 7;     // what muructl data check reports
+  string none = 8;                  // why there is no data directory, when there is none
 }
 
 message RemoveReleaseRequest {
@@ -810,6 +847,9 @@ message RemoveReleasesResponse {
   repeated KeptRelease kept = 2;
   uint64 freed = 3;                 // the bytes given back, or that would be
   bool dry_run = 4;                 // nothing was changed
+  string data_dir = 5;              // an application removal: its data directory, kept or removed
+  bool data_removed = 6;            // the data directory was removed, or would be
+  repeated string data_kept = 7;    // parts outside the data directory, which a removal leaves
 }
 
 // Section 9.3: a canary rollout of a candidate release against the

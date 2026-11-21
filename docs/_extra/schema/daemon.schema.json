@@ -16,10 +16,20 @@
           },
           "type": "array"
         },
+        "data_dir": {
+          "description": "The application's data directory, shared by every release, an absolute path; its media and uploads parts are made in it.",
+          "type": "string",
+          "x-default": "STATE/data/APP"
+        },
         "group": {
           "description": "The group, else the user's primary group.",
           "type": "string",
           "x-default": "the user's primary group"
+        },
+        "media_dir": {
+          "default": "media",
+          "description": "The media part, the one part ever served, a relative one taken from `data_dir`.",
+          "type": "string"
         },
         "priority": {
           "default": 0,
@@ -56,6 +66,11 @@
           "description": "The file creation mask, in octal, for example 027.",
           "type": "string",
           "x-default": "the daemon's own umask"
+        },
+        "uploads_dir": {
+          "default": "uploads",
+          "description": "The uploads part, never served, a relative one taken from `data_dir`.",
+          "type": "string"
         },
         "user": {
           "description": "The user the application's hosts and workers run as, when the daemon runs as root.",
@@ -3038,7 +3053,7 @@
           "type": "string"
         },
         "dir": {
-          "description": "The directory, relative to the source directory, or absolute.",
+          "description": "The directory: relative to the source directory, absolute, or `media:` for the application's media part, with an optional directory inside it after the colon.",
           "type": "string"
         },
         "fallback": {

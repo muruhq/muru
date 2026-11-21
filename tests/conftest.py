@@ -60,6 +60,12 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
     tempfile.gettempdir()
     os.environ.setdefault("MURU_RUN_DIR", str(server.short_dir("muru-rt-")))
+
+    # Issue 849: a development run keeps its data directory under the user
+    # state location, which a daemon started with --state-dir does not
+    # read; the session's own keeps the runs out of the user's.
+
+    os.environ.setdefault("MURU_STATE_DIR", str(server.short_dir("muru-st-")))
     os.environ["TMPDIR"] = str(server.short_dir("muru-tmp-"))
 
     # Issue 812: every instance the session starts is labelled, so what

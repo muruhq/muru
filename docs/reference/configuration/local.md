@@ -51,6 +51,7 @@ The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a muru.toml and i
 | `access_log_query` | string | `"keep"` | What the access log keeps of each request's query string: `keep` (the default), `mask` (secret parameters' values as `***`) or `drop` (the path alone). |
 | `compression` | boolean | `true` | Whether responses are compressed; `false` is `--no-compression`. |
 | `dashboard` | string | `127.0.0.1:8081`; off under `--allow-public` | The dashboard's address, or `off`. |
+| `data_dir` | string | runs/NAME-HASH/data in the user state directory, never in the project | The application's data directory, shared by every run of the project, a relative one taken from the project; its media and uploads parts are made in it. |
 | `env_file` | string |  | A `.env` file whose variables the run starts with, relative to the project. Its values override `[tool.muru.env]`. None is read unless this names one. |
 | `hosts` | array of strings |  | Names the development certificate covers besides localhost. |
 | `https` | boolean | `false` | Serve HTTPS beside HTTP. |

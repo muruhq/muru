@@ -107,6 +107,10 @@ would, or use WhiteNoise. The
 [Django tutorial](../tutorials/first-django-site.md) uses the URL
 patterns in development and the project's entry in production.
 
+The database, `MEDIA_ROOT` and other files kept from one release to the
+next go in the application's data directory; [keeping data between
+releases](data-directory.md#django) has the settings.
+
 Flask serves its package's `static` folder itself under any server.
 Declaring it in the project hands those requests to the edge instead,
 with the same `url_for('static', ...)` paths:
@@ -116,6 +120,11 @@ with the same `url_for('static', ...)` paths:
 path = '/static/'
 dir = 'shop/static'
 ```
+
+Flask's instance folder, where its tutorial keeps the database, goes in
+the application's data directory with `Flask(__name__,
+instance_path=os.environ.get("MURU_DATA_DIR"))`; [keeping data between
+releases](data-directory.md#flask) has the rest.
 
 ## Both
 

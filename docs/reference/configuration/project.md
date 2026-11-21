@@ -294,6 +294,7 @@ The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a muru.toml and i
 | `access_log_query` | string | `"keep"` | What the access log keeps of each request's query string: `keep` (the default), `mask` (secret parameters' values as `***`) or `drop` (the path alone). |
 | `compression` | boolean | `true` | Whether responses are compressed; `false` is `--no-compression`. |
 | `dashboard` | string | `127.0.0.1:8081`; off under `--allow-public` | The dashboard's address, or `off`. |
+| `data_dir` | string | runs/NAME-HASH/data in the user state directory, never in the project | The application's data directory, shared by every run of the project, a relative one taken from the project; its media and uploads parts are made in it. |
 | `env_file` | string |  | A `.env` file whose variables the run starts with, relative to the project. Its values override `[tool.muru.env]`. None is read unless this names one. |
 | `hosts` | array of strings |  | Names the development certificate covers besides localhost. |
 | `https` | boolean | `false` | Serve HTTPS beside HTTP. |
@@ -351,6 +352,7 @@ The `[tool.muru.serve]` table (`[serve]` in muru.toml, and in the file `muructl 
 | `admin_status` | boolean | `false` | Whether `/status` is served on the admin port. |
 | `compression` | boolean | `true` | Whether responses are compressed. |
 | `concurrency` | integer | `1000` | Requests an ASGI worker's event loop takes at once. |
+| `data_dir` | string | none | The application's data directory, normally a mounted volume, which must exist and be writable; its media and uploads parts are made in it. With none, the application is given no data directory. |
 | `entrypoint` | string |  | The application as module:callable. |
 | `factory` | boolean | `false` | Whether the entrypoint is a factory. |
 | `hooks` | string |  | The module providing the lifecycle hooks. |
@@ -363,6 +365,7 @@ The `[tool.muru.serve]` table (`[serve]` in muru.toml, and in the file `muructl 
 | `max_lifetime` | string |  | How long a worker lives before it is replaced. |
 | `max_requests` | integer |  | Requests a worker serves before it is replaced. |
 | `max_requests_per_connection` | integer | `0` | Requests one connection may carry. |
+| `media_dir` | string | `"media"` | The media part, the one part ever served, a relative one taken from the data directory. |
 | `memory` | array of strings |  | The memory policy as KEY=VALUE. |
 | `min_ready` | integer | `1` | The workers ready in every worker group for `/readyz` to pass. |
 | `preload` | string | `"auto"` | Whether the application is imported before the workers are forked: `auto`, `true` or `false`. |
@@ -380,6 +383,7 @@ The `[tool.muru.serve]` table (`[serve]` in muru.toml, and in the file `muructl 
 | `timeout` | array of strings |  | Timeouts as NAME=DURATION, as `--timeout` takes them. |
 | `timestamps` | boolean | `false` | Whether every line carries the full UTC time. |
 | `trusted_proxy` | array of strings | loopback peers, for their forwarding headers alone | The proxies whose forwarding headers are applied: addresses, CIDR ranges, or loopback, private and unix. A proxy named here also gets a proxy's share of connections and keep-alive timeout. |
+| `uploads_dir` | string | `"uploads"` | The uploads part, never served, a relative one taken from the data directory. |
 
 (config-project-tool-muru-static)=
 ## `[[tool.muru.static]]`
@@ -390,7 +394,7 @@ A directory of an application's own files, an entry of the `[[tool.muru.static]]
 | --- | --- | --- | --- |
 | `cache` | table, {ref}`[tool.muru.static.cache] <config-project-tool-muru-static-cache>` |  | The cache headers files are sent with. |
 | `case` | string | `"strict"` | `strict` (the default), which matches names as they are on disk, or `insensitive`. |
-| `dir` | string | required | The directory, relative to the source directory, or absolute. |
+| `dir` | string | required | The directory: relative to the source directory, absolute, or `media:` for the application's media part, with an optional directory inside it after the colon. |
 | `fallback` | string |  | The file served for paths with no file of their own, for a single-page application under the prefix. |
 | `index` | array of strings | `["index.html"]` | The files tried, in order, when a directory is requested. |
 | `path` | string | required | The path prefix, such as `/static/`; the longest wins, on segment boundaries, and `/` is not allowed, since every path would then be looked up as a file first. |

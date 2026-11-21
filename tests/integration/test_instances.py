@@ -280,7 +280,14 @@ def test_named_instances_take_their_locations_from_their_names(tmp_path: Path) -
     env = {
         name: value
         for name, value in os.environ.items()
-        if name not in ("MURU_RUN_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
+        if name
+        not in (
+            "MURU_RUN_DIR",
+            "MURU_STATE_DIR",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+        )
     }
     env.update({"HOME": str(home), "MURU_INSTANCE_LABEL": label})
     path = support.muructl_path()
@@ -354,7 +361,14 @@ def test_a_checkout_reaches_the_instance_its_local_file_names(tmp_path: Path) ->
     env = {
         key: value
         for key, value in os.environ.items()
-        if key not in ("MURU_RUN_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
+        if key
+        not in (
+            "MURU_RUN_DIR",
+            "MURU_STATE_DIR",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+        )
     }
     env.update({"HOME": str(home), "MURU_INSTANCE_LABEL": label})
     checkout = tmp_path / "checkout"

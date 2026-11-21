@@ -507,6 +507,14 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
         ));
     }
 
+    if let Some(dir) = &serving.data_dir {
+        rows.push(Row::new(
+            "data_dir",
+            dir.display().to_string(),
+            run(args.data_dir.is_some(), "data_dir"),
+        ));
+    }
+
     rows.push(Row::new("reload", serving.reload, reload));
 
     let paths = |paths: &[std::path::PathBuf]| -> Vec<String> {

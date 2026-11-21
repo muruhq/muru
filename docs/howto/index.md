@@ -35,6 +35,9 @@ Recipes for specific tasks, assuming you already know the basics. The
   interpreter, environment and settings.
 - [Database migrations](migrations.md): changing a schema while two
   releases share it.
+- [Keeping data between releases](data-directory.md): the data
+  directory every release of an application shares, for databases and
+  saved files.
 - [In a container](containers.md): an image and `muructl serve` as its
   main process.
 - [A Kubernetes Deployment](kubernetes.md): probes, rolling updates and
@@ -151,6 +154,7 @@ users
 secrets
 commands
 migrations
+data-directory
 containers
 kubernetes
 upgrading

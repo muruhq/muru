@@ -35,6 +35,9 @@ pub struct Context {
     /// The project settings file read in place of the one beside the
     /// code, when one is named (section 13.9).
     pub file: Option<PathBuf>,
+    /// The application's places (issue 849), which the command
+    /// is given as the application is.
+    pub places: muru_controller::places::Places,
 }
 
 /// The commands the project declares, read from its file as it is now,
@@ -144,6 +147,7 @@ pub fn check(
 /// application is served with.
 pub fn prepare(context: &Context, request: CommandRequest) -> Result<Prepared, String> {
     let declared_command = check(&context.project, context.file.as_deref(), &request)?;
+    let (places, unset) = crate::places::variables(&context.places);
 
     let env = muru_controller::commands::environment(
         context.env.clone(),
@@ -153,6 +157,7 @@ pub fn prepare(context: &Context, request: CommandRequest) -> Result<Prepared, S
             pycache: None,
             bytecode: None,
             base: None,
+            places: &places,
         },
         &context.app,
         &context.release,
@@ -165,7 +170,7 @@ pub fn prepare(context: &Context, request: CommandRequest) -> Result<Prepared, S
         label: "exec".to_owned(),
         argv: Vec::new(),
         env,
-        unset: Vec::new(),
+        unset,
         clean: false,
         cwd: context.project.clone(),
         identity: None,
@@ -366,14 +371,22 @@ pub async fn own(args: &ProjectArgs, request: &CommandRequest) -> anyhow::Result
         (None, None) => crate::provision::runtime(&python.probe).await?,
     };
 
+    // Issue 849: the places of the run beside it, unless serve's
+    // variables name others, made as the run makes them.
+
+    let app = label(&project, table.entrypoint.as_deref());
+    let places = crate::places::for_command(&project, &app, |name| std::env::var(name).ok())?;
+    crate::places::make(&places, muru_controller::places::DATA_MODE)?;
+
     Ok(Context {
-        app: label(&project, table.entrypoint.as_deref()),
+        app,
         release: String::new(),
         project,
         python: python.python.clone(),
         pythonpath: library.pythonpath.clone(),
         env,
         file: settings.file,
+        places,
     })
 }
 
@@ -390,6 +403,14 @@ mod tests {
             pythonpath: Some(PathBuf::from("/opt/muru")),
             env: vec![("SETTINGS".to_owned(), "shop.settings".to_owned())],
             file: None,
+            places: muru_controller::places::Places {
+                data: Some(muru_config::places::DataDirs::new(
+                    PathBuf::from("/state/runs/shop-1/data"),
+                    None,
+                    None,
+                )),
+                owner: None,
+            },
         }
     }
 
@@ -444,6 +465,25 @@ mod tests {
             "{:?}",
             prepared.env
         );
+
+        // Issue 849: the run's places, which no value inherited
+        // from the shell replaces.
+
+        assert_eq!(
+            value(&prepared, "MURU_DATA_DIR"),
+            Some("/state/runs/shop-1/data")
+        );
+        assert_eq!(
+            value(&prepared, "MURU_UPLOADS_DIR"),
+            Some("/state/runs/shop-1/data/uploads")
+        );
+        assert!(prepared.unset.is_empty());
+
+        let mut without = context(dir.path());
+        without.places = muru_controller::places::Places::default();
+        let prepared = prepare(&without, CommandRequest::OneOff(vec!["true".to_owned()])).unwrap();
+        assert_eq!(value(&prepared, "MURU_DATA_DIR"), None);
+        assert_eq!(prepared.unset.len(), 3, "{:?}", prepared.unset);
     }
 
     #[test]

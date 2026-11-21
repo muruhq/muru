@@ -892,6 +892,21 @@ impl Admin for Service {
             .collect();
         let mut answer = self.measured(&planned, false, request.dry_run).await?;
 
+        // Issue 849: the data directory is the application's, kept unless
+        // asked for; a part that lies outside it, by configuration or
+        // through a link, is never removed and is named.
+
+        let dirs = crate::places::app_data(&self.handle.info.locations.state.path, &app);
+        let resolved = dirs.resolved();
+        answer.data_dir = dirs.data.display().to_string();
+        answer.data_removed = request.data && dirs.data.exists();
+
+        for (name, path) in [("media", &resolved.media), ("uploads", &resolved.uploads)] {
+            if !path.starts_with(&resolved.data) {
+                answer.data_kept.push(format!("{name} {}", path.display()));
+            }
+        }
+
         if request.dry_run {
             return Ok(Response::new(answer));
         }
@@ -940,7 +955,64 @@ impl Admin for Service {
         let _ = std::fs::remove_dir_all(logs.join("commands"));
         let _ = std::fs::remove_dir(&logs);
 
+        if answer.data_removed {
+            let data = dirs.data.clone();
+
+            tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&data))
+                .await
+                .map_err(internal)?
+                .map_err(|error| {
+                    Status::internal(format!(
+                        "{} was removed, and removing its data directory {} failed: {error}",
+                        app.name,
+                        dirs.data.display()
+                    ))
+                })?;
+            self.handle.events.emit(
+                "app.data_removed",
+                &app.name,
+                "notice",
+                &format!("the data directory {} was removed", dirs.data.display()),
+            );
+        }
+
         settle_freed(&mut answer);
+        Ok(Response::new(answer))
+    }
+
+    async fn get_app_data(
+        &self,
+        request: Request<pb::GetAppDataRequest>,
+    ) -> Result<Response<pb::AppData>, Status> {
+        let request = request.into_inner();
+
+        if request.app.is_empty() {
+            return Err(Status::invalid_argument(
+                "name the application whose data directory to show",
+            ));
+        }
+
+        let app = self.handle.store.app(&request.app).map_err(not_found)?;
+        let state = self.handle.info.locations.state.path.clone();
+        let dirs = crate::places::app_data(&state, &app);
+        let expected = planned_identity(&app.name, &self.handle)
+            .map_or_else(crate::host::Identity::current_uid, |identity| identity.uid);
+
+        // Measuring walks the parts, so it goes on the blocking pool.
+
+        let answer = tokio::task::spawn_blocking(move || {
+            crate::places::describe(
+                &app.name,
+                Some(&dirs),
+                "",
+                expected,
+                Some(&state.join("spool")),
+                request.sizes,
+            )
+        })
+        .await
+        .map_err(internal)?;
+
         Ok(Response::new(answer))
     }
 
@@ -2943,8 +3015,9 @@ impl Service {
             // An application's identity and priority are kept as they
             // were, to put back should the apply fail.
 
-            if let Action::SetAppIdentity { app, .. } | Action::SetAppPriority { app, .. } =
-                &change.action
+            if let Action::SetAppIdentity { app, .. }
+            | Action::SetAppPriority { app, .. }
+            | Action::SetAppData { app, .. } = &change.action
                 && !prepared.apps.contains(app)
                 && !prepared.settings.iter().any(|kept| &kept.name == app)
                 && let Ok(kept) = store.app(app)
@@ -2967,6 +3040,19 @@ impl Service {
                     .map(|()| "set".to_owned()),
                 Action::SetAppPriority { app, priority } => store
                     .set_app_priority(app, *priority)
+                    .map(|()| "set".to_owned()),
+                Action::SetAppData {
+                    app,
+                    data_dir,
+                    media_dir,
+                    uploads_dir,
+                } => store
+                    .set_app_data(
+                        app,
+                        data_dir.as_deref(),
+                        media_dir.as_deref(),
+                        uploads_dir.as_deref(),
+                    )
                     .map(|()| "set".to_owned()),
                 Action::Deploy {
                     app,
@@ -3002,6 +3088,18 @@ impl Service {
         added: Added,
     ) -> Result<String, crate::store::StoreError> {
         let store = &self.handle.store;
+
+        // Issue 849: what the release serves is checked against the
+        // application's data directory.
+
+        crate::places::prepare_release(
+            &self.handle.info.locations.state.path,
+            store,
+            app,
+            id,
+            spec,
+        )
+        .map_err(crate::store::StoreError::Decode)?;
         store.create_release(app, id, spec)?;
         let source = spec.source.display();
 
@@ -3316,7 +3414,15 @@ impl Service {
                     kept.group.as_deref(),
                     kept.umask.as_deref(),
                 )
-                .and_then(|()| store.set_app_priority(&kept.name, kept.priority));
+                .and_then(|()| store.set_app_priority(&kept.name, kept.priority))
+                .and_then(|()| {
+                    store.set_app_data(
+                        &kept.name,
+                        kept.data_dir.as_deref(),
+                        kept.media_dir.as_deref(),
+                        kept.uploads_dir.as_deref(),
+                    )
+                });
 
             if let Err(why) = restored {
                 tracing::warn!(%why, "restoring {} after a failed apply failed", kept.name);
@@ -3477,6 +3583,7 @@ impl Service {
             kept: Vec::new(),
             freed: together.freed,
             dry_run,
+            ..Default::default()
         })
     }
 

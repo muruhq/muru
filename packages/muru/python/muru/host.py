@@ -938,12 +938,13 @@ class Group:
         return cls(name, processes, threads, sync_threads, concurrency)
 
 
-def parse_sendfile(text: str) -> list[tuple[str, list[str], str | None]]:
+def parse_sendfile(text: str) -> list[tuple[str, list[str], str | None, dict[str, int]]]:
     """Parse --sendfile, each mount's path hint settings (section 4.9).
 
     The argument is a JSON object by mount name, each with `roots`,
-    absolute directories, and `header`, a second header honoured as
-    X-Muru-Sendfile or null.
+    absolute directories, `owned`, the roots Muru provides that must be
+    owned by a user, by path with the uid, and `header`, a second header
+    honoured as X-Muru-Sendfile or null.
     """
 
     try:
@@ -954,11 +955,12 @@ def parse_sendfile(text: str) -> list[tuple[str, list[str], str | None]]:
     if not isinstance(mounts, dict):
         raise argparse.ArgumentTypeError(f"{text!r} is not an object of mounts")
 
-    parsed: list[tuple[str, list[str], str | None]] = []
+    parsed: list[tuple[str, list[str], str | None, dict[str, int]]] = []
 
     for name, settings in mounts.items():
         roots = settings.get("roots") if isinstance(settings, dict) else None
         header = settings.get("header") if isinstance(settings, dict) else None
+        owned = settings.get("owned", {}) if isinstance(settings, dict) else None
 
         if not isinstance(roots, list) or not all(
             isinstance(root, str) and os.path.isabs(root) for root in roots
@@ -968,7 +970,13 @@ def parse_sendfile(text: str) -> list[tuple[str, list[str], str | None]]:
         if header is not None and not isinstance(header, str):
             raise argparse.ArgumentTypeError(f"mount {name!r}: header is not a header name")
 
-        parsed.append((name, roots, header))
+        if not isinstance(owned, dict) or not all(
+            root in roots and isinstance(uid, int) and not isinstance(uid, bool)
+            for root, uid in owned.items()
+        ):
+            raise argparse.ArgumentTypeError(f"mount {name!r}: owned roots are not its roots")
+
+        parsed.append((name, roots, header, owned))
 
     return parsed
 
@@ -1309,7 +1317,7 @@ class Host:
         reflection: bool = False,
         handoff: str | None = None,
         cgroup: str | None = None,
-        sendfile: list[tuple[str, list[str], str | None]] | None = None,
+        sendfile: list[tuple[str, list[str], str | None, dict[str, int]]] | None = None,
     ) -> None:
         self.release = release
         self.mounts = mounts or []

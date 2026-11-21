@@ -31,12 +31,23 @@ pub struct Hints {
 }
 
 impl Hints {
-    /// The settings for a mount, from its roots and second header.
-    pub fn new(roots: &[String], header: Option<&str>) -> Self {
+    /// The settings for a mount, from its roots, second header and the
+    /// roots Muru provides that must be owned by a user (issue 849), by
+    /// path with the uid.
+    pub fn new(
+        roots: &[String],
+        header: Option<&str>,
+        owned: &std::collections::HashMap<String, u32>,
+    ) -> Self {
         Self {
             roots: roots
                 .iter()
-                .map(|root| Arc::new(Root::new(PathBuf::from(root))))
+                .map(|root| {
+                    Arc::new(match owned.get(root) {
+                        Some(&uid) => Root::owned_by(PathBuf::from(root), uid),
+                        None => Root::new(PathBuf::from(root)),
+                    })
+                })
                 .collect(),
             header: header
                 .filter(|name| !name.is_empty())
@@ -144,6 +155,7 @@ fn suffix(encoding: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::io::Read as _;
 
     fn read(file: &mut File) -> String {
@@ -154,7 +166,7 @@ mod tests {
 
     #[test]
     fn every_hint_header_is_removed_and_the_first_named_path_taken() {
-        let hints = Hints::new(&[], Some("X-Sendfile"));
+        let hints = Hints::new(&[], Some("X-Sendfile"), &HashMap::new());
         let mut headers = vec![
             (b"Content-Type".to_vec(), b"text/plain".to_vec()),
             (b"X-Sendfile".to_vec(), b" /srv/a.txt ".to_vec()),
@@ -169,7 +181,10 @@ mod tests {
         // Without the second header named, X-Sendfile is an ordinary one.
 
         let mut headers = vec![(b"X-Sendfile".to_vec(), b"/srv/a.txt".to_vec())];
-        assert_eq!(Hints::new(&[], None).take(&mut headers), None);
+        assert_eq!(
+            Hints::new(&[], None, &HashMap::new()).take(&mut headers),
+            None
+        );
         assert_eq!(headers.len(), 1);
     }
 
@@ -184,7 +199,7 @@ mod tests {
         std::fs::write(base.path().join("secret.txt"), b"secret").unwrap();
         std::os::unix::fs::symlink("../secret.txt", media.join("escape")).unwrap();
 
-        let hints = Hints::new(&[media.display().to_string()], None);
+        let hints = Hints::new(&[media.display().to_string()], None, &HashMap::new());
         let path = media.join("app.js").display().to_string();
 
         let mut opened = hints
@@ -214,6 +229,36 @@ mod tests {
             Hints::default().open(&path, &[]).unwrap_err(),
             pb::PathHintOutcome::Refused,
             "with no roots every hint is refused"
+        );
+    }
+
+    #[test]
+    fn a_root_muru_provides_must_be_its_users() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let base = tempfile::tempdir().unwrap();
+        let media = base.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        std::fs::write(media.join("report.pdf"), b"report").unwrap();
+        let root = media.display().to_string();
+        let path = media.join("report.pdf").display().to_string();
+        let uid = std::fs::metadata(&media).unwrap().uid();
+
+        let mine = Hints::new(
+            std::slice::from_ref(&root),
+            None,
+            &HashMap::from([(root.clone(), uid)]),
+        );
+        assert!(mine.open(&path, &[]).is_ok());
+
+        let another = Hints::new(
+            std::slice::from_ref(&root),
+            None,
+            &HashMap::from([(root.clone(), uid + 1)]),
+        );
+        assert_eq!(
+            another.open(&path, &[]).unwrap_err(),
+            pb::PathHintOutcome::Refused
         );
     }
 }

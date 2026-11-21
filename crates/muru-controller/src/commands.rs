@@ -211,6 +211,11 @@ pub struct Interpreter<'a> {
     /// `passed_from_daemon`; none for `muructl run` and `muructl serve`,
     /// which pass on the environment they were started with.
     pub base: Option<&'a [(String, String)]>,
+    /// The variables naming the places Muru provides the release (issue
+    /// 849): its data directory and its media and uploads parts, when it
+    /// has them. Muru alone sets them, so the release's own variables of
+    /// those names are dropped.
+    pub places: &'a [(String, String)],
 }
 
 /// The variables a release's processes take from the daemon's own
@@ -359,6 +364,7 @@ pub fn environment(
     }
 
     set.push(("MURU_RELEASE_DIR".to_owned(), source.display().to_string()));
+    set.extend(interpreter.places.iter().cloned());
 
     env.retain(|(name, _)| {
         !set.iter().any(|(key, _)| key == name)
@@ -366,6 +372,7 @@ pub fn environment(
                 name.as_str(),
                 "MURU_APP" | "MURU_RELEASE" | "MURU_RELEASE_DIR"
             )
+            && !muru_config::places::VARIABLES.contains(&name.as_str())
     });
 
     // What the process starts from, under the release's own and Muru's.
@@ -1560,6 +1567,7 @@ mod tests {
                 pycache: None,
                 bytecode: None,
                 base: Some(&base),
+                places: &[],
             },
             "shop",
             "r2",
@@ -1653,6 +1661,7 @@ mod tests {
                 pycache: None,
                 bytecode: Some(Bytecode::Off),
                 base: None,
+                places: &[],
             },
             "shop",
             "r2",
@@ -1702,6 +1711,7 @@ mod tests {
                     pycache: None,
                     bytecode,
                     base: None,
+                    places: &[],
                 },
                 "shop",
                 "r2",
