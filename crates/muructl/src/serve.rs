@@ -215,6 +215,12 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DIR")]
     uploads_dir: Option<String>,
 
+    /// The directory of built static files, MURU_STATIC_DIR, which a
+    /// static entry names as static:, a relative one taken from the
+    /// project (default: staticfiles).
+    #[arg(long, value_name = "DIR")]
+    static_dir: Option<String>,
+
     /// The most request bodies spooled to disk at once (default 1GB, or the memory headroom when the run directory is in memory under a memory limit).
     #[arg(long, value_name = "SIZE")]
     spool_quota: Option<String>,
@@ -291,6 +297,7 @@ const KEYS: &[(&str, Kind)] = &[
     ("data_dir", Kind::Text),
     ("media_dir", Kind::Text),
     ("uploads_dir", Kind::Text),
+    ("static_dir", Kind::Text),
     ("spool_quota", Kind::Text),
     ("trusted_proxy", Kind::List),
     ("shutdown_delay", Kind::Text),
@@ -391,6 +398,7 @@ fn from_flags(args: &ServeArgs) -> BTreeMap<&'static str, Value> {
     text("data_dir", &args.data_dir);
     text("media_dir", &args.media_dir);
     text("uploads_dir", &args.uploads_dir);
+    text("static_dir", &args.static_dir);
     text("spool_quota", &args.spool_quota);
     text("shutdown_delay", &args.shutdown_delay);
     text("shutdown_budget", &args.shutdown_budget);
@@ -531,7 +539,7 @@ pub struct Mode {
     /// The container's cgroup limits as read at start, which the run
     /// reads again at every memory check (sections 7.7 and 13.9).
     pub limits: Option<Limits>,
-    /// The data directory and its parts named (issue 849).
+    /// The data and static directories named (issues 849 and 850).
     pub places: crate::places::ServeDirs,
     /// What was read from the container's limits, a line each, for the
     /// start and `--print-config`.
@@ -908,6 +916,7 @@ fn prepare(
             data: layered.text("data_dir").map(str::to_owned),
             media: layered.text("media_dir").map(str::to_owned),
             uploads: layered.text("uploads_dir").map(str::to_owned),
+            static_dir: layered.text("static_dir").map(str::to_owned),
         },
         start_lines,
     };
@@ -1071,6 +1080,7 @@ fn report(layered: &Layered, mode: &Mode) -> crate::print_config::Serve {
         ("timestamps", false.into()),
         ("run_dir", DEFAULT_RUN_DIR.into()),
         ("runtime_dir", DEFAULT_RUNTIME_DIR.into()),
+        ("static_dir", muru_config::places::SERVE_STATIC_DIR.into()),
         (
             "spool_quota",
             muru_config::format_size(DEFAULT_SPOOL_QUOTA).into(),

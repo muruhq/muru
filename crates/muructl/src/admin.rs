@@ -5970,7 +5970,7 @@ pub enum AppCommand {
     },
 
     /// Remove an application: drain whatever runs and remove every
-    /// release with its environment, bytecode and logs.
+    /// release with its environment, bytecode, static directory and logs.
     /// Its data directory is kept unless --data. Refused while a route
     /// sends it traffic. Asks first; without a terminal it needs --yes.
     Remove(Box<AppRemoveArgs>),

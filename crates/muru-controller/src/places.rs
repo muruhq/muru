@@ -1,11 +1,13 @@
 //! The places Muru provides an application (design specification
-//! sections 4.9, 8.7 and 13.8, issue 849, ADR 0072): its data directory
-//! with the media and uploads parts, shared by every release and kept
-//! when releases go.
+//! sections 4.9, 8.7 and 13.8, issues 849 and 850, ADRs 0072 and 0073):
+//! its data directory with the media and uploads parts, shared by every
+//! release and kept when releases go, and each release's own directory
+//! of built static files.
 //!
 //! Under the daemon the data directory is `STATE/data/APP` unless the
-//! application's `[app.NAME]` table moves it. `muructl run` and
-//! `muructl serve` work out their own
+//! application's `[app.NAME]` table moves it, and the static directory
+//! `STATE/static/APP/RELEASE`, made empty when the release is created and
+//! removed with it. `muructl run` and `muructl serve` work out their own
 //! locations and use the rest of this module as the daemon does: making
 //! what is missing, checking what a release serves, and describing the
 //! data directory for `muructl data show` and `muructl data check`.
@@ -20,6 +22,10 @@ use crate::model::ReleaseSpec;
 
 /// The mode a data directory and its parts are made with.
 pub const DATA_MODE: u32 = 0o700;
+/// The mode of a release's static directory under a root daemon: its
+/// user's, read by the edge's group, setgid so what is made in it keeps
+/// that group.
+pub const SHARED_STATIC_MODE: u32 = 0o2750;
 
 /// The places a release is given, worked out for a start or for the
 /// edge's snapshot.
@@ -27,6 +33,8 @@ pub const DATA_MODE: u32 = 0o700;
 pub struct Places {
     /// The application's data directory, when it has one.
     pub data: Option<DataDirs>,
+    /// The release's directory of built static files, when it has one.
+    pub static_dir: Option<PathBuf>,
     /// The user the media part must belong to, under a daemon whose
     /// applications run as users of their own, so a link in its place
     /// cannot lead the edge or a worker into another user's directory.
@@ -34,11 +42,12 @@ pub struct Places {
 }
 
 impl Places {
-    /// The places as `muru_config` resolves a `media:` directory against
-    /// them.
+    /// The places as `muru_config` resolves a `media:` or `static:`
+    /// directory against them.
     pub fn provided(&self) -> Provided<'_> {
         Provided {
             data: self.data.as_ref(),
+            static_dir: self.static_dir.as_deref(),
         }
     }
 
@@ -50,10 +59,20 @@ impl Places {
     /// The variables naming them, which the release's processes are
     /// given.
     pub fn variables(&self) -> Vec<(String, String)> {
-        self.data
+        let mut variables = self
+            .data
             .as_ref()
             .map(DataDirs::variables)
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        if let Some(dir) = &self.static_dir {
+            variables.push((
+                muru_config::places::STATIC_VARIABLE.to_owned(),
+                dir.display().to_string(),
+            ));
+        }
+
+        variables
     }
 }
 
@@ -73,6 +92,11 @@ pub fn app_data(state: &Path, app: &crate::model::App) -> DataDirs {
         app.media_dir.as_deref(),
         app.uploads_dir.as_deref(),
     )
+}
+
+/// A release's directory of built static files under the daemon.
+pub fn static_dir(state: &Path, app: &str, id: &str) -> PathBuf {
+    state.join("static").join(app).join(id)
 }
 
 /// Make each part of the data directory that is missing, data first,
@@ -110,6 +134,28 @@ pub fn make_data(dirs: &DataDirs, owner: Option<(u32, u32)>, mode: u32) -> Resul
     }
 
     Ok(())
+}
+
+/// Make a release's static directory, empty: whatever an earlier release
+/// of the same name left there goes.
+pub fn empty_static(dir: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("emptying {} failed: {error}", dir.display())),
+    }
+
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("making {} failed: {error}", dir.display()))
+}
+
+/// Give a release's static directory to the release's user, with the
+/// edge's group alone able to read it and setgid, so the files the
+/// release's `collectstatic` writes keep the group, as the release's
+/// socket directory is shared.
+pub fn share_static(dir: &Path, owner: u32, edge_group: u32) -> std::io::Result<()> {
+    std::os::unix::fs::chown(dir, Some(owner), Some(edge_group))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(SHARED_STATIC_MODE))
 }
 
 /// Check what a release would serve against its application's data
@@ -153,20 +199,23 @@ pub fn check_release(spec: &ReleaseSpec, places: &Places) -> Result<(), String> 
 
 /// What a release's creation does with its places under the daemon:
 /// what it serves is checked against its application's data directory,
-/// as the application's table has it now.
+/// as the application's table has it now, and its static directory is
+/// made empty, since a release of the same name may have left files.
 pub fn prepare_release(
     state: &Path,
     store: &crate::store::Store,
     app: &str,
-    _id: &str,
+    id: &str,
     spec: &ReleaseSpec,
 ) -> Result<(), String> {
     let places = Places {
         data: store.app(app).ok().map(|record| app_data(state, &record)),
+        static_dir: Some(static_dir(state, app, id)),
         owner: None,
     };
 
-    check_release(spec, &places)
+    check_release(spec, &places)?;
+    empty_static(&static_dir(state, app, id))
 }
 
 /// Where a part that is itself a symbolic link leads, resolved; none for
@@ -428,9 +477,25 @@ mod tests {
     }
 
     #[test]
+    fn a_releases_static_directory_is_made_empty() {
+        let base = scratch("static");
+        let dir = static_dir(&base, "shop", "r1");
+        assert_eq!(dir, base.join("static/shop/r1"));
+        std::fs::create_dir_all(dir.join("old")).unwrap();
+        std::fs::write(dir.join("old/site.css"), "x").unwrap();
+
+        empty_static(&dir).unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn the_variables_name_each_place_the_release_has() {
         let places = Places {
             data: Some(DataDirs::new(PathBuf::from("/srv/data/shop"), None, None)),
+            static_dir: Some(PathBuf::from("/srv/static/shop/r1")),
             owner: None,
         };
         let names: Vec<String> = places
@@ -440,7 +505,12 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["MURU_DATA_DIR", "MURU_MEDIA_DIR", "MURU_UPLOADS_DIR"]
+            [
+                "MURU_DATA_DIR",
+                "MURU_MEDIA_DIR",
+                "MURU_UPLOADS_DIR",
+                "MURU_STATIC_DIR"
+            ]
         );
         assert!(Places::default().variables().is_empty());
     }

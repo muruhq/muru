@@ -1436,7 +1436,7 @@ impl HostProcess {
             command.env_remove(name);
         }
 
-        // Issue 849: the places are Muru's to name, so a value
+        // Issues 849 and 850: the places are Muru's to name, so a value
         // inherited from the shell that started muructl never reaches the
         // application; those it has are in its environment.
 

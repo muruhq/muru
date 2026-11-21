@@ -812,6 +812,20 @@ RUN install -d -o 10001 -g 0 -m 0770 /data
 A SQLite database on the volume needs a local file system, not NFS, and
 WAL mode, as [SQLite on it](data-directory.md#sqlite-on-it) describes.
 
+Static files built for the release go in the image instead. Run
+`collectstatic` while the image is built; it writes into `staticfiles`
+in the project, the directory `muructl serve` gives as
+`MURU_STATIC_DIR` and serves for a `static:` entry:
+
+```dockerfile
+COPY . .
+RUN muructl build --deployment --target /app/.venv --runtime-dir /opt/muru
+RUN DJANGO_SECRET_KEY=build /app/.venv/bin/python manage.py collectstatic --noinput
+```
+
+`--static-dir`, `MURU_SERVE_STATIC_DIR` or `static_dir` in the serve
+table names another directory, a relative one taken from the project.
+
 ## Inside the container
 
 `muructl` inside the container talks to `muructl serve` over the admin

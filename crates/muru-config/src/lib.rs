@@ -4179,9 +4179,10 @@ pub struct StaticDir {
     /// boundaries, and `/` is not allowed, since every path would then
     /// be looked up as a file first.
     pub path: String,
-    /// The directory: relative to the source directory, absolute, or
-    /// `media:` for the application's media part, with an optional
-    /// directory inside it after the colon.
+    /// The directory: relative to the source directory, absolute,
+    /// `static:` for the release's built static files or `media:` for
+    /// the application's media part, each with an optional directory
+    /// inside it after the colon.
     pub dir: String,
     /// The files tried, in order, when a directory is requested.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -5152,10 +5153,18 @@ pub fn check_sendfile(roots: &[String], header: Option<&str>) -> Result<(), Stri
             return Err(format!("sendfile_roots: {root:?} names no directory"));
         }
 
-        // Issue 849: media: names the media part; data: and uploads: are
-        // refused.
+        // Issues 849 and 850: media: names the media part; static: is a
+        // release's built files, which a static entry serves.
 
-        places::Place::parse(root).map_err(|error| format!("sendfile_roots: {error}"))?;
+        match places::Place::parse(root).map_err(|error| format!("sendfile_roots: {error}"))? {
+            places::Place::Static(_) => {
+                return Err(format!(
+                    "sendfile_roots: {root:?}: static: names the release's built static files, \
+                     which a [[tool.muru.static]] entry serves"
+                ));
+            }
+            places::Place::Media(_) | places::Place::Path(_) => {}
+        }
     }
 
     if let Some(header) = header {
@@ -5196,7 +5205,7 @@ pub fn sendfile_root(
                 media.join(rest)
             }
         }),
-        Err(_) => None,
+        Ok(places::Place::Static(_)) | Err(_) => None,
         Ok(places::Place::Path(_)) => {
             let path = std::path::Path::new(root);
 
@@ -6214,6 +6223,12 @@ pub struct ServeSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "uploads"))]
     pub uploads_dir: Option<String>,
+    /// The directory of built static files, given as `MURU_STATIC_DIR` and
+    /// named `static:` in static entries, a relative one taken from the
+    /// project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "staticfiles"))]
+    pub static_dir: Option<String>,
     /// How long the listener keeps accepting after SIGTERM, readiness
     /// failing, with every connection closing after its response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6882,7 +6897,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn media_is_a_root_of_every_mount_and_data_and_uploads_are_refused() {
+    fn media_is_a_root_of_every_mount_and_static_data_and_uploads_are_refused() {
         let source = Path::new("/src/shop");
         let media = Path::new("/srv/data/shop/media");
         let roots = vec!["media:reports".to_owned(), "files".to_owned()];
@@ -6902,7 +6917,11 @@ mod tests {
         assert_eq!(worker_root_paths(&roots, source, None), ["/src/shop/files"]);
         assert!(check_sendfile(&roots, None).is_ok());
 
-        for (root, why) in [("data:", "never served"), ("uploads:x", "never served")] {
+        for (root, why) in [
+            ("static:", "a [[tool.muru.static]] entry serves"),
+            ("data:", "never served"),
+            ("uploads:x", "never served"),
+        ] {
             let refused = check_sendfile(&[root.to_owned()], None).unwrap_err();
             assert!(refused.contains(why), "{root}: {refused}");
         }

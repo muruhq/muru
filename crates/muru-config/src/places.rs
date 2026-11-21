@@ -1,7 +1,8 @@
 //! The places Muru provides an application (design specification
-//! sections 4.9 and 13.8, issue 849, ADR 0072): its data directory,
-//! shared by every release, with the media and uploads parts Muru makes
-//! in it; and the `media:` form that names the media part in
+//! sections 4.9 and 13.8, issues 849 and 850, ADRs 0072 and 0073): its
+//! data directory, shared by every release, with the media and uploads
+//! parts Muru makes in it, and each release's own directory of built
+//! static files; and the `media:` and `static:` forms that name them in
 //! `sendfile_roots`, a static entry's `dir` and `--static`.
 //!
 //! What may be served is checked here too: only media is ever served,
@@ -16,16 +17,26 @@ pub const DATA_VARIABLE: &str = "MURU_DATA_DIR";
 pub const MEDIA_VARIABLE: &str = "MURU_MEDIA_DIR";
 /// The variable naming the uploads part, kept but never served.
 pub const UPLOADS_VARIABLE: &str = "MURU_UPLOADS_DIR";
+/// The variable naming the release's directory of built static files.
+pub const STATIC_VARIABLE: &str = "MURU_STATIC_DIR";
 
 /// Every variable of this module, which Muru alone sets: a value from
 /// the release's own environment or an inherited one is replaced, or
 /// removed where Muru has none to give.
-pub const VARIABLES: [&str; 3] = [DATA_VARIABLE, MEDIA_VARIABLE, UPLOADS_VARIABLE];
+pub const VARIABLES: [&str; 4] = [
+    DATA_VARIABLE,
+    MEDIA_VARIABLE,
+    UPLOADS_VARIABLE,
+    STATIC_VARIABLE,
+];
 
 /// The media part's name in the data directory by default.
 pub const MEDIA_PART: &str = "media";
 /// The uploads part's name in the data directory by default.
 pub const UPLOADS_PART: &str = "uploads";
+/// The directory under the source `muructl serve` gives as the static
+/// directory by default.
+pub const SERVE_STATIC_DIR: &str = "staticfiles";
 
 /// Where a refusal of a directory sends the reader.
 pub const FILE_HINTS_GUIDE: &str =
@@ -141,6 +152,9 @@ pub enum Place<'a> {
     Path(&'a str),
     /// `media:` or `media:SUBDIR`: the media part, or a directory in it.
     Media(&'a str),
+    /// `static:` or `static:SUBDIR`: the release's directory of built
+    /// static files, or a directory in it.
+    Static(&'a str),
 }
 
 /// The places a release is given, for resolving a [`Place`].
@@ -148,6 +162,8 @@ pub enum Place<'a> {
 pub struct Provided<'a> {
     /// The application's data directory, when it has one.
     pub data: Option<&'a DataDirs>,
+    /// The release's directory of built static files, when it has one.
+    pub static_dir: Option<&'a Path>,
 }
 
 impl<'a> Place<'a> {
@@ -172,10 +188,13 @@ impl<'a> Place<'a> {
             ));
         }
 
-        let Some(rest) = prefixed("media:") else {
+        let (place, rest) = if let Some(rest) = prefixed("media:") {
+            (Self::Media(rest), rest)
+        } else if let Some(rest) = prefixed("static:") {
+            (Self::Static(rest), rest)
+        } else {
             return Ok(Self::Path(text));
         };
-        let place = Self::Media(rest);
 
         let climbs = Path::new(rest)
             .components()
@@ -218,6 +237,16 @@ impl<'a> Place<'a> {
                      here; under muructl serve, name one with --data-dir"
                         .to_owned()
                 }),
+            Self::Static(rest) => {
+                provided
+                    .static_dir
+                    .map(|dir| under(dir, rest))
+                    .ok_or_else(|| {
+                        "static: names the release's directory of built static files, which it \
+                     does not have here"
+                            .to_owned()
+                    })
+            }
         }
     }
 }
@@ -382,6 +411,8 @@ mod tests {
     fn places_are_read_from_their_prefixes_and_data_and_uploads_are_refused() {
         assert_eq!(Place::parse("media:"), Ok(Place::Media("")));
         assert_eq!(Place::parse("media:public"), Ok(Place::Media("public")));
+        assert_eq!(Place::parse("static:"), Ok(Place::Static("")));
+        assert_eq!(Place::parse("static:admin"), Ok(Place::Static("admin")));
         assert_eq!(Place::parse("./media:x"), Ok(Place::Path("./media:x")));
         assert_eq!(Place::parse("shop/static"), Ok(Place::Path("shop/static")));
         assert!(Place::parse("data:").unwrap_err().contains("never served"));
@@ -397,7 +428,11 @@ mod tests {
     #[test]
     fn a_place_resolves_to_its_directory_or_says_why_it_has_none() {
         let dirs = dirs();
-        let provided = Provided { data: Some(&dirs) };
+        let static_dir = PathBuf::from("/srv/state/static/shop/r1");
+        let provided = Provided {
+            data: Some(&dirs),
+            static_dir: Some(&static_dir),
+        };
         let source = Path::new("/src/shop");
         let resolve = |text: &str, provided: &Provided<'_>| {
             Place::parse(text).unwrap().resolve(source, provided)
@@ -407,6 +442,7 @@ mod tests {
             resolve("media:public", &provided).unwrap(),
             Path::new("/srv/state/data/shop/media/public")
         );
+        assert_eq!(resolve("static:", &provided).unwrap(), static_dir);
         assert_eq!(
             resolve("assets", &provided).unwrap(),
             Path::new("/src/shop/assets")
@@ -418,6 +454,7 @@ mod tests {
 
         let none = Provided::default();
         assert!(resolve("media:", &none).unwrap_err().contains("--data-dir"));
+        assert!(resolve("static:", &none).is_err());
     }
 
     #[test]

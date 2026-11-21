@@ -5553,9 +5553,9 @@ fn prefix_key(path: &str) -> String {
 }
 
 /// One of the release's own directories, resolved and checked. One in a
-/// place Muru provides (issue 849), `media:`, is kept by its place, since
-/// that is resolved when the release runs, and is not checked: the
-/// application fills it.
+/// place Muru provides (issues 849 and 850), `media:` or `static:`, is
+/// kept by its place, since that is resolved when the release runs, and
+/// is not checked: the application fills it.
 fn static_spec(entry: &muru_config::StaticDir, source: &Path) -> Result<StaticSpec, String> {
     let place = muru_config::places::Place::parse(&entry.dir)
         .map_err(|error| format!("static {}: {error}", entry.path))?;
@@ -5563,6 +5563,9 @@ fn static_spec(entry: &muru_config::StaticDir, source: &Path) -> Result<StaticSp
     let (dir, within) = match place {
         muru_config::places::Place::Media(rest) => {
             (PathBuf::from(rest), Some(crate::model::Within::Media))
+        }
+        muru_config::places::Place::Static(rest) => {
+            (PathBuf::from(rest), Some(crate::model::Within::Static))
         }
         muru_config::places::Place::Path(text) => {
             let dir = if Path::new(text).is_absolute() {

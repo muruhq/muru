@@ -64,7 +64,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | match.client_class | group, route | none (every class) | 4.14 |
 | match.host, match.method | group | none (every host, every method) | 7.1 |
 | path, internal, cgi_local_redirect, accel_redirect, concurrency, max_connections | mount (cgi_local_redirect and accel_redirect also on the release, for the default mount and as the mounts' default) | none (required except for a gRPC mount, which takes none), false, false, false, 1000, 1000 | 6.7, 4.10, 6.13 |
-| path, dir (a path, or `media:` with an optional directory after the colon), index, fallback, cache, redirect_slash, case | static entry (`[[tool.muru.static]]` or `[[app.NAME.release.ID.static]]`) | none (path and dir required), index.html, none, none, true, strict | 4.9, 13.8 |
+| path, dir (a path, `static:` or `media:`, each with an optional directory after the colon), index, fallback, cache, redirect_slash, case | static entry (`[[tool.muru.static]]` or `[[app.NAME.release.ID.static]]`) | none (path and dir required), index.html, none, none, true, strict | 4.9, 13.8 |
 | scaling.mode, min_workers, max_workers, min_spare, max_spare, advisory | group | static, 1, required by spare and target, 1, max(3, 25% of max_workers), false | 7.2, 7.4 |
 | scaling targets (slot_utilization, queue_wait_p95) | group, target mode | 0.7, off | 7.2, 7.3 |
 | scaling windows and budgets (scale_out_window, scale_in_window, hold_after_growth, reap_interval, idle_reap_after, min_lifetime, max_step_up, churn_budget) | group | 5s, 10m, 5m, 60s, 10m, max(15m, 30 x ready time), 4, 6 per hour | 7.4 |
@@ -116,7 +116,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | user, group, umask, limits | application | daemon's user, none | 10.9 |
 | data_dir, media_dir, uploads_dir | application | STATE/data/APP, media, uploads (relative ones in data_dir) | 13.8 |
 | data_dir | `[tool.muru.run]`, muru.local.toml `[run]` | runs/NAME-HASH/data in the user state location | 13.8 |
-| data_dir, media_dir, uploads_dir | `[tool.muru.serve]` (and `--data-dir` and the rest, `MURU_SERVE_DATA_DIR` and the rest) | none, media, uploads | 13.9 |
+| data_dir, media_dir, uploads_dir, static_dir | `[tool.muru.serve]` (and `--data-dir` and the rest, `MURU_SERVE_DATA_DIR` and the rest) | none, media, uploads, staticfiles | 13.9 |
 | `[secrets.store.NAME]` (kind, command, timeout), env values with secret = { store, key } and optional as = 'file' | daemon, release | file store in the secrets directory | 10.8 |
 | bytecode | release, variant | redirect | 8.2 |
 | commands.NAME: description, run (argv with `{input}` placeholders) or call (module:function), env, timeout, exclusive; inputs.NAME: description, required, default, pattern, secret | release, `[tool.muru.commands]` | none; no timeout, not exclusive; inputs optional and not secret | 9.12 |

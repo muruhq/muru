@@ -75,6 +75,11 @@ each part's owner. Files the application saves there are its own, and
 edge's user needs no access to them. A media part moved behind a
 symbolic link must lead to a directory the application's user owns.
 
+Each release's static directory, where `collectstatic` writes, belongs to
+the application's user with the service user's group, mode `2750`, so
+the edge can read the files written there and nothing else can, and
+what the release's user makes in it keeps that group.
+
 `user = 'root'` is allowed, since it is explicit, and is not recommended:
 a compromised application would have the node. Each release of such an
 application that starts records an `app.user_is_root` warning event.

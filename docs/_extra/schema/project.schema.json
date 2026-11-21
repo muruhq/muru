@@ -1281,6 +1281,11 @@
           },
           "type": "array"
         },
+        "static_dir": {
+          "default": "staticfiles",
+          "description": "The directory of built static files, given as `MURU_STATIC_DIR` and named `static:` in static entries, a relative one taken from the project.",
+          "type": "string"
+        },
         "sync_threads": {
           "default": 8,
           "description": "Threads for synchronous code called from an ASGI application.",
@@ -1337,7 +1342,7 @@
           "type": "string"
         },
         "dir": {
-          "description": "The directory: relative to the source directory, absolute, or `media:` for the application's media part, with an optional directory inside it after the colon.",
+          "description": "The directory: relative to the source directory, absolute, `static:` for the release's built static files or `media:` for the application's media part, each with an optional directory inside it after the colon.",
           "type": "string"
         },
         "fallback": {

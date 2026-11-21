@@ -1,13 +1,15 @@
 //! Where `muructl run`, `muructl serve` and a project's own commands put
-//! an application's places (design specification section 13.8, issue
-//! 849): its data directory, with the media and uploads parts.
+//! an application's places (design specification section 13.8, issues
+//! 849 and 850): its data directory, with the media and uploads parts,
+//! and its directory of built static files.
 //!
-//! A development run keeps it in the user state location, under
+//! A development run keeps both in the user state location, under
 //! `runs/NAME-HASH`, never in the project, which is usually a git
 //! checkout. `muructl serve` has a data directory only when one is named,
-//! normally a mounted volume. A command run on its own uses the run's,
-//! unless serve's variables name another, so a migration run beside
-//! `muructl run` migrates the database it serves.
+//! normally a mounted volume, and its static directory is `staticfiles`
+//! in the project, filled when the image is built. A command run on its
+//! own uses the run's, unless serve's variables name others, so a
+//! migration run beside `muructl run` migrates the database it serves.
 
 use std::path::{Path, PathBuf};
 
@@ -42,7 +44,7 @@ pub fn run_location(project: &Path, name: &str) -> PathBuf {
 
 /// A development run's places: the data directory `data_dir` names, a
 /// relative one taken from the project, else `data` in the run's
-/// location.
+/// location, and `static` there.
 pub fn for_run(project: &Path, name: &str, data_dir: Option<&Path>) -> Places {
     let location = run_location(project, name);
 
@@ -54,6 +56,7 @@ pub fn for_run(project: &Path, name: &str, data_dir: Option<&Path>) -> Places {
 
     Places {
         data: Some(DataDirs::new(data, None, None)),
+        static_dir: Some(location.join("static")),
         owner: None,
     }
 }
@@ -67,10 +70,13 @@ pub struct ServeDirs {
     pub media: Option<String>,
     /// `--uploads-dir`, a relative one taken from the data directory.
     pub uploads: Option<String>,
+    /// `--static-dir`, a relative one taken from the project.
+    pub static_dir: Option<String>,
 }
 
 /// `muructl serve`'s places: a data directory only when one is named,
-/// its parts within it unless named.
+/// its parts within it unless named, and the static directory named or
+/// `staticfiles` in the project.
 pub fn for_serve(project: &Path, dirs: &ServeDirs) -> anyhow::Result<Places> {
     let data = match &dirs.data {
         Some(data) => {
@@ -104,7 +110,21 @@ pub fn for_serve(project: &Path, dirs: &ServeDirs) -> anyhow::Result<Places> {
         }
     };
 
-    Ok(Places { data, owner: None })
+    let static_dir = Path::new(
+        dirs.static_dir
+            .as_deref()
+            .unwrap_or(muru_config::places::SERVE_STATIC_DIR),
+    );
+
+    Ok(Places {
+        data,
+        static_dir: Some(if static_dir.is_absolute() {
+            static_dir.to_path_buf()
+        } else {
+            project.join(static_dir)
+        }),
+        owner: None,
+    })
 }
 
 /// `muructl serve`'s data directory must be there and writable, since it
@@ -139,10 +159,19 @@ pub fn check_volume(places: &Places) -> anyhow::Result<()> {
 }
 
 /// Make what is missing of the places: the data directory and its parts
-/// with `mode`.
+/// with `mode`, and the static directory.
 pub fn make(places: &Places, mode: u32) -> anyhow::Result<()> {
     if let Some(dirs) = &places.data {
         muru_controller::places::make_data(dirs, None, mode).map_err(anyhow::Error::msg)?;
+    }
+
+    if let Some(dir) = &places.static_dir {
+        std::fs::create_dir_all(dir).map_err(|error| {
+            anyhow::anyhow!(
+                "making the static directory {} failed: {error}",
+                dir.display()
+            )
+        })?;
     }
 
     Ok(())
@@ -169,12 +198,16 @@ pub fn lines(places: &Places) -> Vec<String> {
         ),
     }
 
+    if let Some(dir) = &places.static_dir {
+        lines.push(format!("static   {}", shown(dir)));
+    }
+
     lines
 }
 
 /// A static entry's directory, resolved against the places: a relative
-/// path from the project, `media:` from the media part, with whether it
-/// was in a place Muru provides.
+/// path from the project, `media:` and `static:` from what they name,
+/// with which of the two it was.
 pub fn static_directory(
     dir: &str,
     project: &Path,
@@ -188,6 +221,7 @@ pub fn static_directory(
     let within = match place {
         Place::Path(_) => None,
         Place::Media(_) => Some(Within::Media),
+        Place::Static(_) => Some(Within::Static),
     };
 
     Ok((resolved, within))
@@ -200,8 +234,8 @@ pub fn is_empty(dir: &Path) -> bool {
 
 /// A command's places when it runs on its own, through no run or serve
 /// (section 9.12): serve's variables, `MURU_SERVE_DATA_DIR` and the
-/// rest, when they name a data directory, else where a development run
-/// of the project keeps it.
+/// rest, when they name a data directory or a static directory, else
+/// where a development run of the project keeps them.
 pub fn for_command(
     project: &Path,
     name: &str,
@@ -211,6 +245,7 @@ pub fn for_command(
         data: read("MURU_SERVE_DATA_DIR"),
         media: read("MURU_SERVE_MEDIA_DIR"),
         uploads: read("MURU_SERVE_UPLOADS_DIR"),
+        static_dir: read("MURU_SERVE_STATIC_DIR"),
     };
     let run = for_run(project, name, None);
     let named = for_serve(project, &serve)?;
@@ -220,6 +255,11 @@ pub fn for_command(
             named.data
         } else {
             run.data
+        },
+        static_dir: if serve.static_dir.is_some() {
+            named.static_dir
+        } else {
+            run.static_dir
         },
         owner: None,
     })
@@ -251,6 +291,10 @@ mod tests {
 
         assert_eq!(dirs.data, location.join("data"));
         assert_eq!(dirs.media, location.join("data/media"));
+        assert_eq!(
+            places.static_dir.as_deref(),
+            Some(&*location.join("static"))
+        );
         assert!(
             !dirs.data.starts_with(project.path()),
             "never inside the project"
@@ -279,6 +323,10 @@ mod tests {
         let none = for_serve(project, &ServeDirs::default()).unwrap();
         assert!(none.data.is_none());
         assert_eq!(
+            none.static_dir.as_deref(),
+            Some(Path::new("/app/staticfiles"))
+        );
+        assert_eq!(
             variables(&none).1,
             ["MURU_DATA_DIR", "MURU_MEDIA_DIR", "MURU_UPLOADS_DIR"]
         );
@@ -289,12 +337,17 @@ mod tests {
                 data: Some("/data".to_owned()),
                 media: Some("/shared/media".to_owned()),
                 uploads: None,
+                static_dir: Some("collected".to_owned()),
             },
         )
         .unwrap();
         let dirs = named.data.unwrap();
         assert_eq!(dirs.media, Path::new("/shared/media"));
         assert_eq!(dirs.uploads, Path::new("/data/uploads"));
+        assert_eq!(
+            named.static_dir.as_deref(),
+            Some(Path::new("/app/collected"))
+        );
 
         let refused = for_serve(
             project,
@@ -343,5 +396,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(named.data.unwrap().data, Path::new("/data"));
+        assert_eq!(named.static_dir, run.static_dir);
     }
 }

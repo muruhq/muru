@@ -52,6 +52,7 @@ DATA_DIR = Path(os.environ.get("MURU_DATA_DIR", "var"))
 muru: data     /home/me/.local/state/muru/runs/shop-3f9a1c2e7b40/data
 muru: media    /home/me/.local/state/muru/runs/shop-3f9a1c2e7b40/data/media, a file hint root
 muru: uploads  /home/me/.local/state/muru/runs/shop-3f9a1c2e7b40/data/uploads
+muru: static   /home/me/.local/state/muru/runs/shop-3f9a1c2e7b40/static
 ```
 
 A part that is a symbolic link is shown with where it leads, as
@@ -258,7 +259,9 @@ def report(request, name):
 ```
 
 or, for files anyone may see, by a static entry with `dir =
-'media:public'`.
+'media:public'`. Static files from `collectstatic` go in a directory of
+each release's own, as [static files](static-files.md#built-files)
+describes.
 
 ## Flask
 

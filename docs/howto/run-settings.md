@@ -222,18 +222,20 @@ import needs. `muructl deploy` and `muructl serve` do not read one.
 A run gives the application a [data directory](data-directory.md) for
 the files it keeps from one run to the next, such as a SQLite database,
 as `MURU_DATA_DIR`, with `MURU_MEDIA_DIR` and `MURU_UPLOADS_DIR` beneath
-it. It is in your user state directory, `runs/NAME-HASH` under
+it, and a directory for built static files as `MURU_STATIC_DIR`. Both
+are in your user state directory, `runs/NAME-HASH` under
 `~/.local/state/muru` on Linux and `~/Library/Application Support/muru`
 on macOS (or under `MURU_STATE_DIR` when it is set), where `NAME` is the
 application's name and `HASH` comes from the project's path, so two
 checkouts of one project keep apart. Nothing is put in the project,
 which a database could otherwise be committed from by mistake. The run
-prints where it is when it starts, and `muructl status` shows it while
-it runs.
+prints where they are when it starts, and `muructl status` shows them
+while it runs.
 
 `--data-dir DIR`, or `data_dir` in the run table or `muru.local.toml`,
-puts the data directory somewhere else, a relative one in the project.
-The run reads it at start, so a change takes a restart.
+puts the data directory somewhere else, a relative one in the project;
+the static directory stays in the run's own. The run reads it at start,
+so a change takes a restart.
 
 ## What wins
 

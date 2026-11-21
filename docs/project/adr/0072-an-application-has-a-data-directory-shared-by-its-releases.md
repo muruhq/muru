@@ -102,7 +102,7 @@ uploads part by default. `muructl data show`, `muructl data check` and
 ## More information
 
 Issue 849, split from 847 (opening beneath a root) and beside 848 (ADR
-0071, a hint opened by the worker) and 850 (the per-release static
-directory). Sections 4.9, 4.11, 8.7, 9.1, 9.12, 10.9 and 13.8,
+0071, a hint opened by the worker) and 850 (ADR 0073, the per-release
+static directory). Sections 4.9, 4.11, 8.7, 9.1, 9.12, 10.9 and 13.8,
 appendices C and D. Left open: a disk quota on the data directory, and
 a backup the daemon offers.

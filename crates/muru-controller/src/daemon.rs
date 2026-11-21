@@ -6675,8 +6675,9 @@ impl Daemon {
             return Err(format!("release {app}@{id} already exists"));
         }
 
-        // Issue 849: what the release serves is checked against the
-        // application's data directory.
+        // Issues 849 and 850: what the release serves is checked against
+        // the application's data directory, and its static directory is
+        // made empty.
 
         crate::places::prepare_release(&self.locations.state.path, &self.store, app, &id, &spec)?;
 
@@ -6701,13 +6702,14 @@ impl Daemon {
         self.context().runtime_library(python).await
     }
 
-    /// Issue 849: the places a release of the application is given: its
-    /// data directory as the application's `[app.NAME]` table says now
-    /// and, under a root daemon, the user its media part must belong to.
+    /// Issues 849 and 850: the places a release of the application is
+    /// given: its data directory as the application's `[app.NAME]` table
+    /// says now, the release's own static directory and, under a root
+    /// daemon, the user its media part must belong to.
     fn places(
         &self,
         app: &str,
-        _id: &str,
+        id: &str,
         identity: Option<crate::host::Identity>,
     ) -> crate::places::Places {
         let state = &self.locations.state.path;
@@ -6718,13 +6720,15 @@ impl Daemon {
                 .app(app)
                 .ok()
                 .map(|record| crate::places::app_data(state, &record)),
+            static_dir: Some(crate::places::static_dir(state, app, id)),
             owner: self.service.and(identity).map(|identity| identity.uid),
         }
     }
 
     /// Make what is missing of a release's places, given to the user it
-    /// runs as, and check what the release serves against its data
-    /// directory, which may have moved since the release was created.
+    /// runs as, share its static directory with the edge, and check what
+    /// the release serves against its data directory, which may have
+    /// moved since the release was created.
     fn make_places(
         &self,
         spec: &ReleaseSpec,
@@ -6737,6 +6741,20 @@ impl Daemon {
                 identity.map(|identity| (identity.uid, identity.gid)),
                 crate::places::DATA_MODE,
             )?;
+        }
+
+        if let Some(dir) = &places.static_dir {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| format!("making {} failed: {error}", dir.display()))?;
+
+            if let (Some(identity), Some(service)) = (identity, self.service) {
+                crate::places::share_static(dir, identity.uid, service.gid).map_err(|error| {
+                    format!(
+                        "sharing the static directory {} with the edge failed: {error}",
+                        dir.display()
+                    )
+                })?;
+            }
         }
 
         crate::places::check_release(spec, places)
@@ -7041,8 +7059,9 @@ impl Daemon {
             return Err(message);
         }
 
-        // Issue 849: the data directory is there, the release's user's,
-        // and what it serves is still only media.
+        // Issues 849 and 850: the data directory and the static directory
+        // are there, the release's user's, and what it serves is still
+        // only media.
 
         let places = self.places(app, id, identity);
 

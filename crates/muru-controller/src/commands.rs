@@ -211,10 +211,10 @@ pub struct Interpreter<'a> {
     /// `passed_from_daemon`; none for `muructl run` and `muructl serve`,
     /// which pass on the environment they were started with.
     pub base: Option<&'a [(String, String)]>,
-    /// The variables naming the places Muru provides the release (issue
-    /// 849): its data directory and its media and uploads parts, when it
-    /// has them. Muru alone sets them, so the release's own variables of
-    /// those names are dropped.
+    /// The variables naming the places Muru provides the release (issues
+    /// 849 and 850): its data directory, media and uploads parts and its
+    /// directory of built static files, those it has. Muru alone sets
+    /// them, so the release's own variables of those names are dropped.
     pub places: &'a [(String, String)],
 }
 

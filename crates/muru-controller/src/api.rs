@@ -3089,8 +3089,9 @@ impl Service {
     ) -> Result<String, crate::store::StoreError> {
         let store = &self.handle.store;
 
-        // Issue 849: what the release serves is checked against the
-        // application's data directory.
+        // Issues 849 and 850: what the release serves is checked against
+        // the application's data directory, and its static directory is
+        // made empty.
 
         crate::places::prepare_release(
             &self.handle.info.locations.state.path,

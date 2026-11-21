@@ -329,7 +329,7 @@ A directory of an application's own files, an entry of the `[[tool.muru.static]]
 | --- | --- | --- | --- |
 | `cache` | table, {ref}`[route.cache] <config-daemon-route-cache>` |  | The cache headers files are sent with. |
 | `case` | string | `"strict"` | `strict` (the default), which matches names as they are on disk, or `insensitive`. |
-| `dir` | string | required | The directory: relative to the source directory, absolute, or `media:` for the application's media part, with an optional directory inside it after the colon. |
+| `dir` | string | required | The directory: relative to the source directory, absolute, `static:` for the release's built static files or `media:` for the application's media part, each with an optional directory inside it after the colon. |
 | `fallback` | string |  | The file served for paths with no file of their own, for a single-page application under the prefix. |
 | `index` | array of strings | `["index.html"]` | The files tried, in order, when a directory is requested. |
 | `path` | string | required | The path prefix, such as `/static/`; the longest wins, on segment boundaries, and `/` is not allowed, since every path would then be looked up as a file first. |

@@ -307,9 +307,10 @@ def test_a_root_daemon_runs_the_edge_and_applications_as_the_service_user() -> N
         refused = Daemon.request_static(daemon.port, "/sendfile-path?path=/etc/passwd")
         assert refused.status == 500
 
-        # Issue 849: a data directory moved by the application's table is
-        # made for its user, its media part a hint root with nothing
-        # configured.
+        # Issues 849 and 850: a data directory moved by the application's
+        # table is made for its user, its media part a hint root with
+        # nothing configured; the release's static directory is its
+        # user's with the edge's group alone, setgid.
 
         data = daemon.base / "plain-data"
         daemon.apply(
@@ -317,7 +318,8 @@ def test_a_root_daemon_runs_the_edge_and_applications_as_the_service_user() -> N
             f"source = '{FILES}'\n"
             "entrypoint = 'files:wsgi_app'\n"
             f"python = '{sys.executable}'\n"
-            "processes = 1\n"
+            "processes = 1\n\n"
+            "[[app.plain.release.r5.static]]\npath = '/assets/'\ndir = 'static:'\n"
         )
 
         for part in (data, data / "media", data / "uploads"):
@@ -329,6 +331,9 @@ def test_a_root_daemon_runs_the_edge_and_applications_as_the_service_user() -> N
             ).stdout.split()
             assert made == [str(other.pw_uid), "700"], part
 
+        static = (daemon.base / "state" / "static" / "plain" / "r5").stat()
+        assert (static.st_uid, static.st_gid) == (other.pw_uid, service.pw_gid)
+        assert static.st_mode & 0o7777 == 0o2750
         subprocess.run(
             [
                 "sudo",

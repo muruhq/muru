@@ -263,7 +263,7 @@ pub struct RunState {
     pub recorder: Option<Arc<muru_edge::recorder::Recorder>>,
     /// The import reports of the last few loads (section 6.18).
     pub imports: Arc<ImportReports>,
-    /// The application's places (issue 849).
+    /// The application's places (issues 849 and 850).
     pub places: muru_controller::places::Places,
     /// The upload spool, under `muructl serve`.
     pub spool: Option<PathBuf>,

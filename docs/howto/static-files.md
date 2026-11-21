@@ -33,10 +33,10 @@ otherwise a large text file is [compressed](compression.md) on the fly.
 
 ## An application's own files
 
-Files that ship with the application, a Flask package's `static` folder
-or Django's collected `STATIC_ROOT`, are declared in the project rather
-than in a route, so `muructl run` and the daemon serve them the same
-way, and nothing in the application has to serve them in development:
+Files that ship with the application, such as a Flask package's
+`static` folder, are declared in the project rather than in a route,
+so `muructl run` and the daemon serve them the same way, and nothing in
+the application has to serve them in development:
 
 ```toml
 [[tool.muru.static]]
@@ -66,6 +66,59 @@ answers with its own assets, and a rollback brings the old ones back
 with the old code. `muructl run` prints each entry at start-up and
 refuses a directory that does not exist, as a deploy does.
 
+## Built files
+
+Files a release builds rather than ships, such as the output of
+Django's `collectstatic`, go in a directory of the release's own, which
+the release is given as `MURU_STATIC_DIR` and a static entry names as
+`static:`:
+
+```toml
+[[tool.muru.static]]
+path = '/static/'
+dir = 'static:'
+cache = { max_age = '1y', immutable = true }
+```
+
+`static:SUBDIR` names a directory in it. Where it is depends on how the
+application runs:
+
+| How the application runs | `MURU_STATIC_DIR` |
+| --- | --- |
+| The daemon | `STATE/static/APP/RELEASE` in the daemon's state directory, made empty when the release is created and removed with it; `muructl release list` counts it in what each release takes |
+| `muructl run` | `runs/NAME-HASH/static` in the user state directory, beside the run's [data directory](data-directory.md), never in the project |
+| `muructl serve` | `staticfiles` in the project, which the image's build fills; `--static-dir`, `MURU_SERVE_STATIC_DIR` or `static_dir` in the serve table names another, a relative one taken from the project |
+| `muructl command run` and `muructl exec` with no application | the run's, unless `MURU_SERVE_STATIC_DIR` names another |
+
+Under the daemon a declared command run as a `before_fork` gate fills
+the directory once for each release, after its import and before its
+workers fork and before it takes traffic, so a canary and a rollback
+each serve their own assets:
+
+```toml
+[tool.muru.commands.collectstatic]
+run = ['python', 'manage.py', 'collectstatic', '--noinput']
+before_fork = true
+timeout = '5m'
+```
+
+The directory belongs to the release's user. Under a daemon whose
+applications run as [their own users](users.md), its group is the
+edge's alone and it is setgid, so the files the command writes keep
+that group and the edge can read them, as long as they are readable by
+their group, as Django's storage writes them.
+
+A `static:` entry whose directory is empty or missing is served as
+always: its requests find no file and reach the application.
+`muructl run` says so at start-up, and Django's
+`staticfiles_urlpatterns()` serves the files while `DEBUG` is on.
+`muructl command run collectstatic` fills the run's directory, and the
+edge serves the files from then on.
+
+A Flask package's own `static` folder ships with the code, and is a
+directory relative to the project as before; `static:` is for files a
+release builds.
+
 ## Files from the media part
 
 `media:SUBDIR` serves a directory in the application's media part, the
@@ -77,15 +130,12 @@ path = '/media/'
 dir = 'media:public'
 ```
 
-`media:` names the whole part. Every file under such an entry is
-public. Under a daemon whose applications run as [their own
-users](users.md) the edge reads these files as its own user, so they
+Every file under it is public. Under a daemon whose applications run as
+their own users the edge reads these files as its own user, so they
 must be readable by the edge's user, which you arrange. The rest of the
 media part is served through [file hints](file-hints.md) alone, after
 the application's own checks, and the rest of the data directory never
 is; see [keeping data between releases](data-directory.md#what-is-served).
-A `media:` entry whose directory is empty or not there yet is served as
-any other: its requests find no file and reach the application.
 
 ## Mixing files and an application
 

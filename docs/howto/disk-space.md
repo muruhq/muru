@@ -1,7 +1,8 @@
 # Disk space
 
 Every `muructl deploy` adds a release, and a release keeps files: usually
-an environment under the state directory, its bytecode, and a log. Muru removes these only when asked. The
+an environment under the state directory, its bytecode, its static
+directory and a log. Muru removes these only when asked. The
 application's [data directory](data-directory.md), which every release
 shares, is not a release's and goes only with the application, when
 asked.
@@ -18,7 +19,8 @@ shop@r2                  failed              - (4x8)             40.1KB /srv/sho
 shop@r1                  stopped             - (4x8)            196.2MB /srv/shop
 ```
 
-`DISK` counts a release's environment, bytecode, log and log archives,
+`DISK` counts a release's environment, bytecode, static directory, log
+and log archives,
 with each hard-linked file counted once. With `--json`, `disk_freed_bytes`
 says what removing the release would give back, which is less when uv's
 cache also holds its environment's files. A release's source directory is
@@ -64,8 +66,8 @@ failed deploys does not push out good releases.
 A release that applied files declare stays unless `--force` is given,
 since the next `muructl apply` would create it again.
 
-With the release go its environment, its bytecode and its log and log
-archives. `--keep-logs` leaves the log and archives.
+With the release go its environment, its bytecode, its static directory
+and its log and log archives. `--keep-logs` leaves the log and archives.
 A release's source directory is never touched, nor is the application's
 data directory.
 
@@ -92,8 +94,8 @@ muru: error: shop@r5 cannot be removed: it serves the application's traffic
 ## Removing an application
 
 `muructl app remove` removes a whole application: it drains whatever is
-running and removes every release, with its environment, bytecode and
-logs, and the output of its command runs. It keeps
+running and removes every release, with its environment, bytecode,
+static directory and logs, and the output of its command runs. It keeps
 the application's data directory and says where it is; `--data` removes
 that too, with every database and file the releases shared:
 

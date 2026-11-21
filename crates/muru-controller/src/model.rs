@@ -131,9 +131,9 @@ pub struct StaticSpec {
     /// Whether names may differ from the file's on disk in case.
     pub case_insensitive: bool,
     /// The directory Muru provides that `dir` lies in, which is then
-    /// relative to it (issue 849): the application's media part.
-    /// Resolved each time the edge is given the entry, since the media
-    /// part may move.
+    /// relative to it (issues 849 and 850): the application's media part
+    /// or the release's directory of built static files. Resolved each
+    /// time the edge is given the entry, since the media part may move.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub within: Option<Within>,
 }
@@ -144,6 +144,8 @@ pub struct StaticSpec {
 pub enum Within {
     /// `media:`, the application's media part.
     Media,
+    /// `static:`, the release's directory of built static files.
+    Static,
 }
 
 impl Within {
@@ -151,6 +153,7 @@ impl Within {
     pub fn prefix(self) -> &'static str {
         match self {
             Self::Media => "media:",
+            Self::Static => "static:",
         }
     }
 }
@@ -162,6 +165,7 @@ impl StaticSpec {
         let base = match self.within {
             None => return Some(self.dir.clone()),
             Some(Within::Media) => places.data.as_ref().map(|dirs| dirs.media.clone())?,
+            Some(Within::Static) => places.static_dir.clone()?,
         };
 
         Some(if self.dir.as_os_str().is_empty() {

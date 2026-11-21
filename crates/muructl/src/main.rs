@@ -2171,8 +2171,8 @@ struct Resolved {
     env_file_names: Vec<String>,
     /// How the run serves (section 13.1).
     serving: Serving,
-    /// The places the application is given (issue 849): its data
-    /// directory.
+    /// The places the application is given (issues 849 and 850): its
+    /// data directory and its directory of built static files.
     places: muru_controller::places::Places,
     /// The tables as they were read, for --print-config.
     layers: print_config::Layers,
@@ -2504,7 +2504,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         });
     }
 
-    // Issue 849: the places the application is given, and what
+    // Issues 849 and 850: the places the application is given, and what
     // it serves checked against them, as a deploy checks a release.
 
     let absolute = project.canonicalize().unwrap_or_else(|_| project.clone());
@@ -2868,9 +2868,9 @@ fn static_paths(resolved: &Resolved) -> anyhow::Result<Vec<muru_edge::routing::S
         .static_dirs
         .iter()
         .map(|entry| {
-            // Issue 849: a directory Muru provides may be empty or missing
-            // until the application fills it, its requests reaching the
-            // application meanwhile; any other must be there.
+            // Issues 849 and 850: a directory Muru provides may be empty
+            // or missing until the application fills it, its requests
+            // reaching the application meanwhile; any other must be there.
 
             let (directory, within) =
                 places::static_directory(&entry.dir, &resolved.project, &resolved.places)
@@ -3571,7 +3571,7 @@ fn host_spec(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    // Issue 849: the places, which Muru alone names, over what
+    // Issues 849 and 850: the places, which Muru alone names, over what
     // the project's variables say.
 
     let mut env: Vec<(String, String)> = env
@@ -4066,7 +4066,7 @@ async fn run_with(
         None
     };
 
-    // Issue 849: serve's data directory is a volume it is given;
+    // Issues 849 and 850: serve's data directory is a volume it is given;
     // what is missing of the places is made, as the daemon makes them,
     // serve's group-writable since it runs under an arbitrary user with
     // group 0 (section 13.9).
@@ -4507,9 +4507,9 @@ async fn run_with(
     for entry in &static_paths {
         let root = entry.route.root.path();
 
-        // A directory Muru provides that is empty, such as a part of media
-        // nothing has been saved in yet, has its requests reach the
-        // application until something is put there.
+        // A directory Muru provides that is empty, such as the static
+        // directory before collectstatic fills it, has its requests reach
+        // the application until something is put there.
 
         let empty = if places::is_empty(root) {
             ", empty for now: its requests reach the application until files are put there"

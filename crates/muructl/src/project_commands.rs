@@ -35,7 +35,7 @@ pub struct Context {
     /// The project settings file read in place of the one beside the
     /// code, when one is named (section 13.9).
     pub file: Option<PathBuf>,
-    /// The application's places (issue 849), which the command
+    /// The application's places (issues 849 and 850), which the command
     /// is given as the application is.
     pub places: muru_controller::places::Places,
 }
@@ -409,6 +409,7 @@ mod tests {
                     None,
                     None,
                 )),
+                static_dir: Some(PathBuf::from("/state/runs/shop-1/static")),
                 owner: None,
             },
         }
@@ -466,7 +467,7 @@ mod tests {
             prepared.env
         );
 
-        // Issue 849: the run's places, which no value inherited
+        // Issues 849 and 850: the run's places, which no value inherited
         // from the shell replaces.
 
         assert_eq!(
@@ -477,13 +478,17 @@ mod tests {
             value(&prepared, "MURU_UPLOADS_DIR"),
             Some("/state/runs/shop-1/data/uploads")
         );
+        assert_eq!(
+            value(&prepared, "MURU_STATIC_DIR"),
+            Some("/state/runs/shop-1/static")
+        );
         assert!(prepared.unset.is_empty());
 
         let mut without = context(dir.path());
         without.places = muru_controller::places::Places::default();
         let prepared = prepare(&without, CommandRequest::OneOff(vec!["true".to_owned()])).unwrap();
         assert_eq!(value(&prepared, "MURU_DATA_DIR"), None);
-        assert_eq!(prepared.unset.len(), 3, "{:?}", prepared.unset);
+        assert_eq!(prepared.unset.len(), 4, "{:?}", prepared.unset);
     }
 
     #[test]
