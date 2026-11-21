@@ -350,6 +350,18 @@ app = "uvi"
     }
     assert rows == {"gun@r1": ["1", "(1", "gunicorn)"], "uvi@r1": ["1", "(1", "uvicorn)"]}
 
+    # Issue 841: the instance is named by the program it runs, though its
+    # process is the interpreter, and gunicorn's worker is listed beneath
+    # it without --all.
+
+    tree = json.loads(daemon.muructl("status", "--processes", "--app", "gun", "--json").stdout)
+    relay = next(child for child in tree["root"]["children"] if child["role"] == "relay")
+    server = relay["children"][0]
+    assert (server["role"], server["what"]) == ("server", "gun@r1 instance 0: gunicorn"), server
+    assert [(child["role"], child["what"]) for child in server.get("children", [])] == [
+        ("server-worker", "gunicorn worker")
+    ], server
+
 
 def test_a_cutover_canaries_from_the_server_to_native_workers(
     daemon: Daemon, tmp_path: Path

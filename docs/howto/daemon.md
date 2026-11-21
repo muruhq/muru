@@ -624,8 +624,13 @@ muru: error: the daemon exited before it answered (exit status: 1); from /var/lo
   2026-11-02T05:40:11.204Z muru: run: /run/muru (default)
   2026-11-02T05:40:11.204Z muru: logs: /var/log/muru (default)
   2026-11-02T05:40:11.204Z muru: cache: /var/cache/muru (default)
-  2026-11-02T05:40:11.209Z muru: error: cannot listen on 0.0.0.0:80: Address already in use (os error 98)
+  2026-11-02T05:40:11.209Z muru: error: cannot listen on 0.0.0.0:80: port 80 on 0.0.0.0 is in use by nginx (pid 812); choose another listener, or stop it
 ```
+
+A listener whose address another program holds names that program and
+its pid, found with lsof or ss when either is installed, or the instance
+of Muru's that holds it, as a reload that adds a listener does too.
+Without either, the error is the operating system's own.
 
 A daemon owns its state directory and its run directory for as long as
 it runs, through a lock on `daemon.lock` in each. A second daemon given
@@ -679,33 +684,36 @@ figures over the last second:
 
 ```console
 $ muructl status --processes
+daemon  state /var/lib/muru
 edge  1,284 req/s  3.0 err/s  p50 4.0 ms  p95 38 ms  in flight 41  ws 212  conns 1,903  tls 12/s  in 2.1MB/s  out 46.4MB/s
 
-PID    ROLE           WHAT                                   USER      UP     CPU       RSS   REQ/S    BUSY   QUEUE      P95   GIL/LAG
-4242   daemon         system daemon, state /var/lib/muru     muru    3d2h    0.3%    38.0MB
-4250   ├─ edge        listening on :80, :443                 muru    3d2h    2.1%    61.0MB   1,284
-4400   ├─ relay       blog@r3 output to apps/blog/r3.log     blog    1d0h    0.0%     7.0MB
-4401   │  └─ server   blog@r3 instance 0: gunicorn           blog    1d0h    0.8%    74.0MB
-4330   ├─ host        api@r7 serving                         api     1d4h    0.0%    88.0MB     203    6/64       0    12 ms     48 ms
-4331   │  ├─ relay    api@r7 output to apps/api/r7.log       api     1d4h    0.0%     7.0MB
-4340   │  └─ worker   group default, worker 0                api     1d4h    4.2%   131.0MB     203    6/64            12 ms     48 ms
-4290   ├─ host        shop@r41 retained until 07:40 UTC      shop   5h13m    0.0%    91.0MB
-4291   │  ├─ relay    shop@r41 output to apps/shop/r41.log   shop   5h13m    0.0%     7.0MB
-       │  ├─ group    crawlers
-4293   │  ├─ worker   group crawlers, worker 0               shop   5h13m    0.0%   118.0MB
-       │  ├─ group    default
-4292   │  └─ worker   group default, worker 0                shop   5h13m    0.0%   131.0MB
-4301   └─ host        shop@r42 serving                       shop   5h12m    0.0%    92.0MB
-4302      ├─ relay    shop@r42 output to apps/shop/r42.log   shop   5h12m    0.1%     7.0MB
-          ├─ group    crawlers                                                                   61     4/8       0   120 ms    0.4 ms
-4320      ├─ worker   group crawlers, worker 0               shop   5h12m    1.0%   120.0MB      61     4/8           120 ms    0.4 ms
-          ├─ group    default                                                                 1,020   27/32       3    41 ms    2.1 ms
-4310      ├─ worker   group default, worker 0                shop   5h12m   12.3%   140.0MB     512   14/16            40 ms    2.0 ms
-4311      └─ worker   group default, worker 1                shop   2h03m   11.8%   138.0MB     508   13/16            42 ms    2.2 ms
+PID    ROLE                     WHAT                                   USER      UP     CPU       RSS   REQ/S    BUSY   QUEUE      P95   GIL/LAG
+4242   daemon                   system daemon                          muru    3d2h    0.3%    38.0MB
+4250   ├─ edge                  listening on :80, :443                 muru    3d2h    2.1%    61.0MB   1,284
+4400   ├─ relay                 blog@r3 output to apps/blog/r3.log     blog    1d0h    0.0%     7.0MB
+4401   │  └─ server             blog@r3 instance 0: gunicorn           blog    1d0h    0.8%    74.0MB
+4402   │     ├─ server-worker   gunicorn worker                        blog    1d0h    2.4%    96.0MB
+4403   │     └─ server-worker   gunicorn worker                        blog    1d0h    2.2%    95.0MB
+4330   ├─ host                  api@r7 serving                         api     1d4h    0.0%    88.0MB     203    6/64       0    12 ms     48 ms
+4331   │  ├─ relay              api@r7 output to apps/api/r7.log       api     1d4h    0.0%     7.0MB
+4340   │  └─ worker             group default, worker 0                api     1d4h    4.2%   131.0MB     203    6/64            12 ms     48 ms
+4290   ├─ host                  shop@r41 retained until 07:40 UTC      shop   5h13m    0.0%    91.0MB
+4291   │  ├─ relay              shop@r41 output to apps/shop/r41.log   shop   5h13m    0.0%     7.0MB
+       │  ├─ group              crawlers
+4293   │  ├─ worker             group crawlers, worker 0               shop   5h13m    0.0%   118.0MB
+       │  ├─ group              default
+4292   │  └─ worker             group default, worker 0                shop   5h13m    0.0%   131.0MB
+4301   └─ host                  shop@r42 serving                       shop   5h12m    0.0%    92.0MB
+4302      ├─ relay              shop@r42 output to apps/shop/r42.log   shop   5h12m    0.1%     7.0MB
+          ├─ group              crawlers                                                                   61     4/8       0   120 ms    0.4 ms
+4320      ├─ worker             group crawlers, worker 0               shop   5h12m    1.0%   120.0MB      61     4/8           120 ms    0.4 ms
+          ├─ group              default                                                                 1,020   27/32       3    41 ms    2.1 ms
+4310      ├─ worker             group default, worker 0                shop   5h12m   12.3%   140.0MB     512   14/16            40 ms    2.0 ms
+4311      └─ worker             group default, worker 1                shop   2h03m   11.8%   138.0MB     508   13/16            42 ms    2.2 ms
 ```
 
-The first line is the instance's last second: requests and 5xx
-responses per second, the median and 95th percentile total time,
+The first line names the daemon's state directory. The next is the
+instance's last second: requests and 5xx responses per second, the median and 95th percentile total time,
 requests in flight, WebSockets and connections open, TLS handshakes per
 second and the body bytes received and sent per second.
 
@@ -713,13 +721,15 @@ The roles are `daemon`, `edge`, `host` (one per running release),
 `relay` (the release's log relay, which writes its output to the
 release log, or the relay of a managed server's instance, which starts
 the instance and writes its output), `worker`, `server` (a
-[managed server](managed-servers.md) instance) and `command` (a `muructl command run` or `muructl exec`
-while it runs). The tree is the one Muru supervises: a host adopted
+[managed server](managed-servers.md) instance, named by the program its
+command runs, such as `gunicorn`), `server-worker` (a process a managed
+server's instance started, such as one of gunicorn's workers, which
+serve the release's requests) and `command` (a `muructl command run` or
+`muructl exec` while it runs). The tree is the one Muru supervises: a host adopted
 again after the daemon restarted has the init process as its parent
 in `ps`, which its row says.
 
-The daemon's row says whose daemon it is, `user` or `system`, and its
-state directory. A host's row gives its release's part in routing after
+The daemon's row says whose daemon it is, `user` or `system`. A host's row gives its release's part in routing after
 its name, so an idle instance shows which release serves:
 
 | Shown | The release |
@@ -750,12 +760,19 @@ does, still counts in its host's or group's figures for that second,
 though it is no longer listed. Such a row's REQ/S is marked `*`, and a
 line under the table says why; `--json` gives the count as `departed`.
 
+On a terminal the view fits the terminal's width. The figure columns
+empty in every row are left out, the columns close up, and a long WHAT
+is cut short with an ellipsis; when that is still too wide, the last
+columns are left out, and a line under the table names them. The
+instance's figures wrap onto a second line. Output to a pipe or a file,
+and `--json`, have every column in full.
+
 - `--app APP[@RELEASE]` shows the daemon and one application's
   processes, or one release's.
 
-- `--all` adds the processes Muru did not start that descend from one it
-  did, such as a subprocess a worker ran, beneath the process they
-  descend from, with their command line.
+- `--all` adds the other processes Muru did not start that descend from
+  one it did, such as a subprocess a worker ran, beneath the process
+  they descend from, with their command line, as `other`.
 
 - `--watch` shows the view again every second until interrupted, or at
   the interval given, such as `--watch 5s`. On a terminal it is redrawn

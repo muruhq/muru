@@ -961,18 +961,8 @@ fn explain_bind_error(error: anyhow::Error, https: SocketAddr) -> anyhow::Error 
     // Section 13.8: another instance of Muru's is named as an instance,
     // and only another program by what lsof or ss say of it.
 
-    if let Some(message) = muru_controller::registry::in_use_by_instance(
-        address,
-        &format!("choose another with {flag}"),
-    ) {
-        return anyhow::anyhow!(message);
-    }
-
-    match port_holder(port) {
-        Some(holder) => anyhow::anyhow!(
-            "port {port} on {} is in use by {holder}; choose another with {flag}, or stop it",
-            address.ip()
-        ),
+    match muru_controller::registry::in_use_by(address, &format!("choose another with {flag}")) {
+        Some(message) => anyhow::anyhow!(message),
         None => anyhow::anyhow!(
             "port {port} on {} is in use; choose another with {flag} ({flag} auto picks a free one)",
             address.ip()
@@ -1011,7 +1001,7 @@ fn explain_dashboard_error(error: anyhow::Error, address: &str) -> anyhow::Error
         );
     }
 
-    let holder = parsed.and_then(|bound| port_holder(bound.port()));
+    let holder = parsed.and_then(|bound| muru_controller::registry::port_holder(bound.port()));
 
     match holder {
         Some(holder) => anyhow::anyhow!(
@@ -1020,40 +1010,6 @@ fn explain_dashboard_error(error: anyhow::Error, address: &str) -> anyhow::Error
         ),
         None => anyhow::anyhow!("the dashboard's address {address} is in use; {instead}"),
     }
-}
-
-/// The process listening on a TCP port, as "command (pid N)", found with
-/// lsof or ss when either is installed.
-fn port_holder(port: u16) -> Option<String> {
-    let lsof = std::process::Command::new("lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success());
-
-    if let Some(output) = lsof {
-        let text = String::from_utf8_lossy(&output.stdout);
-        let pid = text.lines().find_map(|line| line.strip_prefix('p'));
-        let command = text.lines().find_map(|line| line.strip_prefix('c'));
-
-        if let (Some(pid), Some(command)) = (pid, command) {
-            return Some(format!("{command} (pid {pid})"));
-        }
-    }
-
-    let ss = std::process::Command::new("ss")
-        .args(["-lptnH", &format!("sport = :{port}")])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())?;
-    let text = String::from_utf8_lossy(&ss.stdout);
-
-    // users:(("python3",pid=1234,fd=5))
-
-    let users = text.split("users:((\"").nth(1)?;
-    let (command, rest) = users.split_once('"')?;
-    let pid = rest.split("pid=").nth(1)?.split(',').next()?;
-    Some(format!("{command} (pid {pid})"))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -3702,18 +3658,17 @@ async fn reread(
 /// The line naming what a changed settings file changed that only a
 /// restart applies, as `pyproject.toml changed port; restart the run for
 /// it to take effect`; none when it changed nothing of the kind.
-/// `started` is what those settings were as the run started.
+/// `started` is what those settings were as the run started and `last`
+/// what the last reload read of them (issue 839), so a change still
+/// waiting for a restart is not named again, nor blamed on another file.
 fn restart_line(
     args: &RunArgs,
     paths: &[PathBuf],
     started: &[(String, String)],
+    last: &[(String, String)],
     next: &Resolved,
 ) -> Option<String> {
-    let changed: Vec<String> = restart_only(args, next)
-        .into_iter()
-        .filter(|setting| !started.contains(setting))
-        .map(|(key, _)| key)
-        .collect();
+    let changed = restart_changes(started, last, &restart_only(args, next));
 
     if changed.is_empty() {
         return None;
@@ -3732,6 +3687,20 @@ fn restart_line(
         and_list(&files),
         and_list(&changed)
     ))
+}
+
+/// The restart-only settings `now` has changed since the `last` reload
+/// read them, leaving out one changed back to the value the run
+/// `started` with, which needs no restart.
+fn restart_changes(
+    started: &[(String, String)],
+    last: &[(String, String)],
+    now: &[(String, String)],
+) -> Vec<String> {
+    now.iter()
+        .filter(|setting| !last.contains(setting) && !started.contains(setting))
+        .map(|(key, _)| key.clone())
+        .collect()
 }
 
 /// Items in a sentence: `a`, `a and b`, `a, b and c`.
@@ -3815,9 +3784,11 @@ async fn run_with(
     }));
 
     // Issue 783: what only a restart applies, as the run starts, for a
-    // reload after a settings file changed to name what it cannot apply.
+    // reload after a settings file changed to name what it cannot apply;
+    // and as the last such reload read it (issue 839).
 
     let restart_settings = restart_only(&args, &resolved);
+    let mut restart_read = restart_settings.clone();
 
     // The interpreter is found as the run would find it, so that one the
     // run could not use is refused here with the same words.
@@ -5060,9 +5031,11 @@ async fn run_with(
                         }
                     };
 
-                    if let Some(line) = restart_line(&args, &paths, &restart_settings, &next.resolved) {
+                    if let Some(line) = restart_line(&args, &paths, &restart_settings, &restart_read, &next.resolved) {
                         muru_common::muru_println!("{line}");
                     }
+
+                    restart_read = restart_only(&args, &next.resolved);
 
                     spec = next.spec;
                     static_paths = next.static_paths;
@@ -5425,6 +5398,32 @@ mod tests {
     use clap::Parser as _;
 
     use super::Cli;
+
+    #[test]
+    fn a_restart_only_change_is_named_once_and_not_when_changed_back() {
+        let setting = |key: &str, value: &str| (key.to_owned(), value.to_owned());
+        let started = [setting("access_log", "all"), setting("port", "8000")];
+        let changed = [setting("access_log", "errors"), setting("port", "8000")];
+
+        // Issue 839: the reload that changes it names it; a later reload
+        // that changes nothing of the kind does not name it again.
+
+        assert_eq!(
+            super::restart_changes(&started, &started, &changed),
+            ["access_log"]
+        );
+        assert!(super::restart_changes(&started, &changed, &changed).is_empty());
+
+        // Changed again, it is named again; changed back to what the run
+        // started with, it needs no restart.
+
+        let again = [setting("access_log", "none"), setting("port", "8000")];
+        assert_eq!(
+            super::restart_changes(&started, &changed, &again),
+            ["access_log"]
+        );
+        assert!(super::restart_changes(&started, &again, &started).is_empty());
+    }
 
     #[test]
     fn a_killed_worker_s_evidence_takes_the_requests_in_flight_on_it() {

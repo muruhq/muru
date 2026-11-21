@@ -436,7 +436,7 @@ with `muructl daemon start` did not stay up:
 ```console
 $ muructl logs --daemon --lines 2
 2026-11-02T05:40:11.204Z muru: cache: /var/cache/muru (default)
-2026-11-02T05:40:11.209Z muru: error: cannot listen on 0.0.0.0:80: Address already in use (os error 98)
+2026-11-02T05:40:11.209Z muru: error: cannot listen on 0.0.0.0:80: port 80 on 0.0.0.0 is in use by nginx (pid 812); choose another listener, or stop it
 ```
 
 `muructl daemon status` names the log directory, with the daemon

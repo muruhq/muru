@@ -141,6 +141,8 @@ pub struct Servers {
     supervisor: Supervisor,
     /// Lines the instances' relays have dropped, across every relay.
     dropped: Arc<AtomicU64>,
+    /// The program the command runs, as the process view names it.
+    program: String,
 }
 
 impl Servers {
@@ -191,6 +193,7 @@ impl Servers {
             binds,
             supervisor,
             dropped,
+            program: crate::processes::program_of(&spec.command).unwrap_or_default(),
         })
     }
 
@@ -269,6 +272,7 @@ impl Servers {
             binds,
             supervisor,
             dropped,
+            program: crate::processes::program_of(&spec.command).unwrap_or_default(),
         })
     }
 
@@ -343,6 +347,12 @@ impl Servers {
     /// Every instance's address, as the snapshot names them.
     pub fn addresses(&self) -> Vec<String> {
         self.binds.iter().map(Bind::address).collect()
+    }
+
+    /// The program the instances' command runs, as the process view
+    /// names it (issue 841): `gunicorn` for `gunicorn --workers 2 ...`.
+    pub fn program(&self) -> &str {
+        &self.program
     }
 
     /// How many instances have a process right now.

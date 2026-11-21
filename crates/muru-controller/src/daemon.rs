@@ -863,6 +863,7 @@ pub async fn processes(
         mode: "daemon".to_owned(),
         started_unix_ms: info.started_unix_ms,
         limits: info.cgroup_limits.lock().expect("limits poisoned").clone(),
+        state_dir: crate::registry::home_shortened(&info.locations.state.path),
     };
 
     Some(
@@ -2768,12 +2769,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 }
 
 /// A bind the daemon was refused, as an error: with the instance of
-/// Muru's that holds the address named when one does (issue 808), as
-/// the error's own message under the context the caller adds.
+/// Muru's that holds the address named when one does (issue 808), or
+/// else the program lsof or ss name (issue 837), as the error's own
+/// message under the context the caller adds.
 fn bind_refused(error: std::io::Error, address: SocketAddr, what: &str) -> anyhow::Error {
     if error.kind() == std::io::ErrorKind::AddrInUse
         && let Some(message) =
-            crate::registry::in_use_by_instance(address, &format!("choose another {what}"))
+            crate::registry::in_use_by(address, &format!("choose another {what}"))
     {
         return anyhow::anyhow!(message);
     }
@@ -4252,8 +4254,12 @@ impl Daemon {
         for &(address, tls) in wanted {
             let socket = match self.edge.socket_on(address) {
                 Some(socket) => socket,
-                None => std::net::TcpListener::bind(address)
-                    .map_err(|error| format!("cannot listen on {address}: {error}"))?,
+                None => std::net::TcpListener::bind(address).map_err(|error| {
+                    format!(
+                        "cannot listen on {address}: {}",
+                        bind_refused(error, address, "listener")
+                    )
+                })?,
             };
 
             listeners.push(crate::edges::Listener { socket, tls });
@@ -12610,10 +12616,7 @@ impl Daemon {
         let mut known = vec![Known {
             pid: daemon,
             role: "daemon",
-            what: crate::processes::daemon_phrase(
-                self.locations.mode_word(),
-                &self.locations.state.path,
-            ),
+            what: crate::processes::daemon_phrase(self.locations.mode_word()),
             ..Known::default()
         }];
 
@@ -12758,6 +12761,7 @@ impl Daemon {
                             app: app.clone(),
                             release: id.clone(),
                             index: Some(instance.index),
+                            program: servers.program().to_owned(),
                             ..Known::default()
                         });
                     }

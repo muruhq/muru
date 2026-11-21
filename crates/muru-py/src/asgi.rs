@@ -1626,8 +1626,9 @@ fn add_handoff(
 
 /// Start a request on the event loop: build its scope and channel and
 /// schedule the runner. `request` is the request's id in the shared
-/// state. Fails when the loop is gone, which means the worker is
-/// stopping.
+/// state, and `trace` the request's record, when the edge asked for
+/// one, whose log records are kept from now. Fails when the loop is
+/// gone, which means the worker is stopping.
 #[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
 pub fn start(
     shared: &Arc<Shared>,
@@ -1638,12 +1639,18 @@ pub fn start(
     tx: mpsc::Sender<Outgoing>,
     request: u64,
     offer: Offer,
+    trace: Option<&crate::record::Trace>,
 ) -> Result<Py<Channel>, String> {
     let ready = std::time::Instant::now();
 
     Python::attach(|py| {
         let waited = ready.elapsed();
         crate::signals::GIL_WAIT.record(waited);
+
+        if let Some(trace) = trace {
+            crate::record::start_logs(py, &head.request_id, trace);
+        }
+
         let channel = Channel::new(
             py,
             asgi,

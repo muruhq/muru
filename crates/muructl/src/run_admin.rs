@@ -531,6 +531,7 @@ impl RunProcesses {
             mode: self.mode.to_owned(),
             started_unix_ms: self.started_unix_ms,
             limits: self.limits.lock().expect("limits report poisoned").clone(),
+            state_dir: String::new(),
         };
 
         muru_controller::processes::snapshot(

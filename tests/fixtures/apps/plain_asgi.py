@@ -22,6 +22,16 @@ REQUEST_MARK: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 
 
+def hold_the_interpreter(seconds: int) -> None:
+    """Sleep in C without letting go of the interpreter, as a stuck
+    extension would: no other thread of the worker runs Python meanwhile."""
+
+    import ctypes
+    import ctypes.util
+
+    ctypes.PyDLL(ctypes.util.find_library("c")).sleep(seconds)
+
+
 def info() -> dict[str, Any]:
     """Describe the process and thread serving the request."""
 
@@ -355,6 +365,12 @@ async def application(scope: Scope, receive: Receive, send: Send) -> None:
 
         time.sleep(float(query.get("seconds", "0.5")))
         await respond(send, 200, b"blocked\n")
+    elif path == "/hold":
+        # Section 7.6: hold the interpreter lock on the loop, so no thread
+        # of the worker runs Python.
+
+        hold_the_interpreter(int(query.get("seconds", "1")))
+        await respond(send, 200, b"held\n")
     elif path == "/to-thread":
         # Section 6.6: blocking code run on the loop's pool for synchronous code.
 

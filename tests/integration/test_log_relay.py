@@ -148,6 +148,8 @@ def test_a_stalled_destination_holds_up_no_request(tmp_path: Path) -> None:
             "--threads",
             "1",
             "--no-reload",
+            "--dashboard",
+            "off",
         ],
         cwd=tmp_path,
         stdin=subprocess.PIPE,

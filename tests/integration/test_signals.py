@@ -124,6 +124,8 @@ def launch(
                 "--chdir",
                 str(directory),
                 "--no-reload",
+                "--dashboard",
+                "off",
             ],
             stdout=handle,
             stderr=subprocess.STDOUT,

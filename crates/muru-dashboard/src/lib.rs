@@ -1370,15 +1370,23 @@ async fn processes_paths(
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64);
 
-    let (rows, error) = match answer {
-        Ok(answer) => (processes::rows(&answer, now), String::new()),
-        Err(error) => (Vec::new(), error),
+    let (rows, state_dir, error) = match answer {
+        Ok(answer) => {
+            let state_dir = answer
+                .get("state_dir")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            (processes::rows(&answer, now), state_dir, String::new())
+        }
+        Err(error) => (Vec::new(), String::new(), error),
     };
 
     Some(page(
         processes::ProcessesFragment {
             rows: &rows,
             with_user,
+            state_dir: &state_dir,
             error: &error,
             marked: rows.iter().any(|row| row.rate.ends_with('*')),
         }
