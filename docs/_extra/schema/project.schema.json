@@ -706,7 +706,7 @@
           "x-default": "the release's"
         },
         "sendfile_roots": {
-          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. In a file `muructl apply` reads, a relative path is taken from the file's directory; in a project's settings each is absolute.",
+          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served; the release's when absent, and an empty list refuses every hint. A relative path is taken from the release's source directory.",
           "items": {
             "type": "string"
           },
@@ -1631,7 +1631,7 @@
       "type": "string"
     },
     "sendfile_roots": {
-      "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file, for the default mount and any mount that does not say otherwise; with none every hint is refused.",
+      "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. A relative path is taken from the project's directory, the release's source.",
       "items": {
         "type": "string"
       },

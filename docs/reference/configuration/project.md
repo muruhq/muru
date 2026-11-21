@@ -46,7 +46,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `run` | table, {ref}`[tool.muru.run] <config-project-tool-muru-run>` |  | How `muructl run` serves the project, which the daemon ignores. |
 | `scaling` | table, {ref}`[tool.muru.scaling] <config-project-tool-muru-scaling>` |  | How the default group is scaled; static when absent. |
 | `sendfile_header` | string |  | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile` for the frameworks that send that one. |
-| `sendfile_roots` | array of strings |  | Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file, for the default mount and any mount that does not say otherwise; with none every hint is refused. |
+| `sendfile_roots` | array of strings |  | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. A relative path is taken from the project's directory, the release's source. |
 | `serve` | table, {ref}`[tool.muru.serve] <config-project-tool-muru-serve>` |  | How `muructl serve` runs the project in a container, which the daemon and `muructl run` ignore. |
 | `static` | array of tables, {ref}`[[tool.muru.static]] <config-project-tool-muru-static>` |  | The application's own static directories, served by the edge from the release's source, which is the project directory under `muructl run`. |
 | `sync_threads` | integer | `8` | Threads for synchronous code called from an ASGI application. |
@@ -267,7 +267,7 @@ A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` ta
 | `max_connections` | integer |  | Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; each holds a request slot when absent. |
 | `path` | string |  | The path prefix; the longest wins, on segment boundaries. A gRPC mount has none: its calls are matched by service name. |
 | `sendfile_header` | string | the release's | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
-| `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. In a file `muructl apply` reads, a relative path is taken from the file's directory; in a project's settings each is absolute. |
+| `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served; the release's when absent, and an empty list refuses every hint. A relative path is taken from the release's source directory. |
 | `threads` | integer or table, {ref}`[tool.muru.mounts.NAME.threads] <config-project-tool-muru-mounts-name-threads>` |  | Threads of the mount's own, for a WSGI or gRPC mount; it shares the worker's pool when absent. |
 | `tracing_middleware` | boolean | `false` | Wrap the mount's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for. |
 

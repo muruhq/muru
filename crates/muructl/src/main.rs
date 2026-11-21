@@ -2422,6 +2422,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
     // over them.
 
     muru_config::check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())
+        .and_then(|()| muru_config::check_sendfile_dirs(&table.sendfile_roots, &project))
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     for (name, mount) in &table.mounts {
@@ -2434,6 +2435,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
             .as_deref()
             .or(table.sendfile_header.as_deref());
         muru_config::check_sendfile(roots, header)
+            .and_then(|()| muru_config::check_sendfile_dirs(roots, &project))
             .map_err(|error| anyhow::anyhow!("[tool.muru] mount {name}: {error}"))?;
     }
 
@@ -2814,10 +2816,13 @@ fn mount_paths(resolved: &Resolved) -> Vec<muru_edge::routing::MountPath> {
                 .cgi_local_redirect
                 .unwrap_or(resolved.cgi_local_redirect),
             sendfile: muru_edge::routing::Sendfile::new(
-                mount
-                    .sendfile_roots
-                    .as_deref()
-                    .unwrap_or(&resolved.sendfile_roots),
+                &muru_config::sendfile_root_paths(
+                    mount
+                        .sendfile_roots
+                        .as_deref()
+                        .unwrap_or(&resolved.sendfile_roots),
+                    &resolved.project,
+                ),
                 mount
                     .sendfile_header
                     .as_deref()
@@ -3557,7 +3562,7 @@ fn redirect_flags(resolved: &Resolved) -> muru_edge::routing::RedirectFlags {
 /// project says.
 fn sendfile(resolved: &Resolved) -> Arc<muru_edge::routing::Sendfile> {
     muru_edge::routing::Sendfile::new(
-        &resolved.sendfile_roots,
+        &muru_config::sendfile_root_paths(&resolved.sendfile_roots, &resolved.project),
         resolved.sendfile_header.as_deref().unwrap_or_default(),
     )
 }
@@ -4339,7 +4344,7 @@ async fn run_with(
         muru_common::muru_println!(
             "static {}/ from {}",
             entry.prefix.trim_end_matches('/'),
-            entry.route.directory.display()
+            entry.route.root.path().display()
         );
     }
 

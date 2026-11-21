@@ -8261,7 +8261,10 @@ impl Daemon {
                                     accept_redirects_from: mount.accept_redirects_from.clone(),
                                     accel_redirect: mount.accel_redirect,
                                     cgi_local_redirect: mount.cgi_local_redirect,
-                                    sendfile_roots: mount.sendfile_roots.clone(),
+                                    sendfile_roots: muru_config::sendfile_root_paths(
+                                        &mount.sendfile_roots,
+                                        &release.spec.source,
+                                    ),
                                     sendfile_header: mount
                                         .sendfile_header
                                         .clone()
@@ -8281,7 +8284,12 @@ impl Daemon {
                     sendfile_roots: self
                         .store
                         .release(name, id)
-                        .map(|release| release.spec.sendfile_roots.clone())
+                        .map(|release| {
+                            muru_config::sendfile_root_paths(
+                                &release.spec.sendfile_roots,
+                                &release.spec.source,
+                            )
+                        })
                         .unwrap_or_default(),
                     sendfile_header: self
                         .store
@@ -8318,7 +8326,10 @@ impl Daemon {
                         // to the server's responses, which are trusted.
 
                         if let Ok(release) = self.store.release(name, id) {
-                            server.sendfile_roots = release.spec.sendfile_roots.clone();
+                            server.sendfile_roots = muru_config::sendfile_root_paths(
+                                &release.spec.sendfile_roots,
+                                &release.spec.source,
+                            );
                             server.sendfile_header =
                                 release.spec.sendfile_header.clone().unwrap_or_default();
                         }

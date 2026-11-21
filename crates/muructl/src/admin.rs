@@ -4164,7 +4164,8 @@ pub struct ReleaseArgs {
     pub(crate) stop_signal: Option<String>,
 
     /// A directory a path in an X-Muru-Sendfile response header must lie
-    /// in for the edge to serve the file; repeatable (default the table's).
+    /// in for the file to be served, relative to the source unless
+    /// absolute; repeatable (default the table's).
     #[arg(long = "sendfile-root", value_name = "DIR")]
     pub(crate) sendfile_roots: Vec<String>,
 
@@ -8138,17 +8139,9 @@ fn resolve_paths(document: &mut muru_config::Document, base: &Path) {
                 release.python = Some(absolute_interpreter(Path::new(python), Some(base)));
             }
 
-            for root in &mut release.sendfile_roots {
-                *root = absolute(root);
-            }
-
-            for root in release
-                .mounts
-                .values_mut()
-                .flat_map(|mount| mount.sendfile_roots.iter_mut().flatten())
-            {
-                *root = absolute(root);
-            }
+            // A release's sendfile_roots, its mounts' among them, are
+            // taken from its source rather than the file, as its error
+            // pages are, so they mean the same in every release.
         }
     }
 
@@ -11509,13 +11502,15 @@ tls = { ca = "ca.pem" }
         assert_eq!(release.source.as_deref(), Some("/base/src"));
         assert_eq!(release.cwd.as_deref(), Some("/base/run"));
         assert_eq!(release.python.as_deref(), Some("/base/.venv/bin/python"));
-        assert_eq!(release.sendfile_roots, ["/base/media"]);
+
+        // A release's own pages and sendfile_roots are its source
+        // directory's.
+
+        assert_eq!(release.sendfile_roots, ["media"]);
         assert_eq!(
             release.mounts["api"].sendfile_roots.as_deref(),
-            Some(&["/base/api-media".to_owned()][..])
+            Some(&["api-media".to_owned()][..])
         );
-
-        // A release's own pages are its source directory's.
 
         assert_eq!(
             release.error_pages["503"].file.as_deref(),

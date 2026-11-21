@@ -3936,6 +3936,7 @@ pub fn resolve_spec(
         .or_else(|| table.sendfile_header.clone())
         .or_else(|| previous.and_then(|previous| previous.sendfile_header.clone()));
     muru_config::check_sendfile(&sendfile_roots, sendfile_header.as_deref())?;
+    muru_config::check_sendfile_dirs(&sendfile_roots, &source)?;
 
     // Section 6.13: the origins gRPC-Web answers with CORS, likewise.
 
@@ -3961,6 +3962,7 @@ pub fn resolve_spec(
             .clone()
             .or_else(|| sendfile_header.clone());
         muru_config::check_sendfile(&mount_roots, mount_header.as_deref())
+            .and_then(|()| muru_config::check_sendfile_dirs(&mount_roots, &source))
             .map_err(|error| format!("mount {name}: {error}"))?;
 
         // Section 4.10: a mount's redirect settings, with the release's
@@ -5759,6 +5761,7 @@ fn resolve_http_spec(
     let (error_pages, error_override, maintenance) =
         resolve_error_tables(tables, &BTreeMap::new(), None, None, &source)?;
     muru_config::check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())?;
+    muru_config::check_sendfile_dirs(&table.sendfile_roots, &source)?;
 
     Ok(ReleaseSpec {
         limits: tables

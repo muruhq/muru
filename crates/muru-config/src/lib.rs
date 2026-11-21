@@ -403,10 +403,9 @@ pub struct Mount {
     #[schemars(extend("x-default" = "the release's"))]
     pub cgi_local_redirect: Option<bool>,
     /// Directories a path in an `X-Muru-Sendfile` response header must
-    /// lie in for the edge to serve the file (section 4.9); the
-    /// release's when absent, and an empty list refuses every hint. In
-    /// a file `muructl apply` reads, a relative path is taken from the
-    /// file's directory; in a project's settings each is absolute.
+    /// lie in for the file to be served (section 4.9); the release's
+    /// when absent, and an empty list refuses every hint. A relative
+    /// path is taken from the release's source directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "the release's"))]
     pub sendfile_roots: Option<Vec<String>>,
@@ -1090,10 +1089,10 @@ pub struct Release {
     #[schemars(extend("default" = false))]
     pub cgi_local_redirect: Option<bool>,
     /// Directories a path in an `X-Muru-Sendfile` response header must
-    /// lie in for the edge to serve the file (section 4.9), for the
-    /// default mount and any mount that does not say otherwise; with
-    /// none every hint is refused. A relative path is taken from the
-    /// file's directory.
+    /// lie in for the file to be served (section 4.9), for the default
+    /// mount and any mount that does not say otherwise; with none every
+    /// hint is refused. A relative path is taken from the release's
+    /// `source`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sendfile_roots: Vec<String>,
     /// A second response header honoured as `X-Muru-Sendfile` is, such
@@ -5139,11 +5138,13 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
 }
 
 /// Check a mount's, release's or upstream's file hint keys (section
-/// 4.9): absolute roots and a header name.
+/// 4.9): roots that name a directory and a header name. A release's
+/// relative roots are taken from its source, which
+/// [`check_sendfile_dirs`] checks; an upstream's must be absolute.
 pub fn check_sendfile(roots: &[String], header: Option<&str>) -> Result<(), String> {
     for root in roots {
-        if !root.starts_with('/') {
-            return Err(format!("sendfile_roots: {root:?} must be an absolute path"));
+        if root.trim().is_empty() || root.contains('\0') {
+            return Err(format!("sendfile_roots: {root:?} names no directory"));
         }
     }
 
@@ -5168,6 +5169,47 @@ pub fn check_sendfile(roots: &[String], header: Option<&str>) -> Result<(), Stri
     Ok(())
 }
 
+/// Where a release's `sendfile_roots` entry is (section 4.9): an
+/// absolute one as it is written, a relative one in the release's source
+/// directory.
+pub fn sendfile_root(root: &str, source: &std::path::Path) -> std::path::PathBuf {
+    let path = std::path::Path::new(root);
+
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        source.join(path)
+    }
+}
+
+/// The release's roots as the edge and its workers take them: each
+/// absolute, a relative one taken from the source.
+pub fn sendfile_root_paths(roots: &[String], source: &std::path::Path) -> Vec<String> {
+    roots
+        .iter()
+        .map(|root| sendfile_root(root, source).display().to_string())
+        .collect()
+}
+
+/// Check that each relative `sendfile_roots` entry is a directory in the
+/// release's source (section 4.9), as a static entry's directory must be:
+/// a root that travels with the project is part of the release. An
+/// absolute root is the operator's, and may be made or mounted later.
+pub fn check_sendfile_dirs(roots: &[String], source: &std::path::Path) -> Result<(), String> {
+    for root in roots.iter().filter(|root| !root.starts_with('/')) {
+        let path = sendfile_root(root, source);
+
+        if !path.is_dir() {
+            return Err(format!(
+                "sendfile_roots: {root:?} is not a directory in {}",
+                source.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Check an `[upstream.NAME]` table: the addresses, the protocol, the
 /// TLS and health settings and the durations. Whether the CA file is
 /// readable is for the daemon to check.
@@ -5177,6 +5219,14 @@ pub fn check_upstream(table: &Upstream) -> Result<(), String> {
     }
 
     check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())?;
+
+    if let Some(root) = table
+        .sendfile_roots
+        .iter()
+        .find(|root| !root.starts_with('/'))
+    {
+        return Err(format!("sendfile_roots: {root:?} must be an absolute path"));
+    }
 
     for address in &table.addresses {
         parse_upstream_address(address).map_err(|error| format!("addresses: {error}"))?;
@@ -6252,9 +6302,10 @@ pub struct ToolMuru {
     #[schemars(extend("default" = false))]
     pub cgi_local_redirect: Option<bool>,
     /// Directories a path in an `X-Muru-Sendfile` response header must
-    /// lie in for the edge to serve the file (section 4.9), for the
-    /// default mount and any mount that does not say otherwise; with
-    /// none every hint is refused.
+    /// lie in for the file to be served (section 4.9), for the default
+    /// mount and any mount that does not say otherwise; with none every
+    /// hint is refused. A relative path is taken from the project's
+    /// directory, the release's source.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sendfile_roots: Vec<String>,
     /// A second response header honoured as `X-Muru-Sendfile` is, such
@@ -6724,6 +6775,43 @@ pub fn parse_pyproject(text: &str) -> Result<Option<ToolMuru>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_releases_relative_roots_are_taken_from_its_source_and_must_be_there() {
+        let source = std::env::temp_dir().join(format!("muru-roots-{}", std::process::id()));
+        std::fs::create_dir_all(source.join("media")).unwrap();
+        let roots = vec!["media".to_owned(), "/srv/elsewhere".to_owned()];
+
+        assert_eq!(
+            sendfile_root_paths(&roots, &source),
+            [
+                source.join("media").display().to_string(),
+                "/srv/elsewhere".to_owned()
+            ]
+        );
+        assert!(check_sendfile(&roots, None).is_ok());
+
+        // An absolute root may be made later; a relative one is part of
+        // the release.
+
+        assert!(check_sendfile_dirs(&roots, &source).is_ok());
+        let missing = check_sendfile_dirs(&["reports".to_owned()], &source).unwrap_err();
+        assert!(
+            missing.contains("\"reports\" is not a directory in"),
+            "{missing}"
+        );
+        assert!(check_sendfile(&[" ".to_owned()], None).is_err());
+
+        // An upstream's roots have no source to be taken from.
+
+        let upstream = Upstream {
+            addresses: vec!["127.0.0.1:9000".to_owned()],
+            sendfile_roots: vec!["media".to_owned()],
+            ..Default::default()
+        };
+        assert!(check_upstream(&upstream).unwrap_err().contains("absolute"));
+        std::fs::remove_dir_all(&source).unwrap();
+    }
 
     #[test]
     fn instance_is_a_key_of_the_local_file_alone() {

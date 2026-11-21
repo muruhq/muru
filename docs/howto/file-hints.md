@@ -61,28 +61,55 @@ status other than 200 sends the whole file with that status. The
 `X-Muru-Sendfile` header itself never reaches the client.
 
 The edge opens the path as its own user, and only within the
-directories the mount's `sendfile_roots` lists, compared by canonical
-path, so neither a relative path nor one that climbs out through a
-symbolic link is served:
+directories the mount's `sendfile_roots` lists. A relative root is
+taken from the release's source directory, so the setting travels with
+the project and means the same in every release and under `muructl
+run`, `muructl serve` and the daemon; an absolute root is used as
+written:
 
 ```toml
-[app.media.release.r4]
-source = '/srv/media'
-sendfile_roots = ['/srv/media/files', '/var/cache/thumbnails']
+[tool.muru]
+sendfile_roots = ['media', 'build/reports']
 
-[app.media.release.r4.mounts.archive]
+[tool.muru.mounts.archive]
 path = '/archive'
 entrypoint = 'media.archive:application'
 sendfile_roots = ['/srv/archive']
 ```
 
+A relative root must be a directory in the release's source when the
+release is deployed, or the deploy fails, as it does for a static
+entry's directory; `muructl run` refuses to start without it. An
+absolute root may be made or mounted later. The source directory as a
+whole is never a root unless it is named.
+
 The release's roots apply to its default mount and to every mount that
-does not list its own; without any, every path hint is refused. A path
-outside the roots is answered 500 `sendfile_refused` and logged with
-the path; a path that names nothing, or not a regular file, is 404
-`sendfile_missing`. `muructl deploy --sendfile-root DIR` sets the
-release's roots from the command line, and `muructl run` reads
-`sendfile_roots` from the project's `[tool.muru]` table.
+does not list its own; without any, every path hint is refused. The
+hint must name an absolute path, under a root by its leading
+components, either the root as configured or the directory it leads
+to. The file is then opened beneath the root, one name at a time from
+the root's own open directory, and is never opened again by its path:
+
+- A symbolic link beneath a root is followed only when its target is
+  relative and stays beneath the root, so `media/latest.pdf ->
+  reports/2026.pdf` is served and `media/escape -> ../settings.py` is
+  not. An absolute link is refused, even one naming a file inside the
+  root, and so is a path that climbs out with `..`.
+
+- A root itself may be a symbolic link, as may the directories above
+  it: an operator can move a root to another disk and leave a link in
+  its place, with no change of configuration. Each hint checks that the
+  root's path still leads to the directory being used, and opens the
+  new one when it has been moved.
+
+A path that is relative, outside the roots, or leaves its root is
+answered 500 `sendfile_refused` and logged with the path; a path that
+names nothing, or not a regular file, or a file or root that cannot be
+opened, is 404 `sendfile_missing`. `muructl deploy --sendfile-root
+DIR` sets the release's roots from the command line, a relative one
+taken from the source, and `muructl run` reads `sendfile_roots` from
+the project's `[tool.muru]` table. In a file `muructl apply` reads, a
+release's roots, and its mounts', are taken from its `source` too.
 
 Frameworks and middleware that already speak another server's header
 keep working: `sendfile_header = 'X-Sendfile'` on a release or a mount
@@ -105,6 +132,9 @@ sendfile_roots = ['/srv/legacy/media']
 sendfile_header = 'X-Sendfile'
 ```
 
+An upstream's roots are absolute; in a file `muructl apply` reads, a
+relative one is taken from the file's directory.
+
 A [managed HTTP server](managed-servers.md) release is trusted as an
-upstream, and its release's `sendfile_roots` and `sendfile_header`
-apply to the server's responses.
+upstream, and its release's `sendfile_roots`, relative ones taken from
+its source, and `sendfile_header` apply to the server's responses.

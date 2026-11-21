@@ -218,19 +218,25 @@ pub struct RedirectFlags {
 /// managed server's responses may give.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sendfile {
-    /// Directories a hinted path must lie in, compared by canonical path
-    /// when the hint arrives; with none every path hint is refused.
-    pub roots: Vec<std::path::PathBuf>,
+    /// Directories a hinted path must lie in, held open once used, a
+    /// hinted file opened beneath its root; with none every path hint is
+    /// refused.
+    pub roots: Vec<Arc<muru_common::beneath::Root>>,
     /// A second response header honoured as X-Muru-Sendfile is, in lower
     /// case: `x-sendfile` for the frameworks that send that one.
     pub header: Option<String>,
 }
 
 impl Sendfile {
-    /// The policy a snapshot's roots and header name describe.
+    /// The policy a snapshot's roots and header name describe. The roots
+    /// are absolute: the daemon or muructl resolves a release's relative
+    /// ones against its source before they reach the edge.
     pub fn new(roots: &[String], header: &str) -> Arc<Self> {
         Arc::new(Self {
-            roots: roots.iter().map(std::path::PathBuf::from).collect(),
+            roots: roots
+                .iter()
+                .map(|root| Arc::new(muru_common::beneath::Root::new(root)))
+                .collect(),
             header: (!header.is_empty()).then(|| header.to_ascii_lowercase()),
         })
     }

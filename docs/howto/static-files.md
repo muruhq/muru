@@ -114,9 +114,16 @@ cache = { max_age = '1y', immutable = true, except = ['index.html'] }
 
 Hidden files and directories (names starting with a dot) are never
 served and fall through to the fallback. A path is percent-decoded and
-normalised before the file is looked up, `..` never climbs out, and the
-file's canonical path must lie inside the directory, so a symbolic link
-pointing elsewhere is refused. Each name in the path must match the name
+normalised before the file is looked up, and `..` never climbs out. The
+file is opened beneath the directory, one name at a time from the
+directory's own open descriptor, and what is sent is read from that
+open file, never from a path looked up again. A symbolic link inside
+the directory is followed only when its target is relative and stays
+inside, so `latest.css -> v2/site.css` is served while a link to
+`../secrets` or to any absolute path is not. The directory itself may
+be a symbolic link, to another disk for example, and when it is pointed
+somewhere else the next request serves from the new directory. Each
+name in the path must match the name
 on disk exactly, in case and in Unicode form, so a request for
 `logo.png` does not serve `Logo.PNG` on macOS the way the file system
 would; `case = 'insensitive'` opts a route out of that check.
