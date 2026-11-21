@@ -1338,14 +1338,13 @@ async fn handle_request(
     let websocket = head.scope == pb::Scope::Websocket as i32;
 
     // Section 11.7: when the edge asked for a record, the request's log
-    // records are kept from now until the record is sent.
+    // records are kept from when its job runs until the record is sent.
+    // The job holds the GIL; this task must not wait for it (issue 836).
 
     let trace = shared.request_trace(request_id);
     let edge_id = head.request_id.clone();
-
-    if let Some(trace) = &trace {
-        record::start_logs(&edge_id, trace);
-    }
+    let job_trace = trace.clone();
+    let job_edge_id = edge_id.clone();
 
     // Section 6.14: the request may be handed to the event loop, which
     // then finishes it; the slot is how this task learns of it.
@@ -1361,6 +1360,11 @@ async fn handle_request(
     let worker_shared = Arc::clone(shared);
     let queued = pool.spawn(Box::new(move |py| {
         worker_shared.request_on_this_thread(request_id);
+
+        if let Some(trace) = &job_trace {
+            record::start_logs(py, &job_edge_id, trace);
+        }
+
         let fds: Vec<RawFd> = uploads.iter().map(AsRawFd::as_raw_fd).collect();
         let handed_off = wsgi::run(
             py,
@@ -1520,7 +1524,7 @@ async fn handle_request(
     // Section 11.7: the worker's part of the record follows the response.
 
     if let Some(trace) = trace {
-        let logs = record::take_logs(&edge_id);
+        let logs = record::take_logs(edge_id, Arc::clone(&trace)).await;
         let record = trace.to_message(cancelled.load(Ordering::Relaxed), logs);
         write_record(writer, &record).await?;
     }
@@ -1563,13 +1567,13 @@ async fn handle_asgi_request(
     shared.request_outgoing(request_id, out_tx.clone());
 
     // Section 11.7: when the edge asked for a record, the request's log
-    // records are kept from before the task starts until it is sent.
+    // records are kept from before the task starts until it is sent;
+    // starting the task keeps them.
 
     let trace = shared.request_trace(request_id);
 
     if let Some(trace) = &trace {
         trace.on_loop();
-        record::start_logs(&head.request_id, trace);
     }
 
     let aborted = AtomicBool::new(false);
@@ -1582,7 +1586,15 @@ async fn handle_asgi_request(
     };
 
     let channel = match asgi::start(
-        shared, asgi, &runner, &head, &fds, out_tx, request_id, offer,
+        shared,
+        asgi,
+        &runner,
+        &head,
+        &fds,
+        out_tx,
+        request_id,
+        offer,
+        trace.as_deref(),
     ) {
         Ok(channel) => channel,
         Err(error) => {
@@ -1688,7 +1700,7 @@ async fn handle_asgi_request(
     // Section 11.7: the worker's part of the record follows the response.
 
     if let Some(trace) = trace {
-        let logs = record::take_logs(&head.request_id);
+        let logs = record::take_logs(head.request_id.clone(), Arc::clone(&trace)).await;
         let record = trace.to_message(aborted.load(Ordering::Relaxed), logs);
         write_record(writer, &record).await?;
     }

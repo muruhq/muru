@@ -79,19 +79,27 @@ def start(gil_stall: str) -> support.Server:
     reason="a free-threaded build has no interpreter lock to hold",
 )
 def test_a_worker_holding_the_gil_is_replaced() -> None:
-    server = start("1s")
+    server = start("2s")
 
     try:
         stuck = pid_serving(server)
         assert stuck is not None
-        answers: list[support.Response] = []
-        thread = threading.Thread(
-            target=lambda: answers.append(
-                server.get("/hold?seconds=60", headers={"Accept": "application/json"})
-            ),
-            daemon=True,
-        )
-        thread.start()
+        answers: dict[str, support.Response] = {}
+
+        def ask(path: str) -> None:
+            answers[path] = server.get(path, headers={"Accept": "application/json"})
+
+        held = threading.Thread(target=ask, args=("/hold?seconds=60",), daemon=True)
+        held.start()
+
+        # Issue 836: a second request reaches the worker while the first
+        # holds the lock. The run records its requests, so the worker
+        # keeps each one's log records, which it must not wait on the
+        # lock to start.
+
+        time.sleep(0.5)
+        waiting = threading.Thread(target=ask, args=("/info",), daemon=True)
+        waiting.start()
 
         # Nothing in the worker runs Python while the call holds the lock,
         # so the native watchdog tells the host, which replaces the worker
@@ -100,27 +108,32 @@ def test_a_worker_holding_the_gil_is_replaced() -> None:
         wait_for(lambda: "worker.gil_stalled" in server.log())
         wait_for(lambda: "worker.timeout_killed" in server.log())
         log = server.log()
-        assert "past the GIL stall timeout of 1 s" in log, log
-        assert "no thread of it ran Python for the GIL stall timeout of 1 s" in log, log
+        assert "past the GIL stall timeout of 2 s" in log, log
+        assert "no thread of it ran Python for the GIL stall timeout of 2 s" in log, log
         assert "hold_the_interpreter" in log, "no stack dump"
 
-        # The stuck request is answered when the worker is condemned, not
-        # when it is finally killed, since it cannot finish.
+        # Both requests are answered when the worker is condemned, not
+        # when it is finally killed, since neither can finish.
 
-        thread.join(timeout=10)
-        assert answers, "the stuck request was not answered"
-        assert answers[0].status == 502, answers[0].body
-        assert json.loads(answers[0].body)["reason"] == "worker_stalled"
-        assert "gave up 1 request for the edge to answer" in server.log()
+        held.join(timeout=10)
+        waiting.join(timeout=10)
+        assert set(answers) == {"/hold?seconds=60", "/info"}, answers
+
+        for answer in answers.values():
+            assert answer.status == 502, answer.body
+            assert json.loads(answer.body)["reason"] == "worker_stalled", answer.body
+
+        assert "gave up 2 requests for the edge to answer" in server.log()
 
         # Issue 715: the worker could not answer for its stacks, but named
         # the request it gave up, so its record has the kill.
 
-        request_id = answers[0].header("x-request-id")
+        answer = answers["/hold?seconds=60"]
+        request_id = answer.header("x-request-id")
         assert request_id is not None
         kill = kill_capture(server, request_id)
         assert kill["worker"] == "0" and kill["pid"] == stuck, kill
-        assert "GIL stall timeout of 1 s" in kill["reason"], kill
+        assert "GIL stall timeout of 2 s" in kill["reason"], kill
         assert "replaced by pid" in kill["message"], kill
         wait_for(lambda: pid_serving(server) not in (None, stuck))
         assert server.get("/sleep?seconds=0.1").status == 200

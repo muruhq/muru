@@ -127,6 +127,10 @@ pub struct Trace {
     /// Its waits so far on modules other threads were loading, in
     /// nanoseconds (issue 787).
     import_waits: Arc<AtomicU64>,
+    /// Whether the request's log records were taken, so that a job the
+    /// pool runs only after its request was given up does not start
+    /// keeping them again (issue 836).
+    logs_taken: AtomicBool,
     state: Mutex<State>,
 }
 
@@ -179,6 +183,7 @@ impl Trace {
             gc_before: crate::gc::totals(),
             imports: Arc::default(),
             import_waits: Arc::default(),
+            logs_taken: AtomicBool::new(false),
             state: Mutex::new(State {
                 default_source,
                 ..State::default()
@@ -491,87 +496,106 @@ fn capture(py: Python<'_>) -> PyResult<&Capture> {
 
 /// Start keeping a request's log records, panels and first-time module
 /// loads, the loads on the clock of its `trace`.
-pub fn start_logs(request_id: &str, trace: &Trace) {
-    Python::attach(|py| {
-        let started = capture(py).and_then(|capture| {
-            capture.logs_start.call1(py, (request_id,))?;
-            capture.panels_start.call1(py, (request_id,))?;
+///
+/// It runs on a thread that holds the interpreter already, the pool's
+/// or the event loop's, never on the request's task: a request that
+/// arrives while another thread holds the GIL must still read what the
+/// worker sends it, such as being given up at a GIL stall (issue 836).
+pub fn start_logs(py: Python<'_>, request_id: &str, trace: &Trace) {
+    if trace.logs_taken.load(Ordering::Relaxed) {
+        return;
+    }
 
-            let tally = Py::new(py, ImportTally(Arc::clone(&trace.imports)))?;
-            let waits = Py::new(py, ImportTally(Arc::clone(&trace.import_waits)))?;
-            let since = trace.started.elapsed().as_secs_f64();
-            capture
-                .imports_start
-                .call1(py, (request_id, tally, since, waits))
-        });
+    let started = capture(py).and_then(|capture| {
+        capture.logs_start.call1(py, (request_id,))?;
+        capture.panels_start.call1(py, (request_id,))?;
 
-        if let Err(error) = started {
-            tracing::debug!(%error, "the request's log records cannot be kept");
-        }
+        let tally = Py::new(py, ImportTally(Arc::clone(&trace.imports)))?;
+        let waits = Py::new(py, ImportTally(Arc::clone(&trace.import_waits)))?;
+        let since = trace.started.elapsed().as_secs_f64();
+        capture
+            .imports_start
+            .call1(py, (request_id, tally, since, waits))
     });
+
+    if let Err(error) = started {
+        tracing::debug!(%error, "the request's log records cannot be kept");
+    }
 }
 
-/// Stop keeping a request's log records and panels, and take them.
-pub fn take_logs(request_id: &str) -> Logs {
-    Python::attach(|py| {
-        let Ok(capture) = capture(py) else {
-            return Logs::default();
-        };
+/// Stop keeping a request's log records and panels, and take them, on a
+/// blocking thread, so that the request's task never waits for the GIL
+/// on the link's runtime (issue 836).
+pub async fn take_logs(request_id: String, trace: Arc<Trace>) -> Logs {
+    tokio::task::spawn_blocking(move || {
+        Python::attach(|py| {
+            trace.logs_taken.store(true, Ordering::Relaxed);
+            taken_logs(py, &request_id)
+        })
+    })
+    .await
+    .unwrap_or_default()
+}
 
-        let (kept, dropped) = capture
-            .logs_take
-            .call1(py, (request_id,))
-            .and_then(|taken| taken.extract::<(Vec<(f64, String, String, String)>, u32)>(py))
-            .unwrap_or_default();
+/// Take a request's log records, panels and module loads.
+fn taken_logs(py: Python<'_>, request_id: &str) -> Logs {
+    let Ok(capture) = capture(py) else {
+        return Logs::default();
+    };
 
-        let panels = capture
-            .panels_take
-            .call1(py, (request_id,))
-            .and_then(|taken| panels(taken.bind(py)))
-            .unwrap_or_else(|error| {
-                tracing::debug!(%error, "the request's panels cannot be taken");
-                Vec::new()
-            });
+    let (kept, dropped) = capture
+        .logs_take
+        .call1(py, (request_id,))
+        .and_then(|taken| taken.extract::<(Vec<(f64, String, String, String)>, u32)>(py))
+        .unwrap_or_default();
 
-        let (loads, modules_loaded, modules_ms, waits) = capture
-            .imports_take
-            .call1(py, (request_id,))
-            .and_then(|taken| taken.extract::<TakenLoads>(py))
-            .unwrap_or_else(|error| {
-                tracing::debug!(%error, "the request's module loads cannot be taken");
-                TakenLoads::default()
-            });
+    let panels = capture
+        .panels_take
+        .call1(py, (request_id,))
+        .and_then(|taken| panels(taken.bind(py)))
+        .unwrap_or_else(|error| {
+            tracing::debug!(%error, "the request's panels cannot be taken");
+            Vec::new()
+        });
 
-        Logs {
-            kept,
-            dropped,
-            panels,
-            module_loads: loads
-                .into_iter()
-                .map(
-                    |(at, ms, module, trigger, depth, deferred)| pb::ModuleLoad {
-                        module,
-                        at,
-                        ms,
-                        depth,
-                        trigger,
-                        deferred,
-                    },
-                )
-                .collect(),
-            modules_loaded,
-            modules_ms,
-            import_waits: waits
-                .into_iter()
-                .map(|(at, ms, module, loader)| pb::ImportWait {
+    let (loads, modules_loaded, modules_ms, waits) = capture
+        .imports_take
+        .call1(py, (request_id,))
+        .and_then(|taken| taken.extract::<TakenLoads>(py))
+        .unwrap_or_else(|error| {
+            tracing::debug!(%error, "the request's module loads cannot be taken");
+            TakenLoads::default()
+        });
+
+    Logs {
+        kept,
+        dropped,
+        panels,
+        module_loads: loads
+            .into_iter()
+            .map(
+                |(at, ms, module, trigger, depth, deferred)| pb::ModuleLoad {
                     module,
                     at,
                     ms,
-                    loader,
-                })
-                .collect(),
-        }
-    })
+                    depth,
+                    trigger,
+                    deferred,
+                },
+            )
+            .collect(),
+        modules_loaded,
+        modules_ms,
+        import_waits: waits
+            .into_iter()
+            .map(|(at, ms, module, loader)| pb::ImportWait {
+                module,
+                at,
+                ms,
+                loader,
+            })
+            .collect(),
+    }
 }
 
 /// A request's loads as `muru._imports._take` gives them: each one's
