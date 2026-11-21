@@ -425,6 +425,13 @@ def test_a_daemon_that_exits_at_start_is_reported_with_its_log(tmp_path: Path) -
     assert "the daemon exited before it answered (exit status: 1)" in started.stderr
     assert "cannot listen on" in started.stderr, started.stderr
 
+    # Issue 837: the program holding the address is named, as lsof or ss
+    # say of it, though it is not an instance of Muru's.
+
+    assert f"(pid {os.getpid()}); choose another listener, or stop it" in started.stderr, (
+        started.stderr
+    )
+
     # Every line of daemon.log, the error it exited with among them,
     # starts with the full UTC time.
 

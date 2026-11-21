@@ -475,6 +475,59 @@ pub fn in_use_by_instance(address: std::net::SocketAddr, choose: &str) -> Option
     ))
 }
 
+/// What to say of a bind refused because `address` is in use: the live
+/// instance that holds it, as `in_use_by_instance` says, or else the
+/// program lsof or ss name, `port 8000 on 127.0.0.1 is in use by
+/// python3.14 (pid 4123); CHOOSE, or stop it`. None when neither is
+/// found.
+pub fn in_use_by(address: std::net::SocketAddr, choose: &str) -> Option<String> {
+    if let Some(message) = in_use_by_instance(address, choose) {
+        return Some(message);
+    }
+
+    let holder = port_holder(address.port())?;
+
+    Some(format!(
+        "port {} on {} is in use by {holder}; {choose}, or stop it",
+        address.port(),
+        address.ip()
+    ))
+}
+
+/// The process listening on a TCP port, as "command (pid N)", found with
+/// lsof or ss when either is installed.
+pub fn port_holder(port: u16) -> Option<String> {
+    let lsof = std::process::Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
+
+    if let Some(output) = lsof {
+        let text = String::from_utf8_lossy(&output.stdout);
+        let pid = text.lines().find_map(|line| line.strip_prefix('p'));
+        let command = text.lines().find_map(|line| line.strip_prefix('c'));
+
+        if let (Some(pid), Some(command)) = (pid, command) {
+            return Some(format!("{command} (pid {pid})"));
+        }
+    }
+
+    let ss = std::process::Command::new("ss")
+        .args(["-lptnH", &format!("sport = :{port}")])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let text = String::from_utf8_lossy(&ss.stdout);
+
+    // users:(("python3",pid=1234,fd=5))
+
+    let users = text.split("users:((\"").nth(1)?;
+    let (command, rest) = users.split_once('"')?;
+    let pid = rest.split("pid=").nth(1)?.split(',').next()?;
+    Some(format!("{command} (pid {pid})"))
+}
+
 /// The registries every user may hold an address in that the caller can
 /// read: its own and the system daemon's.
 pub fn readable_registries() -> Vec<PathBuf> {

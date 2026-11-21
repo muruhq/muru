@@ -961,18 +961,8 @@ fn explain_bind_error(error: anyhow::Error, https: SocketAddr) -> anyhow::Error 
     // Section 13.8: another instance of Muru's is named as an instance,
     // and only another program by what lsof or ss say of it.
 
-    if let Some(message) = muru_controller::registry::in_use_by_instance(
-        address,
-        &format!("choose another with {flag}"),
-    ) {
-        return anyhow::anyhow!(message);
-    }
-
-    match port_holder(port) {
-        Some(holder) => anyhow::anyhow!(
-            "port {port} on {} is in use by {holder}; choose another with {flag}, or stop it",
-            address.ip()
-        ),
+    match muru_controller::registry::in_use_by(address, &format!("choose another with {flag}")) {
+        Some(message) => anyhow::anyhow!(message),
         None => anyhow::anyhow!(
             "port {port} on {} is in use; choose another with {flag} ({flag} auto picks a free one)",
             address.ip()
@@ -1011,7 +1001,7 @@ fn explain_dashboard_error(error: anyhow::Error, address: &str) -> anyhow::Error
         );
     }
 
-    let holder = parsed.and_then(|bound| port_holder(bound.port()));
+    let holder = parsed.and_then(|bound| muru_controller::registry::port_holder(bound.port()));
 
     match holder {
         Some(holder) => anyhow::anyhow!(
@@ -1020,40 +1010,6 @@ fn explain_dashboard_error(error: anyhow::Error, address: &str) -> anyhow::Error
         ),
         None => anyhow::anyhow!("the dashboard's address {address} is in use; {instead}"),
     }
-}
-
-/// The process listening on a TCP port, as "command (pid N)", found with
-/// lsof or ss when either is installed.
-fn port_holder(port: u16) -> Option<String> {
-    let lsof = std::process::Command::new("lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success());
-
-    if let Some(output) = lsof {
-        let text = String::from_utf8_lossy(&output.stdout);
-        let pid = text.lines().find_map(|line| line.strip_prefix('p'));
-        let command = text.lines().find_map(|line| line.strip_prefix('c'));
-
-        if let (Some(pid), Some(command)) = (pid, command) {
-            return Some(format!("{command} (pid {pid})"));
-        }
-    }
-
-    let ss = std::process::Command::new("ss")
-        .args(["-lptnH", &format!("sport = :{port}")])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())?;
-    let text = String::from_utf8_lossy(&ss.stdout);
-
-    // users:(("python3",pid=1234,fd=5))
-
-    let users = text.split("users:((\"").nth(1)?;
-    let (command, rest) = users.split_once('"')?;
-    let pid = rest.split("pid=").nth(1)?.split(',').next()?;
-    Some(format!("{command} (pid {pid})"))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

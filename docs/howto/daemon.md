@@ -624,8 +624,13 @@ muru: error: the daemon exited before it answered (exit status: 1); from /var/lo
   2026-11-02T05:40:11.204Z muru: run: /run/muru (default)
   2026-11-02T05:40:11.204Z muru: logs: /var/log/muru (default)
   2026-11-02T05:40:11.204Z muru: cache: /var/cache/muru (default)
-  2026-11-02T05:40:11.209Z muru: error: cannot listen on 0.0.0.0:80: Address already in use (os error 98)
+  2026-11-02T05:40:11.209Z muru: error: cannot listen on 0.0.0.0:80: port 80 on 0.0.0.0 is in use by nginx (pid 812); choose another listener, or stop it
 ```
+
+A listener whose address another program holds names that program and
+its pid, found with lsof or ss when either is installed, or the instance
+of Muru's that holds it, as a reload that adds a listener does too.
+Without either, the error is the operating system's own.
 
 A daemon owns its state directory and its run directory for as long as
 it runs, through a lock on `daemon.lock` in each. A second daemon given
