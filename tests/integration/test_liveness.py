@@ -58,9 +58,9 @@ def kill_capture(server: support.Server, request_id: str) -> dict[str, Any]:
         time.sleep(0.1)
 
 
-def start(gil_stall: str) -> support.Server:
+def start(gil_stall: str, app: str = "plain_wsgi:application") -> support.Server:
     return support.start(
-        "plain_wsgi:application",
+        app,
         workers=1,
         threads=2,
         args=[
@@ -78,8 +78,9 @@ def start(gil_stall: str) -> support.Server:
     not support.workers_have_a_gil(),
     reason="a free-threaded build has no interpreter lock to hold",
 )
-def test_a_worker_holding_the_gil_is_replaced() -> None:
-    server = start("2s")
+@pytest.mark.parametrize("app", ["plain_wsgi:application", "plain_asgi:application"])
+def test_a_worker_holding_the_gil_is_replaced(app: str) -> None:
+    server = start("2s", app)
 
     try:
         stuck = pid_serving(server)
@@ -95,7 +96,8 @@ def test_a_worker_holding_the_gil_is_replaced() -> None:
         # Issue 836: a second request reaches the worker while the first
         # holds the lock. The run records its requests, so the worker
         # keeps each one's log records, which it must not wait on the
-        # lock to start.
+        # lock to start. Issue 842: an ASGI request must not wait on it
+        # to start its task on the loop either.
 
         time.sleep(0.5)
         waiting = threading.Thread(target=ask, args=("/info",), daemon=True)
