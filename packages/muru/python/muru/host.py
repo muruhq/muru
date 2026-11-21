@@ -2543,7 +2543,12 @@ class Host:
         self.relay_outgoing.clear()
 
     def read_relay(self) -> None:
-        """Read which pipes the relay has read to their end, and close them."""
+        """Read which pipes the relay has read to their end, and close them.
+
+        A flush the relay asks for is answered behind every offer already
+        queued for it, so the relay has every pipe held once it reads the
+        answer (issue 838).
+        """
 
         assert self.relay is not None
 
@@ -2564,12 +2569,19 @@ class Host:
             line, _, self.relay_buffer = self.relay_buffer.partition(b"\n")
 
             try:
-                number = json.loads(line).get("ended")
+                message = json.loads(line)
+                number = message.get("ended")
+                flush = message.get("flush")
             except (ValueError, AttributeError):
                 continue
 
             if isinstance(number, int):
                 self.release_pipe(number)
+
+            if isinstance(flush, int):
+                answer = json.dumps({"flushed": flush}, separators=(",", ":")).encode() + b"\n"
+                self.relay_outgoing.append((answer, None))
+                self.flush_relay()
 
     def release_pipe(self, number: int) -> None:
         """Close a held pipe once a relay has read it to its end."""
@@ -5123,6 +5135,26 @@ def elapsed_ms(since: float) -> str:
     return f"{(time.monotonic() - since) * 1000:.0f}"
 
 
+def call_host_hook(hooks: Hooks, hook: str, context: Context) -> bool:
+    """Run one of the host's hooks, on_load or pre_fork, and time it.
+
+    When the hooks module defines the hook, its time is logged once it
+    returns (issue 846). Returns whether the hook completed, as
+    `Hooks.call_logged` does.
+    """
+
+    if not hooks.has(hook):
+        return True
+
+    started = time.monotonic()
+
+    if not hooks.call_logged(hook, context):
+        return False
+
+    log(f"{hook} hook ran in {elapsed_ms(started)} ms")
+    return True
+
+
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     """Parse the host's command line."""
 
@@ -5705,32 +5737,43 @@ def _main(argv: list[str] | None) -> int:
                 instruments.finished(context, _instrumentation.FAILED)
                 return 1
 
-            if not hooks.call_logged("on_load", context):
+            # Issue 846: the import's line and time come before on_load
+            # runs, so the hook's output follows the line saying the
+            # application is loaded, and a slow hook is not a slow import.
+
+            log(f"preloaded {args.app} in {elapsed_ms(started)} ms")
+
+            # A preloaded application has settled its interface by now; a
+            # per-worker factory settles it in each worker.
+
+            if release.resolved is not None:
+                log(f"{args.app} is served as {interface_name(release.resolved)}")
+
+            for mount in mounts:
+                if mount.release.resolved is not None:
+                    log(
+                        f"mount {mount.name}: {mount.release.spec} is served as "
+                        f"{interface_name(mount.release.resolved)}"
+                    )
+
+            if not call_host_hook(hooks, "on_load", context):
                 instruments.finished(context, _instrumentation.FAILED)
                 return 1
 
-        loaded_ms = (time.monotonic() - started) * 1000.0
-        log(f"preloaded {args.app} in {elapsed_ms(started)} ms")
+        # The load's time, for muru_release_load_seconds and the
+        # release.loaded event, counts on_load: it is how long the host
+        # took until it could fork.
 
-        # A preloaded application has settled its interface by now; a
-        # per-worker factory settles it in each worker.
+        loaded_ms = (time.monotonic() - started) * 1000.0
 
         if release.resolved is not None:
             set_context(release.context)
-            log(f"{args.app} is served as {interface_name(release.resolved)}")
-
-        for mount in mounts:
-            if mount.release.resolved is not None:
-                log(
-                    f"mount {mount.name}: {mount.release.spec} is served as "
-                    f"{interface_name(mount.release.resolved)}"
-                )
 
         # Section 6.2: pre_fork runs once, before the import check, so
         # that what it closes is not reported as crossing the fork. With
         # --single nothing forks, so it has no occasion.
 
-        if not args.single and not hooks.call_logged("pre_fork", context):
+        if not args.single and not call_host_hook(hooks, "pre_fork", context):
             instruments.finished(context, _instrumentation.FAILED)
             return 1
 

@@ -5152,6 +5152,12 @@ async fn run_with(
                                     }
                                 }
 
+                                // Issue 838: what the new release's workers
+                                // wrote before they were ready comes first.
+                                // A relay that cannot flush in time does not
+                                // hold up the switch.
+
+                                next.flush_output().await;
                                 muru_common::muru_println!("switched to release r{release}");
                                 release_number.store(release, Ordering::Relaxed);
                                 let previous = std::mem::replace(&mut current, next);

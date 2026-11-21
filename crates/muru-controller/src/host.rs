@@ -3,7 +3,7 @@
 //! SIGTERM (design specification sections 6.1 and 13.1).
 
 use std::collections::HashMap;
-use std::os::fd::{AsFd as _, AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -1007,7 +1007,14 @@ pub struct HostProcess {
 }
 
 /// The tasks reading what relays write to this process.
-type SharedRelays = Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+type SharedRelays = Arc<std::sync::Mutex<Vec<RelayReading>>>;
+
+/// A task reading what a relay writes to this process, and the way to
+/// ask it to write everything the relay has written so far.
+struct RelayReading {
+    task: tokio::task::JoinHandle<()>,
+    flushes: mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
+}
 
 /// A host this process spawned, or one it adopted from a previous daemon.
 enum Process {
@@ -1816,6 +1823,50 @@ impl HostProcess {
         }
     }
 
+    /// Have what the release's workers and host have written so far
+    /// reach this process's streams (issue 838): the release's relay
+    /// reads every pipe it has, or has been offered, until it would
+    /// block and writes what it holds; then what it wrote to this process
+    /// is read and written. Gives up after `OUTPUT_FLUSH`, saying whether
+    /// it finished. A relay writing a release log has nothing to flush
+    /// here.
+    pub async fn flush_output(&self) -> bool {
+        let readings: Vec<_> = self
+            .relays
+            .lock()
+            .expect("relays poisoned")
+            .iter()
+            .filter(|reading| !reading.task.is_finished())
+            .map(|reading| reading.flushes.clone())
+            .collect();
+
+        if readings.is_empty() {
+            return true;
+        }
+
+        let control = self.run_dir.join(crate::relay::CONTROL_SOCKET);
+
+        let flushed = tokio::time::timeout(OUTPUT_FLUSH, async {
+            // What the relay could not flush is still read here.
+
+            let relayed = crate::relay::flush(&control).await.is_ok();
+
+            for reading in readings {
+                let (asked, answered) = tokio::sync::oneshot::channel();
+
+                if reading.send(asked).is_ok() {
+                    let _ = answered.await;
+                }
+            }
+
+            relay_writer_flushed().await;
+            relayed
+        })
+        .await;
+
+        flushed.unwrap_or(false)
+    }
+
     /// The pid of the release's log relay, while one runs.
     pub fn relay_pid(&self) -> Option<u32> {
         let pid = self.relay.pid();
@@ -2073,9 +2124,16 @@ fn listening(socket: &Path) -> bool {
 }
 
 /// Copy a host stream to the matching stream of this process, line by
-/// line, keeping each line for the dashboard.
-async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
-    let mut lines = BufReader::new(stream).lines();
+/// line, keeping each line for the dashboard. A flush asked for on
+/// `flushes` has every whole line the stream holds now handed to the
+/// writer, with any traceback being gathered, before it is answered.
+async fn relay<R: AsyncRead + AsFd + Unpin>(
+    stream: R,
+    logs: Logs,
+    to_stderr: bool,
+    mut flushes: mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>>,
+) {
+    let mut lines = StreamLines::new(stream);
 
     let out = if to_stderr {
         Stream::Stderr
@@ -2083,33 +2141,162 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
         Stream::Stdout
     };
 
-    // Section 11.8: the time is the relay's, put in front when the
-    // terminal asks for it with --timestamps. When lines are
-    // JSON records, each source's traceback is gathered and written as
-    // one record, once its exception's line is followed by something
-    // else or nothing more has come for a moment.
-
-    let mut gathering: HashMap<String, Gathering> = HashMap::new();
+    let mut relaying = Relaying {
+        out,
+        logs,
+        gathering: HashMap::new(),
+    };
 
     loop {
-        // None is a moment with nothing read, which only lets stale
-        // tracebacks go.
+        // A quiet moment, with a traceback being gathered, only lets
+        // stale tracebacks go.
 
-        let next = if gathering.is_empty() {
-            Some(lines.next_line().await)
+        let wait = if relaying.gathering.is_empty() {
+            Duration::MAX
         } else {
-            tokio::time::timeout(TRACEBACK_WAIT, lines.next_line())
-                .await
-                .ok()
+            TRACEBACK_WAIT
         };
 
-        let line = match next {
-            None => None,
-            Some(Ok(Some(line))) => Some(line),
-            Some(_) => break,
-        };
+        tokio::select! {
+            biased;
+            Some(answer) = flushes.recv() => {
+                lines.read_now();
 
-        let stale: Vec<String> = gathering
+                while let Some(line) = lines.whole_line() {
+                    relaying.stale().await;
+                    relaying.line(line).await;
+                }
+
+                relaying.all().await;
+                let _ = answer.send(());
+            }
+            next = tokio::time::timeout(wait, lines.next_line()) => {
+                relaying.stale().await;
+
+                match next {
+                    Ok(Some(line)) => relaying.line(line).await,
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    relaying.all().await;
+}
+
+/// A stream read into lines, with a buffer of its own rather than a
+/// buffered reader's, so that a read a `select!` cancels loses nothing
+/// and a flush can read what the stream holds now.
+struct StreamLines<R> {
+    stream: R,
+    pending: Vec<u8>,
+    chunk: Vec<u8>,
+    ended: bool,
+}
+
+impl<R: AsyncRead + AsFd + Unpin> StreamLines<R> {
+    fn new(stream: R) -> Self {
+        Self {
+            stream,
+            pending: Vec::new(),
+            chunk: vec![0u8; 64 * 1024],
+            ended: false,
+        }
+    }
+
+    /// The next whole line already read, without its line ending.
+    fn whole_line(&mut self) -> Option<String> {
+        let at = self.pending.iter().position(|byte| *byte == b'\n')?;
+        let line: Vec<u8> = self.pending.drain(..=at).collect();
+        Some(text_of(&line[..at]))
+    }
+
+    /// The next line, the last one at the end whether whole or not; none
+    /// once the stream has ended or failed.
+    async fn next_line(&mut self) -> Option<String> {
+        use tokio::io::AsyncReadExt as _;
+
+        loop {
+            if let Some(line) = self.whole_line() {
+                return Some(line);
+            }
+
+            if self.ended {
+                if self.pending.is_empty() {
+                    return None;
+                }
+
+                let rest = std::mem::take(&mut self.pending);
+                return Some(text_of(&rest));
+            }
+
+            match self.stream.read(&mut self.chunk).await {
+                Ok(0) | Err(_) => self.ended = true,
+                Ok(count) => self.pending.extend_from_slice(&self.chunk[..count]),
+            }
+        }
+    }
+
+    /// Read what the stream holds now, until it would block. The runtime
+    /// may not have heard yet that it is readable, and a read through it
+    /// would then wait for that, so the stream is read here through a
+    /// copy of its descriptor, which shares its non-blocking mode; what
+    /// the relay writes in the meantime is not waited for.
+    fn read_now(&mut self) {
+        use std::io::Read as _;
+
+        if self.ended {
+            return;
+        }
+
+        let Ok(copy) = self.stream.as_fd().try_clone_to_owned() else {
+            return;
+        };
+        let mut file = std::fs::File::from(copy);
+
+        for _ in 0..OUTPUT_FLUSH_READS {
+            match file.read(&mut self.chunk) {
+                Ok(0) => {
+                    self.ended = true;
+                    return;
+                }
+                Ok(count) => self.pending.extend_from_slice(&self.chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(_) => {
+                    self.ended = true;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// The most reads of a relay's stream a flush makes: enough for what the
+/// largest pipe Linux gives by default holds.
+const OUTPUT_FLUSH_READS: usize = 16;
+
+/// A line as text, without a carriage return before its newline; bytes
+/// that are not UTF-8 are replaced.
+fn text_of(line: &[u8]) -> String {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    String::from_utf8_lossy(line).into_owned()
+}
+
+/// What `relay` keeps between lines.
+struct Relaying {
+    out: Stream,
+    logs: Logs,
+    /// Each source's traceback being gathered, when lines are JSON.
+    gathering: HashMap<String, Gathering>,
+}
+
+impl Relaying {
+    /// Write the tracebacks that have had nothing more for a moment.
+    async fn stale(&mut self) {
+        let stale: Vec<String> = self
+            .gathering
             .iter()
             .filter(|(_, gathered)| {
                 gathered
@@ -2121,14 +2308,26 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
             .collect();
 
         for source in stale {
-            if let Some(mut gathered) = gathering.remove(&source) {
-                write_traceback(out, &source, &mut gathered).await;
+            if let Some(mut gathered) = self.gathering.remove(&source) {
+                write_traceback(self.out, &source, &mut gathered).await;
             }
         }
+    }
 
-        let Some(line) = line else {
-            continue;
-        };
+    /// Write every traceback being gathered as it is.
+    async fn all(&mut self) {
+        for (source, mut gathered) in self.gathering.drain() {
+            write_traceback(self.out, &source, &mut gathered).await;
+        }
+    }
+
+    /// Take one line. Section 11.8: the time is the relay's, put in front
+    /// when the terminal asks for it with --timestamps. When lines are
+    /// JSON records, each source's traceback is gathered and written as
+    /// one record, once its exception's line is followed by something
+    /// else or nothing more has come for a moment.
+    async fn line(&mut self, line: String) {
+        let out = self.out;
 
         // The log relay put the time on the line when it read it, so a
         // delay on the way here does not move it.
@@ -2138,11 +2337,11 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
             .and_then(muru_common::log::parse_full)
             .unwrap_or_else(SystemTime::now);
         let line = text.to_owned();
-        logs.push(time, &line);
+        self.logs.push(time, &line);
 
         if !muru_common::log::json() {
             write_relayed(out, time, &line).await;
-            continue;
+            return;
         }
 
         let (source, message) = match line.split_once(": ") {
@@ -2150,21 +2349,21 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
             _ => ("", line.as_str()),
         };
 
-        if let Some(gathered) = gathering.get_mut(source) {
+        if let Some(gathered) = self.gathering.get_mut(source) {
             match gathered.traceback.push(message) {
                 Gathered::Kept => {
                     gathered.updated = time;
-                    continue;
+                    return;
                 }
                 Gathered::Finished(text) => {
                     write_relayed(out, gathered.started, &tagged(source, &text)).await;
-                    gathering.remove(source);
+                    self.gathering.remove(source);
                 }
             }
         }
 
         if Traceback::starts(message) {
-            gathering.insert(
+            self.gathering.insert(
                 source.to_owned(),
                 Gathering {
                     started: time,
@@ -2172,14 +2371,10 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
                     traceback: Traceback::new(message),
                 },
             );
-            continue;
+            return;
         }
 
         write_relayed(out, time, &line).await;
-    }
-
-    for (source, gathered) in &mut gathering {
-        write_traceback(out, source, gathered).await;
     }
 }
 
@@ -2300,9 +2495,15 @@ async fn relayed_to_the_end(relays: &SharedRelays) {
     let taken = std::mem::take(&mut *relays.lock().expect("relays poisoned"));
 
     for relay in taken {
-        let _ = tokio::time::timeout(RELAY_END, relay).await;
+        let _ = tokio::time::timeout(RELAY_END, relay.task).await;
     }
 
+    let _ = tokio::time::timeout(RELAY_END, relay_writer_flushed()).await;
+}
+
+/// Resolve once the writer has written every line handed to it before
+/// now.
+async fn relay_writer_flushed() {
     let Some(writer) = relay_writer() else {
         return;
     };
@@ -2310,9 +2511,14 @@ async fn relayed_to_the_end(relays: &SharedRelays) {
     let (answer, written) = tokio::sync::oneshot::channel();
 
     if writer.send(Relayed::Flushed(answer)).await.is_ok() {
-        let _ = tokio::time::timeout(RELAY_END, written).await;
+        let _ = written.await;
     }
 }
+
+/// How long `HostProcess::flush_output` waits for a release's relay and
+/// this process's reading of it, so that a relay held up by a stalled
+/// destination under `block` does not hold up a switch.
+const OUTPUT_FLUSH: Duration = Duration::from_secs(1);
 
 /// What a release's log relay queues and does when full (section 11.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2471,8 +2677,12 @@ impl RelayLaunch {
         let mut child = command.spawn().context("running muructl relay")?;
 
         if let Some(stderr) = child.stderr.take() {
-            let reading = tokio::spawn(relay(stderr, logs.clone(), true));
-            relays.lock().expect("relays poisoned").push(reading);
+            let (flushes, asked) = mpsc::unbounded_channel();
+            let task = tokio::spawn(relay(stderr, logs.clone(), true, asked));
+            relays
+                .lock()
+                .expect("relays poisoned")
+                .push(RelayReading { task, flushes });
         }
 
         if let Some(pid) = child.id() {
@@ -2750,6 +2960,7 @@ async fn read_relay_reports(
                 message: event.message,
             }),
             crate::relay::Report::Reopened => reopens.send_modify(|count| *count += 1),
+            crate::relay::Report::Flushed => {}
         })
         .await;
 

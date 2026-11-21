@@ -128,6 +128,13 @@ in effect, `on_load` and `pre_fork` run in each worker before its
 `post_fork`, so hooks behave the same in both modes. An exception in a hook
 stops the worker, and the terminal says which hook and why.
 
+The host's log follows the same order. It says `preloaded APP in 6 ms`
+once the application is imported, with the import's own time, and only
+then runs `on_load`, so what the hook prints comes after that line. Each
+of the host's hooks the module defines then has a line of its own once
+it returns, `on_load hook ran in 500 ms` and `pre_fork hook ran in 2 ms`,
+so a slow hook is not taken for a slow import.
+
 Callbacks registered with `atexit` run in each worker as it stops, after
 the `on_exit` hook and while the event loop still runs, and in a worker
 that fails to start. Callbacks registered during preload run in every

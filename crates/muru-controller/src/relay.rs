@@ -21,6 +21,14 @@
 //! reading a worker whose queue is full. The relay reports its counts
 //! and stalls on `relay.sock`, a control socket of its own.
 //!
+//! A client of that socket may also ask the relay to flush (issue 838):
+//! the relay asks the host on `output.sock`, which answers once it has
+//! sent every pipe it holds, so the relay has taken them all; it then
+//! reads each pipe until it would block, waits for the writer to write
+//! everything queued before the request, and answers. muructl asks
+//! before it says it has switched to a new release, so that what the
+//! release's workers wrote before they were ready comes first.
+//!
 //! In its second mode (issue 492) the relay is the parent of the one
 //! process whose output it carries, a managed server's instance: it
 //! starts the process with pipes for its standard output and error, is
@@ -30,9 +38,9 @@
 //! for a daemon that adopts it. It exits once the process has ended and
 //! its pipes have.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::io::Write as _;
-use std::os::fd::{OwnedFd, RawFd};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::{Read as _, Write as _};
+use std::os::fd::{AsFd as _, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -41,7 +49,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Context as _;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Notify, broadcast, mpsc, watch};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 
 /// The socket a host listens on for its relay, in its run directory.
 pub const OUTPUT_SOCKET: &str = "output.sock";
@@ -74,6 +82,11 @@ const QUANTUM: usize = 16 * 1024;
 
 /// How much is read from a pipe at once.
 const READ_SIZE: usize = 64 * 1024;
+
+/// The most reads of one pipe a flush makes: enough for everything the
+/// largest pipe Linux gives by default holds, so a worker that never
+/// stops writing cannot keep a flush reading.
+const FLUSH_READS: usize = 16;
 
 /// How long, once the host has gone, the relay keeps reading pipes that
 /// have not reached their end (a process a worker left behind may hold
@@ -273,6 +286,20 @@ struct Queue {
     entries: VecDeque<Entry>,
     bytes: usize,
     room: Arc<Notify>,
+    /// The position of the entry at the front, counting from the first
+    /// ever queued: every entry taken or dropped moves it on, and a gap
+    /// put in front stands at the position of the last line it replaced.
+    head: u64,
+    /// The position the next entry queued gets.
+    next: u64,
+}
+
+/// A flush waiting for the writer: answered once every queue's front has
+/// passed the position it had reached when the flush asked, and the
+/// write that took the last of those entries has finished.
+struct Barrier {
+    targets: Vec<(Source, u64)>,
+    answer: oneshot::Sender<()>,
 }
 
 /// What kind of stall is in progress.
@@ -330,7 +357,23 @@ pub enum Report {
     /// The release log was opened again by name, as SIGUSR1 asked: what
     /// the relay takes from here on goes to the file now at its path.
     Reopened,
+    /// The answer to a flush this client asked for: what the relay's
+    /// pipes held when it asked, and what it had queued, is written.
+    Flushed,
 }
+
+/// A line a client sends on the relay's control socket.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Request {
+    /// Have the host offer every pipe it holds, read each pipe until it
+    /// would block, write what is queued, and answer with `Flushed`.
+    Flush,
+}
+
+/// How a flush is answered as it passes from one part of the relay to
+/// the next; dropping it answers too, as there is nothing more to do.
+type FlushAnswer = oneshot::Sender<()>;
 
 /// The state the readers and the writer share.
 struct State {
@@ -346,6 +389,10 @@ struct State {
     stall: Option<(StallKind, Stall)>,
     /// No more lines will come: the writer writes what is left and ends.
     finished: bool,
+    /// The writer has taken a batch it has not finished writing.
+    writing: bool,
+    /// Flushes waiting for the writer.
+    barriers: Vec<Barrier>,
 }
 
 /// The readers' and the writer's meeting point.
@@ -375,6 +422,8 @@ impl Shared {
                 pipes: 0,
                 stall: None,
                 finished: false,
+                writing: false,
+                barriers: Vec::new(),
             }),
             ready: Condvar::new(),
             reopen: AtomicBool::new(false),
@@ -459,6 +508,8 @@ impl Shared {
                     Some(Entry::Gap(count)) => carried += count,
                     None => break,
                 }
+
+                queue.head += 1;
             }
 
             // The gap stands where the dropped lines were, ahead of what
@@ -466,11 +517,13 @@ impl Shared {
 
             if dropped + carried > 0 {
                 queue.entries.push_front(Entry::Gap(dropped + carried));
+                queue.head -= 1;
             }
         }
 
         queue.bytes += size;
         queue.entries.push_back(Entry::Text { bytes, lines });
+        queue.next += 1;
 
         state.queued_bytes = state.queued_bytes + size - freed;
         state.queued_lines = (state.queued_lines + lines).saturating_sub(dropped);
@@ -578,7 +631,13 @@ impl Shared {
                         break;
                     }
 
-                    match queue.entries.pop_front() {
+                    let popped = queue.entries.pop_front();
+
+                    if popped.is_some() {
+                        queue.head += 1;
+                    }
+
+                    match popped {
                         Some(Entry::Text {
                             bytes,
                             lines: count,
@@ -626,6 +685,7 @@ impl Shared {
 
         state.queued_bytes -= freed;
         state.queued_lines = state.queued_lines.saturating_sub(queued);
+        state.writing = !batch.is_empty();
         drop(state);
 
         // A reader held back under `block` may read again.
@@ -698,6 +758,52 @@ impl Shared {
             format!("the log caught up after {seconds:.1} s; {what}"),
         );
         self.publish();
+    }
+
+    /// Answered once the writer has written every entry queued before
+    /// now, or at once when nothing is queued or being written.
+    fn written_up_to_now(&self) -> oneshot::Receiver<()> {
+        let (answer, answered) = oneshot::channel();
+        let mut state = self.lock();
+
+        let targets: Vec<(Source, u64)> = state
+            .queues
+            .iter()
+            .filter(|(_, queue)| queue.head < queue.next)
+            .map(|(source, queue)| (source.clone(), queue.next))
+            .collect();
+
+        if targets.is_empty() && !state.writing {
+            let _ = answer.send(());
+        } else {
+            state.barriers.push(Barrier { targets, answer });
+        }
+
+        answered
+    }
+
+    /// After a write, whether it succeeded or not: answer the flushes
+    /// whose entries have all been taken.
+    fn finished_writing(&self) {
+        let mut state = self.lock();
+        state.writing = false;
+
+        let waiting = std::mem::take(&mut state.barriers);
+
+        for barrier in waiting {
+            let passed = barrier.targets.iter().all(|(source, target)| {
+                state
+                    .queues
+                    .get(source)
+                    .is_none_or(|queue| queue.head >= *target)
+            });
+
+            if passed {
+                let _ = barrier.answer.send(());
+            } else {
+                state.barriers.push(barrier);
+            }
+        }
     }
 
     /// Change the number of pipes being read.
@@ -903,6 +1009,8 @@ fn write_loop(shared: &Shared, mut destination: Destination) {
                     shared.lost(lines, &failure);
                 }
             }
+
+            shared.finished_writing();
         }
 
         if reopen {
@@ -1008,20 +1116,21 @@ async fn read_loop(args: RelayArgs, shared: Arc<Shared>) -> anyhow::Result<bool>
     let _int = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
     let _hup = signal(SignalKind::hangup()).context("installing the SIGHUP handler")?;
 
-    serve_control(&args.control, &shared)?;
+    let (flush_tx, mut flush_rx) = mpsc::unbounded_channel::<FlushAnswer>();
+    serve_control(&args.control, &shared, flush_tx)?;
 
     let (ended_tx, mut ended_rx) = mpsc::unbounded_channel::<Ended>();
     let mut tasks = tokio::task::JoinSet::new();
 
-    // Pipes being read, by the host's number; the host's own stream is
-    // number 0 whether inherited or offered.
+    // Pipes being read, by the host's number, each with the way to ask
+    // its task to flush; the host's own stream is number 0 whether
+    // inherited or offered.
 
-    let mut reading: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut reading: Pipes = HashMap::new();
 
     if let Some(fd) = args.host_output_fd {
         let owned = crate::fdpass::take_inherited(fd);
-        reading.insert(0);
-        spawn_pipe(
+        let flush = spawn_pipe(
             &mut tasks,
             &shared,
             0,
@@ -1030,6 +1139,7 @@ async fn read_loop(args: RelayArgs, shared: Arc<Shared>) -> anyhow::Result<bool>
             owned,
             &ended_tx,
         )?;
+        reading.insert(0, flush);
     }
 
     let inherited = args.host_output_fd.is_some();
@@ -1052,7 +1162,7 @@ async fn read_loop(args: RelayArgs, shared: Arc<Shared>) -> anyhow::Result<bool>
 
         if host_gone_at.is_none() && connection.is_none() {
             let gave_up = !inherited && !connected_once && started.elapsed() >= CONNECT_GIVE_UP;
-            let host_stream_ended = inherited && !reading.contains(&0);
+            let host_stream_ended = inherited && !reading.contains_key(&0);
 
             if gave_up || connected_once || host_stream_ended {
                 host_gone_at = Some(Instant::now());
@@ -1099,9 +1209,34 @@ async fn read_loop(args: RelayArgs, shared: Arc<Shared>) -> anyhow::Result<bool>
                     connection.ended(ended.pipe).await;
                 }
             }
+            Some(answer) = flush_rx.recv() => {
+                // The host is asked first, so the pipes flushed include
+                // every worker it has forked. A relay that has not reached
+                // the host yet tries at once, rather than at its next try;
+                // one whose host has gone has every pipe it will get.
+
+                if connection.is_none()
+                    && !connected_once
+                    && host_gone_at.is_none()
+                    && let Some(path) = &args.connect
+                    && let Ok(stream) = UnixStream::connect(path).await
+                {
+                    connection = Some(Connection::new(stream));
+                    connected_once = true;
+                }
+
+                let unasked = match &mut connection {
+                    Some(connection) => connection.flush(answer).await,
+                    None => Some(answer),
+                };
+
+                if let Some(answer) = unasked {
+                    flush_pipes(&reading, &shared, answer);
+                }
+            }
             offered = next_offer(&mut connection) => match offered {
-                Some((offer, fd)) => {
-                    if reading.contains(&offer.pipe) {
+                Some(Offer::Pipe(offer, fd)) => {
+                    if reading.contains_key(&offer.pipe) {
                         drop(fd);
                         continue;
                     }
@@ -1114,11 +1249,29 @@ async fn read_loop(args: RelayArgs, shared: Arc<Shared>) -> anyhow::Result<bool>
                     let stream = (offer.stream != "host").then_some(offer.stream);
                     let tag = worker_tag(&source, stream.as_deref());
 
-                    if spawn_pipe(&mut tasks, &shared, offer.pipe, source, tag, fd, &ended_tx).is_ok() {
-                        reading.insert(offer.pipe);
+                    if let Ok(flush) = spawn_pipe(&mut tasks, &shared, offer.pipe, source, tag, fd, &ended_tx) {
+                        reading.insert(offer.pipe, flush);
                     }
                 }
-                None => connection = None,
+                Some(Offer::Flushed(number)) => {
+                    let answer = connection
+                        .as_mut()
+                        .and_then(|connection| connection.flushes.remove(&number));
+
+                    if let Some(answer) = answer {
+                        flush_pipes(&reading, &shared, answer);
+                    }
+                }
+                None => {
+                    // Flushes the host will not answer now go ahead with
+                    // the pipes the relay has.
+
+                    if let Some(gone) = connection.take() {
+                        for answer in gone.flushes.into_values() {
+                            flush_pipes(&reading, &shared, answer);
+                        }
+                    }
+                }
             },
             _ = tokio::time::sleep(tick) => {}
         }
@@ -1148,7 +1301,8 @@ async fn exec_loop(args: RelayArgs, exec: Exec, shared: Arc<Shared>) -> anyhow::
     let _int = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
     let _hup = signal(SignalKind::hangup()).context("installing the SIGHUP handler")?;
 
-    serve_control(&args.control, &shared)?;
+    let (flush_tx, mut flush_rx) = mpsc::unbounded_channel::<FlushAnswer>();
+    serve_control(&args.control, &shared, flush_tx)?;
 
     let relay_pid = std::process::id();
     let mut record = ProcessRecord {
@@ -1191,7 +1345,7 @@ async fn exec_loop(args: RelayArgs, exec: Exec, shared: Arc<Shared>) -> anyhow::
 
     let (ended_tx, mut ended_rx) = mpsc::unbounded_channel::<Ended>();
     let mut tasks = tokio::task::JoinSet::new();
-    let mut reading: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut reading: Pipes = HashMap::new();
     let source = Source::Child(exec.name.as_str().into());
 
     let pipes = [
@@ -1209,7 +1363,7 @@ async fn exec_loop(args: RelayArgs, exec: Exec, shared: Arc<Shared>) -> anyhow::
 
     for (number, fd, tag) in pipes {
         if let Some(Ok(fd)) = fd
-            && spawn_pipe(
+            && let Ok(flush) = spawn_pipe(
                 &mut tasks,
                 &shared,
                 number,
@@ -1218,9 +1372,8 @@ async fn exec_loop(args: RelayArgs, exec: Exec, shared: Arc<Shared>) -> anyhow::
                 fd,
                 &ended_tx,
             )
-            .is_ok()
         {
-            reading.insert(number);
+            reading.insert(number, flush);
         }
     }
 
@@ -1263,6 +1416,7 @@ async fn exec_loop(args: RelayArgs, exec: Exec, shared: Arc<Shared>) -> anyhow::
             Some(ended) = ended_rx.recv() => {
                 reading.remove(&ended.pipe);
             }
+            Some(answer) = flush_rx.recv() => flush_pipes(&reading, &shared, answer),
             status = child.wait(), if exited_at.is_none() => {
                 // The end is recorded at once, so a relay killed while it
                 // writes the last lines has still said how it ended.
@@ -1291,12 +1445,34 @@ fn announce(record: &ProcessRecord) {
     }
 }
 
+/// The pipes being read, by the host's number, each with the way to ask
+/// its task to read what the pipe holds now.
+type Pipes = HashMap<u64, mpsc::UnboundedSender<FlushAnswer>>;
+
+/// What the task reading the host's connection hands on, in order.
+enum Offer {
+    /// A pipe the host offers, with its read end.
+    Pipe(Offered, OwnedFd),
+    /// The host's answer to the flush of this number: every pipe it held
+    /// when it read the request has been offered before this.
+    Flushed(u64),
+}
+
+/// The host's answer to a flush, on its connection.
+#[derive(Debug, serde::Deserialize)]
+struct HostFlushed {
+    flushed: u64,
+}
+
 /// The connection to the host's output socket. Offers are read on a
 /// task of their own, since a read of a line that a `select!` cancels
 /// could lose part of it.
 struct Connection {
-    offers: mpsc::Receiver<(Offered, OwnedFd)>,
+    offers: mpsc::Receiver<Offer>,
     writer: tokio::net::unix::OwnedWriteHalf,
+    /// The flushes asked of the host and not yet answered, by number.
+    flushes: HashMap<u64, FlushAnswer>,
+    next_flush: u64,
 }
 
 impl Connection {
@@ -1312,6 +1488,8 @@ impl Connection {
         Self {
             offers,
             writer: write,
+            flushes: HashMap::new(),
+            next_flush: 0,
         }
     }
 
@@ -1320,14 +1498,30 @@ impl Connection {
         let line = format!("{{\"ended\":{pipe}}}\n");
         let _ = self.writer.write_all(line.as_bytes()).await;
     }
+
+    /// Ask the host to say when it has offered every pipe it holds; the
+    /// answer is given back when the host cannot be asked.
+    async fn flush(&mut self, answer: FlushAnswer) -> Option<FlushAnswer> {
+        let number = self.next_flush;
+        self.next_flush += 1;
+        let line = format!("{{\"flush\":{number}}}\n");
+
+        if self.writer.write_all(line.as_bytes()).await.is_err() {
+            return Some(answer);
+        }
+
+        self.flushes.insert(number, answer);
+        None
+    }
 }
 
-/// Read the host's offers until the connection closes. Every offer
-/// carries exactly one descriptor, on its first byte, so the oldest one
-/// received belongs to the line just read.
+/// Read the host's offers, and its answers to flushes, until the
+/// connection closes. Every offer carries exactly one descriptor, on its
+/// first byte, and an answer none, so the oldest one received belongs to
+/// the offer just read.
 async fn read_offers(
     mut reader: BufReader<muru_proto::descriptors::FdReader>,
-    offers: mpsc::Sender<(Offered, OwnedFd)>,
+    offers: mpsc::Sender<Offer>,
 ) {
     let mut line = String::new();
 
@@ -1339,26 +1533,61 @@ async fn read_offers(
             Ok(_) => {}
         }
 
-        let Ok(offer) = serde_json::from_str::<Offered>(line.trim_end()) else {
-            continue;
-        };
-        let Some(fd) = reader.get_mut().take_fd() else {
-            continue;
+        let line = line.trim_end();
+
+        let offer = if let Ok(answer) = serde_json::from_str::<HostFlushed>(line) {
+            Offer::Flushed(answer.flushed)
+        } else {
+            let Ok(offer) = serde_json::from_str::<Offered>(line) else {
+                continue;
+            };
+            let Some(fd) = reader.get_mut().take_fd() else {
+                continue;
+            };
+
+            Offer::Pipe(offer, fd)
         };
 
-        if offers.send((offer, fd)).await.is_err() {
+        if offers.send(offer).await.is_err() {
             return;
         }
     }
 }
 
-/// The next pipe the host offers, with its read end; none once the
-/// connection has closed. Waits forever without a connection.
-async fn next_offer(connection: &mut Option<Connection>) -> Option<(Offered, OwnedFd)> {
+/// What comes next from the host's connection; none once it has closed.
+/// Waits forever without a connection.
+async fn next_offer(connection: &mut Option<Connection>) -> Option<Offer> {
     match connection {
         Some(connection) => connection.offers.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// Have every pipe's task read what its pipe holds now, then the writer
+/// write everything queued by then, and answer. The waiting is a task of
+/// its own, so a stalled destination under `block` holds up nothing but
+/// the answer.
+fn flush_pipes(pipes: &Pipes, shared: &Arc<Shared>, answer: FlushAnswer) {
+    let read: Vec<oneshot::Receiver<()>> = pipes
+        .values()
+        .filter_map(|pipe| {
+            let (asked, answered) = oneshot::channel();
+            pipe.send(asked).ok().map(|()| answered)
+        })
+        .collect();
+
+    let shared = Arc::clone(shared);
+
+    tokio::spawn(async move {
+        // A pipe whose task has ended has given everything it read.
+
+        for answered in read {
+            let _ = answered.await;
+        }
+
+        let _ = shared.written_up_to_now().await;
+        let _ = answer.send(());
+    });
 }
 
 /// The tag a worker's line gets for its stream, as the host tagged it;
@@ -1372,7 +1601,7 @@ fn worker_tag(source: &Source, stream: Option<&str>) -> String {
 }
 
 /// Start reading one pipe into `source`'s queue, each line tagged with
-/// `tag`.
+/// `tag`. Gives the way to ask the task to read what the pipe holds now.
 fn spawn_pipe(
     tasks: &mut tokio::task::JoinSet<()>,
     shared: &Arc<Shared>,
@@ -1381,52 +1610,110 @@ fn spawn_pipe(
     tag: String,
     fd: OwnedFd,
     ended: &mpsc::UnboundedSender<Ended>,
-) -> std::io::Result<()> {
+) -> std::io::Result<mpsc::UnboundedSender<FlushAnswer>> {
     let receiver = tokio::net::unix::pipe::Receiver::from_owned_fd(fd)?;
 
     let shared = Arc::clone(shared);
     let ended = ended.clone();
+    let (flush, flushes) = mpsc::unbounded_channel();
     shared.pipes(1);
 
     tasks.spawn(async move {
-        read_pipe(receiver, &shared, source, &tag).await;
+        read_pipe(receiver, &shared, source, &tag, flushes).await;
         shared.pipes(-1);
         let _ = ended.send(Ended { pipe });
     });
 
-    Ok(())
+    Ok(flush)
 }
 
 /// Read a pipe to its end, a read at a time: every complete line read is
 /// stamped with the time of the read and tagged, and a partial line waits
-/// for the rest, or is written as it is at the end.
+/// for the rest, or is written as it is at the end. A flush has the pipe
+/// read until it would block before it is answered.
 async fn read_pipe(
     mut receiver: tokio::net::unix::pipe::Receiver,
     shared: &Shared,
     source: Source,
     tag: &str,
+    mut flushes: mpsc::UnboundedReceiver<FlushAnswer>,
 ) {
     let room = shared.room(&source);
     let mut buffer = vec![0u8; READ_SIZE];
     let mut lines = Lines::new(tag);
 
     loop {
-        // Under `block` a full queue stops the reading here, so the
-        // worker's own writes wait and nothing else does.
+        wait_for_room(shared, &source, &room).await;
 
-        loop {
-            let notified = room.notified();
+        tokio::select! {
+            biased;
+            Some(answer) = flushes.recv() => {
+                let open = read_now(&receiver, shared, &source, &room, &mut lines, &mut buffer).await;
+                let _ = answer.send(());
 
-            if shared.has_room(&source) {
-                break;
+                if !open {
+                    break;
+                }
             }
+            read = receiver.read(&mut buffer) => {
+                let count = match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => count,
+                };
 
-            notified.await;
+                for (bytes, count) in lines.feed(&buffer[..count], SystemTime::now()) {
+                    shared.push(source.clone(), bytes, count);
+                }
+            }
+        }
+    }
+
+    if let Some((bytes, count)) = lines.finish(SystemTime::now()) {
+        shared.push(source, bytes, count);
+    }
+}
+
+/// Under `block` a full queue stops the reading here, so the worker's own
+/// writes wait and nothing else does.
+async fn wait_for_room(shared: &Shared, source: &Source, room: &Notify) {
+    loop {
+        let notified = room.notified();
+
+        if shared.has_room(source) {
+            return;
         }
 
-        let count = match receiver.read(&mut buffer).await {
-            Ok(0) | Err(_) => break,
+        notified.await;
+    }
+}
+
+/// Read what the pipe holds now, for a flush, until it would block or
+/// `FLUSH_READS` reads have been made; false once it has reached its end.
+/// The runtime may not have heard yet that the pipe is readable, and a
+/// read through it would then wait for that, so the pipe is read here
+/// through a copy of its descriptor, which shares its non-blocking mode.
+async fn read_now(
+    receiver: &tokio::net::unix::pipe::Receiver,
+    shared: &Shared,
+    source: &Source,
+    room: &Notify,
+    lines: &mut Lines,
+    buffer: &mut [u8],
+) -> bool {
+    let Ok(copy) = receiver.as_fd().try_clone_to_owned() else {
+        return true;
+    };
+    let mut pipe = std::fs::File::from(copy);
+
+    for _ in 0..FLUSH_READS {
+        wait_for_room(shared, source, room).await;
+
+        let count = match pipe.read(buffer) {
+            Ok(0) => return false,
             Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
         };
 
         for (bytes, count) in lines.feed(&buffer[..count], SystemTime::now()) {
@@ -1434,9 +1721,7 @@ async fn read_pipe(
         }
     }
 
-    if let Some((bytes, count)) = lines.finish(SystemTime::now()) {
-        shared.push(source, bytes, count);
-    }
+    true
 }
 
 /// Splits what a pipe gives into stamped, tagged lines, in entries of up
@@ -1551,8 +1836,13 @@ impl Lines {
 }
 
 /// Serve the control socket: each client gets the status at once and
-/// whenever it changes, at most once a second, and every event.
-fn serve_control(path: &Path, shared: &Arc<Shared>) -> anyhow::Result<()> {
+/// whenever it changes, at most once a second, and every event, and may
+/// ask for flushes, which are handed to `flushes`.
+fn serve_control(
+    path: &Path,
+    shared: &Arc<Shared>,
+    flushes: mpsc::UnboundedSender<FlushAnswer>,
+) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(path);
     let listener =
         UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
@@ -1563,39 +1853,74 @@ fn serve_control(path: &Path, shared: &Arc<Shared>) -> anyhow::Result<()> {
             let status = shared.status.subscribe();
             let events = shared.events.subscribe();
             let reopens = shared.reopens.subscribe();
-            tokio::spawn(report_to(stream, status, events, reopens));
+            tokio::spawn(report_to(stream, status, events, reopens, flushes.clone()));
         }
     });
 
     Ok(())
 }
 
-/// Write reports to one control client until it goes away.
+/// Write reports to one control client until it goes away, and answer
+/// each flush it asks for.
 async fn report_to(
-    mut stream: UnixStream,
+    stream: UnixStream,
     mut status: watch::Receiver<Status>,
     mut events: broadcast::Receiver<Event>,
     mut reopens: watch::Receiver<u64>,
+    flushes: mpsc::UnboundedSender<FlushAnswer>,
 ) {
+    let (read, mut stream) = stream.into_split();
+    let mut requests = BufReader::new(read).lines();
+    let mut asking = true;
+    let (flushed_tx, mut flushed) = mpsc::unbounded_channel::<()>();
+
+    // The status goes at most once a second: a change waits for its time
+    // here, rather than in the branch, so a flush is answered meanwhile.
+
     let mut last_sent = Instant::now() - Duration::from_secs(1);
+    let mut due: Option<tokio::time::Instant> = None;
     status.mark_changed();
 
     loop {
+        let wake = due.unwrap_or_else(tokio::time::Instant::now);
+
         tokio::select! {
-            changed = status.changed() => {
+            changed = status.changed(), if due.is_none() => {
                 if changed.is_err() {
                     return;
                 }
 
-                // At most once a second; what changes meanwhile is sent
-                // with the next.
-
-                let wait = Duration::from_secs(1).saturating_sub(last_sent.elapsed());
-                tokio::time::sleep(wait).await;
+                due = Some((last_sent + Duration::from_secs(1)).into());
+            }
+            () = tokio::time::sleep_until(wake), if due.is_some() => {
+                due = None;
                 let current = status.borrow_and_update().clone();
                 last_sent = Instant::now();
 
                 if send(&mut stream, &Report::Status(current)).await.is_err() {
+                    return;
+                }
+            }
+            request = requests.next_line(), if asking => match request {
+                Ok(Some(line)) => {
+                    if let Ok(Request::Flush) = serde_json::from_str::<Request>(&line) {
+                        let (answer, answered) = oneshot::channel();
+                        let _ = flushes.send(answer);
+                        let flushed_tx = flushed_tx.clone();
+
+                        tokio::spawn(async move {
+                            let _ = answered.await;
+                            let _ = flushed_tx.send(());
+                        });
+                    }
+                }
+
+                // A client that has stopped asking may still be reading.
+
+                _ => asking = false,
+            },
+            Some(()) = flushed.recv() => {
+                if send(&mut stream, &Report::Flushed).await.is_err() {
                     return;
                 }
             }
@@ -1617,10 +1942,33 @@ async fn report_to(
     }
 }
 
-async fn send(stream: &mut UnixStream, report: &Report) -> std::io::Result<()> {
+async fn send(
+    stream: &mut tokio::net::unix::OwnedWriteHalf,
+    report: &Report,
+) -> std::io::Result<()> {
     let mut line = serde_json::to_string(report).map_err(std::io::Error::other)?;
     line.push('\n');
     stream.write_all(line.as_bytes()).await
+}
+
+/// Ask the relay whose control socket is at `path` to flush, and wait
+/// for its answer; the caller bounds the wait.
+pub async fn flush(path: &Path) -> std::io::Result<()> {
+    let stream = UnixStream::connect(path).await?;
+    let (read, mut write) = stream.into_split();
+    let mut line = serde_json::to_string(&Request::Flush).map_err(std::io::Error::other)?;
+    line.push('\n');
+    write.write_all(line.as_bytes()).await?;
+
+    let mut lines = BufReader::new(read).lines();
+
+    while let Some(line) = lines.next_line().await? {
+        if let Ok(Report::Flushed) = serde_json::from_str::<Report>(&line) {
+            return Ok(());
+        }
+    }
+
+    Err(std::io::ErrorKind::UnexpectedEof.into())
 }
 
 /// Read a relay's reports from its control socket, handing each to
@@ -1890,6 +2238,149 @@ mod tests {
             written.ends_with(" muru.worker[crawlers/0]: hello\n"),
             "{written}"
         );
+    }
+
+    #[test]
+    fn a_flush_waits_for_the_writer_to_write_what_was_queued_before_it_and_no_more() {
+        let shared = Shared::new(DEFAULT_QUEUE, Overflow::DropOldest);
+
+        // With nothing queued or being written the answer is at once.
+
+        assert!(shared.written_up_to_now().try_recv().is_ok());
+
+        let (bytes, lines) = entry("before\n");
+        shared.push(Source::Worker("0".into()), bytes, lines);
+        let mut flushed = shared.written_up_to_now();
+
+        // More than one write holds, queued after the flush asked.
+
+        let line = "a".repeat(1023) + "\n";
+
+        for _ in 0..200 {
+            let (bytes, lines) = entry(&line);
+            shared.push(Source::Worker("0".into()), bytes, lines);
+        }
+
+        assert!(flushed.try_recv().is_err());
+
+        // Taking the line is not enough: the answer waits for the write.
+
+        let (batch, _) = shared.take().unwrap();
+        assert!(batch.starts_with(b"before\n"));
+        assert!(flushed.try_recv().is_err());
+
+        shared.finished_writing();
+        assert!(flushed.try_recv().is_ok());
+        assert!(shared.lock().queued_lines > 0);
+    }
+
+    #[test]
+    fn a_flush_waits_for_the_gap_that_stands_for_lines_dropped_before_it() {
+        let shared = Shared::new(MIN_QUEUE, Overflow::DropOldest);
+        let line = "d".repeat(1023) + "\n";
+
+        for _ in 0..60 {
+            let (bytes, lines) = entry(&line);
+            shared.push(Source::Worker("0".into()), bytes, lines);
+        }
+
+        let mut flushed = shared.written_up_to_now();
+
+        // Dropping lines queued before the flush leaves a gap in their
+        // place, which is still to be written.
+
+        for _ in 0..60 {
+            let (bytes, lines) = entry(&line);
+            shared.push(Source::Worker("0".into()), bytes, lines);
+        }
+
+        assert!(shared.lock().dropped > 0);
+        assert!(flushed.try_recv().is_err());
+
+        let (batch, _) = shared.take().unwrap();
+        shared.finished_writing();
+        let batch = String::from_utf8_lossy(&batch);
+        assert!(batch.contains("dropped "), "{batch}");
+        assert!(flushed.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_flush_takes_the_hosts_offers_reads_the_pipes_and_answers_once_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join(OUTPUT_SOCKET);
+        let control = dir.path().join(CONTROL_SOCKET);
+        let log = dir.path().join("release.log");
+        let listener = UnixListener::bind(&output).unwrap();
+
+        let args = RelayArgs {
+            connect: Some(output.clone()),
+            control: control.clone(),
+            host_output_fd: None,
+            log_file: Some(log.clone()),
+            also_log_file: None,
+            queue: DEFAULT_QUEUE,
+            overflow: Overflow::DropOldest,
+            release: None,
+            exec: None,
+        };
+        let relay = std::thread::spawn(move || run(args));
+
+        // The host's side. The relay serves its control socket before it
+        // connects, so a flush can be asked for once it has.
+
+        let (host, _) = listener.accept().await.unwrap();
+        let (read_half, mut write_half) = host.into_split();
+        let mut from_relay = BufReader::new(read_half).lines();
+        let flushing = tokio::spawn(async move { flush(&control).await });
+
+        let asked = tokio::time::timeout(Duration::from_secs(10), from_relay.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(asked, "{\"flush\":0}");
+
+        // A worker's line written before its pipe is offered, and the
+        // offer before the answer: the flush reads the line and has it
+        // written before it is answered.
+
+        let (read, mut write) = std::io::pipe().unwrap();
+        write.write_all(b"early\n").unwrap();
+
+        muru_proto::descriptors::write_with_fd(
+            &mut write_half,
+            b"{\"pipe\":7,\"worker\":\"0\",\"stream\":\"stderr\"}\n",
+            std::os::fd::AsFd::as_fd(&read),
+        )
+        .await
+        .unwrap();
+        drop(read);
+        write_half.write_all(b"{\"flushed\":0}\n").await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), flushing)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let written = std::fs::read_to_string(&log).unwrap();
+        assert!(written.ends_with(" muru.worker[0]: early\n"), "{written}");
+
+        // The pipe ends, the host goes away and the relay with it.
+
+        drop(write);
+        let ended = tokio::time::timeout(Duration::from_secs(10), from_relay.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended, "{\"ended\":7}");
+
+        drop(from_relay);
+        drop(write_half);
+        tokio::task::spawn_blocking(move || relay.join().unwrap().unwrap())
+            .await
+            .unwrap();
     }
 
     #[test]
