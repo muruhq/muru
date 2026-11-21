@@ -22,6 +22,7 @@ from support import server as support
 from support.daemon import Daemon, start_daemon
 
 PLAIN = support.FIXTURES
+FILES = support.ROOT / "tests" / "fixtures" / "projects" / "files"
 
 
 def test_a_declared_user_is_recorded_and_reported_as_not_applied_without_root(
@@ -271,5 +272,97 @@ def test_a_root_daemon_runs_the_edge_and_applications_as_the_service_user() -> N
         events = daemon.muru("events").stdout
         assert "app.user_is_root" in events
         assert "runs as root, which is not recommended" in events
+
+        # Section 4.9 (issue 848): a path hint is opened by the worker, as
+        # the application's user, so a file only that user can read is
+        # served though the edge, as the service user, cannot read it.
+
+        media = daemon.base / "media"
+        subprocess.run(
+            ["sudo", "-n", "install", "-d", "-o", "daemon", "-m", "0700", str(media)], check=True
+        )
+        subprocess.run(
+            [
+                "sudo",
+                "-n",
+                "-u",
+                "daemon",
+                "sh",
+                "-c",
+                f"umask 077; printf private > {media}/own.txt",
+            ],
+            check=True,
+        )
+        daemon.apply(
+            "[app.plain]\nuser = 'daemon'\n\n[app.plain.release.r4]\n"
+            f"source = '{FILES}'\n"
+            "entrypoint = 'files:wsgi_app'\n"
+            f"python = '{sys.executable}'\n"
+            "processes = 1\n"
+            f"sendfile_roots = ['{media}']\n"
+            f"env = {{ FILES_DIR = '{media}' }}\n"
+        )
+        hinted = Daemon.request_static(daemon.port, f"/sendfile-path?path={media}/own.txt")
+        assert (hinted.status, hinted.body) == (200, b"private"), hinted
+        refused = Daemon.request_static(daemon.port, "/sendfile-path?path=/etc/passwd")
+        assert refused.status == 500
+
+        # Issues 849 and 850: a data directory moved by the application's
+        # table is made for its user, its media part a hint root with
+        # nothing configured; the release's static directory is its
+        # user's with the edge's group alone, setgid.
+
+        data = daemon.base / "plain-data"
+        daemon.apply(
+            f"[app.plain]\nuser = 'daemon'\ndata_dir = '{data}'\n\n[app.plain.release.r5]\n"
+            f"source = '{FILES}'\n"
+            "entrypoint = 'files:wsgi_app'\n"
+            f"python = '{sys.executable}'\n"
+            "processes = 1\n\n"
+            "[[app.plain.release.r5.static]]\npath = '/assets/'\ndir = 'static:'\n"
+        )
+
+        for part in (data, data / "media", data / "uploads"):
+            made = subprocess.run(
+                ["sudo", "-n", "stat", "-c", "%u %a", str(part)],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.split()
+            assert made == [str(other.pw_uid), "700"], part
+
+        static = (daemon.base / "state" / "static" / "plain" / "r5").stat()
+        assert (static.st_uid, static.st_gid) == (other.pw_uid, service.pw_gid)
+        assert static.st_mode & 0o7777 == 0o2750
+        subprocess.run(
+            [
+                "sudo",
+                "-n",
+                "-u",
+                "daemon",
+                "sh",
+                "-c",
+                f"umask 077; printf report > {data}/media/report.txt",
+            ],
+            check=True,
+        )
+        hinted = Daemon.request_static(daemon.port, f"/sendfile-path?path={data}/media/report.txt")
+        assert (hinted.status, hinted.body) == (200, b"report"), hinted
+
+        # A media part moved behind a link to a directory that is not the
+        # application's user's is refused, so it cannot be pointed at
+        # files of another user.
+
+        foreign = daemon.base / "foreign"
+        subprocess.run(["sudo", "-n", "install", "-d", "-m", "0755", str(foreign)], check=True)
+        subprocess.run(
+            ["sudo", "-n", "sh", "-c", f"printf root > {foreign}/report.txt"], check=True
+        )
+        subprocess.run(
+            ["sudo", "-n", "mv", str(data / "media"), str(data / "media-before")], check=True
+        )
+        subprocess.run(["sudo", "-n", "ln", "-s", str(foreign), str(data / "media")], check=True)
+        refused = Daemon.request_static(daemon.port, f"/sendfile-path?path={data}/media/report.txt")
+        assert refused.status == 500, refused
     finally:
         daemon.stop()

@@ -22,8 +22,13 @@ uv init --bare
 uv venv
 ```
 
-The application lists the products in a sqlite database beside it. Save
-this as `app.py`:
+The application lists the products in a SQLite database. The database
+is not kept beside the code: a release is the source directory it was
+deployed from, and the next release may be another. It goes in the
+application's [data directory](../howto/data-directory.md) instead,
+which every release of the application shares and which Muru names in
+`MURU_DATA_DIR`; outside Muru the code falls back to its own directory.
+Save this as `app.py`:
 
 ```{literalinclude} code/catalog/app.py
 :language: python
@@ -96,7 +101,9 @@ migrate: Apply the database migrations
   timeout 60s
 ```
 
-The database has no table yet. Run the migration, then add a product:
+The database has no table yet; the data directory the daemon made for
+the application, `STATE/data/catalog` in its state directory, is empty.
+Run the migration, then add a product:
 
 ```
 muructl command run catalog migrate
@@ -273,6 +280,9 @@ The first finishes:
 copied 30 of 30
 backed up to backups/catalog-20261102T100340.db
 ```
+
+The backup is in `backups/` in the data directory, beside the database,
+and `muructl data show catalog` says where that is.
 
 ## A long run, detached
 

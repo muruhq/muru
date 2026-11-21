@@ -52,6 +52,18 @@ pub enum Action {
         /// The priority, 0 by default.
         priority: i32,
     },
+    /// Set where the application's data directory and its parts are
+    /// (issue 849), for the releases started after it.
+    SetAppData {
+        /// The application.
+        app: String,
+        /// The data directory, or none for `STATE/data/APP`.
+        data_dir: Option<String>,
+        /// The media part, or none for `media` in the data directory.
+        media_dir: Option<String>,
+        /// The uploads part, or none for `uploads` in the data directory.
+        uploads_dir: Option<String>,
+    },
     /// Set the application's own access log choice (section 11.2).
     SetAppAccessLog {
         /// The application.
@@ -228,6 +240,7 @@ impl Action {
             Action::CreateApp { .. } => "create-app",
             Action::SetAppIdentity { .. } => "set-identity",
             Action::SetAppPriority { .. } => "set-priority",
+            Action::SetAppData { .. } => "set-data",
             Action::SetAppAccessLog { .. } => "set-access-log",
             Action::Deploy { .. } => "deploy",
             Action::Promote { .. } => "promote",
@@ -264,6 +277,7 @@ impl Action {
             Action::CreateApp { .. }
             | Action::SetAppIdentity { .. }
             | Action::SetAppPriority { .. }
+            | Action::SetAppData { .. }
             | Action::Deploy { .. } => Phase::Prepare,
             Action::RemoveRelease { .. } | Action::RemoveApp { .. } => Phase::Finish,
             _ => Phase::Commit,
@@ -320,6 +334,7 @@ impl Change {
             | Action::RemoveApp { app }
             | Action::SetAppIdentity { app, .. }
             | Action::SetAppPriority { app, .. }
+            | Action::SetAppData { app, .. }
             | Action::SetAppAccessLog { app, .. } => app.clone(),
             Action::Deploy { app, id, .. }
             | Action::Promote { app, id }
@@ -735,6 +750,68 @@ fn plan_app(
                 priority,
             },
             detail: format!("priority {priority}"),
+        });
+    }
+
+    // Issue 849: where the data directory and its parts are, which the
+    // releases started after the apply use.
+
+    if let Some(data_dir) = &app.data_dir
+        && !Path::new(data_dir).is_absolute()
+    {
+        plan.errors.push(format!(
+            "{name}: data_dir must be an absolute path, not {data_dir:?}"
+        ));
+        return None;
+    }
+
+    let data = muru_config::places::DataDirs::new(
+        app.data_dir
+            .as_deref()
+            .map_or_else(|| PathBuf::from("/STATE/data").join(name), PathBuf::from),
+        app.media_dir.as_deref(),
+        app.uploads_dir.as_deref(),
+    );
+
+    if let Err(error) = data.check() {
+        plan.errors.push(format!("{name}: {error}"));
+        return None;
+    }
+
+    let same_data = stored.as_ref().map_or(
+        app.data_dir.is_none() && app.media_dir.is_none() && app.uploads_dir.is_none(),
+        |stored| {
+            stored.data_dir == app.data_dir
+                && stored.media_dir == app.media_dir
+                && stored.uploads_dir == app.uploads_dir
+        },
+    );
+
+    if !same_data {
+        let mut parts = Vec::new();
+
+        for (key, value) in [
+            ("data_dir", &app.data_dir),
+            ("media_dir", &app.media_dir),
+            ("uploads_dir", &app.uploads_dir),
+        ] {
+            if let Some(value) = value {
+                parts.push(format!("{key} {value}"));
+            }
+        }
+
+        plan.changes.push(Change {
+            action: Action::SetAppData {
+                app: name.to_owned(),
+                data_dir: app.data_dir.clone(),
+                media_dir: app.media_dir.clone(),
+                uploads_dir: app.uploads_dir.clone(),
+            },
+            detail: if parts.is_empty() {
+                "the data directory in the state directory".to_owned()
+            } else {
+                parts.join(", ")
+            },
         });
     }
 
@@ -2924,6 +3001,9 @@ pub fn export(store: &Store, app: Option<&str>) -> Result<Document, StoreError> 
             access_log: app.access_log.access_log.clone(),
             access_log_exclude: app.access_log.access_log_exclude.clone(),
             slow: app.access_log.slow.clone(),
+            data_dir: app.data_dir.clone(),
+            media_dir: app.media_dir.clone(),
+            uploads_dir: app.uploads_dir.clone(),
             ..AppTable::default()
         };
 
@@ -3936,6 +4016,7 @@ pub fn resolve_spec(
         .or_else(|| table.sendfile_header.clone())
         .or_else(|| previous.and_then(|previous| previous.sendfile_header.clone()));
     muru_config::check_sendfile(&sendfile_roots, sendfile_header.as_deref())?;
+    muru_config::check_sendfile_dirs(&sendfile_roots, &source)?;
 
     // Section 6.13: the origins gRPC-Web answers with CORS, likewise.
 
@@ -3961,6 +4042,7 @@ pub fn resolve_spec(
             .clone()
             .or_else(|| sendfile_header.clone());
         muru_config::check_sendfile(&mount_roots, mount_header.as_deref())
+            .and_then(|()| muru_config::check_sendfile_dirs(&mount_roots, &source))
             .map_err(|error| format!("mount {name}: {error}"))?;
 
         // Section 4.10: a mount's redirect settings, with the release's
@@ -5470,21 +5552,39 @@ fn prefix_key(path: &str) -> String {
     muru_edge::routing::group_prefix(path)
 }
 
-/// One of the release's own directories, resolved and checked.
+/// One of the release's own directories, resolved and checked. One in a
+/// place Muru provides (issues 849 and 850), `media:` or `static:`, is
+/// kept by its place, since that is resolved when the release runs, and
+/// is not checked: the application fills it.
 fn static_spec(entry: &muru_config::StaticDir, source: &Path) -> Result<StaticSpec, String> {
-    let dir = if Path::new(&entry.dir).is_absolute() {
-        PathBuf::from(&entry.dir)
-    } else {
-        source.join(&entry.dir)
-    };
+    let place = muru_config::places::Place::parse(&entry.dir)
+        .map_err(|error| format!("static {}: {error}", entry.path))?;
 
-    if !dir.is_dir() {
-        return Err(format!(
-            "static {}: {} is not a directory",
-            entry.path,
-            dir.display()
-        ));
-    }
+    let (dir, within) = match place {
+        muru_config::places::Place::Media(rest) => {
+            (PathBuf::from(rest), Some(crate::model::Within::Media))
+        }
+        muru_config::places::Place::Static(rest) => {
+            (PathBuf::from(rest), Some(crate::model::Within::Static))
+        }
+        muru_config::places::Place::Path(text) => {
+            let dir = if Path::new(text).is_absolute() {
+                PathBuf::from(text)
+            } else {
+                source.join(text)
+            };
+
+            if !dir.is_dir() {
+                return Err(format!(
+                    "static {}: {} is not a directory",
+                    entry.path,
+                    dir.display()
+                ));
+            }
+
+            (dir, None)
+        }
+    };
 
     let cache = entry.cache.as_ref();
     Ok(StaticSpec {
@@ -5504,6 +5604,7 @@ fn static_spec(entry: &muru_config::StaticDir, source: &Path) -> Result<StaticSp
         cache_except: cache.map(|cache| cache.except.clone()).unwrap_or_default(),
         redirect_slash: entry.redirect_slash.unwrap_or(true),
         case_insensitive: entry.case.as_deref() == Some("insensitive"),
+        within,
     })
 }
 
@@ -5759,6 +5860,7 @@ fn resolve_http_spec(
     let (error_pages, error_override, maintenance) =
         resolve_error_tables(tables, &BTreeMap::new(), None, None, &source)?;
     muru_config::check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())?;
+    muru_config::check_sendfile_dirs(&table.sendfile_roots, &source)?;
 
     Ok(ReleaseSpec {
         limits: tables
@@ -7100,7 +7202,7 @@ fn describe_static(entries: &[StaticSpec]) -> String {
 
     entries
         .iter()
-        .map(|entry| format!("{} from {}", entry.path, entry.dir.display()))
+        .map(|entry| format!("{} from {}", entry.path, entry.table().dir))
         .collect::<Vec<_>>()
         .join("; ")
 }

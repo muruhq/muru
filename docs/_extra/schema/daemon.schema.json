@@ -16,10 +16,20 @@
           },
           "type": "array"
         },
+        "data_dir": {
+          "description": "The application's data directory, shared by every release, an absolute path; its media and uploads parts are made in it.",
+          "type": "string",
+          "x-default": "STATE/data/APP"
+        },
         "group": {
           "description": "The group, else the user's primary group.",
           "type": "string",
           "x-default": "the user's primary group"
+        },
+        "media_dir": {
+          "default": "media",
+          "description": "The media part, the one part ever served, a relative one taken from `data_dir`.",
+          "type": "string"
         },
         "priority": {
           "default": 0,
@@ -56,6 +66,11 @@
           "description": "The file creation mask, in octal, for example 027.",
           "type": "string",
           "x-default": "the daemon's own umask"
+        },
+        "uploads_dir": {
+          "default": "uploads",
+          "description": "The uploads part, never served, a relative one taken from `data_dir`.",
+          "type": "string"
         },
         "user": {
           "description": "The user the application's hosts and workers run as, when the daemon runs as root.",
@@ -1751,7 +1766,7 @@
           "x-default": "the release's"
         },
         "sendfile_roots": {
-          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. In a file `muructl apply` reads, a relative path is taken from the file's directory; in a project's settings each is absolute.",
+          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served; the release's when absent, and an empty list refuses every hint. A relative path is taken from the release's source directory.",
           "items": {
             "type": "string"
           },
@@ -2362,7 +2377,7 @@
           "type": "string"
         },
         "sendfile_roots": {
-          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file, for the default mount and any mount that does not say otherwise; with none every hint is refused. A relative path is taken from the file's directory.",
+          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. A relative path is taken from the release's `source`.",
           "items": {
             "type": "string"
           },
@@ -3038,7 +3053,7 @@
           "type": "string"
         },
         "dir": {
-          "description": "The directory, relative to the source directory, or absolute.",
+          "description": "The directory: relative to the source directory, absolute, `static:` for the release's built static files or `media:` for the application's media part, each with an optional directory inside it after the colon.",
           "type": "string"
         },
         "fallback": {

@@ -1,10 +1,11 @@
+import os
 import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-HERE = Path(__file__).parent
-BACKUPS = HERE / "backups"
+DATA = Path(os.environ.get("MURU_DATA_DIR", Path(__file__).parent))
+BACKUPS = DATA / "backups"
 
 
 def backup(seconds="30"):
@@ -13,7 +14,7 @@ def backup(seconds="30"):
     BACKUPS.mkdir(exist_ok=True)
     target = BACKUPS / f"catalog-{datetime.now(UTC):%Y%m%dT%H%M%S}.db"
 
-    with sqlite3.connect(HERE / "catalog.db") as source, sqlite3.connect(target) as copy:
+    with sqlite3.connect(DATA / "catalog.db") as source, sqlite3.connect(target) as copy:
         steps = int(seconds)
 
         for step in range(1, steps + 1):
@@ -22,7 +23,7 @@ def backup(seconds="30"):
 
         source.backup(copy)
 
-    print(f"backed up to {target.relative_to(HERE)}")
+    print(f"backed up to {target.relative_to(DATA)}")
 
 
 def cleanup(keep="1d", pause="0"):

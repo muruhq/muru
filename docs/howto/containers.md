@@ -771,7 +771,60 @@ volumeMounts:
 ```
 
 If the directory cannot be written, `muructl serve` stops at once and says
-which volume it needs.
+which volume it needs. A [data directory](#keeping-data) is a volume of
+its own.
+
+## Keeping data
+
+A container is replaced, not kept, so files the application keeps
+between versions of the image, a SQLite database or saved uploads, go on
+a volume, named as the application's [data
+directory](data-directory.md). With none named, the application is given
+none: `MURU_DATA_DIR`, `MURU_MEDIA_DIR` and `MURU_UPLOADS_DIR` are not
+set.
+
+```dockerfile
+ENV MURU_SERVE_DATA_DIR=/data
+```
+
+```
+docker volume create shop-data
+docker run -v shop-data:/data registry.example.com/shop
+```
+
+`--data-dir`, `MURU_SERVE_DATA_DIR` or `data_dir` in the serve table
+names it. Set it in the image's environment rather than the serve
+table when a migration or another command is run in the image with
+`muructl command run`, which reads serve's variables and not its table.
+`muructl serve` checks at start that the directory is there and can be
+written, and stops saying which volume to mount when it is not; it
+makes the media and uploads parts in it, group-writable, as it makes
+its run directory. `--media-dir` and `--uploads-dir` (with their
+`MURU_SERVE_` variables) put either part on a volume of its own, a
+relative one inside the data directory. A volume the image's user
+cannot write, such as one created as root, needs its ownership set, as
+Docker's named volumes take theirs from the directory in the image:
+
+```dockerfile
+RUN install -d -o 10001 -g 0 -m 0770 /data
+```
+
+A SQLite database on the volume needs a local file system, not NFS, and
+WAL mode, as [SQLite on it](data-directory.md#sqlite-on-it) describes.
+
+Static files built for the release go in the image instead. Run
+`collectstatic` while the image is built; it writes into `staticfiles`
+in the project, the directory `muructl serve` gives as
+`MURU_STATIC_DIR` and serves for a `static:` entry:
+
+```dockerfile
+COPY . .
+RUN muructl build --deployment --target /app/.venv --runtime-dir /opt/muru
+RUN DJANGO_SECRET_KEY=build /app/.venv/bin/python manage.py collectstatic --noinput
+```
+
+`--static-dir`, `MURU_SERVE_STATIC_DIR` or `static_dir` in the serve
+table names another directory, a relative one taken from the project.
 
 ## Inside the container
 

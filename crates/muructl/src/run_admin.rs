@@ -263,6 +263,10 @@ pub struct RunState {
     pub recorder: Option<Arc<muru_edge::recorder::Recorder>>,
     /// The import reports of the last few loads (section 6.18).
     pub imports: Arc<ImportReports>,
+    /// The application's places (issues 849 and 850).
+    pub places: muru_controller::places::Places,
+    /// The upload spool, under `muructl serve`.
+    pub spool: Option<PathBuf>,
 }
 
 /// The import reports of a run's last few loads (section 6.18), each
@@ -531,6 +535,7 @@ impl RunProcesses {
             mode: self.mode.to_owned(),
             started_unix_ms: self.started_unix_ms,
             limits: self.limits.lock().expect("limits report poisoned").clone(),
+            state_dir: String::new(),
         };
 
         muru_controller::processes::snapshot(
@@ -594,6 +599,7 @@ impl RunState {
             pythonpath,
             env: self.served.env.clone(),
             file: self.served.file.clone(),
+            places: self.places.clone(),
         }
     }
 
@@ -1089,11 +1095,14 @@ impl Registration {
             started_unix_ms: crate::admin::now_unix_ms(),
         };
         let registration = socket.with_file_name("serve.json");
-        std::fs::write(&registration, serde_json::to_vec(&info)?)?;
 
         // Section 13.9: any user ID with the group may use the serve.
 
-        crate::serve::group_writable(&registration, 0o660);
+        muru_common::files::write_whole_with_mode(
+            &registration,
+            serde_json::to_vec(&info)?,
+            0o660,
+        )?;
 
         let mut record = muru_controller::registry::Record::new(
             id,
@@ -1138,7 +1147,7 @@ impl Registration {
     /// for `muructl serve` or when it could not be written.
     pub fn write_pid(&self, pid: u32) -> Option<PathBuf> {
         let path = self.directory.as_ref()?.join("pid");
-        std::fs::write(&path, format!("{pid}\n")).ok()?;
+        muru_common::files::write_whole(&path, format!("{pid}\n")).ok()?;
         Some(path)
     }
 
@@ -1463,6 +1472,38 @@ impl Admin for Service {
                 .expect("limits report poisoned")
                 .clone(),
         }))
+    }
+
+    /// Issue 849: the run's data directory, by the run's application or
+    /// none named.
+    async fn get_app_data(
+        &self,
+        request: Request<pb::GetAppDataRequest>,
+    ) -> Result<Response<pb::AppData>, Status> {
+        let request = request.into_inner();
+        let state = &self.state;
+        state.target(&request.app, "").map_err(Status::not_found)?;
+
+        let app = state.app.clone();
+        let dirs = state.places.data.clone();
+        let spool = state.spool.clone();
+        let uid = muru_controller::host::Identity::current_uid();
+
+        let answer = tokio::task::spawn_blocking(move || {
+            muru_controller::places::describe(
+                &app,
+                dirs.as_ref(),
+                "muructl serve was given no data directory; --data-dir or MURU_SERVE_DATA_DIR \
+                 names one",
+                uid,
+                spool.as_deref(),
+                request.sizes,
+            )
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?;
+
+        Ok(Response::new(answer))
     }
 
     async fn tail_logs(

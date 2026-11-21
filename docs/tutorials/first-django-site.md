@@ -102,27 +102,37 @@ code, and static files are collected into one directory. Save this as
 ```
 
 It takes everything from the development settings and changes what
-production needs. Collect the static files with it:
+production needs. `STATIC_ROOT` is where `collectstatic` copies every
+application's static files, the admin's among them. Muru gives each
+release a directory of its own for them, as `MURU_STATIC_DIR`, so a
+release never overwrites the files of another that is still serving;
+the fallback is for `collectstatic` run outside Muru.
 
-```
-DJANGO_SETTINGS_MODULE=mysite.production DJANGO_SECRET_KEY=x uv run manage.py collectstatic
-```
-
-That copies every application's static files, the admin's among them,
-into `static/` in the project. With `DEBUG` off, Django serves nothing
-from it, so have the edge serve it. Add this to `pyproject.toml`, below
-the entrypoint:
+With `DEBUG` off, Django serves nothing from that directory, so have
+the edge serve it, and have each release fill it before it serves. Add
+this to `pyproject.toml`, below the entrypoint:
 
 ```toml
 [[tool.muru.static]]
 path = "/static/"
-dir = "static"
+dir = "static:"
 cache = { max_age = "1h" }
+
+[tool.muru.commands.collectstatic]
+description = "Collect the static files"
+run = ["python", "manage.py", "collectstatic", "--noinput"]
+before_fork = true
+timeout = "5m"
 ```
 
-A request under `/static/` is answered from the directory when a file
-is there and reaches Django otherwise. The entry is part of the project,
-like the entrypoint, so every deploy of it brings the files along.
+`static:` names the release's own static directory. A request under
+`/static/` is answered from it when a file is there and reaches Django
+otherwise. `before_fork = true` makes `collectstatic` a gate: under the
+daemon it runs once for each release, with the release's settings,
+after the release has imported Django and before its workers start, so
+a release never serves a page without its assets. Under `muructl run`
+the directory stays empty and `staticfiles_urlpatterns()` serves the
+files, as before.
 
 ## Deploy it
 
@@ -138,8 +148,19 @@ muructl deploy mysite . --env DJANGO_SETTINGS_MODULE=mysite.production --env DJA
 muru: release mysite@r1 is ready and serving
 ```
 
-The entrypoint and the static directory came from `[tool.muru]` and the
-interpreter from the project's `.venv`. The admin is at
+The entrypoint, the static entry and the gate came from `[tool.muru]`
+and the interpreter from the project's `.venv`. Before the release
+served, the gate ran `collectstatic` into its static directory:
+
+```
+muructl command runs mysite
+```
+
+```
+RUN    COMMAND       RELEASE  TRIGGER              STARTED              STATE
+1      collectstatic r1       gate:before_fork     2026-11-02T10:11:09Z exited with status 0 after 412ms
+```
+ The admin is at
 http://127.0.0.1:8080/admin/ again, styled, and the access log shows the
 difference between the two kinds of request:
 
@@ -152,9 +173,10 @@ muructl logs --access
 10:11:13.436 200 GET /admin/login/ 4294B 21ms release=mysite@r1 host=127.0.0.1 queue=0.0ms app=21ms worker=0 id=01M60ZW3WWC5HY2QHF3EFRTZQS
 ```
 
-The stylesheet was served by the edge from the release's own `static/`,
-with caching headers and an `ETag`, compressed for a client that accepts
-it, without reaching a worker. The login page came from the release.
+The stylesheet was served by the edge from the release's own static
+directory, with caching headers and an `ETag`, compressed for a client
+that accepts it, without reaching a worker. The login page came from the
+release.
 
 ## Migrations
 
@@ -167,6 +189,13 @@ deploy switches from one release to the next, both serve for a moment
 against the same database, so a migration should leave the schema usable
 by the release before it as well: add a column in one release, start
 using it in the next, and remove the old one after that.
+
+The database here is `db.sqlite3` beside the code, which the daemon
+reads from the project directory you deployed. A project deployed from
+a new directory each time, as a checkout per release is, keeps its
+database in the application's data directory, which every release
+shares; [keeping data between releases](../howto/data-directory.md#django)
+has the settings.
 
 ## Clean up
 

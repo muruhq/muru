@@ -1305,7 +1305,7 @@ async fn handle_request(
         return Ok(None);
     };
 
-    if let (Some(asgi), Some(runner)) = (&shared.asgi, mount.runner.clone()) {
+    if let (Some(_), Some(runner)) = (&shared.asgi, mount.runner.clone()) {
         return handle_asgi_request(
             reader,
             writer,
@@ -1313,7 +1313,6 @@ async fn handle_request(
             uploads,
             request_end,
             shared,
-            asgi,
             runner,
             &mount,
         )
@@ -1338,14 +1337,14 @@ async fn handle_request(
     let websocket = head.scope == pb::Scope::Websocket as i32;
 
     // Section 11.7: when the edge asked for a record, the request's log
-    // records are kept from now until the record is sent.
+    // records are kept from when its job runs until the record is sent.
+    // The job holds the GIL; this task must not wait for it (issue 836).
 
     let trace = shared.request_trace(request_id);
     let edge_id = head.request_id.clone();
-
-    if let Some(trace) = &trace {
-        record::start_logs(&edge_id, trace);
-    }
+    let hint = shared.hint_context(&head);
+    let job_trace = trace.clone();
+    let job_edge_id = edge_id.clone();
 
     // Section 6.14: the request may be handed to the event loop, which
     // then finishes it; the slot is how this task learns of it.
@@ -1361,6 +1360,11 @@ async fn handle_request(
     let worker_shared = Arc::clone(shared);
     let queued = pool.spawn(Box::new(move |py| {
         worker_shared.request_on_this_thread(request_id);
+
+        if let Some(trace) = &job_trace {
+            record::start_logs(py, &job_edge_id, trace);
+        }
+
         let fds: Vec<RawFd> = uploads.iter().map(AsRawFd::as_raw_fd).collect();
         let handed_off = wsgi::run(
             py,
@@ -1400,7 +1404,13 @@ async fn handle_request(
                 let channel = slot.channel().expect("a handoff sets the channel first");
                 write_detach(writer, true).await?;
                 return handle_websocket(
-                    reader, writer, out_rx, shared, channel, &done, request_id,
+                    reader,
+                    writer,
+                    Output::Open(None, out_rx),
+                    shared,
+                    channel,
+                    &done,
+                    request_id,
                 )
                 .await;
             }
@@ -1494,7 +1504,8 @@ async fn handle_request(
         }
     };
     let write_side = async {
-        let result = write_response_after(first, out_rx, writer, trace.as_deref()).await;
+        let result =
+            write_response_after(first, out_rx, writer, trace.as_deref(), Some(&hint)).await;
 
         if let Some(channel) = slot.channel() {
             channel.complete();
@@ -1520,7 +1531,7 @@ async fn handle_request(
     // Section 11.7: the worker's part of the record follows the response.
 
     if let Some(trace) = trace {
-        let logs = record::take_logs(&edge_id);
+        let logs = record::take_logs(edge_id, Arc::clone(&trace)).await;
         let record = trace.to_message(cancelled.load(Ordering::Relaxed), logs);
         write_record(writer, &record).await?;
     }
@@ -1532,6 +1543,49 @@ async fn handle_request(
 /// the response (section 11.7).
 async fn write_record(writer: &mut Writer, record: &pb::WorkerRecord) -> io::Result<()> {
     frame::write(writer, kind::RECORD, 0, record.encode_to_vec().into()).await
+}
+
+/// What came first for an ASGI request: its task started, or the loop or
+/// the control thread sent something while the start still waited for
+/// the GIL (issue 842).
+enum Begun {
+    /// The start finished, with the request's channel or why it failed.
+    Started(Result<Result<Py<asgi::Channel>, String>, tokio::task::JoinError>),
+    /// An item of output, or the output closing.
+    Sent(Option<Outgoing>),
+}
+
+/// The response the write side of an ASGI request has to send.
+enum Output {
+    /// Still to write: an item already taken from the output, if one
+    /// was, and the output.
+    Open(Option<Outgoing>, mpsc::Receiver<Outgoing>),
+    /// The request was given up before its task started and its end is
+    /// written, with this result.
+    Ended(io::Result<()>),
+}
+
+impl Output {
+    /// Write an HTTP response or a WebSocket's, unless it has ended.
+    async fn write_response(
+        self,
+        writer: &mut Writer,
+        trace: Option<&record::Trace>,
+        hint: Option<&crate::pool::HintContext>,
+    ) -> io::Result<()> {
+        match self {
+            Self::Open(first, rx) => write_response_after(first, rx, writer, trace, hint).await,
+            Self::Ended(written) => written,
+        }
+    }
+
+    /// Write a gRPC call's response, unless it has ended.
+    async fn write_grpc_response(self, writer: &mut Writer) -> io::Result<()> {
+        match self {
+            Self::Open(first, rx) => write_grpc_response(first, rx, writer).await,
+            Self::Ended(written) => written,
+        }
+    }
 }
 
 /// Run one request as a task on the event loop: body frames become
@@ -1546,11 +1600,10 @@ async fn handle_asgi_request(
     uploads: Vec<OwnedFd>,
     request_end: bool,
     shared: &Arc<Shared>,
-    asgi: &asgi::Asgi,
     runner: Arc<Py<PyAny>>,
     mount: &crate::pool::Mount,
 ) -> io::Result<Option<frame::Frame>> {
-    let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
+    let (out_tx, mut out_rx) = mpsc::channel::<Outgoing>(32);
     let done = tokio::sync::Notify::new();
 
     // The task starts on the loop now; the channel is how the two sides
@@ -1563,13 +1616,13 @@ async fn handle_asgi_request(
     shared.request_outgoing(request_id, out_tx.clone());
 
     // Section 11.7: when the edge asked for a record, the request's log
-    // records are kept from before the task starts until it is sent.
+    // records are kept from before the task starts until it is sent;
+    // starting the task keeps them.
 
     let trace = shared.request_trace(request_id);
 
     if let Some(trace) = &trace {
         trace.on_loop();
-        record::start_logs(&head.request_id, trace);
     }
 
     let aborted = AtomicBool::new(false);
@@ -1581,14 +1634,72 @@ async fn handle_asgi_request(
         interrupt,
     };
 
-    let channel = match asgi::start(
-        shared, asgi, &runner, &head, &fds, out_tx, request_id, offer,
-    ) {
-        Ok(channel) => channel,
-        Err(error) => {
+    // Issue 842: starting the task takes the GIL, which another thread
+    // may hold for as long as the worker lives, so it runs on a blocking
+    // thread while this task reads the request's output. The control
+    // thread gives up a request that cannot finish through that output,
+    // and an abort that comes before the task has started is written as
+    // the request's end at once.
+
+    let mut start = tokio::task::spawn_blocking({
+        let shared = Arc::clone(shared);
+        let head = Arc::clone(&head);
+        let fds = fds.clone();
+        let trace = trace.clone();
+
+        move || {
+            let Some(asgi) = &shared.asgi else {
+                return Err("the worker has no event loop".to_owned());
+            };
+
+            asgi::start(
+                &shared,
+                asgi,
+                &runner,
+                &head,
+                &fds,
+                out_tx,
+                request_id,
+                offer,
+                trace.as_deref(),
+            )
+        }
+    });
+
+    let begun = tokio::select! {
+        biased;
+        started = &mut start => Begun::Started(started),
+        item = out_rx.recv() => Begun::Sent(item),
+    };
+
+    // An abort first is the request's end whichever side sent it, as the
+    // write sides would write it, and the start is waited for after. The
+    // loop sends anything else only once the start has let go of the GIL,
+    // so the start is about to finish and the item is kept for the write
+    // side.
+
+    let (started, output) = match begun {
+        Begun::Started(started) => (started, Output::Open(None, out_rx)),
+        Begun::Sent(Some(abort @ Outgoing::Abort { .. })) => {
+            let written =
+                write_response_after(Some(abort), out_rx, writer, trace.as_deref(), None).await;
+            ((&mut start).await, Output::Ended(written))
+        }
+        Begun::Sent(item) => ((&mut start).await, Output::Open(item, out_rx)),
+    };
+
+    let channel = match started {
+        Ok(Ok(channel)) => channel,
+        Ok(Err(error)) => {
             shared.request_finished(request_id);
             return Err(io::Error::other(format!(
                 "the worker is shutting down: {error}"
+            )));
+        }
+        Err(error) => {
+            shared.request_finished(request_id);
+            return Err(io::Error::other(format!(
+                "starting the request on the event loop failed: {error}"
             )));
         }
     };
@@ -1596,12 +1707,12 @@ async fn handle_asgi_request(
     let channel = channel.get();
 
     if head.scope == pb::Scope::Websocket as i32 {
-        return handle_websocket(reader, writer, out_rx, shared, channel, &done, request_id).await;
+        return handle_websocket(reader, writer, output, shared, channel, &done, request_id).await;
     }
 
     if head.scope == pb::Scope::Grpc as i32 {
         return handle_grpc(
-            reader, writer, out_rx, shared, channel, &done, request_id, &head,
+            reader, writer, output, shared, channel, &done, request_id, &head,
         )
         .await;
     }
@@ -1670,7 +1781,10 @@ async fn handle_asgi_request(
         }
     };
     let write_side = async {
-        let result = write_response_after(None, out_rx, writer, trace.as_deref()).await;
+        let hint = shared.hint_context(&head);
+        let result = output
+            .write_response(writer, trace.as_deref(), Some(&hint))
+            .await;
         channel.complete();
         done.notify_one();
         result
@@ -1688,7 +1802,7 @@ async fn handle_asgi_request(
     // Section 11.7: the worker's part of the record follows the response.
 
     if let Some(trace) = trace {
-        let logs = record::take_logs(&head.request_id);
+        let logs = record::take_logs(head.request_id.clone(), Arc::clone(&trace)).await;
         let record = trace.to_message(aborted.load(Ordering::Relaxed), logs);
         write_record(writer, &record).await?;
     }
@@ -1704,7 +1818,7 @@ async fn handle_asgi_request(
 async fn handle_websocket(
     reader: &mut Reader,
     writer: &mut Writer,
-    out_rx: mpsc::Receiver<Outgoing>,
+    output: Output,
     shared: &Arc<Shared>,
     channel: &asgi::Channel,
     done: &tokio::sync::Notify,
@@ -1790,7 +1904,7 @@ async fn handle_websocket(
         }
     };
     let write_side = async {
-        let result = write_response(out_rx, writer).await;
+        let result = output.write_response(writer, None, None).await;
         channel.complete();
         done.notify_one();
         result
@@ -1814,7 +1928,7 @@ async fn handle_websocket(
 async fn handle_grpc(
     reader: &mut Reader,
     writer: &mut Writer,
-    out_rx: mpsc::Receiver<Outgoing>,
+    output: Output,
     shared: &Arc<Shared>,
     channel: &asgi::Channel,
     done: &tokio::sync::Notify,
@@ -1882,7 +1996,7 @@ async fn handle_grpc(
         }
     };
     let write_side = async {
-        let result = write_grpc_response(out_rx, writer).await;
+        let result = output.write_grpc_response(writer).await;
         channel.complete();
         done.notify_one();
         result
@@ -1897,15 +2011,81 @@ async fn handle_grpc(
     Ok(early)
 }
 
+/// Answer a path hint (section 4.9): open the file beneath the mount's
+/// roots on the blocking pool, and send the head saying how that went,
+/// with the END flag when it was not opened, or followed by the file's
+/// descriptor and its variant's, each on a FILE frame with the PATH_HINT
+/// flag.
+async fn write_hinted(
+    writer: &mut Writer,
+    mut head: pb::ResponseHead,
+    hint: &crate::pool::HintContext,
+    path: String,
+) -> io::Result<()> {
+    let hints = Arc::clone(&hint.hints);
+    let encodings = hint.encodings.clone();
+    let asked = path.clone();
+    let opened = tokio::task::spawn_blocking(move || hints.open(&asked, &encodings))
+        .await
+        .unwrap_or(Err(pb::PathHintOutcome::Missing));
+
+    let outcome = match &opened {
+        Ok(_) => pb::PathHintOutcome::Opened,
+        Err(outcome) => *outcome,
+    };
+
+    head.path_hint = Some(pb::PathHint {
+        path,
+        outcome: outcome as i32,
+    });
+
+    let Ok(opened) = opened else {
+        return frame::write(
+            writer,
+            kind::RESPONSE,
+            flag::END,
+            head.encode_to_vec().into(),
+        )
+        .await;
+    };
+
+    frame::write(writer, kind::RESPONSE, 0, head.encode_to_vec().into()).await?;
+
+    let files: Vec<(String, std::fs::File)> = std::iter::once((String::new(), opened.file))
+        .chain(opened.variant)
+        .collect();
+    let last = files.len() - 1;
+
+    for (index, (encoding, file)) in files.into_iter().enumerate() {
+        let flags = flag::PATH_HINT | if index == last { flag::END } else { 0 };
+        let hint = pb::FileHint {
+            encoding,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let encoded = frame::encode(kind::FILE, flags, &hint);
+        muru_proto::descriptors::write_with_fd(writer, &encoded, file.as_fd()).await?;
+    }
+
+    Ok(())
+}
+
 /// Turn a gRPC call's output into frames as it comes, each message on its
 /// own: the head, the messages, and an END with the trailers or the
-/// application's failure.
+/// application's failure. `first`, when given, was already taken from
+/// the output.
 async fn write_grpc_response(
+    mut first: Option<Outgoing>,
     mut rx: mpsc::Receiver<Outgoing>,
     writer: &mut Writer,
 ) -> io::Result<()> {
     loop {
-        match rx.recv().await {
+        let item = match first.take() {
+            Some(item) => Some(item),
+            None => rx.recv().await,
+        };
+
+        match item {
             Some(Outgoing::Head { headers, .. }) => {
                 let head = pb::ResponseHead {
                     status: 200,
@@ -1966,17 +2146,15 @@ async fn write_grpc_response(
 }
 
 /// Turn the application's output into frames, coalescing small chunks.
-async fn write_response(rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -> io::Result<()> {
-    write_response_after(None, rx, writer, None).await
-}
-
-/// Write a response whose first item, `first`, has already been taken
-/// from the channel.
+/// `first`, when given, was already taken from the channel. `hint` is how
+/// a path hint in the response's headers is answered (section 4.9); none
+/// for a WebSocket's or a response that cannot carry one.
 async fn write_response_after(
     mut first: Option<Outgoing>,
     mut rx: mpsc::Receiver<Outgoing>,
     writer: &mut Writer,
     trace: Option<&record::Trace>,
+    hint: Option<&crate::pool::HintContext>,
 ) -> io::Result<()> {
     let mut pending_head: Option<Bytes> = None;
     let mut head_written = false;
@@ -2088,9 +2266,16 @@ async fn write_response_after(
             Some(Some(Outgoing::Head {
                 status,
                 reason,
-                headers,
+                mut headers,
                 flush,
             })) => {
+                // Section 4.9 (issue 848): a path hint is taken from the
+                // headers and answered with the file, opened here.
+
+                let hinted = hint
+                    .filter(|_| status != 101)
+                    .and_then(|hint| Some((hint, hint.hints.take(&mut headers)?)));
+
                 immediate = flush == pb::FlushPolicy::Immediate;
                 content_length = headers
                     .iter()
@@ -2109,7 +2294,18 @@ async fn write_response_after(
                     flush: flush as i32,
                     imports_ms: trace.map_or(0.0, record::Trace::imports_ms),
                     import_wait_ms: trace.map_or(0.0, record::Trace::import_wait_ms),
+                    path_hint: None,
                 };
+
+                // The file replaces whatever body the application sends
+                // with the hint, which is read and dropped.
+
+                if let Some((hint, path)) = hinted {
+                    write_hinted(writer, head, hint, path).await?;
+                    head_written = true;
+                    ended = true;
+                    continue;
+                }
 
                 if status == 101 {
                     // The WebSocket is accepted: the head goes out now and
@@ -2222,7 +2418,12 @@ async fn write_response_after(
 
                 sent += length;
                 let end = !more || content_length == Some(sent);
-                let hint = pb::FileHint { offset, length }.encode_to_vec();
+                let hint = pb::FileHint {
+                    offset,
+                    length,
+                    ..Default::default()
+                }
+                .encode_to_vec();
                 let flags = if end { flag::END } else { 0 };
                 let encoded = frame::encode(kind::FILE, flags, &hint);
                 muru_proto::descriptors::write_with_fd(writer, &encoded, fd.as_fd()).await?;

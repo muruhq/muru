@@ -35,6 +35,7 @@ compression = false
 toolbar = true                  # the debug toolbar on HTML pages
 timestamps = true               # the full UTC time in front of every line
 env_file = ".env"               # variables the run starts with
+data_dir = "/srv/shop-dev"      # the data directory, kept between runs
 ```
 
 In a `muru.toml` the same keys go in a `[run]` table at the top level.
@@ -216,6 +217,26 @@ env_file = ".env"    # [run] in ./muru.local.toml
 `muructl check --env-file FILE` reads the same format, for settings the
 import needs. `muructl deploy` and `muructl serve` do not read one.
 
+## The data directory
+
+A run gives the application a [data directory](data-directory.md) for
+the files it keeps from one run to the next, such as a SQLite database,
+as `MURU_DATA_DIR`, with `MURU_MEDIA_DIR` and `MURU_UPLOADS_DIR` beneath
+it, and a directory for built static files as `MURU_STATIC_DIR`. Both
+are in your user state directory, `runs/NAME-HASH` under
+`~/.local/state/muru` on Linux and `~/Library/Application Support/muru`
+on macOS (or under `MURU_STATE_DIR` when it is set), where `NAME` is the
+application's name and `HASH` comes from the project's path, so two
+checkouts of one project keep apart. Nothing is put in the project,
+which a database could otherwise be committed from by mistake. The run
+prints where they are when it starts, and `muructl status` shows them
+while it runs.
+
+`--data-dir DIR`, or `data_dir` in the run table or `muru.local.toml`,
+puts the data directory somewhere else, a relative one in the project;
+the static directory stays in the run's own. The run reads it at start,
+so a change takes a restart.
+
 ## What wins
 
 Highest first: a flag, then `muru.local.toml`, then `[tool.muru.run]`,
@@ -256,7 +277,8 @@ The run table's settings (the port, HTTPS, the dashboard, the reload
 patterns, the access log, the toolbar and the rest), `python` and the
 limits on a request (`max_body_size` and the request timeouts) apply only
 as the run starts. A change to one of them is named on a line of its own,
-and the run keeps the value it started with:
+once, against the file it changed in, and the run keeps the value it
+started with until it is restarted:
 
 ```
 muru: reloading, ./pyproject.toml changed

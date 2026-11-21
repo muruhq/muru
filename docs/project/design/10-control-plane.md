@@ -155,10 +155,11 @@ umask = '027'
 limits = { nofile = 65536, memory = '4GiB', cpu = 2.0 }     # cgroup limits on Linux
 ```
 
+- **Data and static directories (issues 849 and 850).** The application's data directory and its media and uploads parts are made, when missing, owned by the application's user with mode `0700`, before a release's host or command starts; Muru changes nothing of one that is there, and does not refuse a release whose user is not its owner, which fails where its code cannot write and which `muructl data show` makes visible. The media part is a root marked with the application's user (section 4.9), so a link in its place must lead to a directory that user owns. A release's static directory is owned by the release's user with the edge's group, mode `2750`, set again at each start, so the edge reads what `collectstatic` writes there and no other application's user does, and what is made in it keeps the group, as the release's socket directory is shared.
 - When the daemon runs as root, each application's hosts and workers run as the configured user and group, or as the service user (ADR 0026: `muru`, or the `[daemon]` table's `user` or `--user`) when the application names none; never as root unless `user = 'root'` is written, which records an `app.user_is_root` warning at each release start. Its `HOME`, `USER` and `LOGNAME` are the user's own (section 8.7). The release's run directory and socket directory are owned by that user, with the edge's group given access to the sockets only. Without root (user mode), everything runs as the daemon's user and a configured user is reported as not applied.
 - The daemon creates no accounts. A root daemon whose service user does not exist, or is root, refuses to start and names the remedies. The packages ship a sysusers.d entry for `muru`.
 - limits map to per-release cgroups on Linux (section 8.5 describes the container equivalent). cgroups are created by the daemon under its own slice, and delegated by systemd when the unit runs under it.
-- Applications never see each other's run directories, spool directories, bytecode caches or secrets, and cannot reach the admin socket unless their user is in the admin group.
+- Applications never see each other's run directories, spool directories, bytecode caches, data directories or secrets, and cannot reach the admin socket unless their user is in the admin group.
 
 ## 10.10 Atomic apply
 

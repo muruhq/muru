@@ -938,6 +938,49 @@ class Group:
         return cls(name, processes, threads, sync_threads, concurrency)
 
 
+def parse_sendfile(text: str) -> list[tuple[str, list[str], str | None, dict[str, int]]]:
+    """Parse --sendfile, each mount's path hint settings (section 4.9).
+
+    The argument is a JSON object by mount name, each with `roots`,
+    absolute directories, `owned`, the roots Muru provides that must be
+    owned by a user, by path with the uid, and `header`, a second header
+    honoured as X-Muru-Sendfile or null.
+    """
+
+    try:
+        mounts = json.loads(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"{text!r} is not JSON: {error}") from None
+
+    if not isinstance(mounts, dict):
+        raise argparse.ArgumentTypeError(f"{text!r} is not an object of mounts")
+
+    parsed: list[tuple[str, list[str], str | None, dict[str, int]]] = []
+
+    for name, settings in mounts.items():
+        roots = settings.get("roots") if isinstance(settings, dict) else None
+        header = settings.get("header") if isinstance(settings, dict) else None
+        owned = settings.get("owned", {}) if isinstance(settings, dict) else None
+
+        if not isinstance(roots, list) or not all(
+            isinstance(root, str) and os.path.isabs(root) for root in roots
+        ):
+            raise argparse.ArgumentTypeError(f"mount {name!r}: roots are not absolute paths")
+
+        if header is not None and not isinstance(header, str):
+            raise argparse.ArgumentTypeError(f"mount {name!r}: header is not a header name")
+
+        if not isinstance(owned, dict) or not all(
+            root in roots and isinstance(uid, int) and not isinstance(uid, bool)
+            for root, uid in owned.items()
+        ):
+            raise argparse.ArgumentTypeError(f"mount {name!r}: owned roots are not its roots")
+
+        parsed.append((name, roots, header, owned))
+
+    return parsed
+
+
 def parse_mount_handoff(text: str) -> tuple[str, tuple[str, int | None]]:
     """Parse NAME=INTERFACE[,THREADS]: where a mount's requests may be handed.
 
@@ -1274,11 +1317,17 @@ class Host:
         reflection: bool = False,
         handoff: str | None = None,
         cgroup: str | None = None,
+        sendfile: list[tuple[str, list[str], str | None, dict[str, int]]] | None = None,
     ) -> None:
         self.release = release
         self.mounts = mounts or []
         self.reflection = reflection
         self.handoff = handoff
+
+        # Section 4.9: each mount's path hint roots and second header, the
+        # default mount's named "", which the workers enforce.
+
+        self.sendfile = sendfile or []
         self.socket_dir = socket_dir
         self.tcp_base_port = tcp_base_port
         self.detach = detach
@@ -2236,6 +2285,7 @@ class Host:
                 grpc_methods=grpc_methods,
                 handoff=self.handoff is not None,
                 worker=within,
+                sendfile=self.sendfile,
                 **asgi_arguments,
                 **timeout_arguments,
             )
@@ -2543,7 +2593,12 @@ class Host:
         self.relay_outgoing.clear()
 
     def read_relay(self) -> None:
-        """Read which pipes the relay has read to their end, and close them."""
+        """Read which pipes the relay has read to their end, and close them.
+
+        A flush the relay asks for is answered behind every offer already
+        queued for it, so the relay has every pipe held once it reads the
+        answer (issue 838).
+        """
 
         assert self.relay is not None
 
@@ -2564,12 +2619,19 @@ class Host:
             line, _, self.relay_buffer = self.relay_buffer.partition(b"\n")
 
             try:
-                number = json.loads(line).get("ended")
+                message = json.loads(line)
+                number = message.get("ended")
+                flush = message.get("flush")
             except (ValueError, AttributeError):
                 continue
 
             if isinstance(number, int):
                 self.release_pipe(number)
+
+            if isinstance(flush, int):
+                answer = json.dumps({"flushed": flush}, separators=(",", ":")).encode() + b"\n"
+                self.relay_outgoing.append((answer, None))
+                self.flush_relay()
 
     def release_pipe(self, number: int) -> None:
         """Close a held pipe once a relay has read it to its end."""
@@ -5123,6 +5185,26 @@ def elapsed_ms(since: float) -> str:
     return f"{(time.monotonic() - since) * 1000:.0f}"
 
 
+def call_host_hook(hooks: Hooks, hook: str, context: Context) -> bool:
+    """Run one of the host's hooks, on_load or pre_fork, and time it.
+
+    When the hooks module defines the hook, its time is logged once it
+    returns (issue 846). Returns whether the hook completed, as
+    `Hooks.call_logged` does.
+    """
+
+    if not hooks.has(hook):
+        return True
+
+    started = time.monotonic()
+
+    if not hooks.call_logged(hook, context):
+        return False
+
+    log(f"{hook} hook ran in {elapsed_ms(started)} ms")
+    return True
+
+
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     """Parse the host's command line."""
 
@@ -5250,6 +5332,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         choices=HANDOFFS,
         default=None,
         help="the interface the default mount's requests may be handed to",
+    )
+    parser.add_argument(
+        "--sendfile",
+        type=parse_sendfile,
+        default=[],
+        metavar="JSON",
+        help="each mount's path hint roots and second header, by mount name, the default mount's "
+        'under ""',
     )
     parser.add_argument(
         "--mount-handoff",
@@ -5705,32 +5795,43 @@ def _main(argv: list[str] | None) -> int:
                 instruments.finished(context, _instrumentation.FAILED)
                 return 1
 
-            if not hooks.call_logged("on_load", context):
+            # Issue 846: the import's line and time come before on_load
+            # runs, so the hook's output follows the line saying the
+            # application is loaded, and a slow hook is not a slow import.
+
+            log(f"preloaded {args.app} in {elapsed_ms(started)} ms")
+
+            # A preloaded application has settled its interface by now; a
+            # per-worker factory settles it in each worker.
+
+            if release.resolved is not None:
+                log(f"{args.app} is served as {interface_name(release.resolved)}")
+
+            for mount in mounts:
+                if mount.release.resolved is not None:
+                    log(
+                        f"mount {mount.name}: {mount.release.spec} is served as "
+                        f"{interface_name(mount.release.resolved)}"
+                    )
+
+            if not call_host_hook(hooks, "on_load", context):
                 instruments.finished(context, _instrumentation.FAILED)
                 return 1
 
-        loaded_ms = (time.monotonic() - started) * 1000.0
-        log(f"preloaded {args.app} in {elapsed_ms(started)} ms")
+        # The load's time, for muru_release_load_seconds and the
+        # release.loaded event, counts on_load: it is how long the host
+        # took until it could fork.
 
-        # A preloaded application has settled its interface by now; a
-        # per-worker factory settles it in each worker.
+        loaded_ms = (time.monotonic() - started) * 1000.0
 
         if release.resolved is not None:
             set_context(release.context)
-            log(f"{args.app} is served as {interface_name(release.resolved)}")
-
-        for mount in mounts:
-            if mount.release.resolved is not None:
-                log(
-                    f"mount {mount.name}: {mount.release.spec} is served as "
-                    f"{interface_name(mount.release.resolved)}"
-                )
 
         # Section 6.2: pre_fork runs once, before the import check, so
         # that what it closes is not reported as crossing the fork. With
         # --single nothing forks, so it has no occasion.
 
-        if not args.single and not hooks.call_logged("pre_fork", context):
+        if not args.single and not call_host_hook(hooks, "pre_fork", context):
             instruments.finished(context, _instrumentation.FAILED)
             return 1
 
@@ -5851,6 +5952,7 @@ def _main(argv: list[str] | None) -> int:
         reflection=args.reflection,
         handoff=args.handoff,
         cgroup=args.cgroup,
+        sendfile=args.sendfile,
     )
 
     # Section 6.18: the load's import report, or the one a host that fell

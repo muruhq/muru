@@ -199,6 +199,28 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DIR")]
     runtime_dir: Option<String>,
 
+    /// The application's data directory, given to it as MURU_DATA_DIR:
+    /// normally a mounted volume, which must exist and be writable; its
+    /// media and uploads parts are made in it (default: none).
+    #[arg(long, value_name = "DIR")]
+    data_dir: Option<String>,
+
+    /// The media part, MURU_MEDIA_DIR, the one part ever served, a
+    /// relative one taken from the data directory (default: media).
+    #[arg(long, value_name = "DIR")]
+    media_dir: Option<String>,
+
+    /// The uploads part, MURU_UPLOADS_DIR, never served, a relative one
+    /// taken from the data directory (default: uploads).
+    #[arg(long, value_name = "DIR")]
+    uploads_dir: Option<String>,
+
+    /// The directory of built static files, MURU_STATIC_DIR, which a
+    /// static entry names as static:, a relative one taken from the
+    /// project (default: staticfiles).
+    #[arg(long, value_name = "DIR")]
+    static_dir: Option<String>,
+
     /// The most request bodies spooled to disk at once (default 1GB, or the memory headroom when the run directory is in memory under a memory limit).
     #[arg(long, value_name = "SIZE")]
     spool_quota: Option<String>,
@@ -272,6 +294,10 @@ const KEYS: &[(&str, Kind)] = &[
     ("python", Kind::Text),
     ("run_dir", Kind::Text),
     ("runtime_dir", Kind::Text),
+    ("data_dir", Kind::Text),
+    ("media_dir", Kind::Text),
+    ("uploads_dir", Kind::Text),
+    ("static_dir", Kind::Text),
     ("spool_quota", Kind::Text),
     ("trusted_proxy", Kind::List),
     ("shutdown_delay", Kind::Text),
@@ -369,6 +395,10 @@ fn from_flags(args: &ServeArgs) -> BTreeMap<&'static str, Value> {
     text("python", &args.python);
     text("run_dir", &args.run_dir);
     text("runtime_dir", &args.runtime_dir);
+    text("data_dir", &args.data_dir);
+    text("media_dir", &args.media_dir);
+    text("uploads_dir", &args.uploads_dir);
+    text("static_dir", &args.static_dir);
     text("spool_quota", &args.spool_quota);
     text("shutdown_delay", &args.shutdown_delay);
     text("shutdown_budget", &args.shutdown_budget);
@@ -509,6 +539,8 @@ pub struct Mode {
     /// The container's cgroup limits as read at start, which the run
     /// reads again at every memory check (sections 7.7 and 13.9).
     pub limits: Option<Limits>,
+    /// The data and static directories named (issues 849 and 850).
+    pub places: crate::places::ServeDirs,
     /// What was read from the container's limits, a line each, for the
     /// start and `--print-config`.
     pub start_lines: Vec<String>,
@@ -880,6 +912,12 @@ fn prepare(
         trust,
         shutdown,
         limits: limits.cloned(),
+        places: crate::places::ServeDirs {
+            data: layered.text("data_dir").map(str::to_owned),
+            media: layered.text("media_dir").map(str::to_owned),
+            uploads: layered.text("uploads_dir").map(str::to_owned),
+            static_dir: layered.text("static_dir").map(str::to_owned),
+        },
         start_lines,
     };
 
@@ -1042,6 +1080,7 @@ fn report(layered: &Layered, mode: &Mode) -> crate::print_config::Serve {
         ("timestamps", false.into()),
         ("run_dir", DEFAULT_RUN_DIR.into()),
         ("runtime_dir", DEFAULT_RUNTIME_DIR.into()),
+        ("static_dir", muru_config::places::SERVE_STATIC_DIR.into()),
         (
             "spool_quota",
             muru_config::format_size(DEFAULT_SPOOL_QUOTA).into(),

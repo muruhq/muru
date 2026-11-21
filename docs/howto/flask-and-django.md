@@ -81,19 +81,31 @@ answers with its own error page and records `reason=app_error`.
 
 Static files: Django serves them only under `runserver`, so under Muru a
 request for one reaches the application and finds no URL. The edge can
-serve them instead, in development and production alike, from the
-directory `collectstatic` fills, declared in the project (see the
-[static files guide](static-files.md#an-applications-own-files)):
+serve them instead, from the directory `collectstatic` fills, which is
+a directory of each release's own that Muru gives as `MURU_STATIC_DIR`
+(see the [static files guide](static-files.md#built-files)):
+
+```python
+STATIC_ROOT = os.environ.get("MURU_STATIC_DIR", BASE_DIR / "staticfiles")
+```
 
 ```toml
 [[tool.muru.static]]
 path = '/static/'
-dir = 'static'
+dir = 'static:'
+cache = { max_age = '1y', immutable = true }
+
+[tool.muru.commands.collectstatic]
+run = ['python', 'manage.py', 'collectstatic', '--noinput']
+before_fork = true
+timeout = '5m'
 ```
 
-Or, in development, add Django's static file patterns to the URLs,
-which serve them while `DEBUG = True` from each application's own
-`static` directory, with no `collectstatic`, and add nothing otherwise:
+Under the daemon the `collectstatic` command runs once for each release,
+before its workers fork, so each release serves its own assets. In
+development, add Django's static file patterns to the URLs, which serve
+them while `DEBUG = True` from each application's own `static`
+directory, with no `collectstatic`, and add nothing otherwise:
 
 ```python
 from django.contrib.staticfiles.urls import staticfiles_urlpatterns
@@ -101,11 +113,16 @@ from django.contrib.staticfiles.urls import staticfiles_urlpatterns
 urlpatterns += staticfiles_urlpatterns()
 ```
 
-Under the daemon, the project's entry serves `STATIC_ROOT` after
-`collectstatic`, as a [static route](static-files.md) at the site level
-would, or use WhiteNoise. The
-[Django tutorial](../tutorials/first-django-site.md) uses the URL
-patterns in development and the project's entry in production.
+Under `muructl run` the `static:` entry's directory is empty until
+`muructl command run collectstatic` fills it, and its requests reach
+Django's patterns meanwhile. In an image for `muructl serve`, run
+`python manage.py collectstatic --noinput` when the image is built,
+which fills `staticfiles` in the project. The
+[Django tutorial](../tutorials/first-django-site.md) does all three.
+
+The database, `MEDIA_ROOT` and other files kept from one release to the
+next go in the application's data directory; [keeping data between
+releases](data-directory.md#django) has the settings.
 
 Flask serves its package's `static` folder itself under any server.
 Declaring it in the project hands those requests to the edge instead,
@@ -116,6 +133,11 @@ with the same `url_for('static', ...)` paths:
 path = '/static/'
 dir = 'shop/static'
 ```
+
+Flask's instance folder, where its tutorial keeps the database, goes in
+the application's data directory with `Flask(__name__,
+instance_path=os.environ.get("MURU_DATA_DIR"))`; [keeping data between
+releases](data-directory.md#flask) has the rest.
 
 ## Both
 

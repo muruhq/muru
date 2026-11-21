@@ -190,7 +190,7 @@ CREATE TABLE IF NOT EXISTS log_files_seen (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 
 /// The store.
 pub struct Store {
@@ -228,8 +228,10 @@ impl Store {
         // each command's last run (issue 688), version 17 the gates each
         // release has passed (issue 266), version 18 the named conditions
         // of applied files (issue 123), version 19 the activations of
-        // overlays by their conditions (issue 689), and version 20 the
-        // import report of each release's load (issue 741).
+        // overlays by their conditions (issue 689), version 20 the import
+        // report of each release's load (issue 741), and version 21 where
+        // the application's data directory and its parts are (issue 849),
+        // added to an older table here.
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -325,7 +327,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                 user, grp, umask, priority, access_log FROM apps ORDER BY name",
+                 user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir FROM apps ORDER BY name",
             )?;
             let rows = statement.query_map([], app_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -339,7 +341,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                     user, grp, umask, priority, access_log FROM apps WHERE name = ?1",
+                     user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir FROM apps WHERE name = ?1",
                     [name],
                     app_from_row,
                 )
@@ -380,6 +382,30 @@ impl Store {
                 "UPDATE apps SET priority = ?2, resource_version = resource_version + 1 \
                  WHERE name = ?1",
                 params![name, priority],
+            )?;
+
+            if changed == 0 {
+                return Err(StoreError::NotFound(format!("application {name}")));
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Set where the application's data directory and its parts are
+    /// (issue 849); none for each is the default.
+    pub fn set_app_data(
+        &self,
+        name: &str,
+        data_dir: Option<&str>,
+        media_dir: Option<&str>,
+        uploads_dir: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| {
+            let changed = connection.execute(
+                "UPDATE apps SET data_dir = ?2, media_dir = ?3, uploads_dir = ?4, \
+                 resource_version = resource_version + 1 WHERE name = ?1",
+                params![name, data_dir, media_dir, uploads_dir],
             )?;
 
             if changed == 0 {
@@ -1542,12 +1568,15 @@ fn app_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<App> {
             Some(encoded) => decode(&encoded).map_err(|error: StoreError| undecodable(9, error))?,
             None => crate::model::AccessLogSpec::default(),
         },
+        data_dir: row.get(10)?,
+        media_dir: row.get(11)?,
+        uploads_dir: row.get(12)?,
     })
 }
 
-/// Add the identity columns of version 4, the priority of version 9 and
-/// the access log choice of version 11 to an applications table that
-/// predates them.
+/// Add the identity columns of version 4, the priority of version 9, the
+/// access log choice of version 11 and the data directory of version 21
+/// to an applications table that predates them.
 fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
     add_columns(
         connection,
@@ -1558,6 +1587,9 @@ fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
             ("umask", "TEXT"),
             ("priority", "INTEGER"),
             ("access_log", "TEXT"),
+            ("data_dir", "TEXT"),
+            ("media_dir", "TEXT"),
+            ("uploads_dir", "TEXT"),
         ],
     )?;
     add_columns(

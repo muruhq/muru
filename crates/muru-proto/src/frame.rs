@@ -67,6 +67,10 @@ pub mod flag {
     /// Set on a MESSAGE frame that carries a text message rather than a
     /// binary one.
     pub const TEXT: u8 = 0x02;
+    /// Set on a FILE frame whose descriptor the worker opened for a path
+    /// hint (section 4.9): the edge serves the file with static-file
+    /// behaviour rather than sending a range the application chose.
+    pub const PATH_HINT: u8 = 0x04;
 }
 
 /// A decoded frame.

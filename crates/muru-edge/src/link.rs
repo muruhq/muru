@@ -1287,9 +1287,14 @@ pub struct Context<'a> {
     pub mount: String,
     /// The mount's path, joined to SCRIPT_NAME.
     pub mount_path: String,
-    /// The file hints by path the mount, upstream or server may give
-    /// (section 4.9).
+    /// The file hints by path the upstream or managed server may give
+    /// (section 4.9), which the edge opens; a worker opens its own.
     pub sendfile: Arc<Sendfile>,
+    /// For GET and HEAD, the encodings the route's compression policy
+    /// would serve a precompressed variant in for this client, in its
+    /// order (section 4.9): told to a worker, which opens the variant of
+    /// a file a path hint names.
+    pub precompressed: Vec<crate::compression::Encoding>,
     /// The origins whose pages may call the release through gRPC-Web
     /// (section 6.13).
     pub grpc_web: Arc<crate::grpc::WebOrigins>,
@@ -1364,6 +1369,7 @@ impl<'a> Context<'a> {
             mount: String::new(),
             mount_path: String::new(),
             sendfile: Arc::default(),
+            precompressed: Vec::new(),
             grpc_web: Arc::default(),
             forwarded_host: self.forwarded_host.clone(),
             forwarded_port: self.forwarded_port,
@@ -2401,15 +2407,58 @@ async fn handle_inner(
         };
     }
 
-    // Section 4.9: a file hint by path replaces the response's body with
-    // the file, served by the edge; the rest of the worker's response is
-    // drained as for a redirect.
+    // Section 4.9 (issue 848): the worker took a path hint from the
+    // response, opened the file beneath its mount's roots and says how
+    // that went. An opened file's descriptors follow the head, and the
+    // edge serves the file in place of the response's body, with
+    // static-file behaviour.
 
     if upgrade.is_none()
-        && let Some(path) = sendfile_from(&head, &context.sendfile)
+        && let Some(hint) = head.path_hint.clone()
     {
-        let read = set_aside(reader, &back, response_end, limits, settles).await;
-        let response = serve_hint(&path, parts, context, &head, &failing, recording).await;
+        let opened = hint.outcome == pb::PathHintOutcome::Opened as i32 && !response_end;
+
+        let (located, read) = if opened {
+            match read_hinted(&mut reader, &hint.path, limits.response_idle_timeout).await {
+                Ok(found) => (
+                    Ok(found),
+                    set_aside(reader, &back, true, limits, settles).await,
+                ),
+                Err(error) => {
+                    tracing::warn!(
+                        path = hint.path,
+                        "reading a hinted file's descriptor failed: {error}"
+                    );
+                    back.give_reader(None);
+                    back.abort_request();
+                    *failing.recording.lock().expect("recording poisoned") = recording.take();
+                    return failing
+                        .worker_crashed("The worker failed while sending a hinted file.");
+                }
+            }
+        } else {
+            let located = if hint.outcome == pb::PathHintOutcome::Refused as i32 {
+                Err(crate::static_files::Located::Refused)
+            } else {
+                Err(crate::static_files::Located::Missing)
+            };
+
+            (
+                located,
+                set_aside(reader, &back, response_end, limits, settles).await,
+            )
+        };
+
+        let response = serve_hint(
+            &hint.path,
+            parts,
+            context,
+            &head,
+            &failing,
+            recording,
+            Some(located),
+        )
+        .await;
 
         return if read {
             response
@@ -2622,7 +2671,9 @@ pub(crate) fn sendfile_from(head: &pb::ResponseHead, policy: &Sendfile) -> Optio
 }
 
 /// Serve the file a hint names in place of the response it came with
-/// (section 4.9), recording the outcome for the access log.
+/// (section 4.9), recording the outcome for the access log. `located` is
+/// the file a worker opened, or why it did not; without it the edge looks
+/// for the file beneath the upstream's or managed server's roots.
 pub(crate) async fn serve_hint(
     path: &str,
     parts: &http::request::Parts,
@@ -2630,19 +2681,36 @@ pub(crate) async fn serve_hint(
     head: &pb::ResponseHead,
     failing: &Failing<'_>,
     recording: Option<Recording>,
+    located: Option<Result<crate::static_files::Found, crate::static_files::Located>>,
 ) -> Response<ResponseBody> {
     let strip: Vec<&str> = std::iter::once("x-muru-sendfile")
         .chain(context.sendfile.header.as_deref())
         .collect();
-    let served = crate::static_files::serve_hint(
-        path,
-        &context.sendfile.roots,
-        &parts.method,
-        &parts.headers,
-        head,
-        &strip,
-    )
-    .await;
+
+    let served = match located {
+        Some(located) => {
+            crate::static_files::serve_located(
+                path,
+                located,
+                &parts.method,
+                &parts.headers,
+                head,
+                &strip,
+            )
+            .await
+        }
+        None => {
+            crate::static_files::serve_hint(
+                path,
+                &context.sendfile.roots,
+                &parts.method,
+                &parts.headers,
+                head,
+                &strip,
+            )
+            .await
+        }
+    };
 
     match served {
         Ok(crate::static_files::Outcome::Served {
@@ -2660,18 +2728,87 @@ pub(crate) async fn serve_hint(
             response
         }
         Ok(_) => {
+            // The file was found and opened, and its first bytes could not
+            // be read: to the client it is as good as absent.
+
             failing.put_recording(recording);
-            failing.respond(Problem::new(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "method_not_allowed",
-                "A file answers GET and HEAD only.",
-            ))
+            failing.respond(crate::static_files::missing())
         }
         Err(problem) => {
             failing.put_recording(recording);
             failing.respond(problem)
         }
     }
+}
+
+/// The files a worker opened for a path hint (section 4.9), from the FILE
+/// frames with the PATH_HINT flag that follow the head: the file, and its
+/// precompressed variant when one follows, each checked with fstat to be
+/// a regular file.
+async fn read_hinted(
+    reader: &mut Reader,
+    path: &str,
+    idle_timeout: Duration,
+) -> Result<crate::static_files::Found, String> {
+    let mut files: Vec<(String, std::fs::File)> = Vec::new();
+
+    loop {
+        let next = tokio::time::timeout(idle_timeout, frame::read(reader))
+            .await
+            .map_err(|_| "the worker stopped sending".to_owned())?
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "the worker closed the connection".to_owned())?;
+
+        if next.kind != kind::FILE || next.flags & flag::PATH_HINT == 0 || files.len() == 2 {
+            return Err(format!("a frame of type {} out of place", next.kind));
+        }
+
+        let hint = pb::FileHint::decode(next.payload.clone()).unwrap_or_default();
+        let fd = reader
+            .get_mut()
+            .take_fd()
+            .ok_or_else(|| "a file came without its descriptor".to_owned())?;
+        files.push((hint.encoding, std::fs::File::from(fd)));
+
+        if next.is_end() {
+            break;
+        }
+    }
+
+    let mut files = files.into_iter();
+    let Some((_, file)) = files.next() else {
+        return Err("no file came".to_owned());
+    };
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+
+    if !metadata.is_file() {
+        return Err("the file is not a regular file".to_owned());
+    }
+
+    let mut found = crate::static_files::Found {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+        file,
+        name: std::path::PathBuf::from(path),
+        relative: String::new(),
+        variant: None,
+    };
+
+    if let Some((encoding, file)) = files.next() {
+        let encoding = crate::compression::Encoding::parse(&encoding)
+            .ok_or_else(|| format!("{encoding:?} is not a content coding"))?;
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+
+        if metadata.is_file() {
+            found.variant = Some(crate::static_files::Variant {
+                file,
+                length: metadata.len(),
+                encoding,
+            });
+        }
+    }
+
+    Ok(found)
 }
 
 /// Whether a frame carries response body: bytes, or a file range whose

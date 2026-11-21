@@ -95,6 +95,7 @@ message RequestHead {
   string mode = 29;                 // section 4.15: the route's site mode, as muru.mode; none when empty
   bool borrowed = 30;               // section 6.7: the edge gave the request a shared thread its mount borrows
   bool record = 31;                 // section 11.7: send a RECORD frame of the worker's part after the response
+  repeated string precompressed = 32; // section 4.9: for GET and HEAD, the content codings the edge would serve a precompressed variant in, in its order; empty when it would serve none
 }
 
 // What a REQUEST frame opens (sections 5.6 and 6.13). A gRPC call's
@@ -157,10 +158,29 @@ message UploadRef {
 
 // Payload of a FILE frame (section 5.7): the response body, or the next
 // piece of it, is `length` bytes of the file whose descriptor is attached
-// to the frame, from `offset`. The END flag ends the body with it.
+// to the frame, from `offset`. The END flag ends the body with it. With
+// the PATH_HINT flag the descriptor is a file the worker opened for a
+// path hint (section 4.9), served by the edge with static-file behaviour,
+// and offset and length are 0: the first such frame is the file, and a
+// second, when there is one, its precompressed variant.
 message FileHint {
   uint64 offset = 1;
   uint64 length = 2;
+  string encoding = 3;              // a path hint's precompressed variant: its content coding, such as br; empty for the file itself
+}
+
+// Section 4.9: what became of a path hint the worker took from the
+// response's headers, which it removed.
+message PathHint {
+  string path = 1;                  // the path the application named, for the log and the content type
+  PathHintOutcome outcome = 2;
+}
+
+enum PathHintOutcome {
+  PATH_HINT_OUTCOME_UNSPECIFIED = 0;
+  PATH_HINT_OUTCOME_OPENED = 1;     // FILE frames with the PATH_HINT flag follow the head
+  PATH_HINT_OUTCOME_REFUSED = 2;    // relative, outside every root or leaving its root: 500 sendfile_refused; the head has the END flag
+  PATH_HINT_OUTCOME_MISSING = 3;    // nothing there, not a regular file, or not readable: 404 sendfile_missing; the head has the END flag
 }
 
 // How the worker should flush response body chunks (section 5.4).
@@ -178,6 +198,7 @@ message ResponseHead {
   string reason = 4;                // the application's reason phrase, for HTTP/1.1
   double imports_ms = 5;            // a recorded request's first-time module loads before the head, the outermost summed, for Server-Timing (issue 738)
   double import_wait_ms = 6;        // its waits before the head on modules other threads were loading, summed, for Server-Timing (issue 787)
+  PathHint path_hint = 7;           // section 4.9: the response named a file by path, opened by the worker; none otherwise
 }
 
 // Payload of an END frame: the end of a body in one direction.

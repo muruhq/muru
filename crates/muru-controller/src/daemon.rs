@@ -863,6 +863,7 @@ pub async fn processes(
         mode: "daemon".to_owned(),
         started_unix_ms: info.started_unix_ms,
         limits: info.cgroup_limits.lock().expect("limits poisoned").clone(),
+        state_dir: crate::registry::home_shortened(&info.locations.state.path),
     };
 
     Some(
@@ -2278,7 +2279,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     if owns_log {
         let path = locations.pid_file();
 
-        if let Err(error) = std::fs::write(&path, std::process::id().to_string()) {
+        if let Err(error) = muru_common::files::write_whole(&path, std::process::id().to_string()) {
             tracing::warn!(%error, path = %path.display(), "writing the pid file failed");
         }
     }
@@ -2768,12 +2769,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 }
 
 /// A bind the daemon was refused, as an error: with the instance of
-/// Muru's that holds the address named when one does (issue 808), as
-/// the error's own message under the context the caller adds.
+/// Muru's that holds the address named when one does (issue 808), or
+/// else the program lsof or ss name (issue 837), as the error's own
+/// message under the context the caller adds.
 fn bind_refused(error: std::io::Error, address: SocketAddr, what: &str) -> anyhow::Error {
     if error.kind() == std::io::ErrorKind::AddrInUse
         && let Some(message) =
-            crate::registry::in_use_by_instance(address, &format!("choose another {what}"))
+            crate::registry::in_use_by(address, &format!("choose another {what}"))
     {
         return anyhow::anyhow!(message);
     }
@@ -3419,11 +3421,12 @@ fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     toml::from_str(&text).ok()
 }
 
-/// Write a record for the next daemon.
+/// Write a record for the next daemon, whole, so a daemon that reads it
+/// as it is rewritten never takes it for no record.
 fn write_record<T: serde::Serialize>(path: &Path, record: &T) {
     let written = toml::to_string(record)
         .map_err(std::io::Error::other)
-        .and_then(|text| std::fs::write(path, text));
+        .and_then(|text| muru_common::files::write_whole(path, text));
 
     if let Err(error) = written {
         tracing::error!(%error, path = %path.display(), "writing a record failed");
@@ -4251,8 +4254,12 @@ impl Daemon {
         for &(address, tls) in wanted {
             let socket = match self.edge.socket_on(address) {
                 Some(socket) => socket,
-                None => std::net::TcpListener::bind(address)
-                    .map_err(|error| format!("cannot listen on {address}: {error}"))?,
+                None => std::net::TcpListener::bind(address).map_err(|error| {
+                    format!(
+                        "cannot listen on {address}: {}",
+                        bind_refused(error, address, "listener")
+                    )
+                })?,
             };
 
             listeners.push(crate::edges::Listener { socket, tls });
@@ -6668,6 +6675,12 @@ impl Daemon {
             return Err(format!("release {app}@{id} already exists"));
         }
 
+        // Issues 849 and 850: what the release serves is checked against
+        // the application's data directory, and its static directory is
+        // made empty.
+
+        crate::places::prepare_release(&self.locations.state.path, &self.store, app, &id, &spec)?;
+
         self.store
             .create_release(app, &id, &spec)
             .map_err(|error| error.to_string())
@@ -6687,6 +6700,79 @@ impl Daemon {
     /// release's start provides it.
     async fn runtime_library(&self, python: &Path) -> Result<muru_provision::Provided, String> {
         self.context().runtime_library(python).await
+    }
+
+    /// Issues 849 and 850: the places a release of the application is
+    /// given: its data directory as the application's `[app.NAME]` table
+    /// says now, the release's own static directory and, under a root
+    /// daemon, the user its media part must belong to.
+    fn places(
+        &self,
+        app: &str,
+        id: &str,
+        identity: Option<crate::host::Identity>,
+    ) -> crate::places::Places {
+        let state = &self.locations.state.path;
+
+        crate::places::Places {
+            data: self
+                .store
+                .app(app)
+                .ok()
+                .map(|record| crate::places::app_data(state, &record)),
+            static_dir: Some(crate::places::static_dir(state, app, id)),
+            owner: self.service.and(identity).map(|identity| identity.uid),
+        }
+    }
+
+    /// Make what is missing of a release's places, given to the user it
+    /// runs as, share its static directory with the edge, and check what
+    /// the release serves against its data directory, which may have
+    /// moved since the release was created.
+    fn make_places(
+        &self,
+        spec: &ReleaseSpec,
+        places: &crate::places::Places,
+        identity: Option<crate::host::Identity>,
+    ) -> Result<(), String> {
+        if let Some(dirs) = &places.data {
+            crate::places::make_data(
+                dirs,
+                identity.map(|identity| (identity.uid, identity.gid)),
+                crate::places::DATA_MODE,
+            )?;
+        }
+
+        if let Some(dir) = &places.static_dir {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| format!("making {} failed: {error}", dir.display()))?;
+
+            if let (Some(identity), Some(service)) = (identity, self.service) {
+                crate::places::share_static(dir, identity.uid, service.gid).map_err(|error| {
+                    format!(
+                        "sharing the static directory {} with the edge failed: {error}",
+                        dir.display()
+                    )
+                })?;
+            }
+        }
+
+        crate::places::check_release(spec, places)
+    }
+
+    /// The user an application's media part must belong to under a root
+    /// daemon, for the static entries the edge serves from it; none in
+    /// user mode, where the edge and the application are one user.
+    fn media_owner(&self, app: &str) -> Option<u32> {
+        let service = self.service?;
+        let user = self.store.app(app).ok().and_then(|record| record.user);
+
+        match user {
+            Some(user) => crate::host::Identity::lookup(&user, None, None)
+                .ok()
+                .map(|identity| identity.uid),
+            None => Some(service.uid),
+        }
     }
 
     /// Section 8.2: redirected bytecode goes to a directory of the
@@ -6819,6 +6905,9 @@ impl Daemon {
 
         let library = self.runtime_library(&python).await?;
         let pycache = self.pycache_prefix(app, id, spec, identity);
+        let places = self.places(app, id, identity);
+        self.make_places(spec, &places, identity)
+            .map_err(|message| format!("{subject}: {message}"))?;
         let bytecode = Some(spec.bytecode.effective());
         let base = self.daemon_base(bytecode, identity);
         let env = crate::commands::environment(
@@ -6829,6 +6918,7 @@ impl Daemon {
                 pycache: pycache.as_deref(),
                 bytecode,
                 base: Some(&base),
+                places: &places.variables(),
             },
             app,
             id,
@@ -6969,6 +7059,19 @@ impl Daemon {
             return Err(message);
         }
 
+        // Issues 849 and 850: the data directory and the static directory
+        // are there, the release's user's, and what it serves is still
+        // only media.
+
+        let places = self.places(app, id, identity);
+
+        if let Err(message) = self.make_places(spec, &places, identity) {
+            self.set_state(&release, ReleaseState::Failed, &message);
+            self.events
+                .emit("release.failed", &subject, "error", &message);
+            return Err(message);
+        }
+
         // Section 9.9: a managed HTTP release runs its server's
         // instances instead of a host.
 
@@ -7078,6 +7181,8 @@ impl Daemon {
         }
 
         let pycache_prefix = self.pycache_prefix(app, id, spec, identity);
+        let places = self.places(app, id, identity);
+        let media = places.media();
 
         // Section 8.7: the host starts from a clean environment, built
         // once for its host and workers.
@@ -7092,6 +7197,7 @@ impl Daemon {
                 pycache: pycache_prefix.as_deref(),
                 bytecode,
                 base: Some(&base),
+                places: &places.variables(),
             },
             app,
             id,
@@ -7192,7 +7298,24 @@ impl Daemon {
                     concurrency: mount.concurrency.map(|value| value as usize),
                     max_connections: mount.max_connections.map(|value| value as usize),
                     handoff: mount.handoff,
+                    sendfile_roots: muru_config::worker_root_paths(
+                        &mount.sendfile_roots,
+                        &spec.source,
+                        media,
+                    ),
+                    sendfile_header: mount.sendfile_header.clone(),
                 })
+                .collect(),
+            sendfile_roots: muru_config::worker_root_paths(
+                &spec.sendfile_roots,
+                &spec.source,
+                media,
+            ),
+            sendfile_header: spec.sendfile_header.clone(),
+            owned_roots: media
+                .zip(places.owner)
+                .map(|(media, owner)| (media.display().to_string(), owner))
+                .into_iter()
                 .collect(),
         };
 
@@ -8213,11 +8336,16 @@ impl Daemon {
                         .store
                         .release(name, id)
                         .map(|release| {
+                            let places = crate::places::Places {
+                                owner: self.media_owner(name),
+                                ..self.places(name, id, None)
+                            };
+
                             release
                                 .spec
                                 .static_dirs
                                 .iter()
-                                .map(crate::model::StaticSpec::message)
+                                .filter_map(|entry| entry.message(&places))
                                 .collect()
                         })
                         .unwrap_or_default(),
@@ -8254,11 +8382,6 @@ impl Daemon {
                                     accept_redirects_from: mount.accept_redirects_from.clone(),
                                     accel_redirect: mount.accel_redirect,
                                     cgi_local_redirect: mount.cgi_local_redirect,
-                                    sendfile_roots: mount.sendfile_roots.clone(),
-                                    sendfile_header: mount
-                                        .sendfile_header
-                                        .clone()
-                                        .unwrap_or_default(),
                                 })
                                 .collect()
                         })
@@ -8271,17 +8394,6 @@ impl Daemon {
                         .store
                         .release(name, id)
                         .is_ok_and(|release| release.spec.cgi_local_redirect),
-                    sendfile_roots: self
-                        .store
-                        .release(name, id)
-                        .map(|release| release.spec.sendfile_roots.clone())
-                        .unwrap_or_default(),
-                    sendfile_header: self
-                        .store
-                        .release(name, id)
-                        .ok()
-                        .and_then(|release| release.spec.sendfile_header.clone())
-                        .unwrap_or_default(),
                     error_pages: self
                         .store
                         .release(name, id)
@@ -8311,7 +8423,11 @@ impl Daemon {
                         // to the server's responses, which are trusted.
 
                         if let Ok(release) = self.store.release(name, id) {
-                            server.sendfile_roots = release.spec.sendfile_roots.clone();
+                            server.sendfile_roots = muru_config::sendfile_root_paths(
+                                &release.spec.sendfile_roots,
+                                &release.spec.source,
+                                self.places(name, id, None).media(),
+                            );
                             server.sendfile_header =
                                 release.spec.sendfile_header.clone().unwrap_or_default();
                         }
@@ -11984,6 +12100,7 @@ impl Daemon {
                 pycache: None,
                 bytecode: None,
                 base: Some(&base),
+                places: &self.places(app, id, identity).variables(),
             },
             app,
             id,
@@ -12609,10 +12726,7 @@ impl Daemon {
         let mut known = vec![Known {
             pid: daemon,
             role: "daemon",
-            what: crate::processes::daemon_phrase(
-                self.locations.mode_word(),
-                &self.locations.state.path,
-            ),
+            what: crate::processes::daemon_phrase(self.locations.mode_word()),
             ..Known::default()
         }];
 
@@ -12757,6 +12871,7 @@ impl Daemon {
                             app: app.clone(),
                             release: id.clone(),
                             index: Some(instance.index),
+                            program: servers.program().to_owned(),
                             ..Known::default()
                         });
                     }

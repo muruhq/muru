@@ -45,7 +45,7 @@ Every frame is a six byte header followed by its payload: a 32 bit little-endian
 | MESSAGE | 8 | both | bytes | One WebSocket message. TEXT flag for text, otherwise binary (section 5.6). On a gRPC call, one whole gRPC message (section 6.13) |
 | CLOSE | 9 | both | Close | Closes a WebSocket with a code and reason (section 5.6) |
 | INFORMATIONAL | 10 | worker to edge | ResponseHead | A 1xx response before the final head, for example 103 Early Hints. Phase 2 |
-| FILE | 11 | worker to edge | FileHint | The response body is a range of the file whose descriptor is attached to the frame (section 5.7). Phase 2 |
+| FILE | 11 | worker to edge | FileHint | The response body is a range of the file whose descriptor is attached to the frame, or with the PATH_HINT flag a file the worker opened for a path hint (section 5.7). Phase 2 |
 | DETACH | 12 | worker to edge | Detach | The request moved from an application thread to the event loop, or back, so the edge counts it against async slots or slots accordingly (section 6.14) |
 | RECORD | 13 | worker to edge | WorkerRecord | The worker's part of a development run's request record, after the response's end, sent only when the request head asked for it (section 11.7) |
 
@@ -142,6 +142,8 @@ Upgrades are accepted at the edge (HTTP/1.1 Upgrade and HTTP/2 extended CONNECT)
 File descriptors travel on the link itself, attached with SCM_RIGHTS to the frame that refers to them, so no correlation is needed: the descriptor arrives with the first byte of that frame. Both sides read the socket with recvmsg and a control buffer, since a plain read would discard an attached descriptor.
 
 - **Worker to edge:** FILE frames for wsgi.file_wrapper and the ASGI pathsend and zerocopysend extensions (sections 4.9 and 6.5). The worker sends a duplicate of the open descriptor with an offset and length, closes its own copy, and the application thread is free. The edge sends the range to the client itself.
+
+- **Path hints opened by the worker** (section 4.9, ADR 0071): a response head whose path_hint says the hinted file was opened is followed by a FILE frame with the PATH_HINT flag (0x04) whose descriptor is the file, offset and length 0, and, when the worker found a precompressed variant, a second such frame whose FileHint names the variant's encoding (br, zstd or gzip); the last carries END. The edge serves the file with static-file behaviour rather than a range the application chose. A hint that was refused or found nothing is a head with END and no FILE frame. The request head's precompressed field lists, for GET and HEAD, the encodings the edge would serve a variant in, in its order.
 
 - **Edge to worker:** offloaded upload files (section 4.11) attached to the REQUEST frame, matched to the upload references in the head by order. Each UploadRef carries the ref, the form field (empty for a raw upload), the client's file name and content type, the size, the digests by algorithm and, where the spool file has a name, its path. One message carries at most 64 descriptors, so a request with more spreads them over its first bytes, one message each.
 

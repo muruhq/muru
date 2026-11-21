@@ -19,6 +19,7 @@ mod instances;
 mod log_format;
 mod mcp;
 mod open;
+mod places;
 mod print_config;
 mod processes;
 mod project_commands;
@@ -124,6 +125,13 @@ enum Command {
         command: admin::AppCommand,
     },
 
+    /// An application's data directory, shared by its releases: where
+    /// each part is and what may be wrong with it.
+    Data {
+        #[command(subcommand)]
+        command: admin::DataCommand,
+    },
+
     /// Manage releases.
     Release {
         #[command(subcommand)]
@@ -212,8 +220,14 @@ enum Command {
         command: admin::DashboardCommand,
     },
 
-    /// Show the status of the daemon or the development run.
+    /// Show the status of the daemon or the development run, with an
+    /// application's data directory when --app names one, and a run's
+    /// own.
     Status {
+        /// Add what each part of the data directory holds, which walks it.
+        #[arg(long)]
+        sizes: bool,
+
         #[command(flatten)]
         socket: admin::SocketArgs,
 
@@ -489,7 +503,6 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         static_dirs: Vec::new(),
         accel_redirect: false,
         cgi_local_redirect: false,
-        sendfile: Arc::default(),
         grpc_web_origins: Vec::new(),
         errors: Arc::new(muru_edge::errors::ErrorPolicy::default()),
         development: true,
@@ -845,6 +858,13 @@ struct RunArgs {
     #[arg(long)]
     chdir: Option<PathBuf>,
 
+    /// The application's data directory, given to it as MURU_DATA_DIR
+    /// with its media and uploads parts made in it, a relative one taken
+    /// from the project (default: runs/NAME-HASH/data in the user state
+    /// directory, kept between runs and never in the project).
+    #[arg(long, value_name = "DIR")]
+    data_dir: Option<PathBuf>,
+
     /// Edge-to-worker link: unix (sockets in a run directory) or tcp
     /// (loopback ports from --tcp-base-port), the latter for experiments.
     #[arg(long, default_value = "unix")]
@@ -961,18 +981,8 @@ fn explain_bind_error(error: anyhow::Error, https: SocketAddr) -> anyhow::Error 
     // Section 13.8: another instance of Muru's is named as an instance,
     // and only another program by what lsof or ss say of it.
 
-    if let Some(message) = muru_controller::registry::in_use_by_instance(
-        address,
-        &format!("choose another with {flag}"),
-    ) {
-        return anyhow::anyhow!(message);
-    }
-
-    match port_holder(port) {
-        Some(holder) => anyhow::anyhow!(
-            "port {port} on {} is in use by {holder}; choose another with {flag}, or stop it",
-            address.ip()
-        ),
+    match muru_controller::registry::in_use_by(address, &format!("choose another with {flag}")) {
+        Some(message) => anyhow::anyhow!(message),
         None => anyhow::anyhow!(
             "port {port} on {} is in use; choose another with {flag} ({flag} auto picks a free one)",
             address.ip()
@@ -1011,7 +1021,7 @@ fn explain_dashboard_error(error: anyhow::Error, address: &str) -> anyhow::Error
         );
     }
 
-    let holder = parsed.and_then(|bound| port_holder(bound.port()));
+    let holder = parsed.and_then(|bound| muru_controller::registry::port_holder(bound.port()));
 
     match holder {
         Some(holder) => anyhow::anyhow!(
@@ -1020,40 +1030,6 @@ fn explain_dashboard_error(error: anyhow::Error, address: &str) -> anyhow::Error
         ),
         None => anyhow::anyhow!("the dashboard's address {address} is in use; {instead}"),
     }
-}
-
-/// The process listening on a TCP port, as "command (pid N)", found with
-/// lsof or ss when either is installed.
-fn port_holder(port: u16) -> Option<String> {
-    let lsof = std::process::Command::new("lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success());
-
-    if let Some(output) = lsof {
-        let text = String::from_utf8_lossy(&output.stdout);
-        let pid = text.lines().find_map(|line| line.strip_prefix('p'));
-        let command = text.lines().find_map(|line| line.strip_prefix('c'));
-
-        if let (Some(pid), Some(command)) = (pid, command) {
-            return Some(format!("{command} (pid {pid})"));
-        }
-    }
-
-    let ss = std::process::Command::new("ss")
-        .args(["-lptnH", &format!("sport = :{port}")])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())?;
-    let text = String::from_utf8_lossy(&ss.stdout);
-
-    // users:(("python3",pid=1234,fd=5))
-
-    let users = text.split("users:((\"").nth(1)?;
-    let (command, rest) = users.split_once('"')?;
-    let pid = rest.split("pid=").nth(1)?.split(',').next()?;
-    Some(format!("{command} (pid {pid})"))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1316,6 +1292,12 @@ fn main() -> anyhow::Result<()> {
                 admin::AppCommand::Remove(args) => admin::app_remove(*args).await,
             }
         }),
+        Command::Data {
+            command: admin::DataCommand::Show(args),
+        } => runtime.block_on(admin::data_show(*args)),
+        Command::Data {
+            command: admin::DataCommand::Check(args),
+        } => exit_with(runtime, admin::data_check(*args)),
         Command::Release { command } => runtime.block_on(async move {
             match command {
                 admin::ReleaseCommand::List {
@@ -1366,6 +1348,7 @@ fn main() -> anyhow::Result<()> {
         Command::Overlay { command } => runtime.block_on(admin::overlay(command)),
         Command::Condition { command } => runtime.block_on(admin::condition(command)),
         Command::Status {
+            sizes,
             socket,
             processes,
             output,
@@ -1373,7 +1356,11 @@ fn main() -> anyhow::Result<()> {
             let shown = if processes.processes {
                 processes::show(&socket.endpoint()?, &processes, output.json).await
             } else {
-                admin::show_status(&socket.endpoint()?, output.json).await
+                let app = processes
+                    .app
+                    .as_deref()
+                    .map(|app| app.split_once('@').map_or(app, |(app, _)| app));
+                admin::show_status(&socket.endpoint()?, app, sizes, output.json).await
             };
 
             // With nothing where it looked, how many instances the machine
@@ -1974,6 +1961,8 @@ struct Serving {
     timestamps: bool,
     /// The muru.local.toml read, when there was one.
     local: Option<PathBuf>,
+    /// The application's data directory, when one is named (issue 849).
+    data_dir: Option<PathBuf>,
 }
 
 impl Serving {
@@ -2074,6 +2063,10 @@ impl Serving {
             timestamps: !args.no_timestamps
                 && (args.timestamps || settings.timestamps == Some(true)),
             local,
+            data_dir: args
+                .data_dir
+                .clone()
+                .or_else(|| settings.data_dir.as_deref().map(PathBuf::from)),
         })
     }
 
@@ -2178,6 +2171,9 @@ struct Resolved {
     env_file_names: Vec<String>,
     /// How the run serves (section 13.1).
     serving: Serving,
+    /// The places the application is given (issues 849 and 850): its
+    /// data directory and its directory of built static files.
+    places: muru_controller::places::Places,
     /// The tables as they were read, for --print-config.
     layers: print_config::Layers,
 }
@@ -2188,6 +2184,7 @@ impl Resolved {
     /// and the limits on a request (issue 783).
     fn keeping_restart_only(mut self, mut running: Resolved) -> Resolved {
         std::mem::swap(&mut self.serving, &mut running.serving);
+        std::mem::swap(&mut self.places, &mut running.places);
         std::mem::swap(&mut self.python, &mut running.python);
         std::mem::swap(&mut self.layers.run, &mut running.layers.run);
         std::mem::swap(&mut self.layers.local, &mut running.layers.local);
@@ -2414,7 +2411,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
 
     let from_table = entrypoint.is_none();
 
-    let entrypoint = match entrypoint.or(table.entrypoint) {
+    let entrypoint = match entrypoint.or_else(|| table.entrypoint.clone()) {
         Some(entrypoint) => entrypoint,
         None => match &source {
             Some(path) => anyhow::bail!(
@@ -2466,6 +2463,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
     // over them.
 
     muru_config::check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())
+        .and_then(|()| muru_config::check_sendfile_dirs(&table.sendfile_roots, &project))
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     for (name, mount) in &table.mounts {
@@ -2478,6 +2476,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
             .as_deref()
             .or(table.sendfile_header.as_deref());
         muru_config::check_sendfile(roots, header)
+            .and_then(|()| muru_config::check_sendfile_dirs(roots, &project))
             .map_err(|error| anyhow::anyhow!("[tool.muru] mount {name}: {error}"))?;
     }
 
@@ -2504,6 +2503,25 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
             ..Default::default()
         });
     }
+
+    // Issues 849 and 850: the places the application is given, and what
+    // it serves checked against them, as a deploy checks a release.
+
+    let absolute = project.canonicalize().unwrap_or_else(|_| project.clone());
+
+    let places = match serve {
+        Some(mode) => places::for_serve(&absolute, &mode.places)?,
+        None => places::for_run(
+            &absolute,
+            &args
+                .name
+                .clone()
+                .unwrap_or_else(|| app_name(&absolute, &entrypoint)),
+            serving.data_dir.as_deref(),
+        ),
+    };
+
+    check_places(&places, &absolute, &table, &static_dirs)?;
 
     // Section 4.6: the table's own limits on a request, and those of
     // its groups and mounts.
@@ -2596,8 +2614,61 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         env,
         env_file_names,
         serving,
+        places,
         layers,
     })
+}
+
+/// Check what a run serves against its places (issue 849): the layout,
+/// every file hint root of every mount, the media part among them, and
+/// every static entry's directory, so only the media part is served.
+fn check_places(
+    places: &muru_controller::places::Places,
+    project: &Path,
+    table: &muru_config::ToolMuru,
+    static_dirs: &[muru_config::StaticDir],
+) -> anyhow::Result<()> {
+    let Some(dirs) = &places.data else {
+        return Ok(());
+    };
+
+    dirs.check().map_err(anyhow::Error::msg)?;
+
+    let mounts = std::iter::once(("", &table.sendfile_roots)).chain(table.mounts.iter().map(
+        |(name, mount)| {
+            (
+                name.as_str(),
+                mount
+                    .sendfile_roots
+                    .as_ref()
+                    .unwrap_or(&table.sendfile_roots),
+            )
+        },
+    ));
+
+    for (mount, roots) in mounts {
+        let label = if mount.is_empty() {
+            "[tool.muru] sendfile_roots".to_owned()
+        } else {
+            format!("[tool.muru] mount {mount}: sendfile_roots")
+        };
+
+        for root in roots {
+            if let Some(path) = muru_config::sendfile_root(root, project, places.media()) {
+                muru_config::places::check_served(&label, &path, dirs)
+                    .map_err(anyhow::Error::msg)?;
+            }
+        }
+    }
+
+    for entry in static_dirs {
+        let (dir, _) = places::static_directory(&entry.dir, project, places)
+            .map_err(|error| anyhow::anyhow!("static {}: {error}", entry.path))?;
+        muru_config::places::check_served(&format!("static {}", entry.path), &dir, dirs)
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    Ok(())
 }
 
 /// A host's named groups as the edge connects them: each group's sockets
@@ -2797,13 +2868,15 @@ fn static_paths(resolved: &Resolved) -> anyhow::Result<Vec<muru_edge::routing::S
         .static_dirs
         .iter()
         .map(|entry| {
-            let directory = if Path::new(&entry.dir).is_absolute() {
-                PathBuf::from(&entry.dir)
-            } else {
-                resolved.project.join(&entry.dir)
-            };
+            // Issues 849 and 850: a directory Muru provides may be empty
+            // or missing until the application fills it, its requests
+            // reaching the application meanwhile; any other must be there.
+
+            let (directory, within) =
+                places::static_directory(&entry.dir, &resolved.project, &resolved.places)
+                    .map_err(|error| anyhow::anyhow!("static {}: {error}", entry.path))?;
             anyhow::ensure!(
-                directory.is_dir(),
+                within.is_some() || directory.is_dir(),
                 "static {}: {} is not a directory",
                 entry.path,
                 directory.display()
@@ -2831,6 +2904,7 @@ fn static_paths(resolved: &Resolved) -> anyhow::Result<Vec<muru_edge::routing::S
                     cache_except: &except,
                     no_redirect_slash: entry.redirect_slash == Some(false),
                     case_insensitive: entry.case.as_deref() == Some("insensitive"),
+                    owner: None,
                 })
                 .map_err(|error| anyhow::anyhow!("static {}: {error}", entry.path))?;
             Ok(muru_edge::routing::StaticPath {
@@ -2857,17 +2931,6 @@ fn mount_paths(resolved: &Resolved) -> Vec<muru_edge::routing::MountPath> {
             cgi_local_redirect: mount
                 .cgi_local_redirect
                 .unwrap_or(resolved.cgi_local_redirect),
-            sendfile: muru_edge::routing::Sendfile::new(
-                mount
-                    .sendfile_roots
-                    .as_deref()
-                    .unwrap_or(&resolved.sendfile_roots),
-                mount
-                    .sendfile_header
-                    .as_deref()
-                    .or(resolved.sendfile_header.as_deref())
-                    .unwrap_or_default(),
-            ),
         })
         .collect()
 }
@@ -3182,6 +3245,29 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
         );
     }
 
+    // Issue 849: what muructl data check says of the data directory a
+    // run of the project uses, when there is one yet.
+
+    if let Some(dirs) = resolved
+        .places
+        .data
+        .as_ref()
+        .filter(|dirs| dirs.data.exists())
+    {
+        let data = muru_controller::places::describe(
+            &resolved.project.display().to_string(),
+            Some(dirs),
+            "",
+            muru_controller::host::Identity::current_uid(),
+            None,
+            false,
+        );
+
+        for warning in &data.warnings {
+            println!("muru: check: warning: {warning}");
+        }
+    }
+
     // The application, loaded in the interpreter under the import check.
 
     let mut command = tokio::process::Command::new(&python.python);
@@ -3485,6 +3571,15 @@ fn host_spec(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
+    // Issues 849 and 850: the places, which Muru alone names, over what
+    // the project's variables say.
+
+    let mut env: Vec<(String, String)> = env
+        .into_iter()
+        .filter(|(name, _)| !muru_config::places::VARIABLES.contains(&name.as_str()))
+        .collect();
+    env.extend(resolved.places.variables());
+
     let mut spec = HostSpec {
         python,
         pythonpath,
@@ -3525,6 +3620,18 @@ fn host_spec(
                 concurrency: mount.concurrency,
                 max_connections: mount.max_connections,
                 handoff: mount.handoff,
+                sendfile_roots: muru_config::worker_root_paths(
+                    mount
+                        .sendfile_roots
+                        .as_deref()
+                        .unwrap_or(&resolved.sendfile_roots),
+                    &resolved.project,
+                    resolved.places.media(),
+                ),
+                sendfile_header: mount
+                    .sendfile_header
+                    .clone()
+                    .or_else(|| resolved.sendfile_header.clone()),
             })
             .collect(),
         logging: resolved
@@ -3547,6 +3654,13 @@ fn host_spec(
         env,
         shown_env: resolved.env.keys().cloned().collect(),
         identity: None,
+        sendfile_roots: muru_config::worker_root_paths(
+            &resolved.sendfile_roots,
+            &resolved.project,
+            resolved.places.media(),
+        ),
+        sendfile_header: resolved.sendfile_header.clone(),
+        owned_roots: Vec::new(),
     };
 
     // Section 11.8: under serve --log-format json, Python logging writes
@@ -3595,15 +3709,6 @@ fn redirect_flags(resolved: &Resolved) -> muru_edge::routing::RedirectFlags {
         accel_redirect: resolved.accel_redirect,
         cgi_local_redirect: resolved.cgi_local_redirect,
     }
-}
-
-/// Which files the edge sends for a response that names one, as the
-/// project says.
-fn sendfile(resolved: &Resolved) -> Arc<muru_edge::routing::Sendfile> {
-    muru_edge::routing::Sendfile::new(
-        &resolved.sendfile_roots,
-        resolved.sendfile_header.as_deref().unwrap_or_default(),
-    )
 }
 
 /// The settings a run takes only as it starts, each its key and value,
@@ -3702,18 +3807,17 @@ async fn reread(
 /// The line naming what a changed settings file changed that only a
 /// restart applies, as `pyproject.toml changed port; restart the run for
 /// it to take effect`; none when it changed nothing of the kind.
-/// `started` is what those settings were as the run started.
+/// `started` is what those settings were as the run started and `last`
+/// what the last reload read of them (issue 839), so a change still
+/// waiting for a restart is not named again, nor blamed on another file.
 fn restart_line(
     args: &RunArgs,
     paths: &[PathBuf],
     started: &[(String, String)],
+    last: &[(String, String)],
     next: &Resolved,
 ) -> Option<String> {
-    let changed: Vec<String> = restart_only(args, next)
-        .into_iter()
-        .filter(|setting| !started.contains(setting))
-        .map(|(key, _)| key)
-        .collect();
+    let changed = restart_changes(started, last, &restart_only(args, next));
 
     if changed.is_empty() {
         return None;
@@ -3732,6 +3836,20 @@ fn restart_line(
         and_list(&files),
         and_list(&changed)
     ))
+}
+
+/// The restart-only settings `now` has changed since the `last` reload
+/// read them, leaving out one changed back to the value the run
+/// `started` with, which needs no restart.
+fn restart_changes(
+    started: &[(String, String)],
+    last: &[(String, String)],
+    now: &[(String, String)],
+) -> Vec<String> {
+    now.iter()
+        .filter(|setting| !last.contains(setting) && !started.contains(setting))
+        .map(|(key, _)| key.clone())
+        .collect()
 }
 
 /// Items in a sentence: `a`, `a and b`, `a, b and c`.
@@ -3775,7 +3893,7 @@ async fn run_with(
     if !args.bind.ip.is_loopback() && development {
         anyhow::bail!(
             "muructl run serves loopback addresses only, because it is development mode: error \
-             pages show tracebacks and nothing is persisted. --allow-public serves {} with those \
+             pages show tracebacks and no releases are kept. --allow-public serves {} with those \
              behaviours off, but production is the daemon's job (muructl daemon start)",
             args.bind.ip
         );
@@ -3815,9 +3933,11 @@ async fn run_with(
     }));
 
     // Issue 783: what only a restart applies, as the run starts, for a
-    // reload after a settings file changed to name what it cannot apply.
+    // reload after a settings file changed to name what it cannot apply;
+    // and as the last such reload read it (issue 839).
 
     let restart_settings = restart_only(&args, &resolved);
+    let mut restart_read = restart_settings.clone();
 
     // The interpreter is found as the run would find it, so that one the
     // run could not use is refused here with the same words.
@@ -3945,6 +4065,24 @@ async fn run_with(
     } else {
         None
     };
+
+    // Issues 849 and 850: serve's data directory is a volume it is given;
+    // what is missing of the places is made, as the daemon makes them,
+    // serve's group-writable since it runs under an arbitrary user with
+    // group 0 (section 13.9).
+
+    if serve.is_some() {
+        places::check_volume(&resolved.places)?;
+    }
+
+    places::make(
+        &resolved.places,
+        if serve.is_some() {
+            0o770
+        } else {
+            muru_controller::places::DATA_MODE
+        },
+    )?;
 
     // Section 4.9: the application's own directories of files, under
     // the project, each checked to exist before anything starts.
@@ -4103,7 +4241,6 @@ async fn run_with(
     let mut group_tables = resolved.groups.clone();
     let mut mounts = mount_paths(&resolved);
     let mut redirect_flags = redirect_flags(&resolved);
-    let mut sendfile = sendfile(&resolved);
 
     // Section 13.9: the admin port and the probe socket answer while the
     // application loads, the startup and readiness probes failing until
@@ -4268,7 +4405,6 @@ async fn run_with(
         static_dirs: static_paths.clone(),
         accel_redirect: resolved.accel_redirect,
         cgi_local_redirect: resolved.cgi_local_redirect,
-        sendfile: Arc::clone(&sendfile),
         grpc_web_origins: resolved.grpc_web_origins.clone(),
         errors: Arc::clone(&error_policy),
         development,
@@ -4364,11 +4500,27 @@ async fn run_with(
         muru_common::muru_println!("mount {name} {}", mount_serves(mount));
     }
 
+    for line in places::lines(&resolved.places) {
+        muru_common::muru_println!("{line}");
+    }
+
     for entry in &static_paths {
+        let root = entry.route.root.path();
+
+        // A directory Muru provides that is empty, such as the static
+        // directory before collectstatic fills it, has its requests reach
+        // the application until something is put there.
+
+        let empty = if places::is_empty(root) {
+            ", empty for now: its requests reach the application until files are put there"
+        } else {
+            ""
+        };
+
         muru_common::muru_println!(
-            "static {}/ from {}",
+            "static {}/ from {}{empty}",
             entry.prefix.trim_end_matches('/'),
-            entry.route.directory.display()
+            root.display()
         );
     }
 
@@ -4402,7 +4554,7 @@ async fn run_with(
         // Section 13.9: a container's production command needs no warning.
     } else if development {
         muru_common::muru_println!(
-            "development mode: error pages show tracebacks, nothing is persisted{} and only \
+            "development mode: error pages show tracebacks, no releases are kept{} and only \
              loopback is served; production runs under the daemon (muructl daemon start)",
             if resolved.serving.reload {
                 ", the run reloads on change"
@@ -4719,6 +4871,8 @@ async fn run_with(
             processes: Arc::clone(&run_processes),
             recorder: recorder.clone(),
             imports: Arc::clone(&import_reports),
+            places: resolved.places.clone(),
+            spool: serve.as_ref().map(|mode| mode.run_dir.join("spool")),
         });
 
         match run_admin::serve(state, admin_stop_rx).await {
@@ -4922,7 +5076,6 @@ async fn run_with(
                         .map(|pools| {
                             pools
                                 .with_errors(Arc::clone(&error_policy))
-                                .with_sendfile(Arc::clone(&sendfile))
                                 .with_grpc_web(&resolved.grpc_web_origins)
                                 .with_static_dirs(static_paths.clone())
                                 .with_waking(&waiting)
@@ -5060,9 +5213,11 @@ async fn run_with(
                         }
                     };
 
-                    if let Some(line) = restart_line(&args, &paths, &restart_settings, &next.resolved) {
+                    if let Some(line) = restart_line(&args, &paths, &restart_settings, &restart_read, &next.resolved) {
                         muru_common::muru_println!("{line}");
                     }
+
+                    restart_read = restart_only(&args, &next.resolved);
 
                     spec = next.spec;
                     static_paths = next.static_paths;
@@ -5070,7 +5225,6 @@ async fn run_with(
                     group_tables = next.resolved.groups.clone();
                     mounts = mount_paths(&next.resolved);
                     redirect_flags = self::redirect_flags(&next.resolved);
-                    sendfile = self::sendfile(&next.resolved);
                     resolved = next.resolved.keeping_restart_only(resolved);
 
                     if serve.is_none() {
@@ -5165,7 +5319,6 @@ async fn run_with(
                                 .map(|pools| {
                                     pools
                                         .with_errors(Arc::clone(&error_policy))
-                                        .with_sendfile(Arc::clone(&sendfile))
                                         .with_grpc_web(&resolved.grpc_web_origins)
                                 .with_static_dirs(static_paths.clone())
                                 });
@@ -5179,6 +5332,12 @@ async fn run_with(
                                     }
                                 }
 
+                                // Issue 838: what the new release's workers
+                                // wrote before they were ready comes first.
+                                // A relay that cannot flush in time does not
+                                // hold up the switch.
+
+                                next.flush_output().await;
                                 muru_common::muru_println!("switched to release r{release}");
                                 release_number.store(release, Ordering::Relaxed);
                                 let previous = std::mem::replace(&mut current, next);
@@ -5425,6 +5584,32 @@ mod tests {
     use clap::Parser as _;
 
     use super::Cli;
+
+    #[test]
+    fn a_restart_only_change_is_named_once_and_not_when_changed_back() {
+        let setting = |key: &str, value: &str| (key.to_owned(), value.to_owned());
+        let started = [setting("access_log", "all"), setting("port", "8000")];
+        let changed = [setting("access_log", "errors"), setting("port", "8000")];
+
+        // Issue 839: the reload that changes it names it; a later reload
+        // that changes nothing of the kind does not name it again.
+
+        assert_eq!(
+            super::restart_changes(&started, &started, &changed),
+            ["access_log"]
+        );
+        assert!(super::restart_changes(&started, &changed, &changed).is_empty());
+
+        // Changed again, it is named again; changed back to what the run
+        // started with, it needs no restart.
+
+        let again = [setting("access_log", "none"), setting("port", "8000")];
+        assert_eq!(
+            super::restart_changes(&started, &changed, &again),
+            ["access_log"]
+        );
+        assert!(super::restart_changes(&started, &again, &started).is_empty());
+    }
 
     #[test]
     fn a_killed_worker_s_evidence_takes_the_requests_in_flight_on_it() {

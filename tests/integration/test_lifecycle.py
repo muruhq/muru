@@ -63,6 +63,23 @@ def test_hooks_run_in_the_host_and_in_each_worker(hooked: support.Server) -> Non
     assert all(line["pid"] != host for line in post_fork)
     assert len(hook_lines(hooked, "on_ready")) == WORKERS
 
+    # Issue 846: the import's line comes before on_load runs, and each of
+    # the host's hooks has its own line once it returns.
+
+    lines = hooked.log().splitlines()
+
+    def first(text: str) -> int:
+        return next(at for at, line in enumerate(lines) if text in line)
+
+    order = [
+        first("preloaded preload_wsgi:application in "),
+        first("HOOK on_load "),
+        first("on_load hook ran in "),
+        first("HOOK pre_fork "),
+        first("pre_fork hook ran in "),
+    ]
+    assert order == sorted(order), lines
+
     # Preloaded: every worker runs the application the host imported.
 
     assert import_pids(hooked, WORKERS * 8) == {int(host)}

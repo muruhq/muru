@@ -88,8 +88,6 @@ pub struct Config {
     /// The default mount treats a 200 with a local Location and no body
     /// as an internal redirect (section 4.10).
     pub cgi_local_redirect: bool,
-    /// The default mount's file hints by path (section 4.9).
-    pub sendfile: Arc<routing::Sendfile>,
     /// The origins whose pages may call it through gRPC-Web (section
     /// 6.13).
     pub grpc_web_origins: Vec<String>,
@@ -824,7 +822,6 @@ impl Edge {
                     )
                     .await?
                     .with_errors(Arc::clone(&config.errors))
-                    .with_sendfile(Arc::clone(&config.sendfile))
                     .with_grpc_web(&config.grpc_web_origins)
                     .with_static_dirs(config.static_dirs.clone()),
                 )
@@ -1549,6 +1546,11 @@ async fn serve<I>(
                     mount: String::new(),
                     mount_path: String::new(),
                     sendfile: Arc::default(),
+                    precompressed: precompressed_for(
+                        compression,
+                        &parts.method,
+                        accept_encoding.as_ref(),
+                    ),
                     grpc_web: Arc::default(),
                     forwarded_host: forwarded.host.clone(),
                     forwarded_port: forwarded.port,
@@ -2444,6 +2446,21 @@ pub(crate) fn expects_continue(parts: &http::request::Parts) -> bool {
             .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"100-continue"))
 }
 
+/// The encodings a precompressed variant may be served in for a request
+/// (section 4.9): those of the policy the client accepts, in the
+/// policy's order, for GET and HEAD alone, as a static route offers them.
+fn precompressed_for(
+    policy: &compression::Compression,
+    method: &Method,
+    accept: Option<&HeaderValue>,
+) -> Vec<compression::Encoding> {
+    if !policy.enabled || (method != Method::GET && method != Method::HEAD) {
+        return Vec::new();
+    }
+
+    policy.accepted(accept)
+}
+
 pub(crate) fn request_head(
     parts: &http::request::Parts,
     context: &link::Context<'_>,
@@ -2551,6 +2568,11 @@ pub(crate) fn request_head(
         http_version: format!("{:?}", parts.version),
         expect_continue: expects_continue(parts) && content_length != Some(0),
         server_name: context.server_name.clone().unwrap_or_default(),
+        precompressed: context
+            .precompressed
+            .iter()
+            .map(|encoding| encoding.token().to_owned())
+            .collect(),
         client_class: context.client_class.to_string(),
         mode: context.mode.as_deref().unwrap_or_default().to_owned(),
         internal: context
@@ -2683,7 +2705,6 @@ mod tests {
             static_dirs: Vec::new(),
             accel_redirect: false,
             cgi_local_redirect: false,
-            sendfile: Arc::default(),
             grpc_web_origins: Vec::new(),
             errors: Arc::new(errors::ErrorPolicy::default()),
             development: false,

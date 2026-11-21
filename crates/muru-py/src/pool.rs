@@ -384,6 +384,16 @@ pub struct Mount {
     pub handoff: bool,
 }
 
+/// How a request's response answers a path hint (section 4.9): its
+/// mount's settings, and the encodings the edge would serve a
+/// precompressed variant in.
+pub struct HintContext {
+    /// The mount's path hint settings.
+    pub hints: Arc<crate::sendfile::Hints>,
+    /// Content-coding tokens, in the edge's order.
+    pub encodings: Vec<String>,
+}
+
 /// The soft timeout (section 7.6): how long a request may run before it
 /// is interrupted, and the exception class raised in its thread,
 /// `muru.RequestTimeout`.
@@ -427,6 +437,9 @@ pub struct Shared {
     pub handoff: bool,
     /// The worker's index within its group, for HELLO.
     pub worker: u32,
+    /// Each mount's path hint settings (section 4.9), by name, the
+    /// default mount's under `""`.
+    pub sendfile: HashMap<String, Arc<crate::sendfile::Hints>>,
     in_flight: AtomicU32,
     total: AtomicU64,
     next_id: AtomicU64,
@@ -471,6 +484,7 @@ impl Shared {
             grpc_methods: Vec::new(),
             handoff: false,
             worker: 0,
+            sendfile: HashMap::new(),
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
@@ -490,6 +504,16 @@ impl Shared {
     /// Close every open WebSocket with 1001: the worker is stopping.
     pub fn close_websockets(&self) {
         self.draining.send_replace(true);
+    }
+
+    /// How the response to a request answers a path hint (section 4.9):
+    /// its mount's settings, none refusing every hint, and the encodings
+    /// its head says the edge would serve a variant in.
+    pub fn hint_context(&self, head: &muru_proto::worker::v1::RequestHead) -> HintContext {
+        HintContext {
+            hints: self.sendfile.get(&head.mount).cloned().unwrap_or_default(),
+            encodings: head.precompressed.clone(),
+        }
     }
 
     /// The application a request head names: the default mount for an

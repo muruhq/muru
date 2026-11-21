@@ -4,13 +4,17 @@
 //! the file, index files for directories, a redirect to the slash form of
 //! a directory, cache headers, and a fallback file for single-page
 //! applications. Hidden files are never served, paths are normalised and
-//! checked against the canonical name on disk, and symbolic links that
-//! leave the directory are refused.
+//! checked against the name on disk, and every file is opened beneath its
+//! directory's held descriptor (`muru_common::beneath`), so a symbolic link
+//! is followed only where it stays inside and nothing is opened again by
+//! path after the check.
 
 use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
+
+use muru_common::beneath::{self, Failure, Root};
 
 use bytes::Bytes;
 use http::header::{
@@ -33,8 +37,8 @@ pub(crate) const CHUNK: usize = 256 * 1024;
 /// A static route, as the snapshot describes it.
 #[derive(Debug)]
 pub struct StaticRoute {
-    /// The directory served.
-    pub directory: PathBuf,
+    /// The directory served, held open once it has been opened.
+    pub root: Root,
     /// The files tried, in order, when a directory is requested.
     pub index: Vec<String>,
     /// The file served for any path that has no file, for single-page
@@ -81,6 +85,9 @@ pub struct Settings<'a> {
     pub no_redirect_slash: bool,
     /// Accept names that differ from the file's on disk.
     pub case_insensitive: bool,
+    /// The user the directory must be owned by, for one Muru provides
+    /// (issue 849), such as an application's media part.
+    pub owner: Option<u32>,
 }
 
 impl StaticRoute {
@@ -99,6 +106,7 @@ impl StaticRoute {
             cache_except: &route.cache_except,
             no_redirect_slash: route.no_redirect_slash,
             case_insensitive: route.case_insensitive,
+            owner: None,
         })?))
     }
 
@@ -113,6 +121,7 @@ impl StaticRoute {
             cache_except: &entry.cache_except,
             no_redirect_slash: entry.no_redirect_slash,
             case_insensitive: entry.case_insensitive,
+            owner: entry.owner,
         })
     }
 
@@ -138,7 +147,10 @@ impl StaticRoute {
         };
 
         Ok(Self {
-            directory: PathBuf::from(settings.directory),
+            root: match settings.owner {
+                Some(owner) => Root::owned_by(settings.directory, owner),
+                None => Root::new(settings.directory),
+            },
             index: if settings.index.is_empty() {
                 vec!["index.html".to_owned()]
             } else {
@@ -177,15 +189,49 @@ pub enum Outcome {
     MethodNotAllowed,
 }
 
-/// A file found for a request.
-struct Found {
-    path: PathBuf,
-    relative: String,
-    length: u64,
-    modified: Option<SystemTime>,
+/// A file found for a request, open, with what `fstat` said of it.
+pub(crate) struct Found {
+    /// The open file.
+    pub(crate) file: std::fs::File,
+    /// Its name, for the content type.
+    pub(crate) name: PathBuf,
+    /// Its path within the route, for the cache patterns.
+    pub(crate) relative: String,
+    pub(crate) length: u64,
+    pub(crate) modified: Option<SystemTime>,
     /// The precompressed variant the client takes, looked for with the
     /// file itself.
-    variant: Option<(PathBuf, u64, Encoding)>,
+    pub(crate) variant: Option<Variant>,
+}
+
+/// A precompressed variant of a file, open.
+pub(crate) struct Variant {
+    pub(crate) file: std::fs::File,
+    pub(crate) length: u64,
+    pub(crate) encoding: Encoding,
+}
+
+impl Found {
+    /// The file found, from the descriptor opened for it: none when it is
+    /// not a regular file.
+    pub(crate) fn from_opened(
+        opened: beneath::Opened,
+        name: PathBuf,
+        relative: String,
+    ) -> Option<Self> {
+        if !opened.metadata.is_file() {
+            return None;
+        }
+
+        Some(Self {
+            length: opened.metadata.len(),
+            modified: opened.metadata.modified().ok(),
+            file: opened.file,
+            name,
+            relative,
+            variant: None,
+        })
+    }
 }
 
 /// Where a request's path led.
@@ -247,7 +293,7 @@ pub async fn serve(
 
         match resolved {
             Resolved::File(mut found) => {
-                found.variant = precompressed(&found.path, &accepted);
+                found.variant = precompressed(&route.root, Path::new(&found.relative), &accepted);
                 Resolved::File(found)
             }
             other => other,
@@ -275,42 +321,37 @@ pub async fn serve(
 }
 
 /// Why a hinted path is not served.
-enum Located {
-    /// The path is not absolute, or lies outside every root.
+pub(crate) enum Located {
+    /// The path is not absolute, lies outside every root, leaves its root
+    /// by a symbolic link, or its root is one Muru provides that is not
+    /// owned by its user.
     Refused,
-    /// The path names nothing, or not a regular file.
+    /// The path names nothing, or not a regular file, or the file or its
+    /// root cannot be opened.
     Missing,
 }
 
-/// Where a hinted path leads: a regular file whose canonical path lies in
-/// one of the roots, compared by canonical path (section 4.9).
-fn locate(candidate: &Path, roots: &[PathBuf]) -> Result<Found, Located> {
-    if !candidate.is_absolute() {
-        return Err(Located::Refused);
-    }
+/// Where a hinted path leads: a regular file beneath one of the roots,
+/// opened beneath the root's held descriptor (section 4.9). On the
+/// blocking pool.
+fn locate(candidate: &Path, roots: &[Arc<Root>]) -> Result<Found, Located> {
+    let (root, rest) = beneath::locate(roots, candidate).map_err(|_| Located::Refused)?;
 
-    let canonical = std::fs::canonicalize(candidate).map_err(|_| Located::Missing)?;
-    let inside = roots
-        .iter()
-        .any(|root| std::fs::canonicalize(root).is_ok_and(|root| canonical.starts_with(root)));
+    let opened = match root.open(&rest) {
+        Ok(opened) => opened,
+        Err(Failure::Escapes) => return Err(Located::Refused),
+        Err(Failure::NotOwned(text)) => {
+            tracing::warn!(root = %root.path().display(), "{text}; a hinted file beneath it is refused");
+            return Err(Located::Refused);
+        }
+        Err(Failure::Missing) => return Err(Located::Missing),
+        Err(failure @ (Failure::Root(_) | Failure::Unreadable(_))) => {
+            tracing::warn!(path = %candidate.display(), "a hinted file could not be opened: {failure}");
+            return Err(Located::Missing);
+        }
+    };
 
-    if !inside {
-        return Err(Located::Refused);
-    }
-
-    let metadata = std::fs::metadata(&canonical).map_err(|_| Located::Missing)?;
-
-    if !metadata.is_file() {
-        return Err(Located::Missing);
-    }
-
-    Ok(Found {
-        path: canonical,
-        relative: String::new(),
-        length: metadata.len(),
-        modified: metadata.modified().ok(),
-        variant: None,
-    })
+    Found::from_opened(opened, candidate.to_path_buf(), String::new()).ok_or(Located::Missing)
 }
 
 /// Section 4.9: serve the file an application's X-Muru-Sendfile header
@@ -320,7 +361,7 @@ fn locate(candidate: &Path, roots: &[PathBuf]) -> Result<Found, Located> {
 /// names the hint headers, which never reach the client.
 pub async fn serve_hint(
     path: &str,
-    roots: &[PathBuf],
+    roots: &[Arc<Root>],
     method: &Method,
     headers: &HeaderMap,
     head: &muru_proto::worker::v1::ResponseHead,
@@ -332,6 +373,21 @@ pub async fn serve_hint(
         .await
         .unwrap_or(Err(Located::Missing));
 
+    serve_located(path, located, method, headers, head, strip).await
+}
+
+/// Serve a hinted file already looked for: by the edge beneath an
+/// upstream's roots, or by a worker beneath its mount's, whose descriptor
+/// came on the link (section 4.9). A refusal or a missing file is the
+/// problem the client is answered with, logged with the path.
+pub(crate) async fn serve_located(
+    path: &str,
+    located: Result<Found, Located>,
+    method: &Method,
+    headers: &HeaderMap,
+    head: &muru_proto::worker::v1::ResponseHead,
+    strip: &[&str],
+) -> Result<Outcome, crate::errors::Problem> {
     let found = match located {
         Ok(found) => found,
         Err(Located::Refused) => {
@@ -339,19 +395,11 @@ pub async fn serve_hint(
                 path,
                 "the application named a file outside the mount's sendfile_roots; refused"
             );
-            return Err(crate::errors::Problem::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "sendfile_refused",
-                "The application named a file the edge may not send.",
-            ));
+            return Err(refused());
         }
         Err(Located::Missing) => {
             tracing::warn!(path, "the application named a file that is not there");
-            return Err(crate::errors::Problem::new(
-                StatusCode::NOT_FOUND,
-                "sendfile_missing",
-                "The file the application named is not there.",
-            ));
+            return Err(missing());
         }
     };
 
@@ -412,6 +460,25 @@ pub async fn serve_hint(
     Ok(outcome)
 }
 
+/// The answer to a hint naming a file it may not.
+fn refused() -> crate::errors::Problem {
+    crate::errors::Problem::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "sendfile_refused",
+        "The application named a file the edge may not send.",
+    )
+}
+
+/// The answer to a hint naming a file that is not there, or that cannot
+/// be read.
+pub(crate) fn missing() -> crate::errors::Problem {
+    crate::errors::Problem::new(
+        StatusCode::NOT_FOUND,
+        "sendfile_missing",
+        "The file the application named is not there.",
+    )
+}
+
 /// The path's components below the route, percent-decoded and
 /// normalised, or none when it tries to climb out or names a hidden
 /// file.
@@ -439,36 +506,35 @@ fn request_components(within: &str) -> Option<Vec<String>> {
 }
 
 /// Find the file a request names, on the blocking pool: the path is
-/// contained in the directory by canonical path, matched against the
-/// name on disk, and a directory yields its index file or a redirect.
+/// opened beneath the route's directory, matched against the name on
+/// disk, and a directory yields its index file or a redirect.
 fn resolve(route: &StaticRoute, components: &[String], trailing_slash: bool) -> Resolved {
-    let Ok(root) = std::fs::canonicalize(&route.directory) else {
-        return Resolved::Nothing;
-    };
-    let mut candidate = root.clone();
+    let rest: PathBuf = components.iter().collect();
 
-    for component in components {
-        candidate.push(component);
-    }
-
-    let Ok(canonical) = std::fs::canonicalize(&candidate) else {
-        return Resolved::Nothing;
-    };
-
-    if !canonical.starts_with(&root) {
-        tracing::warn!(path = %candidate.display(), "a static path leaves its directory and was refused");
-        return Resolved::Nothing;
-    }
-
-    if !route.case_insensitive && !same_names(&root, components) {
-        return Resolved::Nothing;
-    }
-
-    let Ok(metadata) = std::fs::metadata(&canonical) else {
-        return Resolved::Nothing;
+    let opened = match route.root.open(&rest) {
+        Ok(opened) => opened,
+        Err(Failure::Missing) => return Resolved::Nothing,
+        Err(Failure::Escapes) => {
+            tracing::warn!(
+                path = %route.root.path().join(&rest).display(),
+                "a static path leaves its directory and was refused"
+            );
+            return Resolved::Nothing;
+        }
+        Err(failure) => {
+            tracing::warn!(
+                path = %route.root.path().join(&rest).display(),
+                "a static file could not be opened: {failure}"
+            );
+            return Resolved::Nothing;
+        }
     };
 
-    if metadata.is_dir() {
+    if !route.case_insensitive && !same_names(route.root.path(), components) {
+        return Resolved::Nothing;
+    }
+
+    if opened.metadata.is_dir() {
         if !trailing_slash && route.redirect_slash {
             return Resolved::RedirectToSlash;
         }
@@ -488,17 +554,16 @@ fn resolve(route: &StaticRoute, components: &[String], trailing_slash: bool) -> 
         return Resolved::Nothing;
     }
 
-    if !metadata.is_file() || trailing_slash {
+    if trailing_slash {
         return Resolved::Nothing;
     }
 
-    Resolved::File(Found {
-        path: canonical,
-        relative: components.join("/"),
-        length: metadata.len(),
-        modified: metadata.modified().ok(),
-        variant: None,
-    })
+    let name = route.root.path().join(&rest);
+
+    match Found::from_opened(opened, name, components.join("/")) {
+        Some(found) => Resolved::File(found),
+        None => Resolved::Nothing,
+    }
 }
 
 /// Whether each name in the request is an entry of its directory exactly
@@ -692,7 +757,7 @@ async fn respond(
         };
     }
 
-    let content_type = content_type(&found.path);
+    let content_type = content_type(&found.name);
     base.insert(CONTENT_TYPE, content_type);
 
     // A range request is answered from the file itself; otherwise a
@@ -705,13 +770,20 @@ async fn respond(
         .filter(|_| if_range_holds(headers, &etag, modified.as_deref()))
         .and_then(|value| parse_range(value, found.length));
 
+    let Found {
+        file,
+        length: whole,
+        variant,
+        ..
+    } = found;
+
     match range {
         Some(Range::Unsatisfiable) => {
             let mut response = Response::new(empty());
             *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
             *response.headers_mut() = base;
 
-            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{}", found.length)) {
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{whole}")) {
                 response.headers_mut().insert(CONTENT_RANGE, value);
             }
 
@@ -728,7 +800,7 @@ async fn respond(
         Some(Range::Bytes(start, end)) => {
             let length = end - start + 1;
 
-            let mut response = match body_of(&found.path, start, length, method).await {
+            let mut response = match body_of(file, start, length, method).await {
                 Ok(body) => Response::new(body),
                 Err(error) => return unreadable(error),
             };
@@ -736,9 +808,7 @@ async fn respond(
             *response.status_mut() = StatusCode::PARTIAL_CONTENT;
             *response.headers_mut() = base;
 
-            if let Ok(value) =
-                HeaderValue::from_str(&format!("bytes {start}-{end}/{}", found.length))
-            {
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{whole}")) {
                 response.headers_mut().insert(CONTENT_RANGE, value);
             }
 
@@ -755,12 +825,12 @@ async fn respond(
         None => {}
     }
 
-    let (path, length, encoding) = match &found.variant {
-        Some((path, length, encoding)) => (path.clone(), *length, Some(*encoding)),
-        None => (found.path.clone(), found.length, None),
+    let (file, length, encoding) = match variant {
+        Some(variant) => (variant.file, variant.length, Some(variant.encoding)),
+        None => (file, whole, None),
     };
 
-    let mut response = match body_of(&path, 0, length, method).await {
+    let mut response = match body_of(file, 0, length, method).await {
         Ok(body) => Response::new(body),
         Err(error) => return unreadable(error),
     };
@@ -788,38 +858,45 @@ async fn respond(
 }
 
 /// A precompressed variant of the file (`.br`, `.zst` or `.gz`) in one
-/// of the `accepted` encodings, in their order, with its length. On the
-/// blocking pool.
-fn precompressed(path: &Path, accepted: &[Encoding]) -> Option<(PathBuf, u64, Encoding)> {
+/// of the `accepted` encodings, in their order, opened beneath the root
+/// the file was. On the blocking pool.
+pub(crate) fn precompressed(root: &Root, rest: &Path, accepted: &[Encoding]) -> Option<Variant> {
     for encoding in accepted {
-        let suffix = match encoding {
-            Encoding::Br => "br",
-            Encoding::Zstd => "zst",
-            Encoding::Gzip => "gz",
-        };
-
-        let mut candidate = path.as_os_str().to_owned();
+        let mut candidate = rest.as_os_str().to_owned();
         candidate.push(".");
-        candidate.push(suffix);
-        let candidate = PathBuf::from(candidate);
+        candidate.push(suffix(*encoding));
 
-        if let Ok(metadata) = std::fs::metadata(&candidate)
-            && metadata.is_file()
+        if let Ok(opened) = root.open(Path::new(&candidate))
+            && opened.metadata.is_file()
         {
-            return Some((candidate, metadata.len(), *encoding));
+            return Some(Variant {
+                length: opened.metadata.len(),
+                file: opened.file,
+                encoding: *encoding,
+            });
         }
     }
 
     None
 }
 
+/// The suffix a file precompressed in an encoding has.
+pub(crate) fn suffix(encoding: Encoding) -> &'static str {
+    match encoding {
+        Encoding::Br => "br",
+        Encoding::Zstd => "zst",
+        Encoding::Gzip => "gz",
+    }
+}
+
 /// The file's bytes from `start` for `length`, or an empty body for HEAD.
-/// The file is opened and its first chunk read in one call on the
-/// blocking pool, so a file that cannot be read is known before the
-/// response starts; a file no larger than a chunk is sent whole, and a
-/// larger one streamed, a chunk per call.
+/// The first chunk is read on the blocking pool before the response
+/// starts, so a file that cannot be read is known by then; a file no
+/// larger than a chunk is sent whole, and a larger one streamed, a chunk
+/// per call. The file was opened when it was found, and is never opened
+/// again by its name.
 async fn body_of(
-    path: &Path,
+    file: std::fs::File,
     start: u64,
     length: u64,
     method: &Method,
@@ -828,9 +905,8 @@ async fn body_of(
         return Ok(empty());
     }
 
-    let path = path.to_owned();
     let (file, first) = tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(&path)?;
+        let mut file = file;
 
         if start > 0 {
             file.seek(std::io::SeekFrom::Start(start))?;

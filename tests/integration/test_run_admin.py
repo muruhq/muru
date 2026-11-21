@@ -956,6 +956,8 @@ def test_a_stalled_terminal_leaves_the_run_answering(runtime: Path, tmp_path: Pa
             "--processes",
             "1",
             "--no-reload",
+            "--dashboard",
+            "off",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

@@ -606,9 +606,11 @@ def test_the_processes_are_listed_as_the_daemon_supervises_them(
     state = (daemon.base / "state").resolve()
 
     # Issue 604: the daemon's row names whose daemon it is, as its title
-    # does, and a host's says what its release does with traffic.
+    # does, and a host's says what its release does with traffic. Its
+    # state directory is the answer's own (issue 840).
 
-    assert root["what"] == f"user daemon, state {state}", root["what"]
+    assert root["what"] == "user daemon", root["what"]
+    assert answer["state_dir"] == str(state), answer["state_dir"]
     assert edge["what"] == f"listening on 127.0.0.1:{daemon.port}"
     assert (host["what"], host["state"]) == ("shop@r1 serving", "serving")
     relay, *workers = host["children"]
@@ -656,7 +658,8 @@ def test_the_processes_are_listed_as_the_daemon_supervises_them(
     narrowed = tree("--app", "shop@r1")
     assert [child["role"] for child in narrowed["root"]["children"]] == ["host"]
     text = daemon.muructl("status", "--processes").stdout
-    assert text.splitlines()[0].startswith("edge "), text
+    assert text.splitlines()[0] == f"daemon  state {state}", text
+    assert text.splitlines()[1].startswith("edge "), text
     assert "USER" in text and "├─ edge" in text and "└─ host" in text, text
 
     # --watch, not on a terminal, prints one JSON document a line.

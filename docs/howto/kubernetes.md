@@ -238,6 +238,45 @@ spec:
 [Saturation for an autoscaler](metrics.md#saturation-for-an-autoscaler)
 describes both figures.
 
+## Keeping data
+
+Files the application keeps between images go on volumes, named as its
+[data directory](data-directory.md) and its parts. A SQLite database
+needs a block-backed ReadWriteOnce claim, since its locks and WAL mode
+need a local file system, so a Deployment with a database on it runs
+one replica, with the `Recreate` strategy so the old pod lets go of the
+claim before the new one mounts it. Media the replicas share can be a
+ReadWriteMany claim of its own:
+
+```yaml
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  template:
+    spec:
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: shop
+          env:
+            - {name: MURU_SERVE_DATA_DIR, value: /data}
+            - {name: MURU_SERVE_MEDIA_DIR, value: /media}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: media, mountPath: /media}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: shop-data}
+        - name: media
+          persistentVolumeClaim: {claimName: shop-media}
+```
+
+`fsGroup` gives the volumes to the pod's group, so its user can write
+them. A Job that runs a migration mounts the same claims and sets the
+same variables, which `muructl command run` reads as `muructl serve`
+does. With a database server in place of SQLite, the data directory is
+only for files, and the replicas can share it on a ReadWriteMany claim.
+
 ## Migrations
 
 Declare the migration as a [command](commands.md) of the project:
@@ -278,8 +317,9 @@ With no application named and nothing serving in the Job's pod,
 `muructl` runs the command itself, with the image's interpreter, the
 project's `[tool.muru.env]` variables and the command's timeout, and
 exits with its status, so a failed migration fails the Job. Give the Job
-the environment variables and secrets the Deployment's containers have,
-since the migration reads the same settings. `parallelism` is 1 by
+the environment variables, secrets and volumes the Deployment's
+containers have, since the migration reads the same settings and, with
+`MURU_SERVE_DATA_DIR`, the same [data directory](#keeping-data). `parallelism` is 1 by
 default, which keeps the migration to one run. An init container or a
 Helm pre-upgrade hook runs the same command.
 

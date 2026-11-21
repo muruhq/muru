@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import http.client
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -40,6 +41,19 @@ def application(environ, start_response):
     print("echo", environ["PATH_INFO"], flush=True)
     start_response("200 OK", [("Content-Length", "2")])
     return [b"ok"]
+"""
+
+
+STARTING = """\
+import sys
+
+
+def post_fork(context):
+    print("STARTING post_fork", context.release, file=sys.stderr, flush=True)
+
+
+def on_ready(context):
+    print("STARTING on_ready", context.release, file=sys.stderr, flush=True)
 """
 
 
@@ -148,6 +162,8 @@ def test_a_stalled_destination_holds_up_no_request(tmp_path: Path) -> None:
             "--threads",
             "1",
             "--no-reload",
+            "--dashboard",
+            "off",
         ],
         cwd=tmp_path,
         stdin=subprocess.PIPE,
@@ -174,3 +190,49 @@ def test_a_stalled_destination_holds_up_no_request(tmp_path: Path) -> None:
 
     text = err.decode()
     assert "of worker 0's output here: the log was not keeping up" in text, text[-2000:]
+
+
+def test_a_new_releases_start_up_lines_come_before_the_switch(tmp_path: Path) -> None:
+    """Issue 838: muructl has the new release's relay write what its
+    workers wrote before they were ready, and writes that itself, before
+    it says it has switched to the release."""
+
+    workers = 2
+    (tmp_path / "echo.py").write_text(ECHO)
+    (tmp_path / "starting.py").write_text(STARTING)
+    server = support.start(
+        "echo:application",
+        workers=workers,
+        threads=1,
+        chdir=tmp_path,
+        args=["--hooks", "starting"],
+        reload=True,
+    )
+
+    try:
+        assert server.wait_for_log("watching", timeout=10)
+
+        for version in range(3):
+            # A whole second keeps the modification time distinct on
+            # coarse file systems.
+
+            server.mark_log()
+            time.sleep(1.1)
+            (tmp_path / "echo.py").write_text(ECHO + f"\nVERSION = {version}\n")
+            assert server.wait_for_log("switched to release r", timeout=30)
+
+        log = server.log()
+    finally:
+        server.stop()
+
+    # A release whose start a further change abandoned has no switch line,
+    # and its lines are not counted.
+
+    switches = [
+        (match.start(), match.group(1)) for match in re.finditer(r"switched to release (r\d+)", log)
+    ]
+    assert len(switches) == 3, log
+
+    for at, release in switches:
+        before = re.findall(rf"STARTING (post_fork|on_ready) {release}$", log[:at], re.MULTILINE)
+        assert len(before) == 2 * workers, f"{release}:\n{log}"

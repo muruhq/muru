@@ -34,6 +34,7 @@ pub mod model;
 pub mod notify;
 pub mod overlays;
 pub mod ownership;
+pub mod places;
 pub mod probes;
 pub mod processes;
 pub mod provision;

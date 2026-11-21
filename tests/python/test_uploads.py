@@ -122,3 +122,35 @@ def test_save_links_through_proc_on_linux(stored: dict[str, Any], tmp_path: Path
     target = tmp_path / "linked.bin"
     uploads.Upload(stored).save(target)
     assert target.stat().st_ino == os.fstat(stored["fd"]).st_ino
+
+
+def test_save_puts_a_file_in_the_uploads_directory_by_default(
+    stored: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upload = uploads.Upload({**stored, "name": "../My Photo.JPG"})
+
+    with pytest.raises(ValueError, match="MURU_UPLOADS_DIR is not set"):
+        upload.save()
+
+    store = tmp_path / "uploads"
+    store.mkdir()
+    monkeypatch.setenv("MURU_UPLOADS_DIR", str(store))
+
+    # A name made for it, with the client's extension and nothing else of
+    # its name; a relative destination goes there too, and cannot climb.
+
+    saved = Path(upload.save())
+    assert saved.parent == store
+    assert saved.suffix == ".jpg" and len(saved.stem) == 32
+    assert saved.read_bytes() == b"0123456789"
+
+    assert upload.save("kept.bin") == str(store / "kept.bin")
+
+    with pytest.raises(ValueError, match="climbs out"):
+        upload.save("../escape.bin")
+
+    absolute = tmp_path / "media.bin"
+    assert upload.save(absolute) == str(absolute)
+
+    odd = uploads.Upload({**stored, "name": "archive.tar.gz;rm"})
+    assert Path(odd.save()).suffix == ""

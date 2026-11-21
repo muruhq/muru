@@ -55,7 +55,7 @@ from muru import uploads
 
 def application(environ, start_response):
     for upload in uploads.files(environ):
-        upload.save(f"/srv/media/incoming/{upload.sha256}")
+        upload.save()
     ...
 ```
 
@@ -70,16 +70,37 @@ server. Each upload has:
 | `field`, `name`, `content_type`, `size`, `ref` | As in the form fields; `field` is `None` for a raw upload |
 | `sha256`, `digests` | The SHA-256 digest, or `None` without it, and every digest by algorithm |
 | `open()` | A readable, seekable binary file over the upload, from its start; each call gives an independent one |
-| `save(dest, overwrite=False)` | Gives the file a permanent name and returns it |
+| `save(dest=None, overwrite=False)` | Gives the file a permanent name and returns it |
 | `path` | A path that opens the file, for libraries that need one, valid only during the request |
+
+`save()` with no destination puts the file in the application's uploads
+part, `MURU_UPLOADS_DIR` in its [data directory](data-directory.md),
+under a name made for it: random hex digits with the extension of the
+client's file name, never the rest of that name. A relative destination
+is taken from the uploads part too, and may not climb out of it with
+`..`. The uploads part is never served, so a file that clients will
+fetch is saved into the media part instead, with an absolute
+destination:
+
+```python
+avatar = uploads.get(environ, form["avatar.ref"])
+avatar.save(os.path.join(os.environ["MURU_MEDIA_DIR"], "avatars", f"{user_id}.png"))
+```
+
+Without `MURU_UPLOADS_DIR`, outside Muru or under `muructl serve` with
+no data directory, a relative destination is taken from the working
+directory and `save()` with none raises `ValueError`.
 
 `save()` links the stored file into place when the destination is on the
 same file system as the spool and the worker may link it, which takes no
-time whatever the size; otherwise it copies. An existing destination
-raises `FileExistsError` unless `overwrite=True`, which replaces it in
-one step. Under a daemon running as root, files are stored by the edge's
-service user, so an application running as a user of its own copies
-rather than links.
+time whatever the size; otherwise it copies. With the daemon's default
+layout the data directory and the spool are both in its state
+directory, on one file system; a data directory moved to another disk
+is copied to. `muructl data show APP` says which. An existing
+destination raises `FileExistsError` unless `overwrite=True`, which
+replaces it in one step. Under a daemon running as root, files are
+stored by the edge's service user, so an application running as a user
+of its own copies rather than links.
 
 Upload objects belong to their request. The files are closed when the
 request ends, and a file that was not saved disappears, including when
@@ -135,7 +156,9 @@ is also 507. The form's ordinary fields stay in memory and together may
 hold 10MB. A form that cannot be parsed is 400 `upload_malformed`.
 
 The edge stores files in `spool/` under the daemon's state directory, in
-a directory for each application that only the edge's user can enter.
+a directory for each application that only the edge's user can enter,
+apart from the application's data directory, which belongs to the
+application's user.
 The request deadline starts once the upload has arrived, and the body
 idle timeout bounds each pause while it arrives.
 `muru_upload_spool_bytes` reports what each application's uploads hold,

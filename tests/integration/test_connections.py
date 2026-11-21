@@ -7,6 +7,7 @@ a trusted proxy), and the counts reach the metrics."""
 from __future__ import annotations
 
 import http.client
+import os
 import socket
 import time
 from pathlib import Path
@@ -264,6 +265,28 @@ def test_a_listener_has_limits_of_its_own_and_a_reload_changes_them(tmp_path: Pa
         sock = connect(first)
         assert b"connection: close" not in exchange(sock, "/catalogue").lower()
         sock.close()
+
+        # Issue 837: a listener a reload adds on an address another
+        # program holds is refused, naming that program.
+
+        holder = socket.socket()
+        holder.bind(("127.0.0.1", 0))
+        holder.listen()
+
+        try:
+            taken = holder.getsockname()[1]
+            config.write_text(
+                config.read_text() + f"\n[[listener]]\naddress = '127.0.0.1:{taken}'\n"
+            )
+            refused = daemon.muructl("daemon", "reload", check=False)
+        finally:
+            holder.close()
+
+        output = refused.stdout + refused.stderr
+        assert f"cannot listen on 127.0.0.1:{taken}: port {taken} on 127.0.0.1 is in use by " in (
+            output
+        ), output
+        assert f"(pid {os.getpid()}); choose another listener, or stop it" in output, output
     finally:
         daemon.stop()
 

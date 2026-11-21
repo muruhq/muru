@@ -64,7 +64,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | match.client_class | group, route | none (every class) | 4.14 |
 | match.host, match.method | group | none (every host, every method) | 7.1 |
 | path, internal, cgi_local_redirect, accel_redirect, concurrency, max_connections | mount (cgi_local_redirect and accel_redirect also on the release, for the default mount and as the mounts' default) | none (required except for a gRPC mount, which takes none), false, false, false, 1000, 1000 | 6.7, 4.10, 6.13 |
-| path, dir, index, fallback, cache, redirect_slash, case | static entry (`[[tool.muru.static]]` or `[[app.NAME.release.ID.static]]`) | none (path and dir required), index.html, none, none, true, strict | 4.9 |
+| path, dir (a path, `static:` or `media:`, each with an optional directory after the colon), index, fallback, cache, redirect_slash, case | static entry (`[[tool.muru.static]]` or `[[app.NAME.release.ID.static]]`) | none (path and dir required), index.html, none, none, true, strict | 4.9, 13.8 |
 | scaling.mode, min_workers, max_workers, min_spare, max_spare, advisory | group | static, 1, required by spare and target, 1, max(3, 25% of max_workers), false | 7.2, 7.4 |
 | scaling targets (slot_utilization, queue_wait_p95) | group, target mode | 0.7, off | 7.2, 7.3 |
 | scaling windows and budgets (scale_out_window, scale_in_window, hold_after_growth, reap_interval, idle_reap_after, min_lifetime, max_step_up, churn_budget) | group | 5s, 10m, 5m, 60s, 10m, max(15m, 30 x ready time), 4, 6 per hour | 7.4 |
@@ -85,7 +85,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | max_header_bytes, max_headers, header_read_timeout | `[limits]`, a listener's `limits` | 64KiB, 100, 30s | 4.6 |
 | upload, max_file_size, max_files, hash, precheck, spool_quota | route (spool_quota also in the daemon's [limits], for every application together) | off, unlimited, 100 (at most 500), [sha256], false, 10GB per application (none for the node) | 4.11 |
 | static (directory or release_path), index, fallback, listing, case (strict by default), cache, follow_symlinks, stat_cache | route | none | 4.9 |
-| sendfile_roots, sendfile_header | release, mount, upstream | none, none | 4.9 |
+| sendfile_roots (paths, or `media:` with an optional directory), sendfile_header | release, mount, upstream | the media part, none | 4.9 |
 | rate_limits | host, route | none | 4.15 |
 | name | route | none | 9.10 |
 | methods (deny, answer), mode | route | none, read_only, none | 4.15 |
@@ -114,6 +114,9 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | addresses, protocol, tls (ca, server_name, verify), health (path, interval, timeout, unhealthy_after, healthy_after, eject_after, eject_for), trust_muru_headers, connect_timeout | upstream | required, http1, none, none (ejection after 3 failures for 30s), false, 5s | 4.13 |
 | request_headers (remove, set), response_headers (remove, set, add) | host, route, overlay route | none | 4.7 |
 | user, group, umask, limits | application | daemon's user, none | 10.9 |
+| data_dir, media_dir, uploads_dir | application | STATE/data/APP, media, uploads (relative ones in data_dir) | 13.8 |
+| data_dir | `[tool.muru.run]`, muru.local.toml `[run]` | runs/NAME-HASH/data in the user state location | 13.8 |
+| data_dir, media_dir, uploads_dir, static_dir | `[tool.muru.serve]` (and `--data-dir` and the rest, `MURU_SERVE_DATA_DIR` and the rest) | none, media, uploads, staticfiles | 13.9 |
 | `[secrets.store.NAME]` (kind, command, timeout), env values with secret = { store, key } and optional as = 'file' | daemon, release | file store in the secrets directory | 10.8 |
 | bytecode | release, variant | redirect | 8.2 |
 | commands.NAME: description, run (argv with `{input}` placeholders) or call (module:function), env, timeout, exclusive; inputs.NAME: description, required, default, pattern, secret | release, `[tool.muru.commands]` | none; no timeout, not exclusive; inputs optional and not secret | 9.12 |

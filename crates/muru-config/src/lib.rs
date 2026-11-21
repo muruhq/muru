@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod condition;
 pub mod cron;
+pub mod places;
 pub mod schema;
 
 /// The interface an entrypoint speaks.
@@ -403,10 +404,9 @@ pub struct Mount {
     #[schemars(extend("x-default" = "the release's"))]
     pub cgi_local_redirect: Option<bool>,
     /// Directories a path in an `X-Muru-Sendfile` response header must
-    /// lie in for the edge to serve the file (section 4.9); the
-    /// release's when absent, and an empty list refuses every hint. In
-    /// a file `muructl apply` reads, a relative path is taken from the
-    /// file's directory; in a project's settings each is absolute.
+    /// lie in for the file to be served (section 4.9); the release's
+    /// when absent, and an empty list refuses every hint. A relative
+    /// path is taken from the release's source directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "the release's"))]
     pub sendfile_roots: Option<Vec<String>>,
@@ -1090,10 +1090,10 @@ pub struct Release {
     #[schemars(extend("default" = false))]
     pub cgi_local_redirect: Option<bool>,
     /// Directories a path in an `X-Muru-Sendfile` response header must
-    /// lie in for the edge to serve the file (section 4.9), for the
-    /// default mount and any mount that does not say otherwise; with
-    /// none every hint is refused. A relative path is taken from the
-    /// file's directory.
+    /// lie in for the file to be served (section 4.9), for the default
+    /// mount and any mount that does not say otherwise; with none every
+    /// hint is refused. A relative path is taken from the release's
+    /// `source`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sendfile_roots: Vec<String>,
     /// A second response header honoured as `X-Muru-Sendfile` is, such
@@ -4179,7 +4179,10 @@ pub struct StaticDir {
     /// boundaries, and `/` is not allowed, since every path would then
     /// be looked up as a file first.
     pub path: String,
-    /// The directory, relative to the source directory, or absolute.
+    /// The directory: relative to the source directory, absolute,
+    /// `static:` for the release's built static files or `media:` for
+    /// the application's media part, each with an optional directory
+    /// inside it after the colon.
     pub dir: String,
     /// The files tried, in order, when a directory is requested.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4505,6 +4508,8 @@ pub fn check_static(entries: &[StaticDir]) -> Result<(), String> {
         if entry.dir.is_empty() {
             return Err(format!("{label}: dir names the directory served"));
         }
+
+        places::Place::parse(&entry.dir).map_err(|error| format!("{label}: {error}"))?;
 
         if let Some(other) = entries[..index]
             .iter()
@@ -5139,11 +5144,26 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
 }
 
 /// Check a mount's, release's or upstream's file hint keys (section
-/// 4.9): absolute roots and a header name.
+/// 4.9): roots that name a directory and a header name. A release's
+/// relative roots are taken from its source, which
+/// [`check_sendfile_dirs`] checks; an upstream's must be absolute.
 pub fn check_sendfile(roots: &[String], header: Option<&str>) -> Result<(), String> {
     for root in roots {
-        if !root.starts_with('/') {
-            return Err(format!("sendfile_roots: {root:?} must be an absolute path"));
+        if root.trim().is_empty() || root.contains('\0') {
+            return Err(format!("sendfile_roots: {root:?} names no directory"));
+        }
+
+        // Issues 849 and 850: media: names the media part; static: is a
+        // release's built files, which a static entry serves.
+
+        match places::Place::parse(root).map_err(|error| format!("sendfile_roots: {error}"))? {
+            places::Place::Static(_) => {
+                return Err(format!(
+                    "sendfile_roots: {root:?}: static: names the release's built static files, \
+                     which a [[tool.muru.static]] entry serves"
+                ));
+            }
+            places::Place::Media(_) | places::Place::Path(_) => {}
         }
     }
 
@@ -5168,6 +5188,93 @@ pub fn check_sendfile(roots: &[String], header: Option<&str>) -> Result<(), Stri
     Ok(())
 }
 
+/// Where a release's `sendfile_roots` entry is (section 4.9): an
+/// absolute one as it is written, a relative one in the release's source
+/// directory, and `media:` in the application's media part (issue 849),
+/// or nowhere when it has none.
+pub fn sendfile_root(
+    root: &str,
+    source: &std::path::Path,
+    media: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    match places::Place::parse(root) {
+        Ok(places::Place::Media(rest)) => media.map(|media| {
+            if rest.is_empty() {
+                media.to_path_buf()
+            } else {
+                media.join(rest)
+            }
+        }),
+        Ok(places::Place::Static(_)) | Err(_) => None,
+        Ok(places::Place::Path(_)) => {
+            let path = std::path::Path::new(root);
+
+            Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                source.join(path)
+            })
+        }
+    }
+}
+
+/// The release's roots as the edge takes them for a managed server:
+/// each absolute, a relative one taken from the source and `media:` from
+/// the media part.
+pub fn sendfile_root_paths(
+    roots: &[String],
+    source: &std::path::Path,
+    media: Option<&std::path::Path>,
+) -> Vec<String> {
+    roots
+        .iter()
+        .filter_map(|root| sendfile_root(root, source, media))
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+/// A mount's roots as its workers take them (issue 849): those of
+/// [`sendfile_root_paths`], and the media part, a root of every mount by
+/// default when the application has one.
+pub fn worker_root_paths(
+    roots: &[String],
+    source: &std::path::Path,
+    media: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut paths = sendfile_root_paths(roots, source, media);
+
+    if let Some(media) = media {
+        let media = media.display().to_string();
+
+        if !paths.contains(&media) {
+            paths.push(media);
+        }
+    }
+
+    paths
+}
+
+/// Check that each relative `sendfile_roots` entry is a directory in the
+/// release's source (section 4.9), as a static entry's directory must be:
+/// a root that travels with the project is part of the release. An
+/// absolute root is the operator's, and may be made or mounted later.
+pub fn check_sendfile_dirs(roots: &[String], source: &std::path::Path) -> Result<(), String> {
+    for root in roots.iter().filter(|root| {
+        !root.starts_with('/') && matches!(places::Place::parse(root), Ok(places::Place::Path(_)))
+    }) {
+        let path = source.join(root);
+
+        if !path.is_dir() {
+            return Err(format!(
+                "sendfile_roots: {root:?} is not a directory in {}",
+                source.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Check an `[upstream.NAME]` table: the addresses, the protocol, the
 /// TLS and health settings and the durations. Whether the CA file is
 /// readable is for the daemon to check.
@@ -5177,6 +5284,14 @@ pub fn check_upstream(table: &Upstream) -> Result<(), String> {
     }
 
     check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())?;
+
+    if let Some(root) = table
+        .sendfile_roots
+        .iter()
+        .find(|root| !root.starts_with('/'))
+    {
+        return Err(format!("sendfile_roots: {root:?} must be an absolute path"));
+    }
 
     for address in &table.addresses {
         parse_upstream_address(address).map_err(|error| format!("addresses: {error}"))?;
@@ -5289,6 +5404,21 @@ pub struct App {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "the `[logs]` table's"))]
     pub slow: Option<String>,
+    /// The application's data directory, shared by every release, an
+    /// absolute path; its media and uploads parts are made in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "STATE/data/APP"))]
+    pub data_dir: Option<String>,
+    /// The media part, the one part ever served, a relative one taken
+    /// from `data_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "media"))]
+    pub media_dir: Option<String>,
+    /// The uploads part, never served, a relative one taken from
+    /// `data_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "uploads"))]
+    pub uploads_dir: Option<String>,
 }
 
 /// The `[metrics]` table (section 11.1): where the daemon serves the
@@ -5512,6 +5642,15 @@ impl Document {
 
             if app.priority.is_some() {
                 entry.priority = app.priority;
+            }
+
+            // Issue 849: so do the data directory and its parts, together,
+            // since a relative part is taken from the data directory.
+
+            if app.data_dir.is_some() || app.media_dir.is_some() || app.uploads_dir.is_some() {
+                entry.data_dir = app.data_dir;
+                entry.media_dir = app.media_dir;
+                entry.uploads_dir = app.uploads_dir;
             }
 
             // Section 10.4: so does the release that serves.
@@ -5854,6 +5993,14 @@ pub struct RunSettings {
     /// this names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_file: Option<String>,
+    /// The application's data directory, shared by every run of the
+    /// project, a relative one taken from the project; its media and
+    /// uploads parts are made in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend(
+        "x-default" = "runs/NAME-HASH/data in the user state directory, never in the project"
+    ))]
+    pub data_dir: Option<String>,
 }
 
 impl RunSettings {
@@ -5892,6 +6039,7 @@ impl RunSettings {
             toolbar: over.toolbar.or(self.toolbar),
             timestamps: over.timestamps.or(self.timestamps),
             env_file: over.env_file.clone().or_else(|| self.env_file.clone()),
+            data_dir: over.data_dir.clone().or_else(|| self.data_dir.clone()),
         }
     }
 
@@ -6059,6 +6207,28 @@ pub struct ServeSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "/opt/muru"))]
     pub runtime_dir: Option<String>,
+    /// The application's data directory, normally a mounted volume, which
+    /// must exist and be writable; its media and uploads parts are made in
+    /// it. With none, the application is given no data directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "none"))]
+    pub data_dir: Option<String>,
+    /// The media part, the one part ever served, a relative one taken
+    /// from the data directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "media"))]
+    pub media_dir: Option<String>,
+    /// The uploads part, never served, a relative one taken from the data
+    /// directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "uploads"))]
+    pub uploads_dir: Option<String>,
+    /// The directory of built static files, given as `MURU_STATIC_DIR` and
+    /// named `static:` in static entries, a relative one taken from the
+    /// project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "staticfiles"))]
+    pub static_dir: Option<String>,
     /// How long the listener keeps accepting after SIGTERM, readiness
     /// failing, with every connection closing after its response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6252,9 +6422,10 @@ pub struct ToolMuru {
     #[schemars(extend("default" = false))]
     pub cgi_local_redirect: Option<bool>,
     /// Directories a path in an `X-Muru-Sendfile` response header must
-    /// lie in for the edge to serve the file (section 4.9), for the
-    /// default mount and any mount that does not say otherwise; with
-    /// none every hint is refused.
+    /// lie in for the file to be served (section 4.9), for the default
+    /// mount and any mount that does not say otherwise; with none every
+    /// hint is refused. A relative path is taken from the project's
+    /// directory, the release's source.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sendfile_roots: Vec<String>,
     /// A second response header honoured as `X-Muru-Sendfile` is, such
@@ -6724,6 +6895,78 @@ pub fn parse_pyproject(text: &str) -> Result<Option<ToolMuru>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_is_a_root_of_every_mount_and_static_data_and_uploads_are_refused() {
+        let source = Path::new("/src/shop");
+        let media = Path::new("/srv/data/shop/media");
+        let roots = vec!["media:reports".to_owned(), "files".to_owned()];
+
+        assert_eq!(
+            worker_root_paths(&roots, source, Some(media)),
+            [
+                "/srv/data/shop/media/reports",
+                "/src/shop/files",
+                "/srv/data/shop/media"
+            ]
+        );
+        assert_eq!(
+            worker_root_paths(&["media:".to_owned()], source, Some(media)),
+            ["/srv/data/shop/media"]
+        );
+        assert_eq!(worker_root_paths(&roots, source, None), ["/src/shop/files"]);
+        assert!(check_sendfile(&roots, None).is_ok());
+
+        for (root, why) in [
+            ("static:", "a [[tool.muru.static]] entry serves"),
+            ("data:", "never served"),
+            ("uploads:x", "never served"),
+        ] {
+            let refused = check_sendfile(&[root.to_owned()], None).unwrap_err();
+            assert!(refused.contains(why), "{root}: {refused}");
+        }
+
+        // The media part is Muru's, so it is not looked for in the source.
+
+        assert!(check_sendfile_dirs(&["media:x".to_owned()], source).is_ok());
+    }
+
+    #[test]
+    fn a_releases_relative_roots_are_taken_from_its_source_and_must_be_there() {
+        let source = std::env::temp_dir().join(format!("muru-roots-{}", std::process::id()));
+        std::fs::create_dir_all(source.join("media")).unwrap();
+        let roots = vec!["media".to_owned(), "/srv/elsewhere".to_owned()];
+
+        assert_eq!(
+            sendfile_root_paths(&roots, &source, None),
+            [
+                source.join("media").display().to_string(),
+                "/srv/elsewhere".to_owned()
+            ]
+        );
+        assert!(check_sendfile(&roots, None).is_ok());
+
+        // An absolute root may be made later; a relative one is part of
+        // the release.
+
+        assert!(check_sendfile_dirs(&roots, &source).is_ok());
+        let missing = check_sendfile_dirs(&["reports".to_owned()], &source).unwrap_err();
+        assert!(
+            missing.contains("\"reports\" is not a directory in"),
+            "{missing}"
+        );
+        assert!(check_sendfile(&[" ".to_owned()], None).is_err());
+
+        // An upstream's roots have no source to be taken from.
+
+        let upstream = Upstream {
+            addresses: vec!["127.0.0.1:9000".to_owned()],
+            sendfile_roots: vec!["media".to_owned()],
+            ..Default::default()
+        };
+        assert!(check_upstream(&upstream).unwrap_err().contains("absolute"));
+        std::fs::remove_dir_all(&source).unwrap();
+    }
 
     #[test]
     fn instance_is_a_key_of_the_local_file_alone() {
@@ -7501,6 +7744,15 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert_eq!(shop.access_log.as_deref(), Some("off"));
         assert_eq!(shop.slow.as_deref(), Some("2s"));
         assert_eq!(shop.access_log_exclude, ["/a", "/b"]);
+
+        // Issue 849: the data directory and its parts come along together.
+
+        let data =
+            Document::parse("[app.shop]\ndata_dir = '/srv/shop'\nmedia_dir = 'files'\n").unwrap();
+        first.merge(data).unwrap();
+        let shop = &first.app["shop"];
+        assert_eq!(shop.data_dir.as_deref(), Some("/srv/shop"));
+        assert_eq!(shop.media_dir.as_deref(), Some("files"));
 
         let again = Document::parse("[app.shop.release.r2]\nentrypoint = 'a:c'\n").unwrap();
         let error = first.merge(again).unwrap_err();

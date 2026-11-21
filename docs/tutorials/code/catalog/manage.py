@@ -1,8 +1,9 @@
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
-DATABASE = Path(__file__).parent / "catalog.db"
+DATABASE = Path(os.environ.get("MURU_DATA_DIR", Path(__file__).parent)) / "catalog.db"
 
 # python manage.py add NAME PRICE
 

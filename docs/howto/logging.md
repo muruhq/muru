@@ -43,6 +43,20 @@ and so arrives tagged; nothing needs configuring. On the terminal these
 lines have no time in front; [times on log lines](#times-on-log-lines)
 says where they do and how to ask for one.
 
+### Output during a reload
+
+When a development run reloads, the new release starts with a relay of
+its own beside the release still serving. Before muructl prints
+`muru: switched to release rN`, it has the new release's relay write
+everything the release's host and workers have written so far, and
+writes that itself, so the lines the new workers write while they
+start, such as those of their `post_fork` and `on_ready` hooks, come
+before the switch. The old release's lines as it stops, such as those
+of its `on_drain` and `on_exit` hooks, come after the switch, when they
+happen. A relay that cannot write what it holds within a second, as
+behind a paused terminal under `on_overflow = 'block'`, does not hold
+up the switch: muructl prints the line anyway.
+
 ### When the output cannot keep up
 
 The relay reads each worker's output as it is written and holds it in a
@@ -436,7 +450,7 @@ with `muructl daemon start` did not stay up:
 ```console
 $ muructl logs --daemon --lines 2
 2026-11-02T05:40:11.204Z muru: cache: /var/cache/muru (default)
-2026-11-02T05:40:11.209Z muru: error: cannot listen on 0.0.0.0:80: Address already in use (os error 98)
+2026-11-02T05:40:11.209Z muru: error: cannot listen on 0.0.0.0:80: port 80 on 0.0.0.0 is in use by nginx (pid 812); choose another listener, or stop it
 ```
 
 `muructl daemon status` names the log directory, with the daemon
