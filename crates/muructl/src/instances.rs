@@ -177,6 +177,8 @@ pub enum KindArg {
     Run,
     /// `muructl serve`.
     Serve,
+    /// `muructl detour run`.
+    Detour,
 }
 
 impl KindArg {
@@ -185,6 +187,7 @@ impl KindArg {
             Self::Daemon => Kind::Daemon,
             Self::Run => Kind::Run,
             Self::Serve => Kind::Serve,
+            Self::Detour => Kind::Detour,
         }
     }
 }

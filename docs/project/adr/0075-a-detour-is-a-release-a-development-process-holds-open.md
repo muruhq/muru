@@ -208,6 +208,18 @@ These are smaller choices the issues left open.
   tag is `detour:` and its short ID. Commands run from its checkout reach
   it as they reach a run.
 
+- **The MCP tools.** Two rather than one `detour` tool: `detours`, which
+  reads (the list, and an entry link with the header value), and
+  `detour_traffic`, which changes, since a tool is marked as one or the
+  other and `--read-only` would otherwise leave out listing and links.
+
+- **Choosing a detour.** The admin calls name a detour by its
+  application and release; muructl chooses it from ListDetours by its
+  release, then its application when one detour has it, then the
+  instance resolver over the detours' runs (tag, ID prefix, label), and
+  with nothing named the project's application in a checkout, else the
+  one detour open.
+
 ### Consequences
 
 - Good: code being edited is served through the routing it will live

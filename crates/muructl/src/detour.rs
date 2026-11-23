@@ -36,6 +36,20 @@ pub enum DetourCommand {
 
     /// Open a one-time entry link to a detour's preview in the browser, or print it.
     Preview(PreviewArgs),
+
+    /// List the daemon's open detours.
+    List(ListArgs),
+}
+
+/// `muructl detour list`.
+#[derive(Args)]
+pub struct ListArgs {
+    #[command(flatten)]
+    output: crate::admin::JsonArgs,
+
+    /// Which daemon's detours.
+    #[command(flatten)]
+    socket: SocketArgs,
 }
 
 /// `muructl detour preview`.
@@ -66,6 +80,9 @@ pub struct PreviewArgs {
     #[arg(long, conflicts_with_all = ["list", "print", "host"])]
     header: bool,
 
+    #[command(flatten)]
+    output: crate::admin::JsonArgs,
+
     /// Which daemon the detour is open on.
     #[command(flatten)]
     socket: SocketArgs,
@@ -80,6 +97,9 @@ pub struct TrafficArgs {
     /// detour open); the choice is preview, all, share=N or class=NAME.
     #[arg(value_name = "[DETOUR] CHOICE", num_args = 1..=2, required = true)]
     words: Vec<String>,
+
+    #[command(flatten)]
+    output: crate::admin::JsonArgs,
 
     /// Which daemon the detour is open on.
     #[command(flatten)]
@@ -376,6 +396,88 @@ fn chosen<'a>(wanted: Option<&str>, detours: &'a [pb::Detour]) -> anyhow::Result
     muru_controller::detours::choose(wanted.as_deref(), detours).map_err(anyhow::Error::msg)
 }
 
+/// Run `muructl detour list`.
+pub async fn list(args: ListArgs) -> anyhow::Result<()> {
+    let mut client = muru_controller::client::connect(&args.socket.endpoint()?).await?;
+    let detours = listed(&mut client).await?;
+
+    if args.output.json {
+        return crate::admin::print_answer(&pb::ListDetoursResponse { detours });
+    }
+
+    if detours.is_empty() {
+        println!("no detours are open");
+        return Ok(());
+    }
+
+    for line in table(&detours) {
+        println!("{line}");
+    }
+
+    Ok(())
+}
+
+/// The detours as `detour list` prints them: a heading, then one line
+/// for each, the columns lined up.
+fn table(detours: &[pb::Detour]) -> Vec<String> {
+    let rows: Vec<[String; 7]> = detours
+        .iter()
+        .map(|detour| {
+            [
+                detour.app.clone(),
+                detour.release.clone(),
+                if detour.label.is_empty() {
+                    "-".to_owned()
+                } else {
+                    detour.label.clone()
+                },
+                detour.pid.to_string(),
+                detour.traffic.clone(),
+                crate::instances::uptime(u64::try_from(detour.opened_unix_ms).unwrap_or_default()),
+                muru_controller::registry::home_shortened(Path::new(&detour.directory)),
+            ]
+        })
+        .collect();
+    let headings = [
+        "APP",
+        "RELEASE",
+        "LABEL",
+        "PID",
+        "TRAFFIC",
+        "SINCE",
+        "DIRECTORY",
+    ];
+    let widths: Vec<usize> = (0..headings.len() - 1)
+        .map(|column| {
+            rows.iter()
+                .map(|row| row[column].len())
+                .chain(std::iter::once(headings[column].len()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+
+    let line = |cells: Vec<&str>| {
+        let mut text = String::new();
+
+        for (column, cell) in cells.iter().enumerate() {
+            match widths.get(column) {
+                Some(width) => text.push_str(&format!("{cell:<width$}  ")),
+                None => text.push_str(cell),
+            }
+        }
+
+        text.trim_end().to_owned()
+    };
+
+    std::iter::once(line(headings.to_vec()))
+        .chain(
+            rows.iter()
+                .map(|row| line(row.iter().map(String::as_str).collect())),
+        )
+        .collect()
+}
+
 /// Run `muructl detour traffic`.
 pub async fn traffic(args: TrafficArgs) -> anyhow::Result<()> {
     let (wanted, choice) = match args.words.as_slice() {
@@ -400,6 +502,10 @@ pub async fn traffic(args: TrafficArgs) -> anyhow::Result<()> {
         .await
         .map_err(crate::admin::explain)?
         .into_inner();
+
+    if args.output.json {
+        return crate::admin::print_answer(&after);
+    }
 
     muru_common::muru_println!(
         "detour {}@{} now takes {} (was {before})",
@@ -454,6 +560,12 @@ pub async fn preview(args: PreviewArgs) -> anyhow::Result<()> {
     let detour = chosen(args.detour.as_deref(), &detours)?.clone();
     let name = format!("{}@{}", detour.app, detour.release);
     let preview = mint(&mut client, &detour, args.host.as_deref(), args.list).await?;
+
+    // An agent or a script is given the links and opens nothing.
+
+    if args.output.json {
+        return crate::admin::print_answer(&preview);
+    }
 
     if args.header {
         println!("Muru-Preview: {}", preview.header);
@@ -735,6 +847,38 @@ mod tests {
                 "{flag} was taken"
             );
         }
+    }
+
+    #[test]
+    fn the_list_lines_up_each_detour_and_shows_no_secret() {
+        let detour = pb::Detour {
+            app: "shop".to_owned(),
+            release: "dev-7f3a".to_owned(),
+            label: "feature-x".to_owned(),
+            pid: 41872,
+            traffic: "preview".to_owned(),
+            opened_unix_ms: i64::try_from(crate::admin::now_unix_ms()).unwrap() - 720_000,
+            directory: "/srv/shop-feature-x".to_owned(),
+            ..Default::default()
+        };
+        let other = pb::Detour {
+            app: "blog".to_owned(),
+            release: "dev-1b2c".to_owned(),
+            pid: 7,
+            traffic: "all".to_owned(),
+            opened_unix_ms: i64::try_from(crate::admin::now_unix_ms()).unwrap() - 5_000,
+            directory: "/srv/blog".to_owned(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            table(&[detour, other]),
+            [
+                "APP   RELEASE   LABEL      PID    TRAFFIC  SINCE  DIRECTORY",
+                "shop  dev-7f3a  feature-x  41872  preview  12m    /srv/shop-feature-x",
+                "blog  dev-1b2c  -          7      all      5s     /srv/blog",
+            ]
+        );
     }
 
     #[test]

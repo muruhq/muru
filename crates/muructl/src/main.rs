@@ -1283,6 +1283,7 @@ fn main() -> anyhow::Result<()> {
             detour::DetourCommand::Run(args) => runtime.block_on(detour::run(*args)),
             detour::DetourCommand::Traffic(args) => runtime.block_on(detour::traffic(args)),
             detour::DetourCommand::Preview(args) => runtime.block_on(detour::preview(args)),
+            detour::DetourCommand::List(args) => runtime.block_on(detour::list(args)),
         },
         Command::Serve(args) => runtime.block_on(serve::serve(*args)),
         Command::Probe(args) => serve::probe(args),

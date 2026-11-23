@@ -23,6 +23,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+from support import instances as instances_support
 from support import server as support
 from support.daemon import Daemon, start_daemon
 
@@ -230,6 +231,39 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         assert "server-timing" in seen["headers"]
         assert "muru-preview" not in seen["headers"]
         assert seen["preview"] == ""
+
+        # The detour is listed, with no secret, and its run is an instance
+        # of kind detour that --instance reaches by its tag.
+
+        listed = daemon.muructl("detour", "list", "--json")
+        assert [detour["release"] for detour in json.loads(listed.stdout)["detours"]] == [release]
+        assert value.split(".")[1] not in listed.stdout
+        muructl = support.muructl_path()
+        assert muructl is not None
+        instances = subprocess.run(
+            [
+                str(muructl),
+                "instance",
+                "list",
+                "--kind",
+                "detour",
+                "--label",
+                instances_support.label(),
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        tags = [found["selector"] for found in json.loads(instances.stdout)["instances"]]
+        assert tags == [seen["instance"]], tags
+        status = subprocess.run(
+            [str(muructl), "status", "--instance", tags[0]],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert f"detour detoured@{release}" in status.stdout, status.stdout
 
         # The daemon counts the detour's requests under its own release
         # and the group detour, which conditions, gates and the

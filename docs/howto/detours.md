@@ -265,6 +265,8 @@ The detour then changes the data the serving release uses.
 
 ## From a coding agent
 
-The MCP server's `detour` tool lists the daemon's detours, changes a
-detour's traffic and gives an entry link, so an agent can open a page of
-the detour it is working on. See [coding agents](coding-agents.md).
+The MCP server's `detours` tool lists the daemon's detours and gives an
+entry link to one, with its `Muru-Preview` header value, so an agent can
+open a page of the detour it is working on, and `detour_traffic` changes
+what a detour takes. See [coding agents](coding-agents.md) and the
+[MCP tools](../reference/mcp-tools.md).
