@@ -1157,6 +1157,18 @@ pub async fn handle(
         headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
     }
 
+    // Section 4.13: a WebSocket the client opened over HTTP/2 reaches the
+    // HTTP/1.1 upstream as the HTTP/1.1 handshake, a GET with a key of the
+    // edge's own, whose accept value the upstream's 101 must then carry.
+
+    let (method, accept) = match &upgrade {
+        Some(upgrade) if upgrade.over_http2() => (
+            http::Method::GET,
+            Some(crate::websocket::http1_handshake(&mut headers)),
+        ),
+        _ => (parts.method.clone(), None),
+    };
+
     let length = match &payload {
         Payload::Empty => None,
         Payload::Buffered(data) => Some(data.len() as u64),
@@ -1218,6 +1230,7 @@ pub async fn handle(
     failing.note_in_flight(|in_flight| in_flight.upstream());
     let mut slot = Some(build_request(
         parts,
+        &method,
         shared,
         protocol,
         &host,
@@ -1262,6 +1275,7 @@ pub async fn handle(
                         address.idle.lock().expect("upstream idle poisoned").clear();
                         slot = Some(build_request(
                             parts,
+                            &method,
                             shared,
                             protocol,
                             &host,
@@ -1418,8 +1432,36 @@ pub async fn handle(
     if let Some(upgrade) = upgrade
         && status == StatusCode::SWITCHING_PROTOCOLS
     {
+        if let Some(accept) = &accept
+            && response
+                .headers()
+                .get(http::header::SEC_WEBSOCKET_ACCEPT)
+                .is_none_or(|value| value.as_bytes() != accept.as_bytes())
+        {
+            failing.put_recording(recording.take());
+            drop(response);
+            return Handled::Response(failing.respond(Problem::new(
+                StatusCode::BAD_GATEWAY,
+                FAILED_REASON,
+                "The upstream accepted the WebSocket without the key it was sent.",
+            )));
+        }
+
+        // The handshake's own headers are the edge's to answer the client
+        // with, as its protocol needs; the rest, a subprotocol say, go on.
+
+        let named = connection_options(response.headers());
+        let kept: Vec<worker::Header> = head
+            .headers
+            .into_iter()
+            .filter(|header| {
+                let name = String::from_utf8_lossy(&header.name);
+                !crate::is_hop_by_hop(&name, &named)
+                    && !name.eq_ignore_ascii_case(http::header::SEC_WEBSOCKET_ACCEPT.as_str())
+            })
+            .collect();
         let upstream_side = hyper::upgrade::on(&mut response);
-        let answer = crate::websocket::accepted_response(&upgrade, head.headers);
+        let answer = crate::websocket::accepted_response(&upgrade, kept);
         let ended = shared.detour.then(|| upstream.ended.subscribe());
         tokio::spawn(relay(upgrade, upstream_side, recording, ended));
         return Handled::Response(answer);
@@ -1611,6 +1653,7 @@ fn outgoing_headers(
 #[allow(clippy::too_many_arguments)]
 fn build_request(
     parts: &http::request::Parts,
+    method: &http::Method,
     shared: &Shared,
     protocol: Protocol,
     host: &str,
@@ -1643,7 +1686,7 @@ fn build_request(
     }
 
     let mut request = Request::new(body);
-    *request.method_mut() = parts.method.clone();
+    *request.method_mut() = method.clone();
     *request.uri_mut() = uri;
     *request.version_mut() = version;
     *request.headers_mut() = headers;

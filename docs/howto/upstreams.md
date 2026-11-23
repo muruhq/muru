@@ -54,7 +54,9 @@ path arrives as the client sent it, prefix included.
 
 The upstream's response goes back with its headers, less hop-by-hop
 ones. A WebSocket upgrade is passed to an `http1` upstream and the bytes
-are copied both ways once it answers 101. Limits apply as for
+are copied both ways once it answers 101. A WebSocket a client opens over
+HTTP/2 reaches the upstream as the HTTP/1.1 handshake, so the server sees
+an ordinary upgrade whichever protocol the client used. Limits apply as for
 applications: `max_body_size`, the request deadline (504 `deadline` when
 the response head does not arrive in time) and the response idle
 timeout.

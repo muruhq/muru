@@ -23,6 +23,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+from support import http2
 from support import instances as instances_support
 from support import server as support
 from support.daemon import Daemon, start_daemon
@@ -282,8 +283,9 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         assert plain.status == 500
         assert b"boom from the detoured fixture" not in plain.body
 
-        # A WebSocket goes through the detour over HTTP/1.1, and a gRPC
-        # call over h2c.
+        # A WebSocket goes through the detour over HTTP/1.1, whether the
+        # client opened it over HTTP/1.1 or HTTP/2, and a gRPC call over
+        # h2c.
 
         websockets = pytest.importorskip("websockets.sync.client")
 
@@ -292,6 +294,12 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         ) as socket:
             socket.send("hello")
             assert socket.recv(timeout=10).split() == [seen["instance"], "hello"]
+
+        status, echoed = http2.echo_over_http2(
+            daemon.port, "/ws/echo", "over-h2", f"127.0.0.1:{daemon.port}", preview
+        )
+        assert status == 200
+        assert echoed.split() == [seen["instance"], "over-h2"]
 
         if stubs is not None:
             import grpc
