@@ -1,0 +1,542 @@
+//! `muructl detour` (design specification sections 9.13 and 13.12, ADR
+//! 0075): a development run served behind a local daemon's edge as a
+//! release of an application, held open by a streaming admin call for as
+//! long as the run runs.
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context as _;
+use clap::{Args, Parser, Subcommand};
+use muru_proto::admin::v1 as pb;
+use pb::detour_message::What;
+use tokio_stream::StreamExt as _;
+
+use crate::admin::SocketArgs;
+
+/// How long a run waits between tries to open its detour again.
+const RETRY_EVERY: Duration = Duration::from_secs(2);
+
+/// The socket a detour's edge serves on, in the run's own directory.
+pub const SOCKET: &str = "detour.sock";
+
+/// The detours of a daemon.
+#[derive(Subcommand)]
+pub enum DetourCommand {
+    /// Serve the project in development mode behind a local daemon's edge,
+    /// as a release of an application, for as long as this runs: the
+    /// daemon routes previews to it, or more when asked, with reload, the
+    /// toolbar and tracebacks of a development run.
+    Run(Box<DetourRunArgs>),
+}
+
+/// `muructl detour run`.
+#[derive(Args)]
+pub struct DetourRunArgs {
+    /// The application on the daemon the detour is a release of
+    /// (default: the project's, `[project] name` from pyproject.toml,
+    /// else the module of its entrypoint).
+    #[arg(value_name = "APP")]
+    app: Option<String>,
+
+    /// What the detour takes: preview, only browsers with its preview
+    /// cookie; all, every request for the application; share=N, N percent
+    /// of its clients; or class=NAME, a client class the daemon defines.
+    #[arg(long, value_name = "CHOICE", default_value = "preview")]
+    traffic: String,
+
+    /// Give the run the application's data directory on the daemon, which
+    /// its releases share, in place of the run's own.
+    #[arg(long)]
+    app_data: bool,
+
+    #[command(flatten)]
+    pub label: crate::instances::LabelArgs,
+
+    /// Python to run under: a path or a version (default: as muructl run
+    /// finds it).
+    #[arg(long, value_name = "PATH or VERSION")]
+    python: Option<String>,
+
+    /// Worker processes.
+    #[arg(long)]
+    processes: Option<usize>,
+
+    /// Threads per worker.
+    #[arg(long)]
+    threads: Option<usize>,
+
+    /// One process and one thread, nothing forked, for a debugger.
+    #[arg(long)]
+    single: bool,
+
+    /// The project directory (default: the current directory).
+    #[arg(long)]
+    chdir: Option<PathBuf>,
+
+    /// Bring the environment up to date with the lock first: always, or
+    /// the mode given (auto, always or never).
+    #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "always")]
+    build: Option<String>,
+
+    /// A .env file the run starts with.
+    #[arg(long, value_name = "FILE")]
+    env_file: Option<PathBuf>,
+
+    /// The largest request body the run's edge takes, such as 50MB.
+    #[arg(long, value_name = "SIZE")]
+    max_body_size: Option<String>,
+
+    /// Reload on change (the default).
+    #[arg(long, conflicts_with = "no_reload")]
+    reload: bool,
+
+    /// Do not reload on change.
+    #[arg(long)]
+    no_reload: bool,
+
+    /// A directory to watch for changes instead of the project.
+    #[arg(long = "reload-dir", value_name = "DIR")]
+    reload_dir: Vec<PathBuf>,
+
+    /// Files to watch beside Python files, as a glob.
+    #[arg(long = "reload-include", value_name = "GLOB")]
+    reload_include: Vec<String>,
+
+    /// Files whose changes are ignored, as a glob.
+    #[arg(long = "reload-exclude", value_name = "GLOB")]
+    reload_exclude: Vec<String>,
+
+    /// Insert the development toolbar into HTML pages.
+    #[arg(long, conflicts_with = "no_toolbar")]
+    toolbar: bool,
+
+    /// Leave the toolbar out, whatever the settings say.
+    #[arg(long)]
+    no_toolbar: bool,
+
+    /// The address of the run's own dashboard, or off (default: a free
+    /// loopback port).
+    #[arg(long, value_name = "ADDRESS")]
+    dashboard: Option<String>,
+
+    /// Print the settings the detour's run would use, and where each came
+    /// from, then exit.
+    #[arg(long)]
+    print_config: bool,
+
+    /// Which daemon the detour opens on.
+    #[command(flatten)]
+    socket: SocketArgs,
+}
+
+/// A clap parser for `muructl run`'s arguments alone, which a detour
+/// fills from its own.
+#[derive(Parser)]
+struct RunOnly {
+    #[command(flatten)]
+    args: crate::RunArgs,
+}
+
+/// What a run does as a detour, beside what it does as any run.
+pub struct Mode {
+    /// The application on the daemon.
+    pub app: String,
+    /// The daemon's admin socket.
+    pub daemon: PathBuf,
+    /// What the detour takes, as the flag gives it.
+    pub traffic: String,
+    /// Use the application's data directory on the daemon.
+    pub app_data: bool,
+    /// The run's label, or empty.
+    pub label: String,
+}
+
+impl DetourRunArgs {
+    /// The words of the `muructl run` this detour runs, for its parser.
+    fn run_words(&self) -> Vec<OsString> {
+        let mut words: Vec<OsString> = vec!["muructl-run".into()];
+        let mut flag = |name: &str, value: Option<OsString>| {
+            words.push(format!("--{name}").into());
+
+            if let Some(value) = value {
+                words.push(value);
+            }
+        };
+
+        let given = |value: &Option<String>| value.clone().map(OsString::from);
+        let path = |value: &Option<PathBuf>| value.clone().map(OsString::from);
+
+        for (name, value) in [
+            ("python", given(&self.python)),
+            ("processes", self.processes.map(|n| n.to_string().into())),
+            ("threads", self.threads.map(|n| n.to_string().into())),
+            ("max-body-size", given(&self.max_body_size)),
+            ("dashboard", given(&self.dashboard)),
+        ] {
+            if let Some(value) = value {
+                flag(name, Some(value));
+            }
+        }
+
+        for (name, value) in [
+            ("chdir", path(&self.chdir)),
+            ("env-file", path(&self.env_file)),
+        ] {
+            if let Some(value) = value {
+                flag(name, Some(value));
+            }
+        }
+
+        // `--build=MODE` is one word, so the mode is never taken for
+        // the entrypoint.
+
+        if let Some(mode) = &self.build {
+            flag(&format!("build={mode}"), None);
+        }
+
+        for (name, on) in [
+            ("single", self.single),
+            ("reload", self.reload),
+            ("no-reload", self.no_reload),
+            ("toolbar", self.toolbar),
+            ("no-toolbar", self.no_toolbar),
+            ("print-config", self.print_config),
+        ] {
+            if on {
+                flag(name, None);
+            }
+        }
+
+        for directory in &self.reload_dir {
+            flag("reload-dir", Some(directory.clone().into()));
+        }
+
+        for glob in &self.reload_include {
+            flag("reload-include", Some(glob.into()));
+        }
+
+        for glob in &self.reload_exclude {
+            flag("reload-exclude", Some(glob.into()));
+        }
+
+        words
+    }
+}
+
+/// The project directory the detour serves: `--chdir`, else the current
+/// directory.
+fn project_dir(args: &DetourRunArgs) -> anyhow::Result<PathBuf> {
+    match &args.chdir {
+        Some(directory) => Ok(directory.clone()),
+        None => std::env::current_dir().context("finding the current directory"),
+    }
+}
+
+/// Run `muructl detour run`.
+pub async fn run(args: DetourRunArgs) -> anyhow::Result<()> {
+    muru_controller::detours::Traffic::parse(&args.traffic).map_err(anyhow::Error::msg)?;
+
+    let mut run_args = RunOnly::try_parse_from(args.run_words())
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .args;
+
+    // The application is the daemon's name for it, which the run takes
+    // as its own, so its records and the daemon's name the same thing.
+
+    let project = project_dir(&args)?;
+
+    let app = match &args.app {
+        Some(app) => app.clone(),
+        None => crate::open::project_app(&project).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no application is named and {} names none ([project] name in pyproject.toml, \
+                 or a [tool.muru] entrypoint); give one: muructl detour run APP",
+                project.display()
+            )
+        })?,
+    };
+
+    anyhow::ensure!(
+        muru_config::valid_name(&app),
+        "{app:?} is not an application name: lowercase letters, digits and hyphens"
+    );
+
+    run_args.name = Some(app.clone());
+    run_args.detour = true;
+
+    if args.dashboard.is_none() {
+        run_args.dashboard = Some("127.0.0.1:0".to_owned());
+    }
+
+    let daemon = if args.print_config {
+        PathBuf::new()
+    } else {
+        match args.socket.endpoint()? {
+            muru_controller::client::Endpoint::Unix { path } => path,
+        }
+    };
+
+    let mode = Mode {
+        app,
+        daemon,
+        traffic: args.traffic.clone(),
+        app_data: args.app_data,
+        label: args.label.label.clone().unwrap_or_default(),
+    };
+
+    crate::run_with(run_args, None, None, Some(mode)).await
+}
+
+/// Bind the detour's socket in the run's directory, before anything
+/// starts, so the daemon can check it when the detour opens; connections
+/// wait in its backlog until the edge takes them.
+pub fn bind(directory: &Path) -> anyhow::Result<(std::os::unix::net::UnixListener, PathBuf)> {
+    let socket = directory.join(SOCKET);
+    let _ = std::fs::remove_file(&socket);
+    let listener = std::os::unix::net::UnixListener::bind(&socket).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot listen on the detour's socket {}: {error}; a shorter MURU_RUN_DIR may be \
+             needed, since socket paths are limited to about a hundred bytes",
+            socket.display()
+        )
+    })?;
+
+    Ok((listener, socket))
+}
+
+/// What the run tells the daemon when it opens its detour.
+pub fn request(
+    mode: &Mode,
+    socket: &Path,
+    instance_id: &str,
+    project: &Path,
+) -> pb::OpenDetourRequest {
+    pb::OpenDetourRequest {
+        app: mode.app.clone(),
+        socket: socket.display().to_string(),
+        label: mode.label.clone(),
+        instance_id: instance_id.to_owned(),
+        pid: std::process::id(),
+        directory: project.display().to_string(),
+        traffic: mode.traffic.clone(),
+    }
+}
+
+/// A detour's stream, as the daemon sends it.
+pub type Stream = tonic::Streaming<pb::DetourMessage>;
+
+/// Open the detour on the daemon: its stream, and what the daemon opened.
+pub async fn open(
+    daemon: &Path,
+    request: &pb::OpenDetourRequest,
+) -> anyhow::Result<(Stream, pb::DetourOpened)> {
+    let mut client =
+        muru_controller::client::connect(&muru_controller::client::Endpoint::unix(daemon))
+            .await
+            .with_context(|| format!("reaching the daemon at {}", daemon.display()))?;
+    let mut stream = client
+        .open_detour(request.clone())
+        .await
+        .map_err(|status| anyhow::anyhow!("the daemon refused the detour: {}", status.message()))?
+        .into_inner();
+
+    match stream.next().await {
+        Some(Ok(pb::DetourMessage {
+            what: Some(What::Opened(opened)),
+        })) => Ok((stream, opened)),
+        Some(Err(status)) => anyhow::bail!("the daemon refused the detour: {}", status.message()),
+        _ => anyhow::bail!("the daemon ended the detour as it opened"),
+    }
+}
+
+/// The detour, as the start-up and the toolbar name it: `shop@dev-7f3a`.
+pub fn name(opened: &pb::DetourOpened) -> String {
+    opened
+        .detour
+        .as_ref()
+        .map(|detour| format!("{}@{}", detour.app, detour.release))
+        .unwrap_or_default()
+}
+
+/// What a traffic choice means, as a line says it.
+pub fn takes(traffic: &str, app: &str) -> String {
+    match traffic {
+        "" | "preview" => "preview only, by an entry link (muructl detour preview)".to_owned(),
+        "all" => format!("all of {app}'s traffic"),
+        other => match other.split_once('=') {
+            Some(("share", share)) => format!("{share}% of {app}'s clients"),
+            Some(("class", class)) => format!("the requests of client class {class}"),
+            _ => other.to_owned(),
+        },
+    }
+}
+
+/// Hold the detour open for as long as the run runs: what the daemon
+/// sends goes to the toolbar and the terminal, and when the stream ends
+/// with the run still running it is opened again every two seconds, as
+/// a daemon that restarts has no detours. Aborting the task closes the
+/// stream, which ends the detour.
+pub fn hold(
+    mut stream: Stream,
+    daemon: PathBuf,
+    request: pb::OpenDetourRequest,
+    links: Arc<muru_edge::development::Links>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            // What the daemon says while the detour is open.
+
+            let mut why = "the daemon's stream ended".to_owned();
+
+            while let Some(message) = stream.next().await {
+                match message {
+                    Ok(pb::DetourMessage {
+                        what: Some(What::Changed(detour)),
+                    }) => {
+                        links.set_detour(Some(detour.traffic.clone()));
+                        muru_common::muru_println!(
+                            "detour {}@{} now takes {}",
+                            detour.app,
+                            detour.release,
+                            takes(&detour.traffic, &detour.app)
+                        );
+                    }
+                    Ok(pb::DetourMessage {
+                        what: Some(What::Closing(reason)),
+                    }) => why = format!("the daemon ended it: {reason}"),
+                    Ok(_) => {}
+                    Err(status) => {
+                        why = format!("its stream failed: {}", status.message());
+                        break;
+                    }
+                }
+            }
+
+            muru_common::muru_println!(
+                "the detour is closed, {why}; opening it again every {} seconds while this runs",
+                RETRY_EVERY.as_secs()
+            );
+
+            // The run stays as it is meanwhile, and says each new reason
+            // the daemon gives once.
+
+            let mut said = String::new();
+
+            stream = loop {
+                tokio::time::sleep(RETRY_EVERY).await;
+
+                match open(&daemon, &request).await {
+                    Ok((stream, opened)) => {
+                        links.set_hosts(opened.hosts.clone());
+                        let traffic = opened
+                            .detour
+                            .as_ref()
+                            .map(|detour| detour.traffic.clone())
+                            .unwrap_or_default();
+                        links.set_detour(Some(traffic));
+                        muru_common::muru_println!("detour {} is open again", name(&opened));
+                        break stream;
+                    }
+                    Err(error) => {
+                        let text = format!("{error:#}");
+
+                        if text != said {
+                            muru_common::muru_println!("the detour is not open yet: {text}");
+                            said = text;
+                        }
+                    }
+                }
+            };
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `muructl detour run` alone, for its parser.
+    #[derive(Parser)]
+    struct DetourOnly {
+        #[command(flatten)]
+        args: DetourRunArgs,
+    }
+
+    #[test]
+    fn a_detours_flags_become_the_runs_it_serves_with() {
+        let args = DetourOnly::try_parse_from([
+            "detour",
+            "shop",
+            "--processes",
+            "2",
+            "--threads",
+            "4",
+            "--single",
+            "--build",
+            "--max-body-size",
+            "50MB",
+            "--no-reload",
+            "--reload-exclude",
+            "tests/**",
+            "--toolbar",
+            "--env-file",
+            ".env.dev",
+            "--traffic",
+            "all",
+        ])
+        .expect("parsed")
+        .args;
+
+        assert_eq!(args.app.as_deref(), Some("shop"));
+        assert_eq!(args.traffic, "all");
+
+        let run = RunOnly::try_parse_from(args.run_words())
+            .expect("the run's words parse")
+            .args;
+
+        assert_eq!(run.processes, Some(2));
+        assert_eq!(run.threads, Some(4));
+        assert!(run.single);
+        assert_eq!(run.build.as_deref(), Some("always"));
+        assert_eq!(run.max_body_size, Some(50 * 1024 * 1024));
+        assert!(run.no_reload);
+        assert_eq!(run.reload_exclude, ["tests/**"]);
+        assert!(run.toolbar);
+        assert_eq!(run.env_file.as_deref(), Some(Path::new(".env.dev")));
+
+        // The entrypoint is the project's, never the application's name.
+
+        assert!(run.app.is_none());
+    }
+
+    #[test]
+    fn a_detour_has_no_listener_flags() {
+        for flag in [
+            "--bind",
+            "--port",
+            "--allow-public",
+            "--open",
+            "--https",
+            "--host",
+        ] {
+            assert!(
+                DetourOnly::try_parse_from(["detour", flag, "x"]).is_err(),
+                "{flag} was taken"
+            );
+        }
+    }
+
+    #[test]
+    fn a_traffic_choice_is_said_as_what_it_sends() {
+        assert!(takes("preview", "shop").starts_with("preview only"));
+        assert_eq!(takes("all", "shop"), "all of shop's traffic");
+        assert_eq!(takes("share=10", "shop"), "10% of shop's clients");
+        assert_eq!(
+            takes("class=crawlers", "shop"),
+            "the requests of client class crawlers"
+        );
+    }
+}

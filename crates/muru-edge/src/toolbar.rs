@@ -85,7 +85,7 @@ pub fn answer(
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served here\n");
     }
 
-    if let Err(why) = allowed(&parts.headers, links.hosts()) {
+    if let Err(why) = allowed(&parts.headers, &links.hosts()) {
         return plain(StatusCode::FORBIDDEN, why);
     }
 
@@ -579,7 +579,13 @@ fn policy_nonce(headers: &HeaderMap) -> Result<Option<String>, Skip> {
 /// The tag inserted into a page: the script under the prefix a trusted
 /// proxy forwarded, the request it shows, the dashboard's page for it,
 /// and the page's nonce.
-pub fn tag(prefix: &str, request_id: &str, dashboard: Option<&str>, nonce: Option<&str>) -> Bytes {
+pub fn tag(
+    prefix: &str,
+    request_id: &str,
+    dashboard: Option<&str>,
+    nonce: Option<&str>,
+    detour: Option<&str>,
+) -> Bytes {
     let attribute = |text: &str| {
         text.replace('&', "&amp;")
             .replace('"', "&quot;")
@@ -598,6 +604,10 @@ pub fn tag(prefix: &str, request_id: &str, dashboard: Option<&str>, nonce: Optio
 
     if let Some(nonce) = nonce {
         tag.push_str(&format!(" nonce=\"{}\"", attribute(nonce)));
+    }
+
+    if let Some(detour) = detour {
+        tag.push_str(&format!(" data-detour=\"{}\"", attribute(detour)));
     }
 
     tag.push_str(" async></script>");
@@ -1121,14 +1131,20 @@ mod tests {
                 "/proxy/8080/",
                 "A1",
                 Some("http://127.0.0.1:8081/request/A1"),
-                Some("n\"1")
+                Some("n\"1"),
+                None
             ),
             "<script src=\"/proxy/8080/_muru/toolbar/toolbar.js\" data-request=\"A1\" \
              data-dashboard=\"http://127.0.0.1:8081/request/A1\" nonce=\"n&quot;1\" async></script>"
         );
         assert_eq!(
-            tag("", "A1", None, None),
+            tag("", "A1", None, None, None),
             "<script src=\"/_muru/toolbar/toolbar.js\" data-request=\"A1\" async></script>"
+        );
+        assert_eq!(
+            tag("", "A1", None, None, Some("preview")),
+            "<script src=\"/_muru/toolbar/toolbar.js\" data-request=\"A1\" data-detour=\"preview\" \
+             async></script>"
         );
     }
 

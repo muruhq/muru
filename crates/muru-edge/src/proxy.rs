@@ -201,6 +201,22 @@ impl Trust {
         }
     }
 
+    /// What a detour's run trusts (section 13.12): its one peer, the
+    /// daemon's edge, which reaches it on its Unix socket as loopback,
+    /// for every forwarding header X-Real-IP included, and as a proxy.
+    pub fn detour() -> Self {
+        Self {
+            networks: vec![Network::Loopback],
+            headers: FORWARDING_HEADERS
+                .iter()
+                .map(|header| (*header).to_owned())
+                .collect(),
+            recursive: true,
+            consume: false,
+            headers_only: false,
+        }
+    }
+
     /// Compile the snapshot's proxy settings.
     pub fn from_snapshot(proxy: &pb::Proxy) -> Result<Self, String> {
         let mut networks = Vec::new();

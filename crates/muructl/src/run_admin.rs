@@ -946,8 +946,12 @@ pub struct RunInfo {
     /// run as its project directory does.
     #[serde(default)]
     pub started_from: Option<PathBuf>,
-    /// The address the application is served on.
+    /// The address the application is served on; empty for a detour.
     pub listen: String,
+    /// Whether the run is a detour's, served behind a daemon's edge
+    /// (section 13.12).
+    #[serde(default)]
+    pub detour: bool,
     /// The admin socket.
     pub socket: PathBuf,
     /// The runtime library directories the run uses, which `muructl
@@ -962,17 +966,34 @@ pub struct RunInfo {
 }
 
 impl RunInfo {
+    /// Where the run serves, as a sentence says it: `on
+    /// http://127.0.0.1:8000`, or `as a detour` for a detour's run.
+    pub fn on(&self) -> String {
+        if self.detour {
+            "as a detour".to_owned()
+        } else {
+            format!("on http://{}", self.listen)
+        }
+    }
+
     /// What a run's registry record says of it, when it is a run reached
     /// through a socket.
     pub fn from_record(record: &muru_controller::registry::Record) -> Option<Self> {
-        let listen = record.listeners.first().map(|listener| {
-            listener
+        let detour = record.kind == muru_controller::registry::Kind::Detour;
+
+        // Section 13.12: a detour has no listener of its own.
+
+        let listen = match record.listeners.first() {
+            Some(listener) => listener
                 .bound
                 .clone()
-                .unwrap_or_else(|| listener.configured.clone())
-        })?;
+                .unwrap_or_else(|| listener.configured.clone()),
+            None if detour => String::new(),
+            None => return None,
+        };
 
         Some(Self {
+            detour,
             pid: record.pid,
             app: record.app.clone()?,
             project: record.project.clone()?,
@@ -1028,6 +1049,38 @@ impl Registration {
         listeners: Vec<muru_controller::registry::Listener>,
         names: &[String],
     ) -> anyhow::Result<Self> {
+        Self::in_runtime(
+            muru_controller::registry::Kind::Run,
+            runtime,
+            app,
+            project,
+            listeners,
+            names,
+        )
+    }
+
+    /// Make a detour's own directory under `runtime`, as a run's, and
+    /// register it as a detour, which has no listener (section 13.12).
+    pub fn for_detour(runtime: &Path, app: &str, project: &Path) -> anyhow::Result<Self> {
+        Self::in_runtime(
+            muru_controller::registry::Kind::Detour,
+            runtime,
+            app,
+            project,
+            Vec::new(),
+            &[],
+        )
+    }
+
+    /// A run's or a detour's directory and entry.
+    fn in_runtime(
+        kind: muru_controller::registry::Kind,
+        runtime: &Path,
+        app: &str,
+        project: &Path,
+        listeners: Vec<muru_controller::registry::Listener>,
+        names: &[String],
+    ) -> anyhow::Result<Self> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let id = muru_controller::registry::InstanceId::generate();
@@ -1045,7 +1098,7 @@ impl Registration {
         let socket = directory.join("admin.sock");
         let mut record = muru_controller::registry::Record::new(
             id,
-            muru_controller::registry::Kind::Run,
+            kind,
             muru_controller::client::Endpoint::unix(&socket),
             directory.clone(),
         );
@@ -1090,6 +1143,7 @@ impl Registration {
             project: project.to_path_buf(),
             started_from: None,
             listen,
+            detour: false,
             socket: socket.to_path_buf(),
             runtime: Vec::new(),
             started_unix_ms: crate::admin::now_unix_ms(),
@@ -1225,8 +1279,10 @@ pub fn runs(runtime: &Path) -> Vec<RunInfo> {
         muru_controller::registry::live(&muru_controller::registry::user_registry())
             .iter()
             .filter(|record| {
-                record.kind == muru_controller::registry::Kind::Run
-                    && record.run_dir.starts_with(runtime)
+                matches!(
+                    record.kind,
+                    muru_controller::registry::Kind::Run | muru_controller::registry::Kind::Detour
+                ) && record.run_dir.starts_with(runtime)
             })
             .filter_map(RunInfo::from_record)
             .collect();

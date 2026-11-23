@@ -643,7 +643,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             }
 
             let settings = report(&layered, &mode);
-            crate::run_with(run_args, Some(mode), Some(settings)).await
+            crate::run_with(run_args, Some(mode), Some(settings), None).await
         }
         Err(error) => Err(error),
     };

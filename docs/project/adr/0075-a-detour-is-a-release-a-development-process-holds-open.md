@@ -176,6 +176,15 @@ These are smaller choices the issues left open.
   `/_muru/preview/…`. The cookie is a session cookie, `HttpOnly`,
   `SameSite=Lax`, `Path=/`, `Secure` on HTTPS and without a `Domain`.
 
+- **The run.** The socket is bound before the host starts, so the
+  daemon can check it when the detour opens, and connections wait in its
+  backlog until the edge takes them. The run's own dashboard is on a
+  free loopback port by default, since a fixed one would stop a detour
+  beside a `muructl run`. The daemon's edge strips its preview header and
+  cookie from what it sends the run, so the application never sees the
+  secret, and adds X-Forwarded-Port, since the run has no port of its own
+  for SERVER_PORT.
+
 - **Retrying.** A run whose call ends while it is still running says so
   once and opens it again every two seconds, saying when it is back.
   The first open must succeed, or the run does not start.

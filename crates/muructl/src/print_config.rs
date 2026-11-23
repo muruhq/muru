@@ -227,6 +227,46 @@ fn other_tables_note(tables: &[String], source: Option<&std::path::Path>) -> Vec
     }
 }
 
+/// The keys of the run table a detour does not use, and never refuses
+/// (section 13.12): its listener, its certificate, its hosts and its
+/// compression, which the daemon's edge has instead.
+pub const NOT_USED_BY_A_DETOUR: [&str; 8] = [
+    "port",
+    "https",
+    "https_only",
+    "https_port",
+    "tls_cert",
+    "tls_key",
+    "hosts",
+    "compression",
+];
+
+/// `muructl detour run --print-config`: the run's settings as `muructl
+/// run` reads them, with the keys a detour does not use marked so.
+pub fn for_detour(args: &crate::RunArgs, resolved: &crate::Resolved, interpreter: &str) -> String {
+    let mut settings = run_settings(args, resolved);
+    mark_not_used_by_a_detour(&mut settings);
+    settings
+        .trailer
+        .insert(0, format!("The interpreter is {interpreter}."));
+    render(&settings).replacen("muructl run would use", "muructl detour run would use", 1)
+}
+
+/// Mark the run table's keys a detour does not use, and say why once.
+fn mark_not_used_by_a_detour(settings: &mut Settings) {
+    for row in &mut settings.rows {
+        if NOT_USED_BY_A_DETOUR.contains(&row.key) {
+            row.source = format!("{}; not used by a detour", row.source);
+        }
+    }
+
+    settings.trailer.push(
+        "A detour has no listener, certificate or hosts of its own, and the daemon's edge \
+         compresses its responses, so the keys marked are not used."
+            .to_owned(),
+    );
+}
+
 /// `muructl run --print-config`: the flags over muru.local.toml over the
 /// project's run table over the defaults, and the application's settings
 /// from the flags over the project's table.
@@ -913,5 +953,50 @@ mod tests {
                 "shop@r1: run.hosts = [\"a.test\", \"b.test\"] (default)",
             ]
         );
+    }
+
+    #[test]
+    fn a_detour_marks_the_keys_of_a_listener_its_hosts_and_compression_as_not_used() {
+        let rows = [
+            Row::new("port", 8000, "[tool.muru.run] in pyproject.toml").expect("a row"),
+            Row::new("https", true, "muru.local.toml").expect("a row"),
+            Row::new("hosts", ["shop.test"], DEFAULT).expect("a row"),
+            Row::new("compression", true, DEFAULT).expect("a row"),
+            Row::new("reload", true, DEFAULT).expect("a row"),
+            Row::new("toolbar", true, COMMAND_LINE).expect("a row"),
+        ];
+        let mut settings = Settings {
+            notes: Vec::new(),
+            top: Vec::new(),
+            section: "run",
+            rows: rows.into(),
+            trailer: Vec::new(),
+        };
+
+        mark_not_used_by_a_detour(&mut settings);
+
+        let sources: Vec<(&str, &str)> = settings
+            .rows
+            .iter()
+            .map(|row| (row.key, row.source.as_str()))
+            .collect();
+        assert_eq!(
+            sources,
+            [
+                (
+                    "port",
+                    "[tool.muru.run] in pyproject.toml; not used by a detour"
+                ),
+                ("https", "muru.local.toml; not used by a detour"),
+                ("hosts", "default; not used by a detour"),
+                ("compression", "default; not used by a detour"),
+                ("reload", "default"),
+                ("toolbar", "command line"),
+            ]
+        );
+        assert!(settings.trailer[0].contains("not used"));
+        render(&settings)
+            .parse::<toml::Table>()
+            .expect("valid TOML");
     }
 }

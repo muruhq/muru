@@ -25,5 +25,9 @@ sections 6.8 and 13.1):
   class, site mode and method they were given (sections 4.14 and 4.15),
   and the release that served them, for the overlay tests (section 9.10);
   the tests write its muru.toml.
+- `detoured/`: a WSGI module that reports which instance served it and
+  raises on `/boom`, with a WebSocket echo as an ASGI mount, for the
+  detour test (section 9.13); the test adds a gRPC mount where grpcio is
+  installed.
 
 Run one directly with `muructl run tests/fixtures/projects/shop`.

@@ -608,10 +608,10 @@ impl SocketArgs {
 
                 NOTED.call_once(|| {
                     muru_common::muru_eprintln!(
-                        "reaching the development run of {} on http://{}; {} names instance \
+                        "reaching the development run of {} {}; {} names instance \
                          {name}, pass --instance {name} to reach it",
                         run.app,
-                        run.listen,
+                        run.on(),
                         muru_config::LOCAL_FILE
                     );
                 });
@@ -993,11 +993,11 @@ fn discovered(
             let others: Vec<String> = others.iter().rev().map(|run| reach(run)).collect();
 
             format!(
-                "{} development runs of this project are listening; reaching the newest, {} on \
-                 http://{}; {} {}",
+                "{} development runs of this project are listening; reaching the newest, {} \
+                 {}; {} {}",
                 mine.len(),
                 newest.app,
-                newest.listen,
+                newest.on(),
                 listed(&others, muru_controller::selector::MAX_LISTED),
                 if others.len() == 1 {
                     "reaches the other"
@@ -1017,10 +1017,10 @@ fn discovered(
         let note = match runs {
             [] => None,
             [run] => Some(format!(
-                "using the daemon; the development run of {} on http://{} is also \
+                "using the daemon; the development run of {} {} is also \
                  listening: {}, or the command run from {}, reaches it",
                 run.app,
-                run.listen,
+                run.on(),
                 reach(run),
                 run.project.display()
             )),
@@ -1056,9 +1056,9 @@ fn discovered(
 
             for (run, how) in &shown {
                 message.push_str(&format!(
-                    "\n  {how:width$}  {} on http://{} from {}",
+                    "\n  {how:width$}  {} {} from {}",
                     run.app,
-                    run.listen,
+                    run.on(),
                     run.project.display()
                 ));
             }
@@ -11227,6 +11227,9 @@ fn user_cache_in_use() -> muru_controller::cache::InUse {
             (muru_controller::registry::Kind::Serve, Some(app)) => {
                 format!("muructl serve of {app}")
             }
+            (muru_controller::registry::Kind::Detour, Some(app)) => {
+                format!("the detour of {app}")
+            }
             _ => format!("instance {}", record.tag()),
         };
 
@@ -12142,6 +12145,7 @@ tls = { ca = "ca.pem" }
             project: PathBuf::from(project),
             started_from: None,
             listen: "127.0.0.1:8080".to_owned(),
+            detour: false,
             socket: PathBuf::from(socket),
             runtime: Vec::new(),
             started_unix_ms: 0,
@@ -12189,6 +12193,7 @@ tls = { ca = "ca.pem" }
             project: PathBuf::from("/work/shop"),
             started_from: None,
             listen: format!("127.0.0.1:{port}"),
+            detour: false,
             socket: PathBuf::from(format!("/user/runs/{port}/admin.sock")),
             runtime: Vec::new(),
             started_unix_ms,
@@ -12246,6 +12251,7 @@ tls = { ca = "ca.pem" }
             project: PathBuf::from("/work/shop"),
             started_from: Some(PathBuf::from("/work")),
             listen: "127.0.0.1:18380".to_owned(),
+            detour: false,
             socket: PathBuf::from("/user/runs/18380/admin.sock"),
             runtime: Vec::new(),
             started_unix_ms: 0,
@@ -12255,6 +12261,7 @@ tls = { ca = "ca.pem" }
             project: PathBuf::from("/work"),
             started_from: Some(PathBuf::from("/elsewhere")),
             listen: "127.0.0.1:18381".to_owned(),
+            detour: false,
             socket: PathBuf::from("/user/runs/18381/admin.sock"),
             ..shop.clone()
         };

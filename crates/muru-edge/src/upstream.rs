@@ -347,6 +347,38 @@ impl Shared {
     }
 }
 
+/// Remove the preview header, and the preview cookie from the Cookie
+/// headers, leaving the request's other cookies as they were.
+fn without_preview(headers: &mut HeaderMap) {
+    headers.remove(crate::routing::PREVIEW_HEADER);
+
+    let cookies: Vec<String> = headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .map(str::trim)
+                .filter(|pair| {
+                    pair.split_once('=')
+                        .is_none_or(|(name, _)| name.trim() != crate::routing::PREVIEW_COOKIE)
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .filter(|value| !value.is_empty())
+        .collect();
+
+    headers.remove(http::header::COOKIE);
+
+    for value in cookies {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            headers.append(http::header::COOKIE, value);
+        }
+    }
+}
+
 /// Whether the client said it takes trailers, as a gRPC client does.
 fn wants_trailers(headers: &HeaderMap) -> bool {
     headers
@@ -1095,6 +1127,29 @@ pub async fn handle(
     let host = requested_host(parts, context);
     let mut headers = outgoing_headers(parts, context, &host, upgrade.is_some());
 
+    // Section 4.21: the preview that chose the detour is the daemon's,
+    // and carries its secret, so neither the run's edge nor the
+    // application sees it.
+
+    if shared.detour {
+        without_preview(&mut headers);
+    }
+
+    // Section 4.21: a detour's run is told the port the client came to,
+    // since it has none of its own for SERVER_PORT.
+
+    if shared.detour
+        && !headers.contains_key("x-forwarded-port")
+        && let Ok(value) = HeaderValue::from_str(
+            &context
+                .forwarded_port
+                .unwrap_or_else(|| context.local.port())
+                .to_string(),
+        )
+    {
+        headers.insert(HeaderName::from_static("x-forwarded-port"), value);
+    }
+
     // gRPC servers look for `te: trailers`, the one value HTTP/2 allows,
     // which goes as a hop-by-hop header otherwise.
 
@@ -1840,6 +1895,30 @@ mod tests {
 
         second.end_relays();
         assert!(*relaying.borrow());
+    }
+
+    #[test]
+    fn a_detour_gets_no_preview_header_or_cookie_and_keeps_the_other_cookies() {
+        let mut headers = HeaderMap::new();
+        headers.insert("muru-preview", HeaderValue::from_static("dev-7f3a.0f"));
+        headers.append(
+            http::header::COOKIE,
+            HeaderValue::from_static("session=abc; muru_preview=dev-7f3a.0f; theme=dark"),
+        );
+        headers.append(
+            http::header::COOKIE,
+            HeaderValue::from_static("muru_preview=dev-7f3a.0f"),
+        );
+
+        without_preview(&mut headers);
+
+        assert!(!headers.contains_key("muru-preview"));
+        let cookies: Vec<&str> = headers
+            .get_all(http::header::COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, ["session=abc; theme=dark"]);
     }
 
     #[test]

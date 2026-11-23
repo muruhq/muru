@@ -39,12 +39,14 @@ to the daemon:
 
 ```console
 $ muructl detour run
-muru: using [tool.muru] from pyproject.toml
-muru: serving shop.wsgi:application on detour shop@dev-7f3a of the user daemon with 1 process of 1 thread
-muru: traffic: preview only, by an entry link (muructl detour preview)
-muru: development mode: reload on change, tracebacks in error pages, no compression of its own
+muru: using [tool.muru] from ./pyproject.toml
 ...
-muru: watching /home/me/shop for changes
+muru: serving shop.wsgi:application on detour shop@dev-7f3a of the daemon at /run/user/1000/muru/admin.sock with 2 workers of 3 threads
+muru: traffic: preview only, by an entry link (muructl detour preview)
+muru: development mode: error pages show tracebacks, no releases are kept, the run reloads on change, and the daemon's edge serves the clients and compresses; Ctrl-C ends the detour
+muru: dashboard on http://127.0.0.1:52817/
+muru: admin socket /run/user/1000/muru/run-7f3a91c2/admin.sock
+muru: watching /home/me/shop for changes to **/*.py
 ```
 
 The application is the one the checkout's commands name: `[project]
@@ -55,11 +57,21 @@ checkout's commands reach: `--instance`, `MURU_INSTANCE`, `instance` in
 
 The run serves on a Unix socket in its own run directory and has no
 port. It holds its detour open for as long as it runs. If the daemon
-restarts, the run opens the detour again as soon as the daemon is back.
+restarts, the run says the detour is closed and opens it again as soon
+as the daemon is back:
+
+```console
+muru: the detour is closed, the daemon ended it: the daemon is stopping; opening it again every 2 seconds while this runs
+muru: detour shop@dev-7f3a is open again
+```
+
+The run's own dashboard is on a free loopback port unless `--dashboard`
+names an address, or `off`.
 
 `detour run` takes the settings of a development run: `--processes`,
 `--threads`, `--single`, `--python`, `--chdir`, `--build`, `--env-file`,
-`--max-body-size`, `--reload` and its patterns, `--toolbar` and the
+`--max-body-size`, `--reload` and its patterns, `--toolbar`,
+`--dashboard` and the
 `[tool.muru.run]` table in `pyproject.toml`, `muru.toml` and
 `muru.local.toml` (see [settings for muructl run](run-settings.md)). The
 keys of that table about the run's own listener are not used by a

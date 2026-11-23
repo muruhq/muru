@@ -49,23 +49,23 @@ The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a muru.toml and i
 | `access_log_exclude` | array of strings |  | Paths left out of the access log. |
 | `access_log_file` | string |  | A file the access log's JSON lines go to in place of the terminal, relative to the project. |
 | `access_log_query` | string | `"keep"` | What the access log keeps of each request's query string: `keep` (the default), `mask` (secret parameters' values as `***`) or `drop` (the path alone). |
-| `compression` | boolean | `true` | Whether responses are compressed; `false` is `--no-compression`. |
+| `compression` | boolean | `true` | Whether responses are compressed; `false` is `--no-compression`. Not used by a detour, whose responses the daemon's edge compresses. |
 | `dashboard` | string | `127.0.0.1:8081`; off under `--allow-public` | The dashboard's address, or `off`. |
 | `data_dir` | string | runs/NAME-HASH/data in the user state directory, never in the project | The application's data directory, shared by every run of the project, a relative one taken from the project; its media and uploads parts are made in it. |
 | `env_file` | string |  | A `.env` file whose variables the run starts with, relative to the project. Its values override `[tool.muru.env]`. None is read unless this names one. |
-| `hosts` | array of strings |  | Names the development certificate covers besides localhost. |
-| `https` | boolean | `false` | Serve HTTPS beside HTTP. |
-| `https_only` | boolean | `false` | Serve HTTPS alone, HTTP redirecting to it. |
-| `https_port` | integer or string | `8443`, or `auto` when `port` is | The HTTPS port, or `auto`. |
-| `port` | integer or string | `8080` | The HTTP port, or `auto`. |
+| `hosts` | array of strings |  | Names the development certificate covers besides localhost. Not used by a detour, which takes the daemon's host names. |
+| `https` | boolean | `false` | Serve HTTPS beside HTTP. Not used by a detour. |
+| `https_only` | boolean | `false` | Serve HTTPS alone, HTTP redirecting to it. Not used by a detour. |
+| `https_port` | integer or string | `8443`, or `auto` when `port` is | The HTTPS port, or `auto`. Not used by a detour. |
+| `port` | integer or string | `8080` | The HTTP port, or `auto`. Not used by a detour. |
 | `reload` | boolean | `true` | Reload on changes. |
 | `reload_dirs` | array of strings |  | Directories watched, relative to the project; the project when empty. |
 | `reload_exclude` | array of strings |  | Patterns that never trigger a reload. |
 | `reload_include` | array of strings |  | Patterns watched besides `**/*.py`. |
 | `slow` | string | `"1s"` | How long a request may take before `errors` shows it. |
 | `timestamps` | boolean | `false` | Whether every line on the terminal carries the full UTC time. |
-| `tls_cert` | string |  | A certificate chain to serve, relative to the project. |
-| `tls_key` | string |  | Its private key, relative to the project. |
+| `tls_cert` | string |  | A certificate chain to serve, relative to the project. Not used by a detour. |
+| `tls_key` | string |  | Its private key, relative to the project. Not used by a detour. |
 | `toolbar` | boolean | `false` | Whether the edge inserts the development toolbar into the run's HTML pages. |
 
 (config-local-tracing)=

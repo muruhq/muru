@@ -742,9 +742,19 @@ enum Tls {
     Hosts(Arc<tls::Resolver>),
 }
 
+/// The address a connection on a Unix socket listener is given for its
+/// peer and its listener: loopback, since only processes on the machine
+/// reach the socket. A detour's run serves the daemon's edge this way,
+/// and trusts it as a development run trusts loopback peers (section
+/// 13.12).
+pub const UNIX_ADDRESS: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+
 /// A bound edge, ready to run.
 pub struct Edge {
     listeners: Vec<(TcpListener, SocketAddr, Option<Tls>)>,
+    /// A Unix socket listener, the one a detour's run serves on.
+    unix: Option<tokio::net::UnixListener>,
     local: SocketAddr,
     shared: Arc<Shared>,
 }
@@ -784,18 +794,37 @@ impl Edge {
             listeners.push((listener, tls));
         }
 
-        Self::with_listeners(config, listeners).await
+        Self::with_listeners(config, listeners, None).await
     }
 
     async fn with_listener(config: Config, http: TcpListener) -> anyhow::Result<Self> {
-        Self::with_listeners(config, vec![(http, None)]).await
+        Self::with_listeners(config, vec![(http, None)], None).await
+    }
+
+    /// Prepare the edge on a Unix socket bound elsewhere and no TCP
+    /// listener: a detour's run, which binds its socket before its
+    /// workers start so the daemon can check it (section 13.12). It takes
+    /// HTTP/1.1 and HTTP/2 by prior knowledge alike, told apart by the
+    /// connection preface, and never TLS.
+    pub async fn bind_unix(
+        config: Config,
+        listener: std::os::unix::net::UnixListener,
+    ) -> anyhow::Result<Self> {
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::UnixListener::from_std(listener)?;
+        Self::with_listeners(config, Vec::new(), Some(listener)).await
     }
 
     async fn with_listeners(
         config: Config,
         mut listeners: Vec<(TcpListener, Option<Tls>)>,
+        unix: Option<tokio::net::UnixListener>,
     ) -> anyhow::Result<Self> {
-        let local = listeners[0].0.local_addr()?;
+        let local = match listeners.first() {
+            Some((listener, _)) => listener.local_addr()?,
+            None => UNIX_ADDRESS,
+        };
+
         let mut redirect_to = None;
 
         // Every listener is bound before the workers are connected, so a
@@ -858,9 +887,18 @@ impl Edge {
             .iter()
             .find(|(_, _, acceptor)| acceptor.is_some())
             .map(|(_, address, _)| address.port());
-        let admission = bound
+
+        // The Unix listener, when there is one, comes after the TCP ones
+        // in the listeners' admission and tuning.
+
+        let addresses: Vec<SocketAddr> = bound
             .iter()
-            .map(|(_, address, _)| {
+            .map(|(_, address, _)| *address)
+            .chain(unix.as_ref().map(|_| UNIX_ADDRESS))
+            .collect();
+        let admission = addresses
+            .iter()
+            .map(|address| {
                 Arc::new(connections::Connections::new(
                     address.to_string(),
                     config.limits.max_connections,
@@ -869,14 +907,14 @@ impl Edge {
             })
             .collect();
 
-        let tuning = bound
+        let tuning = addresses
             .iter()
             .map(|_| RwLock::new(Arc::new(Tuning::new(config.limits.clone()))))
             .collect();
-        let addresses = bound.iter().map(|(_, address, _)| *address).collect();
 
         Ok(Self {
             listeners: bound,
+            unix,
             local,
             shared: Arc::new(Shared {
                 pools,
@@ -1029,13 +1067,29 @@ impl Edge {
             }
         });
 
-        let accepting =
-            self.listeners
-                .into_iter()
-                .enumerate()
-                .map(|(index, (listener, address, acceptor))| {
-                    accept(listener, address, acceptor, Arc::clone(&self.shared), index)
-                });
+        let unix_index = self.listeners.len();
+        let mut accepting: Vec<futures::future::BoxFuture<'static, anyhow::Result<()>>> = self
+            .listeners
+            .into_iter()
+            .enumerate()
+            .map(|(index, (listener, address, acceptor))| {
+                Box::pin(accept(
+                    listener,
+                    address,
+                    acceptor,
+                    Arc::clone(&self.shared),
+                    index,
+                )) as futures::future::BoxFuture<'static, anyhow::Result<()>>
+            })
+            .collect();
+
+        if let Some(listener) = self.unix {
+            accepting.push(Box::pin(accept_unix(
+                listener,
+                Arc::clone(&self.shared),
+                unix_index,
+            )));
+        }
 
         let served = futures::future::try_join_all(accepting).await.map(|_| ());
         sampler.abort();
@@ -1046,8 +1100,8 @@ impl Edge {
 /// A listener's accept loop as a drain sees it: the listener, and a share
 /// of the edge's connection count held until the listener is closed.
 /// Fields drop in order, so the listener closes first.
-struct Accepting {
-    listener: TcpListener,
+struct Accepting<L = TcpListener> {
+    listener: L,
     _token: Arc<()>,
 }
 
@@ -1232,6 +1286,73 @@ async fn accept(
                 });
             }
         }
+    }
+}
+
+/// Accept connections on a Unix socket listener and serve each on its
+/// own task, until the edge drains. The peer is the daemon's edge, a
+/// proxy by construction: it takes a proxy's share of connections and
+/// keep-alive, and HTTP/2 by prior knowledge is always allowed.
+async fn accept_unix(
+    listener: tokio::net::UnixListener,
+    shared: Arc<Shared>,
+    index: usize,
+) -> anyhow::Result<()> {
+    let mut draining = shared.draining.subscribe();
+    let admission = Arc::clone(&shared.admission[index]);
+
+    // As a TCP listener's loop does, this one counts as a connection
+    // while it runs, the listener dropped before the count.
+
+    let accepting = Accepting {
+        listener,
+        _token: Arc::clone(&shared.connections),
+    };
+
+    loop {
+        if *draining.borrow() == Phase::Draining {
+            return Ok(());
+        }
+
+        let stream = tokio::select! {
+            accepted = accepting.listener.accept() => accepted?.0,
+            _ = draining.wait_for(|phase| *phase == Phase::Draining) => return Ok(()),
+        };
+        let accepted = Instant::now();
+        let shared = Arc::clone(&shared);
+
+        let guard = match admission.admit(UNIX_ADDRESS.ip(), true) {
+            connections::Admission::Accept(guard) => guard,
+            _ => {
+                drop(stream);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+
+        let token = Arc::clone(&shared.connections);
+        let tuning = shared.tuning(index);
+
+        tokio::spawn(async move {
+            let connection = Arc::new(development::Connection::new(
+                shared.request_ids.next(),
+                accepted,
+                false,
+            ));
+            serve(
+                stream,
+                UNIX_ADDRESS,
+                UNIX_ADDRESS,
+                None,
+                shared,
+                tuning,
+                token,
+                guard,
+                true,
+                connection,
+            )
+            .await;
+        });
     }
 }
 
@@ -2205,11 +2326,13 @@ async fn serve<I>(
                 match toolbar::insertable(&method, &parts.headers, &response) {
                     Ok(nonce) => {
                         let dashboard = shared.links.request_page(&base_id);
+                        let detour = shared.links.detour();
                         let tag = toolbar::tag(
                             forwarded.prefix.as_deref().unwrap_or(""),
                             &base_id,
                             dashboard.as_deref(),
                             nonce.as_deref(),
+                            detour.as_deref(),
                         );
                         let append = toolbar::said_document(&parts.headers);
                         response = toolbar::insert(response, tag, append);
