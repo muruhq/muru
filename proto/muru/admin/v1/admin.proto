@@ -178,6 +178,70 @@ service Admin {
 
   // Section 9.10: the named conditions and their states (issue 123).
   rpc ListConditions(ListConditionsRequest) returns (ListConditionsResponse);
+
+  // Section 9.13 and 10.12: a detour, a release of kind detour that a
+  // development run holds open for as long as this stream is open. The
+  // first message says what was opened; later ones carry changes; the
+  // release goes when the stream ends from either side.
+  rpc OpenDetour(OpenDetourRequest) returns (stream DetourMessage);
+}
+
+// A development run asking to put itself behind the daemon's edge.
+message OpenDetourRequest {
+  // The application the detour is a release of.
+  string app = 1;
+  // The run's Unix socket, which its edge serves on.
+  string socket = 2;
+  // The run's label, when it has one.
+  string label = 3;
+  // The run's instance ID, whose registry entry the daemon checks.
+  string instance_id = 4;
+  // The run's pid.
+  uint32 pid = 5;
+  // The directory the run serves, its checkout.
+  string directory = 6;
+  // What the detour takes: preview (or empty), all, share=N or class=NAME.
+  string traffic = 7;
+}
+
+// One message on a detour's stream.
+message DetourMessage {
+  oneof what {
+    // The first message: the detour is open.
+    DetourOpened opened = 1;
+    // The detour's traffic changed.
+    Detour changed = 2;
+    // The last message from the daemon, saying why it ends the detour.
+    string closing = 3;
+  }
+}
+
+// What the daemon opened for a run.
+message DetourOpened {
+  Detour detour = 1;
+  // The application's host names, patterns left out, which the run's
+  // toolbar accepts beside loopback names.
+  repeated string hosts = 2;
+  // The application's data directory and its parts on the daemon.
+  string data_dir = 3;
+  string media_dir = 4;
+  string uploads_dir = 5;
+}
+
+// An open detour, as listings show it. Never its secret.
+message Detour {
+  string app = 1;
+  // The release ID, dev- and hexadecimal digits.
+  string release = 2;
+  string label = 3;
+  string instance_id = 4;
+  uint32 pid = 5;
+  string directory = 6;
+  // preview, all, share=N or class=NAME.
+  string traffic = 7;
+  int64 opened_unix_ms = 8;
+  // The run's socket.
+  string socket = 9;
 }
 
 // A probe's question (section 13.9): live, ready or startup, of the
@@ -1076,7 +1140,7 @@ message Release {
   uint64 resource_version = 15;
   repeated Worker workers = 16;     // as its host last reported them; empty when no host runs
   uint64 retained_until_unix_ms = 17; // for a retained release, when it is stopped
-  string kind = 18;                 // workers or http (section 9.9)
+  string kind = 18;                 // workers, http (section 9.9) or detour (section 9.13)
   string profile = 19;              // the server of an http release
   uint32 instances = 20;            // instances of an http release's command
   repeated string command = 21;     // the command of an http release
@@ -1097,6 +1161,7 @@ message Release {
   repeated string instrumentation = 36; // its instrumentation modules, in order (section 6.15)
   repeated GatePassed gates = 37;   // the gates it has passed, in order (section 9.12)
   string traffic = 38;              // its shares of the routes that split traffic, where they differ from what serving implies (issue 759)
+  Detour detour = 39;               // a detour's run and traffic, for kind detour (section 9.13)
 }
 
 // A gate a release passed: a run of a command at a point in its life.

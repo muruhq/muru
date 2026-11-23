@@ -511,6 +511,9 @@ pub struct ReleaseRow {
     /// When it was created, in the full UTC form, shown as the viewer's
     /// local clock.
     pub created: String,
+    /// Whether it is a development detour (section 9.13), which a run
+    /// holds open rather than the daemon running it.
+    pub detour: bool,
 }
 
 /// A virtual host.

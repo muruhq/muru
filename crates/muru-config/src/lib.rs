@@ -1471,6 +1471,13 @@ pub struct Daemon {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub debug_exec: Option<bool>,
+    /// Let `muructl detour run` put a development run behind this
+    /// daemon's edge as a release of an application (section 9.13); off
+    /// unless set, read when the daemon starts, and refused by a system
+    /// daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub detours: Option<bool>,
     /// The node's budget across every application (section 7.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<Budget>,

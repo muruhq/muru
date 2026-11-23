@@ -138,7 +138,8 @@ These are smaller choices the issues left open.
   one application would share it, so a run that opens its detour again
   after a daemon restart keeps its name. `APP@detour` names the
   application's one detour and is refused, listing the candidates, when
-  it has several.
+  it has several. A deploy or an apply refuses a release ID of `detour`
+  or one starting with `dev-`, which are kept for detours.
 
 - **The admin calls.** `OpenDetour` is a server stream: the request
   names the application, the run's socket, its label, its instance ID,

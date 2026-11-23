@@ -1275,6 +1275,7 @@ struct Service {
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send>>;
 type LogStream = Pin<Box<dyn Stream<Item = Result<pb::LogLine, Status>> + Send>>;
 type CommandStream = Pin<Box<dyn Stream<Item = Result<pb::CommandOutput, Status>> + Send>>;
+type DetourStream = Pin<Box<dyn Stream<Item = Result<pb::DetourMessage, Status>> + Send>>;
 
 /// Open a run's access log file again by name, saying so: the writer
 /// thread does it after the lines queued before, which this waits for off
@@ -1387,6 +1388,14 @@ impl Admin for Service {
     type WatchEventsStream = EventStream;
     type TailLogsStream = LogStream;
     type RunCommandStream = CommandStream;
+    type OpenDetourStream = DetourStream;
+
+    async fn open_detour(
+        &self,
+        _: Request<pb::OpenDetourRequest>,
+    ) -> Result<Response<DetourStream>, Status> {
+        Err(self.needs_the_daemon("muructl detour run"))
+    }
 
     async fn list_processes(
         &self,

@@ -885,6 +885,12 @@ pub fn live(registry: &Path) -> Vec<Record> {
         .collect()
 }
 
+/// Whether `id` has an entry in `registry` whose owner holds its lock.
+pub fn entry_is_live(registry: &Path, id: InstanceId) -> bool {
+    let directory = registry.join(id.to_string());
+    directory.join(RECORD).exists() && is_live(&directory)
+}
+
 /// Whether the entry at `directory` has a live owner: its lock cannot be
 /// shared. A lock that cannot be opened counts as live, since only its
 /// owner could say otherwise.

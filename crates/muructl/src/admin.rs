@@ -7948,6 +7948,10 @@ fn finish_removal(answer: &pb::RemoveReleasesResponse, json: bool) -> anyhow::Re
 /// The WORKERS column of `release list`: what runs now, or `-` when
 /// nothing does, and the shape the release asks for in brackets.
 fn workers_column(release: &pb::Release) -> String {
+    if let Some(detour) = &release.detour {
+        return format!("- (detour, pid {})", detour.pid);
+    }
+
     if release.kind == "http" {
         let running = release
             .server_instances
@@ -8023,6 +8027,22 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
             "websockets".to_owned(),
             format!("{} open", release.websockets),
         ));
+    }
+
+    // Section 9.13: a detour is a development run's, which the daemon
+    // only routes to.
+
+    if let Some(detour) = &release.detour {
+        lines.push(("kind".to_owned(), "detour".to_owned()));
+        lines.push(("traffic".to_owned(), detour.traffic.clone()));
+        lines.push(("pid".to_owned(), detour.pid.to_string()));
+
+        if !detour.label.is_empty() {
+            lines.push(("label".to_owned(), detour.label.clone()));
+        }
+
+        lines.push(("socket".to_owned(), detour.socket.clone()));
+        return lines;
     }
 
     if release.kind == "http" {
