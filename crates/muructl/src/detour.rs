@@ -33,6 +33,42 @@ pub enum DetourCommand {
 
     /// Change what a detour takes while it runs: preview, all, share=N or class=NAME.
     Traffic(TrafficArgs),
+
+    /// Open a one-time entry link to a detour's preview in the browser, or print it.
+    Preview(PreviewArgs),
+}
+
+/// `muructl detour preview`.
+#[derive(Args)]
+pub struct PreviewArgs {
+    /// The detour: its release, its application, its label, the tag
+    /// muructl instance list shows or a prefix of its ID (default: the
+    /// project's application, else the one detour open).
+    #[arg(value_name = "DETOUR")]
+    detour: Option<String>,
+
+    /// A link for this host of the application's, in place of its best
+    /// address.
+    #[arg(long, value_name = "HOST", conflicts_with = "list")]
+    host: Option<String>,
+
+    /// Print a link for each of the application's addresses, and open
+    /// none.
+    #[arg(long)]
+    list: bool,
+
+    /// Print the link, and open nothing.
+    #[arg(long)]
+    print: bool,
+
+    /// Print the Muru-Preview header that previews the detour without a
+    /// cookie, for curl or a test client.
+    #[arg(long, conflicts_with_all = ["list", "print", "host"])]
+    header: bool,
+
+    /// Which daemon the detour is open on.
+    #[command(flatten)]
+    socket: SocketArgs,
 }
 
 /// `muructl detour traffic`.
@@ -64,6 +100,11 @@ pub struct DetourRunArgs {
     /// of its clients; or class=NAME, a client class the daemon defines.
     #[arg(long, value_name = "CHOICE", default_value = "preview")]
     traffic: String,
+
+    /// Open an entry link to the detour's preview in the browser once the
+    /// detour is open, for the application's best address.
+    #[arg(long)]
+    open_preview: bool,
 
     /// Give the run the application's data directory on the daemon, which
     /// its releases share, in place of the run's own.
@@ -166,6 +207,8 @@ pub struct Mode {
     pub daemon: PathBuf,
     /// What the detour takes, as the flag gives it.
     pub traffic: String,
+    /// Open an entry link once the detour is open.
+    pub open_preview: bool,
     /// Use the application's data directory on the daemon.
     pub app_data: bool,
     /// The run's label, or empty.
@@ -301,6 +344,7 @@ pub async fn run(args: DetourRunArgs) -> anyhow::Result<()> {
         app,
         daemon,
         traffic: args.traffic.clone(),
+        open_preview: args.open_preview,
         app_data: args.app_data,
         label: args.label.label.clone().unwrap_or_default(),
     };
@@ -363,6 +407,94 @@ pub async fn traffic(args: TrafficArgs) -> anyhow::Result<()> {
         after.release,
         takes(&after.traffic, &after.app)
     );
+    Ok(())
+}
+
+/// Ask the daemon for entry links to a detour's preview.
+async fn mint(
+    client: &mut muru_proto::admin::v1::admin_client::AdminClient<tonic::transport::Channel>,
+    detour: &pb::Detour,
+    host: Option<&str>,
+    all: bool,
+) -> anyhow::Result<pb::DetourPreview> {
+    Ok(client
+        .preview_detour(pb::PreviewDetourRequest {
+            app: detour.app.clone(),
+            release: detour.release.clone(),
+            host: host.unwrap_or_default().to_owned(),
+            all,
+        })
+        .await
+        .map_err(crate::admin::explain)?
+        .into_inner())
+}
+
+/// Open an entry link in the browser, saying where it leads and how
+/// many other addresses there are.
+fn open_link(preview: &pb::DetourPreview, detour: &str) {
+    let Some(link) = preview.links.first() else {
+        return;
+    };
+
+    let others = match preview.others {
+        0 => String::new(),
+        1 => " (1 other address: muructl detour preview --list)".to_owned(),
+        count => format!(" ({count} other addresses: muructl detour preview --list)"),
+    };
+
+    muru_common::muru_println!("opened {} in preview of {detour}{others}", link.address);
+    let url = link.url.clone();
+    std::thread::spawn(move || crate::browser::open(&url));
+}
+
+/// Run `muructl detour preview`.
+pub async fn preview(args: PreviewArgs) -> anyhow::Result<()> {
+    let mut client = muru_controller::client::connect(&args.socket.endpoint()?).await?;
+    let detours = listed(&mut client).await?;
+    let detour = chosen(args.detour.as_deref(), &detours)?.clone();
+    let name = format!("{}@{}", detour.app, detour.release);
+    let preview = mint(&mut client, &detour, args.host.as_deref(), args.list).await?;
+
+    if args.header {
+        println!("Muru-Preview: {}", preview.header);
+        return Ok(());
+    }
+
+    if args.list {
+        for link in &preview.links {
+            println!("{}  {}", link.url, link.address);
+        }
+
+        return Ok(());
+    }
+
+    if args.print {
+        if let Some(link) = preview.links.first() {
+            println!("{}", link.url);
+        }
+
+        return Ok(());
+    }
+
+    open_link(&preview, &name);
+
+    // The browser is given a moment to start before muructl exits.
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    Ok(())
+}
+
+/// `--open-preview`: an entry link for the detour just opened, in the
+/// browser.
+pub async fn open_preview(daemon: &Path, opened: &pb::DetourOpened) -> anyhow::Result<()> {
+    let Some(detour) = &opened.detour else {
+        return Ok(());
+    };
+
+    let mut client =
+        muru_controller::client::connect(&muru_controller::client::Endpoint::unix(daemon)).await?;
+    let preview = mint(&mut client, detour, None, false).await?;
+    open_link(&preview, &name(opened));
     Ok(())
 }
 

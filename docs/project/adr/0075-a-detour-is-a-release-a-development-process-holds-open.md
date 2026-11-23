@@ -171,10 +171,13 @@ These are smaller choices the issues left open.
   does not include. Entry tokens are 128 random bits, valid for a
   minute and used once; the daemon sends each edge the token's SHA-256,
   its expiry, the release and the path to redirect to, and the edge
-  keeps no token itself. A used, expired or unknown token is a 404 page
-  saying so, and the access log writes the token's path as
-  `/_muru/preview/…`. The cookie is a session cookie, `HttpOnly`,
-  `SameSite=Lax`, `Path=/`, `Secure` on HTTPS and without a `Domain`.
+  keeps no token itself, at most 1024 of them. A used, expired or
+  unknown token is a 404 page saying so. The preview paths are answered
+  before routing and recorded nowhere, so a token never reaches the
+  access log. The cookie is a session cookie, `HttpOnly`,
+  `SameSite=Lax`, `Path=/`, `Secure` on HTTPS and without a `Domain`; a
+  cookie of the detour form that names no open detour is expired by the
+  response it gets.
 
 - **The run.** The socket is bound before the host starts, so the
   daemon can check it when the detour opens, and connections wait in its

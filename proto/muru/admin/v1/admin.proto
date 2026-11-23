@@ -188,6 +188,27 @@ service Admin {
   rpc ListDetours(ListDetoursRequest) returns (ListDetoursResponse);
   // Change what a detour takes: preview, all, share=N or class=NAME.
   rpc SetDetourTraffic(SetDetourTrafficRequest) returns (Detour);
+  // One-time entry links to a detour's preview, valid for a minute, and
+  // the Muru-Preview header value.
+  rpc PreviewDetour(PreviewDetourRequest) returns (DetourPreview);
+}
+
+message PreviewDetourRequest {
+  string app = 1;
+  string release = 2;
+  string host = 3;                  // a link for this host alone; the best address when empty
+  bool all = 4;                     // a link for each of the application's addresses
+}
+
+message DetourPreview {
+  repeated DetourLink links = 1;    // best first
+  string header = 2;                // the Muru-Preview header's value, RELEASE.SECRET
+  uint32 others = 3;                // the application's addresses no link was made for
+}
+
+message DetourLink {
+  string url = 1;                   // the entry link
+  string address = 2;               // where it leads
 }
 
 message ListDetoursRequest {}

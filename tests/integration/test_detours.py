@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -43,7 +44,9 @@ statuses = [500]
 class Detour:
     """A `muructl detour run` of a project against a daemon."""
 
-    def __init__(self, project: Path, daemon: Daemon, *arguments: str) -> None:
+    def __init__(
+        self, project: Path, daemon: Daemon, *arguments: str, env: dict[str, str] | None = None
+    ) -> None:
         muructl = support.muructl_path()
         assert muructl is not None
         self.log_path = project.parent / "detour.out"
@@ -65,6 +68,7 @@ class Detour:
             cwd=project,
             stdout=self.handle,
             stderr=subprocess.STDOUT,
+            env={**os.environ, **(env or {})},
         )
         self.wait_for_log("admin socket")
 
@@ -167,16 +171,52 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         before = served(daemon)
         assert not before["instance"].startswith("detour:")
 
-        detour = Detour(project, daemon)
+        # --open-preview gives the browser an entry link as the detour
+        # opens, which $BROWSER names here.
+
+        opened = tmp_path / "opened"
+        launcher = tmp_path / "browser"
+        launcher.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{opened}'\n")
+        launcher.chmod(0o755)
+        detour = Detour(project, daemon, "--open-preview", env={"BROWSER": str(launcher)})
+        detour.wait_for_log("in preview of")
+        deadline = time.monotonic() + 20
+
+        while not opened.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        first = urllib.parse.urlsplit(opened.read_text().split()[0])
+        assert first.path.startswith("/_muru/preview/")
+        assert daemon.request(first.path).status == 303
         found = detour_release(daemon)
         assert found is not None, daemon.muructl("release", "list").stdout
         release = found["id"]
         assert release.startswith("dev-")
-        preview = {"Muru-Preview": release}
 
-        # Opening a detour changes nothing for other clients.
+        # Opening a detour changes nothing for other clients, and its name
+        # alone does not reach it: a preview carries its secret.
 
         assert not served(daemon)["instance"].startswith("detour:")
+        assert not served(daemon, **{"Muru-Preview": release})["instance"].startswith("detour:")
+        header = daemon.muructl("detour", "preview", "--header", cwd=project).stdout.strip()
+        name, value = header.split(": ", 1)
+        assert name == "Muru-Preview" and value.startswith(f"{release}.")
+        preview = {"Muru-Preview": value}
+
+        # A one-time entry link sets the preview cookie and leads to the
+        # application, once.
+
+        link = daemon.muructl("detour", "preview", "--print", cwd=project).stdout.strip()
+        entry = urllib.parse.urlsplit(link).path
+        assert entry.startswith("/_muru/preview/")
+        entered = daemon.request(entry)
+        assert entered.status == 303 and entered.header("location") == "/"
+        cookie = (entered.header("set-cookie") or "").split(";")[0]
+        assert cookie == f"muru_preview={value}"
+        assert served(daemon, Cookie=cookie)["instance"].startswith("detour:")
+        assert daemon.request(entry).status == 404
+        left = daemon.request("/_muru/preview/leave")
+        assert left.status == 303 and "Max-Age=0" in (left.header("set-cookie") or "")
 
         # A preview reaches the run, which takes the daemon's request ID
         # and forwarding headers, and sends its own development headers.
@@ -219,7 +259,7 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
 
             with grpc.insecure_channel(f"127.0.0.1:{daemon.port}") as channel:
                 reply = rpc.GreeterStub(channel).SayHello(
-                    pb.Hello(name="Ada"), metadata=(("muru-preview", release),), timeout=10
+                    pb.Hello(name="Ada"), metadata=(("muru-preview", value),), timeout=10
                 )
 
             assert reply.message == f"{seen['instance']} Ada"
@@ -248,6 +288,12 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         detour.stop()
         assert detour_release(daemon) is None
         assert not served(daemon, **preview)["instance"].startswith("detour:")
+
+        # Its cookie reaches nothing now, and the response lets it go.
+
+        stale = served(daemon, Cookie=cookie)
+        assert not stale["instance"].startswith("detour:")
+        assert "Max-Age=0" in stale["headers"].get("set-cookie", "")
         events = daemon.events()
         assert "detour.opened" in events and "detour.closed" in events
     finally:

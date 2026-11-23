@@ -407,6 +407,17 @@ impl EdgeProcess {
             .collect())
     }
 
+    /// Give the edge entry tokens to detours' previews (section 4.21), by
+    /// their hashes.
+    pub async fn add_preview_tokens(&self, tokens: Vec<pb::PreviewToken>) -> anyhow::Result<()> {
+        let mut client = connect(&self.spec.control).await?;
+        client
+            .add_preview_tokens(pb::PreviewTokens { tokens })
+            .await
+            .map_err(|status| anyhow::anyhow!("the edge did not answer: {}", status.message()))?;
+        Ok(())
+    }
+
     /// Respawn the edge if it has exited, with the same listener and the
     /// last snapshot. Returns whether it had to.
     pub async fn check(&mut self) -> anyhow::Result<Option<pb::Applied>> {

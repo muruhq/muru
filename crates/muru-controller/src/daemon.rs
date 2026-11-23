@@ -719,6 +719,13 @@ pub enum Command {
         /// Answered with the detour as it is now, or why not.
         done: oneshot::Sender<Result<muru_proto::admin::v1::Detour, String>>,
     },
+    /// Section 4.21: mint entry links to a detour's preview.
+    PreviewDetour {
+        /// Which detour, and which of its application's addresses.
+        request: muru_proto::admin::v1::PreviewDetourRequest,
+        /// Answered with the links, or why not.
+        done: oneshot::Sender<Result<muru_proto::admin::v1::DetourPreview, String>>,
+    },
     /// Section 9.13: a detour's stream ended, from its run's side or the
     /// daemon's.
     CloseDetour {
@@ -6644,6 +6651,9 @@ impl Daemon {
             } => {
                 let _ = done.send(self.set_detour_traffic(&app, &release, traffic).await);
             }
+            Command::PreviewDetour { request, done } => {
+                let _ = done.send(self.preview_detour(request).await);
+            }
             Command::CloseDetour { serial, reason } => {
                 self.close_detour(serial, &reason).await;
             }
@@ -8440,6 +8450,7 @@ impl Daemon {
                 };
 
                 apps.push(pb::AppWorkers {
+                    preview_secret: String::new(),
                     limits: spec.as_ref().and_then(|spec| spec.limits.message()),
                     app: name.clone(),
                     release: id.clone(),
@@ -8784,6 +8795,7 @@ impl Daemon {
                 .iter()
                 .map(muru_edge::access::Override::to_message)
                 .collect(),
+            detours: self.detours_enabled && self.locations.mode != crate::locations::Mode::System,
         }
     }
 

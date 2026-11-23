@@ -1282,6 +1282,7 @@ fn main() -> anyhow::Result<()> {
         Command::Detour { command } => match command {
             detour::DetourCommand::Run(args) => runtime.block_on(detour::run(*args)),
             detour::DetourCommand::Traffic(args) => runtime.block_on(detour::traffic(args)),
+            detour::DetourCommand::Preview(args) => runtime.block_on(detour::preview(args)),
         },
         Command::Serve(args) => runtime.block_on(serve::serve(*args)),
         Command::Probe(args) => serve::probe(args),
@@ -5106,6 +5107,16 @@ async fn run_with(
             }
             Err(error) => muru_common::muru_println!("no admin socket: {error:#}"),
         }
+    }
+
+    // Section 13.12: --open-preview opens an entry link once the detour
+    // is open; the edge takes it once it runs, below.
+
+    if let (Some(mode), Some((_, opened, _))) = (&detour, &detour_held)
+        && mode.open_preview
+        && let Err(error) = detour::open_preview(&mode.daemon, opened).await
+    {
+        muru_common::muru_println!("no preview link: {error:#}");
     }
 
     // Issue 815: the browser opens on the run's own URL once, now that it

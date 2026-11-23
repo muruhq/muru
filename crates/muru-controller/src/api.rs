@@ -2202,6 +2202,27 @@ impl Admin for Service {
         Ok(Response::new(detour))
     }
 
+    async fn preview_detour(
+        &self,
+        request: Request<pb::PreviewDetourRequest>,
+    ) -> Result<Response<pb::DetourPreview>, Status> {
+        let request = request.into_inner();
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::PreviewDetour {
+                request,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let preview = done_rx
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(preview))
+    }
+
     async fn list_overlays(
         &self,
         _: Request<pb::ListOverlaysRequest>,

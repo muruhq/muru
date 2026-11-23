@@ -20,6 +20,9 @@ pub const ALIAS: &str = "detour";
 /// The source an overlay a detour owns is listed with (section 9.10).
 pub const OVERLAY_SOURCE: &str = "detour";
 
+/// How long an entry link to a detour's preview lasts (section 4.21).
+pub const ENTRY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// How many hexadecimal digits of the run's instance ID a release ID
 /// takes at first.
 const SHORT_DIGITS: usize = 4;

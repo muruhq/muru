@@ -47,6 +47,7 @@ pub mod link;
 pub mod metrics;
 pub mod occasions;
 pub mod panels;
+pub mod preview;
 pub mod proxy;
 pub mod ratelimit;
 pub mod recorder;
@@ -511,9 +512,17 @@ pub struct Pools {
     compression: compression::Compression,
     /// The trusted proxies a development run keeps across replacements.
     trust: proxy::Trust,
+    /// Section 4.21: the entry tokens to detours' previews, which outlast
+    /// any one snapshot.
+    previews: preview::Tokens,
 }
 
 impl Pools {
+    /// The entry tokens to detours' previews, which the daemon adds to.
+    pub fn previews(&self) -> &preview::Tokens {
+        &self.previews
+    }
+
     /// The tables for a request arriving now.
     pub fn current(&self) -> Arc<routing::Routing> {
         Arc::clone(&self.current.read().expect("pools poisoned"))
@@ -873,6 +882,7 @@ impl Edge {
             )),
             compression: config.compression.clone(),
             trust: config.trust.clone(),
+            previews: preview::Tokens::default(),
         });
         let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
 
@@ -1526,6 +1536,21 @@ async fn serve<I>(
             };
 
             let secure = tls.is_some() || scheme == "https";
+
+            // Section 4.21: while the daemon takes detours, the preview
+            // paths are the edge's, on every host, before routing; they
+            // are not recorded, so a token never reaches a log.
+
+            if routing.takes_detours() && preview::reserved(parts.uri.path()) {
+                return Ok(preview::answer(
+                    &parts.method,
+                    parts.uri.path(),
+                    shared.pools.previews(),
+                    secure,
+                    |app, release| routing.detour_secret(app, release),
+                ));
+            }
+
             let redirect_to = redirect_to.filter(|_| !secure);
             let client = forwarded.client.unwrap_or(peer);
             let proxy = forwarded.client.map(|_| peer);
