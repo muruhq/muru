@@ -235,10 +235,12 @@ pub fn is_empty(dir: &Path) -> bool {
 /// A command's places when it runs on its own, through no run or serve
 /// (section 9.12): serve's variables, `MURU_SERVE_DATA_DIR` and the
 /// rest, when they name a data directory or a static directory, else
-/// where a development run of the project keeps them.
+/// where a development run of the project keeps them, with the data
+/// directory its run table names, `data_dir` (issue 859).
 pub fn for_command(
     project: &Path,
     name: &str,
+    data_dir: Option<&Path>,
     read: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<Places> {
     let serve = ServeDirs {
@@ -247,7 +249,7 @@ pub fn for_command(
         uploads: read("MURU_SERVE_UPLOADS_DIR"),
         static_dir: read("MURU_SERVE_STATIC_DIR"),
     };
-    let run = for_run(project, name, None);
+    let run = for_run(project, name, data_dir);
     let named = for_serve(project, &serve)?;
 
     Ok(Places {
@@ -389,9 +391,21 @@ mod tests {
     fn a_command_on_its_own_uses_the_runs_places_unless_serves_variables_name_others() {
         let project = tempfile::tempdir().unwrap();
         let run = for_run(project.path(), "shop", None);
-        assert_eq!(for_command(project.path(), "shop", |_| None).unwrap(), run);
+        assert_eq!(
+            for_command(project.path(), "shop", None, |_| None).unwrap(),
+            run
+        );
 
-        let named = for_command(project.path(), "shop", |name| {
+        // Issue 859: the run table's data directory, as the run takes it.
+
+        let moved = for_command(project.path(), "shop", Some(Path::new("data")), |_| None).unwrap();
+        assert_eq!(
+            moved,
+            for_run(project.path(), "shop", Some(Path::new("data")))
+        );
+        assert_eq!(moved.data.unwrap().data, project.path().join("data"));
+
+        let named = for_command(project.path(), "shop", Some(Path::new("data")), |name| {
             (name == "MURU_SERVE_DATA_DIR").then(|| "/data".to_owned())
         })
         .unwrap();

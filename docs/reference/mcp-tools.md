@@ -8,6 +8,12 @@ makes the tool return its error's sentence as a tool error. `--read-only`
 leaves out every tool that changes something, and `--allow` keeps only the
 ones it names.
 
+Every tool except `docs`, `skill_status` and `instances` also takes an
+`instance` argument, any value `--instance` takes (see [reaching an
+instance](../howto/instances.md#reaching-an-instance)), which reaches that
+instance for the one call in place of the server's own. The table leaves
+it out.
+
 | Tool | Kind | Runs | Arguments |
 | --- | --- | --- | --- |
 | `status` | reads | `muructl status` | none |

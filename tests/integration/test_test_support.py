@@ -23,7 +23,7 @@ def test_a_labelled_leftover_is_found_and_stopped() -> None:
         env={
             **os.environ,
             "MURU_INSTANCE_ID": uuid.uuid4().hex,
-            "MURU_INSTANCE": "gone",
+            "MURU_INSTANCE_TAG": "gone",
             instances.LABEL_VARIABLE: label,
         },
     )

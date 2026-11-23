@@ -26,9 +26,9 @@ application runs:
 | How the application runs | `MURU_DATA_DIR` | `MURU_STATIC_DIR` |
 | --- | --- | --- |
 | The daemon | `STATE/data/APP`, or the application's `data_dir` | `STATE/static/APP/RELEASE` |
-| `muructl run` | `runs/NAME-HASH/data` in the user state directory, or `--data-dir` | `runs/NAME-HASH/static` in the user state directory |
+| `muructl run` | `runs/NAME-HASH/data` in the user state directory, or `--data-dir`, or the run table's or `muru.local.toml`'s `data_dir` | `runs/NAME-HASH/static` in the user state directory |
 | `muructl serve` | `--data-dir`, `MURU_SERVE_DATA_DIR` or the serve table's `data_dir`; none otherwise | `staticfiles` in the project, or `--static-dir` |
-| `muructl command run` and `muructl exec` with no application | `MURU_SERVE_DATA_DIR`, else as `muructl run` | `MURU_SERVE_STATIC_DIR`, else as `muructl run` |
+| `muructl command run` and `muructl exec` with no application | `MURU_SERVE_DATA_DIR`, else as `muructl run` without `--data-dir` | `MURU_SERVE_STATIC_DIR`, else as `muructl run` |
 
 `MURU_MEDIA_DIR` and `MURU_UPLOADS_DIR` are `media` and `uploads` in the
 data directory unless the daemon's `media_dir` and `uploads_dir`, or

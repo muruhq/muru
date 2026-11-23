@@ -331,12 +331,12 @@
   };
 
   // A link inside a panel to a record's panel, as the panels write it
-  // under /_muru/ whatever prefix a proxy serves the run under: the shown
+  // under /_muru/toolbar/ whatever prefix a proxy serves the run under: the shown
   // record's reloads in place, for sorting and paging, and another's
   // opens that record, as a capture's links to the other requests it
   // reached do. Any other link goes where it says.
 
-  const PANEL_LINK = /\/_muru\/requests\/([^/]+)\/panels\/([^/]+)\.html$/;
+  const PANEL_LINK = /\/_muru\/toolbar\/requests\/([^/]+)\/panels\/([^/]+)\.html$/;
 
   content.addEventListener("click", (event) => {
     const link = event.target.closest && event.target.closest("a[href]");

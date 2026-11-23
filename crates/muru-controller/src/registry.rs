@@ -336,6 +336,46 @@ impl Record {
         let port: u16 = listener.configured.rsplit(':').next()?.parse().ok()?;
         (port != 0).then_some(port)
     }
+
+    /// The instance, as a sentence names it: `the development run of shop
+    /// in ~/src/shop (pid 4123, dashboard http://127.0.0.1:8001/)`, or
+    /// `daemon instance dev (pid 5120)`.
+    pub fn describe(&self) -> String {
+        let dashboard = match (self.kind, self.dashboard.as_deref()) {
+            (Kind::Run, Some(dashboard)) => format!(", dashboard {dashboard}"),
+            _ => String::new(),
+        };
+
+        format!("{} (pid {}{dashboard})", self.summary(), self.pid)
+    }
+
+    /// The instance as [`Record::describe`] names it, without what only a
+    /// running instance has: `the development run of shop in ~/src/shop`,
+    /// for an instance that is no longer running.
+    pub fn summary(&self) -> String {
+        let app = self.app.as_deref().unwrap_or("an application");
+
+        match self.kind {
+            Kind::Run => {
+                let project = self
+                    .project
+                    .as_deref()
+                    .map(|project| format!(" in {}", home_shortened(project)))
+                    .unwrap_or_default();
+                format!("the development run of {app}{project}")
+            }
+            Kind::Serve => format!("muructl serve of {app}"),
+            Kind::Daemon => match &self.name {
+                Some(name) => format!("daemon instance {name}"),
+                None => format!(
+                    "the daemon with the state directory {}",
+                    self.state_dir
+                        .as_deref()
+                        .map_or_else(|| self.run_dir.display().to_string(), home_shortened)
+                ),
+            },
+        }
+    }
 }
 
 /// A live instance that holds an address, as a bind that failed names
@@ -349,45 +389,10 @@ pub struct Holder {
 }
 
 impl Holder {
-    /// The instance, as a sentence names it: `the development run of shop
-    /// in ~/src/shop (pid 4123, dashboard http://127.0.0.1:8001/)`, or
-    /// `daemon instance dev (pid 5120)`.
+    /// The instance, as a sentence names it: what [`Record::describe`]
+    /// says.
     pub fn describe(&self) -> String {
-        let record = &self.record;
-        let pid = record.pid;
-
-        match record.kind {
-            Kind::Run => {
-                let project = record
-                    .project
-                    .as_deref()
-                    .map(|project| format!(" in {}", home_shortened(project)))
-                    .unwrap_or_default();
-                let dashboard = record
-                    .dashboard
-                    .as_deref()
-                    .map(|dashboard| format!(", dashboard {dashboard}"))
-                    .unwrap_or_default();
-                format!(
-                    "the development run of {}{project} (pid {pid}{dashboard})",
-                    record.app.as_deref().unwrap_or("an application")
-                )
-            }
-            Kind::Serve => format!(
-                "muructl serve of {} (pid {pid})",
-                record.app.as_deref().unwrap_or("an application")
-            ),
-            Kind::Daemon => match &record.name {
-                Some(name) => format!("daemon instance {name} (pid {pid})"),
-                None => format!(
-                    "the daemon with the state directory {} (pid {pid})",
-                    record
-                        .state_dir
-                        .as_deref()
-                        .map_or_else(|| record.run_dir.display().to_string(), home_shortened)
-                ),
-            },
-        }
+        self.record.describe()
     }
 
     /// How to stop it: `stop it`, or for a daemon the command that does.
@@ -933,6 +938,26 @@ pub fn remove_stale(registry: &Path, id: InstanceId) -> std::io::Result<bool> {
 mod tests {
     use super::*;
 
+    /// Whether the entry of `id` reads as stale within the moment a
+    /// takeover or a prune waits (see [`LOCK_TRIES`]). Its lock can be
+    /// held for an instant after its owner let it go, by a process another
+    /// test forked before it ran its program (issue 818), so a single read
+    /// is not enough.
+    fn stale_soon(registry: &Path, id: InstanceId) -> bool {
+        for _ in 0..LOCK_TRIES {
+            if read(registry)
+                .iter()
+                .any(|found| found.record.id == id && !found.live)
+            {
+                return true;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        false
+    }
+
     fn record(kind: Kind, port: u16) -> Record {
         let mut record = Record::new(
             InstanceId::generate(),
@@ -1054,9 +1079,8 @@ mod tests {
 
         entry.keep();
         drop(entry);
-        let found = read(&registry);
-        assert_eq!(found.len(), 1);
-        assert!(!found[0].live);
+        assert_eq!(read(&registry).len(), 1);
+        assert!(stale_soon(&registry, id));
 
         // The daemon started again takes its own entry over.
 
@@ -1171,7 +1195,7 @@ mod tests {
         }
 
         for found in read(&registry) {
-            assert!(!found.live);
+            assert!(stale_soon(&registry, found.record.id));
             assert!(remove_stale(&registry, found.record.id).expect("pruned"));
         }
 

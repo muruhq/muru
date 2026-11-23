@@ -827,7 +827,7 @@ $ ps -o pid,command -U "$USER" | grep 'muru '
 When a title is too long for the room it has, the words before the
 instance are cut first. Every process the daemon, a run or a serve
 starts, and every process those start in turn, has `MURU_INSTANCE_ID`,
-the instance's full ID, and `MURU_INSTANCE`, its name as the titles show
+the instance's full ID, and `MURU_INSTANCE_TAG`, its name as the titles show
 it, in its environment, which is what ties a subprocess a worker started,
 with no title of Muru's, to its instance.
 
@@ -924,20 +924,23 @@ daemon through its admin socket: `--socket` or `MURU_SOCKET`, else a
 development run whose project is the current directory, else one started
 from the current directory, else the daemon's socket in the runtime
 directory, else the one development run listening; with several runs and
-no daemon the command names them, so one can be chosen with `--socket`.
-`muructl status` says which was found. When the daemon answers while a
-development run is listening, the command says so on standard error and
-names the run, its project directory and its socket:
+no daemon the command lists them, each with the `--instance` value that
+chooses it. `muructl status` says which was found. When the daemon
+answers while a development run is listening, the command says so on
+standard error, with how to reach the run:
 
 ```console
 $ muructl logs --access --lines 1
-muru: using the daemon; the development run of shop on http://127.0.0.1:8080 is also listening: run the command from /home/me/shop, or pass --socket /run/user/1000/muru/run-7f3a9c2e/admin.sock, to reach it
+muru: using the daemon; the development run of shop on http://127.0.0.1:8080 is also listening: --instance run:8080, or the command run from /home/me/shop, reaches it
 ```
 
-With several development runs of one project, the newest is reached,
-and the command names the others and their sockets on standard error.
-`muructl run` prints the directories its commands are reached from when
-it starts, and any other run of the same project already listening. A run
+With several runs listening it says how many, and `muructl instance
+list` names them with what to pass to `--instance` for each. With
+several development runs of one project, the newest is reached, and the
+command gives the `--instance` value of each other one on standard
+error. `muructl run` prints the directories its commands are reached
+from when it starts, and any other run of the same project already
+listening. A run
 directory you may not enter is passed over like one that is not there;
 when nothing else is found, the command says permission was denied on
 its socket.

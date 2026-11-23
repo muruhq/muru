@@ -577,6 +577,9 @@ struct RunArgs {
     #[arg(long, value_name = "NAME")]
     name: Option<String>,
 
+    #[command(flatten)]
+    label: instances::LabelArgs,
+
     /// The interface the entrypoint speaks: auto (detected from the
     /// callable), wsgi, asgi, or grpc for a function that registers gRPC
     /// services.
@@ -1099,6 +1102,21 @@ fn running(command: &Command) -> admin::Running {
     }
 }
 
+/// The label a command that starts an instance was given with --label.
+fn label_of(command: &Command) -> Option<&str> {
+    let label = match command {
+        Command::Run(args) => &args.label,
+        Command::Serve(args) => &args.label,
+        Command::Up(args)
+        | Command::Daemon {
+            command: admin::DaemonCommand::Run(args) | admin::DaemonCommand::Start(args),
+        } => &args.label,
+        _ => return None,
+    };
+
+    label.label.as_deref()
+}
+
 /// What muructl logs when MURU_LOG does not say: its own lines and
 /// every crate's warnings, the MCP library's chatter left out.
 const DEFAULT_LOG: &str = "info,rmcp=warn";
@@ -1180,6 +1198,18 @@ fn main() -> anyhow::Result<()> {
         unsafe {
             std::env::set_var("UV_OFFLINE", "1");
             std::env::set_var("UV_PYTHON_DOWNLOADS", "never");
+        }
+    }
+
+    // Issue 868: --label is the label MURU_INSTANCE_LABEL gives, set where
+    // the instance's record and every process it starts read it, a
+    // daemon started in the background included.
+
+    if let Some(label) = label_of(&cli.command) {
+        // SAFETY: no other thread exists yet, as above.
+
+        unsafe {
+            std::env::set_var(muru_controller::registry::LABEL_VARIABLE, label);
         }
     }
 
@@ -4580,7 +4610,7 @@ async fn run_with(
             edge.links().set_toolbar();
             muru_common::muru_println!(
                 "toolbar on: the edge inserts it into HTML pages, with each request's record \
-                 under /_muru/"
+                 under /_muru/toolbar/"
             );
         }
     }
@@ -4888,14 +4918,16 @@ async fn run_with(
                     // so the runs of it already listening are named, with
                     // how to reach them.
 
+                    let records = admin::running_instances();
+
                     for other in run_admin::runs(&runtime).iter().filter(|other| {
                         other.project == project && other.socket != registration.socket
                     }) {
                         muru_common::muru_println!(
-                            "another development run of this project is listening, {} on http://{}; --socket {} reaches it",
+                            "another development run of this project is listening, {} on http://{}; {} reaches it",
                             other.app,
                             other.listen,
-                            other.socket.display()
+                            admin::reach_run(&other.socket, &records)
                         );
                     }
                 }

@@ -107,9 +107,9 @@ const ATTRIBUTES: &[(&str, &[&str])] = &[
     ("progress", &["value", "max", "title"]),
 ];
 
-/// The prefix the edge answers in a development run (section 4.20),
-/// which a panel's links may name.
-pub const RESERVED_PREFIX: &str = "/_muru/";
+/// The toolbar's paths, under the prefix the edge answers in a
+/// development run (section 4.20), which a panel's links may name.
+pub const TOOLBAR_PREFIX: &str = crate::toolbar::TOOLBAR;
 
 /// Draws panels from their templates and sanitises what they produce.
 pub struct Renderer {
@@ -125,7 +125,7 @@ impl std::fmt::Debug for Renderer {
 }
 
 impl Renderer {
-    /// A renderer whose panels may link to `/_muru/` paths and, when it
+    /// A renderer whose panels may link to `/_muru/toolbar/` paths and, when it
     /// is named, under the dashboard's address.
     pub fn new(dashboard: Option<&str>) -> Self {
         let mut templates = Environment::new();
@@ -228,7 +228,7 @@ fn sanitiser(dashboard: Option<&str>, markdown: bool) -> ammonia::Builder<'stati
     let dashboard = dashboard.map(str::to_owned);
     sanitiser.attribute_filter(move |element, attribute, value| {
         if element == "a" && attribute == "href" {
-            let allowed = value.starts_with(RESERVED_PREFIX)
+            let allowed = value.starts_with(TOOLBAR_PREFIX)
                 || dashboard
                     .as_deref()
                     .is_some_and(|dashboard| value.starts_with(dashboard))
@@ -1683,7 +1683,7 @@ mod tests {
         );
         assert!(
             html.contains(
-                "<a href=\"/_muru/requests/B%202/panels/errors.html\" rel=\"noopener\">B 2</a>"
+                "<a href=\"/_muru/toolbar/requests/B%202/panels/errors.html\" rel=\"noopener\">B 2</a>"
             ),
             "{html}"
         );
@@ -1746,7 +1746,7 @@ mod tests {
             "<table onclick=\"x()\" class=\"values\"><tr><td style=\"color:red\">a</td></tr></table>\
              <script>alert(1)</script><img src=\"x\"><abbr title=\"t\">ab</abbr>\
              <meter value=\"1\" min=\"0\" max=\"2\"></meter><iframe></iframe>\
-             <a href=\"/_muru/requests/A1.json\">ok</a><a href=\"https://example.com/\">no</a>\
+             <a href=\"/_muru/toolbar/requests/A1.json\">ok</a><a href=\"https://example.com/\">no</a>\
              <a href=\"http://127.0.0.1:8081/request/A1\">dashboard</a>\
              <a href=\"javascript:alert(1)\">bad</a>",
         );
@@ -1761,7 +1761,10 @@ mod tests {
             html.contains("<meter value=\"1\" min=\"0\" max=\"2\">"),
             "{html}"
         );
-        assert!(html.contains("href=\"/_muru/requests/A1.json\""), "{html}");
+        assert!(
+            html.contains("href=\"/_muru/toolbar/requests/A1.json\""),
+            "{html}"
+        );
         assert!(
             html.contains("href=\"http://127.0.0.1:8081/request/A1\""),
             "{html}"
@@ -1953,7 +1956,7 @@ mod tests {
             text:
                 "# Queries\n\n| statement | times |\n|---|---:|\n| SELECT 1 | 7 |\n\n\
                    > ~~slow~~ quoted\n\n## Detail\n\n**3** ran. See [the guide](https://example.com/guide) \
-                   or [a record](/_muru/requests/A1.json).\n\n<script>alert(1)</script>\n\n\
+                   or [a record](/_muru/toolbar/requests/A1.json).\n\n<script>alert(1)</script>\n\n\
                    [bad](javascript:alert(1))"
                     .to_owned(),
             markdown: true,
@@ -1981,7 +1984,7 @@ mod tests {
             "{markdown}"
         );
         assert!(
-            markdown.contains("href=\"/_muru/requests/A1.json\""),
+            markdown.contains("href=\"/_muru/toolbar/requests/A1.json\""),
             "{markdown}"
         );
         assert!(

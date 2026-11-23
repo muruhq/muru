@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -96,7 +97,7 @@ def test_the_list_shows_each_instance_its_state_and_what_is_left_behind(
             env={
                 **os.environ,
                 "MURU_INSTANCE_ID": uuid.uuid4().hex,
-                "MURU_INSTANCE": "gone",
+                "MURU_INSTANCE_TAG": "gone",
                 "MURU_INSTANCE_LABEL": label,
             },
         )
@@ -243,6 +244,14 @@ def test_prune_removes_what_is_stale_and_stops_a_detached_daemon_only_when_asked
 
         wait_for(lambda: states() == {"daemon": "detached", "run": "stale"}, timeout=20)
         assert daemon.get("/").status == 200
+
+        # Issue 868: selecting either says why it cannot be reached.
+
+        tags = {row["kind"]: row["tag"] for row in listed(label)["instances"]}
+        stale = muructl("status", "--instance", tags["run"], check=False).stderr
+        assert "which is not running: its entry was left behind" in stale, stale
+        detached = muructl("status", "--instance", tags["daemon"], check=False).stderr
+        assert "which is not running: its daemon has gone" in detached, detached
 
         pruned = json.loads(
             muructl("instance", "prune", "--label", label, "--yes", "--json").stdout
@@ -401,7 +410,12 @@ def test_a_checkout_reaches_the_instance_its_local_file_names(tmp_path: Path) ->
     ), stopped.stderr
 
     try:
-        assert here("daemon", "start", "--instance", name).returncode == 0
+        # The daemon's label comes from --label alone.
+
+        started = here(
+            "daemon", "start", "--instance", name, "--label", label, MURU_INSTANCE_LABEL=""
+        )
+        assert started.returncode == 0, started.stderr
 
         status = here("status")
         assert status.stdout.splitlines()[0].endswith(f", instance {name}"), status.stdout
@@ -417,7 +431,8 @@ def test_a_checkout_reaches_the_instance_its_local_file_names(tmp_path: Path) ->
 
         unknown = here("status", MURU_INSTANCE="nowhere")
         assert (
-            f"no instance nowhere is defined; the defined instances are {name}" in unknown.stderr
+            "nowhere is not the name, tag, ID, label or application of a running instance; "
+            "muructl instance list shows" in unknown.stderr
         ), unknown.stderr
         both = here("status", "--socket", "/tmp/x.sock", "--instance", name)
         assert "--socket and --instance both name what to reach" in both.stderr
@@ -444,6 +459,39 @@ def test_a_checkout_reaches_the_instance_its_local_file_names(tmp_path: Path) ->
             assert status.stdout.startswith("run      pid "), status.stdout
             assert f"muru.local.toml names instance {name}, pass --instance {name}" in status.stderr
             assert here("status", "--instance", name, **session).stdout.startswith("daemon ")
+
+            # Issue 868: what the list shows selects the run, as do the
+            # start of its ID and MURU_INSTANCE; a label two instances
+            # share is refused with both.
+
+            rows = {row["kind"]: row for row in listed(label)["instances"]}
+            assert rows["run"]["selector"] == f"run:{run.port}", rows["run"]
+            assert rows["daemon"]["selector"] == name, rows["daemon"]
+
+            for wanted in (f"run:{run.port}", rows["run"]["id"][:6]):
+                reached = here("status", "--instance", wanted)
+                assert reached.stdout.startswith("run      pid "), (wanted, reached.stderr)
+
+            chosen = here("status", MURU_INSTANCE=f"run:{run.port}", cwd=tmp_path)
+            assert chosen.stdout.startswith("run      pid "), chosen.stderr
+
+            # A command run inside the run, with its MURU_INSTANCE_ID,
+            # reaches the run from anywhere, unless only a daemon answers
+            # it, which finds the daemon as it would elsewhere.
+
+            inside = {"MURU_INSTANCE_ID": rows["run"]["id"]}
+            reached = here("status", cwd=tmp_path, **inside)
+            assert reached.stdout.startswith("run      pid "), reached.stderr
+            releases = here("release", "list", "shop", **inside)
+            assert releases.returncode == 0, releases.stderr
+
+            shared = here("status", "--instance", label)
+            assert f"{label} is the label of 2 running instances" in shared.stderr, shared.stderr
+            listed_run = re.search(rf"\n  run:{run.port} +the development run", shared.stderr)
+            assert listed_run, shared.stderr
+
+            refused = here("daemon", "start", "--instance", f"run:{run.port}")
+            assert "it takes a name, not the tag" in refused.stderr, refused.stderr
         finally:
             run.stop()
     finally:

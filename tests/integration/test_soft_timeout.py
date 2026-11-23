@@ -439,7 +439,9 @@ def record(
     deadline = time.monotonic() + 15
 
     while True:
-        found: dict[str, Any] = json.loads(server.get(f"/_muru/requests/{request_id}.json").body)
+        found: dict[str, Any] = json.loads(
+            server.get(f"/_muru/toolbar/requests/{request_id}.json").body
+        )
         captured = {capture["kind"] for capture in found["captures"]}
 
         if not found["in_progress"] and (kinds or set()) <= captured:
