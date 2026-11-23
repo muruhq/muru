@@ -183,11 +183,22 @@ impl Server {
             .is_ok_and(|status| status.success())
     }
 
-    /// Run a muructl command with --json and turn what it printed into a
-    /// tool result: the JSON on success, the error's sentence on failure.
-    async fn command(&self, mut command: Vec<String>) -> CallToolResult {
+    /// The options that reach the instance a tool call names in its
+    /// `instance` argument (issue 868), or else the one the server was
+    /// started for.
+    fn connect_for(&self, arguments: &JsonObject) -> Vec<String> {
+        match text(arguments, INSTANCE_ARGUMENT) {
+            Some(instance) => vec!["--instance".to_owned(), instance],
+            None => self.connect.to_vec(),
+        }
+    }
+
+    /// Run a muructl command with --json, reaching the instance `connect`
+    /// names, and turn what it printed into a tool result: the JSON on
+    /// success, the error's sentence on failure.
+    async fn command(&self, mut command: Vec<String>, connect: &[String]) -> CallToolResult {
         command.push("--json".to_owned());
-        command.extend(self.connect.iter().cloned());
+        command.extend(connect.iter().cloned());
 
         let output = match tokio::process::Command::new(&self.muructl)
             .args(&command)
@@ -262,7 +273,12 @@ impl Server {
         };
 
         if !given.is_empty() {
-            let listed = self.command(words(&["command", "list", &command[2]])).await;
+            let listed = self
+                .command(
+                    words(&["command", "list", &command[2]]),
+                    &self.connect_for(arguments),
+                )
+                .await;
             let declared = listed
                 .content
                 .first()
@@ -294,7 +310,7 @@ impl Server {
 
         let mut command = command;
         command.push("--json".to_owned());
-        command.extend(self.connect.iter().cloned());
+        command.extend(self.connect_for(arguments));
 
         let output = match tokio::process::Command::new(&self.muructl)
             .args(&command)
@@ -339,17 +355,21 @@ impl Server {
 
         match self.connect.iter().position(|word| word == "--instance") {
             Some(at) => text.push_str(&format!(
-                "\n\nThe tools reach the named instance {}. To work with another, the server \
-                 is started with --instance NAME, or muru.local.toml in the project names one \
-                 with instance = \"NAME\".",
+                "\n\nThe tools reach the instance {} unless a call names another in its \
+                 instance argument.",
                 self.connect.get(at + 1).map_or("", String::as_str)
             )),
             None => text.push_str(
-                "\n\nWith several daemons on the machine, each a named instance, the server is \
-                 started with --instance NAME, or muru.local.toml in the project names one with \
-                 instance = \"NAME\", and every tool reaches that instance; `instances` lists them.",
+                "\n\nThe tools reach the instance discovery finds, a development run of the \
+                 project or the default daemon, unless a call names another in its instance \
+                 argument.",
             ),
         }
+
+        text.push_str(
+            " `instances` lists every instance on the machine; a call's instance is the NAME it \
+             shows, the start of the instance's ID, its label or its application.",
+        );
 
         // A project whose skill is missing or older than this muructl's
         // hears about it once, with the command that fixes it.
@@ -444,7 +464,7 @@ impl ServerHandler for Server {
             },
             _ => match (spec.command)(&arguments) {
                 Ok(command) => {
-                    let result = self.command(command).await;
+                    let result = self.command(command, &self.connect_for(&arguments)).await;
                     finish(spec.name, &arguments, result)
                 }
                 Err(message) => failure(message),
@@ -454,6 +474,14 @@ impl ServerHandler for Server {
         Ok(result.into())
     }
 }
+
+/// The argument of every tool that reaches an instance that names the
+/// instance, as `--instance` takes it.
+const INSTANCE_ARGUMENT: &str = "instance";
+
+/// The tools that work on this machine or on nothing, and so reach no
+/// instance and take no instance argument.
+const LOCAL_TOOLS: [&str; 3] = ["docs", "skill_status", "instances"];
 
 /// A tool: what the agent sees, and the muructl command it runs.
 struct Spec {
@@ -474,8 +502,22 @@ impl Spec {
     /// whether it reads or changes things.
     fn tool(&self) -> Tool {
         let mut schema = JsonObject::new();
+        let mut properties = self.properties.clone();
+
+        if !LOCAL_TOOLS.contains(&self.name)
+            && let Some(properties) = properties.as_object_mut()
+        {
+            properties.insert(
+                INSTANCE_ARGUMENT.to_owned(),
+                json!({
+                    "type": "string",
+                    "description": "The instance to reach instead of the server's own: its NAME as instances shows it, the start of its ID, its label or its application",
+                }),
+            );
+        }
+
         schema.insert("type".to_owned(), json!("object"));
-        schema.insert("properties".to_owned(), self.properties.clone());
+        schema.insert("properties".to_owned(), properties);
 
         if !self.required.is_empty() {
             schema.insert("required".to_owned(), json!(self.required));

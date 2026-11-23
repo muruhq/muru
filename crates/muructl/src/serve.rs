@@ -57,6 +57,9 @@ pub struct ServeArgs {
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
 
+    #[command(flatten)]
+    pub label: crate::instances::LabelArgs,
+
     /// Where the application is served (default 0.0.0.0:8080).
     #[arg(long, value_name = "ADDRESS")]
     listen: Option<String>,

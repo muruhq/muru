@@ -97,6 +97,34 @@ fn new_name(text: &str) -> Result<String, String> {
     Ok(text.to_owned())
 }
 
+/// The label an instance is started with, beside its other options.
+#[derive(Args, Clone, Debug, Default)]
+pub struct LabelArgs {
+    /// A label for the instance, which muructl instance list shows and
+    /// --label filters on, and --instance selects it by when no other
+    /// running instance has it (default: MURU_INSTANCE_LABEL).
+    #[arg(long, value_name = "LABEL", value_parser = parse_label)]
+    pub label: Option<String>,
+}
+
+/// Check a label: 1 to 64 letters, digits, hyphens, underscores and dots,
+/// so it is one word in a table and on a command line.
+fn parse_label(text: &str) -> Result<String, String> {
+    let valid = !text.is_empty()
+        && text.len() <= 64
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+
+    if !valid {
+        return Err(format!(
+            "{text:?} is not a label: 1 to 64 letters, digits, hyphens, underscores and dots"
+        ));
+    }
+
+    Ok(text.to_owned())
+}
+
 /// What `instance prune` takes.
 #[derive(Args)]
 pub struct PruneArgs {
@@ -743,8 +771,9 @@ fn print_ports(ports: &[Port]) {
     print_table(&table);
 }
 
-/// A row as `--json` prints it: the record with its state and location.
-fn row_json(row: &Row) -> serde_json::Value {
+/// A row as `--json` prints it: the record with its state and location,
+/// and for an instance that can be reached what `--instance` takes for it.
+fn row_json(row: &Row, running: &[Record]) -> serde_json::Value {
     let mut value = serde_json::to_value(&row.record).unwrap_or_default();
 
     if let Some(object) = value.as_object_mut() {
@@ -773,6 +802,11 @@ fn row_json(row: &Row) -> serde_json::Value {
         }
 
         object.insert("tag".to_owned(), row.tag().into());
+
+        if let Some(selector) = selector(row, running) {
+            object.insert("selector".to_owned(), selector.into());
+        }
+
         object.insert("state".to_owned(), row.state.word().into());
         object.insert("location".to_owned(), "local".into());
     }
@@ -915,6 +949,14 @@ pub async fn list(args: ListArgs) -> anyhow::Result<i32> {
         Vec::new()
     };
 
+    // What selects each running instance is worked out among all of
+    // them, whatever the filters keep.
+
+    let running: Vec<Record> = all
+        .iter()
+        .filter(|row| row.state == State::Running)
+        .map(|row| row.record.clone())
+        .collect();
     let rows = kept(all, &args);
 
     if args.ports {
@@ -934,7 +976,7 @@ pub async fn list(args: ListArgs) -> anyhow::Result<i32> {
 
     if args.json {
         let mut answer = serde_json::json!({
-            "instances": rows.iter().map(row_json).collect::<Vec<_>>(),
+            "instances": rows.iter().map(|row| row_json(row, &running)).collect::<Vec<_>>(),
         });
 
         if args.orphans {
@@ -943,7 +985,7 @@ pub async fn list(args: ListArgs) -> anyhow::Result<i32> {
 
         println!("{}", serde_json::to_string_pretty(&answer)?);
     } else {
-        print_rows(&rows);
+        print_rows(&rows, &running);
 
         if args.orphans {
             print_orphans(&orphans);
@@ -953,8 +995,21 @@ pub async fn list(args: ListArgs) -> anyhow::Result<i32> {
     Ok(i32::from(args.orphans && !orphans.is_empty()))
 }
 
-/// The instance table.
-fn print_rows(rows: &[Row]) {
+/// What `--instance` takes to reach a row's instance (issue 868): for a
+/// running instance the value that selects it among `running`, for a
+/// stopped named instance its name; none for an instance that cannot be
+/// reached.
+fn selector(row: &Row, running: &[Record]) -> Option<String> {
+    match row.state {
+        State::Running => Some(muru_controller::selector::handle(&row.record, running)),
+        State::Stopped => row.record.name.clone(),
+        State::Detached | State::Stale => None,
+    }
+}
+
+/// The instance table. The NAME of an instance that can be reached is
+/// what `--instance` takes for it; of one that cannot, its tag.
+fn print_rows(rows: &[Row], reachable: &[Record]) {
     if rows.is_empty() {
         println!("muru: no instances to list");
         return;
@@ -983,7 +1038,7 @@ fn print_rows(rows: &[Row]) {
     for row in rows {
         let running = row.state == State::Running;
         let mut cells = vec![
-            row.tag(),
+            selector(row, reachable).unwrap_or_else(|| row.tag()),
             row.record.kind.word().to_owned(),
             row.state.word().to_owned(),
             if running {

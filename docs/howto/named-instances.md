@@ -120,14 +120,20 @@ The instance a command reaches is the first of these that applies:
 
 1. `--socket` or `--instance` on the command line;
 2. `MURU_SOCKET` or `MURU_INSTANCE` in the environment;
-3. `instance` in the current directory's `muru.local.toml`;
-4. a development run of the current directory, then the default
+3. for a command run inside an instance, such as by its web application,
+   that instance, as [the machine overview](instances.md#reaching-an-instance)
+   describes;
+4. `instance` in the current directory's `muru.local.toml`;
+5. a development run of the current directory, then the default
    daemon, as without named instances.
 
 Giving `--socket` and `--instance` together is refused, and so is
-setting both variables. A name that no instance has is refused with the
-names that are defined, and one that is defined and not running says
-how to start it:
+setting both variables. `--instance` and `MURU_INSTANCE` also reach a
+running instance that has no name, by what `muructl instance list`
+shows for it, its label or its application, as [the machine
+overview](instances.md#reaching-an-instance) describes. A value that
+reaches no instance is refused with the instances it could reach, and a
+name that is defined and not running says how to start it:
 
 ```console
 $ muructl status
@@ -149,7 +155,8 @@ and `overlay`, always go to the instance. `instance` belongs in
 table it is refused.
 
 `muructl mcp serve` settles its instance in the same way once, when it
-starts, and every tool reaches it.
+starts, and every tool reaches it unless the call names another in its
+`instance` argument.
 
 ## Listing them
 

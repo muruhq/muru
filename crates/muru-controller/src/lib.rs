@@ -49,6 +49,7 @@ pub mod rotation;
 pub mod runs;
 pub mod scaling;
 pub mod secrets;
+pub mod selector;
 pub mod servers;
 pub mod settings;
 pub mod shutdown;

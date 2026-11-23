@@ -827,7 +827,7 @@ $ ps -o pid,command -U "$USER" | grep 'muru '
 When a title is too long for the room it has, the words before the
 instance are cut first. Every process the daemon, a run or a serve
 starts, and every process those start in turn, has `MURU_INSTANCE_ID`,
-the instance's full ID, and `MURU_INSTANCE`, its name as the titles show
+the instance's full ID, and `MURU_INSTANCE_TAG`, its name as the titles show
 it, in its environment, which is what ties a subprocess a worker started,
 with no title of Muru's, to its instance.
 

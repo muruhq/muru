@@ -640,12 +640,12 @@ def set_title(title: str, short: str) -> None:
 
     On Linux the short name `top` shows is set too, so the host and each
     worker tell themselves apart. The instance the process belongs to, as
-    `MURU_INSTANCE` names it, follows in parentheses (section 13.10).
+    `MURU_INSTANCE_TAG` names it, follows in parentheses (section 13.10).
     """
 
     from muru import _native
 
-    tag = os.environ.get("MURU_INSTANCE")
+    tag = os.environ.get("MURU_INSTANCE_TAG")
     _native.set_title(f"{title} ({tag})" if tag else title, short)
 
 
