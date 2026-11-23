@@ -624,6 +624,30 @@ impl EdgeControl for Control {
         }))
     }
 
+    async fn add_preview_tokens(
+        &self,
+        request: Request<pb::PreviewTokens>,
+    ) -> Result<Response<pb::PreviewTokensAdded>, Status> {
+        // Section 4.21: the edge keeps a token's hash, never the token.
+
+        for token in request.into_inner().tokens {
+            let hash: [u8; 32] = token
+                .sha256
+                .as_slice()
+                .try_into()
+                .map_err(|_| Status::invalid_argument("a token's hash is 32 bytes"))?;
+            self.pools.previews().add(
+                hash,
+                &token.app,
+                &token.release,
+                &token.path,
+                Duration::from_millis(token.ttl_ms),
+            );
+        }
+
+        Ok(Response::new(pb::PreviewTokensAdded {}))
+    }
+
     async fn stop(&self, _: Request<pb::StopRequest>) -> Result<Response<pb::Stopped>, Status> {
         let _ = self.stop.try_send(());
         Ok(Response::new(pb::Stopped {}))

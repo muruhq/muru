@@ -842,7 +842,7 @@
         },
         "compression": {
           "default": true,
-          "description": "Whether responses are compressed; `false` is `--no-compression`.",
+          "description": "Whether responses are compressed; `false` is `--no-compression`. Not used by a detour, whose responses the daemon's edge compresses.",
           "type": "boolean"
         },
         "dashboard": {
@@ -860,7 +860,7 @@
           "type": "string"
         },
         "hosts": {
-          "description": "Names the development certificate covers besides localhost.",
+          "description": "Names the development certificate covers besides localhost. Not used by a detour, which takes the daemon's host names.",
           "items": {
             "type": "string"
           },
@@ -868,23 +868,23 @@
         },
         "https": {
           "default": false,
-          "description": "Serve HTTPS beside HTTP.",
+          "description": "Serve HTTPS beside HTTP. Not used by a detour.",
           "type": "boolean"
         },
         "https_only": {
           "default": false,
-          "description": "Serve HTTPS alone, HTTP redirecting to it.",
+          "description": "Serve HTTPS alone, HTTP redirecting to it. Not used by a detour.",
           "type": "boolean"
         },
         "https_port": {
           "$ref": "#/$defs/RunPort",
-          "description": "The HTTPS port, or `auto`.",
+          "description": "The HTTPS port, or `auto`. Not used by a detour.",
           "x-default": "`8443`, or `auto` when `port` is"
         },
         "port": {
           "$ref": "#/$defs/RunPort",
           "default": 8080,
-          "description": "The HTTP port, or `auto`."
+          "description": "The HTTP port, or `auto`. Not used by a detour."
         },
         "reload": {
           "default": true,
@@ -923,11 +923,11 @@
           "type": "boolean"
         },
         "tls_cert": {
-          "description": "A certificate chain to serve, relative to the project.",
+          "description": "A certificate chain to serve, relative to the project. Not used by a detour.",
           "type": "string"
         },
         "tls_key": {
-          "description": "Its private key, relative to the project.",
+          "description": "Its private key, relative to the project. Not used by a detour.",
           "type": "string"
         },
         "toolbar": {

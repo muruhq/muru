@@ -292,6 +292,9 @@ struct Shared {
     /// speaks TLS.
     tls: Option<(Arc<rustls::ClientConfig>, Option<String>)>,
     trust_muru_headers: bool,
+    /// Section 4.21: a detour's run, whose protocol is chosen request by
+    /// request.
+    detour: bool,
     /// The file hints by path the upstream may give when trusted
     /// (section 4.9).
     sendfile: Arc<crate::routing::Sendfile>,
@@ -302,10 +305,107 @@ struct Shared {
     next: AtomicUsize,
 }
 
+impl Shared {
+    /// The deadline for a client's request to the upstream: the limits'
+    /// for any upstream, none to speak of for a detour (section 4.21).
+    fn request_deadline(&self, limits: &crate::Limits) -> Duration {
+        if self.detour {
+            DETOUR_DEADLINE
+        } else {
+            limits.request_deadline
+        }
+    }
+
+    /// How long a response may pause between pieces.
+    fn response_idle_timeout(&self, limits: &crate::Limits) -> Duration {
+        if self.detour {
+            DETOUR_IDLE_TIMEOUT
+        } else {
+            limits.response_idle_timeout
+        }
+    }
+
+    /// Whether the error override and error pages may replace the
+    /// upstream's own error responses: never a detour's.
+    fn overrides_errors(&self) -> bool {
+        !self.detour
+    }
+
+    /// The protocol a request goes over: the upstream's, or for a detour
+    /// h2c when the request is gRPC (gRPC-Web included, which the run's
+    /// edge translates) and HTTP/1.1 otherwise (section 4.21).
+    fn protocol_for(&self, headers: &HeaderMap) -> Protocol {
+        if !self.detour {
+            return self.protocol;
+        }
+
+        if crate::grpc::Protocol::of(headers).is_some() {
+            Protocol::H2c
+        } else {
+            Protocol::Http1
+        }
+    }
+}
+
+/// Remove the preview header, and the preview cookie from the Cookie
+/// headers, leaving the request's other cookies as they were.
+fn without_preview(headers: &mut HeaderMap) {
+    headers.remove(crate::routing::PREVIEW_HEADER);
+
+    let cookies: Vec<String> = headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .map(str::trim)
+                .filter(|pair| {
+                    pair.split_once('=')
+                        .is_none_or(|(name, _)| name.trim() != crate::routing::PREVIEW_COOKIE)
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .filter(|value| !value.is_empty())
+        .collect();
+
+    headers.remove(http::header::COOKIE);
+
+    for value in cookies {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            headers.append(http::header::COOKIE, value);
+        }
+    }
+}
+
+/// Whether the client said it takes trailers, as a gRPC client does.
+fn wants_trailers(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(http::header::TE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|option| option.trim().eq_ignore_ascii_case("trailers"))
+}
+
+/// How long a detour's response may pause between pieces: a request
+/// held at a breakpoint is answered when the debugger lets it go
+/// (section 4.21).
+const DETOUR_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// A detour's request deadline, which in effect it has none of: far
+/// enough off that nothing a person does at a breakpoint reaches it.
+const DETOUR_DEADLINE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 /// An upstream of a snapshot.
 pub struct Upstream {
     shared: Arc<Shared>,
     probe: Option<tokio::task::JoinHandle<()>>,
+    /// Section 4.21: set when a detour leaves the routing, which closes
+    /// the WebSockets relayed to it. The upstreams successive snapshots
+    /// make for one detour share it.
+    ended: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Drop for Upstream {
@@ -370,6 +470,7 @@ impl Upstream {
             protocol,
             tls,
             trust_muru_headers: message.trust_muru_headers,
+            detour: message.detour,
             sendfile: crate::routing::Sendfile::new(
                 &message.sendfile_roots,
                 &message.sendfile_header,
@@ -399,7 +500,29 @@ impl Upstream {
             tokio::spawn(run_probes(Arc::clone(&shared), config))
         });
 
-        Ok(Self { shared, probe })
+        Ok(Self {
+            shared,
+            probe,
+            ended: Arc::new(tokio::sync::watch::Sender::new(false)),
+        })
+    }
+
+    /// Whether the upstream is a detour's run (section 4.21).
+    pub fn is_detour(&self) -> bool {
+        self.shared.detour
+    }
+
+    /// Take over the WebSockets relayed through the upstream an earlier
+    /// snapshot made for the same detour, so that they last as long as
+    /// the detour and not as long as one snapshot.
+    pub fn carry_relays(&mut self, earlier: &Upstream) {
+        self.ended = Arc::clone(&earlier.ended);
+    }
+
+    /// Close every WebSocket relayed through the upstream, as the end of
+    /// a detour does.
+    pub fn end_relays(&self) {
+        self.ended.send_replace(true);
     }
 
     /// The upstream's name.
@@ -571,10 +694,15 @@ enum Sender {
     Http2(http2::SendRequest<OutBody>),
 }
 
-/// A connection ready to take a request: an idle one, unless `fresh`
-/// asks for a new one, else a new one.
-async fn sender_for(shared: &Shared, address: &Address, fresh: bool) -> std::io::Result<Sender> {
-    if shared.protocol.is_h2() {
+/// A connection ready to take a request over `protocol`: an idle one,
+/// unless `fresh` asks for a new one, else a new one.
+async fn sender_for(
+    shared: &Shared,
+    address: &Address,
+    protocol: Protocol,
+    fresh: bool,
+) -> std::io::Result<Sender> {
+    if protocol.is_h2() {
         let existing = address.h2.lock().expect("upstream h2 poisoned").clone();
 
         if let Some(sender) = existing
@@ -695,18 +823,19 @@ enum Failure {
 /// the body has arrived.
 type Answer = (Response<Incoming>, Option<http1::SendRequest<OutBody>>);
 
-/// Send the request in `slot` to an address and wait for the response
-/// head, on a new connection when `fresh`. A request that was never sent
-/// goes back into the slot.
+/// Send the request in `slot` to an address over `protocol` and wait for
+/// the response head, on a new connection when `fresh`. A request that
+/// was never sent goes back into the slot.
 async fn send(
     shared: &Shared,
     address: &Address,
+    protocol: Protocol,
     slot: &mut Option<Request<OutBody>>,
     deadline: Instant,
     fresh: bool,
 ) -> Result<Answer, Failure> {
     loop {
-        let sender = match sender_for(shared, address, fresh).await {
+        let sender = match sender_for(shared, address, protocol, fresh).await {
             Ok(sender) => sender,
             Err(error) => return Err(Failure::Unsent(error.to_string())),
         };
@@ -945,7 +1074,13 @@ pub async fn handle(
         return Handled::Response(failing.too_large());
     }
 
-    if upgrade.is_some() && shared.protocol.is_h2() {
+    // Section 4.21: a detour is reached over h2c for gRPC, which needs
+    // HTTP/2 end to end, and over HTTP/1.1 for everything else, upgrades
+    // included.
+
+    let protocol = shared.protocol_for(&parts.headers);
+
+    if upgrade.is_some() && protocol.is_h2() {
         return Handled::Response(failing.respond(Problem::new(
             StatusCode::BAD_GATEWAY,
             FAILED_REASON,
@@ -966,7 +1101,12 @@ pub async fn handle(
         && let Some(incoming) = body.as_mut()
         && !incoming.is_end_stream()
     {
-        if content_length.is_none() {
+        // A detour's gRPC call streams its body, as a client stream must;
+        // HTTP/2 needs no length.
+
+        let streams = shared.detour && protocol.is_h2();
+
+        if content_length.is_none() && !streams {
             match link::read_body(incoming, limits.max_body_size).await {
                 Ok(data) => payload = Payload::Buffered(data),
                 Err(BodyError::TooLarge) => return Handled::Response(failing.too_large()),
@@ -985,7 +1125,37 @@ pub async fn handle(
     }
 
     let host = requested_host(parts, context);
-    let headers = outgoing_headers(parts, context, &host, upgrade.is_some());
+    let mut headers = outgoing_headers(parts, context, &host, upgrade.is_some());
+
+    // Section 4.21: the preview that chose the detour is the daemon's,
+    // and carries its secret, so neither the run's edge nor the
+    // application sees it.
+
+    if shared.detour {
+        without_preview(&mut headers);
+    }
+
+    // Section 4.21: a detour's run is told the port the client came to,
+    // since it has none of its own for SERVER_PORT.
+
+    if shared.detour
+        && !headers.contains_key("x-forwarded-port")
+        && let Ok(value) = HeaderValue::from_str(
+            &context
+                .forwarded_port
+                .unwrap_or_else(|| context.local.port())
+                .to_string(),
+        )
+    {
+        headers.insert(HeaderName::from_static("x-forwarded-port"), value);
+    }
+
+    // gRPC servers look for `te: trailers`, the one value HTTP/2 allows,
+    // which goes as a hop-by-hop header otherwise.
+
+    if shared.detour && protocol.is_h2() && wants_trailers(&parts.headers) {
+        headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
+    }
 
     let length = match &payload {
         Payload::Empty => None,
@@ -998,7 +1168,7 @@ pub async fn handle(
 
     let deadline = match context.handler {
         Some(budget) => (context.arrived + limits.request_deadline).min(Instant::now() + budget),
-        None => context.arrived + limits.request_deadline,
+        None => context.arrived + shared.request_deadline(limits),
     };
 
     // The addresses in turn from where the last request left off: those
@@ -1049,6 +1219,7 @@ pub async fn handle(
     let mut slot = Some(build_request(
         parts,
         shared,
+        protocol,
         &host,
         headers,
         length,
@@ -1080,7 +1251,7 @@ pub async fn handle(
         let mut fresh = false;
 
         let outcome = loop {
-            match send(shared, address, &mut slot, deadline, fresh).await {
+            match send(shared, address, protocol, &mut slot, deadline, fresh).await {
                 Err(Failure::Dropped(error)) => match again.take() {
                     Some((payload, headers)) => {
                         tracing::debug!(
@@ -1092,6 +1263,7 @@ pub async fn handle(
                         slot = Some(build_request(
                             parts,
                             shared,
+                            protocol,
                             &host,
                             headers,
                             length,
@@ -1204,8 +1376,12 @@ pub async fn handle(
         return Handled::Redirect(Box::new(redirect));
     }
 
+    // Section 4.21: a detour's responses are the run's own, tracebacks
+    // and all, so no error override or error page replaces them.
+
     if upgrade.is_none()
         && context.handler.is_none()
+        && shared.overrides_errors()
         && let Some(problem) =
             link::override_from(&head, response_end, failing.negotiation(), &context.errors)
     {
@@ -1244,7 +1420,8 @@ pub async fn handle(
     {
         let upstream_side = hyper::upgrade::on(&mut response);
         let answer = crate::websocket::accepted_response(&upgrade, head.headers);
-        tokio::spawn(relay(upgrade, upstream_side, recording));
+        let ended = shared.detour.then(|| upstream.ended.subscribe());
+        tokio::spawn(relay(upgrade, upstream_side, recording, ended));
         return Handled::Response(answer);
     }
 
@@ -1290,7 +1467,7 @@ pub async fn handle(
                 recording,
                 status: status.as_u16(),
                 bytes: 0,
-                idle_timeout: limits.response_idle_timeout,
+                idle_timeout: shared.response_idle_timeout(limits),
             },
             next_chunk,
         );
@@ -1308,11 +1485,12 @@ pub async fn handle(
 }
 
 /// Copy bytes between the client and the upstream for the life of a
-/// WebSocket the upstream accepted.
+/// WebSocket the upstream accepted, or for a detour's until it ends.
 async fn relay(
     upgrade: crate::websocket::Upgrade,
     upstream_side: hyper::upgrade::OnUpgrade,
     recording: Option<Recording>,
+    ended: Option<tokio::sync::watch::Receiver<bool>>,
 ) {
     let (client, server) = match (upgrade.into_on_upgrade().await, upstream_side.await) {
         (Ok(client), Ok(server)) => (client, server),
@@ -1329,9 +1507,20 @@ async fn relay(
 
     let mut client = TokioIo::new(client);
     let mut server = TokioIo::new(server);
-    let copied = tokio::io::copy_bidirectional(&mut client, &mut server)
-        .await
-        .map_or(0, |(_, from_server)| from_server);
+    let copying = tokio::io::copy_bidirectional(&mut client, &mut server);
+
+    // A detour's WebSocket closes when the detour ends; its sender gone
+    // means the same.
+
+    let copied = match ended {
+        Some(mut ended) => {
+            tokio::select! {
+                copied = copying => copied.map_or(0, |(_, from_server)| from_server),
+                _ = ended.wait_for(|ended| *ended) => 0,
+            }
+        }
+        None => copying.await.map_or(0, |(_, from_server)| from_server),
+    };
 
     if let Some(recording) = recording {
         recording.complete(101, "", copied);
@@ -1417,11 +1606,13 @@ fn outgoing_headers(
     headers
 }
 
-/// The request as sent: origin form over HTTP/1.1, the full URI with
-/// the host as its authority over HTTP/2.
+/// The request as sent over `protocol`: origin form over HTTP/1.1, the
+/// full URI with the host as its authority over HTTP/2.
+#[allow(clippy::too_many_arguments)]
 fn build_request(
     parts: &http::request::Parts,
     shared: &Shared,
+    protocol: Protocol,
     host: &str,
     mut headers: HeaderMap,
     length: Option<u64>,
@@ -1432,7 +1623,7 @@ fn build_request(
         .path_and_query()
         .map_or_else(|| parts.uri.path().to_owned(), |target| target.to_string());
 
-    let (uri, version) = if shared.protocol.is_h2() {
+    let (uri, version) = if protocol.is_h2() {
         headers.remove(HOST);
         (
             format!("{}://{host}{target}", scheme(shared))
@@ -1581,5 +1772,166 @@ mod tests {
         assert_eq!(with("timeout=1"), Duration::ZERO);
         assert_eq!(with("timeout=600"), IDLE_FOR);
         assert_eq!(with("timeout=soon"), IDLE_FOR);
+    }
+
+    #[test]
+    fn a_detour_takes_grpc_over_h2c_and_everything_else_over_http1() {
+        let upstream = |detour: bool, protocol: &str| {
+            Upstream::from_message(&pb::Upstream {
+                name: "shop@dev-7f3a".to_owned(),
+                addresses: vec!["unix:/run/user/1000/muru/run-1/detour.sock".to_owned()],
+                protocol: protocol.to_owned(),
+                detour,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let typed = |content_type: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_str(content_type).unwrap(),
+            );
+            headers
+        };
+
+        let detour = upstream(true, "http1");
+
+        for grpc in [
+            "application/grpc",
+            "application/grpc+proto",
+            "application/grpc+json",
+            "application/grpc-web+proto",
+            "application/grpc-web-text",
+        ] {
+            assert_eq!(
+                detour.shared.protocol_for(&typed(grpc)),
+                Protocol::H2c,
+                "{grpc}"
+            );
+        }
+
+        for other in ["text/html", "application/json"] {
+            assert_eq!(
+                detour.shared.protocol_for(&typed(other)),
+                Protocol::Http1,
+                "{other}"
+            );
+        }
+
+        assert_eq!(
+            detour.shared.protocol_for(&HeaderMap::new()),
+            Protocol::Http1
+        );
+
+        // Any other upstream keeps the protocol it was given, gRPC or not.
+
+        let plain = upstream(false, "http1");
+        assert_eq!(
+            plain.shared.protocol_for(&typed("application/grpc")),
+            Protocol::Http1
+        );
+        let h2c = upstream(false, "h2c");
+        assert_eq!(h2c.shared.protocol_for(&typed("text/html")), Protocol::H2c);
+    }
+
+    #[test]
+    fn a_detour_has_no_deadline_a_long_pause_and_no_error_override() {
+        let upstream = |detour: bool| {
+            Upstream::from_message(&pb::Upstream {
+                name: "shop@dev-7f3a".to_owned(),
+                addresses: vec!["unix:/run/user/1000/muru/run-1/detour.sock".to_owned()],
+                detour,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let limits = crate::Limits::default();
+
+        let detour = upstream(true);
+        assert!(detour.shared.request_deadline(&limits) >= Duration::from_secs(24 * 60 * 60));
+        assert_eq!(
+            detour.shared.response_idle_timeout(&limits),
+            Duration::from_secs(60 * 60)
+        );
+        assert!(!detour.shared.overrides_errors());
+        assert!(detour.is_detour());
+
+        let plain = upstream(false);
+        assert_eq!(
+            plain.shared.request_deadline(&limits),
+            limits.request_deadline
+        );
+        assert_eq!(
+            plain.shared.response_idle_timeout(&limits),
+            limits.response_idle_timeout
+        );
+        assert!(plain.shared.overrides_errors());
+        assert!(!plain.is_detour());
+    }
+
+    #[test]
+    fn a_detours_websockets_last_across_snapshots_and_close_when_it_ends() {
+        let upstream = || {
+            Upstream::from_message(&pb::Upstream {
+                name: "shop@dev-7f3a".to_owned(),
+                addresses: vec!["unix:/run/user/1000/muru/run-1/detour.sock".to_owned()],
+                detour: true,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+
+        let first = upstream();
+        let relaying = first.ended.subscribe();
+
+        // The next snapshot's upstream for the same detour takes over the
+        // relays, and the first one going leaves them open.
+
+        let mut second = upstream();
+        second.carry_relays(&first);
+        drop(first);
+        assert!(!*relaying.borrow());
+
+        second.end_relays();
+        assert!(*relaying.borrow());
+    }
+
+    #[test]
+    fn a_detour_gets_no_preview_header_or_cookie_and_keeps_the_other_cookies() {
+        let mut headers = HeaderMap::new();
+        headers.insert("muru-preview", HeaderValue::from_static("dev-7f3a.0f"));
+        headers.append(
+            http::header::COOKIE,
+            HeaderValue::from_static("session=abc; muru_preview=dev-7f3a.0f; theme=dark"),
+        );
+        headers.append(
+            http::header::COOKIE,
+            HeaderValue::from_static("muru_preview=dev-7f3a.0f"),
+        );
+
+        without_preview(&mut headers);
+
+        assert!(!headers.contains_key("muru-preview"));
+        let cookies: Vec<&str> = headers
+            .get_all(http::header::COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, ["session=abc; theme=dark"]);
+    }
+
+    #[test]
+    fn trailers_are_asked_for_by_te_among_other_options() {
+        let te = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::TE, HeaderValue::from_str(value).unwrap());
+            headers
+        };
+
+        assert!(wants_trailers(&te("trailers")));
+        assert!(wants_trailers(&te("gzip, Trailers")));
+        assert!(!wants_trailers(&te("gzip")));
+        assert!(!wants_trailers(&HeaderMap::new()));
     }
 }

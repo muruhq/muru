@@ -164,6 +164,9 @@ pub enum Kind {
     Run,
     /// `muructl serve`.
     Serve,
+    /// `muructl detour run`, a development run behind a daemon's edge
+    /// (section 13.12).
+    Detour,
 }
 
 impl Kind {
@@ -173,6 +176,7 @@ impl Kind {
             Self::Daemon => "daemon",
             Self::Run => "run",
             Self::Serve => "serve",
+            Self::Detour => "detour",
         }
     }
 }
@@ -311,7 +315,8 @@ impl Record {
 
     /// The instance's tag, which its processes' titles carry: its name,
     /// `run:PORT` for a run, with the port it is configured to serve on,
-    /// which is known before anything starts, `serve` for a serve, or the
+    /// which is known before anything starts, `serve` for a serve,
+    /// `detour:` and the short ID for a detour, which has no port, or the
     /// short ID; a run on a port picked when it binds, `--port auto`, is
     /// `run:` and its short ID.
     pub fn tag(&self) -> String {
@@ -325,6 +330,7 @@ impl Record {
                 None => format!("run:{}", self.id.short()),
             },
             Kind::Serve => "serve".to_owned(),
+            Kind::Detour => format!("detour:{}", self.id.short()),
             Kind::Daemon => self.id.short(),
         }
     }
@@ -342,7 +348,7 @@ impl Record {
     /// `daemon instance dev (pid 5120)`.
     pub fn describe(&self) -> String {
         let dashboard = match (self.kind, self.dashboard.as_deref()) {
-            (Kind::Run, Some(dashboard)) => format!(", dashboard {dashboard}"),
+            (Kind::Run | Kind::Detour, Some(dashboard)) => format!(", dashboard {dashboard}"),
             _ => String::new(),
         };
 
@@ -363,6 +369,14 @@ impl Record {
                     .map(|project| format!(" in {}", home_shortened(project)))
                     .unwrap_or_default();
                 format!("the development run of {app}{project}")
+            }
+            Kind::Detour => {
+                let project = self
+                    .project
+                    .as_deref()
+                    .map(|project| format!(" in {}", home_shortened(project)))
+                    .unwrap_or_default();
+                format!("the detour of {app}{project}")
             }
             Kind::Serve => format!("muructl serve of {app}"),
             Kind::Daemon => match &self.name {
@@ -883,6 +897,12 @@ pub fn live(registry: &Path) -> Vec<Record> {
         .filter(|found| found.live)
         .map(|found| found.record)
         .collect()
+}
+
+/// Whether `id` has an entry in `registry` whose owner holds its lock.
+pub fn entry_is_live(registry: &Path, id: InstanceId) -> bool {
+    let directory = registry.join(id.to_string());
+    directory.join(RECORD).exists() && is_live(&directory)
 }
 
 /// Whether the entry at `directory` has a live owner: its lock cannot be

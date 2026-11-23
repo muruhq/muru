@@ -54,9 +54,13 @@ class Daemon:
     state_at_stop: str = ""
 
     def muructl(
-        self, *arguments: str, check: bool = True, stdin: str | None = None
+        self,
+        *arguments: str,
+        check: bool = True,
+        stdin: str | None = None,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run a muructl command against this daemon, with `stdin` as its input.
+        """Run a muructl command against this daemon, with `stdin` as its input, in `cwd`.
 
         Commands that work from the daemon's files rather than its socket
         (the secret commands) get the daemon's locations instead.
@@ -98,6 +102,7 @@ class Daemon:
                 check=False,
                 timeout=180,
                 input=stdin,
+                cwd=cwd,
             )
         except subprocess.TimeoutExpired as error:
             self.timeline.append(f"{stamp(began)} muructl {' '.join(arguments)}: hung")

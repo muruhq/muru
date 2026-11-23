@@ -22,7 +22,8 @@ system     daemon   running   812    9d      0.0.0.0:80, :443 (tls)       -     
 - **NAME** is what `--instance` takes to reach the instance (see
   [Reaching an instance](#reaching-an-instance)): `user` or `system` for
   the default daemons, a named instance's name, `run:PORT` for a
-  development run, `serve` for `muructl serve`, and the first 8 hex
+  development run, `serve` for `muructl serve`, `detour:` and the first 8
+  hex digits of its ID for a [detour](detours.md), and the first 8 hex
   digits of its instance ID for a daemon started with its own
   `--state-dir`. When two running instances would show the same value,
   such as two serves, each shows the first 8 hex digits of its ID
@@ -39,11 +40,11 @@ system     daemon   running   812    9d      0.0.0.0:80, :443 (tls)       -     
   shortened to its port and marked `(tls)` when it carries TLS, or the
   configured addresses marked `(configured)` when nothing is bound.
 
-- **WHERE** is a run's project directory and application, or a daemon's
+- **WHERE** is a run's or a detour's project directory and application, or a daemon's
   state directory, with your home directory shortened to `~`.
 
 A LABEL column is added when any instance has a label. An instance
-takes its label from `--label` on `muructl run`, `muructl serve`,
+takes its label from `--label` on `muructl run`, `muructl detour run`, `muructl serve`,
 `muructl daemon start`, `muructl daemon run` and `muructl up`, or else
 from `MURU_INSTANCE_LABEL` in the environment it starts with, so a
 script or a test session can mark what it starts:
@@ -55,7 +56,7 @@ $ muructl instance list --label nightly
 
 A label is 1 to 64 letters, digits, hyphens, underscores and dots.
 
-`--kind daemon`, `run` or `serve` keeps one kind. The system daemon's
+`--kind daemon`, `run`, `serve` or `detour` keeps one kind. The system daemon's
 entry is in a registry every user can read, so it is listed for you too;
 its admin socket still decides who may use it. As root, `--all-users`
 also lists every user's instances.

@@ -15,7 +15,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 
 | Table | Where | Holds |
 | --- | --- | --- |
-| `[daemon]` | daemon file | paths (state, run, logs), admin socket and TCP access, roles, budgets, offline mode, debug_exec (section 11.7) |
+| `[daemon]` | daemon file | paths (state, run, logs), admin socket and TCP access, roles, budgets, offline mode, debug_exec (section 11.7), detours (section 9.13) |
 | `[tools]` | daemon file | uv path and version constraints, its configuration file, interpreter downloads and install directory, offline mode and the wheel directory (section 8.4) |
 | `[[edge.pool]]`, `[[listener]]` | daemon file | listeners, protocols, processes, threads |
 | `[proxy]` | daemon or listener | trusted proxies and header types |
@@ -152,4 +152,5 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Clients | ratelimit.enforcing, client_class.list_reloaded |
 | Dashboard | dashboard.login_issued |
 | Commands | command.started, command.finished, command.failed |
+| Detours | detour.opened, detour.traffic, detour.closed |
 | Debugging | request.soft_timeout, request.past_deadline, debug.profile, debug.trace, debug.memory, debug.exec, debug.bundle, debug.breakpoint, debug.breakpoint_expired, debug.attached, debug.detached |

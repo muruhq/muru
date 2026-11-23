@@ -67,6 +67,73 @@ struct Service {
     applying: Arc<tokio::sync::Mutex<()>>,
 }
 
+impl Service {
+    /// The open detours, as the daemon last published them.
+    fn detours(&self) -> Vec<pb::Detour> {
+        self.handle
+            .info
+            .detours
+            .lock()
+            .expect("detours poisoned")
+            .clone()
+    }
+
+    /// The detour `app@release` names, when `release` is a detour's ID or
+    /// `detour`, the application's one detour; none for any other
+    /// release. `detour` with several open is refused, naming each.
+    fn detour_named(&self, app: &str, release: &str) -> Result<Option<pb::Detour>, Status> {
+        if release != crate::detours::ALIAS && !crate::detours::is_detour_release(release) {
+            return Ok(None);
+        }
+
+        let mut found: Vec<pb::Detour> = self
+            .detours()
+            .into_iter()
+            .filter(|detour| {
+                detour.app == app && (release == crate::detours::ALIAS || detour.release == release)
+            })
+            .collect();
+
+        match found.len() {
+            0 if release == crate::detours::ALIAS => Err(Status::not_found(format!(
+                "application {app} has no detour open"
+            ))),
+            0 => Ok(None),
+            1 => Ok(found.pop()),
+            _ => Err(Status::failed_precondition(format!(
+                "{app}@{release} is ambiguous: {} detours of {app} are open: {}",
+                found.len(),
+                found
+                    .iter()
+                    .map(|detour| format!("{app}@{}", detour.release))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+}
+
+/// A detour as a release (section 9.13): of kind `detour`, ready while it
+/// is open, serving nothing of its own.
+fn detour_release(detour: pb::Detour) -> pb::Release {
+    pb::Release {
+        app: detour.app.clone(),
+        id: detour.release.clone(),
+        state: ReleaseState::Ready.as_str().to_owned(),
+        message: format!(
+            "a development detour, pid {} in {}",
+            detour.pid,
+            crate::registry::home_shortened(std::path::Path::new(&detour.directory))
+        ),
+        source: detour.directory.clone(),
+        kind: "detour".to_owned(),
+        traffic: format!("detour, {}", detour.traffic),
+        created_unix_ms: u64::try_from(detour.opened_unix_ms).unwrap_or_default(),
+        detour: Some(detour),
+        ..Default::default()
+    }
+}
+
 /// The instant `seconds` ago, for an age limit; none for 0.
 fn older_than(seconds: u64) -> Option<std::time::SystemTime> {
     (seconds > 0).then(|| std::time::SystemTime::now() - std::time::Duration::from_secs(seconds))
@@ -239,6 +306,33 @@ async fn run_truncate(
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send>>;
 type LogStream = Pin<Box<dyn Stream<Item = Result<pb::LogLine, Status>> + Send>>;
 type CommandStream = Pin<Box<dyn Stream<Item = Result<pb::CommandOutput, Status>> + Send>>;
+type DetourStream = Pin<Box<dyn Stream<Item = Result<pb::DetourMessage, Status>> + Send>>;
+
+/// Held by a detour's stream: when the stream is dropped, because its run
+/// went away or the daemon ended it, the daemon is told, and a detour it
+/// has closed already is nothing to it (section 9.13).
+struct DetourCloser {
+    commands: tokio::sync::mpsc::Sender<Command>,
+    serial: u64,
+}
+
+impl Drop for DetourCloser {
+    fn drop(&mut self) {
+        let commands = self.commands.clone();
+        let serial = self.serial;
+
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = commands
+                    .send(Command::CloseDetour {
+                        serial,
+                        reason: "its run went away".to_owned(),
+                    })
+                    .await;
+            });
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl Admin for Service {
@@ -618,6 +712,8 @@ impl Admin for Service {
 
         if !crate::model::valid_name(&id) {
             refusals.push(format!("{id:?} is not a valid release id"));
+        } else if let Some(refusal) = crate::detours::reserved_release(&id) {
+            refusals.push(refusal);
         } else if store.release(&request.app, &id).is_ok() {
             refusals.push(format!("release {}@{id} already exists", request.app));
         }
@@ -769,6 +865,16 @@ impl Admin for Service {
             .await
             .map_err(internal)?;
         }
+
+        // Section 9.13: the detours are releases the daemon holds in
+        // memory alone, listed after the stored ones.
+
+        releases.extend(
+            self.detours()
+                .into_iter()
+                .filter(|detour| app.as_deref().is_none_or(|app| detour.app == app))
+                .map(detour_release),
+        );
 
         Ok(Response::new(pb::ListReleasesResponse { releases }))
     }
@@ -1071,6 +1177,11 @@ impl Admin for Service {
         request: Request<pb::GetReleaseRequest>,
     ) -> Result<Response<pb::Release>, Status> {
         let request = request.into_inner();
+
+        if let Some(detour) = self.detour_named(&request.app, &request.release)? {
+            return Ok(Response::new(detour_release(detour)));
+        }
+
         let release = self
             .handle
             .store
@@ -1251,6 +1362,59 @@ impl Admin for Service {
     }
 
     type RunCommandStream = CommandStream;
+    type OpenDetourStream = DetourStream;
+
+    async fn open_detour(
+        &self,
+        request: Request<pb::OpenDetourRequest>,
+    ) -> Result<Response<DetourStream>, Status> {
+        let opening = crate::detours::Opening::from_message(request.into_inner())
+            .map_err(Status::invalid_argument)?;
+
+        // Section 9.13: the daemon's edge has to reach the run's socket,
+        // which is tried here, outside the daemon's loop.
+
+        tokio::net::UnixStream::connect(&opening.socket)
+            .await
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "the daemon cannot reach the detour's socket {}: {error}",
+                    opening.socket.display()
+                ))
+            })?;
+
+        // The daemon keeps the only sender, so the stream ends when it
+        // closes the detour; the stream's end closes it too.
+
+        let (updates, received) = tokio::sync::mpsc::channel(16);
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::OpenDetour {
+                opening,
+                updates,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let (_, serial) = done_rx
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+
+        let closer = DetourCloser {
+            commands: self.handle.commands.clone(),
+            serial,
+        };
+        let stream = tokio_stream::StreamExt::map(
+            tokio_stream::wrappers::ReceiverStream::new(received),
+            move |message| {
+                let _ = &closer;
+                message
+            },
+        );
+        Ok(Response::new(Box::pin(stream)))
+    }
 
     async fn run_command(
         &self,
@@ -2004,6 +2168,61 @@ impl Admin for Service {
         Ok(Response::new(pb::NoteBundleResponse {}))
     }
 
+    async fn list_detours(
+        &self,
+        _: Request<pb::ListDetoursRequest>,
+    ) -> Result<Response<pb::ListDetoursResponse>, Status> {
+        Ok(Response::new(pb::ListDetoursResponse {
+            detours: self.detours(),
+        }))
+    }
+
+    async fn set_detour_traffic(
+        &self,
+        request: Request<pb::SetDetourTrafficRequest>,
+    ) -> Result<Response<pb::Detour>, Status> {
+        let request = request.into_inner();
+        let traffic =
+            crate::detours::Traffic::parse(&request.traffic).map_err(Status::invalid_argument)?;
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::SetDetourTraffic {
+                app: request.app,
+                release: request.release,
+                traffic,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let detour = done_rx
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(detour))
+    }
+
+    async fn preview_detour(
+        &self,
+        request: Request<pb::PreviewDetourRequest>,
+    ) -> Result<Response<pb::DetourPreview>, Status> {
+        let request = request.into_inner();
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::PreviewDetour {
+                request,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let preview = done_rx
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(preview))
+    }
+
     async fn list_overlays(
         &self,
         _: Request<pb::ListOverlaysRequest>,
@@ -2059,7 +2278,56 @@ impl Admin for Service {
                     name,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+
+        // Section 9.13: an application's detours that take more than
+        // previews own an overlay, active while they do, held in memory.
+
+        let mut overlays = overlays;
+        let detours = self.detours();
+        let apps: BTreeSet<&str> = detours.iter().map(|detour| detour.app.as_str()).collect();
+
+        for app in apps {
+            let traffic: Vec<(String, crate::detours::Traffic)> = detours
+                .iter()
+                .filter(|detour| detour.app == app)
+                .filter_map(|detour| {
+                    crate::detours::Traffic::parse(&detour.traffic)
+                        .ok()
+                        .map(|traffic| (detour.release.clone(), traffic))
+                })
+                .collect();
+            let takings: Vec<crate::detours::Taking<'_>> = traffic
+                .iter()
+                .map(|(release, traffic)| crate::detours::Taking {
+                    app,
+                    release,
+                    traffic,
+                })
+                .collect();
+            let changes = crate::detours::changes(&takings);
+
+            if changes.is_empty() {
+                continue;
+            }
+
+            let since = detours
+                .iter()
+                .filter(|detour| detour.app == app)
+                .map(|detour| u64::try_from(detour.opened_unix_ms).unwrap_or_default())
+                .min()
+                .unwrap_or_default();
+            overlays.push(pb::OverlayInfo {
+                name: crate::detours::overlay_name(app),
+                active: true,
+                state: crate::detours::OVERLAY_SOURCE.to_owned(),
+                since_unix_ms: since,
+                trigger: "its detour".to_owned(),
+                changes,
+                ..Default::default()
+            });
+        }
+
         Ok(Response::new(pb::ListOverlaysResponse { overlays }))
     }
 
@@ -2068,6 +2336,16 @@ impl Admin for Service {
         request: Request<pb::ControlOverlayRequest>,
     ) -> Result<Response<pb::ControlOverlayResponse>, Status> {
         let request = request.into_inner();
+
+        // Section 9.13: a detour's overlay lives and ends with the detour.
+
+        if crate::detours::is_overlay(&request.name) {
+            return Err(Status::failed_precondition(format!(
+                "{} is a detour's, which begins and ends with the detour's traffic: muructl \
+                 detour traffic changes it",
+                request.name
+            )));
+        }
 
         let action = match request.action.as_str() {
             "activate" => crate::daemon::OverlayAction::Activate {
@@ -4192,6 +4470,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
 
     pb::Release {
         traffic: String::new(),
+        detour: None,
         app: release.app,
         id: release.id,
         state: release.state.as_str().to_owned(),

@@ -35,6 +35,8 @@ use crate::scaling::{GroupScaling, Step, decision_message};
 use crate::servers::{Servers, ServersRecord};
 use crate::store::Store;
 
+mod detouring;
+
 /// How long a release may take from its host starting to every worker
 /// listening (section 9.1 startup timeout, provisional).
 const START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -696,6 +698,42 @@ pub enum Command {
         /// Answered with a sentence about what happened.
         done: oneshot::Sender<Result<String, String>>,
     },
+    /// Section 9.13: open a detour for a development run.
+    OpenDetour {
+        /// What the run asked for.
+        opening: crate::detours::Opening,
+        /// The stream to the run, for later messages.
+        updates: crate::detours::Updates,
+        /// Answered with the first message, or why it was refused, and
+        /// the opening's serial.
+        done: oneshot::Sender<Result<(muru_proto::admin::v1::DetourOpened, u64), String>>,
+    },
+    /// Section 9.13: change what a detour takes.
+    SetDetourTraffic {
+        /// The application.
+        app: String,
+        /// The detour's release.
+        release: String,
+        /// What it is to take.
+        traffic: crate::detours::Traffic,
+        /// Answered with the detour as it is now, or why not.
+        done: oneshot::Sender<Result<muru_proto::admin::v1::Detour, String>>,
+    },
+    /// Section 4.21: mint entry links to a detour's preview.
+    PreviewDetour {
+        /// Which detour, and which of its application's addresses.
+        request: muru_proto::admin::v1::PreviewDetourRequest,
+        /// Answered with the links, or why not.
+        done: oneshot::Sender<Result<muru_proto::admin::v1::DetourPreview, String>>,
+    },
+    /// Section 9.13: a detour's stream ended, from its run's side or the
+    /// daemon's.
+    CloseDetour {
+        /// The opening's serial.
+        serial: u64,
+        /// Why, for the event.
+        reason: String,
+    },
 }
 
 /// What came of what was asked of an overlay (section 9.10).
@@ -947,6 +985,8 @@ pub struct Info {
     /// The instance's ID, kept in the state directory so it is the same
     /// across restarts (section 13.8, issue 805).
     pub instance_id: crate::registry::InstanceId,
+    /// Section 9.13: the open detours, as the daemon last published them.
+    pub detours: std::sync::Mutex<Vec<muru_proto::admin::v1::Detour>>,
 }
 
 /// What runs for one release now, for the API.
@@ -1873,6 +1913,15 @@ struct Daemon {
     service: Option<crate::host::Identity>,
     /// Whether `muructl debug exec` may run code in workers.
     debug_exec: bool,
+    /// Section 9.13: whether development runs may open detours, the
+    /// detours open now by release, and the serial the next opening
+    /// takes. They are kept in memory alone, so a daemon that starts
+    /// again has none.
+    detours_enabled: bool,
+    detours: BTreeMap<(String, String), crate::detours::Detour>,
+    detour_serial: u64,
+    /// When the detours' runs were last checked in the registry.
+    detours_checked: Instant,
     /// The runs the daemon keeps (issue 688), and how many of each
     /// command's it keeps.
     runs: crate::runs::Runs,
@@ -1975,6 +2024,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .locations
         .check_run_dir()
         .map_err(|error| anyhow::anyhow!(error))?;
+
+    // Section 9.13: a system daemon's edge serves real traffic, which a
+    // detour would send to a process owned by whoever opened it.
+
+    if let Some(refusal) =
+        crate::detours::setting_refusal(config.settings.detours, config.locations.mode)
+    {
+        anyhow::bail!(refusal);
+    }
 
     // The file was checked whole when it was read (section 10.3); a
     // reload reads it the same way and applies the difference.
@@ -2185,6 +2243,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         stopping: std::sync::atomic::AtomicBool::new(false),
         cgroup_limits: std::sync::Mutex::new(None),
         instance_id,
+        detours: std::sync::Mutex::new(Vec::new()),
     });
     let underway = crate::commands::Underway::default();
     let runs = crate::runs::Runs::new(
@@ -2365,6 +2424,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         shutdown: settings.shutdown.clone(),
         service,
         debug_exec: settings.debug_exec,
+        detours_enabled: settings.detours,
+        detours: BTreeMap::new(),
+        detour_serial: 0,
+        detours_checked: Instant::now(),
         runs: runs.clone(),
         keep_command_runs: settings.keep_command_runs,
         h2c: settings.h2c.clone(),
@@ -2548,6 +2611,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 daemon.guard_memory();
                 daemon.refresh_client_lists().await;
                 daemon.reconcile_overlays().await;
+                daemon.check_detours().await;
                 daemon.check_clock();
                 daemon.watch_rate_limits(samples.as_deref());
             }
@@ -2560,6 +2624,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .info
         .stopping
         .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // Section 9.13: the detours end with the daemon, and their runs open
+    // them again on the next one.
+
+    daemon.close_detours("the daemon is stopping").await;
 
     // Section 13.3: by default the daemon detaches, leaving hosts and the
     // edge serving for the next daemon to re-adopt; with drain it takes
@@ -3641,10 +3710,38 @@ impl Daemon {
                     ),
                     waiting: pools.iter().map(|pool| pool.waiting as usize).sum(),
                     created: full_time(release.created_unix_ms),
+                    detour: false,
                 });
             }
 
             releases.reverse();
+
+            // Section 9.13: the application's detours, newest of all.
+
+            for detour in self
+                .detours
+                .values()
+                .filter(|detour| detour.app() == app.name)
+            {
+                releases.insert(
+                    0,
+                    ReleaseRow {
+                        id: detour.release.clone(),
+                        state: ReleaseState::Ready.as_str().to_owned(),
+                        message: format!(
+                            "{}, traffic {}",
+                            detour.describe(),
+                            detour.opening.traffic.word()
+                        ),
+                        created: full_time(
+                            u64::try_from(detour.opened_unix_ms).unwrap_or_default(),
+                        ),
+                        detour: true,
+                        ..ReleaseRow::default()
+                    },
+                );
+            }
+
             apps.push(AppRow {
                 name: app.name.clone(),
                 current: app.current.clone().unwrap_or_default(),
@@ -4325,6 +4422,15 @@ impl Daemon {
         let active = crate::overlays::ordered(&overlays, &states);
         let mut routes = self.store.routes().unwrap_or_default();
         crate::overlays::apply_routes(&mut routes, &active);
+
+        // Section 9.13: the detours' overlays, over every declared one.
+
+        let takings = self.detour_takings();
+
+        for route in &mut routes {
+            crate::detours::lay_over(route, &takings);
+        }
+
         let base: BTreeSet<String> = self.maintenance.keys().cloned().collect();
         let maintained = crate::overlays::apply_maintenance(&base, &active);
         (routes, maintained)
@@ -6530,6 +6636,27 @@ impl Daemon {
                 let outcome = self.scale_temporary(&app, &group, change, until).await;
                 let _ = done.send(outcome);
             }
+            Command::OpenDetour {
+                opening,
+                updates,
+                done,
+            } => {
+                let _ = done.send(self.open_detour(opening, updates).await);
+            }
+            Command::SetDetourTraffic {
+                app,
+                release,
+                traffic,
+                done,
+            } => {
+                let _ = done.send(self.set_detour_traffic(&app, &release, traffic).await);
+            }
+            Command::PreviewDetour { request, done } => {
+                let _ = done.send(self.preview_detour(request).await);
+            }
+            Command::CloseDetour { serial, reason } => {
+                self.close_detour(serial, &reason).await;
+            }
             Command::Shutdown { .. } | Command::Upgrade { .. } => {}
         }
     }
@@ -6663,6 +6790,9 @@ impl Daemon {
             .map_err(|error| error.to_string())?;
 
         let id = match id {
+            Some(id) if let Some(refusal) = crate::detours::reserved_release(&id) => {
+                return Err(refusal);
+            }
             Some(id) if valid_name(&id) => id,
             Some(id) => return Err(format!("{id:?} is not a valid release id")),
             None => self
@@ -8284,10 +8414,14 @@ impl Daemon {
             .map(|((app, id), _)| (app, id))
             .collect();
         routable.sort();
-        let included: BTreeSet<(String, String)> = routable
+        let mut included: BTreeSet<(String, String)> = routable
             .iter()
             .map(|(app, id)| ((*app).clone(), (*id).clone()))
             .collect();
+
+        // Section 9.13: a detour takes what its overlay gives it.
+
+        included.extend(self.detours.keys().cloned());
 
         for (name, id) in routable {
             if let Some(running) = self.running.get(&(name.clone(), id.clone())) {
@@ -8316,6 +8450,7 @@ impl Daemon {
                 };
 
                 apps.push(pb::AppWorkers {
+                    preview_secret: String::new(),
                     limits: spec.as_ref().and_then(|spec| spec.limits.message()),
                     app: name.clone(),
                     release: id.clone(),
@@ -8437,6 +8572,10 @@ impl Daemon {
                 });
             }
         }
+
+        // Section 9.13: each detour is a release of its application.
+
+        apps.extend(self.detour_apps(&maintained));
 
         // Section 4.3: with no host declared, the one application that
         // serves takes every request. Nothing is chosen between several,
@@ -8619,10 +8758,11 @@ impl Daemon {
         // rollout chooses among its releases as a route's would.
 
         let default_traffic = if hosts.is_empty() && !default_app.is_empty() {
-            let route = muru_config::Route {
+            let mut route = muru_config::Route {
                 app: default_app.clone(),
                 ..muru_config::Route::default()
             };
+            crate::detours::lay_over(&mut route, &self.detour_takings());
             self.route_traffic(&route, &included, &rollouts)
         } else {
             None
@@ -8655,6 +8795,7 @@ impl Daemon {
                 .iter()
                 .map(muru_edge::access::Override::to_message)
                 .collect(),
+            detours: self.detours_enabled && self.locations.mode != crate::locations::Mode::System,
         }
     }
 
@@ -13637,6 +13778,7 @@ fn upstream_message(name: &str, table: &muru_config::Upstream) -> anyhow::Result
         trust_muru_headers: table.trust_muru_headers,
         sendfile_roots: table.sendfile_roots.clone(),
         sendfile_header: table.sendfile_header.clone().unwrap_or_default(),
+        detour: false,
         connect_timeout_ms: millis(table.connect_timeout.as_deref()),
         probe: health.map(|health| pb::UpstreamProbe {
             path: health.path.clone().unwrap_or_default(),

@@ -1195,7 +1195,8 @@ file again, checks it whole, and applies what changed:
 
 The rest of the file is read when the daemon starts: the `[metrics]`
 table, the `[dashboard]` table's `listen` address, the
-`[overlay_webhook]` table and the `[daemon]` table's `user`. A change to
+`[overlay_webhook]` table and the `[daemon]` table's `user` and
+`detours`. A change to
 those takes effect after `muructl daemon stop` and `muructl daemon
 start` (`systemctl restart muru` under systemd), which detaches from the
 hosts and the edge and takes them back, so it costs no request. A daemon

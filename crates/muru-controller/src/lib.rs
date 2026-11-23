@@ -17,6 +17,7 @@ pub mod conditions;
 pub mod config;
 pub mod daemon;
 pub mod dashboard;
+pub mod detours;
 pub mod diagnostics;
 pub mod disk;
 pub mod edges;

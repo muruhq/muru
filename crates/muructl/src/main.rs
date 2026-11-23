@@ -10,6 +10,7 @@
 mod admin;
 mod browser;
 mod dashboard;
+mod detour;
 mod devcert;
 mod diagnostics;
 mod edge;
@@ -74,6 +75,12 @@ struct Cli {
 enum Command {
     /// Run an application with an embedded controller and edge (development mode).
     Run(Box<RunArgs>),
+
+    /// A development run behind a local daemon's edge, as a release of an application, for as long as it runs.
+    Detour {
+        #[command(subcommand)]
+        command: detour::DetourCommand,
+    },
 
     /// Run one application in a container: configured from the image and the environment, probes and metrics on an admin port, logs on standard output.
     #[command(
@@ -802,6 +809,11 @@ struct RunArgs {
     #[arg(skip)]
     settings_file: Option<PathBuf>,
 
+    /// Set by `muructl detour run`, whose run has no listener of its own
+    /// (section 13.12).
+    #[arg(skip)]
+    detour: bool,
+
     /// One process and one thread, serving without forking, for debuggers.
     /// Implies --processes 1 --threads 1.
     #[arg(long)]
@@ -1094,6 +1106,10 @@ fn running(command: &Command) -> admin::Running {
             daemon_only: args.app().is_some(),
             ..admin::Running::default()
         },
+        Command::Detour { .. } => admin::Running {
+            daemon_only: true,
+            ..admin::Running::default()
+        },
         Command::Scale(_) | Command::Restart(_) | Command::Logging { .. } => admin::Running {
             change: change(words.get(1).map(String::as_str) != Some("status")),
             ..admin::Running::default()
@@ -1106,6 +1122,9 @@ fn running(command: &Command) -> admin::Running {
 fn label_of(command: &Command) -> Option<&str> {
     let label = match command {
         Command::Run(args) => &args.label,
+        Command::Detour {
+            command: detour::DetourCommand::Run(args),
+        } => &args.label,
         Command::Serve(args) => &args.label,
         Command::Up(args)
         | Command::Daemon {
@@ -1129,6 +1148,9 @@ fn outlives_its_reader(command: &Command) -> bool {
     matches!(
         command,
         Command::Run(_)
+            | Command::Detour {
+                command: detour::DetourCommand::Run(_),
+            }
             | Command::Serve(_)
             | Command::ServeStatic(_)
             | Command::Exec(_)
@@ -1257,6 +1279,12 @@ fn main() -> anyhow::Result<()> {
 
     let result = match command {
         Command::Run(args) => runtime.block_on(run(*args)),
+        Command::Detour { command } => match command {
+            detour::DetourCommand::Run(args) => runtime.block_on(detour::run(*args)),
+            detour::DetourCommand::Traffic(args) => runtime.block_on(detour::traffic(args)),
+            detour::DetourCommand::Preview(args) => runtime.block_on(detour::preview(args)),
+            detour::DetourCommand::List(args) => runtime.block_on(detour::list(args)),
+        },
         Command::Serve(args) => runtime.block_on(serve::serve(*args)),
         Command::Probe(args) => serve::probe(args),
         Command::Build(args) => runtime.block_on(provision::build(*args)),
@@ -1996,6 +2024,20 @@ struct Serving {
 }
 
 impl Serving {
+    /// Section 13.12: what a detour leaves of the settings. It has no
+    /// listener, certificate or hosts of its own, and the daemon's edge
+    /// compresses, so those keys are set aside whatever set them.
+    fn for_detour(&mut self) {
+        self.port = None;
+        self.https = false;
+        self.https_only = false;
+        self.https_port = None;
+        self.tls_cert = None;
+        self.tls_key = None;
+        self.hosts.clear();
+        self.compression = false;
+    }
+
     /// Lay the flags over `settings`, the local file and the table
     /// already layered. Reload is on by default in development mode and
     /// off under --allow-public, where only the flag turns it on.
@@ -3510,7 +3552,7 @@ fn interface_label(interface: &str) -> &str {
 /// Development mode: one host with forked workers behind an embedded edge,
 /// replaced by a new one when --reload sees a source change.
 async fn run(args: RunArgs) -> anyhow::Result<()> {
-    run_with(args, None, None).await
+    run_with(args, None, None, None).await
 }
 
 /// What hears a release's relay in a run: its counts go to the metrics
@@ -3909,6 +3951,7 @@ async fn run_with(
     args: RunArgs,
     serve: Option<serve::Mode>,
     serve_settings: Option<print_config::Serve>,
+    detour: Option<detour::Mode>,
 ) -> anyhow::Result<()> {
     let mut resolved = resolve_for(&args, serve.as_ref())?;
     muru_common::log::show_timestamps(resolved.serving.timestamps);
@@ -3974,11 +4017,23 @@ async fn run_with(
 
     if args.print_config {
         let python = interpreter(&args, &resolved, false)?;
-        print!(
-            "{}",
+
+        let report = if detour.is_some() {
+            print_config::for_detour(&args, &resolved, &python.describe())
+        } else {
             print_config::for_run(&args, &resolved, &python.describe())
-        );
+        };
+
+        print!("{report}");
         return Ok(());
+    }
+
+    // Section 13.12: a detour has no listener, certificate or hosts of
+    // its own, and the daemon's edge compresses; the run table's keys for
+    // those are not used, and never refused.
+
+    if detour.is_some() {
+        resolved.serving.for_detour();
     }
 
     if let Some(source) = &resolved.source {
@@ -4034,9 +4089,10 @@ async fn run_with(
     // Section 2.1: the process says what it serves, as `muru run APP` or
     // `muru serve APP`.
 
-    let (title, short) = match &serve {
-        Some(_) => (format!("muru serve {label}"), "muru-serve"),
-        None => (format!("muru run {label}"), "muru-run"),
+    let (title, short) = match (&serve, &detour) {
+        (Some(_), _) => (format!("muru serve {label}"), "muru-serve"),
+        (None, Some(_)) => (format!("muru detour {label}"), "muru-detour"),
+        (None, None) => (format!("muru run {label}"), "muru-run"),
     };
 
     muru_common::title::set(&title, short);
@@ -4105,14 +4161,19 @@ async fn run_with(
         places::check_volume(&resolved.places)?;
     }
 
-    places::make(
-        &resolved.places,
-        if serve.is_some() {
-            0o770
-        } else {
-            muru_controller::places::DATA_MODE
-        },
-    )?;
+    // Section 13.12: a detour with --app-data uses the daemon's, which
+    // the daemon says when the detour opens.
+
+    if !detour.as_ref().is_some_and(|mode| mode.app_data) {
+        places::make(
+            &resolved.places,
+            if serve.is_some() {
+                0o770
+            } else {
+                muru_controller::places::DATA_MODE
+            },
+        )?;
+    }
 
     // Section 4.9: the application's own directories of files, under
     // the project, each checked to exist before anything starts.
@@ -4214,6 +4275,7 @@ async fn run_with(
             &project,
             planned,
         ),
+        None if detour.is_some() => run_admin::Registration::for_detour(&runtime, &label, &project),
         None => run_admin::Registration::for_run(
             &runtime,
             &label,
@@ -4248,6 +4310,43 @@ async fn run_with(
     if serve.is_some() {
         serve::group_writable(&run_dir, 0o770);
     }
+
+    // Section 13.12: the detour's socket is bound and the detour opened
+    // before the host starts, so a refusal ends the run with the daemon's
+    // reason and nothing started, and the daemon's host names and data
+    // directory are known to what starts.
+
+    let detour_opened = match &detour {
+        Some(mode) => {
+            let (listener, socket) = detour::bind(&run_dir)?;
+            let instance_id = registration
+                .as_ref()
+                .map(|registration| registration.id.to_string())
+                .unwrap_or_default();
+            let request = detour::request(mode, &socket, &instance_id, &project);
+
+            let (stream, opened) = match detour::open(&mode.daemon, &request).await {
+                Ok(open) => open,
+                Err(error) => {
+                    drop(registration);
+                    let _ = std::fs::remove_dir_all(&run_dir);
+                    return Err(error);
+                }
+            };
+
+            if mode.app_data {
+                resolved.places.data = Some(muru_config::places::DataDirs {
+                    data: PathBuf::from(&opened.data_dir),
+                    media: PathBuf::from(&opened.media_dir),
+                    uploads: PathBuf::from(&opened.uploads_dir),
+                });
+                places::make(&resolved.places, muru_controller::places::DATA_MODE)?;
+            }
+
+            Some((listener, stream, opened, request))
+        }
+        None => None,
+    };
 
     let mut spec = host_spec(
         &args,
@@ -4404,9 +4503,11 @@ async fn run_with(
     // is trusted without setup; muructl serve trusts the proxies it is
     // told to (section 13.9).
 
-    let trust = serve
-        .as_ref()
-        .map_or_else(muru_edge::proxy::Trust::loopback, |mode| mode.trust.clone());
+    let trust = match (&serve, &detour) {
+        (Some(mode), _) => mode.trust.clone(),
+        (None, Some(_)) => muru_edge::proxy::Trust::detour(),
+        (None, None) => muru_edge::proxy::Trust::loopback(),
+    };
 
     let spool = match &serve {
         Some(mode) => Some(
@@ -4425,7 +4526,7 @@ async fn run_with(
 
     let import_reports = Arc::new(run_admin::ImportReports::default());
 
-    let edge = match muru_edge::Edge::bind(muru_edge::Config {
+    let edge_config = muru_edge::Config {
         listen: http_address,
         app: label.clone(),
         release: "r1".to_owned(),
@@ -4451,9 +4552,24 @@ async fn run_with(
         spool: spool.clone(),
         rate_buckets: None,
         recorder: recorder.clone(),
-    })
-    .await
-    {
+    };
+
+    // Section 13.12: a detour's edge serves its socket alone, which was
+    // bound before the host started.
+
+    let (detour_socket, detour_held) = match detour_opened {
+        Some((listener, stream, opened, request)) => {
+            (Some(listener), Some((stream, opened, request)))
+        }
+        None => (None, None),
+    };
+
+    let bound = match detour_socket {
+        Some(listener) => muru_edge::Edge::bind_unix(edge_config, listener).await,
+        None => muru_edge::Edge::bind(edge_config).await,
+    };
+
+    let edge = match bound {
         Ok(edge) => edge,
         Err(error) => {
             current.stop(stop_budget).await;
@@ -4461,6 +4577,7 @@ async fn run_with(
             return Err(explain_bind_error(error, https_address));
         }
     };
+
     let written = edge.access_log();
 
     // Section 11.3: SIGUSR1 opens the access log file again by name, as
@@ -4477,15 +4594,22 @@ async fn run_with(
         }
     });
 
-    let addresses = match edge.https_addr() {
-        Some(https) if resolved.serving.https_only => {
+    let addresses = match (edge.https_addr(), &detour_held) {
+        (_, Some((_, opened, _))) => format!(
+            "detour {} of the daemon at {}",
+            detour::name(opened),
+            detour
+                .as_ref()
+                .map_or_else(String::new, |mode| mode.daemon.display().to_string())
+        ),
+        (Some(https), _) if resolved.serving.https_only => {
             format!(
                 "https://{https} (http://{} redirects to it)",
                 edge.local_addr()
             )
         }
-        Some(https) => format!("http://{} and https://{https}", edge.local_addr()),
-        None => format!("http://{}", edge.local_addr()),
+        (Some(https), _) => format!("http://{} and https://{https}", edge.local_addr()),
+        (None, _) => format!("http://{}", edge.local_addr()),
     };
 
     // The workers said in HELLO what they are and how much they take at
@@ -4582,6 +4706,33 @@ async fn run_with(
 
     if serve.is_some() {
         // Section 13.9: a container's production command needs no warning.
+    } else if let (Some(mode), Some((_, opened, _))) = (&detour, &detour_held) {
+        // Section 13.12: what the detour takes, and what the run keeps of
+        // development mode behind the daemon.
+
+        let traffic = opened
+            .detour
+            .as_ref()
+            .map(|detour| detour.traffic.clone())
+            .unwrap_or_default();
+        muru_common::muru_println!(
+            "traffic: {}{}",
+            detour::takes(&traffic, &mode.app),
+            if traffic == "preview" {
+                "; muructl detour preview gives an entry link"
+            } else {
+                ""
+            }
+        );
+        muru_common::muru_println!(
+            "development mode: error pages show tracebacks, no releases are kept{}, and the \
+             daemon's edge serves the clients and compresses; Ctrl-C ends the detour",
+            if resolved.serving.reload {
+                ", the run reloads on change"
+            } else {
+                ""
+            }
+        );
     } else if development {
         muru_common::muru_println!(
             "development mode: error pages show tracebacks, no releases are kept{} and only \
@@ -4604,7 +4755,14 @@ async fn run_with(
     // into HTML pages, which the start-up says.
 
     if development && serve.is_none() {
-        edge.links().set_hosts(resolved.serving.hosts.clone());
+        match &detour_held {
+            Some((_, opened, _)) => {
+                edge.links().set_hosts(opened.hosts.clone());
+                edge.links()
+                    .set_detour(opened.detour.as_ref().map(|detour| detour.traffic.clone()));
+            }
+            None => edge.links().set_hosts(resolved.serving.hosts.clone()),
+        }
 
         if resolved.serving.toolbar {
             edge.links().set_toolbar();
@@ -4642,9 +4800,13 @@ async fn run_with(
         label.clone(),
         resolved.entrypoint.clone(),
         groups,
-        std::iter::once(edge.local_addr())
-            .chain(edge.https_addr())
-            .collect(),
+        if detour.is_some() {
+            Vec::new()
+        } else {
+            std::iter::once(edge.local_addr())
+                .chain(edge.https_addr())
+                .collect()
+        },
         Arc::clone(&release_number),
     );
     run_processes.host(current.pid(), current.relay_pid());
@@ -4821,9 +4983,13 @@ async fn run_with(
     let mut admin_serving = None;
 
     if let Some(registration) = &registration {
-        let bound: Vec<SocketAddr> = std::iter::once(edge.local_addr())
-            .chain(edge.https_addr())
-            .collect();
+        let bound: Vec<SocketAddr> = if detour.is_some() {
+            Vec::new()
+        } else {
+            std::iter::once(edge.local_addr())
+                .chain(edge.https_addr())
+                .collect()
+        };
         registration.served(&bound, dashboard_address);
 
         if let Some(directory) = &library.pythonpath {
@@ -4850,7 +5016,10 @@ async fn run_with(
     // its process id, written beside its admin socket, for a script that
     // started it in the background to stop exactly that run.
 
-    let mut title = format!("{title} {}", edge.local_addr());
+    let mut title = match &detour_held {
+        Some((_, opened, _)) => format!("{title} {}", detour::name(opened)),
+        None => format!("{title} {}", edge.local_addr()),
+    };
 
     if let Some(address) = dashboard_address {
         title.push_str(&format!(" dashboard {address}"));
@@ -4871,7 +5040,10 @@ async fn run_with(
     }
 
     if let Some(registration) = &registration {
-        let mut listeners = vec![format!("http://{}", edge.local_addr())];
+        let mut listeners = match &detour_held {
+            Some((_, opened, _)) => vec![format!("detour {}", detour::name(opened))],
+            None => vec![format!("http://{}", edge.local_addr())],
+        };
 
         if let Some(https) = edge.https_addr() {
             listeners.push(format!("https://{https}"));
@@ -4924,9 +5096,9 @@ async fn run_with(
                         other.project == project && other.socket != registration.socket
                     }) {
                         muru_common::muru_println!(
-                            "another development run of this project is listening, {} on http://{}; {} reaches it",
+                            "another development run of this project is listening, {} {}; {} reaches it",
                             other.app,
-                            other.listen,
+                            other.on(),
                             admin::reach_run(&other.socket, &records)
                         );
                     }
@@ -4936,6 +5108,16 @@ async fn run_with(
             }
             Err(error) => muru_common::muru_println!("no admin socket: {error:#}"),
         }
+    }
+
+    // Section 13.12: --open-preview opens an entry link once the detour
+    // is open; the edge takes it once it runs, below.
+
+    if let (Some(mode), Some((_, opened, _))) = (&detour, &detour_held)
+        && mode.open_preview
+        && let Err(error) = detour::open_preview(&mode.daemon, opened).await
+    {
+        muru_common::muru_println!("no preview link: {error:#}");
     }
 
     // Issue 815: the browser opens on the run's own URL once, now that it
@@ -5033,6 +5215,19 @@ async fn run_with(
             limits: Arc::clone(&run_processes.limits),
         });
     }
+
+    // Section 13.12: the detour is held open while the run runs, and
+    // opened again when its stream ends.
+
+    let holding = match (&detour, detour_held) {
+        (Some(mode), Some((stream, _, request))) => Some(detour::hold(
+            stream,
+            mode.daemon.clone(),
+            request,
+            edge.links(),
+        )),
+        _ => None,
+    };
 
     let pools = edge.pools();
     let drainer = edge.drainer();
@@ -5400,6 +5595,14 @@ async fn run_with(
             }
         }
     };
+
+    // Section 13.12: the detour ends first, so the daemon sends its
+    // traffic back to the serving release while the requests in flight
+    // here finish.
+
+    if let Some(holding) = holding {
+        holding.abort();
+    }
 
     // Section 13.9: readiness fails first, so a platform stops sending
     // traffic while the requests in flight finish.

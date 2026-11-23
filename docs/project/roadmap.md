@@ -146,7 +146,11 @@ taken up between the steps of the major goals, in no fixed order.
   showing what Muru knows about the request behind each page, from the
   edge's queue down to the application's SQL, with the same record on
   the dashboard, in `muructl` and through the MCP server
-  ([#642](https://github.com/muruhq/muru/issues/642)).
+  ([#642](https://github.com/muruhq/muru/issues/642)); and detours, a
+  development run served through a local daemon's routing as a release
+  of the application, preview only until asked for more, with reload,
+  the toolbar and tracebacks kept
+  ([#873](https://github.com/muruhq/muru/issues/873)).
 
 - **Traffic and configuration:** overlays triggered by conditions over
   Muru's own signals

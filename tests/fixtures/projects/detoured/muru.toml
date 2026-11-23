@@ -1,0 +1,6 @@
+entrypoint = "detoured:wsgi_app"
+threads = 2
+
+[mounts.ws]
+path = "/ws"
+entrypoint = "detoured:asgi_app"

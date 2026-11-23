@@ -1183,6 +1183,54 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "detours",
+            description: "The daemon's detours, development runs it routes to as releases of an application while they run: list them, or give a one-time entry link to one's preview (link), valid for a minute, which a browser follows to get the preview cookie, with the Muru-Preview header value (header) for a client that sends headers instead.",
+            changes: false,
+            properties: json!({
+                "action": {"type": "string", "enum": ["list", "link"]},
+                "detour": {"type": "string", "description": "For link: the detour, by its release, application, label, tag or the start of its ID; the project's application's, or the one open, when left out"},
+                "host": {"type": "string", "description": "For link: one of the application's hosts, in place of its best address"},
+            }),
+            required: &["action"],
+            command: |arguments| match needed(arguments, "action")?.as_str() {
+                "list" => Ok(words(&["detour", "list"])),
+                "link" => {
+                    let mut command = words(&["detour", "preview", "--print"]);
+
+                    if let Some(detour) = text(arguments, "detour") {
+                        command.push(detour);
+                    }
+
+                    if let Some(host) = text(arguments, "host") {
+                        command.extend(["--host".to_owned(), host]);
+                    }
+
+                    Ok(command)
+                }
+                other => Err(format!("{other:?} is not list or link")),
+            },
+        },
+        Spec {
+            name: "detour_traffic",
+            description: "Change what a detour takes: preview (only browsers with its preview cookie), all (every request for its application), share=N (N percent of its clients) or class=NAME (a client class the daemon defines). Anything but preview is an overlay the detour owns, which ends with it.",
+            changes: true,
+            properties: json!({
+                "detour": {"type": "string", "description": "The detour, by its release, application, label, tag or the start of its ID; the project's application's, or the one open, when left out"},
+                "traffic": {"type": "string", "description": "preview, all, share=N or class=NAME"},
+            }),
+            required: &["traffic"],
+            command: |arguments| {
+                let mut command = words(&["detour", "traffic"]);
+
+                if let Some(detour) = text(arguments, "detour") {
+                    command.push(detour);
+                }
+
+                command.push(needed(arguments, "traffic")?);
+                Ok(command)
+            },
+        },
+        Spec {
             name: "overlay_preview",
             description: "What activating an overlay now would change, without activating it.",
             changes: false,
@@ -1835,6 +1883,28 @@ mod tests {
         assert_eq!(
             command("list", json!({"what": "releases", "app": "shop"})),
             Ok(vec!["release".into(), "list".into(), "shop".into()])
+        );
+        assert_eq!(
+            command("detours", json!({"action": "list"})),
+            Ok(vec!["detour".into(), "list".into()])
+        );
+        assert_eq!(
+            command(
+                "detours",
+                json!({"action": "link", "detour": "feature-x", "host": "shop.localhost"})
+            ),
+            Ok(vec![
+                "detour".into(),
+                "preview".into(),
+                "--print".into(),
+                "feature-x".into(),
+                "--host".into(),
+                "shop.localhost".into()
+            ])
+        );
+        assert_eq!(
+            command("detour_traffic", json!({"traffic": "all"})),
+            Ok(vec!["detour".into(), "traffic".into(), "all".into()])
         );
         assert_eq!(
             command(

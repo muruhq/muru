@@ -74,6 +74,13 @@ Request headers whose names contain an underscore are dropped whatever
 the setting, so `X_Forwarded_For` can never reach an application as
 `HTTP_X_FORWARDED_FOR`.
 
+**The request's ID.** An `X-Request-ID` from a trusted peer, of 1 to 200
+visible ASCII characters, is the request's ID: the access log, error
+pages, the `X-Request-ID` response header and the application's
+`muru.request_id` carry it, so the proxy's records and Muru's match.
+From any other peer, or when it is not well formed, the edge makes its
+own.
+
 **HTTPS.** A request forwarded with `X-Forwarded-Proto: https` counts as
 secure: a virtual host that asks for HTTPS does not redirect it, and the
 application sees `https`.

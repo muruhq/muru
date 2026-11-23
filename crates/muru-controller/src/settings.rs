@@ -80,6 +80,8 @@ pub struct NodeSettings {
     /// Whether `muructl debug exec` may run code in workers (section
     /// 11.7).
     pub debug_exec: bool,
+    /// Whether development runs may open detours (section 9.13).
+    pub detours: bool,
     /// Section 8.7: the variables of the daemon's own environment passed
     /// to a release's processes beside the base, by name or `PREFIX*`.
     pub pass_env: Vec<String>,
@@ -211,6 +213,7 @@ impl NodeSettings {
                 .clone()
                 .or_else(|| daemon.and_then(|table| table.user.clone())),
             debug_exec: daemon.and_then(|table| table.debug_exec).unwrap_or(false),
+            detours: daemon.and_then(|table| table.detours).unwrap_or(false),
             pass_env: pass_env_from(daemon)?,
             keep_command_runs: keep_command_runs_from(daemon)?,
             budget,

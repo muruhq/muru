@@ -287,10 +287,14 @@ impl Request {
 pub struct Links {
     dashboard: OnceLock<String>,
     /// The run's own host names besides loopback, which the reserved
-    /// prefix answers to (section 4.20).
-    hosts: OnceLock<Vec<String>>,
+    /// prefix answers to (section 4.20); a detour's come from the daemon
+    /// each time it opens.
+    hosts: std::sync::RwLock<Vec<String>>,
     /// The toolbar goes into the run's HTML pages.
     toolbar: std::sync::atomic::AtomicBool,
+    /// Section 13.12: what a detour's run takes, for the toolbar's badge,
+    /// as `preview` or `all`; none for any other run.
+    detour: std::sync::RwLock<Option<String>>,
 }
 
 impl Links {
@@ -313,9 +317,19 @@ impl Links {
     }
 
     /// Name the run's own host names besides loopback, which the
-    /// reserved prefix answers to. The first call wins.
+    /// reserved prefix answers to, in place of those named before.
     pub fn set_hosts(&self, hosts: Vec<String>) {
-        let _ = self.hosts.set(hosts);
+        *self.hosts.write().expect("hosts poisoned") = hosts;
+    }
+
+    /// Say what the run's detour takes, for the toolbar's badge.
+    pub fn set_detour(&self, traffic: Option<String>) {
+        *self.detour.write().expect("detour poisoned") = traffic;
+    }
+
+    /// What the run's detour takes, when the run is a detour.
+    pub fn detour(&self) -> Option<String> {
+        self.detour.read().expect("detour poisoned").clone()
     }
 
     /// Insert the toolbar into the run's HTML pages.
@@ -330,8 +344,8 @@ impl Links {
 
     /// The run's own host names the reserved prefix answers to, besides
     /// loopback.
-    pub fn hosts(&self) -> &[String] {
-        self.hosts.get().map_or(&[], Vec::as_slice)
+    pub fn hosts(&self) -> Vec<String> {
+        self.hosts.read().expect("hosts poisoned").clone()
     }
 
     /// The dashboard's page for a request, when the dashboard is on.

@@ -87,4 +87,13 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | TriggerOverlay | POST /v1/overlays/{overlay}:trigger (signed webhook) | external trigger from monitoring systems |
 | ClassifyRequest | POST /v1/client-classes:test | classify a sample request |
 
+**Detours** (section 10.12), on the admin socket only
+
+| RPC | Gateway | Purpose |
+| --- | --- | --- |
+| OpenDetour | none | open a detour of an application on the run's Unix socket and hold it while the stream is open; the first message names the release, the application's host names and data directory, later ones carry traffic changes |
+| ListDetours | none | the open detours, never a secret |
+| SetDetourTraffic | none | preview, all, share=N or class=NAME |
+| PreviewDetour | none | mint one-time entry links for the application's addresses, or give the Muru-Preview header value |
+
 Message shapes are defined in proto/muru/admin/v1 during phase 2, and an OpenAPI description of the JSON gateway is generated from them and published with the documentation. This appendix fixes the surface so that every capability in the spec is reachable.

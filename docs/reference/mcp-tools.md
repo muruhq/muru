@@ -38,6 +38,7 @@ it out.
 | `websockets` | reads | `muructl websockets` | `app`, `list` |
 | `requests` | reads | `muructl requests` | `app`, `list` |
 | `overlay_preview` | reads | `muructl overlay preview` | `name` |
+| `detours` | reads | `muructl detour list`, or with `link` `muructl detour preview --print`: a one-time entry link to a detour's preview, valid for a minute, with the `Muru-Preview` header value | `action` (list, link), `detour`, `host` |
 | `skill_status` | reads | `muructl mcp skill status` | none |
 | `docs` | reads | The user guide embedded in `muructl`: the list of pages, or one page's Markdown | `page` |
 | `deploy` | changes | `muructl deploy` | `app`, `source`, `entrypoint`, `python`, `hold`, `wait` (default true), `dry_run` |
@@ -48,6 +49,7 @@ it out.
 | `scale` | changes | `muructl scale` | `target`, `group`, `processes`, `unpin` |
 | `run_command` | changes | `muructl command run`, the output returned as an array of lines (the last 500) with `exit_code`, `ok` and `message`, as a tool error unless `ok`: the command exited with 0 and was not stopped; with `detach`, `muructl command run --detach`, answering with the `run` id at once | `target`, `name`, `inputs` (an object), `secret_inputs` (an object of STORE/KEY references), `detach` |
 | `stop_command_run` | changes | `muructl command stop` | `run` |
+| `detour_traffic` | changes | `muructl detour traffic` | `detour`, `traffic` (preview, all, share=N, class=NAME) |
 | `restart` | changes | `muructl restart` | `target`, `worker`, `all`, `force` |
 | `overlay` | changes | `muructl overlay activate`, `end` or `promote` | `action`, `name`, `for` |
 | `maintenance` | changes | `muructl maintenance on` or `off` | `app` or `host`, `on` |

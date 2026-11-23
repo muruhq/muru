@@ -17,6 +17,11 @@
 
   const id = script.dataset.request;
   const dashboard = script.dataset.dashboard;
+
+  // Section 13.12: a detour's run says what its detour takes, which the
+  // badge shows, with a way out of preview.
+
+  const detour = script.dataset.detour;
   const nonce = script.nonce;
   const base = script.src.replace(/toolbar\.js(\?.*)?$/, "");
   const prefixPath = new URL(base, location.href).pathname;
@@ -112,6 +117,10 @@
   const summary = (found) => {
     badge.replaceChildren(element("span", "name", "muru"));
 
+    if (detour) {
+      badge.append(element("span", "detour", `detour: ${detour}`));
+    }
+
     if (!found) {
       badge.append(element("span", "muted", "record no longer kept"));
       return;
@@ -192,6 +201,12 @@
       link.target = "_blank";
       link.rel = "noopener";
       footer.append(link);
+    }
+
+    if (detour) {
+      const leave = element("a", "", "leave preview");
+      leave.href = "/_muru/preview/leave";
+      footer.append(leave);
     }
   };
 

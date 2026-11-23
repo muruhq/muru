@@ -177,6 +177,8 @@ pub enum KindArg {
     Run,
     /// `muructl serve`.
     Serve,
+    /// `muructl detour run`.
+    Detour,
 }
 
 impl KindArg {
@@ -185,6 +187,7 @@ impl KindArg {
             Self::Daemon => Kind::Daemon,
             Self::Run => Kind::Run,
             Self::Serve => Kind::Serve,
+            Self::Detour => Kind::Detour,
         }
     }
 }
@@ -892,7 +895,7 @@ fn where_column(row: &Row) -> String {
     }
 
     match (record.kind, &record.project, &record.app) {
-        (Kind::Run | Kind::Serve, Some(project), Some(app)) => {
+        (Kind::Run | Kind::Serve | Kind::Detour, Some(project), Some(app)) => {
             format!("{} ({app})", shortened(project))
         }
         _ => record
@@ -1201,7 +1204,8 @@ pub async fn plan(args: &PruneArgs) -> anyhow::Result<Plan> {
             id: row.record.id.to_string(),
             state: row.state.word().to_owned(),
             registry: path,
-            run_dir: (row.record.kind == Kind::Run).then(|| row.record.run_dir.clone()),
+            run_dir: matches!(row.record.kind, Kind::Run | Kind::Detour)
+                .then(|| row.record.run_dir.clone()),
         };
 
         match row.state {
