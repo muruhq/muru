@@ -1390,6 +1390,11 @@ async fn serve<I>(
                 ));
             }
             let forwarded = routing.trust_on(&local).resolve(&peer, &mut parts.headers);
+
+            // Section 4.19: a trusted proxy's own identifier for the
+            // request stands, so its records and the edge's match.
+
+            let base_id = forwarded.request_id.clone().unwrap_or(base_id);
             let accept_encoding = parts.headers.get(http::header::ACCEPT_ENCODING).cloned();
             let method = parts.method.clone();
 
