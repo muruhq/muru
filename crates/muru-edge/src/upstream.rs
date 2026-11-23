@@ -292,6 +292,9 @@ struct Shared {
     /// speaks TLS.
     tls: Option<(Arc<rustls::ClientConfig>, Option<String>)>,
     trust_muru_headers: bool,
+    /// Section 4.21: a detour's run, whose protocol is chosen request by
+    /// request.
+    detour: bool,
     /// The file hints by path the upstream may give when trusted
     /// (section 4.9).
     sendfile: Arc<crate::routing::Sendfile>,
@@ -300,6 +303,33 @@ struct Shared {
     eject_for: Duration,
     /// The address the next request starts with.
     next: AtomicUsize,
+}
+
+impl Shared {
+    /// The protocol a request goes over: the upstream's, or for a detour
+    /// h2c when the request is gRPC (gRPC-Web included, which the run's
+    /// edge translates) and HTTP/1.1 otherwise (section 4.21).
+    fn protocol_for(&self, headers: &HeaderMap) -> Protocol {
+        if !self.detour {
+            return self.protocol;
+        }
+
+        if crate::grpc::Protocol::of(headers).is_some() {
+            Protocol::H2c
+        } else {
+            Protocol::Http1
+        }
+    }
+}
+
+/// Whether the client said it takes trailers, as a gRPC client does.
+fn wants_trailers(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(http::header::TE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|option| option.trim().eq_ignore_ascii_case("trailers"))
 }
 
 /// An upstream of a snapshot.
@@ -370,6 +400,7 @@ impl Upstream {
             protocol,
             tls,
             trust_muru_headers: message.trust_muru_headers,
+            detour: message.detour,
             sendfile: crate::routing::Sendfile::new(
                 &message.sendfile_roots,
                 &message.sendfile_header,
@@ -571,10 +602,15 @@ enum Sender {
     Http2(http2::SendRequest<OutBody>),
 }
 
-/// A connection ready to take a request: an idle one, unless `fresh`
-/// asks for a new one, else a new one.
-async fn sender_for(shared: &Shared, address: &Address, fresh: bool) -> std::io::Result<Sender> {
-    if shared.protocol.is_h2() {
+/// A connection ready to take a request over `protocol`: an idle one,
+/// unless `fresh` asks for a new one, else a new one.
+async fn sender_for(
+    shared: &Shared,
+    address: &Address,
+    protocol: Protocol,
+    fresh: bool,
+) -> std::io::Result<Sender> {
+    if protocol.is_h2() {
         let existing = address.h2.lock().expect("upstream h2 poisoned").clone();
 
         if let Some(sender) = existing
@@ -695,18 +731,19 @@ enum Failure {
 /// the body has arrived.
 type Answer = (Response<Incoming>, Option<http1::SendRequest<OutBody>>);
 
-/// Send the request in `slot` to an address and wait for the response
-/// head, on a new connection when `fresh`. A request that was never sent
-/// goes back into the slot.
+/// Send the request in `slot` to an address over `protocol` and wait for
+/// the response head, on a new connection when `fresh`. A request that
+/// was never sent goes back into the slot.
 async fn send(
     shared: &Shared,
     address: &Address,
+    protocol: Protocol,
     slot: &mut Option<Request<OutBody>>,
     deadline: Instant,
     fresh: bool,
 ) -> Result<Answer, Failure> {
     loop {
-        let sender = match sender_for(shared, address, fresh).await {
+        let sender = match sender_for(shared, address, protocol, fresh).await {
             Ok(sender) => sender,
             Err(error) => return Err(Failure::Unsent(error.to_string())),
         };
@@ -945,7 +982,13 @@ pub async fn handle(
         return Handled::Response(failing.too_large());
     }
 
-    if upgrade.is_some() && shared.protocol.is_h2() {
+    // Section 4.21: a detour is reached over h2c for gRPC, which needs
+    // HTTP/2 end to end, and over HTTP/1.1 for everything else, upgrades
+    // included.
+
+    let protocol = shared.protocol_for(&parts.headers);
+
+    if upgrade.is_some() && protocol.is_h2() {
         return Handled::Response(failing.respond(Problem::new(
             StatusCode::BAD_GATEWAY,
             FAILED_REASON,
@@ -966,7 +1009,12 @@ pub async fn handle(
         && let Some(incoming) = body.as_mut()
         && !incoming.is_end_stream()
     {
-        if content_length.is_none() {
+        // A detour's gRPC call streams its body, as a client stream must;
+        // HTTP/2 needs no length.
+
+        let streams = shared.detour && protocol.is_h2();
+
+        if content_length.is_none() && !streams {
             match link::read_body(incoming, limits.max_body_size).await {
                 Ok(data) => payload = Payload::Buffered(data),
                 Err(BodyError::TooLarge) => return Handled::Response(failing.too_large()),
@@ -985,7 +1033,14 @@ pub async fn handle(
     }
 
     let host = requested_host(parts, context);
-    let headers = outgoing_headers(parts, context, &host, upgrade.is_some());
+    let mut headers = outgoing_headers(parts, context, &host, upgrade.is_some());
+
+    // gRPC servers look for `te: trailers`, the one value HTTP/2 allows,
+    // which goes as a hop-by-hop header otherwise.
+
+    if shared.detour && protocol.is_h2() && wants_trailers(&parts.headers) {
+        headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
+    }
 
     let length = match &payload {
         Payload::Empty => None,
@@ -1049,6 +1104,7 @@ pub async fn handle(
     let mut slot = Some(build_request(
         parts,
         shared,
+        protocol,
         &host,
         headers,
         length,
@@ -1080,7 +1136,7 @@ pub async fn handle(
         let mut fresh = false;
 
         let outcome = loop {
-            match send(shared, address, &mut slot, deadline, fresh).await {
+            match send(shared, address, protocol, &mut slot, deadline, fresh).await {
                 Err(Failure::Dropped(error)) => match again.take() {
                     Some((payload, headers)) => {
                         tracing::debug!(
@@ -1092,6 +1148,7 @@ pub async fn handle(
                         slot = Some(build_request(
                             parts,
                             shared,
+                            protocol,
                             &host,
                             headers,
                             length,
@@ -1417,11 +1474,13 @@ fn outgoing_headers(
     headers
 }
 
-/// The request as sent: origin form over HTTP/1.1, the full URI with
-/// the host as its authority over HTTP/2.
+/// The request as sent over `protocol`: origin form over HTTP/1.1, the
+/// full URI with the host as its authority over HTTP/2.
+#[allow(clippy::too_many_arguments)]
 fn build_request(
     parts: &http::request::Parts,
     shared: &Shared,
+    protocol: Protocol,
     host: &str,
     mut headers: HeaderMap,
     length: Option<u64>,
@@ -1432,7 +1491,7 @@ fn build_request(
         .path_and_query()
         .map_or_else(|| parts.uri.path().to_owned(), |target| target.to_string());
 
-    let (uri, version) = if shared.protocol.is_h2() {
+    let (uri, version) = if protocol.is_h2() {
         headers.remove(HOST);
         (
             format!("{}://{host}{target}", scheme(shared))
@@ -1581,5 +1640,80 @@ mod tests {
         assert_eq!(with("timeout=1"), Duration::ZERO);
         assert_eq!(with("timeout=600"), IDLE_FOR);
         assert_eq!(with("timeout=soon"), IDLE_FOR);
+    }
+
+    #[test]
+    fn a_detour_takes_grpc_over_h2c_and_everything_else_over_http1() {
+        let upstream = |detour: bool, protocol: &str| {
+            Upstream::from_message(&pb::Upstream {
+                name: "shop@dev-7f3a".to_owned(),
+                addresses: vec!["unix:/run/user/1000/muru/run-1/detour.sock".to_owned()],
+                protocol: protocol.to_owned(),
+                detour,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let typed = |content_type: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_str(content_type).unwrap(),
+            );
+            headers
+        };
+
+        let detour = upstream(true, "http1");
+
+        for grpc in [
+            "application/grpc",
+            "application/grpc+proto",
+            "application/grpc+json",
+            "application/grpc-web+proto",
+            "application/grpc-web-text",
+        ] {
+            assert_eq!(
+                detour.shared.protocol_for(&typed(grpc)),
+                Protocol::H2c,
+                "{grpc}"
+            );
+        }
+
+        for other in ["text/html", "application/json"] {
+            assert_eq!(
+                detour.shared.protocol_for(&typed(other)),
+                Protocol::Http1,
+                "{other}"
+            );
+        }
+
+        assert_eq!(
+            detour.shared.protocol_for(&HeaderMap::new()),
+            Protocol::Http1
+        );
+
+        // Any other upstream keeps the protocol it was given, gRPC or not.
+
+        let plain = upstream(false, "http1");
+        assert_eq!(
+            plain.shared.protocol_for(&typed("application/grpc")),
+            Protocol::Http1
+        );
+        let h2c = upstream(false, "h2c");
+        assert_eq!(h2c.shared.protocol_for(&typed("text/html")), Protocol::H2c);
+    }
+
+    #[test]
+    fn trailers_are_asked_for_by_te_among_other_options() {
+        let te = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::TE, HeaderValue::from_str(value).unwrap());
+            headers
+        };
+
+        assert!(wants_trailers(&te("trailers")));
+        assert!(wants_trailers(&te("gzip, Trailers")));
+        assert!(!wants_trailers(&te("gzip")));
+        assert!(!wants_trailers(&HeaderMap::new()));
     }
 }

@@ -13733,6 +13733,7 @@ fn upstream_message(name: &str, table: &muru_config::Upstream) -> anyhow::Result
         trust_muru_headers: table.trust_muru_headers,
         sendfile_roots: table.sendfile_roots.clone(),
         sendfile_header: table.sendfile_header.clone().unwrap_or_default(),
+        detour: false,
         connect_timeout_ms: millis(table.connect_timeout.as_deref()),
         probe: health.map(|health| pb::UpstreamProbe {
             path: health.path.clone().unwrap_or_default(),

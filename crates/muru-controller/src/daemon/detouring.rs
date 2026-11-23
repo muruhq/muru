@@ -279,6 +279,7 @@ impl Daemon {
                         addresses: vec![detour.address()],
                         protocol: "http1".to_owned(),
                         trust_muru_headers: true,
+                        detour: true,
                         ..Default::default()
                     }),
                     release: detour.release.clone(),
