@@ -938,6 +938,26 @@ pub fn remove_stale(registry: &Path, id: InstanceId) -> std::io::Result<bool> {
 mod tests {
     use super::*;
 
+    /// Whether the entry of `id` reads as stale within the moment a
+    /// takeover or a prune waits (see [`LOCK_TRIES`]). Its lock can be
+    /// held for an instant after its owner let it go, by a process another
+    /// test forked before it ran its program (issue 818), so a single read
+    /// is not enough.
+    fn stale_soon(registry: &Path, id: InstanceId) -> bool {
+        for _ in 0..LOCK_TRIES {
+            if read(registry)
+                .iter()
+                .any(|found| found.record.id == id && !found.live)
+            {
+                return true;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        false
+    }
+
     fn record(kind: Kind, port: u16) -> Record {
         let mut record = Record::new(
             InstanceId::generate(),
@@ -1059,9 +1079,8 @@ mod tests {
 
         entry.keep();
         drop(entry);
-        let found = read(&registry);
-        assert_eq!(found.len(), 1);
-        assert!(!found[0].live);
+        assert_eq!(read(&registry).len(), 1);
+        assert!(stale_soon(&registry, id));
 
         // The daemon started again takes its own entry over.
 
@@ -1176,7 +1195,7 @@ mod tests {
         }
 
         for found in read(&registry) {
-            assert!(!found.live);
+            assert!(stale_soon(&registry, found.record.id));
             assert!(remove_stale(&registry, found.record.id).expect("pruned"));
         }
 
