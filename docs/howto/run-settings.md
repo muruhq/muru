@@ -235,7 +235,9 @@ while it runs.
 `--data-dir DIR`, or `data_dir` in the run table or `muru.local.toml`,
 puts the data directory somewhere else, a relative one in the project;
 the static directory stays in the run's own. The run reads it at start,
-so a change takes a restart.
+so a change takes a restart. A project's command run with no run up,
+`muructl command run` or `muructl exec`, reads `data_dir` from the run
+table and `muru.local.toml` too, and uses the same directory.
 
 ## What wins
 

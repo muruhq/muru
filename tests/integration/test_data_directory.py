@@ -265,6 +265,14 @@ def test_a_run_keeps_its_places_out_of_the_project_and_its_commands_share_them(
     )
     assert alone.stdout.strip() == str(data)
 
+    # Issue 859: and the data directory a run table names, as the run
+    # would take it.
+
+    (project / "muru.local.toml").write_text("[run]\ndata_dir = 'data'\n")
+    moved = subprocess.run(alone.args, cwd=project, capture_output=True, text=True, check=True)
+    assert moved.stdout.strip() == str(project.resolve() / "data"), moved.stderr
+    (project / "muru.local.toml").unlink()
+
     # muructl serve has a data directory only when one is named, and it
     # must be there.
 

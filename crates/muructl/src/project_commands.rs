@@ -318,6 +318,7 @@ pub async fn own(args: &ProjectArgs, request: &CommandRequest) -> anyhow::Result
     )?;
 
     let found = muru_config::load_settings(&settings.project, settings.file.as_deref())?;
+    let source = found.as_ref().map(|(path, _)| path.clone());
     anyhow::ensure!(
         settings.project.is_dir(),
         "{} is not a directory",
@@ -372,10 +373,22 @@ pub async fn own(args: &ProjectArgs, request: &CommandRequest) -> anyhow::Result
     };
 
     // Issue 849: the places of the run beside it, unless serve's
-    // variables name others, made as the run makes them.
+    // variables name others, made as the run makes them. Issue 859: the
+    // data directory the run table names, muru.local.toml's over the
+    // project's, as `muructl run` takes it without --data-dir.
+
+    let local = muru_config::load_local(&project, source.as_deref())?
+        .map(|(_, file)| file.run)
+        .unwrap_or_default();
+    let run = table.run.clone().unwrap_or_default().layered(&local);
 
     let app = label(&project, table.entrypoint.as_deref());
-    let places = crate::places::for_command(&project, &app, |name| std::env::var(name).ok())?;
+    let places = crate::places::for_command(
+        &project,
+        &app,
+        run.data_dir.as_deref().map(Path::new),
+        |name| std::env::var(name).ok(),
+    )?;
     crate::places::make(&places, muru_controller::places::DATA_MODE)?;
 
     Ok(Context {

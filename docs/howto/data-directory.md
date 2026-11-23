@@ -44,7 +44,7 @@ DATA_DIR = Path(os.environ.get("MURU_DATA_DIR", "var"))
 | The daemon | `STATE/data/APP` in the daemon's state directory: `/var/lib/muru/data/APP` for the system daemon, `~/.local/state/muru/data/APP` for a user daemon on Linux, `~/Library/Application Support/muru/data/APP` on macOS, and under the state directory of a [named instance](named-instances.md) |
 | `muructl run` | `runs/NAME-HASH/data` in your user state directory (`~/.local/state/muru` on Linux, `~/Library/Application Support/muru` on macOS), where `NAME` is the application's name and `HASH` comes from the project's path, so two checkouts of one project do not share a database. It is kept between runs and is never inside the project |
 | `muructl serve` | none, unless `--data-dir`, `MURU_SERVE_DATA_DIR` or `data_dir` in the serve table names one, normally a mounted volume; with none the three variables are not set |
-| `muructl command run` and `muructl exec` with no application | where `muructl run` keeps it, so `muructl command run migrate` migrates the database `muructl run` serves; `MURU_SERVE_DATA_DIR` names another, as it does for `muructl serve` |
+| `muructl command run` and `muructl exec` with no application | where `muructl run` keeps it, the run table's or `muru.local.toml`'s `data_dir` included, so `muructl command run migrate` migrates the database `muructl run` serves whether or not the run is up; `MURU_SERVE_DATA_DIR` names another, as it does for `muructl serve` |
 
 `muructl run` prints the locations when it starts:
 
@@ -76,7 +76,10 @@ from `data_dir`. A change applies to releases started after it.
 
 Under `muructl run`, `--data-dir DIR`, `data_dir` in `[tool.muru.run]`
 or in `muru.local.toml` moves the data directory, a relative one taken
-from the project; the parts are always `media` and `uploads` in it.
+from the project; the parts are always `media` and `uploads` in it. A
+project's command run with no run up, `muructl command run` or `muructl
+exec`, takes the same `data_dir` from the run table and
+`muru.local.toml`, so it and the run share one data directory.
 
 Under `muructl serve`, `--data-dir`, `--media-dir` and `--uploads-dir`,
 or `MURU_SERVE_DATA_DIR`, `MURU_SERVE_MEDIA_DIR` and
