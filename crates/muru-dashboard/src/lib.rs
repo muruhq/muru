@@ -960,17 +960,17 @@ fn whole(bytes: Bytes) -> Body {
 
 /// Section 10.7: a development run's request page, `/request/ID`, and
 /// the record as JSON at `/v1/requests/ID`. A panel's link to another
-/// request's panel, `/_muru/requests/ID/panels/NAME.html` as the toolbar
+/// request's panel, `/_muru/toolbar/requests/ID/panels/NAME.html` as the toolbar
 /// follows it, goes to that panel on the request's page (issue 706).
 fn request_paths(path: &str, source: &Source, requests: &RequestSource) -> Option<Response<Body>> {
     if let Some((request_id, panel)) = path
-        .strip_prefix("/_muru/requests/")
+        .strip_prefix("/_muru/toolbar/requests/")
         .and_then(|rest| rest.split_once("/panels/"))
         .and_then(|(id, panel)| Some((id, panel.strip_suffix(".html")?)))
     {
         let mut response = plain(StatusCode::SEE_OTHER, "see the request's page\n");
 
-        if let Ok(location) = format!("../../../../request/{request_id}#panel-{panel}").parse() {
+        if let Ok(location) = format!("../../../../../request/{request_id}#panel-{panel}").parse() {
             response
                 .headers_mut()
                 .insert(http::header::LOCATION, location);
@@ -1594,6 +1594,31 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_panel_link_goes_to_the_panel_on_the_requests_page() {
+        let source: Source = Arc::new(|| unreachable!("a panel link reads no data"));
+        let requests: RequestSource = Arc::new(|_| Err("not kept".to_owned()));
+
+        // Five steps up from .../_muru/toolbar/requests/A1/panels/ is the
+        // dashboard's own root, whatever prefix it is served under.
+
+        let response = request_paths(
+            "/_muru/toolbar/requests/A1/panels/errors.html",
+            &source,
+            &requests,
+        )
+        .expect("a panel link is answered");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[http::header::LOCATION],
+            "../../../../../request/A1#panel-errors"
+        );
+
+        assert!(
+            request_paths("/_muru/requests/A1/panels/errors.html", &source, &requests).is_none()
+        );
+    }
 
     #[test]
     fn a_side_is_shown_as_busy_of_slots_and_a_missing_one_as_a_dash() {

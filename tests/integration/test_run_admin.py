@@ -490,7 +490,7 @@ def test_a_request_is_looked_up_by_its_id(runtime: Path) -> None:
         # A panel's link to another request's panel, as the toolbar
         # follows it, goes to that request's page here (issue 706).
 
-        assert "<h2>Errors</h2>" in read(f"/_muru/requests/{request_id}/panels/errors.html")
+        assert "<h2>Errors</h2>" in read(f"/_muru/toolbar/requests/{request_id}/panels/errors.html")
 
         # A failed request's record has the exception, its traceback and
         # the log record that reported it.
@@ -542,7 +542,7 @@ def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) 
         assert request_id is not None
         assert page.header("content-length") is None
         tag = (
-            f'<script src="/_muru/toolbar.js" data-request="{request_id}" '
+            f'<script src="/_muru/toolbar/toolbar.js" data-request="{request_id}" '
             f'data-dashboard="http://127.0.0.1:{port}/request/{request_id}" async></script>'
         )
         assert page.body.decode() == f"<html><body><h1>Page</h1>{tag}</body></html>"
@@ -564,18 +564,18 @@ def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) 
             "/page",
             headers={"Sec-Fetch-Dest": "document", "X-Forwarded-Prefix": "/proxy/8080"},
         )
-        assert b'<script src="/proxy/8080/_muru/toolbar.js"' in proxied.body
+        assert b'<script src="/proxy/8080/_muru/toolbar/toolbar.js"' in proxied.body
 
         # The reserved prefix: the script, the record and a panel, and
         # nothing for another site's page or an unknown host.
 
-        script = server.get("/_muru/toolbar.js", headers={"Sec-Fetch-Site": "same-origin"})
+        script = server.get("/_muru/toolbar/toolbar.js", headers={"Sec-Fetch-Site": "same-origin"})
         assert script.status == 200
         assert script.header("content-type") == "text/javascript"
         deadline = time.monotonic() + 10
 
         while True:
-            answer = server.get(f"/_muru/requests/{request_id}.json")
+            answer = server.get(f"/_muru/toolbar/requests/{request_id}.json")
             assert answer.status == 200
             found = json.loads(answer.body)
 
@@ -586,14 +586,14 @@ def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) 
             time.sleep(0.05)
 
         assert found["request_id"] == request_id and found["target"] == "/page"
-        panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html")
+        panel = server.get(f"/_muru/toolbar/requests/{request_id}/panels/timing.html")
         assert panel.status == 200 and "<table" in panel.body.decode()
-        assert server.get("/_muru/requests/NOSUCH.json").status == 404
+        assert server.get("/_muru/toolbar/requests/NOSUCH.json").status == 404
 
         # The page view's summaries, several in one answer, and the IDs
         # no longer kept.
 
-        batch = json.loads(server.get(f"/_muru/requests?ids={request_id},NOSUCH").body)
+        batch = json.loads(server.get(f"/_muru/toolbar/requests?ids={request_id},NOSUCH").body)
         assert [summary["request_id"] for summary in batch["requests"]] == [request_id]
         assert batch["not_kept"] == ["NOSUCH"]
         summary = batch["requests"][0]
@@ -603,12 +603,14 @@ def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) 
             False,
         )
         assert summary["connection"] == found["connection"]["id"]
-        assert server.get("/_muru/requests").status == 400
+        assert server.get("/_muru/toolbar/requests").status == 400
         refused = server.get(
-            f"/_muru/requests/{request_id}.json", headers={"Sec-Fetch-Site": "cross-site"}
+            f"/_muru/toolbar/requests/{request_id}.json", headers={"Sec-Fetch-Site": "cross-site"}
         )
         assert refused.status == 403
-        rebound = server.get(f"/_muru/requests/{request_id}.json", headers={"Host": "evil.test"})
+        rebound = server.get(
+            f"/_muru/toolbar/requests/{request_id}.json", headers={"Host": "evil.test"}
+        )
         assert rebound.status == 403
 
         # Issue 708: a form's POST that redirects, then the page it led
@@ -618,14 +620,16 @@ def test_the_toolbar_is_inserted_into_pages_and_reads_the_record(runtime: Path) 
         posted = server.request("POST", "/form", body=b"name=x", headers=document)
         assert posted.status == 303
         landed = server.get("/page", headers=document)
-        entries = json.loads(server.get("/_muru/history").body)["entries"]
+        entries = json.loads(server.get("/_muru/toolbar/history").body)["entries"]
         assert [(step["method"], step["target"]) for step in entries[0]["steps"]] == [
             ("POST", "/form"),
             ("GET", "/page"),
         ], entries
         assert entries[0]["steps"][1]["request_id"] == landed.header("x-request-id")
         assert all(
-            step["target"] != "/_muru/history" for entry in entries for step in entry["steps"]
+            step["target"] != "/_muru/toolbar/history"
+            for entry in entries
+            for step in entry["steps"]
         )
     finally:
         server.stop()
@@ -646,7 +650,7 @@ def test_a_blocked_event_loop_is_on_the_requests_record(runtime: Path) -> None:
         request_id = response.header("x-request-id")
         deadline = time.monotonic() + 10
 
-        while (found := json.loads(server.get(f"/_muru/requests/{request_id}.json").body))[
+        while (found := json.loads(server.get(f"/_muru/toolbar/requests/{request_id}.json").body))[
             "in_progress"
         ]:
             assert time.monotonic() < deadline, found
@@ -660,7 +664,7 @@ def test_a_blocked_event_loop_is_on_the_requests_record(runtime: Path) -> None:
         assert worker["loop_lag"] + worker["loop_lag_at"] <= worker["to_close"] + 1, worker
         held = worker["loop_held_stretches"]
         assert max(stretch["ms"] for stretch in held) == worker["loop_lag"], worker
-        panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html").body.decode()
+        panel = server.get(f"/_muru/toolbar/requests/{request_id}/panels/timing.html").body.decode()
         assert ">event loop held</td>" in panel and "During the request" in panel
 
         # Issue 738: the module the request loaded on first use, under
@@ -731,7 +735,7 @@ def test_a_request_waiting_on_another_requests_import_says_so(
         request_id = waited.header("x-request-id")
         deadline = time.monotonic() + 10
 
-        while (found := json.loads(server.get(f"/_muru/requests/{request_id}.json").body))[
+        while (found := json.loads(server.get(f"/_muru/toolbar/requests/{request_id}.json").body))[
             "in_progress"
         ]:
             assert time.monotonic() < deadline, found
@@ -741,7 +745,7 @@ def test_a_request_waiting_on_another_requests_import_says_so(
         assert [(wait["module"], wait["loader"]) for wait in waits] == [
             ("waiting_slow", loaded[0].header("x-request-id"))
         ], found["from_worker"]
-        panel = server.get(f"/_muru/requests/{request_id}/panels/timing.html").body.decode()
+        panel = server.get(f"/_muru/toolbar/requests/{request_id}/panels/timing.html").body.decode()
         assert ">waiting for an import</td>" in panel, panel
     finally:
         server.stop()

@@ -24,7 +24,7 @@ Turn the toolbar on for a run with `--toolbar`:
 ```console
 $ muructl run shop.wsgi:application --toolbar
 ...
-muru: toolbar on: the edge inserts it into HTML pages, with each request's record under /_muru/
+muru: toolbar on: the edge inserts it into HTML pages, with each request's record under /_muru/toolbar/
 ```
 
 or for every run of the project with `toolbar = true` in its
@@ -47,7 +47,7 @@ pages Flask and other Werkzeug applications send, where the browser
 puts it into the page's body all the same:
 
 ```html
-<script src="/_muru/toolbar.js" data-request="01JCZ8X4R3T5V6W7Y8Z9A0B1C2" async></script>
+<script src="/_muru/toolbar/toolbar.js" data-request="01JCZ8X4R3T5V6W7Y8Z9A0B1C2" async></script>
 ```
 
 It goes into a page a browser loads as a document, so `fetch()` and htmx
@@ -172,16 +172,19 @@ says once, on the terminal, which path and why.
 
 ### The reserved prefix
 
-The toolbar's files and data are under `/_muru/` on the application's
-own address, answered by Muru without reaching the application:
+Every path under `/_muru/` on the application's own address is Muru's
+during a development run. The toolbar's files and data are under
+`/_muru/toolbar/`, answered by Muru without reaching the application:
 
 | Path | Gives |
 | --- | --- |
-| `/_muru/toolbar.js`, `/_muru/toolbar.css` | the toolbar itself |
-| `/_muru/requests/ID.json` | the record, as `muructl debug request ID --json` prints it |
-| `/_muru/requests/ID/panels/NAME.html` | one panel of the record, drawn |
-| `/_muru/requests?ids=ID,ID` | what the "This page" tab shows of each request named, at most 100 |
-| `/_muru/history` | what the History tab shows: the recent document requests, redirects joined to where they led |
+| `/_muru/toolbar/toolbar.js`, `/_muru/toolbar/toolbar.css` | the toolbar itself |
+| `/_muru/toolbar/requests/ID.json` | the record, as `muructl debug request ID --json` prints it |
+| `/_muru/toolbar/requests/ID/panels/NAME.html` | one panel of the record, drawn |
+| `/_muru/toolbar/requests?ids=ID,ID` | what the "This page" tab shows of each request named, at most 100 |
+| `/_muru/toolbar/history` | what the History tab shows: the recent document requests, redirects joined to where they led |
+
+Any other path under `/_muru/` is answered with 404.
 
 `requests?ids=` answers with `requests`, one entry for each request
 named that is still kept, with its method, target, status, times,

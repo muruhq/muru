@@ -162,7 +162,9 @@ def record(server: support.Server, response: support.Response) -> dict[str, Any]
     deadline = time.monotonic() + 10
 
     while True:
-        found: dict[str, Any] = json.loads(server.get(f"/_muru/requests/{request_id}.json").body)
+        found: dict[str, Any] = json.loads(
+            server.get(f"/_muru/toolbar/requests/{request_id}.json").body
+        )
 
         if not found["in_progress"] and found["worker_part"] == "arrived":
             return found

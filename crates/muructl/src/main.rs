@@ -4610,7 +4610,7 @@ async fn run_with(
             edge.links().set_toolbar();
             muru_common::muru_println!(
                 "toolbar on: the edge inserts it into HTML pages, with each request's record \
-                 under /_muru/"
+                 under /_muru/toolbar/"
             );
         }
     }

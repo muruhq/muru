@@ -44,7 +44,7 @@ def test_a_panel_added_in_the_worker_is_in_the_record_and_drawn(tmp_path: Path) 
         deadline = time.monotonic() + 10
 
         while True:
-            found = json.loads(server.get(f"/_muru/requests/{request_id}.json").body)
+            found = json.loads(server.get(f"/_muru/toolbar/requests/{request_id}.json").body)
 
             if not found["in_progress"] and found["worker_part"] == "arrived":
                 break
@@ -66,14 +66,16 @@ def test_a_panel_added_in_the_worker_is_in_the_record_and_drawn(tmp_path: Path) 
         assert view["name"] == "view" and view["children"][0]["name"] == "query"
         assert view["start_ms"] >= found["queue_ms"]
 
-        drawn = server.get(f"/_muru/requests/{request_id}/panels/steps.html").body.decode()
+        drawn = server.get(f"/_muru/toolbar/requests/{request_id}/panels/steps.html").body.decode()
         assert "view" in drawn and "query" in drawn and "depth-2" in drawn, drawn
 
         # A markdown panel is drawn by the edge, its outside link opening
         # in a new tab.
 
         assert panels["analysis"]["markdown"] is True
-        drawn = server.get(f"/_muru/requests/{request_id}/panels/analysis.html").body.decode()
+        drawn = server.get(
+            f"/_muru/toolbar/requests/{request_id}/panels/analysis.html"
+        ).body.decode()
         assert "<h3>Queries</h3>" in drawn, drawn
         assert 'href="https://example.com/guide"' in drawn and 'target="_blank"' in drawn, drawn
     finally:
