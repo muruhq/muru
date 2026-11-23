@@ -27,7 +27,19 @@ pub struct Sample {
     pub value: f64,
 }
 
+/// The group a detour's requests are counted under (section 9.13).
+pub const DETOUR_GROUP: &str = "detour";
+
 impl Sample {
+    /// Whether the sample counts a detour's requests, which conditions,
+    /// rollout gates and the autoscaler leave out (section 9.13); the
+    /// access log, `muructl metrics` and the dashboard keep them.
+    pub fn of_a_detour(&self) -> bool {
+        self.labels
+            .iter()
+            .any(|(label, value)| label == "group" && value == DETOUR_GROUP)
+    }
+
     /// A sample with string labels.
     pub fn new(name: &str, labels: &[(&str, &str)], value: f64) -> Self {
         Self {

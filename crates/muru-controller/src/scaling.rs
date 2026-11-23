@@ -90,10 +90,13 @@ impl Signals {
         };
         let mut slots: Vec<(usize, bool, f64)> = Vec::new();
 
+        // Section 9.13: a detour's requests never scale a release.
+
         for sample in samples {
             if label(sample, "app").as_deref() != Some(app)
                 || label(sample, "release").as_deref() != Some(release)
                 || label(sample, "group").as_deref() != Some(group)
+                || sample.of_a_detour()
             {
                 continue;
             }

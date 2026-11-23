@@ -231,6 +231,13 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         assert "muru-preview" not in seen["headers"]
         assert seen["preview"] == ""
 
+        # The daemon counts the detour's requests under its own release
+        # and the group detour, which conditions, gates and the
+        # autoscaler leave out.
+
+        metrics = daemon.muructl("metrics").stdout
+        assert f'release="{release}",group="detour"' in metrics, metrics
+
         # The run's traceback reaches the client past the daemon's error
         # override, which still replaces the serving release's.
 

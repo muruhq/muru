@@ -841,6 +841,10 @@ impl GroupPath {
 /// (section 9.9).
 pub const SERVER_GROUP: &str = "http";
 
+/// The group a detour's requests are logged and counted under (section
+/// 9.13), which conditions, rollout gates and the autoscaler leave out.
+pub const DETOUR_GROUP: &str = crate::metrics::DETOUR_GROUP;
+
 impl AppPools {
     /// The workers of any of this release's pools that could not be
     /// connected to, each once.
@@ -1070,7 +1074,12 @@ impl AppPools {
                 pool: Arc::new(LinkPool::empty()),
                 app: self.app.clone(),
                 release: self.release.clone(),
-                group: SERVER_GROUP.to_owned(),
+                group: if self.is_detour() {
+                    DETOUR_GROUP
+                } else {
+                    SERVER_GROUP
+                }
+                .to_owned(),
                 mount: String::new(),
                 script_name: String::new(),
                 redirects: RedirectFlags::default(),
