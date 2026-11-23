@@ -1585,18 +1585,14 @@ pub fn remove_instance(args: RemoveArgs) -> anyhow::Result<()> {
     let area = muru_controller::locations::caller_config_area(args.system);
     let Some(definition) = muru_controller::catalogue::find(&area, &args.name) else {
         let (defined, _) = muru_controller::catalogue::read(&area);
-        let names: Vec<String> = defined
-            .into_iter()
-            .map(|definition| definition.name)
-            .collect();
 
         anyhow::bail!(
             "no instance {} is defined{}",
             args.name,
-            if names.is_empty() {
-                String::new()
+            if defined.is_empty() {
+                ""
             } else {
-                format!("; the defined instances are {}", names.join(", "))
+                "; muructl instance list shows the ones that are"
             }
         );
     };

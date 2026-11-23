@@ -307,7 +307,7 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
         third = start(runtime)
 
         try:
-            older = f"--socket {first.admin_socket()}"
+            older = f"--instance run:{first.port}"
             assert "another development run of this project is listening" in third.log()
             assert older in third.log(), third.log()
             reached = muructl(runtime, "status", cwd=support.FIXTURES)
@@ -316,7 +316,7 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
                 "2 development runs of this project are listening; reaching the newest"
                 in reached.stderr
             ), reached.stderr
-            assert older in reached.stderr
+            assert f"{older} reaches the other" in reached.stderr, reached.stderr
         finally:
             third.stop()
 
@@ -326,9 +326,9 @@ def test_the_socket_is_found_by_project_or_named(runtime: Path, tmp_path: Path) 
         leave_socket_behind(runtime / "admin.sock")
         ambiguous = muructl(runtime, "status", cwd=tmp_path, check=False)
         assert ambiguous.returncode != 0
-        assert "several development runs are" in ambiguous.stderr
-        assert f"--socket {first.admin_socket()}" in ambiguous.stderr
-        assert f"--socket {second.admin_socket()}" in ambiguous.stderr
+        assert "no daemon is running and 2 development runs are" in ambiguous.stderr
+        assert f"\n  --instance run:{first.port}  " in ambiguous.stderr, ambiguous.stderr
+        assert f"\n  --instance run:{second.port}  " in ambiguous.stderr, ambiguous.stderr
         chosen = muructl(
             runtime,
             "status",

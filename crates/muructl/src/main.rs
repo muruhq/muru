@@ -4918,14 +4918,16 @@ async fn run_with(
                     // so the runs of it already listening are named, with
                     // how to reach them.
 
+                    let records = admin::running_instances();
+
                     for other in run_admin::runs(&runtime).iter().filter(|other| {
                         other.project == project && other.socket != registration.socket
                     }) {
                         muru_common::muru_println!(
-                            "another development run of this project is listening, {} on http://{}; --socket {} reaches it",
+                            "another development run of this project is listening, {} on http://{}; {} reaches it",
                             other.app,
                             other.listen,
-                            other.socket.display()
+                            admin::reach_run(&other.socket, &records)
                         );
                     }
                 }

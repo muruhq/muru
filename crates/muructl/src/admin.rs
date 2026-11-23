@@ -424,15 +424,11 @@ pub fn resolve_name(name: &str, system: bool) -> anyhow::Result<client::Endpoint
         .find_map(|area| muru_controller::catalogue::find(area, name));
 
     let Some(definition) = defined else {
-        let mut names: Vec<String> = areas
+        let none_defined = areas
             .iter()
-            .flat_map(|area| muru_controller::catalogue::read(area).0)
-            .map(|definition| definition.name)
-            .collect();
-        names.sort();
-        names.dedup();
+            .all(|area| muru_controller::catalogue::read(area).0.is_empty());
 
-        if names.is_empty() {
+        if none_defined {
             anyhow::bail!(
                 "no instance {name} is defined, and no named instances are defined at all; \
                  define it with muructl instance create {name} --listen ADDRESS"
@@ -440,8 +436,7 @@ pub fn resolve_name(name: &str, system: bool) -> anyhow::Result<client::Endpoint
         }
 
         anyhow::bail!(
-            "no instance {name} is defined; the defined instances are {}",
-            names.join(", ")
+            "no instance {name} is defined; muructl instance list shows the ones that are"
         );
     };
 
@@ -875,7 +870,16 @@ impl SocketArgs {
             .and_then(|directory| directory.canonicalize())
             .ok();
 
-        let discovery = discovered(&runs, here.as_deref(), daemon, daemon_listening, denied)?;
+        let records = running_instances();
+        let reach = |run: &crate::run_admin::RunInfo| reach_run(&run.socket, &records);
+        let discovery = discovered(
+            &runs,
+            here.as_deref(),
+            daemon,
+            daemon_listening,
+            denied,
+            &reach,
+        )?;
 
         // A command may look for its socket more than once; the note that
         // the daemon was chosen over a run is said once.
@@ -954,13 +958,17 @@ fn may_not_enter(path: &Path) -> bool {
 /// listens, then the one run listening. With nothing there, the socket
 /// of a run directory this user may not enter when there is one, so the
 /// permission error is reported, or the daemon's. When the daemon is
-/// chosen while runs listen, the note names them and how to reach them.
+/// chosen while runs listen, the note says how to reach them. `reach`
+/// gives the option that reaches a run, `--instance` with what
+/// `muructl instance list` shows for it; the notes name few runs and
+/// point at that list for the rest (issue 885).
 fn discovered(
     runs: &[crate::run_admin::RunInfo],
     here: Option<&Path>,
     daemon: PathBuf,
     daemon_listening: bool,
     denied: Option<PathBuf>,
+    reach: &dyn Fn(&crate::run_admin::RunInfo) -> String,
 ) -> anyhow::Result<Discovery> {
     // The runs whose project is this directory, else those started from
     // it; of several, the newest (issue 714), with a note naming the
@@ -982,23 +990,20 @@ fn discovered(
 
     if let Some((newest, others)) = mine.split_last() {
         let note = (!others.is_empty()).then(|| {
+            let others: Vec<String> = others.iter().rev().map(|run| reach(run)).collect();
+
             format!(
                 "{} development runs of this project are listening; reaching the newest, {} on \
-                 http://{}; pass --socket to reach another: {}",
+                 http://{}; {} {}",
                 mine.len(),
                 newest.app,
                 newest.listen,
-                others
-                    .iter()
-                    .rev()
-                    .map(|run| format!(
-                        "{} on http://{} (--socket {})",
-                        run.app,
-                        run.listen,
-                        run.socket.display()
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("; ")
+                listed(&others, muru_controller::selector::MAX_LISTED),
+                if others.len() == 1 {
+                    "reaches the other"
+                } else {
+                    "reach the others"
+                }
             )
         });
 
@@ -1013,26 +1018,16 @@ fn discovered(
             [] => None,
             [run] => Some(format!(
                 "using the daemon; the development run of {} on http://{} is also \
-                 listening: run the command from {}, or pass --socket {}, to reach it",
+                 listening: {}, or the command run from {}, reaches it",
                 run.app,
                 run.listen,
-                run.project.display(),
-                run.socket.display()
+                reach(run),
+                run.project.display()
             )),
             several => Some(format!(
-                "using the daemon; development runs are also listening: {}; run the \
-                 command from a run's project directory, or pass --socket, to reach one",
-                several
-                    .iter()
-                    .map(|run| format!(
-                        "{} on http://{} from {} (--socket {})",
-                        run.app,
-                        run.listen,
-                        run.project.display(),
-                        run.socket.display()
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("; ")
+                "using the daemon; {} development runs are also listening: pass --instance to \
+                 reach one, as muructl instance list names them",
+                several.len()
             )),
         };
 
@@ -1045,22 +1040,74 @@ fn discovered(
     match runs {
         [] => Ok(Discovery::quiet(denied.unwrap_or(daemon))),
         [run] => Ok(Discovery::quiet(run.socket.clone())),
-        several => anyhow::bail!(
-            "no daemon is running and several development runs are: {}; name one with \
-             --socket, or run the command from its project directory",
-            several
+        several => {
+            let mut message = format!(
+                "no daemon is running and {} development runs are; choose one, or run the \
+                 command from its project directory:",
+                several.len()
+            );
+
+            let shown: Vec<(&crate::run_admin::RunInfo, String)> = several
                 .iter()
-                .map(|run| format!(
-                    "{} on http://{} from {} (--socket {})",
+                .take(muru_controller::selector::MAX_LISTED)
+                .map(|run| (run, reach(run)))
+                .collect();
+            let width = shown.iter().map(|(_, how)| how.len()).max().unwrap_or(0);
+
+            for (run, how) in &shown {
+                message.push_str(&format!(
+                    "\n  {how:width$}  {} on http://{} from {}",
                     run.app,
                     run.listen,
-                    run.project.display(),
-                    run.socket.display()
-                ))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ),
+                    run.project.display()
+                ));
+            }
+
+            if several.len() > muru_controller::selector::MAX_LISTED {
+                message.push_str(&format!(
+                    "\n  and {} more; muructl instance list shows them all",
+                    several.len() - muru_controller::selector::MAX_LISTED
+                ));
+            }
+
+            anyhow::bail!(message)
+        }
     }
+}
+
+/// `items` joined with commas, the first `most` of them, and how many
+/// more after.
+fn listed(items: &[String], most: usize) -> String {
+    let mut text = items
+        .iter()
+        .take(most)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if items.len() > most {
+        text.push_str(&format!(" and {} more", items.len() - most));
+    }
+
+    text
+}
+
+/// The option that reaches a run among the running `records`:
+/// `--instance` with what `muructl instance list` shows for it, or
+/// `--socket` and its path when no record has its socket.
+pub fn reach_run(socket: &Path, records: &[muru_controller::registry::Record]) -> String {
+    records
+        .iter()
+        .find(|record| record.admin.socket() == Some(socket))
+        .map_or_else(
+            || format!("--socket {}", socket.display()),
+            |record| {
+                format!(
+                    "--instance {}",
+                    muru_controller::selector::handle(record, records)
+                )
+            },
+        )
 }
 
 /// The daemon subcommands.
@@ -12079,6 +12126,7 @@ tls = { ca = "ca.pem" }
             runtime: Vec::new(),
             started_unix_ms: 0,
         };
+        let reach = |run: &RunInfo| format!("--socket {}", run.socket.display());
         let daemon = PathBuf::from("/user/admin.sock");
         let denied = PathBuf::from("/run/muru/admin.sock");
         let found = |runs: &[RunInfo], here, listening, denied: Option<&Path>| {
@@ -12088,6 +12136,7 @@ tls = { ca = "ca.pem" }
                 daemon.clone(),
                 listening,
                 denied.map(Path::to_path_buf),
+                &reach,
             )
             .expect("found")
             .socket
@@ -12127,6 +12176,7 @@ tls = { ca = "ca.pem" }
 
         // Listed by port, the older run on the lower one.
 
+        let reach = |run: &RunInfo| format!("--instance run:{}", &run.listen[10..]);
         let runs = [run(8080, 1_000), run(8090, 2_000)];
         let found = super::discovered(
             &runs,
@@ -12134,6 +12184,7 @@ tls = { ca = "ca.pem" }
             PathBuf::from("/user/admin.sock"),
             true,
             None,
+            &reach,
         )
         .expect("found");
         assert_eq!(found.socket, runs[1].socket);
@@ -12145,7 +12196,7 @@ tls = { ca = "ca.pem" }
             "{note}"
         );
         assert!(
-            note.contains("shop on http://127.0.0.1:8080 (--socket /user/runs/8080/admin.sock)"),
+            note.ends_with("; --instance run:8080 reaches the other"),
             "{note}"
         );
 
@@ -12157,6 +12208,7 @@ tls = { ca = "ca.pem" }
             PathBuf::from("/user/admin.sock"),
             true,
             None,
+            &reach,
         )
         .expect("found");
         assert_eq!((one.socket, one.note), (runs[0].socket.clone(), None));
@@ -12187,9 +12239,17 @@ tls = { ca = "ca.pem" }
             ..shop.clone()
         };
         let daemon = PathBuf::from("/user/admin.sock");
+        let reach = |run: &RunInfo| format!("--instance run:{}", &run.listen[10..]);
         let found = |runs: &[RunInfo], here: &str| {
-            super::discovered(runs, Some(Path::new(here)), daemon.clone(), true, None)
-                .expect("found")
+            super::discovered(
+                runs,
+                Some(Path::new(here)),
+                daemon.clone(),
+                true,
+                None,
+                &reach,
+            )
+            .expect("found")
         };
 
         // The directory a run was started from reaches it ahead of the
@@ -12211,18 +12271,36 @@ tls = { ca = "ca.pem" }
         assert!(note.starts_with("using the daemon;"), "{note}");
         assert!(note.contains("shop on http://127.0.0.1:18380"), "{note}");
         assert!(
-            note.contains("--socket /user/runs/18380/admin.sock"),
+            note.contains("--instance run:18380, or the command run from /work/shop"),
             "{note}"
         );
 
+        // Of several, only how many, and where they are all named.
+
         let several = found(&both, "/tmp").note.expect("a note");
-        assert!(
-            several.contains("development runs are also listening"),
-            "{several}"
+        assert_eq!(
+            several,
+            "using the daemon; 2 development runs are also listening: pass --instance to \
+             reach one, as muructl instance list names them"
         );
-        assert!(
-            several.contains("api on http://127.0.0.1:18381"),
-            "{several}"
+
+        // With no daemon, the runs to choose from, one to a line.
+
+        let chosen = super::discovered(
+            &both,
+            Some(Path::new("/tmp")),
+            daemon.clone(),
+            false,
+            None,
+            &reach,
+        )
+        .expect_err("two runs and no daemon")
+        .to_string();
+        assert_eq!(
+            chosen,
+            "no daemon is running and 2 development runs are; choose one, or run the command \
+             from its project directory:\n  --instance run:18380  shop on http://127.0.0.1:18380 \
+             from /work/shop\n  --instance run:18381  api on http://127.0.0.1:18381 from /work"
         );
     }
 
