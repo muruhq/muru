@@ -1101,10 +1101,10 @@ pub async fn handle(
         && let Some(incoming) = body.as_mut()
         && !incoming.is_end_stream()
     {
-        // A detour's gRPC call streams its body, as a client stream must;
-        // HTTP/2 needs no length.
+        // A gRPC call to an HTTP/2 upstream, a detour's included, streams
+        // its body, as a client stream must; HTTP/2 needs no length.
 
-        let streams = shared.detour && protocol.is_h2();
+        let streams = protocol.is_h2() && crate::grpc::Protocol::of(&parts.headers).is_some();
 
         if content_length.is_none() && !streams {
             match link::read_body(incoming, limits.max_body_size).await {
@@ -1153,7 +1153,7 @@ pub async fn handle(
     // gRPC servers look for `te: trailers`, the one value HTTP/2 allows,
     // which goes as a hop-by-hop header otherwise.
 
-    if shared.detour && protocol.is_h2() && wants_trailers(&parts.headers) {
+    if protocol.is_h2() && wants_trailers(&parts.headers) {
         headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
     }
 

@@ -124,6 +124,12 @@ ALPN over TLS. Both multiplex every request to an address over one
 connection. A Unix socket address with TLS needs `server_name`, since
 there is no host to check the certificate against.
 
+A gRPC server behind an `h2c` or `h2` upstream gets each call as the
+client made it: the request body streams, so client streaming and
+bidirectional calls are answered as their messages arrive, and
+`te: trailers` reaches the server. `max_body_size` does not bound a gRPC
+call's stream; the server's own message limits apply.
+
 ## Behind a static route, in a traffic policy, as a handler
 
 A static route can fall back to an upstream for what no file answers:
