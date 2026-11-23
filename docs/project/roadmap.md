@@ -223,21 +223,32 @@ Every piece of planned work is a
 repository: bugs, the steps of each major goal, the smaller features and
 the ideas.
 
+- Each open issue carries one status label, which says where it stands:
+  `status:triage` while it waits for the maintainer to decide where it
+  goes, `status:next` once it is picked to be worked on next,
+  `status:in-progress` while it is worked on, `status:backlog` for work
+  accepted but not for now, and `status:icebox` for work kept with no
+  commitment to do it. A closed issue carries none.
+
 - The [project board](https://github.com/users/GrahamDumpleton/projects/1)
   shows every open issue of Muru and of its
   [workshops](https://github.com/muruhq/muru-workshops) with its
-  status (backlog, next, in progress, in review, done), priority, size
-  and goal (one of the major goals, a smaller feature, housekeeping or an
-  idea), and is the place to see what is being worked on and what comes
-  next.
+  status, priority, size and goal (one of the major goals, a smaller
+  feature, housekeeping or an idea). Its status follows the label:
+  triage, backlog and icebox show as Backlog, an issue a pull request
+  will close shows as In Review, and a closed one as Done.
 
 - Each step of a major goal is a tracking issue whose sub-issues are the
-  work of that step, so its progress shows on the issue.
+  work of that step, so its progress shows on the issue. Other work that
+  is done in pieces has a tracking issue too.
 
-- Labels say what kind of work an issue is: `bug`, `enhancement`,
-  `documentation` and `ci`, `containers` for running Muru in a container
-  or a Kubernetes pod, `decision` for an issue where a choice has to be
-  made before work starts, and `tracking` for the issue of a goal's step.
+- Other labels say what kind of work an issue is: `bug`, `enhancement`,
+  `documentation` and `ci`, `testing` for a problem in the tests rather
+  than in Muru, `security` for a vulnerability or hardening, `workshops`
+  for an issue a tutorial or workshop runs into, `decision` for an issue
+  where a choice has to be made before work starts, `idea` for a
+  speculative idea, whatever its status, and `tracking` for a parent
+  issue whose sub-issues are the work.
 
 - A [milestone](https://github.com/muruhq/muru/milestones) for
   each upcoming release collects the issues planned for it.

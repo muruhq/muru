@@ -1,6 +1,6 @@
 name: Documentation
 description: Something in the documentation is wrong, missing or unclear
-labels: [documentation]
+labels: [documentation, status:triage]
 body:
   - type: input
     id: page
