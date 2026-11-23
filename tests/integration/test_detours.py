@@ -224,6 +224,24 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
 
             assert reply.message == f"{seen['instance']} Ada"
 
+        # All of the application's traffic goes to the detour while it
+        # says so, by an overlay it owns, and back again.
+
+        switched = daemon.muructl("detour", "traffic", "all", cwd=project)
+        assert "now takes all of detoured's traffic (was preview)" in switched.stdout
+        assert served(daemon)["instance"].startswith("detour:")
+        overlays = daemon.muructl("overlay", "list").stdout
+        assert "detour:detoured" in overlays and "detour" in overlays
+        refused = daemon.muructl("overlay", "end", "detour:detoured", check=False)
+        assert refused.returncode != 0
+        assert "muructl detour traffic" in refused.stderr
+        detour.wait_for_log("now takes all of detoured's traffic")
+
+        daemon.muructl("detour", "traffic", "detoured", "preview")
+        assert not served(daemon)["instance"].startswith("detour:")
+        assert served(daemon, **preview)["instance"].startswith("detour:")
+        assert "detour:detoured" not in daemon.muructl("overlay", "list").stdout
+
         # The detour ends with its run, and the daemon's traffic is back on
         # the serving release at once.
 

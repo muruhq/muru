@@ -1281,6 +1281,7 @@ fn main() -> anyhow::Result<()> {
         Command::Run(args) => runtime.block_on(run(*args)),
         Command::Detour { command } => match command {
             detour::DetourCommand::Run(args) => runtime.block_on(detour::run(*args)),
+            detour::DetourCommand::Traffic(args) => runtime.block_on(detour::traffic(args)),
         },
         Command::Serve(args) => runtime.block_on(serve::serve(*args)),
         Command::Probe(args) => serve::probe(args),
@@ -4712,7 +4713,15 @@ async fn run_with(
             .as_ref()
             .map(|detour| detour.traffic.clone())
             .unwrap_or_default();
-        muru_common::muru_println!("traffic: {}", detour::takes(&traffic, &mode.app));
+        muru_common::muru_println!(
+            "traffic: {}{}",
+            detour::takes(&traffic, &mode.app),
+            if traffic == "preview" {
+                "; muructl detour preview gives an entry link"
+            } else {
+                ""
+            }
+        );
         muru_common::muru_println!(
             "development mode: error pages show tracebacks, no releases are kept{}, and the \
              daemon's edge serves the clients and compresses; Ctrl-C ends the detour",

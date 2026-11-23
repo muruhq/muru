@@ -4,6 +4,7 @@
 //! daemon keeps them in memory alone; this module has what it keeps and
 //! the choices that need no daemon.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use muru_proto::admin::v1 as pb;
@@ -253,6 +254,289 @@ pub fn release_name(instance_id: &str, taken: impl Fn(&str) -> bool) -> String {
     format!("{RELEASE_PREFIX}{digits}-{}", &fresh[..SHORT_DIGITS])
 }
 
+/// The name of the runtime overlay a detour's traffic is carried by,
+/// one for each application (section 9.13).
+pub fn overlay_name(app: &str) -> String {
+    format!("detour:{app}")
+}
+
+/// Whether an overlay's name is one a detour owns, which the overlay
+/// commands leave alone.
+pub fn is_overlay(name: &str) -> bool {
+    name.starts_with("detour:")
+}
+
+/// What one detour asks of its application's routes.
+#[derive(Debug, Clone, Copy)]
+pub struct Taking<'a> {
+    /// The application.
+    pub app: &'a str,
+    /// The detour's release.
+    pub release: &'a str,
+    /// What it takes.
+    pub traffic: &'a Traffic,
+}
+
+/// Lay the detours' traffic over a route, when it is their
+/// application's: `all` pins it to the detour, `share=N` replaces its
+/// split with N percent to the detour, the serving release taking the
+/// rest, and `class=NAME` gives the class the detour. A route of
+/// another application, or detours that take previews alone, leave it
+/// as it is.
+pub fn lay_over(route: &mut muru_config::Route, takings: &[Taking<'_>]) {
+    let own: Vec<&Taking<'_>> = takings
+        .iter()
+        .filter(|taking| taking.app == route.app && taking.traffic != &Traffic::Preview)
+        .collect();
+
+    if own.is_empty() {
+        return;
+    }
+
+    let traffic = route.traffic.get_or_insert_with(Default::default);
+    let mut shares = BTreeMap::new();
+
+    for taking in &own {
+        match taking.traffic {
+            Traffic::Preview => {}
+            Traffic::All => {
+                traffic.split = BTreeMap::from([(taking.release.to_owned(), 100)]);
+                shares.clear();
+                break;
+            }
+            Traffic::Share(share) => {
+                shares.insert(taking.release.to_owned(), *share);
+            }
+            Traffic::Class(class) => {
+                traffic
+                    .classes
+                    .insert(class.clone(), taking.release.to_owned());
+            }
+        }
+    }
+
+    if !shares.is_empty() {
+        traffic.split = shares;
+    }
+}
+
+/// What the overlay of an application's detours changes, for `overlay
+/// list`: one line for each detour that takes more than previews.
+pub fn changes(takings: &[Taking<'_>]) -> Vec<String> {
+    takings
+        .iter()
+        .filter(|taking| taking.traffic != &Traffic::Preview)
+        .map(|taking| {
+            let what = match taking.traffic {
+                Traffic::Preview => String::new(),
+                Traffic::All => "every route pinned".to_owned(),
+                Traffic::Share(share) => format!("{share}% of every route"),
+                Traffic::Class(class) => format!("client class {class} on every route"),
+            };
+
+            format!("app {} to {}: {what}", taking.app, taking.release)
+        })
+        .collect()
+}
+
+/// Why a detour cannot take `wanted` of its application, given the
+/// application's other detours, whether a rollout of it is under way
+/// and the client classes the daemon defines (section 9.13).
+pub fn traffic_refusal(
+    taking: Taking<'_>,
+    others: &[Taking<'_>],
+    rollout: bool,
+    classes: &[String],
+) -> Option<String> {
+    let app = taking.app;
+
+    match taking.traffic {
+        Traffic::Preview => None,
+        Traffic::All | Traffic::Share(_) if rollout => Some(format!(
+            "a rollout of {app} is under way, and {} would take traffic from it; wait for it to \
+             end, or abort it",
+            taking.traffic.word()
+        )),
+        Traffic::All => others
+            .iter()
+            .find(|other| other.traffic == &Traffic::All)
+            .map(|other| {
+                format!(
+                    "detour {app}@{} takes all of {app}'s traffic already; set its traffic to \
+                     preview first",
+                    other.release
+                )
+            }),
+        Traffic::Share(share) => {
+            let taken: u32 = others
+                .iter()
+                .map(|other| match other.traffic {
+                    Traffic::Share(share) => *share,
+                    Traffic::All => 100,
+                    _ => 0,
+                })
+                .sum();
+
+            (taken + share > 100).then(|| {
+                format!(
+                    "{app}'s other detours take {taken}% already, so share={share} would make \
+                     more than the whole"
+                )
+            })
+        }
+        Traffic::Class(class) if !classes.contains(class) => Some(format!(
+            "the daemon defines no client class {class}{}",
+            if classes.is_empty() {
+                String::new()
+            } else {
+                format!("; it has {}", classes.join(", "))
+            }
+        )),
+        Traffic::Class(_) => None,
+    }
+}
+
+/// The detour `wanted` names among `detours` (section 13.12), by the
+/// instance resolver's rules over the detours' runs, with two of a
+/// detour's own first: its release, and its application when one detour
+/// has it. With no value, the one detour there is. An ambiguous value is
+/// refused, listing each detour it matched with the value to pass for it.
+pub fn choose<'a>(
+    wanted: Option<&str>,
+    detours: &'a [pb::Detour],
+) -> Result<&'a pb::Detour, String> {
+    let listing = "muructl detour list";
+
+    let Some(wanted) = wanted.map(str::trim).filter(|wanted| !wanted.is_empty()) else {
+        return match detours {
+            [] => Err("no detour is open on this daemon".to_owned()),
+            [only] => Ok(only),
+            several => Err(ambiguous("", several, detours)),
+        };
+    };
+
+    if let Some(found) = detours.iter().find(|detour| detour.release == wanted) {
+        return Ok(found);
+    }
+
+    let of_app: Vec<&pb::Detour> = detours
+        .iter()
+        .filter(|detour| detour.app == wanted)
+        .collect();
+
+    match of_app.as_slice() {
+        [only] => return Ok(only),
+        [] => {}
+        several => {
+            let several: Vec<pb::Detour> = several.iter().map(|detour| (*detour).clone()).collect();
+            return Err(ambiguous(wanted, &several, detours));
+        }
+    }
+
+    // The rest are the resolver's: the run's tag, a prefix of its ID and
+    // its label, over records made from what the daemon was told.
+
+    let records: Vec<crate::registry::Record> = detours.iter().map(record_of).collect();
+
+    match crate::selector::select(wanted, &records) {
+        Ok(choice) => detours
+            .iter()
+            .find(|detour| detour.instance_id == choice.record.id.to_string())
+            .ok_or_else(|| format!("{wanted} names no open detour; {listing} shows them")),
+        Err(crate::selector::Refusal::Ambiguous { .. }) => {
+            let matched: Vec<pb::Detour> = detours
+                .iter()
+                .filter(|detour| detour.label == wanted)
+                .cloned()
+                .collect();
+            Err(ambiguous(wanted, &matched, detours))
+        }
+        Err(_) => Err(format!(
+            "{wanted} is not the release, application, tag, ID or label of an open detour; \
+             {listing} shows them"
+        )),
+    }
+}
+
+/// A detour's run as a registry record, for the instance resolver.
+fn record_of(detour: &pb::Detour) -> crate::registry::Record {
+    let id = detour
+        .instance_id
+        .parse()
+        .unwrap_or_else(|_| crate::registry::InstanceId::nil());
+    let mut record = crate::registry::Record::new(
+        id,
+        crate::registry::Kind::Detour,
+        crate::client::Endpoint::unix(&detour.socket),
+        PathBuf::from(&detour.directory),
+    );
+    record.label = (!detour.label.is_empty()).then(|| detour.label.clone());
+    record.app = Some(detour.app.clone());
+    record.project = Some(PathBuf::from(&detour.directory));
+    record.pid = detour.pid;
+    record
+}
+
+/// The value that chooses `detour` alone among `detours`: its label when
+/// no other has it, else its release.
+pub fn handle(detour: &pb::Detour, detours: &[pb::Detour]) -> String {
+    let label_alone = !detour.label.is_empty()
+        && detours
+            .iter()
+            .filter(|other| other.label == detour.label)
+            .count()
+            == 1;
+
+    if label_alone {
+        detour.label.clone()
+    } else {
+        detour.release.clone()
+    }
+}
+
+/// The refusal of a value several detours match.
+fn ambiguous(wanted: &str, matched: &[pb::Detour], detours: &[pb::Detour]) -> String {
+    let lines: Vec<(String, String)> = matched
+        .iter()
+        .map(|detour| {
+            (
+                handle(detour, detours),
+                format!(
+                    "{}@{}, pid {} in {}",
+                    detour.app,
+                    detour.release,
+                    detour.pid,
+                    crate::registry::home_shortened(std::path::Path::new(&detour.directory))
+                ),
+            )
+        })
+        .collect();
+    let width = lines
+        .iter()
+        .map(|(value, _)| value.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut text = if wanted.is_empty() {
+        format!("{} detours are open; name one:", matched.len())
+    } else {
+        format!("{wanted} names {} open detours; name one:", matched.len())
+    };
+
+    for (value, what) in lines.iter().take(crate::selector::MAX_LISTED) {
+        text.push_str(&format!("\n  {value:width$}  {what}"));
+    }
+
+    if lines.len() > crate::selector::MAX_LISTED {
+        text.push_str(&format!(
+            "\n  and {} more; muructl detour list shows them all",
+            lines.len() - crate::selector::MAX_LISTED
+        ));
+    }
+
+    text
+}
+
 /// Whether a release ID is a detour's.
 pub fn is_detour_release(release: &str) -> bool {
     release.starts_with(RELEASE_PREFIX)
@@ -355,6 +639,170 @@ mod tests {
                 .contains("detours = true in the [daemon] table of /etc/muru/muru.toml")
         );
         assert!(opening_refusal(true, Mode::User, config).is_none());
+    }
+
+    fn route(app: &str) -> muru_config::Route {
+        muru_config::Route {
+            app: app.to_owned(),
+            ..muru_config::Route::default()
+        }
+    }
+
+    /// What a detour of shop asks.
+    fn taking<'a>(release: &'a str, traffic: &'a Traffic) -> Taking<'a> {
+        Taking {
+            app: "shop",
+            release,
+            traffic,
+        }
+    }
+
+    #[test]
+    fn each_choice_is_laid_over_the_routes_of_its_application_alone() {
+        let all = &Traffic::All;
+        let share = &Traffic::Share(10);
+        let class = &Traffic::Class("crawlers".to_owned());
+        let preview = &Traffic::Preview;
+
+        let mut pinned = route("shop");
+        lay_over(&mut pinned, &[taking("dev-1", all)]);
+        assert_eq!(
+            pinned.traffic.unwrap().split,
+            BTreeMap::from([("dev-1".to_owned(), 100)])
+        );
+
+        let mut split = route("shop");
+        split.traffic = Some(muru_config::Traffic {
+            split: BTreeMap::from([("r2".to_owned(), 50)]),
+            sticky: Some(true),
+            ..Default::default()
+        });
+        lay_over(
+            &mut split,
+            &[taking("dev-1", share), taking("dev-2", preview)],
+        );
+        let traffic = split.traffic.unwrap();
+        assert_eq!(traffic.split, BTreeMap::from([("dev-1".to_owned(), 10)]));
+        assert_eq!(traffic.sticky, Some(true), "the rest of the policy stays");
+
+        let mut classed = route("shop");
+        lay_over(&mut classed, &[taking("dev-1", class)]);
+        assert_eq!(
+            classed.traffic.unwrap().classes,
+            BTreeMap::from([("crawlers".to_owned(), "dev-1".to_owned())])
+        );
+
+        let mut other = route("blog");
+        lay_over(&mut other, &[taking("dev-1", all)]);
+        assert!(other.traffic.is_none());
+
+        let mut previewed = route("shop");
+        lay_over(&mut previewed, &[taking("dev-1", preview)]);
+        assert!(previewed.traffic.is_none());
+
+        assert_eq!(
+            changes(&[taking("dev-1", all), taking("dev-2", preview)]),
+            ["app shop to dev-1: every route pinned"]
+        );
+    }
+
+    #[test]
+    fn all_and_a_share_wait_for_a_rollout_and_never_take_more_than_the_whole() {
+        let all = Traffic::All;
+        let share = Traffic::Share(60);
+        let crawlers = Traffic::Class("crawlers".to_owned());
+        let bots = Traffic::Class("bots".to_owned());
+        let preview = Traffic::Preview;
+        let classes = ["crawlers".to_owned()];
+
+        assert!(traffic_refusal(taking("dev-1", &all), &[], false, &classes).is_none());
+        assert!(
+            traffic_refusal(taking("dev-1", &all), &[], true, &classes)
+                .unwrap()
+                .contains("rollout")
+        );
+        assert!(
+            traffic_refusal(taking("dev-1", &share), &[], true, &classes)
+                .unwrap()
+                .contains("rollout")
+        );
+        assert!(traffic_refusal(taking("dev-1", &preview), &[], true, &classes).is_none());
+        assert!(traffic_refusal(taking("dev-1", &crawlers), &[], true, &classes).is_none());
+
+        assert!(
+            traffic_refusal(
+                taking("dev-2", &all),
+                &[taking("dev-1", &all)],
+                false,
+                &classes
+            )
+            .unwrap()
+            .contains("dev-1 takes all")
+        );
+        assert!(
+            traffic_refusal(
+                taking("dev-2", &share),
+                &[taking("dev-1", &share)],
+                false,
+                &classes
+            )
+            .unwrap()
+            .contains("more than the whole")
+        );
+        assert!(
+            traffic_refusal(taking("dev-1", &bots), &[], false, &classes)
+                .unwrap()
+                .contains("no client class bots; it has crawlers")
+        );
+    }
+
+    fn detour(release: &str, app: &str, label: &str, id: &str) -> pb::Detour {
+        pb::Detour {
+            app: app.to_owned(),
+            release: release.to_owned(),
+            label: label.to_owned(),
+            instance_id: id.to_owned(),
+            pid: 4123,
+            directory: "/home/me/shop".to_owned(),
+            socket: "/run/user/1000/muru/run-1/detour.sock".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_detour_is_chosen_by_release_application_tag_id_or_label() {
+        let one = detour(
+            "dev-7f3a",
+            "shop",
+            "main",
+            "7f3a91c2d4e5f60718293a4b5c6d7e8f",
+        );
+        let two = detour(
+            "dev-1b2c",
+            "shop",
+            "feature-x",
+            "1b2c3d4e5f60718293a4b5c6d7e8f901",
+        );
+        let blog = detour("dev-9999", "blog", "", "99990000aaaabbbbccccddddeeeeffff");
+        let detours = [one.clone(), two.clone(), blog.clone()];
+
+        assert_eq!(choose(Some("dev-1b2c"), &detours).unwrap(), &two);
+        assert_eq!(choose(Some("blog"), &detours).unwrap(), &blog);
+        assert_eq!(choose(Some("detour:7f3a91c2"), &detours).unwrap(), &one);
+        assert_eq!(choose(Some("1b2c3d"), &detours).unwrap(), &two);
+        assert_eq!(choose(Some("feature-x"), &detours).unwrap(), &two);
+
+        let refused = choose(Some("shop"), &detours).unwrap_err();
+        assert!(refused.contains("shop names 2 open detours"), "{refused}");
+        assert!(
+            refused.contains("main") && refused.contains("feature-x"),
+            "{refused}"
+        );
+
+        assert!(choose(None, &detours).is_err());
+        assert_eq!(choose(None, std::slice::from_ref(&blog)).unwrap(), &blog);
+        assert!(choose(Some("nothing"), &detours).is_err());
+        assert!(choose(None, &[]).unwrap_err().contains("no detour is open"));
     }
 
     #[test]

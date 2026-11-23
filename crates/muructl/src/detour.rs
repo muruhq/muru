@@ -30,6 +30,24 @@ pub enum DetourCommand {
     /// daemon routes previews to it, or more when asked, with reload, the
     /// toolbar and tracebacks of a development run.
     Run(Box<DetourRunArgs>),
+
+    /// Change what a detour takes while it runs: preview, all, share=N or class=NAME.
+    Traffic(TrafficArgs),
+}
+
+/// `muructl detour traffic`.
+#[derive(Args)]
+pub struct TrafficArgs {
+    /// The detour, then what it is to take. The detour is its release, its
+    /// application, its label, the tag muructl instance list shows or a
+    /// prefix of its ID (default: the project's application, else the one
+    /// detour open); the choice is preview, all, share=N or class=NAME.
+    #[arg(value_name = "[DETOUR] CHOICE", num_args = 1..=2, required = true)]
+    words: Vec<String>,
+
+    /// Which daemon the detour is open on.
+    #[command(flatten)]
+    socket: SocketArgs,
 }
 
 /// `muructl detour run`.
@@ -290,6 +308,64 @@ pub async fn run(args: DetourRunArgs) -> anyhow::Result<()> {
     crate::run_with(run_args, None, None, Some(mode)).await
 }
 
+/// The daemon's open detours.
+async fn listed(
+    client: &mut muru_proto::admin::v1::admin_client::AdminClient<tonic::transport::Channel>,
+) -> anyhow::Result<Vec<pb::Detour>> {
+    Ok(client
+        .list_detours(pb::ListDetoursRequest {})
+        .await
+        .map_err(crate::admin::explain)?
+        .into_inner()
+        .detours)
+}
+
+/// The detour a command names, or the one a command run from a checkout
+/// means: the project's application's, else the daemon's one detour.
+fn chosen<'a>(wanted: Option<&str>, detours: &'a [pb::Detour]) -> anyhow::Result<&'a pb::Detour> {
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|directory| crate::open::project_app(&directory))
+        .filter(|app| detours.iter().any(|detour| &detour.app == app));
+    let wanted = wanted.map(str::to_owned).or(project);
+
+    muru_controller::detours::choose(wanted.as_deref(), detours).map_err(anyhow::Error::msg)
+}
+
+/// Run `muructl detour traffic`.
+pub async fn traffic(args: TrafficArgs) -> anyhow::Result<()> {
+    let (wanted, choice) = match args.words.as_slice() {
+        [choice] => (None, choice.clone()),
+        [wanted, choice] => (Some(wanted.as_str()), choice.clone()),
+        _ => anyhow::bail!("give the detour's traffic, as muructl detour traffic [DETOUR] all"),
+    };
+
+    muru_controller::detours::Traffic::parse(&choice).map_err(anyhow::Error::msg)?;
+
+    let mut client = muru_controller::client::connect(&args.socket.endpoint()?).await?;
+    let detours = listed(&mut client).await?;
+    let detour = chosen(wanted, &detours)?;
+    let before = detour.traffic.clone();
+
+    let after = client
+        .set_detour_traffic(pb::SetDetourTrafficRequest {
+            app: detour.app.clone(),
+            release: detour.release.clone(),
+            traffic: choice,
+        })
+        .await
+        .map_err(crate::admin::explain)?
+        .into_inner();
+
+    muru_common::muru_println!(
+        "detour {}@{} now takes {} (was {before})",
+        after.app,
+        after.release,
+        takes(&after.traffic, &after.app)
+    );
+    Ok(())
+}
+
 /// Bind the detour's socket in the run's directory, before anything
 /// starts, so the daemon can check it when the detour opens; connections
 /// wait in its backlog until the edge takes them.
@@ -364,7 +440,7 @@ pub fn name(opened: &pb::DetourOpened) -> String {
 /// What a traffic choice means, as a line says it.
 pub fn takes(traffic: &str, app: &str) -> String {
     match traffic {
-        "" | "preview" => "preview only, by an entry link (muructl detour preview)".to_owned(),
+        "" | "preview" => "previews only".to_owned(),
         "all" => format!("all of {app}'s traffic"),
         other => match other.split_once('=') {
             Some(("share", share)) => format!("{share}% of {app}'s clients"),
@@ -531,7 +607,7 @@ mod tests {
 
     #[test]
     fn a_traffic_choice_is_said_as_what_it_sends() {
-        assert!(takes("preview", "shop").starts_with("preview only"));
+        assert_eq!(takes("preview", "shop"), "previews only");
         assert_eq!(takes("all", "shop"), "all of shop's traffic");
         assert_eq!(takes("share=10", "shop"), "10% of shop's clients");
         assert_eq!(

@@ -708,6 +708,17 @@ pub enum Command {
         /// the opening's serial.
         done: oneshot::Sender<Result<(muru_proto::admin::v1::DetourOpened, u64), String>>,
     },
+    /// Section 9.13: change what a detour takes.
+    SetDetourTraffic {
+        /// The application.
+        app: String,
+        /// The detour's release.
+        release: String,
+        /// What it is to take.
+        traffic: crate::detours::Traffic,
+        /// Answered with the detour as it is now, or why not.
+        done: oneshot::Sender<Result<muru_proto::admin::v1::Detour, String>>,
+    },
     /// Section 9.13: a detour's stream ended, from its run's side or the
     /// daemon's.
     CloseDetour {
@@ -4404,6 +4415,15 @@ impl Daemon {
         let active = crate::overlays::ordered(&overlays, &states);
         let mut routes = self.store.routes().unwrap_or_default();
         crate::overlays::apply_routes(&mut routes, &active);
+
+        // Section 9.13: the detours' overlays, over every declared one.
+
+        let takings = self.detour_takings();
+
+        for route in &mut routes {
+            crate::detours::lay_over(route, &takings);
+        }
+
         let base: BTreeSet<String> = self.maintenance.keys().cloned().collect();
         let maintained = crate::overlays::apply_maintenance(&base, &active);
         (routes, maintained)
@@ -6616,6 +6636,14 @@ impl Daemon {
             } => {
                 let _ = done.send(self.open_detour(opening, updates).await);
             }
+            Command::SetDetourTraffic {
+                app,
+                release,
+                traffic,
+                done,
+            } => {
+                let _ = done.send(self.set_detour_traffic(&app, &release, traffic).await);
+            }
             Command::CloseDetour { serial, reason } => {
                 self.close_detour(serial, &reason).await;
             }
@@ -8376,10 +8404,14 @@ impl Daemon {
             .map(|((app, id), _)| (app, id))
             .collect();
         routable.sort();
-        let included: BTreeSet<(String, String)> = routable
+        let mut included: BTreeSet<(String, String)> = routable
             .iter()
             .map(|(app, id)| ((*app).clone(), (*id).clone()))
             .collect();
+
+        // Section 9.13: a detour takes what its overlay gives it.
+
+        included.extend(self.detours.keys().cloned());
 
         for (name, id) in routable {
             if let Some(running) = self.running.get(&(name.clone(), id.clone())) {
@@ -8715,10 +8747,11 @@ impl Daemon {
         // rollout chooses among its releases as a route's would.
 
         let default_traffic = if hosts.is_empty() && !default_app.is_empty() {
-            let route = muru_config::Route {
+            let mut route = muru_config::Route {
                 app: default_app.clone(),
                 ..muru_config::Route::default()
             };
+            crate::detours::lay_over(&mut route, &self.detour_takings());
             self.route_traffic(&route, &included, &rollouts)
         } else {
             None

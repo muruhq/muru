@@ -184,6 +184,22 @@ service Admin {
   // first message says what was opened; later ones carry changes; the
   // release goes when the stream ends from either side.
   rpc OpenDetour(OpenDetourRequest) returns (stream DetourMessage);
+  // The open detours, never a secret.
+  rpc ListDetours(ListDetoursRequest) returns (ListDetoursResponse);
+  // Change what a detour takes: preview, all, share=N or class=NAME.
+  rpc SetDetourTraffic(SetDetourTrafficRequest) returns (Detour);
+}
+
+message ListDetoursRequest {}
+
+message ListDetoursResponse {
+  repeated Detour detours = 1;
+}
+
+message SetDetourTrafficRequest {
+  string app = 1;
+  string release = 2;
+  string traffic = 3;
 }
 
 // A development run asking to put itself behind the daemon's edge.

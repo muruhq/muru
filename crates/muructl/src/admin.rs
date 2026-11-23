@@ -11826,7 +11826,7 @@ pub fn print_answer<T: serde::Serialize>(answer: &T) -> anyhow::Result<()> {
 }
 
 /// A gRPC status as a plain sentence.
-fn explain(status: tonic::Status) -> anyhow::Error {
+pub(crate) fn explain(status: tonic::Status) -> anyhow::Error {
     anyhow::anyhow!("{}", status.message())
 }
 

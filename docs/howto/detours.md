@@ -42,7 +42,7 @@ $ muructl detour run
 muru: using [tool.muru] from ./pyproject.toml
 ...
 muru: serving shop.wsgi:application on detour shop@dev-7f3a of the daemon at /run/user/1000/muru/admin.sock with 2 workers of 3 threads
-muru: traffic: preview only, by an entry link (muructl detour preview)
+muru: traffic: previews only; muructl detour preview gives an entry link
 muru: development mode: error pages show tracebacks, no releases are kept, the run reloads on change, and the daemon's edge serves the clients and compresses; Ctrl-C ends the detour
 muru: dashboard on http://127.0.0.1:52817/
 muru: admin socket /run/user/1000/muru/run-7f3a91c2/admin.sock
@@ -157,7 +157,7 @@ detour traffic` changes it while it runs:
 $ muructl detour traffic all
 muru: detour shop@dev-7f3a now takes all of shop's traffic (was preview)
 $ muructl detour traffic preview
-muru: detour shop@dev-7f3a now takes preview only (was all)
+muru: detour shop@dev-7f3a now takes previews only (was all)
 ```
 
 A choice other than preview is an overlay named `detour:APP`, owned by

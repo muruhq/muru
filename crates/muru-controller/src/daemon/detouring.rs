@@ -45,13 +45,6 @@ impl Daemon {
             ));
         }
 
-        if opening.traffic != Traffic::Preview {
-            return Err(format!(
-                "a detour takes previews only here, not {}",
-                opening.traffic.word()
-            ));
-        }
-
         // A run that opens its detour again, after its stream dropped,
         // replaces the detour it had, keeping its release's name.
 
@@ -70,6 +63,11 @@ impl Daemon {
         let release = detours::release_name(&opening.instance_id, |name| {
             self.detours.contains_key(&(app.clone(), name.to_owned()))
         });
+
+        if let Some(refusal) = self.traffic_refusal(&app, &release, &opening.traffic) {
+            return Err(refusal);
+        }
+
         let secret = detours::secret()?;
         self.detour_serial += 1;
         let serial = self.detour_serial;
@@ -230,6 +228,111 @@ impl Daemon {
         for (serial, why) in gone {
             self.close_detour(serial, why).await;
         }
+    }
+
+    /// Change what a detour takes (section 9.13): the overlay it owns
+    /// changes with it, its run hears of it, and `detour.traffic` records
+    /// the old choice and the new.
+    pub(super) async fn set_detour_traffic(
+        &mut self,
+        app: &str,
+        release: &str,
+        traffic: Traffic,
+    ) -> Result<admin::Detour, String> {
+        let key = (app.to_owned(), release.to_owned());
+
+        if !self.detours.contains_key(&key) {
+            return Err(format!("{app}@{release} is not an open detour"));
+        }
+
+        if let Some(refusal) = self.traffic_refusal(app, release, &traffic) {
+            return Err(refusal);
+        }
+
+        let Some(detour) = self.detours.get_mut(&key) else {
+            return Err(format!("{app}@{release} is not an open detour"));
+        };
+
+        let before = std::mem::replace(&mut detour.opening.traffic, traffic.clone());
+
+        if let Err(error) = self.push_snapshot().await {
+            if let Some(detour) = self.detours.get_mut(&key) {
+                detour.opening.traffic = before;
+            }
+
+            let _ = self.push_snapshot().await;
+            return Err(format!("the edge refused the detour's traffic: {error}"));
+        }
+
+        let Some(detour) = self.detours.get(&key) else {
+            return Err(format!("{app}@{release} closed as its traffic changed"));
+        };
+
+        let message = detour.message();
+        let _ = detour.updates.try_send(Ok(admin::DetourMessage {
+            what: Some(admin::detour_message::What::Changed(message.clone())),
+        }));
+        self.publish_detours();
+
+        let subject = format!("{app}@{release}");
+        self.events.emit(
+            "detour.traffic",
+            &subject,
+            "info",
+            &format!(
+                "detour {subject} takes {} now, {} before",
+                traffic.word(),
+                before.word()
+            ),
+        );
+
+        Ok(message)
+    }
+
+    /// What every open detour asks of its application's routes.
+    pub(super) fn detour_takings(&self) -> Vec<detours::Taking<'_>> {
+        self.detours
+            .values()
+            .map(|detour| detours::Taking {
+                app: detour.app(),
+                release: &detour.release,
+                traffic: &detour.opening.traffic,
+            })
+            .collect()
+    }
+
+    /// Why a detour of `app` cannot take `traffic` now: a rollout under
+    /// way, another detour's claim, or a client class the daemon does
+    /// not define.
+    fn traffic_refusal(&self, app: &str, release: &str, traffic: &Traffic) -> Option<String> {
+        let rollout = self
+            .store
+            .rollouts(Some(app))
+            .unwrap_or_default()
+            .iter()
+            .any(|rollout| rollout.state.is_active());
+        let classes: Vec<String> = self
+            .clients
+            .classes_message
+            .iter()
+            .map(|class| class.name.clone())
+            .collect();
+        let others: Vec<detours::Taking<'_>> = self
+            .detour_takings()
+            .into_iter()
+            .filter(|other| other.app == app && other.release != release)
+            .collect();
+
+        detours::traffic_refusal(
+            detours::Taking {
+                app,
+                release,
+                traffic,
+            },
+            &others,
+            rollout,
+            &classes,
+        )
     }
 
     /// Publish the open detours for the API.

@@ -2168,6 +2168,40 @@ impl Admin for Service {
         Ok(Response::new(pb::NoteBundleResponse {}))
     }
 
+    async fn list_detours(
+        &self,
+        _: Request<pb::ListDetoursRequest>,
+    ) -> Result<Response<pb::ListDetoursResponse>, Status> {
+        Ok(Response::new(pb::ListDetoursResponse {
+            detours: self.detours(),
+        }))
+    }
+
+    async fn set_detour_traffic(
+        &self,
+        request: Request<pb::SetDetourTrafficRequest>,
+    ) -> Result<Response<pb::Detour>, Status> {
+        let request = request.into_inner();
+        let traffic =
+            crate::detours::Traffic::parse(&request.traffic).map_err(Status::invalid_argument)?;
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::SetDetourTraffic {
+                app: request.app,
+                release: request.release,
+                traffic,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let detour = done_rx
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(detour))
+    }
+
     async fn list_overlays(
         &self,
         _: Request<pb::ListOverlaysRequest>,
@@ -2223,7 +2257,56 @@ impl Admin for Service {
                     name,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+
+        // Section 9.13: an application's detours that take more than
+        // previews own an overlay, active while they do, held in memory.
+
+        let mut overlays = overlays;
+        let detours = self.detours();
+        let apps: BTreeSet<&str> = detours.iter().map(|detour| detour.app.as_str()).collect();
+
+        for app in apps {
+            let traffic: Vec<(String, crate::detours::Traffic)> = detours
+                .iter()
+                .filter(|detour| detour.app == app)
+                .filter_map(|detour| {
+                    crate::detours::Traffic::parse(&detour.traffic)
+                        .ok()
+                        .map(|traffic| (detour.release.clone(), traffic))
+                })
+                .collect();
+            let takings: Vec<crate::detours::Taking<'_>> = traffic
+                .iter()
+                .map(|(release, traffic)| crate::detours::Taking {
+                    app,
+                    release,
+                    traffic,
+                })
+                .collect();
+            let changes = crate::detours::changes(&takings);
+
+            if changes.is_empty() {
+                continue;
+            }
+
+            let since = detours
+                .iter()
+                .filter(|detour| detour.app == app)
+                .map(|detour| u64::try_from(detour.opened_unix_ms).unwrap_or_default())
+                .min()
+                .unwrap_or_default();
+            overlays.push(pb::OverlayInfo {
+                name: crate::detours::overlay_name(app),
+                active: true,
+                state: crate::detours::OVERLAY_SOURCE.to_owned(),
+                since_unix_ms: since,
+                trigger: "its detour".to_owned(),
+                changes,
+                ..Default::default()
+            });
+        }
+
         Ok(Response::new(pb::ListOverlaysResponse { overlays }))
     }
 
@@ -2232,6 +2315,16 @@ impl Admin for Service {
         request: Request<pb::ControlOverlayRequest>,
     ) -> Result<Response<pb::ControlOverlayResponse>, Status> {
         let request = request.into_inner();
+
+        // Section 9.13: a detour's overlay lives and ends with the detour.
+
+        if crate::detours::is_overlay(&request.name) {
+            return Err(Status::failed_precondition(format!(
+                "{} is a detour's, which begins and ends with the detour's traffic: muructl \
+                 detour traffic changes it",
+                request.name
+            )));
+        }
 
         let action = match request.action.as_str() {
             "activate" => crate::daemon::OverlayAction::Activate {
