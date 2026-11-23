@@ -533,7 +533,21 @@ impl Pools {
     /// groups to the requests waiting for them (section 7.4).
     pub fn apply(&self, routing: routing::Routing) {
         let pools = routing.group_pools();
-        *self.current.write().expect("pools poisoned") = Arc::new(routing);
+        let routing = Arc::new(routing);
+        let previous = std::mem::replace(
+            &mut *self.current.write().expect("pools poisoned"),
+            Arc::clone(&routing),
+        );
+
+        // Section 4.21: the WebSockets of a detour the new tables no
+        // longer have are closed, as a drain closes a release's.
+
+        for server in previous.servers() {
+            if server.is_detour() && routing.server_named(server.name()).is_none() {
+                server.end_relays();
+            }
+        }
+
         wake::wakes().publish(&pools);
     }
 }

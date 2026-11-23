@@ -306,6 +306,31 @@ struct Shared {
 }
 
 impl Shared {
+    /// The deadline for a client's request to the upstream: the limits'
+    /// for any upstream, none to speak of for a detour (section 4.21).
+    fn request_deadline(&self, limits: &crate::Limits) -> Duration {
+        if self.detour {
+            DETOUR_DEADLINE
+        } else {
+            limits.request_deadline
+        }
+    }
+
+    /// How long a response may pause between pieces.
+    fn response_idle_timeout(&self, limits: &crate::Limits) -> Duration {
+        if self.detour {
+            DETOUR_IDLE_TIMEOUT
+        } else {
+            limits.response_idle_timeout
+        }
+    }
+
+    /// Whether the error override and error pages may replace the
+    /// upstream's own error responses: never a detour's.
+    fn overrides_errors(&self) -> bool {
+        !self.detour
+    }
+
     /// The protocol a request goes over: the upstream's, or for a detour
     /// h2c when the request is gRPC (gRPC-Web included, which the run's
     /// edge translates) and HTTP/1.1 otherwise (section 4.21).
@@ -332,10 +357,23 @@ fn wants_trailers(headers: &HeaderMap) -> bool {
         .any(|option| option.trim().eq_ignore_ascii_case("trailers"))
 }
 
+/// How long a detour's response may pause between pieces: a request
+/// held at a breakpoint is answered when the debugger lets it go
+/// (section 4.21).
+const DETOUR_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// A detour's request deadline, which in effect it has none of: far
+/// enough off that nothing a person does at a breakpoint reaches it.
+const DETOUR_DEADLINE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 /// An upstream of a snapshot.
 pub struct Upstream {
     shared: Arc<Shared>,
     probe: Option<tokio::task::JoinHandle<()>>,
+    /// Section 4.21: set when a detour leaves the routing, which closes
+    /// the WebSockets relayed to it. The upstreams successive snapshots
+    /// make for one detour share it.
+    ended: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Drop for Upstream {
@@ -430,7 +468,29 @@ impl Upstream {
             tokio::spawn(run_probes(Arc::clone(&shared), config))
         });
 
-        Ok(Self { shared, probe })
+        Ok(Self {
+            shared,
+            probe,
+            ended: Arc::new(tokio::sync::watch::Sender::new(false)),
+        })
+    }
+
+    /// Whether the upstream is a detour's run (section 4.21).
+    pub fn is_detour(&self) -> bool {
+        self.shared.detour
+    }
+
+    /// Take over the WebSockets relayed through the upstream an earlier
+    /// snapshot made for the same detour, so that they last as long as
+    /// the detour and not as long as one snapshot.
+    pub fn carry_relays(&mut self, earlier: &Upstream) {
+        self.ended = Arc::clone(&earlier.ended);
+    }
+
+    /// Close every WebSocket relayed through the upstream, as the end of
+    /// a detour does.
+    pub fn end_relays(&self) {
+        self.ended.send_replace(true);
     }
 
     /// The upstream's name.
@@ -1053,7 +1113,7 @@ pub async fn handle(
 
     let deadline = match context.handler {
         Some(budget) => (context.arrived + limits.request_deadline).min(Instant::now() + budget),
-        None => context.arrived + limits.request_deadline,
+        None => context.arrived + shared.request_deadline(limits),
     };
 
     // The addresses in turn from where the last request left off: those
@@ -1261,8 +1321,12 @@ pub async fn handle(
         return Handled::Redirect(Box::new(redirect));
     }
 
+    // Section 4.21: a detour's responses are the run's own, tracebacks
+    // and all, so no error override or error page replaces them.
+
     if upgrade.is_none()
         && context.handler.is_none()
+        && shared.overrides_errors()
         && let Some(problem) =
             link::override_from(&head, response_end, failing.negotiation(), &context.errors)
     {
@@ -1301,7 +1365,8 @@ pub async fn handle(
     {
         let upstream_side = hyper::upgrade::on(&mut response);
         let answer = crate::websocket::accepted_response(&upgrade, head.headers);
-        tokio::spawn(relay(upgrade, upstream_side, recording));
+        let ended = shared.detour.then(|| upstream.ended.subscribe());
+        tokio::spawn(relay(upgrade, upstream_side, recording, ended));
         return Handled::Response(answer);
     }
 
@@ -1347,7 +1412,7 @@ pub async fn handle(
                 recording,
                 status: status.as_u16(),
                 bytes: 0,
-                idle_timeout: limits.response_idle_timeout,
+                idle_timeout: shared.response_idle_timeout(limits),
             },
             next_chunk,
         );
@@ -1365,11 +1430,12 @@ pub async fn handle(
 }
 
 /// Copy bytes between the client and the upstream for the life of a
-/// WebSocket the upstream accepted.
+/// WebSocket the upstream accepted, or for a detour's until it ends.
 async fn relay(
     upgrade: crate::websocket::Upgrade,
     upstream_side: hyper::upgrade::OnUpgrade,
     recording: Option<Recording>,
+    ended: Option<tokio::sync::watch::Receiver<bool>>,
 ) {
     let (client, server) = match (upgrade.into_on_upgrade().await, upstream_side.await) {
         (Ok(client), Ok(server)) => (client, server),
@@ -1386,9 +1452,20 @@ async fn relay(
 
     let mut client = TokioIo::new(client);
     let mut server = TokioIo::new(server);
-    let copied = tokio::io::copy_bidirectional(&mut client, &mut server)
-        .await
-        .map_or(0, |(_, from_server)| from_server);
+    let copying = tokio::io::copy_bidirectional(&mut client, &mut server);
+
+    // A detour's WebSocket closes when the detour ends; its sender gone
+    // means the same.
+
+    let copied = match ended {
+        Some(mut ended) => {
+            tokio::select! {
+                copied = copying => copied.map_or(0, |(_, from_server)| from_server),
+                _ = ended.wait_for(|ended| *ended) => 0,
+            }
+        }
+        None => copying.await.map_or(0, |(_, from_server)| from_server),
+    };
 
     if let Some(recording) = recording {
         recording.complete(101, "", copied);
@@ -1701,6 +1778,68 @@ mod tests {
         );
         let h2c = upstream(false, "h2c");
         assert_eq!(h2c.shared.protocol_for(&typed("text/html")), Protocol::H2c);
+    }
+
+    #[test]
+    fn a_detour_has_no_deadline_a_long_pause_and_no_error_override() {
+        let upstream = |detour: bool| {
+            Upstream::from_message(&pb::Upstream {
+                name: "shop@dev-7f3a".to_owned(),
+                addresses: vec!["unix:/run/user/1000/muru/run-1/detour.sock".to_owned()],
+                detour,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let limits = crate::Limits::default();
+
+        let detour = upstream(true);
+        assert!(detour.shared.request_deadline(&limits) >= Duration::from_secs(24 * 60 * 60));
+        assert_eq!(
+            detour.shared.response_idle_timeout(&limits),
+            Duration::from_secs(60 * 60)
+        );
+        assert!(!detour.shared.overrides_errors());
+        assert!(detour.is_detour());
+
+        let plain = upstream(false);
+        assert_eq!(
+            plain.shared.request_deadline(&limits),
+            limits.request_deadline
+        );
+        assert_eq!(
+            plain.shared.response_idle_timeout(&limits),
+            limits.response_idle_timeout
+        );
+        assert!(plain.shared.overrides_errors());
+        assert!(!plain.is_detour());
+    }
+
+    #[test]
+    fn a_detours_websockets_last_across_snapshots_and_close_when_it_ends() {
+        let upstream = || {
+            Upstream::from_message(&pb::Upstream {
+                name: "shop@dev-7f3a".to_owned(),
+                addresses: vec!["unix:/run/user/1000/muru/run-1/detour.sock".to_owned()],
+                detour: true,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+
+        let first = upstream();
+        let relaying = first.ended.subscribe();
+
+        // The next snapshot's upstream for the same detour takes over the
+        // relays, and the first one going leaves them open.
+
+        let mut second = upstream();
+        second.carry_relays(&first);
+        drop(first);
+        assert!(!*relaying.borrow());
+
+        second.end_relays();
+        assert!(*relaying.borrow());
     }
 
     #[test]

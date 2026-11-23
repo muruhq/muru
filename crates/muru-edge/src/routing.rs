@@ -1432,8 +1432,18 @@ impl Routing {
             // for its workers, as an upstream named after the release.
 
             if let Some(server) = &app.server {
-                let server = Upstream::from_message(server)
+                let mut server = Upstream::from_message(server)
                     .map_err(|error| anyhow::anyhow!("{}@{}: {error}", app.app, app.release))?;
+
+                // Section 4.21: a detour's WebSockets outlast the snapshot.
+
+                if server.is_detour()
+                    && let Some(earlier) =
+                        previous.and_then(|previous| previous.server_named(server.name()))
+                {
+                    server.carry_relays(&earlier);
+                }
+
                 pools = pools.with_server(Arc::new(server));
             }
 
@@ -1845,6 +1855,15 @@ impl Routing {
             .collect();
         servers.sort_by(|left, right| left.name().cmp(right.name()));
         servers
+    }
+
+    /// The managed server or detour named `name`, as `app@release`.
+    pub fn server_named(&self, name: &str) -> Option<Arc<Upstream>> {
+        self.app_pools()
+            .iter()
+            .filter_map(|pools| pools.server())
+            .find(|server| server.name() == name)
+            .cloned()
     }
 
     /// The error pages and override in force for a request (section
