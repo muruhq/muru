@@ -181,6 +181,9 @@ pub struct Detour {
     pub serial: u64,
     /// The stream to its run.
     pub updates: Updates,
+    /// When its traffic goes back to preview on its own, Unix
+    /// milliseconds; 0 for never.
+    pub until_unix_ms: u64,
 }
 
 impl Detour {
@@ -201,6 +204,7 @@ impl Detour {
             traffic: self.opening.traffic.word(),
             opened_unix_ms: self.opened_unix_ms,
             socket: self.opening.socket.display().to_string(),
+            until_unix_ms: self.until_unix_ms,
         }
     }
 
@@ -340,6 +344,36 @@ pub fn changes(takings: &[Taking<'_>]) -> Vec<String> {
             format!("app {} to {}: {what}", taking.app, taking.release)
         })
         .collect()
+}
+
+/// A detour's traffic as listings show it: the choice, and when it goes
+/// back to preview, as HH:MM UTC, when it is timed.
+pub fn traffic_text(traffic: &str, until_unix_ms: u64) -> String {
+    if until_unix_ms == 0 {
+        traffic.to_owned()
+    } else {
+        format!("{traffic} until {}", crate::daemon::clock(until_unix_ms))
+    }
+}
+
+/// Why `traffic` cannot end on its own at `until_unix_ms` (0 for never),
+/// at `now_unix_ms`: preview is what a timed choice goes back to, so it
+/// has nothing to end, and the end must be still to come.
+pub fn timed_refusal(traffic: &Traffic, until_unix_ms: u64, now_unix_ms: u64) -> Option<String> {
+    if until_unix_ms == 0 {
+        return None;
+    }
+
+    if *traffic == Traffic::Preview {
+        return Some(
+            "a detour goes back to preview when a timed choice ends, so preview takes no end \
+             time"
+                .to_owned(),
+        );
+    }
+
+    (until_unix_ms <= now_unix_ms)
+        .then(|| "the time given for the detour's traffic to end has passed already".to_owned())
 }
 
 /// Why a detour cannot take `wanted` of its application, given the
@@ -601,6 +635,35 @@ mod tests {
         for choice in ["preview", "all", "share=10", "class=crawlers"] {
             assert_eq!(Traffic::parse(choice).unwrap().word(), choice);
         }
+    }
+
+    #[test]
+    fn a_timed_choice_needs_something_to_end_and_an_end_to_come() {
+        let now = 1_800_000_000_000;
+
+        // Untimed, anything goes; timed, preview has nothing to end and
+        // the end must be ahead.
+
+        assert_eq!(timed_refusal(&Traffic::Preview, 0, now), None);
+        assert_eq!(timed_refusal(&Traffic::Share(10), now + 60_000, now), None);
+        assert!(
+            timed_refusal(&Traffic::Preview, now + 60_000, now)
+                .unwrap()
+                .contains("preview takes no end time")
+        );
+        assert!(
+            timed_refusal(&Traffic::All, now, now)
+                .unwrap()
+                .contains("has passed already")
+        );
+
+        // Listings give the end as a UTC clock.
+
+        assert_eq!(traffic_text("all", 0), "all");
+        assert_eq!(
+            traffic_text("share=10", 1_800_000_000_000 + 25 * 60_000),
+            "share=10 until 08:25 UTC"
+        );
     }
 
     #[test]

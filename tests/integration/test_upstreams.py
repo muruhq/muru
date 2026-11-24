@@ -650,6 +650,18 @@ def test_a_websocket_is_relayed_to_an_upstream(site: Fixture) -> None:
         assert connection.recv(timeout=10) == "echo:hello"
 
 
+def test_a_websocket_over_http2_reaches_an_http1_upstream(site: Fixture) -> None:
+    from support import http2
+
+    # The client's extended CONNECT becomes the HTTP/1.1 handshake for
+    # the upstream, and its 101 the 200 the client waits for.
+
+    status, echoed = http2.echo_over_http2(
+        site.daemon.port, "/ws/chat", "hello", authority=f"site.test:{site.daemon.port}"
+    )
+    assert (status, echoed) == (200, "echo:hello")
+
+
 def test_h2c_and_h2_upstreams_reach_the_daemon_itself(site: Fixture) -> None:
     for prefix in ("/h2c/", "/h2/"):
         response = call(site.daemon.port, f"{prefix}internal-info?q=1", {"X-User": prefix})

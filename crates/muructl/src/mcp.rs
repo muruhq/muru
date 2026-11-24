@@ -1212,11 +1212,12 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "detour_traffic",
-            description: "Change what a detour takes: preview (only browsers with its preview cookie), all (every request for its application), share=N (N percent of its clients) or class=NAME (a client class the daemon defines). Anything but preview is an overlay the detour owns, which ends with it.",
+            description: "Change what a detour takes: preview (only browsers with its preview cookie), all (every request for its application), share=N (N percent of its clients) or class=NAME (a client class the daemon defines), until changed or, with for, for that long, when it goes back to preview on its own. Anything but preview is an overlay the detour owns, which ends with it.",
             changes: true,
             properties: json!({
                 "detour": {"type": "string", "description": "The detour, by its release, application, label, tag or the start of its ID; the project's application's, or the one open, when left out"},
                 "traffic": {"type": "string", "description": "preview, all, share=N or class=NAME"},
+                "for": {"type": "string", "description": "How long the choice lasts before the detour takes preview again, such as 10m; until changed when left out. Not with preview"},
             }),
             required: &["traffic"],
             command: |arguments| {
@@ -1227,6 +1228,11 @@ fn specs() -> Vec<Spec> {
                 }
 
                 command.push(needed(arguments, "traffic")?);
+
+                if let Some(duration) = text(arguments, "for") {
+                    command.extend(["--for".to_owned(), duration]);
+                }
+
                 Ok(command)
             },
         },
@@ -1905,6 +1911,20 @@ mod tests {
         assert_eq!(
             command("detour_traffic", json!({"traffic": "all"})),
             Ok(vec!["detour".into(), "traffic".into(), "all".into()])
+        );
+        assert_eq!(
+            command(
+                "detour_traffic",
+                json!({"detour": "shop", "traffic": "share=10", "for": "10m"})
+            ),
+            Ok(vec![
+                "detour".into(),
+                "traffic".into(),
+                "shop".into(),
+                "share=10".into(),
+                "--for".into(),
+                "10m".into()
+            ])
         );
         assert_eq!(
             command(

@@ -54,7 +54,9 @@ path arrives as the client sent it, prefix included.
 
 The upstream's response goes back with its headers, less hop-by-hop
 ones. A WebSocket upgrade is passed to an `http1` upstream and the bytes
-are copied both ways once it answers 101. Limits apply as for
+are copied both ways once it answers 101. A WebSocket a client opens over
+HTTP/2 reaches the upstream as the HTTP/1.1 handshake, so the server sees
+an ordinary upgrade whichever protocol the client used. Limits apply as for
 applications: `max_body_size`, the request deadline (504 `deadline` when
 the response head does not arrive in time) and the response idle
 timeout.
@@ -123,6 +125,12 @@ servers that speak it by prior knowledge. `h2` negotiates HTTP/2 through
 ALPN over TLS. Both multiplex every request to an address over one
 connection. A Unix socket address with TLS needs `server_name`, since
 there is no host to check the certificate against.
+
+A gRPC server behind an `h2c` or `h2` upstream gets each call as the
+client made it: the request body streams, so client streaming and
+bidirectional calls are answered as their messages arrive, and
+`te: trailers` reaches the server. `max_body_size` does not bound a gRPC
+call's stream; the server's own message limits apply.
 
 ## Behind a static route, in a traffic policy, as a handler
 

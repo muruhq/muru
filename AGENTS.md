@@ -267,38 +267,53 @@ with `--fix`; the formatters keep what it inserts.
   and repeat it at the end of every report, each with its title and body
   ready to file, until every one has an issue.
 
-- Keep the [project board](https://github.com/users/GrahamDumpleton/projects/1)
-  true to the work, since it is how the maintainer decides what comes next.
-  Every open issue of both repositories is on it (issues in this
-  repository are added automatically; add a workshops issue with
+- Give every open issue exactly one status label, which is where it
+  stands: `status:triage` while it waits for the maintainer to decide
+  where it goes, `status:next` once it is picked to be worked on next,
+  `status:in-progress` while it is worked on, `status:backlog` for work
+  accepted but not for now, and `status:icebox` for work kept with no
+  commitment to do it. The label is the source of truth, and the
+  [project board](https://github.com/users/GrahamDumpleton/projects/1)
+  follows it: triage, backlog and icebox are Backlog there, `Closes #N`
+  in a pull request moves the issue to In Review, and closing it moves
+  it to Done, when its status label comes off. Label a speculative idea
+  `idea` as well, whatever its status.
+
+- A new issue gets `status:triage`, a security problem included, and the
+  maintainer moves it from there. There are two exceptions. The first is
+  a problem in the tests or their harness rather than in Muru, a flaky
+  test above all: label it `testing` (with `bug` as well while the cause
+  is unknown) and, when it is small, give it `status:next` with Goal
+  Housekeeping, Priority P1 and an Order ahead of the rest, so it is
+  fixed in the next piece of work; a branch for other work may carry it.
+  The second is a problem found while working on an issue already in
+  Next or In Progress that can be fixed on the same branch, above all
+  one in the same or related code, whether it is in Muru or in the
+  tests: give it `status:next` with an Order beside the issue that
+  turned it up, and fix it on that branch, so related problems are
+  fixed together while the code is fresh.
+
+- Keep the board true to the work, since it is how the maintainer
+  decides what comes next. Every open issue of this repository,
+  muruhq/muru-workshops and muruhq/muru-hosting is on it (issues in this
+  repository are added automatically; add the others with
   `gh project item-add`), with Priority, Goal and Size set and Order
   where it ranks against its neighbours. Goal places the issue in the
-  [roadmap](docs/project/roadmap.md): one of its major goals (Containers,
-  Production readiness, Beyond one node), Smaller feature, Housekeeping
-  (bugs, flaky tests, workshop follow-ups) or Idea. Each step of a major
-  goal is a parent issue labelled `tracking`, with the step's issues as
-  its sub-issues; add an issue that belongs to a step as a sub-issue of
-  it. The maintainer moves issues to Next; take the Next issue with the
-  lowest Order, never a `tracking` issue, move it to In Progress
-  and add it to the open release milestone when its branch is made,
-  and let `Closes #N` move it to In Review and
-  Done. There are two exceptions to the maintainer choosing what goes
-  to Next. The first is a problem in the tests or their harness rather
-  than in Muru, a flaky test above all: label it `testing` (with `bug`
-  as well while the cause is unknown) and, when it is small, put it
-  straight into Next with Goal Housekeeping, Priority P1 and an Order
-  ahead of the rest, so it is fixed in the next piece of work instead
-  of waiting in Backlog; a branch for other work may carry it. The
-  second is a problem found while working on an issue already in Next
-  or In Progress that can be fixed on the same branch, above all one in
-  the same or related code, whether it is in Muru or in the tests: put
-  it into Next with an Order beside the issue that turned it up, and
-  fix it on that branch, so related problems are fixed together while
-  the code is fresh. A problem unrelated to the work still goes to
-  Backlog. When work changes an issue's size, priority or what blocks
-  it, update the issue and its fields in the same step. `gh project field-list
-  1 --owner GrahamDumpleton` gives the field and option ids that
+  [roadmap](docs/project/roadmap.md): one of its major goals
+  (Containers, Production readiness, Beyond one node), Smaller feature,
+  Housekeeping (bugs, flaky tests, workshop follow-ups) or Idea, and
+  Hosting for muru-hosting. Each step of a major goal is a parent issue
+  labelled `tracking`, with the step's issues as its sub-issues; add an
+  issue that belongs to a step as a sub-issue of it. When work changes
+  an issue's size, priority or what blocks it, update the issue and its
+  fields in the same step. `gh project field-list 1 --owner
+  GrahamDumpleton` gives the field and option ids that
   `gh project item-edit` needs.
+
+- Take the `status:next` issue with the lowest Order, never a `tracking`
+  issue. When its branch is made, change its label to
+  `status:in-progress`, move it to In Progress on the board and add it
+  to the open release milestone.
 
 - Keep the lists in sections 19 and 20 of the specification live. When a
   change resolves an open question (19.2), retires a risk (19.3) or brings a

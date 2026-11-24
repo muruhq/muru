@@ -1861,6 +1861,11 @@ mod tests {
         // The shell lives through TERM, which only interrupts its first
         // wait, and then waits for its child. Only the child's exit lets
         // it go, and the child is signalled only when the group is.
+        //
+        // The child puts TERM back to its default before it says it is
+        // ready: a forked child runs the shell's trap until it execs, so
+        // a TERM arriving between the fork and the exec would otherwise
+        // be caught, and the sleep then waits out its 600 s.
 
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, pid) = start_script(
@@ -1869,7 +1874,7 @@ mod tests {
                 stop_group: true,
                 ..spec(dir.path())
             },
-            "trap : TERM; /bin/sleep 600 & : > ready; wait; wait",
+            "trap : TERM; (trap - TERM; : > ready; exec /bin/sleep 600) & wait; wait",
         )
         .await;
 

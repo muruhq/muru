@@ -79,6 +79,7 @@ impl Daemon {
             opened_unix_ms: crate::model::now_unix_ms() as i64,
             serial,
             updates,
+            until_unix_ms: 0,
         };
 
         let data = crate::places::app_data(&self.locations.state.path, &record);
@@ -230,19 +231,29 @@ impl Daemon {
         }
     }
 
-    /// Change what a detour takes (section 9.13): the overlay it owns
-    /// changes with it, its run hears of it, and `detour.traffic` records
-    /// the old choice and the new.
+    /// Change what a detour takes (section 9.13), until changed again or,
+    /// with `until_unix_ms`, until then, when the tick puts it back to
+    /// preview: the overlay it owns changes with it, its run hears of it,
+    /// and `detour.traffic` records the old choice and the new, and
+    /// `reason` when the daemon made the change.
     pub(super) async fn set_detour_traffic(
         &mut self,
         app: &str,
         release: &str,
         traffic: Traffic,
+        until_unix_ms: u64,
+        reason: Option<&str>,
     ) -> Result<admin::Detour, String> {
         let key = (app.to_owned(), release.to_owned());
 
         if !self.detours.contains_key(&key) {
             return Err(format!("{app}@{release} is not an open detour"));
+        }
+
+        if let Some(refusal) =
+            detours::timed_refusal(&traffic, until_unix_ms, crate::model::now_unix_ms())
+        {
+            return Err(refusal);
         }
 
         if let Some(refusal) = self.traffic_refusal(app, release, &traffic) {
@@ -254,10 +265,12 @@ impl Daemon {
         };
 
         let before = std::mem::replace(&mut detour.opening.traffic, traffic.clone());
+        let until_before = std::mem::replace(&mut detour.until_unix_ms, until_unix_ms);
 
         if let Err(error) = self.push_snapshot().await {
             if let Some(detour) = self.detours.get_mut(&key) {
                 detour.opening.traffic = before;
+                detour.until_unix_ms = until_before;
             }
 
             let _ = self.push_snapshot().await;
@@ -280,13 +293,39 @@ impl Daemon {
             &subject,
             "info",
             &format!(
-                "detour {subject} takes {} now, {} before",
-                traffic.word(),
-                before.word()
+                "detour {subject} takes {} now, {} before{}",
+                detours::traffic_text(&traffic.word(), until_unix_ms),
+                before.word(),
+                reason
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
             ),
         );
 
         Ok(message)
+    }
+
+    /// A detour whose timed traffic is due takes preview again, through
+    /// the same change as `muructl detour traffic`. Looked at every tick.
+    pub(super) async fn expire_detour_traffic(&mut self) {
+        let now = crate::model::now_unix_ms();
+        let due: Vec<(String, String)> = self
+            .detours
+            .values()
+            .filter(|detour| detour.until_unix_ms != 0 && detour.until_unix_ms <= now)
+            .map(|detour| (detour.app().to_owned(), detour.release.clone()))
+            .collect();
+
+        for (app, release) in due {
+            let reason = "the time it was set for is over";
+
+            if let Err(error) = self
+                .set_detour_traffic(&app, &release, Traffic::Preview, 0, Some(reason))
+                .await
+            {
+                tracing::warn!(%error, "detour {app}@{release} could not go back to preview");
+            }
+        }
     }
 
     /// Mint entry links to a detour's preview (section 4.21): one for the

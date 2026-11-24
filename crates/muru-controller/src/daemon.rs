@@ -716,6 +716,8 @@ pub enum Command {
         release: String,
         /// What it is to take.
         traffic: crate::detours::Traffic,
+        /// When it goes back to preview, Unix milliseconds; 0 for never.
+        until_unix_ms: u64,
         /// Answered with the detour as it is now, or why not.
         done: oneshot::Sender<Result<muru_proto::admin::v1::Detour, String>>,
     },
@@ -2611,6 +2613,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 daemon.guard_memory();
                 daemon.refresh_client_lists().await;
                 daemon.reconcile_overlays().await;
+                daemon.expire_detour_traffic().await;
                 daemon.check_detours().await;
                 daemon.check_clock();
                 daemon.watch_rate_limits(samples.as_deref());
@@ -3731,7 +3734,10 @@ impl Daemon {
                         message: format!(
                             "{}, traffic {}",
                             detour.describe(),
-                            detour.opening.traffic.word()
+                            crate::detours::traffic_text(
+                                &detour.opening.traffic.word(),
+                                detour.until_unix_ms
+                            )
                         ),
                         created: full_time(
                             u64::try_from(detour.opened_unix_ms).unwrap_or_default(),
@@ -6647,9 +6653,13 @@ impl Daemon {
                 app,
                 release,
                 traffic,
+                until_unix_ms,
                 done,
             } => {
-                let _ = done.send(self.set_detour_traffic(&app, &release, traffic).await);
+                let _ = done.send(
+                    self.set_detour_traffic(&app, &release, traffic, until_unix_ms, None)
+                        .await,
+                );
             }
             Command::PreviewDetour { request, done } => {
                 let _ = done.send(self.preview_detour(request).await);
@@ -13509,8 +13519,9 @@ pub(crate) fn full_time(unix_ms: u64) -> String {
 }
 
 /// A Unix time as HH:MM with the zone, UTC: how `release list` and the
-/// process view give a retained release's deadline.
-fn clock(unix_ms: u64) -> String {
+/// process view give a retained release's deadline, and a detour's
+/// timed traffic its end.
+pub(crate) fn clock(unix_ms: u64) -> String {
     let seconds = (unix_ms / 1000) % 86_400;
     format!("{:02}:{:02} UTC", seconds / 3600, (seconds % 3600) / 60)
 }

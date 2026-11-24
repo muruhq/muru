@@ -1,6 +1,6 @@
 name: Feature request
 description: Describe a problem or requirement for the maintainer to consider
-labels: [enhancement]
+labels: [enhancement, status:triage]
 body:
   - type: markdown
     attributes:

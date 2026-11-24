@@ -8034,7 +8034,10 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
 
     if let Some(detour) = &release.detour {
         lines.push(("kind".to_owned(), "detour".to_owned()));
-        lines.push(("traffic".to_owned(), detour.traffic.clone()));
+        lines.push((
+            "traffic".to_owned(),
+            muru_controller::detours::traffic_text(&detour.traffic, detour.until_unix_ms),
+        ));
         lines.push(("pid".to_owned(), detour.pid.to_string()));
 
         if !detour.label.is_empty() {
