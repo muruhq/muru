@@ -911,8 +911,8 @@ pub struct CommandInputSpec {
 }
 
 /// Section 3.3: where each of a release's settings came from, by key:
-/// the release table or deploy flags, the source's [tool.muru] table,
-/// the previous release, or the default. It records how the settings
+/// the release table or deploy flags, the application's settings, the
+/// source's [tool.muru] table, or the default. It records how the settings
 /// were reached, not what they are, so two specs are equal whatever
 /// their layers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

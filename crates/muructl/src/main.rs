@@ -3170,7 +3170,6 @@ fn interpreter(
         flag: if built { None } else { args.python.as_deref() },
         table: resolved.python.as_deref(),
         project: &resolved.project,
-        previous: None,
         always: false,
         uv: uv.as_ref(),
         isolation: &isolation,

@@ -15,10 +15,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from support import server as support
-from support.daemon import Daemon, start_daemon
-
-RELEASES = support.ROOT / "docs" / "tutorials" / "code" / "releases"
+from support.daemon import Daemon, start_daemon, tutorial_site
 
 
 @contextmanager
@@ -57,21 +54,23 @@ def greetings(daemon: Daemon, count: int = 20) -> set[str]:
 
 
 def test_the_first_canary_tutorial(tmp_path: Path) -> None:
-    daemon = start_daemon(tmp_path)
+    releases = tutorial_site(tmp_path)
+    (tmp_path / "daemon").mkdir()
+    daemon = start_daemon(tmp_path / "daemon")
 
     try:
         # Where the deploy tutorial left off: r1 serving after r2 failed
         # and r3 was rolled back.
 
-        daemon.deploy("hello", RELEASES / "v1", "--entrypoint", "app:application")
-        daemon.muructl("deploy", "hello", str(RELEASES / "v2"), check=False)
-        daemon.muructl("deploy", "hello", str(RELEASES / "v3"))
+        daemon.deploy("hello", releases / "v1")
+        daemon.muructl("deploy", "hello", str(releases / "v2"), check=False)
+        daemon.muructl("deploy", "hello", str(releases / "v3"))
         daemon.muructl("rollback", "hello")
         assert greetings(daemon) == {"Hello from hello@r1\n"}
 
         # A release with a bug, held out of traffic.
 
-        held = daemon.muructl("deploy", "hello", str(RELEASES / "v4"), "--hold").stdout
+        held = daemon.muructl("deploy", "hello", str(releases / "v4"), "--hold").stdout
         assert held.strip() == "muru: release hello@r4 is ready and held: not serving"
         assert greetings(daemon) == {"Hello from hello@r1\n"}
 
@@ -94,7 +93,7 @@ def test_the_first_canary_tutorial(tmp_path: Path) -> None:
         # A good release: previewed during its first step, its second
         # step approved, then promoted.
 
-        daemon.muructl("deploy", "hello", str(RELEASES / "v5"), "--hold")
+        daemon.muructl("deploy", "hello", str(releases / "v5"), "--hold")
 
         with loop(daemon):
             daemon.muructl(

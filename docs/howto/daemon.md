@@ -42,16 +42,17 @@ from the directory's `[tool.muru]` table unless a flag overrides them,
 exactly as `muructl run` reads them. Release ids are `r1`, `r2` and so
 on unless `--release` names one.
 
-A deploy takes what neither its flags nor the source's table give from
-the release before it, so a `--timeout soft=3s` or `--env DEBUG=1` given
-once stays in force through later deploys until a flag or the table
-changes it. Environment variables and secrets carry by name. The tables
-in `[tool.muru]`, worker groups, mounts, logging, scaling and error
-pages, come from the source alone, so a source that drops a group drops
-it. The interpreter is the source directory's `.venv` when it has one,
-otherwise the previous release's, otherwise `--python`. `--fresh` deploys
-from the flags, the source and the defaults alone, ignoring the previous
-release.
+A release's settings come from its flags, then the [settings on its
+application](#settings-on-the-application), then the source's
+`[tool.muru]` table, then the defaults. Nothing comes from the release
+before it, so a `--timeout soft=3s` or `--env DEBUG=1` given for one
+deploy applies to that release alone, and after a rollback the next
+deploy is what its own flags, the application and the source say. The
+tables in `[tool.muru]`, worker groups, mounts, static entries, logging,
+scaling and error pages, come from the source alone, so a source that
+drops a group or a static entry drops it. The interpreter is `--python`,
+else the source directory's `.venv`, else the source's own Python
+request.
 
 `deploy --dry-run` asks the daemon what the deploy would do and changes
 nothing. It prints the id the release would take, each setting with the
@@ -67,15 +68,14 @@ muru: plan (nothing changed): release shop@r4, shop.wsgi:application 4x8 from /s
   processes = 4                         (deploy flags)
   threads = 8                           ([tool.muru])
   sync_threads = 8                      (default)
-  max_requests = 5000                   (the previous release)
+  max_requests = 5000                   (the application)
   ...
   env DEBUG (--env)
-  env SHOP_DATABASE (the previous release)
+  env SHOP_DATABASE (the application)
   env SENTRY_ENVIRONMENT ([tool.muru.env])
-  secret STRIPE_KEY = vault/stripe (the previous release)
+  secret STRIPE_KEY = vault/stripe (the application)
   env HTTP_PROXY (passed from the daemon)
   env PATH (passed from the daemon)
-  settings nothing else gives come from shop@r3; --fresh takes none
   the release would take over from shop@r3, which would stay warm for 1800s with 1 worker to a group
 ```
 
@@ -365,9 +365,10 @@ directory it can read.
   code applies from there. With no source the current directory is
   written as its full path.
 - **The settings** come from the flags, then the source's settings,
-  then the defaults. Nothing comes from a release the application
-  already has, so applying the file gives the release that `muructl
-  deploy --fresh` gives for the same flags.
+  then the defaults. Nothing comes from a release or the settings the
+  application already has, so applying the file gives the release
+  `muructl deploy` gives for the same flags to an application with no
+  settings of its own.
 - **The interpreter** is written when `--python` or the source's
   settings name one. Otherwise the table has no `python` key, and the
   daemon finds the interpreter when the file is applied, as it does for
@@ -521,9 +522,9 @@ holds that the file does not, with exit code 2 when they differ.
 
 `muructl config show [APP] --effective` writes the same document headed
 by each serving release's settings and where each came from: the
-release table of an applied file or the deploy's flags, the source's
-`[tool.muru]` table, the source's `.venv` for the interpreter, the
-previous release, or the default:
+release table of an applied file or the deploy's flags, the
+application's settings, the source's `[tool.muru]` table, the source's
+`.venv` for the interpreter, or the default:
 
 ```console
 $ muructl config show shop --effective
@@ -534,7 +535,7 @@ $ muructl config show shop --effective
 #   shop@r3: entrypoint = shop.wsgi:application ([tool.muru])
 #   shop@r3: python = /srv/shop/.venv/bin/python (the source's .venv)
 #   shop@r3: processes = 4 (deploy flags)
-#   shop@r3: threads = 8 (the previous release)
+#   shop@r3: threads = 8 (the application)
 #   shop@r3: sync_threads = 8 (default)
 ...
 ```

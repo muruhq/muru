@@ -766,25 +766,18 @@ def test_the_daemons_file_is_named_only_where_it_is_read(daemon: Daemon, tmp_pat
     assert "not an address" in run(MURU_DAEMON_CONFIG=str(config))
 
 
-def test_a_deploy_carries_settings_from_the_previous_release(daemon: Daemon) -> None:
-    # Section 3.3: what neither the flags nor the source's table give
-    # comes from the release before, a timeout, a memory key and an
-    # environment variable alike, and --fresh starts from the defaults.
+def test_a_deploy_takes_nothing_from_the_release_before(daemon: Daemon) -> None:
+    # Section 3.3, issue 861: a flag applies to its own release alone. What
+    # neither the next deploy's flags nor the source's table give is the
+    # default, a timeout, a memory key and an environment variable alike.
 
     daemon.deploy(
         "shop", SHOP, "--timeout", "soft=3s", "--memory", "soft_limit=800MB", "--env", "DEBUG=1"
     )
     daemon.deploy("shop", SHOP)
     shown = daemon.muructl("config", "show", "shop", "--effective").stdout
-    assert "#   shop@r2: timeouts.soft_timeout = 3s (the previous release)" in shown
-    assert "#   shop@r2: memory.soft_limit = 800MB (the previous release)" in shown
+    assert "#   shop@r2: timeouts.soft_timeout = off (default)" in shown
+    assert "#   shop@r2: memory.soft_limit = off (default)" in shown
     assert "#   shop@r2: threads = 3 ([tool.muru])" in shown
     exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
-    assert exported["app"]["shop"]["release"]["r2"]["env"] == {"DEBUG": "1"}
-
-    daemon.deploy("shop", SHOP, "--fresh")
-    shown = daemon.muructl("config", "show", "shop", "--effective").stdout
-    assert "#   shop@r3: timeouts.soft_timeout = off (default)" in shown
-    assert "#   shop@r3: memory.soft_limit = off (default)" in shown
-    exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
-    assert "env" not in exported["app"]["shop"]["release"]["r3"]
+    assert "env" not in exported["app"]["shop"]["release"]["r2"]

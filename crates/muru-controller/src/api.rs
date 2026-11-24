@@ -846,11 +846,6 @@ impl Admin for Service {
             }
         }
 
-        let previous = app
-            .as_ref()
-            .filter(|_| !request.fresh)
-            .and_then(|app| app.current.clone().or_else(|| app.previous.clone()));
-
         // What the serving release would keep once it is replaced.
 
         let retained = app
@@ -887,9 +882,6 @@ impl Admin for Service {
                 .unwrap_or_default(),
             builds: spec.as_ref().is_some_and(|spec| spec.build.builds),
             serving: app.and_then(|app| app.current).unwrap_or_default(),
-            settings_from: previous
-                .filter(|_| spec.as_ref().is_some_and(|spec| spec.http.is_none()))
-                .unwrap_or_default(),
             hold: request.hold,
             retain_ms: request
                 .retain_ms
@@ -3292,35 +3284,28 @@ struct Deploying {
 
 impl Service {
     /// Resolve a deploy request into the release it describes. Section
-    /// 3.3: a deploy takes what its flags and the source do not give
-    /// from the release before it, unless it is fresh. Resolution may
-    /// run uv and the interpreter, so it is off the runtime's threads.
+    /// 3.3: a deploy takes what its flags do not give from the
+    /// application's settings, then the source, then the defaults, and
+    /// nothing from the release before it (issues 861 and 899).
+    /// Resolution may run uv and the interpreter, so it is off the
+    /// runtime's threads.
     async fn resolve_deploy(
         &self,
         request: &pb::DeployRequest,
         provisioning: crate::provision::Provisioning,
     ) -> Result<Result<ReleaseSpec, String>, Status> {
-        let app = self.handle.store.app(&request.app).ok();
-        let settings = app
-            .as_ref()
-            .map(|app| app.settings.clone())
+        let settings = self
+            .handle
+            .store
+            .app(&request.app)
+            .map(|app| app.settings)
             .unwrap_or_default();
-
-        let previous = if request.fresh {
-            None
-        } else {
-            app.and_then(|app| app.current.or(app.previous))
-                .and_then(|id| self.handle.store.release(&request.app, &id).ok())
-                .map(|release| release.spec)
-        };
-
         let resolving = request.clone();
 
         tokio::task::spawn_blocking(move || {
             crate::app_settings::resolve(
                 &resolving,
                 &settings,
-                previous.as_ref(),
                 &config::Tables::default(),
                 &provisioning,
             )

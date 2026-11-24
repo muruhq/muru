@@ -664,13 +664,12 @@ impl AppSettings {
 pub fn resolve(
     request: &pb::DeployRequest,
     settings: &AppSettings,
-    previous: Option<&crate::model::ReleaseSpec>,
     tables: &crate::config::Tables<'_>,
     provisioning: &crate::provision::Provisioning,
 ) -> Result<crate::model::ReleaseSpec, String> {
     let mut request = request.clone();
     let given = settings.under(&mut request);
-    let mut spec = crate::config::resolve_spec(&request, previous, tables, provisioning)?;
+    let mut spec = crate::config::resolve_spec(&request, tables, provisioning)?;
 
     for key in given {
         spec.layers.0.insert(key, LAYER.to_owned());

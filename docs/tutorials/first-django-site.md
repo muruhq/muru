@@ -136,13 +136,20 @@ files, as before.
 
 ## Deploy it
 
-Start the daemon if it is not running and deploy the project with the
-production settings in its environment:
+Start the daemon if it is not running, give the application its
+production settings, which belong to this deployment rather than the
+code, and deploy the project:
 
 ```
 muructl daemon start
-muructl deploy mysite . --env DJANGO_SETTINGS_MODULE=mysite.production --env DJANGO_SECRET_KEY=change-me
+muructl app set mysite --env DJANGO_SETTINGS_MODULE=mysite.production --env DJANGO_SECRET_KEY=change-me
+muructl deploy mysite .
 ```
+
+`muructl app set` keeps the variables on the application, so this
+release and every later one gets them, without giving them again on each
+deploy. In production the secret key would be a secret, `--secret
+DJANGO_SECRET_KEY=STORE:KEY`, so only its reference is stored.
 
 ```
 muru: release mysite@r1 is ready and serving

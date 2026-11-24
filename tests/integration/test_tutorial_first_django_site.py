@@ -145,14 +145,16 @@ def test_the_django_tutorial(tmp_path: Path) -> None:
     daemon = start_daemon(tmp_path / "daemon")
 
     try:
-        out = daemon.deploy(
+        daemon.muructl(
+            "app",
+            "set",
             "mysite",
-            project,
             "--env",
             "DJANGO_SETTINGS_MODULE=mysite.production",
             "--env",
             "DJANGO_SECRET_KEY=change-me",
         )
+        out = daemon.deploy("mysite", project)
         assert out == "muru: release mysite@r1 is ready and serving"
         base = f"http://127.0.0.1:{daemon.port}"
         assert status(f"{base}{stylesheet}") == 200

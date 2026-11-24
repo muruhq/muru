@@ -1,6 +1,6 @@
 //! Choosing the interpreter a release runs on (design specification
 //! section 8.1): a path as given, an existing environment as it is, a
-//! request through uv, the previous release's, or python3 on PATH; then
+//! request through uv, or python3 on PATH; then
 //! the probe, the support check and `requires-python`.
 
 use std::path::{Path, PathBuf};
@@ -31,8 +31,6 @@ pub struct Inputs<'a> {
     pub table: Option<&'a str>,
     /// The project or source directory.
     pub project: &'a Path,
-    /// The previous release's interpreter, under the daemon.
-    pub previous: Option<&'a Path>,
     /// Whether the build mode is `always`, in which case a request is
     /// preferred over an existing environment.
     pub always: bool,
@@ -53,8 +51,6 @@ pub enum Chosen {
     ProjectVirtualenv,
     /// A request resolved through uv.
     Request(Request),
-    /// The previous release's interpreter.
-    Previous,
     /// `python3` on PATH, because nothing else named one.
     Default,
 }
@@ -93,7 +89,6 @@ impl Resolved {
             Chosen::Request(request) => {
                 format!("{} from {}", request.text, request.source.as_str())
             }
-            Chosen::Previous => "the previous release's".to_owned(),
             Chosen::Default => "python3 on PATH, since nothing named one".to_owned(),
         };
 
@@ -251,7 +246,8 @@ pub fn resolve(inputs: &Inputs<'_>) -> Result<Resolved, ResolveError> {
 }
 
 /// The order of section 8.1: a path, an existing environment, a request,
-/// the previous release's interpreter, python3.
+/// python3. A release never takes an earlier release's interpreter
+/// (issue 861), which may be in another source's `.venv`.
 fn choose(
     inputs: &Inputs<'_>,
     flag: Option<Python>,
@@ -311,10 +307,6 @@ fn choose(
         };
     }
 
-    if let Some(previous) = inputs.previous {
-        return Ok((previous.to_path_buf(), Chosen::Previous));
-    }
-
     find_on_path("python3")
         .map(|python| (python, Chosen::Default))
         .ok_or_else(|| ResolveError::NoPython {
@@ -349,7 +341,6 @@ mod tests {
             flag: None,
             table: None,
             project,
-            previous: None,
             always: false,
             uv,
             isolation,
@@ -505,19 +496,16 @@ mod tests {
     }
 
     #[test]
-    fn nothing_named_falls_back_to_the_previous_release_then_python3() {
-        let Some(python3) = python3() else {
+    fn nothing_named_falls_back_to_python3() {
+        if python3().is_none() {
             return;
-        };
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let isolation = Isolation::default();
         let _guard = EnvGuard::set("VIRTUAL_ENV", "");
-        let mut inputs = inputs(dir.path(), None, &isolation);
-        inputs.previous = Some(&python3);
+        let inputs = inputs(dir.path(), None, &isolation);
 
-        assert_eq!(resolve(&inputs).unwrap().chosen, Chosen::Previous);
-
-        inputs.previous = None;
         assert_eq!(resolve(&inputs).unwrap().chosen, Chosen::Default);
     }
 }

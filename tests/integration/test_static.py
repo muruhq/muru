@@ -367,8 +367,9 @@ def test_an_applications_own_directories_under_run_and_deploy(tmp_path: Path) ->
 
     assert "static /gone/: " in str(refused.value) and "is not a directory" in str(refused.value)
 
-    # Under the daemon the table's entry serves, a flag adds one, a plain
-    # deploy carries both forward, and --fresh starts from the table.
+    # Under the daemon the table's entry serves, a flag adds one, and a
+    # plain deploy takes the table's alone: nothing is carried from the
+    # release before (issue 861).
 
     (tmp_path / "daemon").mkdir()
     daemon = start_daemon(tmp_path / "daemon")
@@ -383,14 +384,22 @@ def test_an_applications_own_directories_under_run_and_deploy(tmp_path: Path) ->
         assert daemon.get("/assets/nothing.css").status == 404
 
         daemon.deploy("files", project)
-        assert daemon.get("/fixture/fox.txt").status == 200, "the flag's entry carried forward"
+        assert daemon.get("/assets/site.css").status == 200
+        assert daemon.get("/fixture/fox.txt").status == 404, "the flag's entry is not carried"
         exported = daemon.muructl("config", "show", "files").stdout
         assert "[[app.files.release.r2.static]]" in exported
-        assert f'dir = "{STATIC}"' in exported or f"dir = '{STATIC}'" in exported
+        assert str(STATIC) not in exported, exported
 
-        daemon.deploy("files", project, "--fresh")
-        assert daemon.get("/assets/site.css").status == 200
-        assert daemon.get("/fixture/fox.txt").status == 404, "--fresh takes the table alone"
+        # A source with no entries of its own, deployed after one with
+        # them, serves none of the other source's files.
+
+        bare = tmp_path / "bare"
+        bare.mkdir()
+        (bare / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+        (bare / "pyproject.toml").write_text("[tool.muru]\nentrypoint = 'app:application'\n")
+        daemon.deploy("files", bare)
+        assert daemon.get("/assets/site.css").body != b"body { color: red }\n"
+        assert "static" not in daemon.muructl("config", "show", "files").stdout
 
         refused = daemon.muructl(
             "deploy", "files", str(project), "--static", "/gone/=nowhere", check=False

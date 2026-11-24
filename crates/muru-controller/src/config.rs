@@ -3729,14 +3729,14 @@ pub fn logging_layers(
 }
 
 /// Section 3.3: the layer a release setting came from, the first of
-/// the request, the source's [tool.muru] table and the previous release
-/// that gives it, else the default.
-fn layer(given: bool, table: bool, previous: bool, declared: bool) -> &'static str {
-    match (given, table, previous) {
-        (true, _, _) if declared => "the release table",
-        (true, _, _) => "deploy flags",
-        (_, true, _) => "[tool.muru]",
-        (_, _, true) => "the previous release",
+/// the request and the source's [tool.muru] table that gives it, else
+/// the default. The application's settings are laid under the request
+/// before it is resolved and named after (issue 899).
+fn layer(given: bool, table: bool, declared: bool) -> &'static str {
+    match (given, table) {
+        (true, _) if declared => "the release table",
+        (true, _) => "deploy flags",
+        (_, true) => "[tool.muru]",
         _ => "default",
     }
 }
@@ -3787,30 +3787,22 @@ pub fn resolve_declared(
     crate::app_settings::resolve(
         &request_from(app, table, source),
         settings,
-        None,
         &tables,
         provisioning,
     )
 }
 
 /// Resolve a deploy request into a release spec: the request's settings,
-/// then the source's [tool.muru] table, then the previous release when
-/// one is given (a deploy that is not fresh) and it ran native workers,
-/// then the defaults of section 13.1. Every setting a deploy flag can
+/// then the source's [tool.muru] table, then the defaults of section
+/// 13.1, and never an earlier release (issue 861). Every setting a deploy flag can
 /// set layers that way; the tables (groups, mounts, logging, scaling and
 /// error pages) come from the source alone, and the environment layers
 /// by name (section 3.3).
 pub fn resolve_spec(
     request: &pb::DeployRequest,
-    previous: Option<&ReleaseSpec>,
     tables: &Tables<'_>,
     provisioning: &crate::provision::Provisioning,
 ) -> Result<ReleaseSpec, String> {
-    // Section 9.9: a managed server's release has no workers, entrypoint
-    // or interpreter of its own, so the native release after it, the
-    // cutover, starts from the defaults.
-
-    let previous = previous.filter(|previous| previous.http.is_none());
     let Tables {
         groups,
         mounts,
@@ -3859,12 +3851,10 @@ pub fn resolve_spec(
     // The entrypoint from the request replaces the table's with its
     // factory settings, as muructl run does (section 13.1).
 
-    let (entrypoint, from_table, from_previous) = if !request.entrypoint.is_empty() {
-        (request.entrypoint.clone(), false, false)
+    let (entrypoint, from_table) = if !request.entrypoint.is_empty() {
+        (request.entrypoint.clone(), false)
     } else if let Some(entrypoint) = table.entrypoint.clone() {
-        (entrypoint, true, false)
-    } else if let Some(previous) = previous {
-        (previous.entrypoint.clone(), false, true)
+        (entrypoint, true)
     } else {
         return Err(format!(
             "{} has no entrypoint in its [tool.muru] table; give one as module:callable",
@@ -3883,7 +3873,6 @@ pub fn resolve_spec(
                 .factory_phase
                 .unwrap_or(muru_config::FactoryPhase::Worker),
         ),
-        (None, _) if from_previous => previous.and_then(|previous| previous.factory),
         (None, _) => None,
     };
 
@@ -3894,20 +3883,14 @@ pub fn resolve_spec(
     let build = resolve_build(request, &table, &source, provisioning)?;
 
     // Section 8.1: the interpreter as given, else the source's own
-    // virtualenv, else a request resolved through uv, else what the
-    // previous release ran, else the python3 on the path; probed, so an
+    // virtualenv, else a request resolved through uv, else the python3
+    // on the path; probed, so an
     // interpreter that cannot run Muru fails the deploy here. A release
     // that builds takes a request over the source's virtualenv, since the
     // request says what to build with.
 
-    let (python, interpreter) = resolve_interpreter(
-        request,
-        &table,
-        previous,
-        &source,
-        provisioning,
-        build.builds,
-    )?;
+    let (python, interpreter) =
+        resolve_interpreter(request, &table, &source, provisioning, build.builds)?;
 
     // Section 8.2: where bytecode goes, and whether the source already
     // holds bytecode for the interpreter, which a redirected release then
@@ -3937,22 +3920,18 @@ pub fn resolve_spec(
     let processes = request
         .processes
         .or(table.processes.map(|value| value as u32))
-        .or(previous.map(|previous| previous.processes))
         .unwrap_or(DEFAULT_PROCESSES);
     let threads = request
         .threads
         .or(table.threads.map(|value| value as u32))
-        .or(previous.map(|previous| previous.threads))
         .unwrap_or(DEFAULT_THREADS);
     let sync_threads = request
         .sync_threads
         .or(table.sync_threads.map(|value| value as u32))
-        .or(previous.map(|previous| previous.sync_threads))
         .unwrap_or(DEFAULT_SYNC_THREADS);
     let concurrency = request
         .concurrency
         .or(table.concurrency.map(|value| value as u32))
-        .or(previous.map(|previous| previous.concurrency))
         .unwrap_or(DEFAULT_CONCURRENCY);
     let groups = groups.unwrap_or(&table.groups);
     let mounts = mounts.unwrap_or(&table.mounts);
@@ -4043,44 +4022,32 @@ pub fn resolve_spec(
     let accel_redirect = request
         .accel_redirect
         .or(table.accel_redirect)
-        .or(previous.map(|previous| previous.accel_redirect))
         .unwrap_or(false);
     let cgi_local_redirect = request
         .cgi_local_redirect
         .or(table.cgi_local_redirect)
-        .or(previous.map(|previous| previous.cgi_local_redirect))
         .unwrap_or(false);
 
-    // Section 4.9: the file hint keys, from the request, else the table,
-    // else the previous release.
+    // Section 4.9: the file hint keys, from the request, else the table.
 
-    let sendfile_roots = if !request.sendfile_roots.is_empty() {
-        request.sendfile_roots.clone()
-    } else if !table.sendfile_roots.is_empty() {
+    let sendfile_roots = if request.sendfile_roots.is_empty() {
         table.sendfile_roots.clone()
     } else {
-        previous
-            .map(|previous| previous.sendfile_roots.clone())
-            .unwrap_or_default()
+        request.sendfile_roots.clone()
     };
     let sendfile_header = request
         .sendfile_header
         .clone()
-        .or_else(|| table.sendfile_header.clone())
-        .or_else(|| previous.and_then(|previous| previous.sendfile_header.clone()));
+        .or_else(|| table.sendfile_header.clone());
     muru_config::check_sendfile(&sendfile_roots, sendfile_header.as_deref())?;
     muru_config::check_sendfile_dirs(&sendfile_roots, &source)?;
 
     // Section 6.13: the origins gRPC-Web answers with CORS, likewise.
 
-    let grpc_web_origins = if !request.grpc_web_origins.is_empty() {
-        request.grpc_web_origins.clone()
-    } else if !table.grpc_web_origins.is_empty() {
+    let grpc_web_origins = if request.grpc_web_origins.is_empty() {
         table.grpc_web_origins.clone()
     } else {
-        previous
-            .map(|previous| previous.grpc_web_origins.clone())
-            .unwrap_or_default()
+        request.grpc_web_origins.clone()
     };
     muru_config::check_origins(&grpc_web_origins)?;
 
@@ -4126,21 +4093,17 @@ pub fn resolve_spec(
     }
 
     // Section 4.9: the release's own directories of files, by path: the
-    // previous release's, then the table's, then the request's; each
-    // directory resolved under the source and checked to exist.
+    // table's, then the request's; each directory resolved under the
+    // source and checked to exist.
 
     let static_dirs = resolve_static_dirs(
-        previous.map_or(&[][..], |previous| &previous.static_dirs),
         static_dirs.unwrap_or(&table.static_dirs),
         &request.static_dirs,
         &source,
     )?;
 
     // Section 7.6 and 7.7: the host's own timeouts and recycling, from
-    // the request, else the table, else the previous release, else the
-    // defaults of appendix C.
-
-    let carried = previous.map(|previous| &previous.timeouts);
+    // the request, else the table, else the defaults of appendix C.
 
     let table_timeouts = table.timeouts.clone().unwrap_or_default();
     let duration_ms =
@@ -4157,62 +4120,53 @@ pub fn resolve_spec(
         request.max_lifetime_ms,
         table.max_lifetime.as_ref(),
         "max_lifetime",
-    )?
-    .or(previous.and_then(|previous| previous.max_lifetime_ms));
+    )?;
     let timeouts = crate::model::WorkerTimeouts {
         soft_timeout_ms: duration_ms(
             request.soft_timeout_ms,
             table_timeouts.soft_timeout.as_ref(),
             "soft_timeout",
-        )?
-        .or(carried.and_then(|carried| carried.soft_timeout_ms)),
+        )?,
         hard_timeout_ms: duration_ms(
             request.hard_timeout_ms,
             table_timeouts.hard_timeout.as_ref(),
             "hard_timeout",
-        )?
-        .or(carried.and_then(|carried| carried.hard_timeout_ms)),
+        )?,
         hard_drain_grace_ms: duration_ms(
             request.hard_drain_grace_ms,
             table_timeouts.hard_drain_grace.as_ref(),
             "hard_drain_grace",
         )?
-        .or(carried.map(|carried| carried.hard_drain_grace_ms))
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().hard_drain_grace_ms),
         shutdown_timeout_ms: duration_ms(
             request.shutdown_timeout_ms,
             table_timeouts.shutdown_timeout.as_ref(),
             "shutdown_timeout",
         )?
-        .or(carried.map(|carried| carried.shutdown_timeout_ms))
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().shutdown_timeout_ms),
         websocket_drain_grace_ms: duration_ms(
             request.websocket_drain_grace_ms,
             table_timeouts.websocket_drain_grace.as_ref(),
             "websocket_drain_grace",
         )?
-        .or(carried.map(|carried| carried.websocket_drain_grace_ms))
         .unwrap_or_default(),
         exit_grace_ms: duration_ms(
             request.exit_grace_ms,
             table_timeouts.exit_grace.as_ref(),
             "exit_grace",
         )?
-        .or(carried.map(|carried| carried.exit_grace_ms))
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().exit_grace_ms),
         loop_stall_timeout_ms: duration_ms(
             request.loop_stall_timeout_ms,
             table_timeouts.loop_stall_timeout.as_ref(),
             "loop_stall_timeout",
         )?
-        .or(carried.map(|carried| carried.loop_stall_timeout_ms))
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().loop_stall_timeout_ms),
         gil_stall_timeout_ms: duration_ms(
             request.gil_stall_timeout_ms,
             table_timeouts.gil_stall_timeout.as_ref(),
             "gil_stall_timeout",
         )?
-        .or(carried.map(|carried| carried.gil_stall_timeout_ms))
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().gil_stall_timeout_ms),
     };
 
@@ -4236,13 +4190,9 @@ pub fn resolve_spec(
             }
         };
     let defaults = crate::model::MemoryPolicy::default();
-    let kept = previous.map(|previous| &previous.memory);
     let memory = crate::model::MemoryPolicy {
         measure: match request.memory_measure.as_str() {
-            "" => table_memory
-                .measure
-                .or(kept.map(|kept| kept.measure))
-                .unwrap_or(defaults.measure),
+            "" => table_memory.measure.unwrap_or(defaults.measure),
             given => given
                 .parse()
                 .map_err(|error: muru_config::ParseError| format!("memory.measure: {error}"))?,
@@ -4251,32 +4201,27 @@ pub fn resolve_spec(
             request.memory_soft_limit,
             table_memory.soft_limit.as_ref(),
             "soft_limit",
-        )?
-        .or(kept.and_then(|kept| kept.soft_limit)),
+        )?,
         soft_for_ms: duration_ms(
             request.memory_soft_for_ms,
             table_memory.soft_for.as_ref(),
             "memory.soft_for",
         )?
-        .or(kept.map(|kept| kept.soft_for_ms))
         .unwrap_or(defaults.soft_for_ms),
         reclaim_first: request
             .memory_reclaim_first
             .or(table_memory.reclaim_first)
-            .or(kept.map(|kept| kept.reclaim_first))
             .unwrap_or(defaults.reclaim_first),
         hard_limit: size(
             request.memory_hard_limit,
             table_memory.hard_limit.as_ref(),
             "hard_limit",
-        )?
-        .or(kept.and_then(|kept| kept.hard_limit)),
+        )?,
         check_interval_ms: duration_ms(
             request.memory_check_interval_ms,
             table_memory.check_interval.as_ref(),
             "memory.check_interval",
         )?
-        .or(kept.map(|kept| kept.check_interval_ms))
         .unwrap_or(defaults.check_interval_ms),
     };
 
@@ -4310,7 +4255,6 @@ pub fn resolve_spec(
     }
 
     let (env, env_layers) = resolve_env_specs(
-        previous.map_or(&[][..], |previous| &previous.env),
         &table.env,
         if tables.declared {
             "the release table"
@@ -4347,7 +4291,7 @@ pub fn resolve_spec(
         &source,
     )?;
 
-    let mut layers = resolve_layers(request, &table, previous, tables.declared, &source);
+    let mut layers = resolve_layers(request, &table, tables.declared, &source);
     layers.0.extend(env_layers);
 
     // Section 11.4: Python logging defaults, the source's table with a
@@ -4436,10 +4380,7 @@ pub fn resolve_spec(
     }
 
     let interface = match request.interface.as_str() {
-        "" => table
-            .interface
-            .or(previous.map(|previous| previous.interface))
-            .unwrap_or(muru_config::Interface::Auto),
+        "" => table.interface.unwrap_or(muru_config::Interface::Auto),
         given => given
             .parse()
             .map_err(|error: muru_config::ParseError| error.to_string())?,
@@ -4449,9 +4390,7 @@ pub fn resolve_spec(
     // interface it hands from when that is declared.
 
     let handoff = match request.handoff.as_str() {
-        "" => table
-            .handoff
-            .or_else(|| previous.and_then(|previous| previous.handoff)),
+        "" => table.handoff,
         given => Some(
             given
                 .parse()
@@ -4472,28 +4411,20 @@ pub fn resolve_spec(
         sync_threads,
         concurrency,
         preload: match request.preload.as_str() {
-            "" => table
-                .preload
-                .or(previous.map(|previous| previous.preload))
-                .unwrap_or(muru_config::Preload::Auto),
+            "" => table.preload.unwrap_or(muru_config::Preload::Auto),
             given => given
                 .parse()
                 .map_err(|error: muru_config::ParseError| error.to_string())?,
         },
         hooks: (!request.hooks.is_empty())
             .then(|| request.hooks.clone())
-            .or(table.hooks)
-            .or_else(|| previous.and_then(|previous| previous.hooks.clone())),
+            .or(table.hooks),
         preload_modules,
         instrumentation,
         lazy_imports,
         import_report,
         factory,
-        reflection: request
-            .reflection
-            .or(table.reflection)
-            .or(previous.map(|previous| previous.reflection))
-            .unwrap_or(false),
+        reflection: request.reflection.or(table.reflection).unwrap_or(false),
         handoff,
         grpc_web_origins,
         groups: resolved_groups,
@@ -4504,10 +4435,7 @@ pub fn resolve_spec(
         sendfile_roots,
         sendfile_header,
         logging: python_logging,
-        max_requests: request
-            .max_requests
-            .or(table.max_requests)
-            .or(previous.and_then(|previous| previous.max_requests)),
+        max_requests: request.max_requests.or(table.max_requests),
         max_lifetime_ms,
         timeouts,
         memory,
@@ -4931,11 +4859,10 @@ fn resolve_build(
 
 /// Section 8.1: the release's interpreter and what the probe found. With
 /// provisioning off, the order before probing existed: the request's
-/// value as a path, the source's .venv, the previous release's, python3.
+/// value as a path, the source's .venv, python3.
 fn resolve_interpreter(
     request: &pb::DeployRequest,
     table: &muru_config::ToolMuru,
-    previous: Option<&ReleaseSpec>,
     source: &Path,
     provisioning: &crate::provision::Provisioning,
     builds: bool,
@@ -4948,8 +4875,6 @@ fn resolve_interpreter(
 
             if venv.is_file() {
                 venv
-            } else if let Some(previous) = previous {
-                previous.python.clone()
             } else {
                 PathBuf::from("python3")
             }
@@ -4963,7 +4888,6 @@ fn resolve_interpreter(
         flag: (!request.python.is_empty()).then_some(request.python.as_str()),
         table: table.python.as_deref(),
         project: source,
-        previous: previous.map(|previous| previous.python.as_path()),
         always: builds,
         uv: provisioning.uv.as_ref(),
         isolation: &provisioning.isolation,
@@ -4997,13 +4921,11 @@ fn resolve_interpreter(
 fn resolve_layers(
     request: &pb::DeployRequest,
     table: &muru_config::ToolMuru,
-    previous: Option<&ReleaseSpec>,
     declared: bool,
     source: &Path,
 ) -> crate::model::Layers {
     let timeouts = table.timeouts.clone().unwrap_or_default();
     let memory = table.memory.clone().unwrap_or_default();
-    let before = previous.is_some();
     let venv = source.join(".venv").join("bin").join("python").is_file();
 
     let python = if request.python.is_empty() && venv {
@@ -5013,7 +4935,7 @@ fn resolve_layers(
     {
         "the project's Python request"
     } else {
-        layer(!request.python.is_empty(), false, before, declared)
+        layer(!request.python.is_empty(), false, declared)
     };
 
     let keys = [
@@ -5022,7 +4944,6 @@ fn resolve_layers(
             layer(
                 !request.entrypoint.is_empty(),
                 table.entrypoint.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5035,7 +4956,6 @@ fn resolve_layers(
                     .build
                     .as_ref()
                     .is_some_and(|build| build.when.is_some()),
-                false,
                 declared,
             ),
         ),
@@ -5044,7 +4964,6 @@ fn resolve_layers(
             layer(
                 !request.bytecode.is_empty(),
                 table.bytecode.is_some(),
-                false,
                 declared,
             ),
         ),
@@ -5053,7 +4972,6 @@ fn resolve_layers(
             layer(
                 !request.interface.is_empty(),
                 table.interface.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5062,7 +4980,6 @@ fn resolve_layers(
             layer(
                 !request.preload.is_empty(),
                 table.preload.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5071,25 +4988,18 @@ fn resolve_layers(
             layer(
                 request.processes.is_some(),
                 table.processes.is_some(),
-                before,
                 declared,
             ),
         ),
         (
             "threads",
-            layer(
-                request.threads.is_some(),
-                table.threads.is_some(),
-                before,
-                declared,
-            ),
+            layer(request.threads.is_some(), table.threads.is_some(), declared),
         ),
         (
             "sync_threads",
             layer(
                 request.sync_threads.is_some(),
                 table.sync_threads.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5098,7 +5008,6 @@ fn resolve_layers(
             layer(
                 request.concurrency.is_some(),
                 table.concurrency.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5107,7 +5016,6 @@ fn resolve_layers(
             layer(
                 request.max_requests.is_some(),
                 table.max_requests.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5116,7 +5024,6 @@ fn resolve_layers(
             layer(
                 request.max_lifetime_ms.is_some(),
                 table.max_lifetime.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5125,7 +5032,6 @@ fn resolve_layers(
             layer(
                 request.soft_timeout_ms.is_some(),
                 timeouts.soft_timeout.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5134,7 +5040,6 @@ fn resolve_layers(
             layer(
                 request.hard_timeout_ms.is_some(),
                 timeouts.hard_timeout.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5143,7 +5048,6 @@ fn resolve_layers(
             layer(
                 request.hard_drain_grace_ms.is_some(),
                 timeouts.hard_drain_grace.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5152,7 +5056,6 @@ fn resolve_layers(
             layer(
                 request.websocket_drain_grace_ms.is_some(),
                 timeouts.websocket_drain_grace.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5161,7 +5064,6 @@ fn resolve_layers(
             layer(
                 request.exit_grace_ms.is_some(),
                 timeouts.exit_grace.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5170,7 +5072,6 @@ fn resolve_layers(
             layer(
                 request.shutdown_timeout_ms.is_some(),
                 timeouts.shutdown_timeout.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5179,7 +5080,6 @@ fn resolve_layers(
             layer(
                 request.loop_stall_timeout_ms.is_some(),
                 timeouts.loop_stall_timeout.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5188,7 +5088,6 @@ fn resolve_layers(
             layer(
                 request.gil_stall_timeout_ms.is_some(),
                 timeouts.gil_stall_timeout.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5197,7 +5096,6 @@ fn resolve_layers(
             layer(
                 !request.memory_measure.is_empty(),
                 memory.measure.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5206,7 +5104,6 @@ fn resolve_layers(
             layer(
                 request.memory_soft_limit.is_some(),
                 memory.soft_limit.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5215,7 +5112,6 @@ fn resolve_layers(
             layer(
                 request.memory_soft_for_ms.is_some(),
                 memory.soft_for.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5224,7 +5120,6 @@ fn resolve_layers(
             layer(
                 request.memory_reclaim_first.is_some(),
                 memory.reclaim_first.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5233,7 +5128,6 @@ fn resolve_layers(
             layer(
                 request.memory_hard_limit.is_some(),
                 memory.hard_limit.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5242,7 +5136,6 @@ fn resolve_layers(
             layer(
                 request.memory_check_interval_ms.is_some(),
                 memory.check_interval.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5251,7 +5144,6 @@ fn resolve_layers(
             layer(
                 request.accel_redirect.is_some(),
                 table.accel_redirect.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5260,7 +5152,6 @@ fn resolve_layers(
             layer(
                 request.cgi_local_redirect.is_some(),
                 table.cgi_local_redirect.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5568,20 +5459,17 @@ pub fn route_layers(store: &Store, document: &Document, node: &muru_edge::Limits
 }
 
 /// Section 4.9: the release's own directories of files, layered by
-/// path prefix: the previous release's, the table's, then the request's,
-/// each directory taken under the source when relative and checked to
-/// be one.
+/// path prefix: the table's, then the request's, each directory taken
+/// under the source when relative and checked to be one. Nothing comes
+/// from an earlier release (issue 861), whose directory may be in
+/// another source.
 fn resolve_static_dirs(
-    previous: &[StaticSpec],
     table: &[muru_config::StaticDir],
     request: &[pb::StaticDir],
     source: &Path,
 ) -> Result<Vec<StaticSpec>, String> {
     muru_config::check_static(table)?;
-    let mut by_path: BTreeMap<String, StaticSpec> = previous
-        .iter()
-        .map(|entry| (prefix_key(&entry.path), entry.clone()))
-        .collect();
+    let mut by_path: BTreeMap<String, StaticSpec> = BTreeMap::new();
 
     for entry in table {
         by_path.insert(prefix_key(&entry.path), static_spec(entry, source)?);
@@ -5663,23 +5551,15 @@ fn static_spec(entry: &muru_config::StaticDir, source: &Path) -> Result<StaticSp
 
 /// Section 10.8: the environment, the table's entries with the
 /// request's over them, references kept as references.
-/// The release's variables, by name: the previous release's, then its
-/// table's, then the request's, each with the layer it came from under
-/// `env.NAME` (section 3.3).
+/// The release's variables, by name: its table's, then the request's,
+/// each with the layer it came from under `env.NAME` (section 3.3).
 fn resolve_env_specs(
-    previous: &[EnvSpec],
     table: &BTreeMap<String, muru_config::EnvValue>,
     table_layer: &str,
     request: &[pb::EnvEntry],
 ) -> Result<(Vec<EnvSpec>, BTreeMap<String, String>), String> {
-    let mut env_table: BTreeMap<String, EnvSpec> = previous
-        .iter()
-        .map(|spec| (spec.name.clone(), spec.clone()))
-        .collect();
-    let mut layers: BTreeMap<String, String> = previous
-        .iter()
-        .map(|spec| (env_layer(&spec.name), "the previous release".to_owned()))
-        .collect();
+    let mut env_table: BTreeMap<String, EnvSpec> = BTreeMap::new();
+    let mut layers: BTreeMap<String, String> = BTreeMap::new();
 
     for (name, value) in table {
         env_table.insert(name.clone(), env_spec_from_table(name, value)?);
@@ -5909,7 +5789,7 @@ fn resolve_http_spec(
         return Err("shutdown_timeout must be longer than nothing".to_owned());
     }
 
-    let (env, env_layers) = resolve_env_specs(&[], &BTreeMap::new(), "", &request.env)?;
+    let (env, env_layers) = resolve_env_specs(&BTreeMap::new(), "", &request.env)?;
     let (error_pages, error_override, maintenance) =
         resolve_error_tables(tables, &BTreeMap::new(), None, None, &source)?;
     muru_config::check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())?;
@@ -6300,7 +6180,6 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         app: app.to_owned(),
         source: source.to_owned(),
         override_freeze: false,
-        fresh: false,
         static_dirs: Vec::new(),
         retain_workers: None,
         kind: table
@@ -7350,7 +7229,6 @@ mod tests {
                 python: "/usr/bin/python3".to_owned(),
                 ..Default::default()
             },
-            None,
             &Tables::default(),
             &crate::provision::Provisioning::off(),
         )
@@ -7484,10 +7362,11 @@ mod tests {
             "shop@r1: timeouts.soft_timeout = off (default)"
         );
 
-        // A deploy takes what it does not give from the release before;
-        // a declared release names its table.
+        // A deploy takes nothing from the release before it (issue 861):
+        // what its flags and the source do not give is the default, and
+        // with no entrypoint anywhere it is refused. A declared release
+        // names its table.
 
-        let previous = store.release("shop", "r1").unwrap().spec;
         let request = pb::DeployRequest {
             app: "shop".to_owned(),
             source: source.display().to_string(),
@@ -7495,16 +7374,23 @@ mod tests {
             ..Default::default()
         };
         let off = crate::provision::Provisioning::off();
-        let next = resolve_spec(&request, Some(&previous), &Tables::default(), &off).unwrap();
-        assert_eq!(next.layers.0["entrypoint"], "the previous release");
+        let error = resolve_spec(&request, &Tables::default(), &off).unwrap_err();
+        assert!(error.contains("has no entrypoint"), "{error}");
+
+        let request = pb::DeployRequest {
+            entrypoint: "shop.wsgi:application".to_owned(),
+            ..request
+        };
+        let next = resolve_spec(&request, &Tables::default(), &off).unwrap();
+        assert_eq!(next.layers.0["entrypoint"], "deploy flags");
         assert_eq!(next.layers.0["threads"], "deploy flags");
-        assert_eq!(next.layers.0["sync_threads"], "the previous release");
+        assert_eq!(next.layers.0["sync_threads"], "default");
 
         let declared = Tables {
             declared: true,
             ..Tables::default()
         };
-        let spec = resolve_spec(&request, Some(&previous), &declared, &off).unwrap();
+        let spec = resolve_spec(&request, &declared, &off).unwrap();
         assert_eq!(spec.layers.0["threads"], "the release table");
         assert_eq!(spec, next, "layers are not settings");
     }
@@ -7537,8 +7423,7 @@ mod tests {
         };
         let off = crate::provision::Provisioning::off();
         let spec =
-            crate::app_settings::resolve(&request, &settings, None, &Tables::default(), &off)
-                .unwrap();
+            crate::app_settings::resolve(&request, &settings, &Tables::default(), &off).unwrap();
         assert_eq!((spec.processes, spec.threads), (2, 3));
         assert_eq!(spec.layers.0["threads"], "the application");
         assert_eq!(spec.layers.0["env.DATABASE_URL"], "the application");
