@@ -1366,6 +1366,13 @@ fn main() -> anyhow::Result<()> {
                     admin::app_list(socket, output.json).await
                 }
                 admin::AppCommand::Remove(args) => admin::app_remove(*args).await,
+                admin::AppCommand::Set(args) => admin::app_set(*args).await,
+                admin::AppCommand::Unset(args) => admin::app_unset(*args).await,
+                admin::AppCommand::Show {
+                    app,
+                    socket,
+                    output,
+                } => admin::app_show(app, socket, output.json).await,
             }
         }),
         Command::Data {

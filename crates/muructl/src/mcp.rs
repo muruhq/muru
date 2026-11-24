@@ -899,6 +899,16 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "app_settings",
+            description: "The release settings an application gives every release deployed from now: variables, secrets by reference, worker counts, recycling, the host's timeouts and the memory policy.",
+            changes: false,
+            properties: json!({"app": {"type": "string"}}),
+            required: &["app"],
+            command: |arguments| {
+                Ok([words(&["app", "show"]), vec![needed(arguments, "app")?]].concat())
+            },
+        },
+        Spec {
             name: "commands",
             description: "The commands an application declares (migrations, data fixes, checks and the like), with their inputs, which are required or secret, and how each last ran.",
             changes: false,
@@ -1297,6 +1307,90 @@ fn specs() -> Vec<Spec> {
 
                 if flag(arguments, "dry_run") {
                     command.push("--dry-run".to_owned());
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "set_app_settings",
+            description: "Set release settings on an application, which every release deployed from now takes over the source's [tool.muru] and under a deploy's own flags: env (variables), secrets (NAME to STORE:KEY, or STORE:KEY:file), processes, threads, sync_threads, concurrency, max_requests, max_lifetime, timeouts (NAME to a duration: soft, hard, hard_drain_grace, shutdown, websocket_drain_grace, exit_grace, loop_stall, gil_stall) and memory (KEY to a value). replace removes the others first. No running release changes; the application is created when it does not exist.",
+            changes: true,
+            properties: json!({
+                "app": {"type": "string"},
+                "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                "secrets": {"type": "object", "additionalProperties": {"type": "string"}, "description": "NAME to STORE:KEY, or STORE:KEY:file"},
+                "processes": {"type": "integer"},
+                "threads": {"type": "integer"},
+                "sync_threads": {"type": "integer"},
+                "concurrency": {"type": "integer"},
+                "max_requests": {"type": "integer"},
+                "max_lifetime": {"type": "string", "description": "A duration such as 1h"},
+                "timeouts": {"type": "object", "additionalProperties": {"type": "string"}},
+                "memory": {"type": "object", "additionalProperties": {"type": "string"}},
+                "replace": {"type": "boolean"},
+            }),
+            required: &["app"],
+            command: |arguments| {
+                let mut command = words(&["app", "set"]);
+                command.push(needed(arguments, "app")?);
+
+                for (key, name) in [
+                    ("processes", "--processes"),
+                    ("threads", "--threads"),
+                    ("sync_threads", "--sync-threads"),
+                    ("concurrency", "--concurrency"),
+                    ("max_requests", "--max-requests"),
+                    ("max_lifetime", "--max-lifetime"),
+                ] {
+                    command.extend(option(arguments, key, name));
+                }
+
+                for (key, name) in [
+                    ("env", "--env"),
+                    ("secrets", "--secret"),
+                    ("timeouts", "--timeout"),
+                    ("memory", "--memory"),
+                ] {
+                    for (setting, value) in pairs(arguments, key)? {
+                        command.push(name.to_owned());
+                        command.push(format!("{setting}={value}"));
+                    }
+                }
+
+                if flag(arguments, "replace") {
+                    command.push("--replace".to_owned());
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "unset_app_settings",
+            description: "Remove release settings from an application by key (processes, threads, sync_threads, concurrency, max_requests, max_lifetime, timeouts.KEY, memory.KEY, env.NAME, or env for every variable), or every one with all. No running release changes.",
+            changes: true,
+            properties: json!({
+                "app": {"type": "string"},
+                "keys": {"type": "array", "items": {"type": "string"}},
+                "all": {"type": "boolean"},
+            }),
+            required: &["app"],
+            command: |arguments| {
+                let mut command = words(&["app", "unset"]);
+                command.push(needed(arguments, "app")?);
+
+                for key in arguments
+                    .get("keys")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let key = key.as_str().ok_or("keys are strings")?;
+                    command.push(key.to_owned());
+                }
+
+                if flag(arguments, "all") {
+                    command.push("--all".to_owned());
                 }
 
                 Ok(command)

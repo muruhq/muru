@@ -474,6 +474,94 @@ impl Admin for Service {
         Ok(Response::new(app_message(app, maintenance)))
     }
 
+    async fn set_app_settings(
+        &self,
+        request: Request<pb::SetAppSettingsRequest>,
+    ) -> Result<Response<pb::AppSettings>, Status> {
+        let request = request.into_inner();
+
+        if !crate::model::valid_name(&request.app) {
+            return Err(Status::invalid_argument(format!(
+                "{:?} is not a valid application name: lowercase letters, digits and hyphens, up to 63 characters",
+                request.app
+            )));
+        }
+
+        let given = crate::app_settings::AppSettings::from_message(
+            &request.set.clone().unwrap_or_default(),
+        )
+        .map_err(Status::invalid_argument)?;
+
+        // A key both set and removed says two things at once.
+
+        let set_keys: Vec<String> = given.lines().into_iter().map(|(key, _)| key).collect();
+
+        if let Some(key) = request.unset.iter().find(|key| {
+            set_keys
+                .iter()
+                .any(|set| set == *key || (key.as_str() == "env" && set.starts_with("env.")))
+        }) {
+            return Err(Status::invalid_argument(format!(
+                "{key} is both set and removed"
+            )));
+        }
+
+        let before = self
+            .handle
+            .store
+            .app(&request.app)
+            .map(|app| app.settings)
+            .unwrap_or_default();
+
+        let settings = self
+            .handle
+            .store
+            .update_app_settings(&request.app, |settings| {
+                if request.clear {
+                    *settings = crate::app_settings::AppSettings::default();
+                }
+
+                for key in &request.unset {
+                    settings.unset(key)?;
+                }
+
+                *settings = settings.with(&given);
+                Ok(())
+            })
+            .map_err(internal)?
+            .map_err(Status::invalid_argument)?;
+
+        // Section 11.5: the change is an event, naming the keys and never
+        // a value, since a variable may hold something private.
+
+        if settings != before {
+            let keys = |settings: &crate::app_settings::AppSettings| -> BTreeMap<String, String> {
+                settings.lines().into_iter().collect()
+            };
+            let (old, new) = (keys(&before), keys(&settings));
+            let changed: Vec<&str> = old
+                .keys()
+                .chain(new.keys())
+                .filter(|key| old.get(*key) != new.get(*key))
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+
+            self.handle.events.emit(
+                "app.settings_changed",
+                &request.app,
+                "notice",
+                &format!(
+                    "the application's settings changed: {}; releases deployed from now take them",
+                    changed.join(", ")
+                ),
+            );
+        }
+
+        Ok(Response::new(settings.to_message()))
+    }
+
     async fn dashboard_login(
         &self,
         request: Request<pb::DashboardLoginRequest>,
@@ -3212,14 +3300,16 @@ impl Service {
         request: &pb::DeployRequest,
         provisioning: crate::provision::Provisioning,
     ) -> Result<Result<ReleaseSpec, String>, Status> {
+        let app = self.handle.store.app(&request.app).ok();
+        let settings = app
+            .as_ref()
+            .map(|app| app.settings.clone())
+            .unwrap_or_default();
+
         let previous = if request.fresh {
             None
         } else {
-            self.handle
-                .store
-                .app(&request.app)
-                .ok()
-                .and_then(|app| app.current.or(app.previous))
+            app.and_then(|app| app.current.or(app.previous))
                 .and_then(|id| self.handle.store.release(&request.app, &id).ok())
                 .map(|release| release.spec)
         };
@@ -3227,8 +3317,9 @@ impl Service {
         let resolving = request.clone();
 
         tokio::task::spawn_blocking(move || {
-            config::resolve_spec(
+            crate::app_settings::resolve(
                 &resolving,
+                &settings,
                 previous.as_ref(),
                 &config::Tables::default(),
                 &provisioning,
@@ -4062,6 +4153,7 @@ fn app_message(app: crate::model::App, (maintenance, by): (bool, String)) -> pb:
         maintenance,
         maintenance_overlay: by,
         priority: app.priority,
+        settings: Some(app.settings.to_message()),
     }
 }
 

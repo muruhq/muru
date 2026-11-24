@@ -71,6 +71,14 @@ pub enum Action {
         /// The choice, empty for the `[logs]` table's.
         access_log: crate::model::AccessLogSpec,
     },
+    /// Set the application's own release settings (issue 899), which
+    /// the releases deployed after the apply take.
+    SetAppSettings {
+        /// The application.
+        app: String,
+        /// The settings, empty for none.
+        settings: Box<crate::app_settings::AppSettings>,
+    },
     /// Create a release with this spec and, as `added` says, move
     /// traffic to it, start it held, or leave it stopped.
     Deploy {
@@ -242,6 +250,7 @@ impl Action {
             Action::SetAppPriority { .. } => "set-priority",
             Action::SetAppData { .. } => "set-data",
             Action::SetAppAccessLog { .. } => "set-access-log",
+            Action::SetAppSettings { .. } => "set-settings",
             Action::Deploy { .. } => "deploy",
             Action::Promote { .. } => "promote",
             Action::RemoveRelease { .. } => "remove-release",
@@ -335,7 +344,8 @@ impl Change {
             | Action::SetAppIdentity { app, .. }
             | Action::SetAppPriority { app, .. }
             | Action::SetAppData { app, .. }
-            | Action::SetAppAccessLog { app, .. } => app.clone(),
+            | Action::SetAppAccessLog { app, .. }
+            | Action::SetAppSettings { app, .. } => app.clone(),
             Action::Deploy { app, id, .. }
             | Action::Promote { app, id }
             | Action::RemoveRelease { app, id } => {
@@ -835,9 +845,41 @@ fn plan_app(
         });
     }
 
+    // Issue 899: the application's own release settings, which the
+    // document states in full, as it states the rest of the table. The
+    // keys alone are shown, since a variable's value may be private.
+
+    let settings = match crate::app_settings::AppSettings::from_table(app) {
+        Ok(settings) => settings,
+        Err(error) => {
+            plan.errors.push(format!("{name}: {error}"));
+            return None;
+        }
+    };
+
+    if stored
+        .as_ref()
+        .map_or(!settings.is_empty(), |stored| stored.settings != settings)
+    {
+        let keys: Vec<String> = settings.lines().into_iter().map(|(key, _)| key).collect();
+
+        plan.changes.push(Change {
+            detail: if keys.is_empty() {
+                "no settings of its own".to_owned()
+            } else {
+                keys.join(", ")
+            },
+            action: Action::SetAppSettings {
+                app: name.to_owned(),
+                settings: Box::new(settings.clone()),
+            },
+        });
+    }
+
     // Releases are resolved as a deploy would resolve them, from the
-    // table and the source's own [tool.muru], never from an earlier
-    // release, so a file means the same thing wherever it is applied.
+    // table, the document's settings for the application and the
+    // source's own [tool.muru], never from an earlier release, so a file
+    // means the same thing wherever it is applied.
 
     let mut deploys = Vec::new();
 
@@ -867,7 +909,7 @@ fn plan_app(
             continue;
         };
 
-        let spec = match resolve_declared(name, table, source, provisioning) {
+        let spec = match resolve_declared(name, table, &settings, source, provisioning) {
             Ok(spec) => spec,
             Err(error) => {
                 plan.errors.push(format!("{name}@{id}: {error}"));
@@ -2919,6 +2961,9 @@ fn write(
         Action::SetAppAccessLog { app, access_log } => {
             writes.set_app_access_log(app, access_log).map(|()| "set")?
         }
+        Action::SetAppSettings { app, settings } => {
+            writes.set_app_settings(app, settings).map(|()| "set")?
+        }
         Action::PutHost { name, host, new } => writes.put_host(name, host).map(|()| made(*new))?,
         Action::RemoveHost { name } => writes.delete_host(name).map(|()| "removed")?,
         Action::PutRoute { route, new } => writes.put_route(route).map(|()| made(*new))?,
@@ -3011,6 +3056,7 @@ pub fn export(store: &Store, app: Option<&str>) -> Result<Document, StoreError> 
             uploads_dir: app.uploads_dir.clone(),
             ..AppTable::default()
         };
+        app.settings.write_table(&mut table);
 
         if let Some(current) = &app.current {
             let release = store.release(&app.name, current)?;
@@ -3710,6 +3756,7 @@ pub const DEFAULT_CONCURRENCY: u32 = 1000;
 pub fn resolve_declared(
     app: &str,
     table: &ReleaseTable,
+    settings: &crate::app_settings::AppSettings,
     source: &str,
     provisioning: &crate::provision::Provisioning,
 ) -> Result<ReleaseSpec, String> {
@@ -3737,8 +3784,9 @@ pub fn resolve_declared(
         declared: true,
     };
 
-    resolve_spec(
+    crate::app_settings::resolve(
         &request_from(app, table, source),
+        settings,
         None,
         &tables,
         provisioning,
@@ -6208,7 +6256,10 @@ fn parse_or<T: std::str::FromStr<Err = muru_config::ParseError>>(
 }
 
 /// One variable of an `[env]` table as the spec records it.
-fn env_spec_from_table(name: &str, value: &muru_config::EnvValue) -> Result<EnvSpec, String> {
+pub(crate) fn env_spec_from_table(
+    name: &str,
+    value: &muru_config::EnvValue,
+) -> Result<EnvSpec, String> {
     muru_config::check_env_name(name)?;
 
     Ok(match value {
@@ -6635,7 +6686,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
 }
 
 /// The environment as the table that declares it, secrets as references.
-fn env_table_from(env: &[EnvSpec]) -> BTreeMap<String, muru_config::EnvValue> {
+pub(crate) fn env_table_from(env: &[EnvSpec]) -> BTreeMap<String, muru_config::EnvValue> {
     env.iter()
         .map(|entry| {
             let value = match (&entry.secret_store, &entry.secret_key) {
@@ -7459,6 +7510,72 @@ mod tests {
     }
 
     #[test]
+    fn the_applications_settings_are_a_layer_an_export_writes_and_applies_back() {
+        let source = source_dir();
+        let store = store_with_shop(&source);
+        let settings = crate::app_settings::AppSettings::from_message(&pb::AppSettings {
+            threads: Some(3),
+            env: vec![pb::EnvEntry {
+                name: "DATABASE_URL".to_owned(),
+                value: "postgres://db/shop".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        store.set_app_settings("shop", &settings).unwrap();
+
+        // A deploy that does not give them takes them, under its own
+        // flags, and records where they came from.
+
+        let request = pb::DeployRequest {
+            app: "shop".to_owned(),
+            source: source.display().to_string(),
+            entrypoint: "shop.wsgi:application".to_owned(),
+            processes: Some(2),
+            ..Default::default()
+        };
+        let off = crate::provision::Provisioning::off();
+        let spec =
+            crate::app_settings::resolve(&request, &settings, None, &Tables::default(), &off)
+                .unwrap();
+        assert_eq!((spec.processes, spec.threads), (2, 3));
+        assert_eq!(spec.layers.0["threads"], "the application");
+        assert_eq!(spec.layers.0["env.DATABASE_URL"], "the application");
+        assert_eq!(spec.layers.0["processes"], "deploy flags");
+
+        // The export writes them on the application's table, and applying
+        // it back changes nothing; a document without them removes them.
+
+        let planned =
+            |document: &Document| plan(&store, document, true, false, &Defined::default(), &off);
+        let text = export(&store, None).unwrap().to_toml().unwrap();
+        let document = Document::parse(&text).unwrap();
+        assert_eq!(document.app["shop"].threads, Some(3), "{text}");
+        assert!(
+            document.app["shop"].env.contains_key("DATABASE_URL"),
+            "{text}"
+        );
+        assert!(planned(&document).changes.is_empty());
+
+        let mut without = document.clone();
+        let app = without.app.get_mut("shop").unwrap();
+        app.threads = None;
+        app.env.clear();
+        let changes = planned(&without).changes;
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].action.name(), "set-settings");
+        assert_eq!(changes[0].detail, "no settings of its own");
+
+        let mut zero = document;
+        zero.app.get_mut("shop").unwrap().processes = Some(0);
+        assert_eq!(
+            planned(&zero).errors,
+            ["shop: processes must be more than 0"]
+        );
+    }
+
+    #[test]
     fn an_application_without_a_serving_release_still_exports() {
         let source = source_dir();
         let store = store_with_shop(&source);
@@ -7537,6 +7654,7 @@ mod tests {
             resolve_declared(
                 "shop",
                 &document.app["shop"].release["r1"],
+                &crate::app_settings::AppSettings::default(),
                 &source.display().to_string(),
                 &crate::provision::Provisioning::off(),
             )
@@ -7623,6 +7741,7 @@ mod tests {
             resolve_declared(
                 "shop",
                 &document.app["shop"].release["r1"],
+                &crate::app_settings::AppSettings::default(),
                 &source.display().to_string(),
                 &crate::provision::Provisioning::off(),
             )
@@ -7683,6 +7802,7 @@ mod tests {
             resolve_declared(
                 "shop",
                 table,
+                &crate::app_settings::AppSettings::default(),
                 &source.display().to_string(),
                 &crate::provision::Provisioning::off(),
             )

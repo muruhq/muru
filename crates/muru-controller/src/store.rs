@@ -327,7 +327,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                 user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir FROM apps ORDER BY name",
+                 user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings FROM apps ORDER BY name",
             )?;
             let rows = statement.query_map([], app_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -341,7 +341,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                     user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir FROM apps WHERE name = ?1",
+                     user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings FROM apps WHERE name = ?1",
                     [name],
                     app_from_row,
                 )
@@ -424,6 +424,51 @@ impl Store {
         access_log: &crate::model::AccessLogSpec,
     ) -> Result<(), StoreError> {
         self.with(|connection| Writes { connection }.set_app_access_log(name, access_log))
+    }
+
+    /// Set the application's own release settings (issue 899); empty
+    /// ones remove them.
+    pub fn set_app_settings(
+        &self,
+        name: &str,
+        settings: &crate::app_settings::AppSettings,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| Writes { connection }.set_app_settings(name, settings))
+    }
+
+    /// Change the application's own release settings in one step under
+    /// the store's lock, creating the application when it does not exist:
+    /// `change` is given the settings as they are, and what it leaves is
+    /// written and returned. A change that fails writes nothing.
+    pub fn update_app_settings(
+        &self,
+        name: &str,
+        change: impl FnOnce(&mut crate::app_settings::AppSettings) -> Result<(), String>,
+    ) -> Result<Result<crate::app_settings::AppSettings, String>, StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "INSERT OR IGNORE INTO apps (name, created_unix_ms) VALUES (?1, ?2)",
+                params![name, now_unix_ms() as i64],
+            )?;
+
+            let encoded: Option<String> = connection.query_row(
+                "SELECT settings FROM apps WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )?;
+
+            let mut settings: crate::app_settings::AppSettings = match encoded {
+                Some(encoded) => decode(&encoded)?,
+                None => crate::app_settings::AppSettings::default(),
+            };
+
+            if let Err(error) = change(&mut settings) {
+                return Ok(Err(error));
+            }
+
+            Writes { connection }.set_app_settings(name, &settings)?;
+            Ok(Ok(settings))
+        })
     }
 
     /// Create an application if it does not exist, and return it.
@@ -1571,6 +1616,12 @@ fn app_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<App> {
         data_dir: row.get(10)?,
         media_dir: row.get(11)?,
         uploads_dir: row.get(12)?,
+        settings: match row.get::<_, Option<String>>(13)? {
+            Some(encoded) => {
+                decode(&encoded).map_err(|error: StoreError| undecodable(13, error))?
+            }
+            None => crate::app_settings::AppSettings::default(),
+        },
     })
 }
 
@@ -1590,6 +1641,7 @@ fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
             ("data_dir", "TEXT"),
             ("media_dir", "TEXT"),
             ("uploads_dir", "TEXT"),
+            ("settings", "TEXT"),
         ],
     )?;
     add_columns(
@@ -1670,6 +1722,32 @@ pub struct Writes<'a> {
 }
 
 impl Writes<'_> {
+    /// Set the application's own release settings (issue 899); empty
+    /// ones remove them.
+    pub fn set_app_settings(
+        &self,
+        name: &str,
+        settings: &crate::app_settings::AppSettings,
+    ) -> Result<(), StoreError> {
+        let encoded = if settings.is_empty() {
+            None
+        } else {
+            Some(toml::to_string(settings).map_err(|error| StoreError::Decode(error.to_string()))?)
+        };
+
+        let changed = self.connection.execute(
+            "UPDATE apps SET settings = ?2, resource_version = resource_version + 1 \
+                 WHERE name = ?1",
+            params![name, encoded],
+        )?;
+
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("application {name}")));
+        }
+
+        Ok(())
+    }
+
     /// Set the application's own access log choice (section 11.2); an
     /// empty one leaves the `[logs]` table's.
     pub fn set_app_access_log(

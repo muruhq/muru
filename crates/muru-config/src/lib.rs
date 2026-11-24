@@ -5426,6 +5426,84 @@ pub struct App {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "uploads"))]
     pub uploads_dir: Option<String>,
+    /// Environment variables every release deployed after this is
+    /// applied takes, over the source's `[tool.muru.env]` and under the
+    /// release's own; a secret is given by reference, never by value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvValue>,
+    /// Worker processes for every release, over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 1"))]
+    pub processes: Option<usize>,
+    /// Application threads per worker for every release, over the
+    /// source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 4"))]
+    pub threads: Option<usize>,
+    /// Threads for synchronous code called from an ASGI application, for
+    /// every release, over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 8"))]
+    pub sync_threads: Option<usize>,
+    /// Requests an ASGI worker's event loop takes at once, for every
+    /// release, over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 1000"))]
+    pub concurrency: Option<usize>,
+    /// Requests a worker serves before it is replaced, for every release,
+    /// over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else never"))]
+    pub max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced, for every release,
+    /// over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else never"))]
+    pub max_lifetime: Option<String>,
+    /// The host's timeouts for every release, each over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<HostTimeouts>,
+    /// The memory policy for every release, each key over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
+}
+
+/// The host's timeouts an application's table sets for its releases:
+/// those of a release's `timeouts` table that a deploy flag can set, and
+/// not the limits on the requests the edge serves, which belong to a
+/// release, a route or a virtual host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostTimeouts {
+    /// How long a request may run in a worker before it is interrupted
+    /// by raising `muru.RequestTimeout` in its thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_timeout: Option<String>,
+    /// How long a request may run in a worker before the worker is
+    /// replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_timeout: Option<String>,
+    /// How long a worker being replaced is given to finish its other
+    /// requests before it is told to stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_drain_grace: Option<String>,
+    /// How long a worker told to stop is given before it is killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_timeout: Option<String>,
+    /// How long a worker told to stop keeps its open WebSockets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket_drain_grace: Option<String>,
+    /// How long a worker has for its shutdown work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_grace: Option<String>,
+    /// How long an ASGI worker's event loop may go without running
+    /// before the worker is replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_stall_timeout: Option<String>,
+    /// How long a worker may go with no thread running Python before it
+    /// is replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gil_stall_timeout: Option<String>,
 }
 
 /// The `[metrics]` table (section 11.1): where the daemon serves the

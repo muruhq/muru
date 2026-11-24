@@ -1632,6 +1632,9 @@ pub struct App {
     pub media_dir: Option<String>,
     /// Where its uploads part is, a relative one in the data directory.
     pub uploads_dir: Option<String>,
+    /// The release settings every release deployed from now takes
+    /// (issue 899).
+    pub settings: crate::app_settings::AppSettings,
 }
 
 impl App {

@@ -162,6 +162,52 @@ A release whose host exits on its own is marked failed; if it was serving,
 the daemon starts it again. A deploy whose release fails to start leaves
 the previous release serving and reports the failure.
 
+### Settings on the application
+
+A release's flags apply to that release. A setting meant to last
+through every deploy goes on the application, when it belongs to the
+deployment, such as a database URL, a secret or this node's worker
+count, or in `[tool.muru]` when it follows the code:
+
+```console
+$ muructl app set shop --env SHOP_DATABASE=postgres://db/shop --secret STRIPE_KEY=vault:stripe --processes 4
+muru: shop's settings are changed for the releases deployed from now; no running release changes
+processes = 4
+env.SHOP_DATABASE = postgres://db/shop
+env.STRIPE_KEY = secret vault:stripe
+```
+
+Every release deployed after that takes them, over the source's
+`[tool.muru]` and under the deploy's own flags, so `--processes 2` on one
+deploy gives that release 2 and leaves the application's 4 for the next.
+Variables and secrets layer by name: a release gets every name from the
+application, the source and its flags, and the flag wins for a name
+given in more than one. A secret is kept as its reference, never its
+value. No release that is running changes; the settings take effect at
+the next deploy. Setting them on an application that does not exist yet
+creates it, so they can be in place before its first release.
+
+`muructl app set` takes the deploy flags for the variables and secrets,
+`--processes`, `--threads`, `--sync-threads`, `--concurrency`,
+`--max-requests`, `--max-lifetime`, `--timeout NAME=DURATION` and
+`--memory KEY=VALUE`, and `--replace` removes the settings not given.
+The entrypoint, interface, interpreter and the other settings that say
+what the code is stay with the source and the deploy, as do the tables.
+`muructl app unset` removes settings by key, and `muructl app show`
+lists them:
+
+```
+muructl app unset shop env.SHOP_DATABASE processes
+muructl app unset shop timeouts.hard_timeout memory.soft_limit
+muructl app unset shop --all
+muructl app show shop
+```
+
+The same settings go on an application's table in a file given to
+`muructl apply` (see [declaring applications in
+files](#declaring-applications-in-files)), and `muructl config export`
+writes them there.
+
 ### What a release's environment holds
 
 A release's host, workers, commands and managed servers start from a
@@ -186,8 +232,9 @@ clean environment, whoever started the daemon and from wherever:
    pass_env = ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE", "AWS_*"]
    ```
 
-4. What the release declares, in `[tool.muru.env]`, with `--env` and as
-   secrets, which overrides the base and `pass_env` but not what Muru sets.
+4. What the release declares, in `[tool.muru.env]`, on its application,
+   with `--env` and as secrets, which overrides the base and `pass_env`
+   but not what Muru sets.
 
 Anything else the daemon's own environment holds does not reach a
 release. A release that needs another variable declares it, or the
@@ -234,10 +281,32 @@ those of the
 `[tool.muru]` table (`entrypoint`, `interface`, `factory`,
 `factory_phase`, `python`, `processes`, `threads`, `sync_threads`,
 `concurrency`, `preload`, `hooks` and `preload_modules`), and what a
-table leaves out comes
-from the source's `[tool.muru]` table and then the defaults, exactly as
-a deploy resolves them. A directory applies every `.toml` file in it, in
-name order, as one configuration.
+table leaves out comes from the application's settings, then the
+source's `[tool.muru]` table and then the defaults, exactly as a deploy
+resolves them. A directory applies every `.toml` file in it, in name
+order, as one configuration.
+
+The application's own table holds the [settings on the
+application](#settings-on-the-application) that `muructl app set` sets,
+with the same keys: `env`, `processes`, `threads`, `sync_threads`,
+`concurrency`, `max_requests`, `max_lifetime`, a `timeouts` table of the
+host's timeouts and a `memory` table. The file states them in full, as
+it states the application's user, so applying a file whose application
+has none removes those `muructl app set` gave, and `muructl config
+export` writes them, so settings made at a terminal can be kept in a
+file:
+
+```toml
+[app.shop]
+processes = 4
+
+[app.shop.env]
+SHOP_DATABASE = "postgres://db/shop"
+STRIPE_KEY = { secret = { store = "vault", key = "stripe" } }
+
+[app.shop.release.r1]
+source = "/srv/shop"
+```
 
 So a release's table needs only its `source` when the project's own
 file says the rest:

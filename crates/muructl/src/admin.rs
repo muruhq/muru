@@ -6267,6 +6267,268 @@ pub enum AppCommand {
     /// Its data directory is kept unless --data. Refused while a route
     /// sends it traffic. Asks first; without a terminal it needs --yes.
     Remove(Box<AppRemoveArgs>),
+
+    /// Set release settings on the application, which every release
+    /// deployed from now takes over the source's [tool.muru], and under a
+    /// deploy's own flags: variables, secrets, worker counts, recycling,
+    /// the host's timeouts and the memory policy. No running release
+    /// changes. The application is created when it does not exist.
+    Set(Box<AppSetArgs>),
+
+    /// Remove release settings from the application, by key: processes,
+    /// threads, sync_threads, concurrency, max_requests, max_lifetime,
+    /// timeouts.KEY, memory.KEY, env.NAME, or env for every variable.
+    Unset(Box<AppUnsetArgs>),
+
+    /// Show the release settings the application gives its releases.
+    Show {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
+    },
+}
+
+/// What `muructl app set` takes: the deploy flags an application's
+/// settings hold.
+#[derive(Args, Clone)]
+pub struct AppSetArgs {
+    /// The application.
+    app: String,
+
+    /// Worker processes.
+    #[arg(long)]
+    processes: Option<u32>,
+
+    /// Application threads per worker.
+    #[arg(long)]
+    threads: Option<u32>,
+
+    /// Threads for synchronous code called from an ASGI application.
+    #[arg(long, value_name = "N")]
+    sync_threads: Option<u32>,
+
+    /// Requests an ASGI worker's event loop takes at once.
+    #[arg(long, value_name = "N")]
+    concurrency: Option<u32>,
+
+    /// Replace a worker after this many requests, with jitter.
+    #[arg(long, value_name = "N")]
+    max_requests: Option<u64>,
+
+    /// Replace a worker after this long, for example 1h, with jitter.
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    max_lifetime: Option<Duration>,
+
+    /// A host timeout as NAME=DURATION, as deploy --timeout takes it:
+    /// soft, hard, hard_drain_grace, shutdown, websocket_drain_grace,
+    /// exit_grace, loop_stall or gil_stall. Repeatable.
+    #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
+    timeouts: Vec<(String, Duration)>,
+
+    /// A memory setting as KEY=VALUE, as deploy --memory takes it:
+    /// measure, soft_limit, soft_for, reclaim_first, hard_limit or
+    /// check_interval. Repeatable.
+    #[arg(long = "memory", value_name = "KEY=VALUE", value_parser = crate::parse_memory_setting)]
+    memory: Vec<(String, String)>,
+
+    /// An environment variable as NAME=VALUE. Repeatable.
+    #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env_setting)]
+    env: Vec<(String, String)>,
+
+    /// A secret as NAME=STORE:KEY, delivered as the variable, or
+    /// NAME=STORE:KEY:file for a file named by NAME_FILE; the reference is
+    /// kept, never the value. Repeatable.
+    #[arg(long = "secret", value_name = "NAME=STORE:KEY[:file]", value_parser = parse_secret_setting)]
+    secrets: Vec<(String, String, String, bool)>,
+
+    /// Remove every setting the application has first, so it holds only
+    /// those given here.
+    #[arg(long)]
+    replace: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// What `muructl app unset` takes.
+#[derive(Args, Clone)]
+pub struct AppUnsetArgs {
+    /// The application.
+    app: String,
+
+    /// The settings to remove, by key.
+    #[arg(value_name = "KEY", required_unless_present = "all")]
+    keys: Vec<String>,
+
+    /// Remove every setting.
+    #[arg(long, conflicts_with = "keys")]
+    all: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+impl AppSetArgs {
+    /// The settings given, as the admin message carries them.
+    fn settings(&self) -> pb::AppSettings {
+        let timeout = |name: &str| timeout_ms(&self.timeouts, name);
+
+        pb::AppSettings {
+            env: self
+                .env
+                .iter()
+                .map(|(name, value)| pb::EnvEntry {
+                    name: name.clone(),
+                    value: value.clone(),
+                    ..Default::default()
+                })
+                .chain(
+                    self.secrets
+                        .iter()
+                        .map(|(name, store, key, as_file)| pb::EnvEntry {
+                            name: name.clone(),
+                            secret_store: store.clone(),
+                            secret_key: key.clone(),
+                            as_file: *as_file,
+                            ..Default::default()
+                        }),
+                )
+                .collect(),
+            processes: self.processes,
+            threads: self.threads,
+            sync_threads: self.sync_threads,
+            concurrency: self.concurrency,
+            max_requests: self.max_requests,
+            max_lifetime_ms: self
+                .max_lifetime
+                .map(|lifetime| lifetime.as_millis() as u64),
+            soft_timeout_ms: timeout("soft"),
+            hard_timeout_ms: timeout("hard"),
+            hard_drain_grace_ms: timeout("hard_drain_grace"),
+            shutdown_timeout_ms: timeout("shutdown"),
+            websocket_drain_grace_ms: timeout("websocket_drain_grace"),
+            exit_grace_ms: timeout("exit_grace"),
+            loop_stall_timeout_ms: timeout("loop_stall"),
+            gil_stall_timeout_ms: timeout("gil_stall"),
+            memory_measure: memory_setting(&self.memory, "measure").unwrap_or_default(),
+            memory_soft_limit: memory_setting(&self.memory, "soft_limit")
+                .and_then(|text| muru_config::parse_size(&text).ok()),
+            memory_soft_for_ms: memory_setting(&self.memory, "soft_for")
+                .and_then(|text| muru_config::parse_duration(&text).ok())
+                .map(|duration| duration.as_millis() as u64),
+            memory_reclaim_first: memory_setting(&self.memory, "reclaim_first")
+                .map(|text| text == "true"),
+            memory_hard_limit: memory_setting(&self.memory, "hard_limit")
+                .and_then(|text| muru_config::parse_size(&text).ok()),
+            memory_check_interval_ms: memory_setting(&self.memory, "check_interval")
+                .and_then(|text| muru_config::parse_duration(&text).ok())
+                .map(|duration| duration.as_millis() as u64),
+        }
+    }
+}
+
+/// Set an application's release settings.
+pub async fn app_set(args: AppSetArgs) -> anyhow::Result<()> {
+    let settings = args.settings();
+
+    anyhow::ensure!(
+        args.replace || settings != pb::AppSettings::default(),
+        "give a setting to set, such as --env NAME=VALUE or --processes N; \
+         `muructl app unset` removes them"
+    );
+
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
+    let answer = client
+        .set_app_settings(pb::SetAppSettingsRequest {
+            app: args.app.clone(),
+            set: Some(settings),
+            unset: Vec::new(),
+            clear: args.replace,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    report_app_settings(&args.app, &answer, args.output.json)
+}
+
+/// Remove some of an application's release settings, or all of them.
+pub async fn app_unset(args: AppUnsetArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
+    let answer = client
+        .set_app_settings(pb::SetAppSettingsRequest {
+            app: args.app.clone(),
+            set: None,
+            unset: args.keys.clone(),
+            clear: args.all,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    report_app_settings(&args.app, &answer, args.output.json)
+}
+
+/// Show an application's release settings.
+pub async fn app_show(app: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.endpoint()?).await?;
+    let answer = client
+        .get_app(pb::GetAppRequest { name: app.clone() })
+        .await
+        .map_err(explain)?
+        .into_inner();
+    let settings = answer.settings.unwrap_or_default();
+
+    if json {
+        return print_answer(&settings);
+    }
+
+    print_app_settings(&app, &settings)
+}
+
+/// What `app set` and `app unset` say: that the change waits for the next
+/// deploy, then the settings as they now are.
+fn report_app_settings(app: &str, settings: &pb::AppSettings, json: bool) -> anyhow::Result<()> {
+    if json {
+        return print_answer(settings);
+    }
+
+    println!(
+        "muru: {app}'s settings are changed for the releases deployed from now; \
+         no running release changes"
+    );
+    print_app_settings(app, settings)
+}
+
+/// An application's settings, a line a key, a secret by its reference.
+fn print_app_settings(app: &str, settings: &pb::AppSettings) -> anyhow::Result<()> {
+    let lines = muru_controller::app_settings::AppSettings::from_message(settings)
+        .map_err(|error| anyhow::anyhow!(error))?
+        .lines();
+
+    if lines.is_empty() {
+        println!(
+            "{app} has no settings of its own; its releases take the flags they are deployed \
+             with, the source's [tool.muru] and the defaults"
+        );
+    }
+
+    for (key, value) in lines {
+        println!("{key} = {value}");
+    }
+
+    Ok(())
 }
 
 /// What `muructl app remove` takes.

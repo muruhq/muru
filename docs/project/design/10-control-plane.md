@@ -136,6 +136,8 @@ timeout = '5s'
 
 - **References.** Configuration refers to a secret with a structured value naming the store and key, in the same style as every other setting:
 
+An application's own variables and secrets go in `[app.NAME.env]` in the same form, and every release deployed after the apply takes them under its own (section 3.3, issue 899).
+
 ```toml
 [app.shop.release.r42.env]
 DJANGO_SETTINGS_MODULE = 'shop.settings'
@@ -167,7 +169,7 @@ limits = { nofile = 65536, memory = '4GiB', cpu = 2.0 }     # cgroup limits on L
 An apply is validated as a whole, and files with an error apply nothing. It is then carried out in two phases (ADR 0055):
 
 1. **Prepare.** The applications the files add are created, with the identity and priority their processes start with, and the releases they add are recorded, each started held or left stopped as the plan says (section 10.4). A release a promotion names that does not run is started held too. Nothing points at them yet: no host, route, overlay or promotion is written, and traffic stays where it is. A release that does not start stops the apply. The releases the apply recorded are removed, a release the daemon had that it started is stopped again, the identities and priorities it set are put back and the applications it created are removed. The report says nothing was applied, naming the release and why, and a `config.apply_failed` event records it.
-2. **Commit.** The hosts, routes, upstreams, overlays, client classes, rate limits and access-log choices, and the release that serves each application, are written in one transaction of the state store. The releases the routes' traffic names that do not run are started, and then one snapshot gives the edge all of it, so a promotion's traffic switch reaches the edge with the routes the same files write. The releases that served before then drain, and with --prune the releases and applications the files no longer contain are drained and removed. A `config.applied` event counts the changes.
+2. **Commit.** The hosts, routes, upstreams, overlays, client classes, rate limits, access-log choices and applications' release settings (section 3.3, issue 899), and the release that serves each application, are written in one transaction of the state store. The releases the routes' traffic names that do not run are started, and then one snapshot gives the edge all of it, so a promotion's traffic switch reaches the edge with the routes the same files write. The releases that served before then drain, and with --prune the releases and applications the files no longer contain are drained and removed. A `config.applied` event counts the changes.
 
 What the apply guarantees:
 

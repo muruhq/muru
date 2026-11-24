@@ -22,6 +22,7 @@ it out.
 | `urls` | reads | `muructl open --list`: every URL the application can be reached at, best first, opening nothing | `app` |
 | `list` | reads | `muructl app list`, `release list`, `host list`, `route list`, `upstream list`, `rollout status` or `overlay list` | `what` (apps, releases, hosts, routes, upstreams, rollouts, overlays), `app` |
 | `release` | reads | `muructl release show` | `release` (app@release) |
+| `app_settings` | reads | `muructl app show` | `app` |
 | `commands` | reads | `muructl command list` | `target` |
 | `conditions` | reads | `muructl condition list`, or with `name` `muructl condition show` | `name` |
 | `command_runs` | reads | `muructl command runs` | `app`, `name` |
@@ -41,6 +42,8 @@ it out.
 | `detours` | reads | `muructl detour list`, or with `link` `muructl detour preview --print`: a one-time entry link to a detour's preview, valid for a minute, with the `Muru-Preview` header value | `action` (list, link), `detour`, `host` |
 | `skill_status` | reads | `muructl mcp skill status` | none |
 | `docs` | reads | The user guide embedded in `muructl`: the list of pages, or one page's Markdown | `page` |
+| `set_app_settings` | changes | `muructl app set` | `app`, `env`, `secrets`, `processes`, `threads`, `sync_threads`, `concurrency`, `max_requests`, `max_lifetime`, `timeouts`, `memory`, `replace` |
+| `unset_app_settings` | changes | `muructl app unset` | `app`, `keys`, `all` |
 | `deploy` | changes | `muructl deploy` | `app`, `source`, `entrypoint`, `python`, `hold`, `wait` (default true), `dry_run` |
 | `promote` | changes | `muructl rollout bluegreen` | `release` |
 | `rollback` | changes | `muructl rollback` | `app` |

@@ -22,6 +22,12 @@ service Admin {
   rpc GetApp(GetAppRequest) returns (App);
   // Remove an application and every release it has, or say what would go.
   rpc RemoveApp(RemoveAppRequest) returns (RemoveReleasesResponse);
+  // Issue 899: set and remove an application's own release settings,
+  // which every release deployed after the change takes over the source's
+  // [tool.muru] and under the release's own flags or table. The
+  // application is created when it does not exist. Answers with the
+  // settings as they now are.
+  rpc SetAppSettings(SetAppSettingsRequest) returns (AppSettings);
   // Issue 849: an application's data directory and its parts, where each
   // leads, whose it is and what may be wrong with it.
   rpc GetAppData(GetAppDataRequest) returns (AppData);
@@ -728,6 +734,47 @@ message App {
   bool maintenance = 9;             // the edge serves its maintenance page
   int32 priority = 10;              // the node's budget admits higher priorities' scale-ups first
   string maintenance_overlay = 11;  // the active overlay whose maintenance setting is in force, if one is (issue 757)
+  AppSettings settings = 12;        // the release settings every release deployed from now takes (issue 899)
+}
+
+// An application's own release settings (issue 899): what every release
+// deployed after they are set takes, over the source's [tool.muru] and
+// under the release's own flags or table. Each is unset when absent or
+// empty. Environment variables and secrets layer by name.
+message AppSettings {
+  repeated EnvEntry env = 1;                 // variables, and secrets by reference, never by value
+  optional uint32 processes = 2;
+  optional uint32 threads = 3;
+  optional uint32 sync_threads = 4;
+  optional uint32 concurrency = 5;
+  optional uint64 max_requests = 6;          // requests a worker serves before it is replaced
+  optional uint64 max_lifetime_ms = 7;       // how long a worker lives before it is replaced
+  optional uint64 soft_timeout_ms = 8;
+  optional uint64 hard_timeout_ms = 9;
+  optional uint64 hard_drain_grace_ms = 10;
+  optional uint64 shutdown_timeout_ms = 11;
+  optional uint64 websocket_drain_grace_ms = 12;
+  optional uint64 exit_grace_ms = 13;
+  optional uint64 loop_stall_timeout_ms = 14;
+  optional uint64 gil_stall_timeout_ms = 15;
+  string memory_measure = 16;                // uss, pss or rss
+  optional uint64 memory_soft_limit = 17;    // bytes
+  optional uint64 memory_soft_for_ms = 18;
+  optional bool memory_reclaim_first = 19;
+  optional uint64 memory_hard_limit = 20;    // bytes
+  optional uint64 memory_check_interval_ms = 21;
+}
+
+// Set some of an application's settings and remove others. The settings
+// in `set` replace those of the same key, a variable by its name, and
+// `unset` names keys to remove as the application's table names them:
+// processes, timeouts.hard_timeout, memory.soft_limit, env.NAME, or env
+// for every variable. A key both set and unset is refused.
+message SetAppSettingsRequest {
+  string app = 1;
+  AppSettings set = 2;
+  repeated string unset = 3;
+  bool clear = 4;                            // remove every setting first
 }
 
 // A deploy names the application (created on first use) and the source.

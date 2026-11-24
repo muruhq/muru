@@ -761,8 +761,14 @@ run = ['python', 'manage.py', 'migrate']
     fn both(request: &pb::DeployRequest, full: bool) -> (ReleaseSpec, ReleaseSpec, Rendered) {
         let off = Provisioning::off();
         let rendered = render(request, &request.source, full).unwrap();
-        let mut applied =
-            config::resolve_declared("shop", &rendered.table, &request.source, &off).unwrap();
+        let mut applied = config::resolve_declared(
+            "shop",
+            &rendered.table,
+            &crate::app_settings::AppSettings::default(),
+            &request.source,
+            &off,
+        )
+        .unwrap();
         let mut deployed =
             config::resolve_spec(request, None, &config::Tables::default(), &off).unwrap();
         applied.layers = crate::model::Layers::default();
