@@ -97,14 +97,15 @@ start_response("200 OK", [("X-Muru-Sendfile", path)])
 ```
 
 `sendfile_roots` adds others. `media:` names the media part and
-`media:SUBDIR` a directory in it; a relative root is taken from the
-release's source directory, so the setting travels with the project and
-means the same in every release and under `muructl run`, `muructl
-serve` and the daemon; an absolute root is used as written:
+`media:SUBDIR` a directory in it; `source:SUBDIR` names a directory in
+the release's source directory, so the setting travels with the project
+and means the same in every release and under `muructl run`, `muructl
+serve` and the daemon. A plain relative root means the same as
+`source:` with it. An absolute root is used as written:
 
 ```toml
 [tool.muru]
-sendfile_roots = ['build/reports']
+sendfile_roots = ['source:build/reports']
 
 [tool.muru.mounts.archive]
 path = '/archive'
@@ -112,8 +113,8 @@ entrypoint = 'media.archive:application'
 sendfile_roots = ['media:archive', '/srv/archive']
 ```
 
-A relative root must be a directory in the release's source when the
-release is deployed, or the deploy fails, as it does for a static
+A root in the source must be a directory there when the release is
+deployed, or the deploy fails, as it does for a static
 entry's directory; `muructl run` refuses to start without it. An
 absolute root may be made or mounted later. The source directory as a
 whole is never a root unless it is named.

@@ -41,16 +41,21 @@ the application has to serve them in development:
 ```toml
 [[tool.muru.static]]
 path = '/static/'
-dir = 'shop/static'
+dir = 'source:shop/static'
 cache = { max_age = '1h' }
 ```
 
-Each entry names a path prefix and a directory under the project, with
-`index`, `fallback` (a file), `cache`, `redirect_slash` and `case` as a
-static route has them. `--static /static/=DIR`, repeatable on `muructl
-run` and `muructl deploy`, adds an entry or replaces the one with its
-prefix, and a deploy without the flag keeps what the release before it
-had, as it does every other setting. The edge serves a path under the
+Each entry names a path prefix and a directory, with `index`,
+`fallback` (a file), `cache`, `redirect_slash` and `case` as a static
+route has them. `source:SUBDIR` names a directory in the project, and
+`source:` the project itself. A plain relative path, `dir =
+'shop/static'`, means the same; `source:` says so where `static:` or
+`media:` entries sit beside it. Neither may climb out with `..`. An
+absolute path names that directory wherever the release comes from.
+`--static /static/=DIR`, repeatable on `muructl run` and `muructl
+deploy`, adds an entry or replaces the one with its prefix for that run
+or release. A deploy without the flag takes the source's entries alone,
+so a source that drops an entry drops it. The edge serves a path under the
 prefix from the directory when a file answers it, with the cache
 headers, conditional requests, ranges and precompressed variants of a
 static route; what has no file, and every method files do not answer,
@@ -60,11 +65,14 @@ would then be looked up as a file first; a site that is files at `/`
 with the application under them is a [static route with a
 fallback](#mixing-files-and-an-application).
 
-Under the daemon the directory is read from the release's own source,
-so the release the request was routed to serves its own files: a canary
-answers with its own assets, and a rollback brings the old ones back
-with the old code. `muructl run` prints each entry at start-up and
-refuses a directory that does not exist, as a deploy does.
+Under the daemon a directory in the source is read from the release's
+own source, so the release the request was routed to serves its own
+files: a canary answers with its own assets, and a rollback brings the
+old ones back with the old code. `muructl config export` writes such a
+directory as `source:SUBDIR`, so the exported release names its own
+source's directory rather than one path on one node. `muructl run`
+prints each entry at start-up and refuses a directory that does not
+exist, as a deploy does.
 
 ## Built files
 
@@ -115,9 +123,10 @@ always: its requests find no file and reach the application.
 `muructl command run collectstatic` fills the run's directory, and the
 edge serves the files from then on.
 
-A Flask package's own `static` folder ships with the code, and is a
-directory relative to the project as before; `static:` is for files a
-release builds.
+A Flask package's own `static` folder ships with the code, and is
+`source:` and its directory in the project; `static:` is for files a
+release builds. The two look alike when written `dir = 'static'` and
+`dir = 'static:'`, which is what `source:static` avoids.
 
 ## Files from the media part
 

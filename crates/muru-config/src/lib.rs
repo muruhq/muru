@@ -405,8 +405,9 @@ pub struct Mount {
     pub cgi_local_redirect: Option<bool>,
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the file to be served (section 4.9); the release's
-    /// when absent, and an empty list refuses every hint. A relative
-    /// path is taken from the release's source directory.
+    /// when absent, and an empty list refuses every hint. `source:SUBDIR`,
+    /// or a relative path, is taken from the release's source directory,
+    /// and `media:SUBDIR` from the media part.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "the release's"))]
     pub sendfile_roots: Option<Vec<String>>,
@@ -1092,8 +1093,9 @@ pub struct Release {
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the file to be served (section 4.9), for the default
     /// mount and any mount that does not say otherwise; with none every
-    /// hint is refused. A relative path is taken from the release's
-    /// `source`.
+    /// hint is refused. `source:SUBDIR`, or a relative path, is taken
+    /// from the release's `source`, and `media:SUBDIR` from the media
+    /// part.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sendfile_roots: Vec<String>,
     /// A second response header honoured as `X-Muru-Sendfile` is, such
@@ -4186,10 +4188,11 @@ pub struct StaticDir {
     /// boundaries, and `/` is not allowed, since every path would then
     /// be looked up as a file first.
     pub path: String,
-    /// The directory: relative to the source directory, absolute,
+    /// The directory: `source:` for the release's source directory,
     /// `static:` for the release's built static files or `media:` for
     /// the application's media part, each with an optional directory
-    /// inside it after the colon.
+    /// inside it after the colon; or a path, absolute, or relative to the
+    /// source directory as `source:` is.
     pub dir: String,
     /// The files tried, in order, when a directory is requested.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -5170,7 +5173,7 @@ pub fn check_sendfile(roots: &[String], header: Option<&str>) -> Result<(), Stri
                      which a [[tool.muru.static]] entry serves"
                 ));
             }
-            places::Place::Media(_) | places::Place::Path(_) => {}
+            places::Place::Media(_) | places::Place::Path(_) | places::Place::Source(_) => {}
         }
     }
 
@@ -5196,9 +5199,9 @@ pub fn check_sendfile(roots: &[String], header: Option<&str>) -> Result<(), Stri
 }
 
 /// Where a release's `sendfile_roots` entry is (section 4.9): an
-/// absolute one as it is written, a relative one in the release's source
-/// directory, and `media:` in the application's media part (issue 849),
-/// or nowhere when it has none.
+/// absolute one as it is written, a relative one or `source:` in the
+/// release's source directory (issue 900), and `media:` in the
+/// application's media part (issue 849), or nowhere when it has none.
 pub fn sendfile_root(
     root: &str,
     source: &std::path::Path,
@@ -5213,6 +5216,11 @@ pub fn sendfile_root(
             }
         }),
         Ok(places::Place::Static(_)) | Err(_) => None,
+        Ok(places::Place::Source(rest)) => Some(if rest.is_empty() {
+            source.to_path_buf()
+        } else {
+            source.join(rest)
+        }),
         Ok(places::Place::Path(_)) => {
             let path = std::path::Path::new(root);
 
@@ -5261,15 +5269,17 @@ pub fn worker_root_paths(
     paths
 }
 
-/// Check that each relative `sendfile_roots` entry is a directory in the
-/// release's source (section 4.9), as a static entry's directory must be:
-/// a root that travels with the project is part of the release. An
-/// absolute root is the operator's, and may be made or mounted later.
+/// Check that each relative or `source:` `sendfile_roots` entry is a
+/// directory in the release's source (section 4.9), as a static entry's
+/// directory must be: a root that travels with the project is part of the
+/// release. An absolute root is the operator's, and may be made or
+/// mounted later.
 pub fn check_sendfile_dirs(roots: &[String], source: &std::path::Path) -> Result<(), String> {
-    for root in roots.iter().filter(|root| {
-        !root.starts_with('/') && matches!(places::Place::parse(root), Ok(places::Place::Path(_)))
+    for (root, within) in roots.iter().filter_map(|root| {
+        let within = places::Place::parse(root).ok()?.in_source()?;
+        Some((root, within))
     }) {
-        let path = source.join(root);
+        let path = source.join(within);
 
         if !path.is_dir() {
             return Err(format!(
@@ -6518,8 +6528,9 @@ pub struct ToolMuru {
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the file to be served (section 4.9), for the default
     /// mount and any mount that does not say otherwise; with none every
-    /// hint is refused. A relative path is taken from the project's
-    /// directory, the release's source.
+    /// hint is refused. `source:SUBDIR`, or a relative path, is taken
+    /// from the project's directory, the release's source, and
+    /// `media:SUBDIR` from the media part.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sendfile_roots: Vec<String>,
     /// A second response header honoured as `X-Muru-Sendfile` is, such

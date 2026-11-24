@@ -838,8 +838,9 @@ struct RunArgs {
     single: bool,
 
     /// A directory of the application's own files the edge serves under
-    /// a path prefix, as PREFIX=DIR with DIR relative to the project,
-    /// over the [[tool.muru.static]] entries by prefix. Repeatable.
+    /// a path prefix, as PREFIX=DIR, with DIR source:SUBDIR or relative
+    /// for a directory in the project, static: or media:, over the
+    /// [[tool.muru.static]] entries by prefix. Repeatable.
     #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = parse_static_setting)]
     static_dirs: Vec<(String, String)>,
 
@@ -1637,7 +1638,7 @@ pub(crate) fn apply_timeouts(limits: &mut muru_edge::Limits, timeouts: &[(String
 pub(crate) fn parse_static_setting(text: &str) -> Result<(String, String), String> {
     let (prefix, directory) = text
         .split_once('=')
-        .ok_or_else(|| format!("{text:?} is not PREFIX=DIR, for example /static/=static"))?;
+        .ok_or_else(|| format!("{text:?} is not PREFIX=DIR, for example /static/=source:static"))?;
     let entry = muru_config::StaticDir {
         path: prefix.trim().to_owned(),
         dir: directory.trim().to_owned(),

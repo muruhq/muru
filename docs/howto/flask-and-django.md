@@ -131,8 +131,13 @@ with the same `url_for('static', ...)` paths:
 ```toml
 [[tool.muru.static]]
 path = '/static/'
-dir = 'shop/static'
+dir = 'source:shop/static'
 ```
+
+`source:` names a directory in the project; a plain relative path,
+`dir = 'shop/static'`, means the same. A Django project that serves an
+application's own `static` directory beside the `static:` entry above
+writes it `source:shop/static`, so the two are not confused.
 
 Flask's instance folder, where its tutorial keeps the database, goes in
 the application's data directory with `Flask(__name__,

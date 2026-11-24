@@ -189,7 +189,7 @@ pub fn check_release(spec: &ReleaseSpec, places: &Places) -> Result<(), String> 
     }
 
     for entry in &spec.static_dirs {
-        if let Some(dir) = entry.directory(places) {
+        if let Some(dir) = entry.directory(&spec.source, places) {
             muru_config::places::check_served(&format!("static {}", entry.path), &dir, dirs)?;
         }
     }

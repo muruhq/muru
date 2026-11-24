@@ -152,7 +152,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `reflection` | boolean | `false` | Serve gRPC server reflection for the services the release's gRPC mounts register (default false). |
 | `scaling` | table, {ref}`[app.NAME.release.ID.scaling] <config-daemon-app-name-release-id-scaling>` |  | How the default group is scaled; static when absent. |
 | `sendfile_header` | string |  | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile` for the frameworks that send that one. |
-| `sendfile_roots` | array of strings |  | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. A relative path is taken from the release's `source`. |
+| `sendfile_roots` | array of strings |  | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. `source:SUBDIR`, or a relative path, is taken from the release's `source`, and `media:SUBDIR` from the media part. |
 | `source` | string |  | The source directory. A relative path is taken from the file's directory. Required by `muructl apply` for a `workers` release. |
 | `static` | array of tables, {ref}`[[app.NAME.release.ID.static]] <config-daemon-app-name-release-id-static>` |  | The application's own static directories, served by the edge from the release's source, which is the project directory under `muructl run`. |
 | `stop_signal` | string | the profile's, `TERM` | The signal that stops an `http` release's instance gracefully: TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. Required by the generic profile; the other profiles know their server's. |
@@ -280,7 +280,7 @@ A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` ta
 | `max_connections` | integer |  | Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; each holds a request slot when absent. |
 | `path` | string |  | The path prefix; the longest wins, on segment boundaries. A gRPC mount has none: its calls are matched by service name. |
 | `sendfile_header` | string | the release's | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
-| `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served; the release's when absent, and an empty list refuses every hint. A relative path is taken from the release's source directory. |
+| `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served; the release's when absent, and an empty list refuses every hint. `source:SUBDIR`, or a relative path, is taken from the release's source directory, and `media:SUBDIR` from the media part. |
 | `threads` | integer or table, {ref}`[app.NAME.release.ID.mounts.NAME.threads] <config-daemon-app-name-release-id-mounts-name-threads>` |  | Threads of the mount's own, for a WSGI or gRPC mount; it shares the worker's pool when absent. |
 | `tracing_middleware` | boolean | `false` | Wrap the mount's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for. |
 
@@ -340,7 +340,7 @@ A directory of an application's own files, an entry of the `[[tool.muru.static]]
 | --- | --- | --- | --- |
 | `cache` | table, {ref}`[route.cache] <config-daemon-route-cache>` |  | The cache headers files are sent with. |
 | `case` | string | `"strict"` | `strict` (the default), which matches names as they are on disk, or `insensitive`. |
-| `dir` | string | required | The directory: relative to the source directory, absolute, `static:` for the release's built static files or `media:` for the application's media part, each with an optional directory inside it after the colon. |
+| `dir` | string | required | The directory: `source:` for the release's source directory, `static:` for the release's built static files or `media:` for the application's media part, each with an optional directory inside it after the colon; or a path, absolute, or relative to the source directory as `source:` is. |
 | `fallback` | string |  | The file served for paths with no file of their own, for a single-page application under the prefix. |
 | `index` | array of strings | `["index.html"]` | The files tried, in order, when a directory is requested. |
 | `path` | string | required | The path prefix, such as `/static/`; the longest wins, on segment boundaries, and `/` is not allowed, since every path would then be looked up as a file first. |

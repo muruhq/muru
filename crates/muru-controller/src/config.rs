@@ -4030,11 +4030,14 @@ pub fn resolve_spec(
 
     // Section 4.9: the file hint keys, from the request, else the table.
 
-    let sendfile_roots = if request.sendfile_roots.is_empty() {
-        table.sendfile_roots.clone()
+    let sendfile_roots: Vec<String> = if request.sendfile_roots.is_empty() {
+        &table.sendfile_roots
     } else {
-        request.sendfile_roots.clone()
-    };
+        &request.sendfile_roots
+    }
+    .iter()
+    .map(|root| root_by_place(root))
+    .collect();
     let sendfile_header = request
         .sendfile_header
         .clone()
@@ -4055,7 +4058,8 @@ pub fn resolve_spec(
         let path = mount.path.trim_end_matches('/').to_owned();
         let mount_roots = mount
             .sendfile_roots
-            .clone()
+            .as_ref()
+            .map(|roots| roots.iter().map(|root| root_by_place(root)).collect())
             .unwrap_or_else(|| sendfile_roots.clone());
         let mount_header = mount
             .sendfile_header
@@ -5488,6 +5492,28 @@ fn resolve_static_dirs(
     Ok(by_path.into_values().collect())
 }
 
+/// A directory in the source as a release records it: relative, with
+/// `.` left out, so `./assets`, `assets/` and `source:assets` are one.
+fn in_source(within: &str) -> PathBuf {
+    Path::new(within)
+        .components()
+        .filter(|component| matches!(component, std::path::Component::Normal(_)))
+        .collect()
+}
+
+/// A file hint root as a release records it (issue 900): one in the
+/// source, `source:SUBDIR` or a relative path, by its place, so an
+/// export names it as `source:SUBDIR`; any other as it is written.
+fn root_by_place(root: &str) -> String {
+    match muru_config::places::Place::parse(root)
+        .ok()
+        .and_then(|place| place.in_source())
+    {
+        Some(within) => format!("source:{}", in_source(within).display()),
+        None => root.to_owned(),
+    }
+}
+
 /// A prefix as paths are matched by it, without a trailing slash.
 fn prefix_key(path: &str) -> String {
     muru_edge::routing::group_prefix(path)
@@ -5496,24 +5522,36 @@ fn prefix_key(path: &str) -> String {
 /// One of the release's own directories, resolved and checked. One in a
 /// place Muru provides (issues 849 and 850), `media:` or `static:`, is
 /// kept by its place, since that is resolved when the release runs, and
-/// is not checked: the application fills it.
+/// is not checked: the application fills it. One in the source, written
+/// `source:SUBDIR` or as a relative path (issue 900), is kept by its
+/// place too, so the release's own source is what it names, and is
+/// checked to be a directory there.
 fn static_spec(entry: &muru_config::StaticDir, source: &Path) -> Result<StaticSpec, String> {
     let place = muru_config::places::Place::parse(&entry.dir)
         .map_err(|error| format!("static {}: {error}", entry.path))?;
 
-    let (dir, within) = match place {
-        muru_config::places::Place::Media(rest) => {
+    let (dir, within) = match (place, place.in_source()) {
+        (muru_config::places::Place::Media(rest), _) => {
             (PathBuf::from(rest), Some(crate::model::Within::Media))
         }
-        muru_config::places::Place::Static(rest) => {
+        (muru_config::places::Place::Static(rest), _) => {
             (PathBuf::from(rest), Some(crate::model::Within::Static))
         }
-        muru_config::places::Place::Path(text) => {
-            let dir = if Path::new(text).is_absolute() {
-                PathBuf::from(text)
-            } else {
-                source.join(text)
-            };
+        (_, Some(within)) => {
+            let dir = in_source(within);
+
+            if !source.join(&dir).is_dir() {
+                return Err(format!(
+                    "static {}: {} is not a directory",
+                    entry.path,
+                    source.join(&dir).display()
+                ));
+            }
+
+            (dir, Some(crate::model::Within::Source))
+        }
+        (_, None) => {
+            let dir = PathBuf::from(&entry.dir);
 
             if !dir.is_dir() {
                 return Err(format!(
@@ -5823,7 +5861,11 @@ fn resolve_http_spec(
         static_dirs: Vec::new(),
         accel_redirect: false,
         cgi_local_redirect: false,
-        sendfile_roots: table.sendfile_roots.clone(),
+        sendfile_roots: table
+            .sendfile_roots
+            .iter()
+            .map(|root| root_by_place(root))
+            .collect(),
         sendfile_header: table.sendfile_header.clone(),
         logging: muru_config::PythonLogging::default(),
         max_requests: None,
@@ -7458,6 +7500,51 @@ mod tests {
             planned(&zero).errors,
             ["shop: processes must be more than 0"]
         );
+    }
+
+    #[test]
+    fn a_directory_in_the_source_is_recorded_by_its_place() {
+        // Issue 900: source:SUBDIR and a relative path name one directory
+        // of the release's own source, kept relative to it, written back
+        // as source:SUBDIR, and checked to be there.
+
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("assets")).unwrap();
+        std::fs::create_dir_all(source.path().join("downloads")).unwrap();
+
+        let entry = |dir: &str| muru_config::StaticDir {
+            path: "/assets/".to_owned(),
+            dir: dir.to_owned(),
+            ..Default::default()
+        };
+
+        for dir in ["assets", "./assets/", "source:assets"] {
+            let spec = static_spec(&entry(dir), source.path()).unwrap();
+            assert_eq!(spec.within, Some(crate::model::Within::Source), "{dir}");
+            assert_eq!(spec.dir, Path::new("assets"), "{dir}");
+            assert_eq!(spec.table().dir, "source:assets", "{dir}");
+            assert_eq!(
+                spec.directory(Path::new("/srv/r2"), &crate::places::Places::default()),
+                Some(PathBuf::from("/srv/r2/assets"))
+            );
+        }
+
+        let whole = static_spec(&entry("source:"), source.path()).unwrap();
+        assert_eq!(whole.table().dir, "source:");
+
+        let error = static_spec(&entry("source:gone"), source.path()).unwrap_err();
+        assert!(error.contains("is not a directory"), "{error}");
+
+        let absolute = source.path().join("assets").display().to_string();
+        let spec = static_spec(&entry(&absolute), source.path()).unwrap();
+        assert_eq!((spec.within, spec.table().dir), (None, absolute));
+
+        // File hint roots in the source are kept as source:SUBDIR too.
+
+        assert_eq!(root_by_place("downloads"), "source:downloads");
+        assert_eq!(root_by_place("source:./downloads"), "source:downloads");
+        assert_eq!(root_by_place("media:"), "media:");
+        assert_eq!(root_by_place("/srv/files"), "/srv/files");
     }
 
     #[test]

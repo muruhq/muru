@@ -389,6 +389,7 @@ def test_an_applications_own_directories_under_run_and_deploy(tmp_path: Path) ->
         exported = daemon.muructl("config", "show", "files").stdout
         assert "[[app.files.release.r2.static]]" in exported
         assert str(STATIC) not in exported, exported
+        assert 'dir = "source:assets"' in exported, exported
 
         # A source with no entries of its own, deployed after one with
         # them, serves none of the other source's files.

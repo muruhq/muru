@@ -4502,8 +4502,9 @@ pub struct ReleaseArgs {
     pub(crate) sendfile_header: Option<String>,
 
     /// A directory of the application's own files the edge serves under
-    /// a path prefix, as PREFIX=DIR with DIR relative to the source, over
-    /// the source's [[tool.muru.static]] entries by prefix. Repeatable.
+    /// a path prefix, as PREFIX=DIR, with DIR source:SUBDIR or relative
+    /// for a directory in the source, static: or media:, over the
+    /// source's [[tool.muru.static]] entries by prefix. Repeatable.
     #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = crate::parse_static_setting)]
     pub(crate) static_dirs: Vec<(String, String)>,
 
