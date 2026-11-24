@@ -209,6 +209,14 @@ pub struct DetourRunArgs {
     #[arg(long)]
     no_toolbar: bool,
 
+    /// Trace the run with wrapture, over the settings files' tracing.
+    #[arg(long, conflicts_with = "no_tracing")]
+    tracing: bool,
+
+    /// No tracing for the run, whatever the settings say.
+    #[arg(long)]
+    no_tracing: bool,
+
     /// The address of the run's own dashboard, or off (default: a free
     /// loopback port).
     #[arg(long, value_name = "ADDRESS")]
@@ -297,6 +305,8 @@ impl DetourRunArgs {
             ("no-reload", self.no_reload),
             ("toolbar", self.toolbar),
             ("no-toolbar", self.no_toolbar),
+            ("tracing", self.tracing),
+            ("no-tracing", self.no_tracing),
             ("print-config", self.print_config),
         ] {
             if on {

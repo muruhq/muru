@@ -745,6 +745,15 @@ struct RunArgs {
     #[arg(long)]
     no_timestamps: bool,
 
+    /// Trace this run with wrapture, with the configuration wrapture
+    /// finds itself, over the settings files' tracing.
+    #[arg(long, conflicts_with = "no_tracing")]
+    tracing: bool,
+
+    /// No tracing for this run, over settings files that turn it on.
+    #[arg(long)]
+    no_tracing: bool,
+
     /// Serve an address other than loopback. Development behaviours are
     /// then off (no tracebacks in error pages, the 10MB body limit, no
     /// dashboard unless asked for), but this is still not the supported
@@ -2174,8 +2183,8 @@ struct Resolved {
     /// The instrumentation modules (section 6.15): muru.local.toml's,
     /// then the table's.
     instrumentation: Vec<muru_config::Instrumentation>,
-    /// `tracing` (section 11.6) as written: muru.local.toml's, else the
-    /// table's.
+    /// `tracing` (section 11.6) as written: a flag's, else
+    /// muru.local.toml's, else a run table's, else the table's.
     tracing: Option<muru_config::Tracing>,
     /// The muru.local.toml `tracing` came from, when it came from one.
     tracing_from_local: Option<PathBuf>,
@@ -2432,11 +2441,24 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     // Section 11.6: tracing is set up by a module of Muru's own, at the
-    // head of the list the host is given. muru.local.toml's tracing takes
-    // the place of the project's, for this machine's runs.
+    // head of the list the host is given. The flags, then muru.local.toml's
+    // tracing, then the run tables (muru.local.toml's over the project's)
+    // take the place of the project's tracing, for runs alone.
 
-    let tracing_from_local = local_tracing.is_some().then(|| local.clone()).flatten();
-    let tracing = local_tracing.or_else(|| table.tracing.clone());
+    let tracing_flag = match (args.tracing, args.no_tracing) {
+        (true, _) => Some(muru_config::Tracing::Enabled(true)),
+        (_, true) => Some(muru_config::Tracing::Enabled(false)),
+        _ => None,
+    };
+
+    let tracing_from_local = (tracing_flag.is_none() && local_tracing.is_some())
+        .then(|| local.clone())
+        .flatten();
+    let tracing = tracing_flag
+        .or(local_tracing)
+        .or_else(|| local_run.tracing.clone())
+        .or_else(|| run_table.tracing.clone())
+        .or_else(|| table.tracing.clone());
 
     let tracing_entry = muru_config::tracing_instrumentation(
         tracing.as_ref(),

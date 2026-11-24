@@ -185,6 +185,10 @@
           "default": false,
           "description": "Whether the edge inserts the development toolbar into the run's HTML pages.",
           "type": "boolean"
+        },
+        "tracing": {
+          "$ref": "#/$defs/Tracing",
+          "description": "Tracing with wrapture for `muructl run`, as a boolean or a table with `config`, in place of the project's `tracing`. The daemon and `muructl serve` take the project's."
         }
       },
       "type": "object"

@@ -310,6 +310,7 @@ The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a muru.toml and i
 | `tls_cert` | string |  | A certificate chain to serve, relative to the project. Not used by a detour. |
 | `tls_key` | string |  | Its private key, relative to the project. Not used by a detour. |
 | `toolbar` | boolean | `false` | Whether the edge inserts the development toolbar into the run's HTML pages. |
+| `tracing` | boolean or table, {ref}`[tool.muru.tracing] <config-project-tool-muru-tracing>` |  | Tracing with wrapture for `muructl run`, as a boolean or a table with `config`, in place of the project's `tracing`. The daemon and `muructl serve` take the project's. |
 
 (config-project-tool-muru-scaling)=
 ## `[tool.muru.scaling]`
@@ -438,6 +439,8 @@ The same keys apply at `[tool.muru.groups.NAME.timeouts]`.
 ## `[tool.muru.tracing]`
 
 Tracing turned on with its settings, in place of `tracing = true`.
+
+The same keys apply at `[tool.muru.run.tracing]`.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |

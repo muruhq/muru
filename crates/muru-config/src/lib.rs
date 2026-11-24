@@ -5998,6 +5998,11 @@ pub struct RunSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub timestamps: Option<bool>,
+    /// Tracing with wrapture for `muructl run`, as a boolean or a table
+    /// with `config`, in place of the project's `tracing`. The daemon and
+    /// `muructl serve` take the project's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracing: Option<Tracing>,
     /// A `.env` file whose variables the run starts with, relative to the
     /// project. Its values override `[tool.muru.env]`. None is read unless
     /// this names one.
@@ -6048,6 +6053,7 @@ impl RunSettings {
             compression: over.compression.or(self.compression),
             toolbar: over.toolbar.or(self.toolbar),
             timestamps: over.timestamps.or(self.timestamps),
+            tracing: over.tracing.clone().or_else(|| self.tracing.clone()),
             env_file: over.env_file.clone().or_else(|| self.env_file.clone()),
             data_dir: over.data_dir.clone().or_else(|| self.data_dir.clone()),
         }
@@ -8006,6 +8012,31 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(error.starts_with("tracing: "), "{error}");
 
         assert_eq!(parse_local("", None).unwrap().tracing, None);
+    }
+
+    #[test]
+    fn the_run_table_takes_tracing_and_the_local_run_table_wins() {
+        let table = parse_muru_toml("[run]\ntracing = true\n").unwrap();
+        let run = table.run.unwrap();
+        assert_eq!(run.tracing, Some(Tracing::Enabled(true)));
+
+        let table = parse_muru_toml("[run.tracing]\nconfig = 'dev.toml'\n").unwrap();
+        assert_eq!(
+            table.run.unwrap().tracing,
+            Some(Tracing::Settings(TracingSettings {
+                config: Some("dev.toml".to_owned())
+            }))
+        );
+
+        let off = RunSettings {
+            tracing: Some(Tracing::Enabled(false)),
+            ..RunSettings::default()
+        };
+        assert_eq!(run.layered(&off).tracing, Some(Tracing::Enabled(false)));
+        assert_eq!(
+            run.layered(&RunSettings::default()).tracing,
+            Some(Tracing::Enabled(true))
+        );
     }
 
     #[test]

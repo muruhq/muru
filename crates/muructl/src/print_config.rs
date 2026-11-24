@@ -415,13 +415,18 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
         ));
     }
 
-    // Section 11.6: tracing, from muru.local.toml or the project, and the
-    // entrypoint's request middleware.
+    // Section 11.6: tracing, from a flag, muru.local.toml, the run table
+    // or the project, and the entrypoint's request middleware.
 
     if let Some(tracing) = &resolved.tracing {
         let source = match &resolved.tracing_from_local {
+            _ if args.tracing || args.no_tracing => COMMAND_LINE.to_owned(),
             Some(path) => path.display().to_string(),
-            None => project.clone(),
+            None => match &local {
+                Some(local) if has(&layers.local, "tracing") => local.clone(),
+                _ if has(&layers.run, "tracing") => run_table.clone(),
+                _ => project.clone(),
+            },
         };
 
         top.push(Row::new("tracing", tracing, source));
