@@ -98,6 +98,19 @@ pub struct TrafficArgs {
     #[arg(value_name = "[DETOUR] CHOICE", num_args = 1..=2, required = true)]
     words: Vec<String>,
 
+    /// Go back to preview on its own after this long, for example 10m.
+    #[arg(long = "for", value_name = "DURATION", value_parser = muru_config::parse_duration, conflicts_with = "until")]
+    duration: Option<Duration>,
+
+    /// Go back to preview on its own at this time, such as
+    /// 2026-11-02T09:00 or an RFC 3339 time.
+    #[arg(long, value_name = "TIME")]
+    until: Option<String>,
+
+    /// The time zone --until is in; the local zone without it.
+    #[arg(long, value_name = "ZONE", requires = "until")]
+    timezone: Option<String>,
+
     #[command(flatten)]
     output: crate::admin::JsonArgs,
 
@@ -432,7 +445,7 @@ fn table(detours: &[pb::Detour]) -> Vec<String> {
                     detour.label.clone()
                 },
                 detour.pid.to_string(),
-                detour.traffic.clone(),
+                muru_controller::detours::traffic_text(&detour.traffic, detour.until_unix_ms),
                 crate::instances::uptime(u64::try_from(detour.opened_unix_ms).unwrap_or_default()),
                 muru_controller::registry::home_shortened(Path::new(&detour.directory)),
             ]
@@ -486,7 +499,26 @@ pub async fn traffic(args: TrafficArgs) -> anyhow::Result<()> {
         _ => anyhow::bail!("give the detour's traffic, as muructl detour traffic [DETOUR] all"),
     };
 
-    muru_controller::detours::Traffic::parse(&choice).map_err(anyhow::Error::msg)?;
+    let traffic = muru_controller::detours::Traffic::parse(&choice).map_err(anyhow::Error::msg)?;
+
+    // A timed choice goes back to preview, so preview itself takes no
+    // time.
+
+    let until = match (args.duration, &args.until) {
+        (Some(duration), _) => {
+            crate::admin::now_unix_ms().saturating_add(duration.as_millis() as u64)
+        }
+        (None, Some(text)) => muru_config::parse_moment(text, args.timezone.as_deref())
+            .map_err(anyhow::Error::msg)?
+            .max(0) as u64,
+        (None, None) => 0,
+    };
+
+    if until != 0 && traffic == muru_controller::detours::Traffic::Preview {
+        anyhow::bail!(
+            "a detour goes back to preview when --for or --until ends, so preview takes neither"
+        );
+    }
 
     let mut client = muru_controller::client::connect(&args.socket.endpoint()?).await?;
     let detours = listed(&mut client).await?;
@@ -498,6 +530,7 @@ pub async fn traffic(args: TrafficArgs) -> anyhow::Result<()> {
             app: detour.app.clone(),
             release: detour.release.clone(),
             traffic: choice,
+            until_unix_ms: until,
         })
         .await
         .map_err(crate::admin::explain)?
@@ -508,12 +541,26 @@ pub async fn traffic(args: TrafficArgs) -> anyhow::Result<()> {
     }
 
     muru_common::muru_println!(
-        "detour {}@{} now takes {} (was {before})",
+        "detour {}@{} now takes {}{} (was {before})",
         after.app,
         after.release,
-        takes(&after.traffic, &after.app)
+        takes(&after.traffic, &after.app),
+        ending(after.until_unix_ms)
     );
     Ok(())
+}
+
+/// When a timed choice ends, as a line says it after what the detour
+/// takes; nothing for one that lasts until changed.
+pub fn ending(until_unix_ms: u64) -> String {
+    if until_unix_ms == 0 {
+        String::new()
+    } else {
+        format!(
+            ", until {}, then previews only",
+            crate::admin::format_time(until_unix_ms)
+        )
+    }
 }
 
 /// Ask the daemon for entry links to a detour's preview.
@@ -718,10 +765,11 @@ pub fn hold(
                     }) => {
                         links.set_detour(Some(detour.traffic.clone()));
                         muru_common::muru_println!(
-                            "detour {}@{} now takes {}",
+                            "detour {}@{} now takes {}{}",
                             detour.app,
                             detour.release,
-                            takes(&detour.traffic, &detour.app)
+                            takes(&detour.traffic, &detour.app),
+                            ending(detour.until_unix_ms)
                         );
                     }
                     Ok(pb::DetourMessage {

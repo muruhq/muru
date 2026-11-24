@@ -186,7 +186,8 @@ service Admin {
   rpc OpenDetour(OpenDetourRequest) returns (stream DetourMessage);
   // The open detours, never a secret.
   rpc ListDetours(ListDetoursRequest) returns (ListDetoursResponse);
-  // Change what a detour takes: preview, all, share=N or class=NAME.
+  // Change what a detour takes: preview, all, share=N or class=NAME,
+  // until changed or until a time, when it takes preview again.
   rpc SetDetourTraffic(SetDetourTrafficRequest) returns (Detour);
   // One-time entry links to a detour's preview, valid for a minute, and
   // the Muru-Preview header value.
@@ -221,6 +222,9 @@ message SetDetourTrafficRequest {
   string app = 1;
   string release = 2;
   string traffic = 3;
+  // When the choice ends and the detour takes preview again; never when
+  // 0. Refused with preview, which has nothing to end.
+  uint64 until_unix_ms = 4;
 }
 
 // A development run asking to put itself behind the daemon's edge.
@@ -279,6 +283,8 @@ message Detour {
   int64 opened_unix_ms = 8;
   // The run's socket.
   string socket = 9;
+  // When its traffic goes back to preview on its own; 0 for never.
+  uint64 until_unix_ms = 10;
 }
 
 // A probe's question (section 13.9): live, ready or startup, of the

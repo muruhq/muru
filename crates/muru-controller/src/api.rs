@@ -127,7 +127,10 @@ fn detour_release(detour: pb::Detour) -> pb::Release {
         ),
         source: detour.directory.clone(),
         kind: "detour".to_owned(),
-        traffic: format!("detour, {}", detour.traffic),
+        traffic: format!(
+            "detour, {}",
+            crate::detours::traffic_text(&detour.traffic, detour.until_unix_ms)
+        ),
         created_unix_ms: u64::try_from(detour.opened_unix_ms).unwrap_or_default(),
         detour: Some(detour),
         ..Default::default()
@@ -2191,6 +2194,7 @@ impl Admin for Service {
                 app: request.app,
                 release: request.release,
                 traffic,
+                until_unix_ms: request.until_unix_ms,
                 done: done_tx,
             })
             .await

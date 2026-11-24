@@ -331,6 +331,42 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         assert served(daemon, **preview)["instance"].startswith("detour:")
         assert "detour:detoured" not in daemon.muructl("overlay", "list").stdout
 
+        # A timed choice goes back to preview on its own, and preview
+        # takes no time.
+
+        reverted = detour.log().count("now takes previews only") + 1
+        refused = daemon.muructl(
+            "detour", "traffic", "preview", "--for", "1m", cwd=project, check=False
+        )
+        assert refused.returncode != 0 and "preview takes neither" in refused.stderr
+        timed = daemon.muructl("detour", "traffic", "all", "--for", "2s", "--json", cwd=project)
+        assert json.loads(timed.stdout)["until_unix_ms"] > 0
+        assert served(daemon)["instance"].startswith("detour:")
+        assert " until " in daemon.muructl("detour", "list").stdout
+        deadline = time.monotonic() + 15
+
+        while served(daemon)["instance"].startswith("detour:") and time.monotonic() < deadline:
+            time.sleep(0.2)
+
+        assert not served(daemon)["instance"].startswith("detour:")
+        listed = json.loads(daemon.muructl("detour", "list", "--json").stdout)["detours"]
+        assert [(found["traffic"], found.get("until_unix_ms", 0)) for found in listed] == [
+            ("preview", 0)
+        ]
+        assert "the time it was set for is over" in daemon.muructl("events").stdout
+
+        # The run heard of both changes.
+
+        detour.wait_for_log("now takes all of detoured's traffic, until ")
+        deadline = time.monotonic() + 10
+
+        while (
+            detour.log().count("now takes previews only") < reverted and time.monotonic() < deadline
+        ):
+            time.sleep(0.1)
+
+        assert detour.log().count("now takes previews only") >= reverted, detour.log()
+
         # The detour ends with its run, and the daemon's traffic is back on
         # the serving release at once.
 

@@ -173,6 +173,24 @@ choice.
 under way, and `all` is refused while another detour of the application
 takes all of it.
 
+`--for` or `--until` makes a choice last a while and then go back to
+preview on its own, so a detour is not left taking real traffic:
+
+```console
+$ muructl detour traffic share=10 --for 10m
+muru: detour shop@dev-7f3a now takes 10% of shop's clients, until 2026-11-24T03:15:00Z, then previews only (was preview)
+```
+
+`--until` takes a time such as `2026-11-24T14:00`, in the local time zone
+or the one `--timezone` names, or an RFC 3339 time. The detour goes back
+to preview whatever the choice before was, and the run says so in its
+terminal and its toolbar. Another `detour traffic` replaces the choice
+and its time; without `--for` the new one lasts until changed. Preview
+takes neither option. `detour list` and `release list` show when a
+timed choice ends, and a timed choice does not survive the daemon
+restarting, since the run opens its detour again with its own
+`--traffic`.
+
 ## What the daemon leaves to the run
 
 The daemon's edge treats a detour as an upstream that a person is
