@@ -88,6 +88,8 @@ $ muructl release show shop@r9 --json
 | `muructl overlay activate` | The outcome: `message` |
 | `muructl overlay end` | The outcome: `message` |
 | `muructl overlay promote` | The outcome: `message`, and `files`, the TOML blocks the applied files need for the next apply to keep the promotion |
+| `muructl proto list` | `{"version": ..., "files": [...]}`, each file with `path` beneath the export directory, `package` and `services` |
+| `muructl proto status` | How the `.proto` files beneath the directory compare with this muructl's: `dir`, `state` (`current`, `missing`, `out_of_date`, `edited` or `edited_out_of_date`), `edited`, `version`, `installed_version`, and `files`, each with `name`, `path`, `state` and `installed_version` |
 | `muructl maintenance on` | `app`, or `host` with `--host`, `on` and `since_unix_ms` |
 | `muructl maintenance off` | `app`, or `host` with `--host`, `on` and `since_unix_ms` (0) |
 | `muructl dashboard login` | The sign-in link: `url`, `code`, `expires_in_s`, and with `--token` the `token` |

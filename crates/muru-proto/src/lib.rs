@@ -42,6 +42,22 @@ pub mod admin {
     }
 }
 
+/// The protocol definitions given out to clients of the admin API that
+/// are not part of Muru (section 20.11, `muructl proto`): `muru.admin.v1`
+/// and whatever it imports, never the worker or edge protocols, which are
+/// Muru's own.
+pub mod public {
+    /// Each file as the binary was built from it, by its path beneath the
+    /// include directory, so that `protoc -I DIR` resolves the imports.
+    pub const FILES: &[(&str, &str)] = &[(
+        "muru/admin/v1/admin.proto",
+        include_str!("../../../proto/muru/admin/v1/admin.proto"),
+    )];
+
+    /// A `FileDescriptorSet` of the files, with their imports included.
+    pub const DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/public.protoset"));
+}
+
 /// The edge control protocol, package `muru.edge.v1`, between the daemon
 /// and its edge processes.
 pub mod edge {

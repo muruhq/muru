@@ -24,6 +24,7 @@ mod places;
 mod print_config;
 mod processes;
 mod project_commands;
+mod proto;
 mod provision;
 mod pstats;
 mod render;
@@ -338,6 +339,14 @@ enum Command {
     Mcp {
         #[command(subcommand)]
         command: mcp::McpCommand,
+    },
+
+    /// The admin API's .proto files this muructl was built from, for a
+    /// client that generates its own stubs: write them out, check a copy,
+    /// print or list them.
+    Proto {
+        #[command(subcommand)]
+        command: proto::ProtoCommand,
     },
 
     /// Serve a directory of files with no configuration,
@@ -1494,6 +1503,7 @@ fn main() -> anyhow::Result<()> {
         Command::Websockets(args) => runtime.block_on(admin::websockets(args)),
         Command::Requests(args) => runtime.block_on(admin::requests(args)),
         Command::Mcp { command } => runtime.block_on(mcp::run(command)),
+        Command::Proto { command } => proto::run(command),
         Command::Exec(args) => exit_with(runtime, admin::exec(args)),
         Command::Commands {
             command: admin::CommandCommand::List(args),
