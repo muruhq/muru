@@ -125,7 +125,7 @@ def test_what_the_workers_leave_running_goes_with_the_host(tmp_path: Path) -> No
             for entry in Path(f"/proc/{child}/environ").read_text().split("\0")
             if "=" in entry
         )
-        assert environ["MURU_INSTANCE"] == f"run:{server.port}", environ
+        assert environ["MURU_INSTANCE_TAG"] == f"run:{server.port}", environ
         assert len(environ["MURU_INSTANCE_ID"]) == 32, environ
     finally:
         # Stopping the server stops the worker, whose child comes to the

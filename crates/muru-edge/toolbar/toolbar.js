@@ -17,6 +17,11 @@
 
   const id = script.dataset.request;
   const dashboard = script.dataset.dashboard;
+
+  // Section 13.12: a detour's run says what its detour takes, which the
+  // badge shows, with a way out of preview.
+
+  const detour = script.dataset.detour;
   const nonce = script.nonce;
   const base = script.src.replace(/toolbar\.js(\?.*)?$/, "");
   const prefixPath = new URL(base, location.href).pathname;
@@ -112,6 +117,10 @@
   const summary = (found) => {
     badge.replaceChildren(element("span", "name", "muru"));
 
+    if (detour) {
+      badge.append(element("span", "detour", `detour: ${detour}`));
+    }
+
     if (!found) {
       badge.append(element("span", "muted", "record no longer kept"));
       return;
@@ -192,6 +201,12 @@
       link.target = "_blank";
       link.rel = "noopener";
       footer.append(link);
+    }
+
+    if (detour) {
+      const leave = element("a", "", "leave preview");
+      leave.href = "/_muru/preview/leave";
+      footer.append(leave);
     }
   };
 
@@ -331,12 +346,12 @@
   };
 
   // A link inside a panel to a record's panel, as the panels write it
-  // under /_muru/ whatever prefix a proxy serves the run under: the shown
+  // under /_muru/toolbar/ whatever prefix a proxy serves the run under: the shown
   // record's reloads in place, for sorting and paging, and another's
   // opens that record, as a capture's links to the other requests it
   // reached do. Any other link goes where it says.
 
-  const PANEL_LINK = /\/_muru\/requests\/([^/]+)\/panels\/([^/]+)\.html$/;
+  const PANEL_LINK = /\/_muru\/toolbar\/requests\/([^/]+)\/panels\/([^/]+)\.html$/;
 
   content.addEventListener("click", (event) => {
     const link = event.target.closest && event.target.closest("a[href]");

@@ -325,9 +325,13 @@ fn read(term: &Comparison, samples: &[Sample], figures: &Figures) -> Reading {
 
     match term.signal.kind {
         Kind::Rate | Kind::Share => {
+            // Section 9.13: a detour's requests are a developer's, not
+            // the application's, and count for nothing here.
+
             let in_scope: Vec<&Sample> = samples
                 .iter()
                 .filter(|sample| sample.name == "muru_requests_total")
+                .filter(|sample| !sample.of_a_detour())
                 .filter(|sample| matches(sample, term, SCOPE_LABELS))
                 .collect();
 
@@ -364,6 +368,7 @@ fn read(term: &Comparison, samples: &[Sample], figures: &Figures) -> Reading {
             let phase = term.label("phase").unwrap_or("total");
             let in_scope = |sample: &&Sample, suffix: &str| {
                 sample.name == format!("muru_request_duration_seconds{suffix}")
+                    && !sample.of_a_detour()
                     && matches(sample, term, SCOPE_LABELS)
                     && sample
                         .labels
@@ -838,6 +843,39 @@ mod tests {
             events[0].contains("condition.resolved resolved, clear for 3s"),
             "{events:?}"
         );
+        assert_eq!(state(&engine), State::Resolved);
+    }
+
+    #[test]
+    fn a_detours_requests_count_for_nothing() {
+        let mut engine = engine("when = \"error_rate{app='shop'}[10s] > 0.2\"\nmin_requests = 10");
+        let detour = |count: f64| {
+            let mut sample = requests("shop", "5xx", "app_error", count);
+            sample.labels = sample
+                .labels
+                .into_iter()
+                .map(|(label, value)| match label.as_str() {
+                    "group" => (label, muru_edge::metrics::DETOUR_GROUP.to_owned()),
+                    "release" => (label, "dev-7f3a".to_owned()),
+                    _ => (label, value),
+                })
+                .collect();
+            sample
+        };
+
+        // Every request of the detour fails, and the application's own
+        // are well: the error rate is the application's.
+
+        for second in 0..15u64 {
+            let count = (second + 1) as f64 * 10.0;
+            let samples = [requests("shop", "2xx", "", count), detour(count)];
+            assert!(
+                engine
+                    .observe(second * 1000, &samples, &Figures::default())
+                    .is_empty()
+            );
+        }
+
         assert_eq!(state(&engine), State::Resolved);
     }
 

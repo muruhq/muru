@@ -848,6 +848,11 @@ fn plan_app(
             continue;
         }
 
+        if let Some(refusal) = crate::detours::reserved_release(id) {
+            plan.errors.push(format!("{name}@{id}: {refusal}"));
+            continue;
+        }
+
         if let Err(error) = muru_config::check_release_kind(table) {
             plan.errors.push(format!("{name}@{id}: {error}"));
             continue;

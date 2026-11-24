@@ -12,6 +12,7 @@ dependencies = []
 [dependency-groups]
 dev = [
     "brotli>=1.2.1",
+    "h2>=4.1",
     "maturin>=1.8,<2",
     "mypy>=1.14",
     "nox>=2025.2.9",

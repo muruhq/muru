@@ -48,7 +48,7 @@ def kill_capture(server: support.Server, request_id: str) -> dict[str, Any]:
     deadline = time.monotonic() + 15
 
     while True:
-        found = json.loads(server.get(f"/_muru/requests/{request_id}.json").body)
+        found = json.loads(server.get(f"/_muru/toolbar/requests/{request_id}.json").body)
         kills = [c for c in found.get("captures", []) if c["kind"] == "worker.timeout_killed"]
 
         if kills:

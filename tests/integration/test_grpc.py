@@ -13,11 +13,13 @@ from __future__ import annotations
 import base64
 import http.client
 import os
+import queue
 import shutil
 import struct
 import subprocess
 import sys
 from collections.abc import Iterator
+from concurrent import futures
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -366,10 +368,31 @@ def test_a_cancelled_stream_frees_its_worker(service: Service) -> None:
     assert stub.SayHello(pb.Hello(name="after"), timeout=10).message == "Hello after"
 
 
-def test_the_daemon_serves_a_grpc_mount_from_an_applied_file(
+def relayed_server(service: Service) -> tuple[Any, int]:
+    """A grpcio server of the test's own, whose Chat answers each message
+    as it arrives, for an h2c upstream to reach."""
+
+    class Greeter(service.rpc.GreeterServicer):
+        def SayHello(self, request: Any, context: Any) -> Any:
+            return service.pb.Reply(message=f"Upstream {request.name}")
+
+        def Chat(self, requests: Iterator[Any], context: Any) -> Iterator[Any]:
+            for request in requests:
+                yield service.pb.Reply(message=f"upstream:{request.name}")
+
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+    service.rpc.add_GreeterServicer_to_server(Greeter(), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    return server, port
+
+
+def test_the_daemon_serves_a_grpc_mount_and_relays_to_a_grpc_upstream(
     service: Service, tmp_path: Path
 ) -> None:
-    daemon = start_daemon(tmp_path)
+    relay_port = support.free_port()
+    daemon = start_daemon(tmp_path, listeners=[(support.free_port(), False), (relay_port, False)])
+    upstream, upstream_port = relayed_server(service)
 
     try:
         config = tmp_path / "svc.toml"
@@ -395,6 +418,20 @@ name = 'root'
 host = 'site'
 path = '/'
 app = 'svc'
+
+[upstream.grpcio]
+addresses = ['127.0.0.1:{upstream_port}']
+protocol = 'h2c'
+
+[host.relay]
+names = ['relay.test']
+listeners = ['127.0.0.1:{relay_port}']
+
+[[route]]
+name = 'relayed'
+host = 'relay'
+path = '/'
+upstream = 'grpcio'
 """
 
         # A gRPC mount is matched by service name, so a path is refused.
@@ -415,5 +452,29 @@ app = 'svc'
         exported = daemon.muructl("config", "export").stdout
         assert "reflection = true" in exported
         assert 'interface = "grpc"' in exported
+
+        # A grpcio server behind an h2c upstream gets the call as the
+        # client made it, with te: trailers, which grpcio requires, and a
+        # client stream that streams: each message of a chat is answered
+        # before the next is sent.
+
+        channel = grpc.insecure_channel(
+            f"127.0.0.1:{relay_port}", options=(("grpc.default_authority", "relay.test"),)
+        )
+        relayed = service.rpc.GreeterStub(channel)
+        assert relayed.SayHello(service.pb.Hello(name="relay"), timeout=10).message == (
+            "Upstream relay"
+        )
+
+        sending: queue.Queue[Any] = queue.Queue()
+        chat = relayed.Chat(iter(sending.get, None), timeout=10)
+
+        for name in ("x", "y"):
+            sending.put(service.pb.Hello(name=name))
+            assert next(chat).message == f"upstream:{name}"
+
+        sending.put(None)
+        assert list(chat) == []
     finally:
         daemon.stop()
+        upstream.stop(None)

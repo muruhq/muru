@@ -276,7 +276,7 @@ fn joined(base: &str, under: Option<&str>) -> String {
 
 /// The application a project's directory deploys as: its `[project]`
 /// name, else the top-level module of its `[tool.muru]` entrypoint.
-fn project_app(directory: &Path) -> Option<String> {
+pub(crate) fn project_app(directory: &Path) -> Option<String> {
     let text = std::fs::read_to_string(directory.join("pyproject.toml")).ok();
     let name = text.as_deref().and_then(|text| {
         let file: toml::Table = text.parse().ok()?;
@@ -529,6 +529,7 @@ fn describe(record: &Record) -> String {
 
     match record.kind {
         Kind::Serve => format!("muructl serve of {app}"),
+        Kind::Detour => format!("detour of {app}"),
         _ => format!("development run of {app}"),
     }
 }

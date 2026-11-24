@@ -44,7 +44,25 @@ service EdgeControl {
   // they are open, so a rotation's postrotate knows the renamed files are
   // complete.
   rpc ReopenLogs(ReopenLogsRequest) returns (LogsReopened);
+  // Section 4.21: keep one-time entry tokens to detours' previews, by
+  // their hashes, until they expire.
+  rpc AddPreviewTokens(PreviewTokens) returns (PreviewTokensAdded);
 }
+
+message PreviewTokens {
+  repeated PreviewToken tokens = 1;
+}
+
+// An entry token as the edge keeps it: never the token itself.
+message PreviewToken {
+  bytes sha256 = 1;                     // the token's SHA-256
+  string app = 2;
+  string release = 3;                   // the detour's
+  string path = 4;                      // where it redirects, on the host it is used on
+  uint64 ttl_ms = 5;                    // how long it lasts
+}
+
+message PreviewTokensAdded {}
 
 message ReopenLogsRequest {}
 
@@ -75,6 +93,7 @@ message Snapshot {
   repeated ListenerLimits listener_limits = 20; // section 4.18: listeners' own limits, over the snapshot's; read only with limits
   repeated ListenerProxy listener_proxies = 21; // section 4.7: listeners' own trusted proxies, in place of proxy for their connections
   bool no_host = 22;                    // sections 4.3 and 4.5: several applications serve and no host chooses; every request is 421
+  bool detours = 23;                    // section 4.21: the daemon takes detours, so /_muru/preview/ is the edge's
 }
 
 // Section 11.2: which access records are written, where the edge was
@@ -227,6 +246,7 @@ message Upstream {
   uint64 eject_for_ms = 12;             // how long it is set aside; 30000 when 0
   repeated string sendfile_roots = 13;  // section 4.9: directories an X-Muru-Sendfile path must lie in, when trusted
   string sendfile_header = 14;          // a second header honoured as X-Muru-Sendfile is, such as X-Sendfile; none when empty
+  bool detour = 15;                     // section 4.21: a detour's run, reached over h2c for gRPC and http1 otherwise, whatever protocol says
 }
 
 // How an upstream's addresses are probed.
@@ -438,6 +458,7 @@ message AppWorkers {
   reserved 18;
   AccessLogChoice access_log = 19;      // section 11.2: the application's own access log choice; none when absent
   RequestLimits limits = 20;            // section 4.6: the release's own limits on a request, over its host's; none when absent
+  string preview_secret = 21;           // section 4.21: a detour's secret, which a preview must carry as RELEASE.SECRET; empty for any other release
 }
 
 // Section 4.9: a directory of a release's own files, served by the edge

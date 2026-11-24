@@ -183,11 +183,22 @@ impl Server {
             .is_ok_and(|status| status.success())
     }
 
-    /// Run a muructl command with --json and turn what it printed into a
-    /// tool result: the JSON on success, the error's sentence on failure.
-    async fn command(&self, mut command: Vec<String>) -> CallToolResult {
+    /// The options that reach the instance a tool call names in its
+    /// `instance` argument (issue 868), or else the one the server was
+    /// started for.
+    fn connect_for(&self, arguments: &JsonObject) -> Vec<String> {
+        match text(arguments, INSTANCE_ARGUMENT) {
+            Some(instance) => vec!["--instance".to_owned(), instance],
+            None => self.connect.to_vec(),
+        }
+    }
+
+    /// Run a muructl command with --json, reaching the instance `connect`
+    /// names, and turn what it printed into a tool result: the JSON on
+    /// success, the error's sentence on failure.
+    async fn command(&self, mut command: Vec<String>, connect: &[String]) -> CallToolResult {
         command.push("--json".to_owned());
-        command.extend(self.connect.iter().cloned());
+        command.extend(connect.iter().cloned());
 
         let output = match tokio::process::Command::new(&self.muructl)
             .args(&command)
@@ -262,7 +273,12 @@ impl Server {
         };
 
         if !given.is_empty() {
-            let listed = self.command(words(&["command", "list", &command[2]])).await;
+            let listed = self
+                .command(
+                    words(&["command", "list", &command[2]]),
+                    &self.connect_for(arguments),
+                )
+                .await;
             let declared = listed
                 .content
                 .first()
@@ -294,7 +310,7 @@ impl Server {
 
         let mut command = command;
         command.push("--json".to_owned());
-        command.extend(self.connect.iter().cloned());
+        command.extend(self.connect_for(arguments));
 
         let output = match tokio::process::Command::new(&self.muructl)
             .args(&command)
@@ -339,17 +355,21 @@ impl Server {
 
         match self.connect.iter().position(|word| word == "--instance") {
             Some(at) => text.push_str(&format!(
-                "\n\nThe tools reach the named instance {}. To work with another, the server \
-                 is started with --instance NAME, or muru.local.toml in the project names one \
-                 with instance = \"NAME\".",
+                "\n\nThe tools reach the instance {} unless a call names another in its \
+                 instance argument.",
                 self.connect.get(at + 1).map_or("", String::as_str)
             )),
             None => text.push_str(
-                "\n\nWith several daemons on the machine, each a named instance, the server is \
-                 started with --instance NAME, or muru.local.toml in the project names one with \
-                 instance = \"NAME\", and every tool reaches that instance; `instances` lists them.",
+                "\n\nThe tools reach the instance discovery finds, a development run of the \
+                 project or the default daemon, unless a call names another in its instance \
+                 argument.",
             ),
         }
+
+        text.push_str(
+            " `instances` lists every instance on the machine; a call's instance is the NAME it \
+             shows, the start of the instance's ID, its label or its application.",
+        );
 
         // A project whose skill is missing or older than this muructl's
         // hears about it once, with the command that fixes it.
@@ -444,7 +464,7 @@ impl ServerHandler for Server {
             },
             _ => match (spec.command)(&arguments) {
                 Ok(command) => {
-                    let result = self.command(command).await;
+                    let result = self.command(command, &self.connect_for(&arguments)).await;
                     finish(spec.name, &arguments, result)
                 }
                 Err(message) => failure(message),
@@ -454,6 +474,14 @@ impl ServerHandler for Server {
         Ok(result.into())
     }
 }
+
+/// The argument of every tool that reaches an instance that names the
+/// instance, as `--instance` takes it.
+const INSTANCE_ARGUMENT: &str = "instance";
+
+/// The tools that work on this machine or on nothing, and so reach no
+/// instance and take no instance argument.
+const LOCAL_TOOLS: [&str; 3] = ["docs", "skill_status", "instances"];
 
 /// A tool: what the agent sees, and the muructl command it runs.
 struct Spec {
@@ -474,8 +502,22 @@ impl Spec {
     /// whether it reads or changes things.
     fn tool(&self) -> Tool {
         let mut schema = JsonObject::new();
+        let mut properties = self.properties.clone();
+
+        if !LOCAL_TOOLS.contains(&self.name)
+            && let Some(properties) = properties.as_object_mut()
+        {
+            properties.insert(
+                INSTANCE_ARGUMENT.to_owned(),
+                json!({
+                    "type": "string",
+                    "description": "The instance to reach instead of the server's own: its NAME as instances shows it, the start of its ID, its label or its application",
+                }),
+            );
+        }
+
         schema.insert("type".to_owned(), json!("object"));
-        schema.insert("properties".to_owned(), self.properties.clone());
+        schema.insert("properties".to_owned(), properties);
 
         if !self.required.is_empty() {
             schema.insert("required".to_owned(), json!(self.required));
@@ -1141,6 +1183,60 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "detours",
+            description: "The daemon's detours, development runs it routes to as releases of an application while they run: list them, or give a one-time entry link to one's preview (link), valid for a minute, which a browser follows to get the preview cookie, with the Muru-Preview header value (header) for a client that sends headers instead.",
+            changes: false,
+            properties: json!({
+                "action": {"type": "string", "enum": ["list", "link"]},
+                "detour": {"type": "string", "description": "For link: the detour, by its release, application, label, tag or the start of its ID; the project's application's, or the one open, when left out"},
+                "host": {"type": "string", "description": "For link: one of the application's hosts, in place of its best address"},
+            }),
+            required: &["action"],
+            command: |arguments| match needed(arguments, "action")?.as_str() {
+                "list" => Ok(words(&["detour", "list"])),
+                "link" => {
+                    let mut command = words(&["detour", "preview", "--print"]);
+
+                    if let Some(detour) = text(arguments, "detour") {
+                        command.push(detour);
+                    }
+
+                    if let Some(host) = text(arguments, "host") {
+                        command.extend(["--host".to_owned(), host]);
+                    }
+
+                    Ok(command)
+                }
+                other => Err(format!("{other:?} is not list or link")),
+            },
+        },
+        Spec {
+            name: "detour_traffic",
+            description: "Change what a detour takes: preview (only browsers with its preview cookie), all (every request for its application), share=N (N percent of its clients) or class=NAME (a client class the daemon defines), until changed or, with for, for that long, when it goes back to preview on its own. Anything but preview is an overlay the detour owns, which ends with it.",
+            changes: true,
+            properties: json!({
+                "detour": {"type": "string", "description": "The detour, by its release, application, label, tag or the start of its ID; the project's application's, or the one open, when left out"},
+                "traffic": {"type": "string", "description": "preview, all, share=N or class=NAME"},
+                "for": {"type": "string", "description": "How long the choice lasts before the detour takes preview again, such as 10m; until changed when left out. Not with preview"},
+            }),
+            required: &["traffic"],
+            command: |arguments| {
+                let mut command = words(&["detour", "traffic"]);
+
+                if let Some(detour) = text(arguments, "detour") {
+                    command.push(detour);
+                }
+
+                command.push(needed(arguments, "traffic")?);
+
+                if let Some(duration) = text(arguments, "for") {
+                    command.extend(["--for".to_owned(), duration]);
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "overlay_preview",
             description: "What activating an overlay now would change, without activating it.",
             changes: false,
@@ -1793,6 +1889,42 @@ mod tests {
         assert_eq!(
             command("list", json!({"what": "releases", "app": "shop"})),
             Ok(vec!["release".into(), "list".into(), "shop".into()])
+        );
+        assert_eq!(
+            command("detours", json!({"action": "list"})),
+            Ok(vec!["detour".into(), "list".into()])
+        );
+        assert_eq!(
+            command(
+                "detours",
+                json!({"action": "link", "detour": "feature-x", "host": "shop.localhost"})
+            ),
+            Ok(vec![
+                "detour".into(),
+                "preview".into(),
+                "--print".into(),
+                "feature-x".into(),
+                "--host".into(),
+                "shop.localhost".into()
+            ])
+        );
+        assert_eq!(
+            command("detour_traffic", json!({"traffic": "all"})),
+            Ok(vec!["detour".into(), "traffic".into(), "all".into()])
+        );
+        assert_eq!(
+            command(
+                "detour_traffic",
+                json!({"detour": "shop", "traffic": "share=10", "for": "10m"})
+            ),
+            Ok(vec![
+                "detour".into(),
+                "traffic".into(),
+                "shop".into(),
+                "share=10".into(),
+                "--for".into(),
+                "10m".into()
+            ])
         );
         assert_eq!(
             command(

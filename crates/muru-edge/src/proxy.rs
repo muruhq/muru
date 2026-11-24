@@ -161,6 +161,24 @@ pub struct Resolved {
     pub port: Option<u16>,
     /// The path prefix the proxy stripped, when forwarded.
     pub prefix: Option<String>,
+    /// The request's identifier the proxy gave it, in X-Request-ID, when
+    /// well formed (section 4.19).
+    pub request_id: Option<String>,
+}
+
+/// The longest request identifier a trusted proxy's X-Request-ID may give
+/// (section 4.19).
+const MAX_REQUEST_ID: usize = 200;
+
+/// A trusted proxy's X-Request-ID, when it is 1 to 200 visible ASCII
+/// characters; anything else is passed over and the edge makes its own.
+fn request_id(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get("x-request-id")?.to_str().ok()?.trim();
+
+    (!value.is_empty()
+        && value.len() <= MAX_REQUEST_ID
+        && value.bytes().all(|byte| byte.is_ascii_graphic()))
+    .then(|| value.to_owned())
 }
 
 impl Trust {
@@ -180,6 +198,22 @@ impl Trust {
             recursive: true,
             consume: false,
             headers_only: true,
+        }
+    }
+
+    /// What a detour's run trusts (section 13.12): its one peer, the
+    /// daemon's edge, which reaches it on its Unix socket as loopback,
+    /// for every forwarding header X-Real-IP included, and as a proxy.
+    pub fn detour() -> Self {
+        Self {
+            networks: vec![Network::Loopback],
+            headers: FORWARDING_HEADERS
+                .iter()
+                .map(|header| (*header).to_owned())
+                .collect(),
+            recursive: true,
+            consume: false,
+            headers_only: false,
         }
     }
 
@@ -238,7 +272,10 @@ impl Trust {
         // Each type is read in the configured order, and the first that
         // gives a value wins, so the order of `headers` is the precedence.
 
-        let mut resolved = Resolved::default();
+        let mut resolved = Resolved {
+            request_id: request_id(headers),
+            ..Resolved::default()
+        };
 
         for header in &self.headers {
             match header.as_str() {
@@ -533,6 +570,31 @@ mod tests {
                 ..Default::default()
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_trusted_proxys_request_id_stands_when_it_is_well_formed() {
+        let trust = trust(&["10.0.0.0/8"], &["x-forwarded-for"], true, false);
+        let id = |value: &str, from: &str| {
+            trust
+                .resolve(&peer(from), &mut headers(&[("x-request-id", value)]))
+                .request_id
+        };
+
+        assert_eq!(id("abc-123", "10.0.0.1:4"), Some("abc-123".to_owned()));
+        assert_eq!(id("abc-123", "192.0.2.1:4"), None);
+        assert_eq!(id("two words", "10.0.0.1:4"), None);
+        assert_eq!(id(&"x".repeat(201), "10.0.0.1:4"), None);
+        assert_eq!(
+            id(&"x".repeat(200), "10.0.0.1:4").map(|id| id.len()),
+            Some(200)
+        );
+        assert_eq!(
+            trust
+                .resolve(&peer("10.0.0.1:4"), &mut HeaderMap::new())
+                .request_id,
+            None
         );
     }
 

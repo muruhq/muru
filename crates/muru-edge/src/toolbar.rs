@@ -1,7 +1,8 @@
 //! The development toolbar (design specification section 4.20, ADR
-//! 0062): the reserved prefix `/_muru/`, which the edge answers from the
-//! run's request records, and the `<script>` tag it inserts into HTML
-//! pages when the run asks for the toolbar.
+//! 0062): the reserved prefix `/_muru/`, whose `toolbar/` paths the edge
+//! answers from the run's request records (issue 872), and the
+//! `<script>` tag it inserts into HTML pages when the run asks for the
+//! toolbar.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -29,6 +30,11 @@ use crate::{BoxError, ResponseBody};
 
 /// The prefix the edge answers itself in a development run.
 pub const PREFIX: &str = "/_muru/";
+
+/// The toolbar's paths, under the reserved prefix: its files, the
+/// records and their panels, the summaries and the history. Nothing else
+/// under the prefix is answered yet, and is a 404 from the edge.
+pub const TOOLBAR: &str = "/_muru/toolbar/";
 
 /// The toolbar's script, embedded in the binary, with the script for the
 /// spans tables' tooltips after it (issue 737), which the dashboard serves
@@ -64,10 +70,11 @@ pub fn reserved(path: &str) -> bool {
     path.starts_with(PREFIX)
 }
 
-/// Answer a request under the reserved prefix: the toolbar's files, a
-/// record as JSON, one of its panels drawn, or the summaries of several
-/// records. Only GET and HEAD, only from a loopback host or one of the
-/// run's own names, and never from another site's page.
+/// Answer a request under the reserved prefix: under the toolbar's paths,
+/// its files, a record as JSON, one of its panels drawn, or the summaries
+/// of several records, and anything else not found. Only GET and HEAD,
+/// only from a loopback host or one of the run's own names, and never
+/// from another site's page.
 pub fn answer(
     parts: &http::request::Parts,
     links: &Links,
@@ -78,11 +85,13 @@ pub fn answer(
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served here\n");
     }
 
-    if let Err(why) = allowed(&parts.headers, links.hosts()) {
+    if let Err(why) = allowed(&parts.headers, &links.hosts()) {
         return plain(StatusCode::FORBIDDEN, why);
     }
 
-    let within = parts.uri.path().strip_prefix(PREFIX).unwrap_or("");
+    let Some(within) = parts.uri.path().strip_prefix(TOOLBAR) else {
+        return plain(StatusCode::NOT_FOUND, "not found\n");
+    };
 
     let response = match within {
         "toolbar.js" => content("text/javascript", Bytes::from_static(SCRIPT.as_bytes())),
@@ -570,7 +579,13 @@ fn policy_nonce(headers: &HeaderMap) -> Result<Option<String>, Skip> {
 /// The tag inserted into a page: the script under the prefix a trusted
 /// proxy forwarded, the request it shows, the dashboard's page for it,
 /// and the page's nonce.
-pub fn tag(prefix: &str, request_id: &str, dashboard: Option<&str>, nonce: Option<&str>) -> Bytes {
+pub fn tag(
+    prefix: &str,
+    request_id: &str,
+    dashboard: Option<&str>,
+    nonce: Option<&str>,
+    detour: Option<&str>,
+) -> Bytes {
     let attribute = |text: &str| {
         text.replace('&', "&amp;")
             .replace('"', "&quot;")
@@ -578,7 +593,7 @@ pub fn tag(prefix: &str, request_id: &str, dashboard: Option<&str>, nonce: Optio
     };
 
     let mut tag = format!(
-        "<script src=\"{}{PREFIX}toolbar.js\" data-request=\"{}\"",
+        "<script src=\"{}{TOOLBAR}toolbar.js\" data-request=\"{}\"",
         attribute(prefix.trim_end_matches('/')),
         attribute(request_id)
     );
@@ -589,6 +604,10 @@ pub fn tag(prefix: &str, request_id: &str, dashboard: Option<&str>, nonce: Optio
 
     if let Some(nonce) = nonce {
         tag.push_str(&format!(" nonce=\"{}\"", attribute(nonce)));
+    }
+
+    if let Some(detour) = detour {
+        tag.push_str(&format!(" data-detour=\"{}\"", attribute(detour)));
     }
 
     tag.push_str(" async></script>");
@@ -1055,7 +1074,7 @@ mod tests {
             answer(&parts, &links, &recorder, &Renderer::new(None))
         };
 
-        let response = ask("/_muru/requests?ids=B%2C1,NOSUCH,A,B%2C1");
+        let response = ask("/_muru/toolbar/requests?ids=B%2C1,NOSUCH,A,B%2C1");
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let found: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1077,18 +1096,32 @@ mod tests {
 
         // None named, or too many, is refused.
 
-        assert_eq!(ask("/_muru/requests").status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            ask("/_muru/toolbar/requests").status(),
+            StatusCode::BAD_REQUEST
+        );
         let many = vec!["X"; MAX_BATCH + 1].join(",");
         assert_eq!(
-            ask(&format!("/_muru/requests?ids={many}")).status(),
+            ask(&format!("/_muru/toolbar/requests?ids={many}")).status(),
             StatusCode::OK,
             "the same ID many times is one"
         );
         let many: Vec<String> = (0..=MAX_BATCH).map(|n| n.to_string()).collect();
         assert_eq!(
-            ask(&format!("/_muru/requests?ids={}", many.join(","))).status(),
+            ask(&format!("/_muru/toolbar/requests?ids={}", many.join(","))).status(),
             StatusCode::BAD_REQUEST
         );
+
+        // The prefix outside the toolbar's paths is the edge's, and found
+        // nowhere (issue 872).
+
+        for elsewhere in ["/_muru/toolbar.js", "/_muru/preview/x", "/_muru/"] {
+            assert_eq!(
+                ask(elsewhere).status(),
+                StatusCode::NOT_FOUND,
+                "{elsewhere}"
+            );
+        }
     }
 
     #[test]
@@ -1098,14 +1131,20 @@ mod tests {
                 "/proxy/8080/",
                 "A1",
                 Some("http://127.0.0.1:8081/request/A1"),
-                Some("n\"1")
+                Some("n\"1"),
+                None
             ),
-            "<script src=\"/proxy/8080/_muru/toolbar.js\" data-request=\"A1\" \
+            "<script src=\"/proxy/8080/_muru/toolbar/toolbar.js\" data-request=\"A1\" \
              data-dashboard=\"http://127.0.0.1:8081/request/A1\" nonce=\"n&quot;1\" async></script>"
         );
         assert_eq!(
-            tag("", "A1", None, None),
-            "<script src=\"/_muru/toolbar.js\" data-request=\"A1\" async></script>"
+            tag("", "A1", None, None, None),
+            "<script src=\"/_muru/toolbar/toolbar.js\" data-request=\"A1\" async></script>"
+        );
+        assert_eq!(
+            tag("", "A1", None, None, Some("preview")),
+            "<script src=\"/_muru/toolbar/toolbar.js\" data-request=\"A1\" data-detour=\"preview\" \
+             async></script>"
         );
     }
 

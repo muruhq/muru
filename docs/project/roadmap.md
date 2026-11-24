@@ -146,7 +146,11 @@ taken up between the steps of the major goals, in no fixed order.
   showing what Muru knows about the request behind each page, from the
   edge's queue down to the application's SQL, with the same record on
   the dashboard, in `muructl` and through the MCP server
-  ([#642](https://github.com/muruhq/muru/issues/642)).
+  ([#642](https://github.com/muruhq/muru/issues/642)); and detours, a
+  development run served through a local daemon's routing as a release
+  of the application, preview only until asked for more, with reload,
+  the toolbar and tracebacks kept
+  ([#873](https://github.com/muruhq/muru/issues/873)).
 
 - **Traffic and configuration:** overlays triggered by conditions over
   Muru's own signals
@@ -209,7 +213,7 @@ Ideas recorded for later evaluation, from
 each an issue so that nothing foreseen is lost: among them traffic
 capture and replay, shadow traffic, predictive scaling, resumable
 uploads, sub-interpreters, the PROXY protocol, an admin client for
-applications, ASGI response trailers, and builds without uv.
+applications and ASGI response trailers.
 They are not committed work until taken up.
 
 ## How work is tracked
@@ -219,21 +223,32 @@ Every piece of planned work is a
 repository: bugs, the steps of each major goal, the smaller features and
 the ideas.
 
+- Each open issue carries one status label, which says where it stands:
+  `status:triage` while it waits for the maintainer to decide where it
+  goes, `status:next` once it is picked to be worked on next,
+  `status:in-progress` while it is worked on, `status:backlog` for work
+  accepted but not for now, and `status:icebox` for work kept with no
+  commitment to do it. A closed issue carries none.
+
 - The [project board](https://github.com/users/GrahamDumpleton/projects/1)
   shows every open issue of Muru and of its
   [workshops](https://github.com/muruhq/muru-workshops) with its
-  status (backlog, next, in progress, in review, done), priority, size
-  and goal (one of the major goals, a smaller feature, housekeeping or an
-  idea), and is the place to see what is being worked on and what comes
-  next.
+  status, priority, size and goal (one of the major goals, a smaller
+  feature, housekeeping or an idea). Its status follows the label:
+  triage, backlog and icebox show as Backlog, an issue a pull request
+  will close shows as In Review, and a closed one as Done.
 
 - Each step of a major goal is a tracking issue whose sub-issues are the
-  work of that step, so its progress shows on the issue.
+  work of that step, so its progress shows on the issue. Other work that
+  is done in pieces has a tracking issue too.
 
-- Labels say what kind of work an issue is: `bug`, `enhancement`,
-  `documentation` and `ci`, `containers` for running Muru in a container
-  or a Kubernetes pod, `decision` for an issue where a choice has to be
-  made before work starts, and `tracking` for the issue of a goal's step.
+- Other labels say what kind of work an issue is: `bug`, `enhancement`,
+  `documentation` and `ci`, `testing` for a problem in the tests rather
+  than in Muru, `security` for a vulnerability or hardening, `workshops`
+  for an issue a tutorial or workshop runs into, `decision` for an issue
+  where a choice has to be made before work starts, `idea` for a
+  speculative idea, whatever its status, and `tracking` for a parent
+  issue whose sub-issues are the work.
 
 - A [milestone](https://github.com/muruhq/muru/milestones) for
   each upcoming release collects the issues planned for it.

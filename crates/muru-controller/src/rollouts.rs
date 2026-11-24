@@ -59,9 +59,12 @@ impl Counters {
                 .map(|(_, value)| value.clone())
         };
 
+        // Section 9.13: a detour's requests never count for a gate.
+
         for sample in samples {
             if label(sample, "app").as_deref() != Some(app)
                 || label(sample, "release").as_deref() != Some(release)
+                || sample.of_a_detour()
             {
                 continue;
             }
@@ -383,6 +386,29 @@ mod tests {
             probes: Vec::new(),
             min_requests: 10,
         }
+    }
+
+    #[test]
+    fn a_detours_requests_never_count_for_a_gate() {
+        let labels = |group: &'static str| {
+            [
+                ("app", "shop"),
+                ("release", "r2"),
+                ("group", group),
+                ("status", "5xx"),
+            ]
+        };
+        let samples = [
+            Sample::new("muru_requests_total", &labels("default"), 4.0),
+            Sample::new(
+                "muru_requests_total",
+                &labels(muru_edge::metrics::DETOUR_GROUP),
+                40.0,
+            ),
+        ];
+
+        let counters = Counters::from_samples(&samples, "shop", "r2");
+        assert_eq!((counters.total, counters.errors), (4.0, 4.0));
     }
 
     #[test]

@@ -164,6 +164,9 @@ pub enum Kind {
     Run,
     /// `muructl serve`.
     Serve,
+    /// `muructl detour run`, a development run behind a daemon's edge
+    /// (section 13.12).
+    Detour,
 }
 
 impl Kind {
@@ -173,6 +176,7 @@ impl Kind {
             Self::Daemon => "daemon",
             Self::Run => "run",
             Self::Serve => "serve",
+            Self::Detour => "detour",
         }
     }
 }
@@ -311,7 +315,8 @@ impl Record {
 
     /// The instance's tag, which its processes' titles carry: its name,
     /// `run:PORT` for a run, with the port it is configured to serve on,
-    /// which is known before anything starts, `serve` for a serve, or the
+    /// which is known before anything starts, `serve` for a serve,
+    /// `detour:` and the short ID for a detour, which has no port, or the
     /// short ID; a run on a port picked when it binds, `--port auto`, is
     /// `run:` and its short ID.
     pub fn tag(&self) -> String {
@@ -325,6 +330,7 @@ impl Record {
                 None => format!("run:{}", self.id.short()),
             },
             Kind::Serve => "serve".to_owned(),
+            Kind::Detour => format!("detour:{}", self.id.short()),
             Kind::Daemon => self.id.short(),
         }
     }
@@ -335,6 +341,54 @@ impl Record {
         let listener = self.listeners.first()?;
         let port: u16 = listener.configured.rsplit(':').next()?.parse().ok()?;
         (port != 0).then_some(port)
+    }
+
+    /// The instance, as a sentence names it: `the development run of shop
+    /// in ~/src/shop (pid 4123, dashboard http://127.0.0.1:8001/)`, or
+    /// `daemon instance dev (pid 5120)`.
+    pub fn describe(&self) -> String {
+        let dashboard = match (self.kind, self.dashboard.as_deref()) {
+            (Kind::Run | Kind::Detour, Some(dashboard)) => format!(", dashboard {dashboard}"),
+            _ => String::new(),
+        };
+
+        format!("{} (pid {}{dashboard})", self.summary(), self.pid)
+    }
+
+    /// The instance as [`Record::describe`] names it, without what only a
+    /// running instance has: `the development run of shop in ~/src/shop`,
+    /// for an instance that is no longer running.
+    pub fn summary(&self) -> String {
+        let app = self.app.as_deref().unwrap_or("an application");
+
+        match self.kind {
+            Kind::Run => {
+                let project = self
+                    .project
+                    .as_deref()
+                    .map(|project| format!(" in {}", home_shortened(project)))
+                    .unwrap_or_default();
+                format!("the development run of {app}{project}")
+            }
+            Kind::Detour => {
+                let project = self
+                    .project
+                    .as_deref()
+                    .map(|project| format!(" in {}", home_shortened(project)))
+                    .unwrap_or_default();
+                format!("the detour of {app}{project}")
+            }
+            Kind::Serve => format!("muructl serve of {app}"),
+            Kind::Daemon => match &self.name {
+                Some(name) => format!("daemon instance {name}"),
+                None => format!(
+                    "the daemon with the state directory {}",
+                    self.state_dir
+                        .as_deref()
+                        .map_or_else(|| self.run_dir.display().to_string(), home_shortened)
+                ),
+            },
+        }
     }
 }
 
@@ -349,45 +403,10 @@ pub struct Holder {
 }
 
 impl Holder {
-    /// The instance, as a sentence names it: `the development run of shop
-    /// in ~/src/shop (pid 4123, dashboard http://127.0.0.1:8001/)`, or
-    /// `daemon instance dev (pid 5120)`.
+    /// The instance, as a sentence names it: what [`Record::describe`]
+    /// says.
     pub fn describe(&self) -> String {
-        let record = &self.record;
-        let pid = record.pid;
-
-        match record.kind {
-            Kind::Run => {
-                let project = record
-                    .project
-                    .as_deref()
-                    .map(|project| format!(" in {}", home_shortened(project)))
-                    .unwrap_or_default();
-                let dashboard = record
-                    .dashboard
-                    .as_deref()
-                    .map(|dashboard| format!(", dashboard {dashboard}"))
-                    .unwrap_or_default();
-                format!(
-                    "the development run of {}{project} (pid {pid}{dashboard})",
-                    record.app.as_deref().unwrap_or("an application")
-                )
-            }
-            Kind::Serve => format!(
-                "muructl serve of {} (pid {pid})",
-                record.app.as_deref().unwrap_or("an application")
-            ),
-            Kind::Daemon => match &record.name {
-                Some(name) => format!("daemon instance {name} (pid {pid})"),
-                None => format!(
-                    "the daemon with the state directory {} (pid {pid})",
-                    record
-                        .state_dir
-                        .as_deref()
-                        .map_or_else(|| record.run_dir.display().to_string(), home_shortened)
-                ),
-            },
-        }
+        self.record.describe()
     }
 
     /// How to stop it: `stop it`, or for a daemon the command that does.
@@ -880,6 +899,12 @@ pub fn live(registry: &Path) -> Vec<Record> {
         .collect()
 }
 
+/// Whether `id` has an entry in `registry` whose owner holds its lock.
+pub fn entry_is_live(registry: &Path, id: InstanceId) -> bool {
+    let directory = registry.join(id.to_string());
+    directory.join(RECORD).exists() && is_live(&directory)
+}
+
 /// Whether the entry at `directory` has a live owner: its lock cannot be
 /// shared. A lock that cannot be opened counts as live, since only its
 /// owner could say otherwise.
@@ -932,6 +957,26 @@ pub fn remove_stale(registry: &Path, id: InstanceId) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether the entry of `id` reads as stale within the moment a
+    /// takeover or a prune waits (see [`LOCK_TRIES`]). Its lock can be
+    /// held for an instant after its owner let it go, by a process another
+    /// test forked before it ran its program (issue 818), so a single read
+    /// is not enough.
+    fn stale_soon(registry: &Path, id: InstanceId) -> bool {
+        for _ in 0..LOCK_TRIES {
+            if read(registry)
+                .iter()
+                .any(|found| found.record.id == id && !found.live)
+            {
+                return true;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        false
+    }
 
     fn record(kind: Kind, port: u16) -> Record {
         let mut record = Record::new(
@@ -1054,9 +1099,8 @@ mod tests {
 
         entry.keep();
         drop(entry);
-        let found = read(&registry);
-        assert_eq!(found.len(), 1);
-        assert!(!found[0].live);
+        assert_eq!(read(&registry).len(), 1);
+        assert!(stale_soon(&registry, id));
 
         // The daemon started again takes its own entry over.
 
@@ -1171,7 +1215,7 @@ mod tests {
         }
 
         for found in read(&registry) {
-            assert!(!found.live);
+            assert!(stale_soon(&registry, found.record.id));
             assert!(remove_stale(&registry, found.record.id).expect("pruned"));
         }
 

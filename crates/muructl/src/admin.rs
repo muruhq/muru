@@ -31,46 +31,92 @@ pub struct InstanceArgs {
     #[arg(long, global = true)]
     system: bool,
 
-    /// A named instance, whose locations all follow from its name (default:
-    /// MURU_INSTANCE); user and system name the default daemons.
-    #[arg(long, global = true, value_name = "NAME", value_parser = parse_instance_name)]
+    /// The instance to reach: a named instance, user or system for the
+    /// default daemons, or a running instance by the tag, the start of
+    /// the ID, the label or the application muructl instance list shows
+    /// (default: MURU_INSTANCE).
+    #[arg(long, global = true, value_name = "INSTANCE")]
     instance: Option<String>,
 }
 
-/// Check an instance's name as --instance takes it: a named instance's,
-/// or `user` or `system`.
+/// Check an instance's name as the commands that start a daemon take it:
+/// a named instance's, or `user` or `system`, since the daemon's
+/// directories follow from it.
 fn parse_instance_name(text: &str) -> Result<String, String> {
-    muru_controller::locations::check_name(text)?;
+    muru_controller::locations::check_name(text).map_err(|error| {
+        format!(
+            "{error}; this command starts a daemon whose directories follow from the name, so \
+             it takes a name, not the tag, ID, label or application of a running instance"
+        )
+    })?;
     Ok(text.to_owned())
 }
 
-/// The variable that names the instance a command reaches.
-pub const INSTANCE_VARIABLE: &str = muru_controller::instance::TAG_VARIABLE;
-
-/// The instance `MURU_INSTANCE` names, when it names one by its name. The
-/// same variable carries the tag of the instance a process belongs to,
-/// which for a development run or a serve, or a daemon kept apart by its
-/// own --state-dir, is not a name: a value that is the short form of
-/// `MURU_INSTANCE_ID` beside it, or not a name at all, names nothing.
-pub fn instance_from_environment() -> Option<String> {
-    let value = std::env::var(INSTANCE_VARIABLE).ok()?;
-    let value = value.trim();
-    let id = std::env::var(muru_controller::instance::ID_VARIABLE).unwrap_or_default();
-
-    if value.is_empty()
-        || muru_controller::locations::check_name(value).is_err()
-        || (!id.is_empty() && id.starts_with(value))
-    {
-        return None;
+/// Whether `name` is an instance reached by its name even when it is not
+/// running: a default daemon, or a named instance that is defined.
+pub fn is_defined(name: &str) -> bool {
+    if muru_controller::locations::check_name(name).is_err() {
+        return false;
     }
 
-    Some(value.to_owned())
+    muru_controller::locations::RESERVED_NAMES.contains(&name)
+        || [false, true]
+            .map(muru_controller::locations::caller_config_area)
+            .iter()
+            .any(|area| muru_controller::catalogue::find(area, name).is_some())
+}
+
+/// `MURU_INSTANCE` as it is set, whatever it names.
+fn instance_variable() -> Option<String> {
+    std::env::var(INSTANCE_VARIABLE)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// The variable a person sets to choose the instance a command reaches,
+/// as `--instance` does. Muru passes the instance a process belongs to
+/// down in others, `MURU_INSTANCE_ID` and `MURU_INSTANCE_TAG`, never in
+/// this one.
+pub const INSTANCE_VARIABLE: &str = "MURU_INSTANCE";
+
+/// The instance `MURU_INSTANCE` names, when the value is a name.
+pub fn instance_from_environment() -> Option<String> {
+    instance_variable().filter(|value| muru_controller::locations::check_name(value).is_ok())
+}
+
+/// The running instance this process belongs to, by the
+/// `MURU_INSTANCE_ID` every process of an instance carries (issue 868),
+/// for a `muructl` command a web application, a project's command or
+/// anything else of the instance's runs. A run or a serve is passed over
+/// for a command only a daemon answers, which goes on to find a daemon
+/// as it would anywhere else. None outside an instance, or when the
+/// instance has gone.
+pub fn own_instance() -> Option<muru_controller::registry::Record> {
+    let id: muru_controller::registry::InstanceId =
+        std::env::var(muru_controller::instance::ID_VARIABLE)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+    let record = running_instances()
+        .into_iter()
+        .find(|record| record.id == id)?;
+    let daemon_only = RUNNING.get().is_some_and(|running| running.daemon_only);
+
+    (!daemon_only || record.kind == muru_controller::registry::Kind::Daemon).then_some(record)
 }
 
 impl InstanceArgs {
-    /// The named instance the options or the environment give.
+    /// The named instance the options or the environment give, which the
+    /// locations follow from: one that is defined, or a default daemon.
+    /// Any other value selects a running instance, as [`select_running`]
+    /// decides, and has no locations of its own.
     pub fn instance(&self) -> Option<String> {
-        self.instance.clone().or_else(instance_from_environment)
+        match &self.instance {
+            Some(value) => is_defined(value).then(|| value.clone()),
+            None => instance_from_environment().filter(|name| is_defined(name)),
+        }
     }
 
     /// Resolve the locations for these options and the environment.
@@ -170,11 +216,23 @@ impl DaemonFileArgs {
 }
 
 /// Where the daemon keeps everything: what the commands that start or
-/// are the daemon take.
+/// are the daemon take. Its `--instance` is a name, never a running
+/// instance's tag or ID, since the daemon's directories follow from it.
 #[derive(Args, Clone, Default)]
 pub struct LocationArgs {
-    #[command(flatten)]
-    instance: InstanceArgs,
+    /// The runtime directory: the admin socket and the release run directories.
+    #[arg(long, global = true, value_name = "DIR")]
+    run_dir: Option<PathBuf>,
+
+    /// Use the system locations (/etc/muru, /var/lib/muru and so on)
+    /// whoever runs the command.
+    #[arg(long, global = true)]
+    system: bool,
+
+    /// A named instance, whose locations all follow from its name (default:
+    /// MURU_INSTANCE); user and system name the default daemons.
+    #[arg(long, global = true, value_name = "NAME", value_parser = parse_instance_name)]
+    instance: Option<String>,
 
     #[command(flatten)]
     files: DaemonFileArgs,
@@ -187,14 +245,14 @@ impl LocationArgs {
     /// configuration and say nothing.
     pub fn resolve(&self) -> anyhow::Result<Locations> {
         muru_controller::locations::check_renamed().map_err(anyhow::Error::msg)?;
-        let instance = self.instance.instance();
+        let instance = self.instance.clone().or_else(instance_from_environment);
 
         // A name with every location given by a flag would decide nothing.
 
-        if self.instance.instance.is_some()
+        if self.instance.is_some()
             && self.files.config.is_some()
             && self.files.state_dir.is_some()
-            && self.instance.run_dir.is_some()
+            && self.run_dir.is_some()
             && self.files.log_dir.is_some()
         {
             anyhow::bail!(
@@ -207,18 +265,28 @@ impl LocationArgs {
         Ok(Locations::resolve(&Options {
             config: self.files.config.clone(),
             state_dir: self.files.state_dir.clone(),
-            run_dir: self.instance.run_dir.clone(),
+            run_dir: self.run_dir.clone(),
             log_dir: self.files.log_dir.clone(),
             cache_dir: self.files.cache_dir.clone(),
-            system: self.instance.system,
+            system: self.system,
             instance,
         }))
+    }
+
+    /// The options that find the instance, for a command that reaches it
+    /// once it runs.
+    pub fn instance_args(&self) -> InstanceArgs {
+        InstanceArgs {
+            run_dir: self.run_dir.clone(),
+            system: self.system,
+            instance: self.instance.clone(),
+        }
     }
 
     /// The same options, for a daemon started in the background.
     fn as_arguments(&self) -> Vec<String> {
         let mut arguments = self.files.as_arguments();
-        arguments.extend(self.instance.as_arguments());
+        arguments.extend(self.instance_args().as_arguments());
         arguments
     }
 }
@@ -235,7 +303,8 @@ pub struct JsonArgs {
 #[derive(Args, Clone, Default)]
 pub struct SocketArgs {
     /// The admin socket (default: MURU_SOCKET, else the instance
-    /// MURU_INSTANCE or muru.local.toml names, else a development run
+    /// MURU_INSTANCE names, else for a command run inside an instance that
+    /// instance, else the one muru.local.toml names, else a development run
     /// whose project is the current directory or that was started from
     /// it, else the user daemon's socket in the runtime directory, else
     /// the one development run listening).
@@ -257,6 +326,8 @@ pub enum ChosenBy {
     Flag,
     /// `MURU_INSTANCE`.
     Variable,
+    /// The instance the process runs under, by `MURU_INSTANCE_ID`.
+    Own,
     /// `instance` in a muru.local.toml.
     LocalFile(PathBuf),
 }
@@ -353,15 +424,11 @@ pub fn resolve_name(name: &str, system: bool) -> anyhow::Result<client::Endpoint
         .find_map(|area| muru_controller::catalogue::find(area, name));
 
     let Some(definition) = defined else {
-        let mut names: Vec<String> = areas
+        let none_defined = areas
             .iter()
-            .flat_map(|area| muru_controller::catalogue::read(area).0)
-            .map(|definition| definition.name)
-            .collect();
-        names.sort();
-        names.dedup();
+            .all(|area| muru_controller::catalogue::read(area).0.is_empty());
 
-        if names.is_empty() {
+        if none_defined {
             anyhow::bail!(
                 "no instance {name} is defined, and no named instances are defined at all; \
                  define it with muructl instance create {name} --listen ADDRESS"
@@ -369,8 +436,7 @@ pub fn resolve_name(name: &str, system: bool) -> anyhow::Result<client::Endpoint
         }
 
         anyhow::bail!(
-            "no instance {name} is defined; the defined instances are {}",
-            names.join(", ")
+            "no instance {name} is defined; muructl instance list shows the ones that are"
         );
     };
 
@@ -387,6 +453,93 @@ pub fn resolve_name(name: &str, system: bool) -> anyhow::Result<client::Endpoint
     }
 }
 
+/// The live instances on this machine that a command may reach, from the
+/// caller's registry and the system daemon's, each once.
+pub fn running_instances() -> Vec<muru_controller::registry::Record> {
+    let mut records: Vec<muru_controller::registry::Record> =
+        muru_controller::registry::readable_registries()
+            .iter()
+            .flat_map(|registry| muru_controller::registry::live(registry))
+            .collect();
+    records.sort_by_key(|record| record.started_unix_ms);
+    records.dedup_by_key(|record| record.id);
+    records
+}
+
+/// The running instance `wanted` selects (section 13.8, issue 868): by
+/// its name, tag, the start of its ID, its label or its application, as
+/// [`muru_controller::selector`] decides, with its endpoint and the value
+/// that selects it.
+pub fn select_running(wanted: &str, by: &ChosenBy) -> anyhow::Result<(client::Endpoint, String)> {
+    let records = running_instances();
+
+    match muru_controller::selector::select(wanted, &records) {
+        Ok(choice) => Ok((
+            choice.record.admin.clone(),
+            muru_controller::selector::handle(choice.record, &records),
+        )),
+        Err(refusal) => {
+            let ambiguous = matches!(
+                refusal,
+                muru_controller::selector::Refusal::Ambiguous { .. }
+            );
+
+            if !ambiguous && let Some(message) = not_running(wanted) {
+                anyhow::bail!(message);
+            }
+
+            let instead = match by {
+                ChosenBy::Variable => format!("set {INSTANCE_VARIABLE} to one of these"),
+                _ => "pass one of these to --instance".to_owned(),
+            };
+
+            anyhow::bail!(refusal.message(&instead, "muructl instance list"))
+        }
+    }
+}
+
+/// What to say when `wanted` selects no running instance but one that is
+/// listed as no longer running, detached or stale, by the same rules: that
+/// instance and why it cannot be reached, rather than a value nothing
+/// knows. None when no such instance matches it alone.
+fn not_running(wanted: &str) -> Option<String> {
+    let registries = crate::instances::registries(false).ok()?;
+    let rows: Vec<crate::instances::Row> =
+        crate::instances::rows(&registries, &muru_controller::lookup::muru_processes())
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.state,
+                    crate::instances::State::Detached | crate::instances::State::Stale
+                )
+            })
+            .collect();
+    let records: Vec<muru_controller::registry::Record> =
+        rows.iter().map(|row| row.record.clone()).collect();
+
+    let choice = muru_controller::selector::select(wanted, &records).ok()?;
+    let row = rows.iter().find(|row| row.record.id == choice.record.id)?;
+    let what = row.record.summary();
+
+    let why = match (row.state, row.record.kind, row.record.name.as_deref()) {
+        (crate::instances::State::Detached, _, Some(name)) => format!(
+            "its daemon has gone and left its edge and hosts serving; start it again with \
+             muructl daemon start --instance {name} to reach it"
+        ),
+        (crate::instances::State::Detached, _, None) => "its daemon has gone and left its \
+             edge and hosts serving; start the daemon again on the same directories to reach \
+             it"
+        .to_owned(),
+        _ => "its entry was left behind when it stopped, and muructl instance prune removes it"
+            .to_owned(),
+    };
+
+    Some(format!(
+        "{wanted} is {what}, which is not running: {why}; muructl instance list shows the \
+         running instances"
+    ))
+}
+
 impl SocketArgs {
     /// The socket the command line or `MURU_SOCKET` names, if either does.
     pub fn given_socket(&self) -> Option<PathBuf> {
@@ -397,11 +550,12 @@ impl SocketArgs {
         })
     }
 
-    /// Choose the instance to reach (section 13.8, issue 811): `--socket`
-    /// or `--instance`, then `MURU_SOCKET` or `MURU_INSTANCE`, then
-    /// `instance` in muru.local.toml, then discovery. A development run of
-    /// this directory still wins over the local file for a command both
-    /// answer, with a note; a flag or variable is explicit and wins.
+    /// Choose the instance to reach (section 13.8, issues 811 and 868):
+    /// `--socket` or `--instance`, then `MURU_SOCKET` or `MURU_INSTANCE`,
+    /// then the instance this process runs under, then `instance` in
+    /// muru.local.toml, then discovery. A development run of this
+    /// directory still wins over the local file for a command both answer,
+    /// with a note; a flag or variable is explicit and wins.
     pub fn choose(&self) -> anyhow::Result<client::Endpoint> {
         let system = self.locations.system;
 
@@ -416,7 +570,7 @@ impl SocketArgs {
 
         let variable_socket = std::env::var_os(SOCKET_VARIABLE).filter(|value| !value.is_empty());
 
-        match (variable_socket, instance_from_environment()) {
+        match (variable_socket, instance_variable()) {
             (Some(_), Some(_)) => anyhow::bail!(
                 "{SOCKET_VARIABLE} and {INSTANCE_VARIABLE} are both set, and both name what to \
                  reach; unset one"
@@ -424,6 +578,15 @@ impl SocketArgs {
             (Some(socket), None) => return Ok(client::Endpoint::unix(PathBuf::from(socket))),
             (None, Some(name)) => return self.chosen_by_name(&name, ChosenBy::Variable, system),
             (None, None) => {}
+        }
+
+        // A command run inside an instance, by its application or one of
+        // its project's commands, reaches that instance (issue 868).
+
+        if let Some(record) = own_instance() {
+            let handle = muru_controller::selector::handle(&record, &running_instances());
+            self.say_change(&handle, &ChosenBy::Own);
+            return Ok(record.admin);
         }
 
         // The checkout's own file, unless a development run of this
@@ -445,10 +608,10 @@ impl SocketArgs {
 
                 NOTED.call_once(|| {
                     muru_common::muru_eprintln!(
-                        "reaching the development run of {} on http://{}; {} names instance \
+                        "reaching the development run of {} {}; {} names instance \
                          {name}, pass --instance {name} to reach it",
                         run.app,
-                        run.listen,
+                        run.on(),
                         muru_config::LOCAL_FILE
                     );
                 });
@@ -462,8 +625,8 @@ impl SocketArgs {
         Ok(client::Endpoint::unix(self.socket()?))
     }
 
-    /// The instance a name chooses, by the flag, the variable or the
-    /// checkout's muru.local.toml, without reaching it: what `muructl mcp
+    /// The instance a flag, the variable or the checkout's muru.local.toml
+    /// chooses, as the value given, without reaching it: what `muructl mcp
     /// serve` settles once at start.
     pub fn named(&self) -> anyhow::Result<Option<String>> {
         if self.socket.is_some() {
@@ -478,8 +641,8 @@ impl SocketArgs {
             return Ok(None);
         }
 
-        if let Some(name) = instance_from_environment() {
-            return Ok(Some(name));
+        if let Some(value) = instance_variable() {
+            return Ok(Some(value));
         }
 
         let directory = std::env::current_dir()?;
@@ -503,29 +666,42 @@ impl SocketArgs {
             .max_by_key(|run| run.started_unix_ms)
     }
 
-    /// The instance `name` names, said when the command changes something.
+    /// The instance `name` chooses, by its name when it is defined and
+    /// else among the running instances, said when the command changes
+    /// something. The local file's value is always a name.
     fn chosen_by_name(
         &self,
         name: &str,
         by: ChosenBy,
         system: bool,
     ) -> anyhow::Result<client::Endpoint> {
-        let endpoint = resolve_name(name, system)?;
+        let (endpoint, name) = if is_defined(name) || matches!(by, ChosenBy::LocalFile(_)) {
+            (resolve_name(name, system)?, name.to_owned())
+        } else {
+            select_running(name, &by)?
+        };
+        self.say_change(&name, &by);
+        Ok(endpoint)
+    }
+
+    /// Note the instance a name or the process's own instance chose, for
+    /// `--json` output, and say where a change went when the command
+    /// changes something.
+    fn say_change(&self, name: &str, by: &ChosenBy) {
         let _ = REACHED.set(name.to_owned());
 
         if let Some(change) = RUNNING.get().and_then(|running| running.change.as_deref()) {
             static SAID: std::sync::Once = std::sync::Once::new();
 
-            let from = match &by {
+            let from = match by {
                 ChosenBy::LocalFile(_) => format!(" (from {})", muru_config::LOCAL_FILE),
                 ChosenBy::Variable => format!(" (from {INSTANCE_VARIABLE})"),
-                _ => String::new(),
+                ChosenBy::Own => " (the instance this runs under)".to_owned(),
+                ChosenBy::Flag => String::new(),
             };
 
             SAID.call_once(|| muru_common::muru_eprintln!("{change} to instance {name}{from}"));
         }
-
-        Ok(endpoint)
     }
 
     /// The same options, for a muructl command run on this one's behalf,
@@ -627,14 +803,43 @@ impl SocketArgs {
     /// listens, else the one run listening; several runs and no daemon
     /// are named, so one can be chosen.
     pub fn socket(&self) -> anyhow::Result<PathBuf> {
-        if let Some(socket) = self.given_socket() {
-            return Ok(socket);
+        if let Some(socket) = &self.socket {
+            return Ok(socket.clone());
         }
 
-        // A named instance's socket is where its name puts it.
+        // A named instance's socket is where its name puts it, running or
+        // not; any other value selects a running instance (issue 868).
+        // The flag comes before the variables, the socket's before the
+        // instance's.
 
-        if self.locations.instance().is_some() {
-            return Ok(self.locations.resolve().admin_socket());
+        let variable_socket = std::env::var_os(SOCKET_VARIABLE)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+
+        let selected = match (&self.locations.instance, variable_socket) {
+            (Some(value), _) => Some((value.clone(), ChosenBy::Flag)),
+            (None, Some(socket)) => return Ok(socket),
+            (None, None) => instance_variable().map(|value| (value, ChosenBy::Variable)),
+        };
+
+        if let Some((value, by)) = selected {
+            if self.locations.instance().is_some() {
+                return Ok(self.locations.resolve().admin_socket());
+            }
+
+            let (endpoint, _) = select_running(&value, &by)?;
+            return endpoint
+                .socket()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| anyhow::anyhow!("{value} is not reached through a socket"));
+        }
+
+        // Issue 868: a command run inside an instance reaches that one.
+
+        if let Some(socket) =
+            own_instance().and_then(|record| record.admin.socket().map(Path::to_path_buf))
+        {
+            return Ok(socket);
         }
 
         // Section 13.9: inside a container, the serve that runs there.
@@ -665,19 +870,61 @@ impl SocketArgs {
             .and_then(|directory| directory.canonicalize())
             .ok();
 
-        let discovery = discovered(&runs, here.as_deref(), daemon, daemon_listening, denied)?;
+        let records = running_instances();
+        let reach = |run: &crate::run_admin::RunInfo| reach_run(&run.socket, &records);
+        let discovery = discovered(
+            &runs,
+            here.as_deref(),
+            daemon,
+            daemon_listening,
+            denied,
+            &reach,
+        )?;
 
         // A command may look for its socket more than once; the note that
         // the daemon was chosen over a run is said once.
 
         static NOTED: std::sync::Once = std::sync::Once::new();
 
-        if let Some(note) = &discovery.note {
+        let note = discovery
+            .note
+            .clone()
+            .or_else(|| chosen_among_several(&discovery.socket, &locations.run.path));
+
+        if let Some(note) = note {
             NOTED.call_once(|| muru_common::muru_eprintln!("{note}"));
         }
 
         Ok(discovery.socket)
     }
+}
+
+/// What to say when discovery chose `socket` while other instances it
+/// could have reached run (issue 868): which one it is, and how to choose
+/// another. The candidates are the running instances under the caller's
+/// run directory, as discovery itself sees them. None when there was no
+/// other, or nothing running has the socket.
+fn chosen_among_several(socket: &Path, run_dir: &Path) -> Option<String> {
+    let records: Vec<muru_controller::registry::Record> = running_instances()
+        .into_iter()
+        .filter(|record| record.run_dir.starts_with(run_dir))
+        .collect();
+
+    if records.len() < 2 {
+        return None;
+    }
+
+    let chosen = records
+        .iter()
+        .find(|record| record.admin.socket() == Some(socket))?;
+
+    Some(format!(
+        "reaching {}, instance {}, one of {} running; pass --instance to choose another, as \
+         muructl instance list names them",
+        chosen.describe(),
+        muru_controller::selector::handle(chosen, &records),
+        records.len()
+    ))
 }
 
 /// Where discovery led: the socket, and what to tell the user about the
@@ -711,13 +958,17 @@ fn may_not_enter(path: &Path) -> bool {
 /// listens, then the one run listening. With nothing there, the socket
 /// of a run directory this user may not enter when there is one, so the
 /// permission error is reported, or the daemon's. When the daemon is
-/// chosen while runs listen, the note names them and how to reach them.
+/// chosen while runs listen, the note says how to reach them. `reach`
+/// gives the option that reaches a run, `--instance` with what
+/// `muructl instance list` shows for it; the notes name few runs and
+/// point at that list for the rest (issue 885).
 fn discovered(
     runs: &[crate::run_admin::RunInfo],
     here: Option<&Path>,
     daemon: PathBuf,
     daemon_listening: bool,
     denied: Option<PathBuf>,
+    reach: &dyn Fn(&crate::run_admin::RunInfo) -> String,
 ) -> anyhow::Result<Discovery> {
     // The runs whose project is this directory, else those started from
     // it; of several, the newest (issue 714), with a note naming the
@@ -739,23 +990,20 @@ fn discovered(
 
     if let Some((newest, others)) = mine.split_last() {
         let note = (!others.is_empty()).then(|| {
+            let others: Vec<String> = others.iter().rev().map(|run| reach(run)).collect();
+
             format!(
-                "{} development runs of this project are listening; reaching the newest, {} on \
-                 http://{}; pass --socket to reach another: {}",
+                "{} development runs of this project are listening; reaching the newest, {} \
+                 {}; {} {}",
                 mine.len(),
                 newest.app,
-                newest.listen,
-                others
-                    .iter()
-                    .rev()
-                    .map(|run| format!(
-                        "{} on http://{} (--socket {})",
-                        run.app,
-                        run.listen,
-                        run.socket.display()
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("; ")
+                newest.on(),
+                listed(&others, muru_controller::selector::MAX_LISTED),
+                if others.len() == 1 {
+                    "reaches the other"
+                } else {
+                    "reach the others"
+                }
             )
         });
 
@@ -769,27 +1017,17 @@ fn discovered(
         let note = match runs {
             [] => None,
             [run] => Some(format!(
-                "using the daemon; the development run of {} on http://{} is also \
-                 listening: run the command from {}, or pass --socket {}, to reach it",
+                "using the daemon; the development run of {} {} is also \
+                 listening: {}, or the command run from {}, reaches it",
                 run.app,
-                run.listen,
-                run.project.display(),
-                run.socket.display()
+                run.on(),
+                reach(run),
+                run.project.display()
             )),
             several => Some(format!(
-                "using the daemon; development runs are also listening: {}; run the \
-                 command from a run's project directory, or pass --socket, to reach one",
-                several
-                    .iter()
-                    .map(|run| format!(
-                        "{} on http://{} from {} (--socket {})",
-                        run.app,
-                        run.listen,
-                        run.project.display(),
-                        run.socket.display()
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("; ")
+                "using the daemon; {} development runs are also listening: pass --instance to \
+                 reach one, as muructl instance list names them",
+                several.len()
             )),
         };
 
@@ -802,22 +1040,74 @@ fn discovered(
     match runs {
         [] => Ok(Discovery::quiet(denied.unwrap_or(daemon))),
         [run] => Ok(Discovery::quiet(run.socket.clone())),
-        several => anyhow::bail!(
-            "no daemon is running and several development runs are: {}; name one with \
-             --socket, or run the command from its project directory",
-            several
+        several => {
+            let mut message = format!(
+                "no daemon is running and {} development runs are; choose one, or run the \
+                 command from its project directory:",
+                several.len()
+            );
+
+            let shown: Vec<(&crate::run_admin::RunInfo, String)> = several
                 .iter()
-                .map(|run| format!(
-                    "{} on http://{} from {} (--socket {})",
+                .take(muru_controller::selector::MAX_LISTED)
+                .map(|run| (run, reach(run)))
+                .collect();
+            let width = shown.iter().map(|(_, how)| how.len()).max().unwrap_or(0);
+
+            for (run, how) in &shown {
+                message.push_str(&format!(
+                    "\n  {how:width$}  {} {} from {}",
                     run.app,
-                    run.listen,
-                    run.project.display(),
-                    run.socket.display()
-                ))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ),
+                    run.on(),
+                    run.project.display()
+                ));
+            }
+
+            if several.len() > muru_controller::selector::MAX_LISTED {
+                message.push_str(&format!(
+                    "\n  and {} more; muructl instance list shows them all",
+                    several.len() - muru_controller::selector::MAX_LISTED
+                ));
+            }
+
+            anyhow::bail!(message)
+        }
     }
+}
+
+/// `items` joined with commas, the first `most` of them, and how many
+/// more after.
+fn listed(items: &[String], most: usize) -> String {
+    let mut text = items
+        .iter()
+        .take(most)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if items.len() > most {
+        text.push_str(&format!(" and {} more", items.len() - most));
+    }
+
+    text
+}
+
+/// The option that reaches a run among the running `records`:
+/// `--instance` with what `muructl instance list` shows for it, or
+/// `--socket` and its path when no record has its socket.
+pub fn reach_run(socket: &Path, records: &[muru_controller::registry::Record]) -> String {
+    records
+        .iter()
+        .find(|record| record.admin.socket() == Some(socket))
+        .map_or_else(
+            || format!("--socket {}", socket.display()),
+            |record| {
+                format!(
+                    "--instance {}",
+                    muru_controller::selector::handle(record, records)
+                )
+            },
+        )
 }
 
 /// The daemon subcommands.
@@ -898,6 +1188,9 @@ pub enum DaemonCommand {
 /// What `daemon run` and `daemon start` take.
 #[derive(Args, Clone)]
 pub struct DaemonRunArgs {
+    #[command(flatten)]
+    pub label: crate::instances::LabelArgs,
+
     /// Serve plain HTTP on this address alone, instead of the [[listener]]
     /// entries of the configuration file (default 127.0.0.1:8080).
     #[arg(long, value_name = "ADDRESS")]
@@ -7655,6 +7948,10 @@ fn finish_removal(answer: &pb::RemoveReleasesResponse, json: bool) -> anyhow::Re
 /// The WORKERS column of `release list`: what runs now, or `-` when
 /// nothing does, and the shape the release asks for in brackets.
 fn workers_column(release: &pb::Release) -> String {
+    if let Some(detour) = &release.detour {
+        return format!("- (detour, pid {})", detour.pid);
+    }
+
     if release.kind == "http" {
         let running = release
             .server_instances
@@ -7730,6 +8027,25 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
             "websockets".to_owned(),
             format!("{} open", release.websockets),
         ));
+    }
+
+    // Section 9.13: a detour is a development run's, which the daemon
+    // only routes to.
+
+    if let Some(detour) = &release.detour {
+        lines.push(("kind".to_owned(), "detour".to_owned()));
+        lines.push((
+            "traffic".to_owned(),
+            muru_controller::detours::traffic_text(&detour.traffic, detour.until_unix_ms),
+        ));
+        lines.push(("pid".to_owned(), detour.pid.to_string()));
+
+        if !detour.label.is_empty() {
+            lines.push(("label".to_owned(), detour.label.clone()));
+        }
+
+        lines.push(("socket".to_owned(), detour.socket.clone()));
+        return lines;
     }
 
     if release.kind == "http" {
@@ -10914,6 +11230,9 @@ fn user_cache_in_use() -> muru_controller::cache::InUse {
             (muru_controller::registry::Kind::Serve, Some(app)) => {
                 format!("muructl serve of {app}")
             }
+            (muru_controller::registry::Kind::Detour, Some(app)) => {
+                format!("the detour of {app}")
+            }
             _ => format!("instance {}", record.tag()),
         };
 
@@ -11510,7 +11829,7 @@ pub fn print_answer<T: serde::Serialize>(answer: &T) -> anyhow::Result<()> {
 }
 
 /// A gRPC status as a plain sentence.
-fn explain(status: tonic::Status) -> anyhow::Error {
+pub(crate) fn explain(status: tonic::Status) -> anyhow::Error {
     anyhow::anyhow!("{}", status.message())
 }
 
@@ -11829,10 +12148,12 @@ tls = { ca = "ca.pem" }
             project: PathBuf::from(project),
             started_from: None,
             listen: "127.0.0.1:8080".to_owned(),
+            detour: false,
             socket: PathBuf::from(socket),
             runtime: Vec::new(),
             started_unix_ms: 0,
         };
+        let reach = |run: &RunInfo| format!("--socket {}", run.socket.display());
         let daemon = PathBuf::from("/user/admin.sock");
         let denied = PathBuf::from("/run/muru/admin.sock");
         let found = |runs: &[RunInfo], here, listening, denied: Option<&Path>| {
@@ -11842,6 +12163,7 @@ tls = { ca = "ca.pem" }
                 daemon.clone(),
                 listening,
                 denied.map(Path::to_path_buf),
+                &reach,
             )
             .expect("found")
             .socket
@@ -11874,6 +12196,7 @@ tls = { ca = "ca.pem" }
             project: PathBuf::from("/work/shop"),
             started_from: None,
             listen: format!("127.0.0.1:{port}"),
+            detour: false,
             socket: PathBuf::from(format!("/user/runs/{port}/admin.sock")),
             runtime: Vec::new(),
             started_unix_ms,
@@ -11881,6 +12204,7 @@ tls = { ca = "ca.pem" }
 
         // Listed by port, the older run on the lower one.
 
+        let reach = |run: &RunInfo| format!("--instance run:{}", &run.listen[10..]);
         let runs = [run(8080, 1_000), run(8090, 2_000)];
         let found = super::discovered(
             &runs,
@@ -11888,6 +12212,7 @@ tls = { ca = "ca.pem" }
             PathBuf::from("/user/admin.sock"),
             true,
             None,
+            &reach,
         )
         .expect("found");
         assert_eq!(found.socket, runs[1].socket);
@@ -11899,7 +12224,7 @@ tls = { ca = "ca.pem" }
             "{note}"
         );
         assert!(
-            note.contains("shop on http://127.0.0.1:8080 (--socket /user/runs/8080/admin.sock)"),
+            note.ends_with("; --instance run:8080 reaches the other"),
             "{note}"
         );
 
@@ -11911,6 +12236,7 @@ tls = { ca = "ca.pem" }
             PathBuf::from("/user/admin.sock"),
             true,
             None,
+            &reach,
         )
         .expect("found");
         assert_eq!((one.socket, one.note), (runs[0].socket.clone(), None));
@@ -11928,6 +12254,7 @@ tls = { ca = "ca.pem" }
             project: PathBuf::from("/work/shop"),
             started_from: Some(PathBuf::from("/work")),
             listen: "127.0.0.1:18380".to_owned(),
+            detour: false,
             socket: PathBuf::from("/user/runs/18380/admin.sock"),
             runtime: Vec::new(),
             started_unix_ms: 0,
@@ -11937,13 +12264,22 @@ tls = { ca = "ca.pem" }
             project: PathBuf::from("/work"),
             started_from: Some(PathBuf::from("/elsewhere")),
             listen: "127.0.0.1:18381".to_owned(),
+            detour: false,
             socket: PathBuf::from("/user/runs/18381/admin.sock"),
             ..shop.clone()
         };
         let daemon = PathBuf::from("/user/admin.sock");
+        let reach = |run: &RunInfo| format!("--instance run:{}", &run.listen[10..]);
         let found = |runs: &[RunInfo], here: &str| {
-            super::discovered(runs, Some(Path::new(here)), daemon.clone(), true, None)
-                .expect("found")
+            super::discovered(
+                runs,
+                Some(Path::new(here)),
+                daemon.clone(),
+                true,
+                None,
+                &reach,
+            )
+            .expect("found")
         };
 
         // The directory a run was started from reaches it ahead of the
@@ -11965,18 +12301,36 @@ tls = { ca = "ca.pem" }
         assert!(note.starts_with("using the daemon;"), "{note}");
         assert!(note.contains("shop on http://127.0.0.1:18380"), "{note}");
         assert!(
-            note.contains("--socket /user/runs/18380/admin.sock"),
+            note.contains("--instance run:18380, or the command run from /work/shop"),
             "{note}"
         );
 
+        // Of several, only how many, and where they are all named.
+
         let several = found(&both, "/tmp").note.expect("a note");
-        assert!(
-            several.contains("development runs are also listening"),
-            "{several}"
+        assert_eq!(
+            several,
+            "using the daemon; 2 development runs are also listening: pass --instance to \
+             reach one, as muructl instance list names them"
         );
-        assert!(
-            several.contains("api on http://127.0.0.1:18381"),
-            "{several}"
+
+        // With no daemon, the runs to choose from, one to a line.
+
+        let chosen = super::discovered(
+            &both,
+            Some(Path::new("/tmp")),
+            daemon.clone(),
+            false,
+            None,
+            &reach,
+        )
+        .expect_err("two runs and no daemon")
+        .to_string();
+        assert_eq!(
+            chosen,
+            "no daemon is running and 2 development runs are; choose one, or run the command \
+             from its project directory:\n  --instance run:18380  shop on http://127.0.0.1:18380 \
+             from /work/shop\n  --instance run:18381  api on http://127.0.0.1:18381 from /work"
         );
     }
 

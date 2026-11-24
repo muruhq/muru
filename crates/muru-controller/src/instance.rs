@@ -1,10 +1,15 @@
 //! Which instance this process is (design specification sections 2.1
 //! and 13.10, issue 806): its ID and its tag, set once at start by the
 //! daemon, a development run or `muructl serve`, and given to every
-//! process it starts in `MURU_INSTANCE_ID` and `MURU_INSTANCE`. Workers
+//! process it starts in `MURU_INSTANCE_ID` and `MURU_INSTANCE_TAG`. Workers
 //! inherit them from their host, and so do the subprocesses a worker
 //! starts, which is how a process with no title of Muru's is attributed
-//! to its instance.
+//! to its instance, and how a `muructl` command run by one of them knows
+//! the instance it runs under (issue 868).
+//!
+//! `MURU_INSTANCE`, which a person sets to choose an instance as
+//! `--instance` does, is a different variable: the two were one before
+//! issue 868, which made a value Muru passed down look like a choice.
 //!
 //! The tag names the instance in titles: `user` or `system` for the
 //! default daemons, a named instance's name, `run:PORT` for a run,
@@ -17,7 +22,7 @@ use std::sync::OnceLock;
 pub const ID_VARIABLE: &str = "MURU_INSTANCE_ID";
 
 /// The variable holding the instance's tag.
-pub const TAG_VARIABLE: &str = "MURU_INSTANCE";
+pub const TAG_VARIABLE: &str = "MURU_INSTANCE_TAG";
 
 /// This process's instance, once set: its ID, its tag and its label.
 static IDENTITY: OnceLock<(String, String, Option<String>)> = OnceLock::new();

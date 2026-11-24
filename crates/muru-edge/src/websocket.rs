@@ -47,6 +47,30 @@ impl Upgrade {
     pub(crate) fn into_on_upgrade(self) -> OnUpgrade {
         self.on_upgrade
     }
+
+    /// Whether the client opened the WebSocket over HTTP/2, by extended
+    /// CONNECT, and so sent no handshake an HTTP/1.1 server would take.
+    pub(crate) fn over_http2(&self) -> bool {
+        self.http2
+    }
+}
+
+/// Turn the request of a WebSocket opened over HTTP/2 into the HTTP/1.1
+/// handshake for an upstream (section 4.13): `Upgrade: websocket`,
+/// `Connection: Upgrade` and a key of the edge's own, since HTTP/2 carries
+/// none. The client's version, protocols and extensions are already among
+/// the headers. Returns the Sec-WebSocket-Accept the upstream's 101 must
+/// carry.
+pub(crate) fn http1_handshake(headers: &mut http::HeaderMap) -> String {
+    let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
+    headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+    headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+
+    if let Ok(value) = HeaderValue::from_str(&key) {
+        headers.insert(http::header::SEC_WEBSOCKET_KEY, value);
+    }
+
+    tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes())
 }
 
 /// Recognise a WebSocket upgrade: the HTTP/1.1 Upgrade dance, or the
@@ -593,5 +617,33 @@ mod tests {
     async fn drain_gives_up_when_the_time_is_up() {
         let (_client, mut server) = tokio::io::duplex(1024);
         drain(&mut server, Duration::from_millis(100)).await;
+    }
+
+    #[test]
+    fn an_http2_upgrade_gets_a_fresh_key_and_the_accept_it_needs() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("sec-websocket-protocol", HeaderValue::from_static("chat"));
+        let accept = http1_handshake(&mut headers);
+
+        assert_eq!(headers[UPGRADE], "websocket");
+        assert_eq!(headers[CONNECTION], "Upgrade");
+        assert_eq!(headers["sec-websocket-protocol"], "chat");
+
+        // The key is sixteen random bytes in base64, and the accept is the
+        // one RFC 6455 derives from it; another handshake has another key.
+
+        let key = headers[http::header::SEC_WEBSOCKET_KEY]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(key.len(), 24);
+        assert_eq!(
+            accept,
+            tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes())
+        );
+
+        let mut again = http::HeaderMap::new();
+        http1_handshake(&mut again);
+        assert_ne!(again[http::header::SEC_WEBSOCKET_KEY], key.as_str());
     }
 }

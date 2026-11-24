@@ -9,6 +9,61 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a35 (2026-11-24)
+
+### Added
+
+- The daemon's edge reaches a detour over HTTP/2 for gRPC calls and over HTTP/1.1 for everything else, WebSockets included, chosen request by request, so a detour serves whatever its application serves. ([#875](https://github.com/muruhq/muru/issues/875))
+- Added `detours = true` in the daemon's `[daemon]` table, which lets a development run on the same machine serve an application through the daemon's routing as a release of kind `detour` for as long as it runs. A system daemon refuses the setting. ([#876](https://github.com/muruhq/muru/issues/876))
+- The daemon's edge leaves a detour's responses as its run made them: no error override or error page replaces them, so tracebacks reach the browser; a request has no deadline and its response may pause for up to an hour, so a breakpoint holds it; the run is never taken out of service for failing; and the WebSockets open through a detour close when it ends. ([#877](https://github.com/muruhq/muru/issues/877))
+- Added `muructl detour run`, development mode served through a local daemon's edge as a release of kind `detour` of the application, for as long as it runs: reload, the toolbar, tracebacks and `--single` work as under `muructl run`, the run serves on a Unix socket in its own directory with no port, it opens its detour again when the daemon restarts, and Ctrl-C ends it. The `[run]` table is read as `muructl run` reads it, its listener, TLS, `hosts` and `compression` keys not used. ([#878](https://github.com/muruhq/muru/issues/878))
+- Added `muructl detour traffic [DETOUR] preview|all|share=N|class=NAME` and `--traffic` on `muructl detour run`: a detour takes previews only by default, and the other choices are an overlay named `detour:APP` that the detour owns, listed by `muructl overlay list` with the source `detour` and ended with the detour. `all` and `share` wait for a rollout of the application to end. ([#879](https://github.com/muruhq/muru/issues/879))
+- Added `muructl detour preview [DETOUR]` and `--open-preview` on `muructl detour run`: a one-time entry link, valid for a minute, gives a browser a preview cookie carrying a secret the daemon made for the detour, and leads to the application's address; `--host`, `--list`, `--print` and `--header` give another host's link, a link for each address, a link to print, or the `Muru-Preview` header for curl. `/_muru/preview/leave` leaves preview, and a cookie of a detour that has ended is let go. ([#880](https://github.com/muruhq/muru/issues/880))
+- A detour's requests are counted under its release with the group `detour`, so they show in `muructl metrics`, the access log and the dashboard beside the application's, and conditions, rollout gates and the autoscaler leave them out. ([#881](https://github.com/muruhq/muru/issues/881))
+- Added `muructl detour list`, with `--json`, which lists a daemon's open detours with their application, release, label, pid, traffic and directory and never a secret; `muructl instance list --kind detour`, where a detour's run is listed with the tag `detour:` and its short ID, which `--instance` takes; and the MCP tools `detours`, which lists detours and gives an entry link with the `Muru-Preview` value, and `detour_traffic`. ([#882](https://github.com/muruhq/muru/issues/882))
+- `muructl detour traffic` takes `--for DURATION`, or `--until TIME` with `--timezone`, after which the detour goes back to preview on its own, as do the MCP `detour_traffic` tool with `for`; `detour list`, `release list` and the dashboard show when a timed choice ends. ([#891](https://github.com/muruhq/muru/issues/891))
+
+### Changed
+
+- The development toolbar's files and data moved under `/_muru/toolbar/`:
+  the script and stylesheet, each request's record and panels, the
+  summaries by ID and the history. A development run still reserves every
+  path under `/_muru/`, and answers any other path there with 404. ([#872](https://github.com/muruhq/muru/issues/872))
+- When a command could have reached more than one instance, its messages
+  listed every development run inline with its admin socket's path. They
+  now give the short `--instance` value `muructl instance list` shows, say
+  how many runs there are where there are several, and list candidates one
+  to a line, at most five, only where a choice is needed. ([#885](https://github.com/muruhq/muru/issues/885))
+
+### Fixed
+
+- `muructl command run` and `muructl exec` with no development run up
+  ignored `data_dir` in the run table and `muru.local.toml`, so a
+  migration run before the first `muructl run` used a different data
+  directory from the run's. They now use the same one. ([#859](https://github.com/muruhq/muru/issues/859))
+- `--instance` and `MURU_INSTANCE` reached only named instances, while
+  `muructl instance list` showed unnamed ones as `run:9080` or a daemon's
+  short ID. They now select a running instance by the name the list shows,
+  the start of its ID, its label or its application, and refuse an
+  ambiguous value with each candidate and what to pass for it. `--label` on
+  `muructl run`, `serve`, `daemon start`, `daemon run` and `up` sets the
+  label, a command that chose among several instances says which it
+  reached, and every MCP tool that reaches an instance takes an `instance`
+  argument.
+  A `muructl` command run inside an instance, such as by its web
+  application, reaches that instance unless told otherwise, and the tag
+  every process of an instance carries is now `MURU_INSTANCE_TAG`, so
+  `MURU_INSTANCE` only ever names the instance a person chose. ([#868](https://github.com/muruhq/muru/issues/868))
+- The edge takes the request ID a trusted proxy gives in `X-Request-ID`, of 1 to 200 visible ASCII characters, in place of one of its own, as the access log, error pages and the application's `muru.request_id` then show, so a proxy's records and Muru's match. ([#890](https://github.com/muruhq/muru/issues/890))
+- A WebSocket a client opens over HTTP/2, as a browser on HTTPS may, reaches an `http1` upstream, a managed HTTP release or a detour as the HTTP/1.1 handshake the server expects, where it was sent as a CONNECT and refused. ([#892](https://github.com/muruhq/muru/issues/892))
+- A gRPC call through an `h2c` or `h2` upstream reaches the server as the client made it: its request body streams, so client streaming and bidirectional calls are answered as they go, and `te: trailers` is kept, without which grpcio servers refused every call. ([#893](https://github.com/muruhq/muru/issues/893))
+
+### Security
+
+- Updated the url library the edge uses, through ammonia, to 2.5.9, for
+  RUSTSEC-2026-0592. ([#887](https://github.com/muruhq/muru/issues/887))
+
+
 ## 0.1.0a34 (2026-11-22)
 
 ### Added

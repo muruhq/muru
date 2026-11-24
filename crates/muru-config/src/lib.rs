@@ -1471,6 +1471,13 @@ pub struct Daemon {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub debug_exec: Option<bool>,
+    /// Let `muructl detour run` put a development run behind this
+    /// daemon's edge as a release of an application (section 9.13); off
+    /// unless set, read when the daemon starts, and refused by a system
+    /// daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub detours: Option<bool>,
     /// The node's budget across every application (section 7.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<Budget>,
@@ -5910,29 +5917,31 @@ fn check_instance_name(name: &str) -> Result<(), String> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RunSettings {
-    /// The HTTP port, or `auto`.
+    /// The HTTP port, or `auto`. Not used by a detour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = 8080))]
     pub port: Option<RunPort>,
-    /// Serve HTTPS beside HTTP.
+    /// Serve HTTPS beside HTTP. Not used by a detour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub https: Option<bool>,
-    /// Serve HTTPS alone, HTTP redirecting to it.
+    /// Serve HTTPS alone, HTTP redirecting to it. Not used by a detour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub https_only: Option<bool>,
-    /// The HTTPS port, or `auto`.
+    /// The HTTPS port, or `auto`. Not used by a detour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "`8443`, or `auto` when `port` is"))]
     pub https_port: Option<RunPort>,
-    /// A certificate chain to serve, relative to the project.
+    /// A certificate chain to serve, relative to the project. Not used
+    /// by a detour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_cert: Option<String>,
-    /// Its private key, relative to the project.
+    /// Its private key, relative to the project. Not used by a detour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_key: Option<String>,
-    /// Names the development certificate covers besides localhost.
+    /// Names the development certificate covers besides localhost. Not
+    /// used by a detour, which takes the daemon's host names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
     /// Reload on changes.
@@ -5976,6 +5985,7 @@ pub struct RunSettings {
     #[schemars(extend("x-default" = "`127.0.0.1:8081`; off under `--allow-public`"))]
     pub dashboard: Option<String>,
     /// Whether responses are compressed; `false` is `--no-compression`.
+    /// Not used by a detour, whose responses the daemon's edge compresses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = true))]
     pub compression: Option<bool>,

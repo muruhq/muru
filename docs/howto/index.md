@@ -13,6 +13,9 @@ Recipes for specific tasks, assuming you already know the basics. The
   framework's ASGI application.
 - [Settings for muructl run](run-settings.md): every setting of a
   development run, from flags or the project's `[tool.muru]` table.
+- [Develop behind a local daemon with a detour](detours.md): a
+  development run served through a daemon's routing as a release of the
+  application.
 - [Interpreters and environments](interpreters.md): the interpreter, the
   environment Muru builds with uv, and the runtime library.
 - [HTTPS in development](https.md): HTTPS and HTTP/2 with a local
@@ -143,6 +146,7 @@ flask-and-django
 asgi
 starlette-and-fastapi
 run-settings
+detours
 interpreters
 https
 mounts

@@ -60,7 +60,7 @@ def test_the_debugging_tutorial(tmp_path: Path) -> None:
         # panel, then one statement once the authors are joined.
 
         listed = page(server, "/")
-        assert b'<script src="/_muru/toolbar.js"' in listed.body
+        assert b'<script src="/_muru/toolbar/toolbar.js"' in listed.body
         first = record(server, listed)
         assert ["SELECT name FROM author WHERE id = ?", "7"] == statements(first)[0][:2]
 
@@ -74,7 +74,7 @@ def test_the_debugging_tutorial(tmp_path: Path) -> None:
         failing = server.get("/authors/4", headers=DOCUMENT)
         assert failing.status == 500
         assert b"Internal Server Error" in failing.body
-        assert b'<script src="/_muru/toolbar.js"' in failing.body
+        assert b'<script src="/_muru/toolbar/toolbar.js"' in failing.body
         failed = record(server, failing)
         errors = {value["name"]: value["value"] for value in panel(failed, "errors")["values"]}
         assert errors["answered"] == "the application answered 500 itself"
@@ -115,7 +115,7 @@ def test_the_debugging_tutorial(tmp_path: Path) -> None:
         )
         assert posted.status == 302
         page(server, "/")
-        entries = json.loads(server.get("/_muru/history").body)["entries"]
+        entries = json.loads(server.get("/_muru/toolbar/history").body)["entries"]
         steps = entries[0]["steps"]
         assert [(step["method"], step["target"]) for step in steps] == [
             ("POST", "/books"),
@@ -206,7 +206,9 @@ def record(server: support.Server, response: support.Response) -> dict[str, Any]
     deadline = time.monotonic() + 10
 
     while True:
-        found: dict[str, Any] = json.loads(server.get(f"/_muru/requests/{request_id}.json").body)
+        found: dict[str, Any] = json.loads(
+            server.get(f"/_muru/toolbar/requests/{request_id}.json").body
+        )
 
         if not found["in_progress"] and found["worker_part"] == "arrived":
             return found

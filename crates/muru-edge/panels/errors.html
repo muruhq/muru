@@ -29,7 +29,7 @@
 {%- if name == "stack" or name is startingwith("thread ") %}
 <tr><th>{{ name }}</th><td><pre{% if name == "stack" %} class="error"{% endif %}>{{ row.cells[1] }}</pre></td></tr>
 {%- elif name == "also reached" %}
-<tr><th>{{ name }}</th><td class="mono"><a href="/_muru/requests/{{ row.cells[1]|urlencode }}/panels/errors.html">{{ row.cells[1] }}</a></td></tr>
+<tr><th>{{ name }}</th><td class="mono"><a href="/_muru/toolbar/requests/{{ row.cells[1]|urlencode }}/panels/errors.html">{{ row.cells[1] }}</a></td></tr>
 {%- else %}
 <tr><th>{{ name }}</th><td>{{ row.cells[1] }}</td></tr>
 {%- endif %}

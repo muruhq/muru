@@ -57,6 +57,9 @@ pub struct ServeArgs {
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
 
+    #[command(flatten)]
+    pub label: crate::instances::LabelArgs,
+
     /// Where the application is served (default 0.0.0.0:8080).
     #[arg(long, value_name = "ADDRESS")]
     listen: Option<String>,
@@ -640,7 +643,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             }
 
             let settings = report(&layered, &mode);
-            crate::run_with(run_args, Some(mode), Some(settings)).await
+            crate::run_with(run_args, Some(mode), Some(settings), None).await
         }
         Err(error) => Err(error),
     };
