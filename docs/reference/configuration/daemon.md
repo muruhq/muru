@@ -45,17 +45,64 @@ An application's table and its releases.
 | --- | --- | --- | --- |
 | `access_log` | string | the `[logs]` table's | Which of the application's requests the access log writes, over the `[logs]` table's choice: `on`, `errors` or `off`. |
 | `access_log_exclude` | array of strings |  | Paths whose requests to the application the access log leaves out, besides those the `[logs]` table names. |
+| `concurrency` | integer | the source's, else 1000 | Requests an ASGI worker's event loop takes at once, for every release, over the source's. |
 | `data_dir` | string | STATE/data/APP | The application's data directory, shared by every release, an absolute path; its media and uploads parts are made in it. |
+| `env` | table of strings or tables, {ref}`[app.NAME.env.NAME] <config-daemon-app-name-env-name>` |  | Environment variables every release deployed after this is applied takes, over the source's `[tool.muru.env]` and under the release's own; a secret is given by reference, never by value. |
 | `group` | string | the user's primary group | The group, else the user's primary group. |
+| `max_lifetime` | string | the source's, else never | How long a worker lives before it is replaced, for every release, over the source's. |
+| `max_requests` | integer | the source's, else never | Requests a worker serves before it is replaced, for every release, over the source's. |
 | `media_dir` | string | `"media"` | The media part, the one part ever served, a relative one taken from `data_dir`. |
+| `memory` | table, {ref}`[app.NAME.memory] <config-daemon-app-name-memory>` |  | The memory policy for every release, each key over the source's. |
 | `priority` | integer | `0` | Which applications' scale-ups the node's budget admits first, the highest first. |
+| `processes` | integer | the source's, else 1 | Worker processes for every release, over the source's. |
 | `release` | table of tables, {ref}`[app.NAME.release.ID] <config-daemon-app-name-release-id>` |  | Releases by identifier. |
 | `schedule` | array of tables, {ref}`[[app.NAME.schedule]] <config-daemon-app-name-schedule>` |  | Scheduled capacity. |
 | `serving` | string | the last release in id order an apply adds, else the one that serves | The release that serves the application's traffic, a declared one or one the daemon has. The other releases an apply adds are started held, and naming a release the daemon has promotes it. |
 | `slow` | string | the `[logs]` table's | How slow one of the application's requests is to be written under `access_log = "errors"`. |
+| `sync_threads` | integer | the source's, else 8 | Threads for synchronous code called from an ASGI application, for every release, over the source's. |
+| `threads` | integer | the source's, else 4 | Application threads per worker for every release, over the source's. |
+| `timeouts` | table, {ref}`[app.NAME.timeouts] <config-daemon-app-name-timeouts>` |  | The host's timeouts for every release, each over the source's. |
 | `umask` | string | the daemon's own umask | The file creation mask, in octal, for example 027. |
 | `uploads_dir` | string | `"uploads"` | The uploads part, never served, a relative one taken from `data_dir`. |
 | `user` | string | the daemon's own user | The user the application's hosts and workers run as, when the daemon runs as root. |
+
+(config-daemon-app-name-env-name)=
+## `[app.NAME.env.NAME]`
+
+A secret reference in an `[env]` table.
+
+The same keys apply at `[app.NAME.release.ID.env.NAME]`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `as` | string | `"env"` | How the value is delivered: `env` as the variable, or `file` as a file only the release's user can read, whose path is in `NAME_FILE`. |
+| `secret` | table, {ref}`[app.NAME.env.NAME.secret] <config-daemon-app-name-env-name-secret>` | required | The store and key. |
+
+(config-daemon-app-name-env-name-secret)=
+## `[app.NAME.env.NAME.secret]`
+
+Which secret: a store declared in the daemon's file, and a key in it.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `key` | string | required | The key within the store. |
+| `store` | string | required | The store's name. |
+
+(config-daemon-app-name-memory)=
+## `[app.NAME.memory]`
+
+The `[memory]` table of a release or a `[tool.muru]` table: the limits a worker's memory is held to.
+
+The same keys apply at `[app.NAME.release.ID.memory]` and `[app.NAME.release.ID.groups.NAME.memory]`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `check_interval` | string | `"5s"` | How often memory is measured. |
+| `hard_limit` | string | off; under `muructl serve` with a memory limit, a share of it | Over this the worker leaves routing at once and is replaced, for example 1200MB. |
+| `measure` | string | `"uss"` | What is measured: uss (the default), pss or rss. `uss`: Unique set size: pages no other process shares, the default, since preloaded pages are shared copy-on-write. `pss`: Proportional set size: shared pages counted in proportion. `rss`: Resident set size: every resident page. |
+| `reclaim_first` | boolean | `true` | Whether to collect garbage and trim the heap before recycling over the soft limit. |
+| `soft_for` | string | `"2m"` | How long the worker may stay over the soft limit. |
+| `soft_limit` | string |  | Over this for soft_for, the worker reclaims and then recycles, for example 800MB; off when absent. |
 
 (config-daemon-app-name-release-id)=
 ## `[app.NAME.release.ID]`
@@ -74,7 +121,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `concurrency` | integer | `1000` | Requests an ASGI worker's event loop takes at once. |
 | `cwd` | string | `source` | The directory an `http` release's command runs in; `source` when absent, and one of the two is required. A relative path is taken from the file's directory. |
 | `entrypoint` | string | the source's `[tool.muru]` | The application as module:callable, else from the source's `[tool.muru]` table. |
-| `env` | table of strings or tables, {ref}`[app.NAME.release.ID.env.NAME] <config-daemon-app-name-release-id-env-name>` |  | Environment variables for the workers: a value, or a secret reference resolved when the release starts. |
+| `env` | table of strings or tables, {ref}`[app.NAME.env.NAME] <config-daemon-app-name-env-name>` |  | Environment variables for the workers: a value, or a secret reference resolved when the release starts. |
 | `error_override` | table, {ref}`[error_override] <config-daemon-error-override>` |  | Replace the application's own error responses with error pages. |
 | `error_pages` | table of tables, {ref}`[error_pages.STATUS] <config-daemon-error-pages-status>` |  | Custom error pages, by status or status:reason. |
 | `factory` | boolean | `false` | Whether the entrypoint is a factory. |
@@ -94,7 +141,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `max_body_size` | string | the host's, else `max_body_size` in `[limits]` | The largest body of a request the release serves, for example 50MB, which the edge enforces. |
 | `max_lifetime` | string |  | How long a worker lives before it is replaced, for example 1h, with jitter; off when absent. |
 | `max_requests` | integer |  | Requests a worker serves before it is replaced, with jitter; off when absent. |
-| `memory` | table, {ref}`[app.NAME.release.ID.memory] <config-daemon-app-name-release-id-memory>` |  | The memory policy for the workers. |
+| `memory` | table, {ref}`[app.NAME.memory] <config-daemon-app-name-memory>` |  | The memory policy for the workers. |
 | `mounts` | table of tables, {ref}`[app.NAME.release.ID.mounts.NAME] <config-daemon-app-name-release-id-mounts-name>` |  | Mounts by name. |
 | `preload` | string | `"auto"` | Whether the application is imported once, in the host, before the workers are forked from it. `auto`: Preload when the import check passes, otherwise import per worker. `true`: Preload, and fail the release when the import check does not pass. `false`: Import in every worker. |
 | `preload_modules` | array of strings |  | Modules the host imports after the entrypoint and the mounts, so they are loaded once before the fork; when given, they replace the list in the source's `[tool.muru]` table. |
@@ -105,7 +152,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `reflection` | boolean | `false` | Serve gRPC server reflection for the services the release's gRPC mounts register (default false). |
 | `scaling` | table, {ref}`[app.NAME.release.ID.scaling] <config-daemon-app-name-release-id-scaling>` |  | How the default group is scaled; static when absent. |
 | `sendfile_header` | string |  | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile` for the frameworks that send that one. |
-| `sendfile_roots` | array of strings |  | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. A relative path is taken from the release's `source`. |
+| `sendfile_roots` | array of strings |  | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. `source:SUBDIR`, or a relative path, is taken from the release's `source`, and `media:SUBDIR` from the media part. |
 | `source` | string |  | The source directory. A relative path is taken from the file's directory. Required by `muructl apply` for a `workers` release. |
 | `static` | array of tables, {ref}`[[app.NAME.release.ID.static]] <config-daemon-app-name-release-id-static>` |  | The application's own static directories, served by the edge from the release's source, which is the project directory under `muructl run`. |
 | `stop_signal` | string | the profile's, `TERM` | The signal that stops an `http` release's instance gracefully: TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. Required by the generic profile; the other profiles know their server's. |
@@ -171,26 +218,6 @@ When the daemon runs a command by itself.
 | `secret_inputs` | table of strings |  | Inputs taken from one of the daemon's secret stores, by name, each as STORE/KEY. |
 | `timezone` | string | the system's | The IANA time zone `cron` is read in. |
 
-(config-daemon-app-name-release-id-env-name)=
-## `[app.NAME.release.ID.env.NAME]`
-
-A secret reference in an `[env]` table.
-
-| Key | Type | Default | Description |
-| --- | --- | --- | --- |
-| `as` | string | `"env"` | How the value is delivered: `env` as the variable, or `file` as a file only the release's user can read, whose path is in `NAME_FILE`. |
-| `secret` | table, {ref}`[app.NAME.release.ID.env.NAME.secret] <config-daemon-app-name-release-id-env-name-secret>` | required | The store and key. |
-
-(config-daemon-app-name-release-id-env-name-secret)=
-## `[app.NAME.release.ID.env.NAME.secret]`
-
-Which secret: a store declared in the daemon's file, and a key in it.
-
-| Key | Type | Default | Description |
-| --- | --- | --- | --- |
-| `key` | string | required | The key within the store. |
-| `store` | string | required | The store's name. |
-
 (config-daemon-app-name-release-id-groups-name)=
 ## `[app.NAME.release.ID.groups.NAME]`
 
@@ -203,7 +230,7 @@ A worker group, the `[app.NAME.release.ID.groups.NAME]` or `[tool.muru.groups.NA
 | `max_body_size` | string | the release's | The largest body of a request the group serves, for example 200MB, which the edge enforces. |
 | `max_lifetime` | string | the release's | How long a worker of the group lives before it is replaced, for example 1h, with jitter. |
 | `max_requests` | integer | the release's | Requests a worker of the group serves before it is replaced, with jitter. |
-| `memory` | table, {ref}`[app.NAME.release.ID.memory] <config-daemon-app-name-release-id-memory>` |  | The group's own memory policy, each key the release's when absent. |
+| `memory` | table, {ref}`[app.NAME.memory] <config-daemon-app-name-memory>` |  | The group's own memory policy, each key the release's when absent. |
 | `mounts` | array of strings |  | The named mounts the group's workers serve, beside the default mount, which every worker serves; every mount when absent. The group's paths must lie within them. |
 | `optional` | boolean | `false` | Whether the release is ready without the group's workers: its requests wait until one listens. |
 | `paths` | array of strings |  | Path prefixes, with an optional trailing `*`; the most specific match across all groups wins. |
@@ -234,22 +261,6 @@ One instrumentation module of a release: a tool such as an import timer or an AP
 | `module` | string | required | The module, as a dotted Python module name. |
 | `settings` | table |  | The settings its `configure` function is given, as a table of any values. |
 
-(config-daemon-app-name-release-id-memory)=
-## `[app.NAME.release.ID.memory]`
-
-The `[memory]` table of a release or a `[tool.muru]` table: the limits a worker's memory is held to.
-
-The same keys apply at `[app.NAME.release.ID.groups.NAME.memory]`.
-
-| Key | Type | Default | Description |
-| --- | --- | --- | --- |
-| `check_interval` | string | `"5s"` | How often memory is measured. |
-| `hard_limit` | string | off; under `muructl serve` with a memory limit, a share of it | Over this the worker leaves routing at once and is replaced, for example 1200MB. |
-| `measure` | string | `"uss"` | What is measured: uss (the default), pss or rss. `uss`: Unique set size: pages no other process shares, the default, since preloaded pages are shared copy-on-write. `pss`: Proportional set size: shared pages counted in proportion. `rss`: Resident set size: every resident page. |
-| `reclaim_first` | boolean | `true` | Whether to collect garbage and trim the heap before recycling over the soft limit. |
-| `soft_for` | string | `"2m"` | How long the worker may stay over the soft limit. |
-| `soft_limit` | string |  | Over this for soft_for, the worker reclaims and then recycles, for example 800MB; off when absent. |
-
 (config-daemon-app-name-release-id-mounts-name)=
 ## `[app.NAME.release.ID.mounts.NAME]`
 
@@ -269,7 +280,7 @@ A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` ta
 | `max_connections` | integer |  | Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; each holds a request slot when absent. |
 | `path` | string |  | The path prefix; the longest wins, on segment boundaries. A gRPC mount has none: its calls are matched by service name. |
 | `sendfile_header` | string | the release's | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
-| `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served; the release's when absent, and an empty list refuses every hint. A relative path is taken from the release's source directory. |
+| `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served; the release's when absent, and an empty list refuses every hint. `source:SUBDIR`, or a relative path, is taken from the release's source directory, and `media:SUBDIR` from the media part. |
 | `threads` | integer or table, {ref}`[app.NAME.release.ID.mounts.NAME.threads] <config-daemon-app-name-release-id-mounts-name-threads>` |  | Threads of the mount's own, for a WSGI or gRPC mount; it shares the worker's pool when absent. |
 | `tracing_middleware` | boolean | `false` | Wrap the mount's application in wrapture's request middleware when tracing is on, so each request records as one tree. For an application no framework instrumentation records requests for. |
 
@@ -329,7 +340,7 @@ A directory of an application's own files, an entry of the `[[tool.muru.static]]
 | --- | --- | --- | --- |
 | `cache` | table, {ref}`[route.cache] <config-daemon-route-cache>` |  | The cache headers files are sent with. |
 | `case` | string | `"strict"` | `strict` (the default), which matches names as they are on disk, or `insensitive`. |
-| `dir` | string | required | The directory: relative to the source directory, absolute, `static:` for the release's built static files or `media:` for the application's media part, each with an optional directory inside it after the colon. |
+| `dir` | string | required | The directory: `source:` for the release's source directory, `static:` for the release's built static files or `media:` for the application's media part, each with an optional directory inside it after the colon; or a path, absolute, or relative to the source directory as `source:` is. |
 | `fallback` | string |  | The file served for paths with no file of their own, for a single-page application under the prefix. |
 | `index` | array of strings | `["index.html"]` | The files tried, in order, when a directory is requested. |
 | `path` | string | required | The path prefix, such as `/static/`; the longest wins, on segment boundaries, and `/` is not allowed, since every path would then be looked up as a file first. |
@@ -377,6 +388,22 @@ An `[[app.NAME.schedule]]` entry: capacity for a window, shorthand for an overla
 | `start` | string |  | A one-off window's start, as for an overlay's schedule. |
 | `timezone` | string | the daemon's system time zone | The time zone of local times. |
 | `warm_up` | string |  | How long before each window the floor applies, such as 30m. |
+
+(config-daemon-app-name-timeouts)=
+## `[app.NAME.timeouts]`
+
+The host's timeouts an application's table sets for its releases: those of a release's `timeouts` table that a deploy flag can set, and not the limits on the requests the edge serves, which belong to a release, a route or a virtual host.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `exit_grace` | string |  | How long a worker has for its shutdown work. |
+| `gil_stall_timeout` | string |  | How long a worker may go with no thread running Python before it is replaced. |
+| `hard_drain_grace` | string |  | How long a worker being replaced is given to finish its other requests before it is told to stop. |
+| `hard_timeout` | string |  | How long a request may run in a worker before the worker is replaced. |
+| `loop_stall_timeout` | string |  | How long an ASGI worker's event loop may go without running before the worker is replaced. |
+| `shutdown_timeout` | string |  | How long a worker told to stop is given before it is killed. |
+| `soft_timeout` | string |  | How long a request may run in a worker before it is interrupted by raising `muru.RequestTimeout` in its thread. |
+| `websocket_drain_grace` | string |  | How long a worker told to stop keeps its open WebSockets. |
 
 (config-daemon-client-class)=
 ## `[[client_class]]`

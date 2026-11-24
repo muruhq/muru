@@ -2126,6 +2126,7 @@ impl Admin for Service {
         list_apps(pb::ListAppsRequest) -> pb::ListAppsResponse, "muructl app";
         get_app(pb::GetAppRequest) -> pb::App, "muructl app";
         remove_app(pb::RemoveAppRequest) -> pb::RemoveReleasesResponse, "muructl app remove";
+        set_app_settings(pb::SetAppSettingsRequest) -> pb::AppSettings, "muructl app set";
         deploy(pb::DeployRequest) -> pb::Release, "muructl deploy";
         plan_deploy(pb::DeployRequest) -> pb::DeployPlan, "muructl deploy";
         list_releases(pb::ListReleasesRequest) -> pb::ListReleasesResponse, "muructl release";

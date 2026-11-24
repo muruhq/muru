@@ -24,6 +24,7 @@ mod places;
 mod print_config;
 mod processes;
 mod project_commands;
+mod proto;
 mod provision;
 mod pstats;
 mod render;
@@ -338,6 +339,14 @@ enum Command {
     Mcp {
         #[command(subcommand)]
         command: mcp::McpCommand,
+    },
+
+    /// The admin API's .proto files this muructl was built from, for a
+    /// client that generates its own stubs: write them out, check a copy,
+    /// print or list them.
+    Proto {
+        #[command(subcommand)]
+        command: proto::ProtoCommand,
     },
 
     /// Serve a directory of files with no configuration,
@@ -745,6 +754,15 @@ struct RunArgs {
     #[arg(long)]
     no_timestamps: bool,
 
+    /// Trace this run with wrapture, with the configuration wrapture
+    /// finds itself, over the settings files' tracing.
+    #[arg(long, conflicts_with = "no_tracing")]
+    tracing: bool,
+
+    /// No tracing for this run, over settings files that turn it on.
+    #[arg(long)]
+    no_tracing: bool,
+
     /// Serve an address other than loopback. Development behaviours are
     /// then off (no tracebacks in error pages, the 10MB body limit, no
     /// dashboard unless asked for), but this is still not the supported
@@ -820,8 +838,9 @@ struct RunArgs {
     single: bool,
 
     /// A directory of the application's own files the edge serves under
-    /// a path prefix, as PREFIX=DIR with DIR relative to the project,
-    /// over the [[tool.muru.static]] entries by prefix. Repeatable.
+    /// a path prefix, as PREFIX=DIR, with DIR source:SUBDIR or relative
+    /// for a directory in the project, static: or media:, over the
+    /// [[tool.muru.static]] entries by prefix. Repeatable.
     #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = parse_static_setting)]
     static_dirs: Vec<(String, String)>,
 
@@ -1348,6 +1367,13 @@ fn main() -> anyhow::Result<()> {
                     admin::app_list(socket, output.json).await
                 }
                 admin::AppCommand::Remove(args) => admin::app_remove(*args).await,
+                admin::AppCommand::Set(args) => admin::app_set(*args).await,
+                admin::AppCommand::Unset(args) => admin::app_unset(*args).await,
+                admin::AppCommand::Show {
+                    app,
+                    socket,
+                    output,
+                } => admin::app_show(app, socket, output.json).await,
             }
         }),
         Command::Data {
@@ -1485,6 +1511,7 @@ fn main() -> anyhow::Result<()> {
         Command::Websockets(args) => runtime.block_on(admin::websockets(args)),
         Command::Requests(args) => runtime.block_on(admin::requests(args)),
         Command::Mcp { command } => runtime.block_on(mcp::run(command)),
+        Command::Proto { command } => proto::run(command),
         Command::Exec(args) => exit_with(runtime, admin::exec(args)),
         Command::Commands {
             command: admin::CommandCommand::List(args),
@@ -1611,7 +1638,7 @@ pub(crate) fn apply_timeouts(limits: &mut muru_edge::Limits, timeouts: &[(String
 pub(crate) fn parse_static_setting(text: &str) -> Result<(String, String), String> {
     let (prefix, directory) = text
         .split_once('=')
-        .ok_or_else(|| format!("{text:?} is not PREFIX=DIR, for example /static/=static"))?;
+        .ok_or_else(|| format!("{text:?} is not PREFIX=DIR, for example /static/=source:static"))?;
     let entry = muru_config::StaticDir {
         path: prefix.trim().to_owned(),
         dir: directory.trim().to_owned(),
@@ -2174,8 +2201,8 @@ struct Resolved {
     /// The instrumentation modules (section 6.15): muru.local.toml's,
     /// then the table's.
     instrumentation: Vec<muru_config::Instrumentation>,
-    /// `tracing` (section 11.6) as written: muru.local.toml's, else the
-    /// table's.
+    /// `tracing` (section 11.6) as written: a flag's, else
+    /// muru.local.toml's, else a run table's, else the table's.
     tracing: Option<muru_config::Tracing>,
     /// The muru.local.toml `tracing` came from, when it came from one.
     tracing_from_local: Option<PathBuf>,
@@ -2432,11 +2459,24 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     // Section 11.6: tracing is set up by a module of Muru's own, at the
-    // head of the list the host is given. muru.local.toml's tracing takes
-    // the place of the project's, for this machine's runs.
+    // head of the list the host is given. The flags, then muru.local.toml's
+    // tracing, then the run tables (muru.local.toml's over the project's)
+    // take the place of the project's tracing, for runs alone.
 
-    let tracing_from_local = local_tracing.is_some().then(|| local.clone()).flatten();
-    let tracing = local_tracing.or_else(|| table.tracing.clone());
+    let tracing_flag = match (args.tracing, args.no_tracing) {
+        (true, _) => Some(muru_config::Tracing::Enabled(true)),
+        (_, true) => Some(muru_config::Tracing::Enabled(false)),
+        _ => None,
+    };
+
+    let tracing_from_local = (tracing_flag.is_none() && local_tracing.is_some())
+        .then(|| local.clone())
+        .flatten();
+    let tracing = tracing_flag
+        .or(local_tracing)
+        .or_else(|| local_run.tracing.clone())
+        .or_else(|| run_table.tracing.clone())
+        .or_else(|| table.tracing.clone());
 
     let tracing_entry = muru_config::tracing_instrumentation(
         tracing.as_ref(),
@@ -3131,7 +3171,6 @@ fn interpreter(
         flag: if built { None } else { args.python.as_deref() },
         table: resolved.python.as_deref(),
         project: &resolved.project,
-        previous: None,
         always: false,
         uv: uv.as_ref(),
         isolation: &isolation,

@@ -8490,7 +8490,7 @@ impl Daemon {
                                 .spec
                                 .static_dirs
                                 .iter()
-                                .filter_map(|entry| entry.message(&places))
+                                .filter_map(|entry| entry.message(&release.spec.source, &places))
                                 .collect()
                         })
                         .unwrap_or_default(),

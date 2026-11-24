@@ -253,6 +253,40 @@ def test_print_config_says_where_each_setting_came_from(tmp_path: Path) -> None:
     assert "listener" not in document and "app" not in document
 
 
+def test_the_run_table_turns_tracing_on_for_runs_alone(tmp_path: Path) -> None:
+    # The run table's tracing takes the place of the project's for a run;
+    # muru.local.toml's, then a flag, take the place of the run table's.
+
+    directory = project(tmp_path / "project", "tracing = true\n")
+    pyproject = directory / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text().replace("[tool.muru.run]", "tracing = false\n\n[tool.muru.run]")
+    )
+
+    def tracing(*flags: str) -> tuple[str, str]:
+        completed = subprocess.run(
+            [str(muructl()), "run", str(directory), "--print-config", *flags],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        lines = [line for line in completed.stdout.splitlines() if line.startswith("tracing = ")]
+        assert len(lines) == 1, completed.stdout
+        value, source = lines[0].removeprefix("tracing = ").split("# ", 1)
+        return value.strip(), source
+
+    assert tracing() == ("true", f"[tool.muru.run] in {pyproject}")
+
+    local = directory / "muru.local.toml"
+    local.write_text("[run]\ntracing = false\n")
+    assert tracing() == ("false", f"[run] in {local}")
+
+    local.write_text("tracing = false\n")
+    assert tracing() == ("false", str(local))
+    assert tracing("--tracing") == ("true", "command line")
+
+
 def test_mistakes_name_the_file_they_are_in(tmp_path: Path) -> None:
     directory = project(tmp_path / "project", "port = 'free'\n")
     refused = subprocess.run(

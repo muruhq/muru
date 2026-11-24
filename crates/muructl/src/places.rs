@@ -219,7 +219,7 @@ pub fn static_directory(
         .map_err(anyhow::Error::msg)?;
 
     let within = match place {
-        Place::Path(_) => None,
+        Place::Path(_) | Place::Source(_) => None,
         Place::Media(_) => Some(Within::Media),
         Place::Static(_) => Some(Within::Static),
     };

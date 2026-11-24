@@ -417,7 +417,7 @@ def test_hints_from_a_release_and_a_trusted_upstream_under_the_daemon(
         # The applied keys round-trip through the export.
 
         exported = daemon.muructl("config", "export").stdout
-        assert f'sendfile_roots = [\n    "{files}",\n    "reports",\n]' in exported
+        assert f'sendfile_roots = [\n    "{files}",\n    "source:reports",\n]' in exported
         assert 'sendfile_header = "X-Sendfile"' in exported
 
         config = tmp_path / "upstreams.toml"

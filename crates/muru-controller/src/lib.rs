@@ -6,6 +6,7 @@
 //! in the daemon (ADR 0002).
 
 pub mod api;
+pub mod app_settings;
 pub mod budget;
 pub mod cache;
 pub mod catalogue;

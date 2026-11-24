@@ -11,10 +11,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from support import server as support
-from support.daemon import Daemon, start_daemon
-
-RELEASES = support.ROOT / "docs" / "tutorials" / "code" / "releases"
+from support.daemon import Daemon, start_daemon, tutorial_site
 
 
 def greeting(daemon: Daemon) -> str:
@@ -24,7 +21,9 @@ def greeting(daemon: Daemon) -> str:
 
 
 def test_the_deploy_and_roll_back_tutorial(tmp_path: Path) -> None:
-    daemon = start_daemon(tmp_path)
+    releases = tutorial_site(tmp_path)
+    (tmp_path / "daemon").mkdir()
+    daemon = start_daemon(tmp_path / "daemon")
 
     try:
         # Start the daemon: with nothing deployed, every request is 503.
@@ -35,7 +34,7 @@ def test_the_deploy_and_roll_back_tutorial(tmp_path: Path) -> None:
 
         # Deploy the first release.
 
-        out = daemon.deploy("hello", RELEASES / "v1", "--entrypoint", "app:application")
+        out = daemon.deploy("hello", releases / "v1")
         assert out == "muru: release hello@r1 is ready and serving"
         assert greeting(daemon) == "Hello from hello@r1\n"
         assert "traffic.switched" in daemon.events()
@@ -43,7 +42,7 @@ def test_the_deploy_and_roll_back_tutorial(tmp_path: Path) -> None:
         # A release that fails leaves the first one serving, and its log
         # says why.
 
-        failed = daemon.muructl("deploy", "hello", str(RELEASES / "v2"), check=False)
+        failed = daemon.muructl("deploy", "hello", str(releases / "v2"), check=False)
         assert failed.returncode == 1
         assert "before its workers were ready: cannot load" in failed.stderr
         assert "KeyError: 'GREETING'" in failed.stderr
@@ -69,7 +68,7 @@ def test_the_deploy_and_roll_back_tutorial(tmp_path: Path) -> None:
         runner.start()
 
         try:
-            out = daemon.muructl("deploy", "hello", str(RELEASES / "v3")).stdout.strip()
+            out = daemon.muructl("deploy", "hello", str(releases / "v3")).stdout.strip()
         finally:
             stop.set()
             runner.join()
@@ -101,14 +100,14 @@ def test_the_deploy_and_roll_back_tutorial(tmp_path: Path) -> None:
 
         daemon.stop(shutdown=False)
         assert greeting(daemon) == "Hello from hello@r1\n"
-        daemon = start_daemon(tmp_path, run_dir=daemon.run_dir, port=daemon.port)
+        daemon = start_daemon(tmp_path / "daemon", run_dir=daemon.run_dir, port=daemon.port)
         assert greeting(daemon) == "Hello from hello@r1\n"
         assert "release.adopted" in daemon.events()
 
         # Clean up: after a shutdown, the next start serves r1 again.
 
         daemon.stop()
-        daemon = start_daemon(tmp_path, run_dir=daemon.run_dir, port=daemon.port)
+        daemon = start_daemon(tmp_path / "daemon", run_dir=daemon.run_dir, port=daemon.port)
         daemon.muructl("release", "wait", "hello@r1")
         assert greeting(daemon) == "Hello from hello@r1\n"
     finally:

@@ -33,6 +33,7 @@ slow = "500ms"
 dashboard = "127.0.0.1:8082"    # or "off"
 compression = false
 toolbar = true                  # the debug toolbar on HTML pages
+tracing = true                  # tracing with wrapture, for runs alone
 timestamps = true               # the full UTC time in front of every line
 env_file = ".env"               # variables the run starts with
 data_dir = "/srv/shop-dev"      # the data directory, kept between runs
@@ -41,7 +42,8 @@ data_dir = "/srv/shop-dev"      # the data directory, kept between runs
 In a `muru.toml` the same keys go in a `[run]` table at the top level.
 Each key is a flag of `muructl run`, named in snake case and taking the
 same values; `compression = false` stands for `--no-compression`,
-`--no-toolbar` turns a table's `toolbar = true` off for one run, and
+`--no-toolbar` turns a table's `toolbar = true` off for one run,
+`--no-tracing` turns a table's `tracing` off for one run, and
 `--no-timestamps` turns a table's `timestamps = true` off for one run. With
 the table above, `muructl run` on its own is the whole command in place
 of:
@@ -276,9 +278,9 @@ takes. Settings that are not usable, such as a file that does not parse,
 leave the current release serving, and the terminal says why.
 
 The run table's settings (the port, HTTPS, the dashboard, the reload
-patterns, the access log, the toolbar and the rest), `python` and the
-limits on a request (`max_body_size` and the request timeouts) apply only
-as the run starts. A change to one of them is named on a line of its own,
+patterns, the access log, the toolbar and the rest, apart from
+`tracing`), `python` and the limits on a request (`max_body_size` and the
+request timeouts) apply only as the run starts. A change to one of them is named on a line of its own,
 once, against the file it changed in, and the run keeps the value it
 started with until it is restarted:
 

@@ -23,7 +23,7 @@ repos:
         name: text users see names no design section, phase or ADR
         entry: uv run python scripts/check-user-text.py
         language: system
-        types_or: [python, rust]
+        types_or: [python, rust, proto]
 
       - id: user-docs
         stages: [pre-commit]

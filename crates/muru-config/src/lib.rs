@@ -405,8 +405,9 @@ pub struct Mount {
     pub cgi_local_redirect: Option<bool>,
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the file to be served (section 4.9); the release's
-    /// when absent, and an empty list refuses every hint. A relative
-    /// path is taken from the release's source directory.
+    /// when absent, and an empty list refuses every hint. `source:SUBDIR`,
+    /// or a relative path, is taken from the release's source directory,
+    /// and `media:SUBDIR` from the media part.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "the release's"))]
     pub sendfile_roots: Option<Vec<String>>,
@@ -1092,8 +1093,9 @@ pub struct Release {
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the file to be served (section 4.9), for the default
     /// mount and any mount that does not say otherwise; with none every
-    /// hint is refused. A relative path is taken from the release's
-    /// `source`.
+    /// hint is refused. `source:SUBDIR`, or a relative path, is taken
+    /// from the release's `source`, and `media:SUBDIR` from the media
+    /// part.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sendfile_roots: Vec<String>,
     /// A second response header honoured as `X-Muru-Sendfile` is, such
@@ -4186,10 +4188,11 @@ pub struct StaticDir {
     /// boundaries, and `/` is not allowed, since every path would then
     /// be looked up as a file first.
     pub path: String,
-    /// The directory: relative to the source directory, absolute,
+    /// The directory: `source:` for the release's source directory,
     /// `static:` for the release's built static files or `media:` for
     /// the application's media part, each with an optional directory
-    /// inside it after the colon.
+    /// inside it after the colon; or a path, absolute, or relative to the
+    /// source directory as `source:` is.
     pub dir: String,
     /// The files tried, in order, when a directory is requested.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -5170,7 +5173,7 @@ pub fn check_sendfile(roots: &[String], header: Option<&str>) -> Result<(), Stri
                      which a [[tool.muru.static]] entry serves"
                 ));
             }
-            places::Place::Media(_) | places::Place::Path(_) => {}
+            places::Place::Media(_) | places::Place::Path(_) | places::Place::Source(_) => {}
         }
     }
 
@@ -5196,9 +5199,9 @@ pub fn check_sendfile(roots: &[String], header: Option<&str>) -> Result<(), Stri
 }
 
 /// Where a release's `sendfile_roots` entry is (section 4.9): an
-/// absolute one as it is written, a relative one in the release's source
-/// directory, and `media:` in the application's media part (issue 849),
-/// or nowhere when it has none.
+/// absolute one as it is written, a relative one or `source:` in the
+/// release's source directory (issue 900), and `media:` in the
+/// application's media part (issue 849), or nowhere when it has none.
 pub fn sendfile_root(
     root: &str,
     source: &std::path::Path,
@@ -5213,6 +5216,11 @@ pub fn sendfile_root(
             }
         }),
         Ok(places::Place::Static(_)) | Err(_) => None,
+        Ok(places::Place::Source(rest)) => Some(if rest.is_empty() {
+            source.to_path_buf()
+        } else {
+            source.join(rest)
+        }),
         Ok(places::Place::Path(_)) => {
             let path = std::path::Path::new(root);
 
@@ -5261,15 +5269,17 @@ pub fn worker_root_paths(
     paths
 }
 
-/// Check that each relative `sendfile_roots` entry is a directory in the
-/// release's source (section 4.9), as a static entry's directory must be:
-/// a root that travels with the project is part of the release. An
-/// absolute root is the operator's, and may be made or mounted later.
+/// Check that each relative or `source:` `sendfile_roots` entry is a
+/// directory in the release's source (section 4.9), as a static entry's
+/// directory must be: a root that travels with the project is part of the
+/// release. An absolute root is the operator's, and may be made or
+/// mounted later.
 pub fn check_sendfile_dirs(roots: &[String], source: &std::path::Path) -> Result<(), String> {
-    for root in roots.iter().filter(|root| {
-        !root.starts_with('/') && matches!(places::Place::parse(root), Ok(places::Place::Path(_)))
+    for (root, within) in roots.iter().filter_map(|root| {
+        let within = places::Place::parse(root).ok()?.in_source()?;
+        Some((root, within))
     }) {
-        let path = source.join(root);
+        let path = source.join(within);
 
         if !path.is_dir() {
             return Err(format!(
@@ -5426,6 +5436,84 @@ pub struct App {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "uploads"))]
     pub uploads_dir: Option<String>,
+    /// Environment variables every release deployed after this is
+    /// applied takes, over the source's `[tool.muru.env]` and under the
+    /// release's own; a secret is given by reference, never by value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvValue>,
+    /// Worker processes for every release, over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 1"))]
+    pub processes: Option<usize>,
+    /// Application threads per worker for every release, over the
+    /// source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 4"))]
+    pub threads: Option<usize>,
+    /// Threads for synchronous code called from an ASGI application, for
+    /// every release, over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 8"))]
+    pub sync_threads: Option<usize>,
+    /// Requests an ASGI worker's event loop takes at once, for every
+    /// release, over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 1000"))]
+    pub concurrency: Option<usize>,
+    /// Requests a worker serves before it is replaced, for every release,
+    /// over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else never"))]
+    pub max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced, for every release,
+    /// over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else never"))]
+    pub max_lifetime: Option<String>,
+    /// The host's timeouts for every release, each over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<HostTimeouts>,
+    /// The memory policy for every release, each key over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
+}
+
+/// The host's timeouts an application's table sets for its releases:
+/// those of a release's `timeouts` table that a deploy flag can set, and
+/// not the limits on the requests the edge serves, which belong to a
+/// release, a route or a virtual host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostTimeouts {
+    /// How long a request may run in a worker before it is interrupted
+    /// by raising `muru.RequestTimeout` in its thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_timeout: Option<String>,
+    /// How long a request may run in a worker before the worker is
+    /// replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_timeout: Option<String>,
+    /// How long a worker being replaced is given to finish its other
+    /// requests before it is told to stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_drain_grace: Option<String>,
+    /// How long a worker told to stop is given before it is killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_timeout: Option<String>,
+    /// How long a worker told to stop keeps its open WebSockets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket_drain_grace: Option<String>,
+    /// How long a worker has for its shutdown work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_grace: Option<String>,
+    /// How long an ASGI worker's event loop may go without running
+    /// before the worker is replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_stall_timeout: Option<String>,
+    /// How long a worker may go with no thread running Python before it
+    /// is replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gil_stall_timeout: Option<String>,
 }
 
 /// The `[metrics]` table (section 11.1): where the daemon serves the
@@ -5998,6 +6086,11 @@ pub struct RunSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub timestamps: Option<bool>,
+    /// Tracing with wrapture for `muructl run`, as a boolean or a table
+    /// with `config`, in place of the project's `tracing`. The daemon and
+    /// `muructl serve` take the project's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracing: Option<Tracing>,
     /// A `.env` file whose variables the run starts with, relative to the
     /// project. Its values override `[tool.muru.env]`. None is read unless
     /// this names one.
@@ -6048,6 +6141,7 @@ impl RunSettings {
             compression: over.compression.or(self.compression),
             toolbar: over.toolbar.or(self.toolbar),
             timestamps: over.timestamps.or(self.timestamps),
+            tracing: over.tracing.clone().or_else(|| self.tracing.clone()),
             env_file: over.env_file.clone().or_else(|| self.env_file.clone()),
             data_dir: over.data_dir.clone().or_else(|| self.data_dir.clone()),
         }
@@ -6434,8 +6528,9 @@ pub struct ToolMuru {
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the file to be served (section 4.9), for the default
     /// mount and any mount that does not say otherwise; with none every
-    /// hint is refused. A relative path is taken from the project's
-    /// directory, the release's source.
+    /// hint is refused. `source:SUBDIR`, or a relative path, is taken
+    /// from the project's directory, the release's source, and
+    /// `media:SUBDIR` from the media part.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sendfile_roots: Vec<String>,
     /// A second response header honoured as `X-Muru-Sendfile` is, such
@@ -8006,6 +8101,31 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(error.starts_with("tracing: "), "{error}");
 
         assert_eq!(parse_local("", None).unwrap().tracing, None);
+    }
+
+    #[test]
+    fn the_run_table_takes_tracing_and_the_local_run_table_wins() {
+        let table = parse_muru_toml("[run]\ntracing = true\n").unwrap();
+        let run = table.run.unwrap();
+        assert_eq!(run.tracing, Some(Tracing::Enabled(true)));
+
+        let table = parse_muru_toml("[run.tracing]\nconfig = 'dev.toml'\n").unwrap();
+        assert_eq!(
+            table.run.unwrap().tracing,
+            Some(Tracing::Settings(TracingSettings {
+                config: Some("dev.toml".to_owned())
+            }))
+        );
+
+        let off = RunSettings {
+            tracing: Some(Tracing::Enabled(false)),
+            ..RunSettings::default()
+        };
+        assert_eq!(run.layered(&off).tracing, Some(Tracing::Enabled(false)));
+        assert_eq!(
+            run.layered(&RunSettings::default()).tracing,
+            Some(Tracing::Enabled(true))
+        );
     }
 
     #[test]

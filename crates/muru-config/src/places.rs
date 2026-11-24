@@ -3,7 +3,8 @@
 //! data directory, shared by every release, with the media and uploads
 //! parts Muru makes in it, and each release's own directory of built
 //! static files; and the `media:` and `static:` forms that name them in
-//! `sendfile_roots`, a static entry's `dir` and `--static`.
+//! `sendfile_roots`, a static entry's `dir` and `--static`, beside
+//! `source:` for the release's own source (issue 900).
 //!
 //! What may be served is checked here too: only media is ever served,
 //! so the data directory, the uploads part and any directory containing
@@ -155,6 +156,9 @@ pub enum Place<'a> {
     /// `static:` or `static:SUBDIR`: the release's directory of built
     /// static files, or a directory in it.
     Static(&'a str),
+    /// `source:` or `source:SUBDIR`: the release's source directory, or a
+    /// directory in it (issue 900), which a relative path names too.
+    Source(&'a str),
 }
 
 /// The places a release is given, for resolving a [`Place`].
@@ -170,7 +174,8 @@ impl<'a> Place<'a> {
     /// Read a directory as configuration writes it. `data:` and
     /// `uploads:` are refused, saying why; any other text is a path, so
     /// a directory whose name starts with `media:` is written
-    /// `./media:x`.
+    /// `./media:x`. A relative path stays a path, though it names a
+    /// directory in the source as `source:` does: see [`Place::in_source`].
     pub fn parse(text: &'a str) -> Result<Self, String> {
         let prefixed = |prefix: &str| text.strip_prefix(prefix);
 
@@ -192,6 +197,8 @@ impl<'a> Place<'a> {
             (Self::Media(rest), rest)
         } else if let Some(rest) = prefixed("static:") {
             (Self::Static(rest), rest)
+        } else if let Some(rest) = prefixed("source:") {
+            (Self::Source(rest), rest)
         } else {
             return Ok(Self::Path(text));
         };
@@ -212,7 +219,19 @@ impl<'a> Place<'a> {
 
     /// Whether the place is one Muru provides rather than a path.
     pub fn is_provided(self) -> bool {
-        !matches!(self, Self::Path(_))
+        matches!(self, Self::Media(_) | Self::Static(_))
+    }
+
+    /// The directory in the source a place names, by its path relative to
+    /// the source: `source:SUBDIR`'s, or a relative path's, which means
+    /// the same (issue 900). None for an absolute path or a place Muru
+    /// provides.
+    pub fn in_source(self) -> Option<&'a str> {
+        match self {
+            Self::Source(rest) => Some(rest),
+            Self::Path(text) if !Path::new(text).is_absolute() => Some(text),
+            _ => None,
+        }
     }
 
     /// The directory, absolute: a relative path is taken from `source`;
@@ -229,6 +248,7 @@ impl<'a> Place<'a> {
         match self {
             Self::Path(text) if Path::new(text).is_absolute() => Ok(PathBuf::from(text)),
             Self::Path(text) => Ok(source.join(text)),
+            Self::Source(rest) => Ok(under(source, rest)),
             Self::Media(rest) => provided
                 .data
                 .map(|dirs| under(&dirs.media, rest))
@@ -414,6 +434,22 @@ mod tests {
         assert_eq!(Place::parse("static:"), Ok(Place::Static("")));
         assert_eq!(Place::parse("static:admin"), Ok(Place::Static("admin")));
         assert_eq!(Place::parse("./media:x"), Ok(Place::Path("./media:x")));
+        assert_eq!(Place::parse("source:"), Ok(Place::Source("")));
+        assert_eq!(Place::parse("source:assets"), Ok(Place::Source("assets")));
+        assert!(Place::parse("source:../other").is_err());
+        assert_eq!(
+            Place::parse("source:assets").unwrap().in_source(),
+            Some("assets")
+        );
+        assert_eq!(Place::parse("assets").unwrap().in_source(), Some("assets"));
+        assert_eq!(Place::parse("/srv/assets").unwrap().in_source(), None);
+        assert_eq!(Place::parse("media:").unwrap().in_source(), None);
+        assert_eq!(
+            Place::parse("source:assets")
+                .unwrap()
+                .resolve(Path::new("/srv/shop"), &Provided::default()),
+            Ok(PathBuf::from("/srv/shop/assets"))
+        );
         assert_eq!(Place::parse("shop/static"), Ok(Place::Path("shop/static")));
         assert!(Place::parse("data:").unwrap_err().contains("never served"));
         assert!(

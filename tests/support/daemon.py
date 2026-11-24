@@ -27,6 +27,26 @@ from support import server as support
 
 SHOP = support.ROOT / "tests" / "fixtures" / "projects" / "shop"
 FACTORY = support.ROOT / "tests" / "fixtures" / "projects" / "factory"
+TUTORIAL_RELEASES = support.ROOT / "docs" / "tutorials" / "code" / "releases"
+
+
+def tutorial_site(directory: Path) -> Path:
+    """The deploy tutorials' `site` directory: a copy of each release the
+    pages include, beside a `.venv` that is this interpreter's, which each
+    release's `[tool.muru]` names as `../.venv/bin/python`."""
+
+    site = directory / "site"
+    site.mkdir()
+    (site / ".venv").symlink_to(Path(sys.prefix), target_is_directory=True)
+
+    for release in sorted(TUTORIAL_RELEASES.iterdir()):
+        target = site / release.name
+        target.mkdir()
+
+        for name in ["app.py", "pyproject.toml"]:
+            (target / name).write_text((release / name).read_text())
+
+    return site
 
 
 def stamp(at: float) -> str:

@@ -30,6 +30,27 @@ fn main() -> Result<(), Box<dyn Error>> {
             ],
             &["../../proto"],
         )?;
+
+    // The admin API is the one protocol given out to clients that are not
+    // part of Muru (`muructl proto`): a descriptor set of it, with its
+    // imports, is built beside the generated code.
+
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+    let status = std::process::Command::new(&protoc)
+        .arg("--include_imports")
+        .arg(format!(
+            "--descriptor_set_out={}",
+            out_dir.join("public.protoset").display()
+        ))
+        .arg("-I../../proto")
+        .arg(format!("-I{}", include.display()))
+        .arg("muru/admin/v1/admin.proto")
+        .status()?;
+
+    if !status.success() {
+        return Err(format!("protoc could not build the admin descriptor set: {status}").into());
+    }
+
     println!("cargo:rerun-if-changed=../../proto/muru/worker/v1/worker.proto");
     println!("cargo:rerun-if-changed=../../proto/muru/admin/v1/admin.proto");
     println!("cargo:rerun-if-changed=../../proto/muru/edge/v1/edge.proto");

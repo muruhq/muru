@@ -136,7 +136,8 @@ fn beside(table: &[String], request: &[String]) -> Vec<String> {
 
 /// Render the release a deploy request describes: the request checked
 /// as a deploy checks it, then written as the table an apply of which
-/// gives the release a fresh deploy of the request would. `source` is
+/// gives the release a deploy of the request would, to an application
+/// with no settings of its own. `source` is
 /// the directory as the table names it, which need not be the path the
 /// request reads it by. With `full` the defaults are written too.
 ///
@@ -146,7 +147,6 @@ fn beside(table: &[String], request: &[String]) -> Vec<String> {
 pub fn render(request: &pb::DeployRequest, source: &str, full: bool) -> Result<Rendered, String> {
     let spec = config::resolve_spec(
         request,
-        None,
         &config::Tables::default(),
         &crate::provision::Provisioning::off(),
     )?;
@@ -756,15 +756,20 @@ run = ['python', 'manage.py', 'migrate']
     }
 
     /// The release an apply of the rendered table gives, and the one a
-    /// fresh deploy of the request gives, with where their settings came
+    /// deploy of the request gives, with where their settings came
     /// from set aside: the two name the layers differently.
     fn both(request: &pb::DeployRequest, full: bool) -> (ReleaseSpec, ReleaseSpec, Rendered) {
         let off = Provisioning::off();
         let rendered = render(request, &request.source, full).unwrap();
-        let mut applied =
-            config::resolve_declared("shop", &rendered.table, &request.source, &off).unwrap();
-        let mut deployed =
-            config::resolve_spec(request, None, &config::Tables::default(), &off).unwrap();
+        let mut applied = config::resolve_declared(
+            "shop",
+            &rendered.table,
+            &crate::app_settings::AppSettings::default(),
+            &request.source,
+            &off,
+        )
+        .unwrap();
+        let mut deployed = config::resolve_spec(request, &config::Tables::default(), &off).unwrap();
         applied.layers = crate::model::Layers::default();
         deployed.layers = crate::model::Layers::default();
         (applied, deployed, rendered)
@@ -918,7 +923,6 @@ run = ['python', 'manage.py', 'migrate']
 
         let spec = config::resolve_spec(
             &request(source),
-            None,
             &config::Tables::default(),
             &Provisioning::off(),
         )

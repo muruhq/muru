@@ -1,10 +1,8 @@
-// Admin protocol between muructl (and the dashboard's JSON gateway) and the
-// daemon (design specification section 10.6 and appendix B). Served over the
-// admin Unix socket. Messages change additively within a major version.
-//
-// This is the first slice: applications, releases, deploys, rollback,
-// drains, events and daemon status. The remaining resources and operations
-// of appendix B are added as their features land.
+// The admin API of Muru: what muructl, the dashboard and other clients
+// call to manage a daemon, a development run or muructl serve. Served on
+// the admin Unix socket. Muru is in alpha, and the API may change between
+// releases: generate stubs from the files of the release in use, which
+// `muructl proto export` writes out.
 
 syntax = "proto3";
 
@@ -15,7 +13,7 @@ service Admin {
   rpc GetStatus(GetStatusRequest) returns (Status);
   rpc Probe(ProbeRequest) returns (ProbeAnswer);
 
-  // Section 13.10: the instance's processes as Muru supervises them, with
+  // The instance's processes as Muru supervises them, with
   // what the operating system says of each and the last second's figures.
   rpc ListProcesses(ListProcessesRequest) returns (Processes);
 
@@ -24,6 +22,12 @@ service Admin {
   rpc GetApp(GetAppRequest) returns (App);
   // Remove an application and every release it has, or say what would go.
   rpc RemoveApp(RemoveAppRequest) returns (RemoveReleasesResponse);
+  // Issue 899: set and remove an application's own release settings,
+  // which every release deployed after the change takes over the source's
+  // [tool.muru] and under the release's own flags or table. The
+  // application is created when it does not exist. Answers with the
+  // settings as they now are.
+  rpc SetAppSettings(SetAppSettingsRequest) returns (AppSettings);
   // Issue 849: an application's data directory and its parts, where each
   // leads, whose it is and what may be wrong with it.
   rpc GetAppData(GetAppDataRequest) returns (AppData);
@@ -50,7 +54,7 @@ service Admin {
   // Remove one release, or say what that would free.
   rpc RemoveRelease(RemoveReleaseRequest) returns (RemoveReleasesResponse);
 
-  // Section 9.3: shift an application's traffic to a release step by step,
+  // Shift an application's traffic to a release step by step,
   // with gates, and control the rollout; or move all of it at once.
   rpc StartRollout(StartRolloutRequest) returns (Rollout);
   rpc GetRollout(GetRolloutRequest) returns (Rollout);
@@ -61,23 +65,23 @@ service Admin {
   rpc AbortRollout(RolloutControlRequest) returns (Rollout);
   rpc PromoteRelease(PromoteReleaseRequest) returns (Release);
 
-  // Section 7.4: pin or release a worker group's count, and read the
+  // Pin or release a worker group's count, and read the
   // autoscaler's signals, decisions and churn for a release.
   rpc SetScale(SetScaleRequest) returns (ScaleStatus);
   rpc GetScaleStatus(GetScaleStatusRequest) returns (ScaleStatus);
-  // Section 4.12: serve the maintenance page for an application at the
+  // Serve the maintenance page for an application at the
   // edge, or serve it as usual again.
   rpc SetMaintenance(SetMaintenanceRequest) returns (MaintenanceStatus);
 
-  // Section 11.2: change which requests the access log writes for a
+  // Change which requests the access log writes for a
   // period, put the changes back, or list those in force.
   rpc OverrideAccessLog(OverrideAccessLogRequest) returns (AccessLogOverrides);
 
-  // Section 10.7: a single-use link that signs a browser in to the
+  // A single-use link that signs a browser in to the
   // dashboard, which shows and never changes.
   rpc DashboardLogin(DashboardLoginRequest) returns (DashboardLoginLink);
   // Every URL an application can be reached at, best first, worked out
-  // from the routing (section 4.3, issue 815).
+  // from the routing (issue 815).
   rpc ApplicationUrls(ApplicationUrlsRequest) returns (ApplicationUrlsResponse);
 
   // Events, from a sequence number.
@@ -87,20 +91,20 @@ service Admin {
   // Stop the daemon: detaching by default, or draining everything first.
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 
-  // Virtual hosts and routes (sections 4.3 and 4.5), as applied.
+  // Virtual hosts and routes, as applied.
   rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
   rpc ListRoutes(ListRoutesRequest) returns (ListRoutesResponse);
 
-  // HTTP upstreams (section 4.13), as applied.
+  // HTTP upstreams, as applied.
   rpc ListUpstreams(ListUpstreamsRequest) returns (ListUpstreamsResponse);
 
-  // Declarative configuration (section 10.4): apply a document, compare
+  // Declarative configuration: apply a document, compare
   // one with desired state, or export desired state as one.
   rpc ApplyConfig(ApplyConfigRequest) returns (ConfigReport);
   rpc DiffConfig(DiffConfigRequest) returns (ConfigReport);
   rpc ExportConfig(ExportConfigRequest) returns (ExportConfigResponse);
 
-  // Logs (sections 11.2 and 11.3): a release's output or the access log,
+  // Logs: a release's output or the access log,
   // and reopening every log file after an external rotation.
   rpc TailLogs(TailLogsRequest) returns (stream LogLine);
   rpc ReopenLogs(ReopenLogsRequest) returns (ReopenLogsResponse);
@@ -113,21 +117,21 @@ service Admin {
   // Remove log archives by count or age and, when asked, the logs of what no longer exists.
   rpc PruneLogs(PruneLogsRequest) returns (PruneLogsResponse);
 
-  // The daemon's re-creatable data (sections 8.2, 8.3 and 13.8).
+  // The daemon's re-creatable data.
   rpc ListCache(ListCacheRequest) returns (ListCacheResponse);
   // Remove what is stale, or list what would go.
   rpc PruneCache(PruneCacheRequest) returns (RemoveCacheResponse);
   // Remove everything in the daemon's area that is not in use, or list it.
   rpc ClearCache(ClearCacheRequest) returns (RemoveCacheResponse);
 
-  // Metrics (section 11.1): the node's Prometheus text exposition.
+  // Metrics: the node's Prometheus text exposition.
   rpc GetMetrics(GetMetricsRequest) returns (MetricsText);
 
   // The WebSockets open now, counted by endpoint and listed.
   rpc ListWebSockets(ListWebSocketsRequest) returns (WebSocketList);
 
   // The requests in flight now, queued or running, counted by worker
-  // group and listed (section 11.7).
+  // group and listed.
   rpc ListRequests(ListRequestsRequest) returns (RequestList);
 
   // A development run's record of one request, by its ID (section
@@ -135,51 +139,51 @@ service Admin {
   rpc GetRequest(GetRequestRequest) returns (RequestRecord);
 
   // Re-read the daemon's configuration file for what can change while
-  // running (section 13.3).
+  // running.
   rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
 
-  // Re-exec the daemon from the installed binary and replace the edge
-  // (section 13.4). The daemon answers, then re-executes; the hosts and
+  // Re-exec the daemon from the installed binary and replace the edge.
+  // The daemon answers, then re-executes; the hosts and
   // the edge keep serving and the new image takes them over.
   rpc UpgradeDaemon(UpgradeDaemonRequest) returns (UpgradeDaemonResponse);
 
-  // Ask a release's workers something (section 11.7): status, stacks,
+  // Ask a release's workers something: status, stacks,
   // tasks, inspect or logging, through the host's control connection.
-  // DumpStacks and SetLogLevel of appendix B are the stacks and logging
-  // operations of this one call.
+  // Dumping stacks and setting a log level are operations of this one
+  // call.
   rpc Debug(DebugRequest) returns (DebugResponse);
 
-  // Section 11.9: say that a diagnostic bundle is being made of this
+  // Say that a diagnostic bundle is being made of this
   // system, which is recorded as an event as the debug operations are.
   rpc NoteBundle(NoteBundleRequest) returns (NoteBundleResponse);
 
-  // Section 9.10: overlays, their state, and activating, ending,
+  // Overlays, their state, and activating, ending,
   // previewing and promoting one.
   rpc ListOverlays(ListOverlaysRequest) returns (ListOverlaysResponse);
   rpc ControlOverlay(ControlOverlayRequest) returns (ControlOverlayResponse);
   rpc PreviewOverlay(PreviewOverlayRequest) returns (PreviewOverlayResponse);
 
-  // Section 9.12: a command run with a release's interpreter,
+  // A command run with a release's interpreter,
   // environment, user and source directory, its output streamed as it
   // is written and its exit status last: one the application declares,
-  // by name, or a one-off command. The Exec of appendix B.
+  // by name, or a one-off command.
   rpc RunCommand(RunCommandRequest) returns (stream CommandOutput);
 
-  // Section 9.12: the commands a release declares, with their inputs
+  // The commands a release declares, with their inputs
   // and the application's last run of each.
   rpc ListCommands(ListCommandsRequest) returns (ListCommandsResponse);
 
-  // Section 9.12: the runs of an application's commands the daemon
+  // The runs of an application's commands the daemon
   // keeps, one run, a run's output, and stopping a run (issue 688).
   rpc ListCommandRuns(ListCommandRunsRequest) returns (ListCommandRunsResponse);
   rpc GetCommandRun(GetCommandRunRequest) returns (CommandRunRecord);
   rpc TailCommandRun(TailCommandRunRequest) returns (stream LogLine);
   rpc StopCommandRun(StopCommandRunRequest) returns (CommandRunRecord);
 
-  // Section 9.10: the named conditions and their states (issue 123).
+  // The named conditions and their states (issue 123).
   rpc ListConditions(ListConditionsRequest) returns (ListConditionsResponse);
 
-  // Section 9.13 and 10.12: a detour, a release of kind detour that a
+  // A detour, a release of kind detour that a
   // development run holds open for as long as this stream is open. The
   // first message says what was opened; later ones carry changes; the
   // release goes when the stream ends from either side.
@@ -287,7 +291,7 @@ message Detour {
   uint64 until_unix_ms = 10;
 }
 
-// A probe's question (section 13.9): live, ready or startup, of the
+// A probe's question: live, ready or startup, of the
 // daemon, narrowed to one application for ready and startup when app is
 // set, with the workers each needed group must have ready for ready.
 message ProbeRequest {
@@ -322,7 +326,7 @@ message Processes {
 }
 
 // A cgroup v2's limits as last read, and the memory guard watching its
-// memory.max (sections 7.7 and 13.9). Read when used, so they follow a
+// memory.max. Read when used, so they follow a
 // docker update or an in-place resize.
 message CgroupLimits {
   string cgroup = 1;                // the cgroup's directory
@@ -372,7 +376,7 @@ message Process {
   repeated Process children = 16;
   string interface = 17;            // a host's and its workers': what the default mount runs as, wsgi, asgi or grpc; empty until the host has said
   string state = 18;                // a host's release's part in routing: serving, canary, held, draining, retained, or its state while it starts
-  optional int32 oom_score_adj = 19; // Linux: /proc/PID/oom_score_adj, 500 for a worker (section 7.7); absent elsewhere
+  optional int32 oom_score_adj = 19; // Linux: /proc/PID/oom_score_adj, 500 for a worker; absent elsewhere
 }
 
 message Figures {
@@ -404,9 +408,9 @@ message Status {
   uint32 edge_pid = 10;             // the edge process serving the listeners
   string metrics = 11;              // the metrics listener's address, or empty
   string dashboard = 12;            // the dashboard's address, or empty
-  string budget = 13;               // what the releases hold of the node's budget (section 7.4), or empty without one
+  string budget = 13;               // what the releases hold of the node's budget, or empty without one
   uint32 websockets = 14;           // WebSockets open on the edge, as last sampled
-  string kind = 15;                 // daemon, or run for a development run (section 13.1); stopped only in what muructl daemon status prints with no daemon running (section 13.8)
+  string kind = 15;                 // daemon, or run for a development run; stopped only in what muructl daemon status prints with no daemon running
   string app = 16;                  // a run's application, as its log names it; empty for a daemon
   string release = 17;              // a run's release, r1 and so on; empty for a daemon
   string project = 18;              // a run's project directory; empty for a daemon
@@ -415,7 +419,7 @@ message Status {
   string log_dir = 21;              // the daemon's log directory; empty for a run, which writes no log files
   string cache_dir = 22;            // the daemon's cache directory; empty for a run
   CgroupLimits limits = 23;         // the cgroup's limits and the memory guard, when there is a cgroup v2
-  string instance_id = 24;          // the instance's ID, 32 hex digits, as its registry entry has it (section 13.8), so a client can check it reached the instance it meant
+  string instance_id = 24;          // the instance's ID, 32 hex digits, as its registry entry has it, so a client can check it reached the instance it meant
   string hostname = 25;             // the machine's hostname
   string name = 26;                 // the instance's name: user, system or a named instance's; empty for a run, a serve or a daemon whose locations were given by flags
 }
@@ -460,7 +464,7 @@ message GetRequestRequest {
   string request_id = 1;
 }
 
-// What a development run keeps of one request (section 11.7): the
+// What a development run keeps of one request: the
 // access log's record, the connection, the headers with secret values
 // masked, the compression decision, and the panels drawn from them.
 // Bodies are never kept.
@@ -523,7 +527,7 @@ message CaptureThread {
   string stack = 3;
 }
 
-// The worker's part of a request's record (section 11.7). Times are
+// The worker's part of a request's record. Times are
 // milliseconds from when the worker took the request, 0 for one that did
 // not happen.
 message WorkerPart {
@@ -615,7 +619,7 @@ message RequestCompression {
   string skipped = 3;               // why not, when not compressed
 }
 
-// One panel of a request's record, as data (ADR 0063): spans on the
+// One panel of a request's record, as data: spans on the
 // request's clock, values, and tables, any of them empty.
 message Panel {
   string name = 1;                  // timing, where, response, logs, errors, connection, or one from the worker
@@ -667,7 +671,7 @@ message ListRequestsRequest {
   uint32 limit = 2;                 // requests listed, the oldest first; 0 for none
 }
 
-// The requests in flight (section 11.7): counted by worker group, since
+// The requests in flight: counted by worker group, since
 // the edge queues per group, and listed.
 message RequestList {
   uint32 in_flight = 1;             // requests in flight, of the application asked for
@@ -724,17 +728,59 @@ message App {
   string previous_release = 3;      // the release a rollback restores, if any
   uint64 resource_version = 4;
   uint64 created_unix_ms = 5;
-  string user = 6;                  // the user its processes run as under a root daemon (section 10.9)
+  string user = 6;                  // the user its processes run as under a root daemon
   string group = 7;
   string umask = 8;                 // octal
-  bool maintenance = 9;             // the edge serves its maintenance page (section 4.12)
-  int32 priority = 10;              // the node's budget admits higher priorities' scale-ups first (section 7.4)
+  bool maintenance = 9;             // the edge serves its maintenance page
+  int32 priority = 10;              // the node's budget admits higher priorities' scale-ups first
   string maintenance_overlay = 11;  // the active overlay whose maintenance setting is in force, if one is (issue 757)
+  AppSettings settings = 12;        // the release settings every release deployed from now takes (issue 899)
+}
+
+// An application's own release settings (issue 899): what every release
+// deployed after they are set takes, over the source's [tool.muru] and
+// under the release's own flags or table. Each is unset when absent or
+// empty. Environment variables and secrets layer by name.
+message AppSettings {
+  repeated EnvEntry env = 1;                 // variables, and secrets by reference, never by value
+  optional uint32 processes = 2;
+  optional uint32 threads = 3;
+  optional uint32 sync_threads = 4;
+  optional uint32 concurrency = 5;
+  optional uint64 max_requests = 6;          // requests a worker serves before it is replaced
+  optional uint64 max_lifetime_ms = 7;       // how long a worker lives before it is replaced
+  optional uint64 soft_timeout_ms = 8;
+  optional uint64 hard_timeout_ms = 9;
+  optional uint64 hard_drain_grace_ms = 10;
+  optional uint64 shutdown_timeout_ms = 11;
+  optional uint64 websocket_drain_grace_ms = 12;
+  optional uint64 exit_grace_ms = 13;
+  optional uint64 loop_stall_timeout_ms = 14;
+  optional uint64 gil_stall_timeout_ms = 15;
+  string memory_measure = 16;                // uss, pss or rss
+  optional uint64 memory_soft_limit = 17;    // bytes
+  optional uint64 memory_soft_for_ms = 18;
+  optional bool memory_reclaim_first = 19;
+  optional uint64 memory_hard_limit = 20;    // bytes
+  optional uint64 memory_check_interval_ms = 21;
+}
+
+// Set some of an application's settings and remove others. The settings
+// in `set` replace those of the same key, a variable by its name, and
+// `unset` names keys to remove as the application's table names them:
+// processes, timeouts.hard_timeout, memory.soft_limit, env.NAME, or env
+// for every variable. A key both set and unset is refused.
+message SetAppSettingsRequest {
+  string app = 1;
+  AppSettings set = 2;
+  repeated string unset = 3;
+  bool clear = 4;                            // remove every setting first
 }
 
 // A deploy names the application (created on first use) and the source.
-// Settings not given come from the source's [tool.muru] table, then from
-// the application's previous release, then from the defaults.
+// Settings not given come from the application's settings, then the
+// source's [tool.muru] table, then the defaults; never from an earlier
+// release (issue 861).
 message DeployRequest {
   string app = 1;
   string source = 2;                // a directory
@@ -752,23 +798,23 @@ message DeployRequest {
   string release = 14;              // a chosen release id, else generated
   bool wait = 15;                   // return once the release serves, or fails
   optional uint64 retain_ms = 16;   // how long the superseded release stays warm; default 30 minutes, 0 to stop it
-  optional uint64 max_requests = 17;        // requests a worker serves before it is replaced (section 7.7)
+  optional uint64 max_requests = 17;        // requests a worker serves before it is replaced
   optional uint64 max_lifetime_ms = 18;     // how long a worker lives before it is replaced
-  optional uint64 hard_timeout_ms = 19;     // how long a request may run before its worker is replaced (section 7.6)
+  optional uint64 hard_timeout_ms = 19;     // how long a request may run before its worker is replaced
   optional uint64 hard_drain_grace_ms = 20; // how long a replaced worker gets to finish its other requests
   optional uint64 shutdown_timeout_ms = 21; // how long a worker told to stop gets before it is killed
-  string memory_measure = 22;               // uss, pss or rss (section 7.7); the table's or uss when empty
+  string memory_measure = 22;               // uss, pss or rss; the table's or uss when empty
   optional uint64 memory_soft_limit = 23;   // bytes; over it for soft_for the worker reclaims, then recycles
   optional uint64 memory_soft_for_ms = 24;
   optional bool memory_reclaim_first = 25;
   optional uint64 memory_hard_limit = 26;   // bytes; over it the worker is replaced at once
   optional uint64 memory_check_interval_ms = 27;
-  repeated EnvEntry env = 28;               // environment variables (section 10.8), over the table's
+  repeated EnvEntry env = 28;               // environment variables, over the table's
   bool hold = 29;                           // start the release but leave traffic where it is, for a preview or a rollout
-  optional uint64 soft_timeout_ms = 30;     // how long a request may run before it is interrupted (section 7.6)
-  optional bool accel_redirect = 31;        // X-Accel-Redirect from the default mount is an internal redirect (section 4.10)
+  optional uint64 soft_timeout_ms = 30;     // how long a request may run before it is interrupted
+  optional bool accel_redirect = 31;        // X-Accel-Redirect from the default mount is an internal redirect
   optional bool cgi_local_redirect = 32;    // a 200 with a local Location and no body is an internal redirect
-  string kind = 33;                         // workers (the default) or http, a managed HTTP server release (section 9.9)
+  string kind = 33;                         // workers (the default) or http, a managed HTTP server release
   string profile = 34;                      // the server of an http release: gunicorn, uvicorn, granian, mod_wsgi-express or generic
   repeated string command = 35;             // the command of an http release, with {bind} where the server takes its address
   string bind = 36;                         // how an http release binds: unix (the default) or port
@@ -776,25 +822,25 @@ message DeployRequest {
   string readiness_path = 38;               // the path probed until an instance answers 2xx or 3xx; any answer when empty
   optional uint64 readiness_timeout_ms = 39; // how long the instances get to be ready; 60 s when absent
   string stop_signal = 40;                  // the signal that stops an instance gracefully; the profile's when empty
-  repeated string sendfile_roots = 41;      // section 4.9: directories an X-Muru-Sendfile path must lie in; the table's when empty
+  repeated string sendfile_roots = 41;      // directories an X-Muru-Sendfile path must lie in; the table's when empty
   optional string sendfile_header = 42;     // a second header honoured as X-Muru-Sendfile is; the table's when absent
-  bool override_freeze = 43;                // deploy although an overlay freezes the application's deploys (section 9.6)
-  optional bool reflection = 44;            // section 6.13: serve gRPC server reflection; the table's when absent
-  optional uint64 loop_stall_timeout_ms = 45; // section 7.6: how long an ASGI worker's loop may stall before it is replaced
-  optional uint32 retain_workers = 46;      // section 9.1: the workers each group of the superseded release keeps while warm; when absent 1, or 0 for a group whose min_workers is 0
-  repeated string grpc_web_origins = 47;    // section 6.13: origins whose pages may call it through gRPC-Web, or *; the table's when empty
+  bool override_freeze = 43;                // deploy although an overlay freezes the application's deploys
+  optional bool reflection = 44;            // serve gRPC server reflection; the table's when absent
+  optional uint64 loop_stall_timeout_ms = 45; // how long an ASGI worker's loop may stall before it is replaced
+  optional uint32 retain_workers = 46;      // the workers each group of the superseded release keeps while warm; when absent 1, or 0 for a group whose min_workers is 0
+  repeated string grpc_web_origins = 47;    // origins whose pages may call it through gRPC-Web, or *; the table's when empty
   optional uint64 websocket_drain_grace_ms = 48; // how long a worker told to stop keeps its WebSockets before closing them with 1001
-  optional uint64 gil_stall_timeout_ms = 49; // section 7.6: how long a worker may run no Python, or send no report, before it is replaced
-  bool fresh = 50;                          // section 3.3: take nothing from the previous release; the source and the defaults alone
-  repeated StaticDir static_dirs = 51;      // section 4.9: the release's own directories of files, over the table's by path
-  string build_when = 52;                   // section 8.2: auto, always or never; the table's, else auto, when empty
+  optional uint64 gil_stall_timeout_ms = 49; // how long a worker may run no Python, or send no report, before it is replaced
+  reserved 50;                              // was fresh: a deploy takes nothing from an earlier release
+  repeated StaticDir static_dirs = 51;      // the release's own directories of files, over the table's by path
+  string build_when = 52;                   // auto, always or never; the table's, else auto, when empty
   repeated string build_extras = 53;        // extras the built environment includes, beside the table's
   repeated string build_groups = 54;        // dependency groups the built environment includes, beside the table's
-  string bytecode = 55;                     // section 8.2: redirect, source or off; the table's, else redirect, when empty
-  string handoff = 56;                      // section 6.14: asgi or wsgi; the table's, else the previous release's, when empty
-  optional bool build_source_builds = 57;   // section 8.2: allow sdists to be built on the node; the table's, else false, when absent
-  optional bool build_compile_bytecode = 58; // section 8.2: compile bytecode at build time; the table's, else true, when absent
-  optional uint64 exit_grace_ms = 59;      // section 7.6: how long a worker has for its shutdown work after its requests have had theirs
+  string bytecode = 55;                     // redirect, source or off; the table's, else redirect, when empty
+  string handoff = 56;                      // asgi or wsgi; the table's when empty
+  optional bool build_source_builds = 57;   // allow sdists to be built on the node; the table's, else false, when absent
+  optional bool build_compile_bytecode = 58; // compile bytecode at build time; the table's, else true, when absent
+  optional uint64 exit_grace_ms = 59;      // how long a worker has for its shutdown work after its requests have had theirs
 }
 
 // What a deploy would do. With refusals nothing would be deployed.
@@ -806,13 +852,13 @@ message DeployPlan {
   repeated DeploySetting settings = 5;
   bool builds = 6;                  // the daemon would build an environment from uv.lock
   string serving = 7;               // the release that serves now, or empty
-  string settings_from = 8;         // the release whose settings fill what nothing else gives, or empty
+  reserved 8;                       // was settings_from: a deploy takes nothing from an earlier release
   bool hold = 9;                    // the release would start and traffic would stay where it is
   uint64 retain_ms = 10;            // how long the release it replaces would stay warm
   optional uint32 retain_workers = 11; // and the workers each of its groups would keep, as --retain-workers gave
   repeated string refusals = 12;    // what would refuse the deploy
   string retained = 13;             // what the release it replaces would keep, such as "1 worker to a group"
-  repeated DeployEnv env = 14;      // the variables and secrets it would get, by name, never by value (section 8.7)
+  repeated DeployEnv env = 14;      // the variables and secrets it would get, by name, never by value
 }
 
 // A variable a planned release would get, and where it would come from.
@@ -820,18 +866,17 @@ message DeployEnv {
   string name = 1;
   string secret = 2;                // store/key for a secret, otherwise empty
   bool as_file = 3;                 // a secret delivered as the file NAME_FILE names
-  string layer = 4;                 // --env, [tool.muru.env], the release table, the previous release or passed from the daemon
+  string layer = 4;                 // --env, the application, [tool.muru.env], the release table or passed from the daemon
 }
 
-// One of a planned release's settings and the layer it would come from
-// (section 3.3).
+// One of a planned release's settings and the layer it would come from.
 message DeploySetting {
   string key = 1;
   string value = 2;
   string layer = 3;                 // deploy flags, [tool.muru], the previous release or default
 }
 
-// Section 4.9: a directory of the release's own files, as --static gives it.
+// A directory of the release's own files, as --static gives it.
 message StaticDir {
   string path = 1;                  // the prefix, such as /static/
   string dir = 2;                   // the directory, relative to the source or absolute
@@ -959,7 +1004,7 @@ message RemoveReleasesResponse {
   repeated string data_kept = 7;    // parts outside the data directory, which a removal leaves
 }
 
-// Section 9.3: a canary rollout of a candidate release against the
+// A canary rollout of a candidate release against the
 // baseline that serves.
 message StartRolloutRequest {
   string app = 1;
@@ -969,7 +1014,7 @@ message StartRolloutRequest {
   uint64 max_p95_ms = 5;            // a gate: the candidate's p95 over the step; none when 0
   uint64 min_requests = 6;          // requests before the gates judge, 100 when 0
   bool approve_each_step = 7;       // wait for ResumeRollout before each step after the first
-  bool override_freeze = 8;         // start although an overlay freezes the application's deploys (section 9.6)
+  bool override_freeze = 8;         // start although an overlay freezes the application's deploys
   uint64 max_p99_ms = 9;            // a gate: the candidate's p99 over the step; none when 0
   uint64 max_worker_faults = 10;    // a gate: the candidate's worker crashes and timeout kills over the step
   uint64 max_queue_wait_p95_ms = 11; // a gate: the candidate's p95 wait for a worker thread; none when 0
@@ -1021,14 +1066,14 @@ message RolloutControlRequest {
   bool override_freeze = 2;         // promote although an overlay freezes the application's deploys
 }
 
-// Blue/green (section 9.2): move all traffic to the release now.
+// Blue/green: move all traffic to the release now.
 message PromoteReleaseRequest {
   string app = 1;
   string release = 2;
-  bool override_freeze = 3;         // promote although an overlay freezes the application's deploys (section 9.6)
+  bool override_freeze = 3;         // promote although an overlay freezes the application's deploys
 }
 
-// Section 7.4: pin a group's worker count, so the autoscaler stands
+// Pin a group's worker count, so the autoscaler stands
 // aside, or let it decide again.
 message SetScaleRequest {
   string app = 1;
@@ -1036,14 +1081,14 @@ message SetScaleRequest {
   string group = 3;                 // default when empty
   optional uint32 processes = 4;    // the count to pin
   bool unpin = 5;                   // let the autoscaler decide again
-  optional uint32 min_workers = 6;  // section 7.5: a floor until until_unix_ms, as a temporary schedule
+  optional uint32 min_workers = 6;  // a floor until until_unix_ms, as a temporary schedule
   optional uint32 max_workers = 7;  // and a ceiling with it
   uint64 until_unix_ms = 8;         // when the floor or the cap ends
   optional uint32 cap_workers = 9;  // issue 712: a cap until until_unix_ms, in place of a floor
 }
 
 message DashboardLoginRequest {
-  reserved 1;                       // was actions: the dashboard has none (ADR 0060)
+  reserved 1;                       // was actions: the dashboard has none
   reserved "actions";
   bool token = 2;                   // a session at once, as a bearer token for scripts, in place of a link
 }
@@ -1104,7 +1149,7 @@ message AccessLogOverrides {
   uint32 reset = 2;                 // how many a reset put back
 }
 
-// A change in force (section 11.2).
+// A change in force.
 message AccessLogOverride {
   string mode = 1;
   string app = 2;                   // every application when empty
@@ -1125,7 +1170,7 @@ message ScaleStatus {
 }
 
 // One worker group's scaling: the policy, where it stands and what the
-// autoscaler saw and did last (section 7.3 and 7.4).
+// autoscaler saw and did last.
 message GroupScale {
   string group = 1;
   string mode = 2;                  // static, spare or target
@@ -1147,23 +1192,23 @@ message GroupScale {
   string policy = 18;               // the policy as one phrase
   uint64 scale_outs = 19;
   uint64 scale_ins = 20;
-  uint32 floor = 21;                // the fewest workers, with what schedules and overlays set (section 7.5)
+  uint32 floor = 21;                // the fewest workers, with what schedules and overlays set
   uint32 ceiling = 22;              // the most workers, likewise
   repeated string capacity_from = 23; // the overlays and schedules setting capacity now
   bool scale_in_held = 24;          // a schedule holds scale-in
-  optional double worker_cpu = 25;  // section 7.3: CPU seconds per wall second, as a share of what a worker can use
+  optional double worker_cpu = 25;  // cPU seconds per wall second, as a share of what a worker can use
   optional double gil_wait_p95_ms = 26;
   optional double loop_lag_p95_ms = 27;
   string bottleneck = 28;           // cpu, gil, io, heavy, loop, handoff, memory, gc, idle, none or waiting
   string diagnosis = 29;            // the bottleneck in words
   string advice = 30;               // the tuning it suggests for the next release, when any
-  optional double gc_share = 31;    // section 11.1: the share of the workers' time spent in garbage collection
-  optional double handoff_queue_wait_p95_ms = 32; // section 6.14: the wait for a thread of requests handed from ASGI to WSGI
+  optional double gc_share = 31;    // the share of the workers' time spent in garbage collection
+  optional double handoff_queue_wait_p95_ms = 32; // the wait for a thread of requests handed from ASGI to WSGI
   uint32 cap = 33;                  // issue 712: the most workers an overlay or a schedule allows now, 0 for none
   repeated string cap_from = 34;    // the overlays and schedules whose cap that is
 }
 
-// Section 9.1: pending, starting, warming, ready, draining, stopping,
+// Pending, starting, warming, ready, draining, stopping,
 // stopped and failed.
 message Release {
   string app = 1;
@@ -1183,12 +1228,12 @@ message Release {
   uint64 resource_version = 15;
   repeated Worker workers = 16;     // as its host last reported them; empty when no host runs
   uint64 retained_until_unix_ms = 17; // for a retained release, when it is stopped
-  string kind = 18;                 // workers, http (section 9.9) or detour (section 9.13)
+  string kind = 18;                 // workers, http or detour
   string profile = 19;              // the server of an http release
   uint32 instances = 20;            // instances of an http release's command
   repeated string command = 21;     // the command of an http release
-  repeated ReleaseMount mounts = 22; // named mounts beside the default one at / (section 6.7)
-  repeated ReleaseGroup groups = 23; // named worker groups beside the default one (section 7.1)
+  repeated ReleaseMount mounts = 22; // named mounts beside the default one at /
+  repeated ReleaseGroup groups = 23; // named worker groups beside the default one
   string detected_interface = 24;   // wsgi, asgi or grpc as the host settled it; empty until known
   uint32 websockets = 25;           // WebSockets open on its workers, as last sampled
   string python_version = 26;       // as probed when the release was resolved, as 3.13.9; empty when not probed
@@ -1197,14 +1242,14 @@ message Release {
   string environment = 29;          // the environment the daemon built for the release, when it builds one
   string build_when = 30;           // the build mode in force: auto, always or never
   string bytecode = 31;             // where bytecode goes: redirect with its directory, source (precompiled when detected), or off
-  repeated ServerInstance server_instances = 32; // an http release's instances while it runs (section 9.9)
+  repeated ServerInstance server_instances = 32; // an http release's instances while it runs
   bool host_running = 33;           // whether a host runs for it now; false for a stopped or dormant release
   uint64 disk_bytes = 34;           // what its environment, bytecode and logs take; set when asked for
   uint64 disk_freed_bytes = 35;     // what removing it would give back, less than disk_bytes when files are hard-linked elsewhere
-  repeated string instrumentation = 36; // its instrumentation modules, in order (section 6.15)
-  repeated GatePassed gates = 37;   // the gates it has passed, in order (section 9.12)
+  repeated string instrumentation = 36; // its instrumentation modules, in order
+  repeated GatePassed gates = 37;   // the gates it has passed, in order
   string traffic = 38;              // its shares of the routes that split traffic, where they differ from what serving implies (issue 759)
-  Detour detour = 39;               // a detour's run and traffic, for kind detour (section 9.13)
+  Detour detour = 39;               // a detour's run and traffic, for kind detour
 }
 
 // A gate a release passed: a run of a command at a point in its life.
@@ -1247,9 +1292,9 @@ message ReleaseGroup {
   uint32 sync_threads = 6;
   uint32 concurrency = 7;
   bool optional = 8;
-  repeated string hosts = 9;            // ADR 0033: the hosts the group takes, every host when empty
-  repeated string methods = 10;         // ADR 0033: the methods, upper case, every method when empty
-  repeated string mounts = 11;          // ADR 0033: the named mounts its workers serve, every mount when empty
+  repeated string hosts = 9;            // the hosts the group takes, every host when empty
+  repeated string methods = 10;         // the methods, upper case, every method when empty
+  repeated string mounts = 11;          // the named mounts its workers serve, every mount when empty
 }
 
 message Worker {
@@ -1273,7 +1318,7 @@ message WatchEventsRequest {
   uint64 after = 1;
 }
 
-// Section 11.5: one stream of state changes.
+// One stream of state changes.
 message Event {
   uint64 sequence = 1;
   uint64 time_unix_ms = 2;
@@ -1330,7 +1375,7 @@ message ListOverlaysResponse {
   repeated OverlayInfo overlays = 1;
 }
 
-// An overlay as declared, with its state (section 9.10).
+// An overlay as declared, with its state.
 message OverlayInfo {
   string name = 1;
   bool active = 2;
@@ -1379,7 +1424,7 @@ message ApplyConfigRequest {
   string document = 1;
   bool dry_run = 2;                 // report the plan and change nothing
   bool prune = 3;                   // also remove what the document does not contain
-  bool override_freeze = 4;         // deploy releases of applications an overlay freezes (section 9.6)
+  bool override_freeze = 4;         // deploy releases of applications an overlay freezes
   bool hold = 5;                    // start the releases the apply adds and leave traffic where it is
   bool no_wait = 6;                 // return once those releases are recorded, without waiting for them to serve
   optional uint64 retain_ms = 7;    // how long a release the apply replaces stays warm; 30 minutes when absent
@@ -1410,8 +1455,8 @@ message ConfigChange {
 
 message ExportConfigRequest {
   string app = 1;                   // one application, else all
-  bool effective = 3;               // routes as the active overlays leave them (section 9.10)
-  bool resolve_rollouts = 4;        // each rollout under way as where it stands (section 10.4)
+  bool effective = 3;               // routes as the active overlays leave them
+  bool resolve_rollouts = 4;        // each rollout under way as where it stands
 }
 
 message ExportConfigResponse {
@@ -1421,7 +1466,7 @@ message ExportConfigResponse {
   uint64 time_unix_ms = 4;
   uint64 state_version = 5;         // the last event sequence number
   repeated string attributions = 6; // with effective: what each active overlay sets that is in force
-  repeated string layers = 7;       // with effective: each release setting and each route's limits, with the layer it came from (section 3.3)
+  repeated string layers = 7;       // with effective: each release setting and each route's limits, with the layer it came from
 }
 
 message ListHostsRequest {}
@@ -1441,13 +1486,13 @@ message Host {
   bool use_canonical_name = 8;
   bool default = 9;
   bool canonical_redirect = 10;       // other names are redirected to the canonical name
-  string max_body_size = 11;          // the host's own body limit, as configured (section 4.6)
+  string max_body_size = 11;          // the host's own body limit, as configured
   map<string, string> timeouts = 12;  // the host's own request timeouts, as configured
-  string access_log = 13;             // the host's own access log choice (section 11.2): on, errors or off
-  string compression = 14;            // "off" when the host turns compression off, "set" when it has other settings of its own (section 4.17)
-  string request_headers = 15;        // what the host removes from and sets on requests (section 4.7), as one phrase
+  string access_log = 13;             // the host's own access log choice: on, errors or off
+  string compression = 14;            // "off" when the host turns compression off, "set" when it has other settings of its own
+  string request_headers = 15;        // what the host removes from and sets on requests, as one phrase
   string response_headers = 16;       // what the host removes from, sets on and adds to responses, as one phrase
-  bool maintenance = 17;              // the edge serves the maintenance page for the host (section 4.12)
+  bool maintenance = 17;              // the edge serves the maintenance page for the host
   string access_log_format = 18;      // how the host's access records are written, when it says: json or combined
   string access_log_file = 19;        // the file in the log directory that takes the host's access records, when it names one
   string access_log_query = 20;       // what the host's access records keep of the query string, when it says: keep, mask or drop
@@ -1463,23 +1508,23 @@ message Route {
   string host = 1;
   string path = 2;
   string app = 3;                   // empty for a static route
-  string static_dir = 4;            // the directory, for a static route (section 4.9)
+  string static_dir = 4;            // the directory, for a static route
   string fallback_app = 5;          // the application behind a static route, when there is one
-  repeated TrafficShare traffic = 6; // the traffic policy's shares (section 9.4), empty without one
+  repeated TrafficShare traffic = 6; // the traffic policy's shares, empty without one
   bool sticky = 7;
   string hash_key = 8;              // the policy's key, when it names one
-  bool internal = 9;                // reachable only through internal redirects (section 4.10)
+  bool internal = 9;                // reachable only through internal redirects
   repeated string accept_redirects_from = 10; // other applications whose redirects may reach the route
-  string auth = 11;                 // "APP PATH" when an authentication sub-request guards the route (section 4.16)
-  string upstream = 12;             // the upstream that takes the requests (section 4.13), for an upstream route
+  string auth = 11;                 // "APP PATH" when an authentication sub-request guards the route
+  string upstream = 12;             // the upstream that takes the requests, for an upstream route
   string fallback_upstream = 13;    // the upstream behind a static route, when there is one
-  string upload = 14;               // multipart or raw when the edge receives uploads (section 4.11), with ", precheck"
-  string max_body_size = 15;        // the route's own body limit, as configured (section 4.6)
-  repeated string client_classes = 16; // the client classes the route takes (section 4.14); every request when empty
+  string upload = 14;               // multipart or raw when the edge receives uploads, with ", precheck"
+  string max_body_size = 15;        // the route's own body limit, as configured
+  repeated string client_classes = 16; // the client classes the route takes; every request when empty
   map<string, string> traffic_classes = 17; // a client class to the release, or upstream:NAME, that takes its requests
-  map<string, string> timeouts = 18; // the route's own request timeouts, as configured (section 4.6)
-  string compression = 19;          // "off" when the route turns compression off, "set" when it has other settings of its own (section 4.17)
-  string request_headers = 20;      // what the route removes from and sets on requests (section 4.7), as one phrase
+  map<string, string> timeouts = 18; // the route's own request timeouts, as configured
+  string compression = 19;          // "off" when the route turns compression off, "set" when it has other settings of its own
+  string request_headers = 20;      // what the route removes from and sets on requests, as one phrase
   string response_headers = 21;     // what the route removes from, sets on and adds to responses, as one phrase
 }
 
@@ -1489,7 +1534,7 @@ message ListUpstreamsResponse {
   repeated Upstream upstreams = 1;
 }
 
-// An HTTP upstream (section 4.13), as applied.
+// An HTTP upstream, as applied.
 message Upstream {
   string name = 1;
   repeated string addresses = 2;

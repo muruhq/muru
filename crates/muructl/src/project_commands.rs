@@ -352,7 +352,6 @@ pub async fn own(args: &ProjectArgs, request: &CommandRequest) -> anyhow::Result
         flag: settings.python.as_deref(),
         table: table.python.as_deref(),
         project: &project,
-        previous: None,
         always: false,
         uv: uv.as_ref(),
         isolation: &isolation,
