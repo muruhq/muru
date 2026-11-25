@@ -71,7 +71,13 @@ same happens to a request with no Host header at all. A host with no
 
 Routes belong to a host and name a path prefix and an application. The
 longest prefix wins, matched on segment boundaries: `/api` covers `/api`
-and `/api/users` and not `/apiary`; `/` covers everything. A request
+and `/api/users` and not `/apiary`; `/` covers everything. A route's
+path selects which requests reach the application and does not change
+what the application sees: behind a route at `/api` it gets
+`SCRIPT_NAME=""` and `PATH_INFO=/api/users`, as it would behind `/`. A
+route that should give part of its path to the application as its mount
+point says so with
+[`strip_prefix`](#an-application-under-a-sub-path). A request
 whose host has no route for its path gets 404 with the reason `no_route`.
 The application's serving release takes the request, unless the route
 has a `traffic` table sharing its requests between releases (see

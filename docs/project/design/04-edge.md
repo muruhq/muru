@@ -179,7 +179,7 @@ The edge sends a request again only when no worker can have seen it: a worker th
 
 **Mixing static and dynamic content.** Static files and applications combine through routes in a virtual host, matched by longest path prefix, plus a fallback option for when they share the same paths. Static files are always served by the edge and never reach Python.
 
-*Static site with applications under it.* The application receives SCRIPT_NAME /app.
+*Static site with applications under it.* With `strip_prefix` (section 4.5) the application receives SCRIPT_NAME /app and the rest of the path as PATH_INFO; without it, it receives SCRIPT_NAME "" and PATH_INFO /app/..., since a route's path selects requests and does not set SCRIPT_NAME (issue 906).
 
 ```toml
 [[route]]
@@ -191,6 +191,7 @@ static = '/srv/site/public'
 host = 'example'
 path = '/app/'
 app = 'shop'
+strip_prefix = '/app'
 ```
 
 *Application at the root with a static prefix.*
@@ -221,7 +222,7 @@ fallback = { app = 'shop' }
 
 - For GET and HEAD the edge serves the file when one exists, or the index file for a directory. Otherwise, and for every other method, the request goes to the fallback target, so a POST to a path that also has a file still reaches the application.
 - The fallback target can be an application, an upstream, or a file.
-- The application sees the route's prefix as SCRIPT_NAME (empty here), as if it were routed directly.
+- The fallback application sees the request as a route to it would give it: SCRIPT_NAME from its mounts, the route's `strip_prefix` (section 4.5) and a trusted prefix, and nothing from the route's path otherwise.
 - Hidden files and directories (names starting with a dot) are never served and fall through. Paths are normalised before the file check, and symbolic links leaving the directory are refused (see *Opening beneath a root*).
 - File checks use the file system directly, with a short metadata cache (stat_cache = '1s' by default) to avoid repeated lookups for hot paths.
 
