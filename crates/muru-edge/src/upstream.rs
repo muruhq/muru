@@ -306,6 +306,32 @@ struct Shared {
 }
 
 impl Shared {
+    /// The addresses a request tries, in turn from where the last
+    /// request left off: those in service, and among them, at its turn,
+    /// one whose ejection is over and which may take its one trial
+    /// request (section 4.13), so that an address comes back while the
+    /// others serve. When none is in service or due a trial, every
+    /// address, which is better than answering nothing.
+    fn in_turn(&self, now: Instant) -> Vec<(&Arc<Address>, Admission)> {
+        let count = self.addresses.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let in_order = (0..count).map(|offset| &self.addresses[(start + offset) % count]);
+
+        let candidates: Vec<(&Arc<Address>, Admission)> = in_order
+            .clone()
+            .map(|address| (address, address.admission(now)))
+            .filter(|(_, admission)| *admission != Admission::Closed)
+            .collect();
+
+        if candidates.is_empty() {
+            return in_order
+                .map(|address| (address, Admission::Closed))
+                .collect();
+        }
+
+        candidates
+    }
+
     /// The deadline for a client's request to the upstream: the limits'
     /// for any upstream, none to speak of for a detour (section 4.21).
     fn request_deadline(&self, limits: &crate::Limits) -> Duration {
@@ -1183,36 +1209,7 @@ pub async fn handle(
         None => context.arrived + shared.request_deadline(limits),
     };
 
-    // The addresses in turn from where the last request left off: those
-    // in service first, then one that is due a trial after an ejection,
-    // and when nothing is in service every address, which is better than
-    // answering nothing.
-
-    let count = shared.addresses.len();
-    let start = shared.next.fetch_add(1, Ordering::Relaxed);
-    let now = Instant::now();
-    let in_order: Vec<&Arc<Address>> = (0..count)
-        .map(|offset| &shared.addresses[(start + offset) % count])
-        .collect();
-    let mut candidates: Vec<&Arc<Address>> = in_order
-        .iter()
-        .copied()
-        .filter(|address| address.admission(now) == Admission::Open)
-        .collect();
-
-    let trials = candidates.is_empty();
-
-    if trials {
-        candidates = in_order
-            .iter()
-            .copied()
-            .filter(|address| address.admission(now) == Admission::Trial)
-            .collect();
-    }
-
-    if candidates.is_empty() {
-        candidates = in_order.clone();
-    }
+    let candidates = shared.in_turn(Instant::now());
 
     // A request that may go again if a kept connection turns out to have
     // been closed by the server: one whose method is idempotent and whose
@@ -1244,7 +1241,7 @@ pub async fn handle(
     // A request that was never sent stays in the slot for the next
     // address; one that went out in part cannot be sent again.
 
-    for address in candidates {
+    for (address, admission) in candidates {
         if slot.is_none() {
             break;
         }
@@ -1252,7 +1249,7 @@ pub async fn handle(
         // An address due a trial takes one request at a time; the claim
         // is made here, so an address never tried keeps none.
 
-        if trials && !address.claim_trial() {
+        if admission == Admission::Trial && !address.claim_trial() {
             continue;
         }
 
@@ -1815,6 +1812,63 @@ mod tests {
         assert_eq!(with("timeout=1"), Duration::ZERO);
         assert_eq!(with("timeout=600"), IDLE_FOR);
         assert_eq!(with("timeout=soon"), IDLE_FOR);
+    }
+
+    #[test]
+    fn an_ejected_address_gets_its_trial_at_its_turn_while_the_others_serve() {
+        let upstream = Upstream::from_message(&pb::Upstream {
+            name: "legacy@r1".to_owned(),
+            addresses: vec!["127.0.0.1:9001".to_owned(), "127.0.0.1:9002".to_owned()],
+            eject_after: 1,
+            eject_for_ms: 5_000,
+            ..Default::default()
+        })
+        .unwrap();
+        let shared = &upstream.shared;
+        let texts = |now: Instant| -> Vec<(String, Admission)> {
+            shared
+                .in_turn(now)
+                .into_iter()
+                .map(|(address, admission)| (address.text.clone(), admission))
+                .collect()
+        };
+        let now = Instant::now();
+
+        // Ejected, the second address is left out while its time runs.
+
+        shared.addresses[1].failed("legacy@r1", 1, Duration::from_secs(5));
+        assert_eq!(texts(now), [("127.0.0.1:9001".to_owned(), Admission::Open)]);
+
+        // Once it is up, the address takes its turn again beside the one
+        // in service, rather than only when nothing else serves.
+
+        let later = now + Duration::from_secs(6);
+        let turns = [texts(later), texts(later)];
+        assert!(
+            turns
+                .iter()
+                .any(|turn| turn.first().map(|(_, admission)| *admission) == Some(Admission::Trial)),
+            "{turns:?}"
+        );
+        assert!(turns.iter().all(|turn| turn.len() == 2), "{turns:?}");
+
+        // A trial in flight closes it to the rest, and its success puts
+        // it back in service.
+
+        assert!(shared.addresses[1].claim_trial());
+        assert_eq!(texts(later).len(), 1);
+        shared.addresses[1].succeeded("legacy@r1");
+        assert!(
+            texts(later)
+                .iter()
+                .all(|(_, admission)| *admission == Admission::Open)
+        );
+
+        // With every address out, a request still tries them all.
+
+        shared.addresses[0].failed("legacy@r1", 1, Duration::from_secs(5));
+        shared.addresses[1].failed("legacy@r1", 1, Duration::from_secs(5));
+        assert_eq!(texts(Instant::now()).len(), 2);
     }
 
     #[test]

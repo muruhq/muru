@@ -23,9 +23,10 @@ from support import server as support
 
 
 class Upstream:
-    """One upstream server, on a TCP port or a Unix socket."""
+    """One upstream server, on a TCP port or a Unix socket: `port` when
+    given, else a free one."""
 
-    def __init__(self, name: str, unix: bool = False) -> None:
+    def __init__(self, name: str, unix: bool = False, port: int | None = None) -> None:
         self.name = name
         self.healthy = True
         self.requests: list[dict[str, object]] = []
@@ -143,7 +144,7 @@ class Upstream:
             self.port = 0
         else:
             self.path = None
-            self.port = support.free_port()
+            self.port = port or support.free_port()
             self.server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
             self.server.daemon_threads = True
             self.address = f"127.0.0.1:{self.port}"
