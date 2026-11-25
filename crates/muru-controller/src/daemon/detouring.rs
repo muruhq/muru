@@ -83,11 +83,14 @@ impl Daemon {
         };
 
         let data = crate::places::app_data(&self.locations.state.path, &record);
+        let (serving, mounts) = self.serving_mounts(&app);
         let opened = admin::DetourOpened {
             detour: Some(detour.message()),
             data_dir: data.data.display().to_string(),
             media_dir: data.media.display().to_string(),
             uploads_dir: data.uploads.display().to_string(),
+            serving,
+            mounts,
         };
         let describe = detour.describe();
 
@@ -460,6 +463,35 @@ impl Daemon {
             rollout,
             &classes,
         )
+    }
+
+    /// The serving release of an application, as app@release, and its
+    /// named mounts, which a detour's run compares with its own (issue
+    /// 907).
+    fn serving_mounts(&self, app: &str) -> (String, Vec<admin::DetourMount>) {
+        let Some(id) = self.serving.get(app) else {
+            return (String::new(), Vec::new());
+        };
+
+        let mounts = self
+            .store
+            .release(app, id)
+            .map(|release| {
+                release
+                    .spec
+                    .mounts
+                    .iter()
+                    .map(|mount| admin::DetourMount {
+                        name: mount.name.clone(),
+                        path: mount.path.clone(),
+                        interface: crate::detours::interface_name(mount.interface).to_owned(),
+                        entrypoint: mount.entrypoint.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        (format!("{app}@{id}"), mounts)
     }
 
     /// Publish the open detours for the API.

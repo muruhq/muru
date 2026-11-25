@@ -53,6 +53,7 @@ class Detour:
         assert muructl is not None
         self.log_path = project.parent / "detour.out"
         self.handle = self.log_path.open("ab")
+        self.start = self.handle.tell()
         self.process = subprocess.Popen(
             [
                 str(muructl),
@@ -75,7 +76,11 @@ class Detour:
         self.wait_for_log("admin socket")
 
     def log(self) -> str:
-        return self.log_path.read_text(errors="replace")
+        """What this run has written, after what runs before it wrote."""
+
+        with self.log_path.open("rb") as log:
+            log.seek(self.start)
+            return log.read().decode(errors="replace")
 
     def wait_for_log(self, text: str, timeout: float = 60.0) -> None:
         deadline = time.monotonic() + timeout
@@ -427,6 +432,21 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
             daemon.request("/_muru/toolbar/toolbar.js", "sub.test", headers=preview).status == 404
         )
 
+        # Behind the stripping route the detour sees what the release it
+        # stands in for does; for the stripped part itself it is sent the
+        # path /, as any upstream is.
+
+        through = daemon.request("/app/foo", "strip.test", headers=preview)
+        release = daemon.request("/app/foo", "strip.test")
+
+        for response in (through, release):
+            report = json.loads(response.body)
+            assert (report["script_name"], report["path_info"]) == ("/app", "/foo")
+
+        assert json.loads(through.body)["instance"].startswith("detour:")
+        bare_part = json.loads(daemon.request("/app", "strip.test", headers=preview).body)
+        assert (bare_part["script_name"], bare_part["path_info"]) == ("/app", "/")
+
         # The detour ends with its run, and the daemon's traffic is back on
         # the serving release at once.
 
@@ -441,6 +461,45 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         assert "Max-Age=0" in stale["headers"].get("set-cookie", "")
         events = daemon.events()
         assert "detour.opened" in events and "detour.closed" in events
+
+        # A checkout whose mounts differ from the serving release's says
+        # so as its detour opens, and serves its own; with --mounts
+        # release it serves the release's.
+
+        bare = tmp_path / "bare"
+        bare.mkdir()
+        for module in project.glob("*.py"):
+            shutil.copy(module, bare / module.name)
+
+        (bare / "muru.toml").write_text('entrypoint = "detoured:wsgi_app"\nthreads = 2\n')
+        detour = Detour(bare, daemon, "detoured")
+        detour.wait_for_log("on detour detoured@")
+        assert "warning: the serving release detoured@" in detour.log(), detour.log()
+        assert "mounts detoured:asgi_app at /ws (auto) as ws, which this checkout does not" in (
+            detour.log()
+        )
+        assert "--mounts release" in detour.log()
+        bare_value = daemon.muructl("detour", "preview", "--header", cwd=bare).stdout
+        bare_preview = dict([bare_value.strip().split(": ", 1)])
+        own = served(daemon, "/ws/x", **bare_preview)
+        assert own["instance"].startswith("detour:")
+        assert (own["script_name"], own["path_info"]) == ("", "/ws/x")
+        detour.stop()
+
+        detour = Detour(bare, daemon, "detoured", "--mounts", "release")
+        detour.wait_for_log("on detour detoured@")
+        assert "serving the mounts of the serving release detoured@" in detour.log()
+        assert "warning: the serving release" not in detour.log()
+        bare_value = daemon.muructl("detour", "preview", "--header", cwd=bare).stdout
+        bare_preview = dict([bare_value.strip().split(": ", 1)])
+
+        with websockets.connect(
+            f"ws://127.0.0.1:{daemon.port}/ws/echo", additional_headers=bare_preview
+        ) as socket:
+            socket.send("mounted")
+            assert socket.recv(timeout=10).split()[1] == "mounted"
+
+        detour.stop()
     finally:
         if detour is not None:
             detour.stop()

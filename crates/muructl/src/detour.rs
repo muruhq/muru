@@ -144,6 +144,12 @@ pub struct DetourRunArgs {
     #[arg(long)]
     app_data: bool,
 
+    /// Whose mounts the detour serves with: checkout, the mounts this
+    /// checkout declares, or release, those of the serving release it
+    /// stands in for.
+    #[arg(long, value_enum, value_name = "FROM", default_value = "checkout")]
+    mounts: MountsFrom,
+
     #[command(flatten)]
     pub label: crate::instances::LabelArgs,
 
@@ -240,6 +246,16 @@ struct RunOnly {
     args: crate::RunArgs,
 }
 
+/// Whose mount table a detour serves with (issue 907).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MountsFrom {
+    /// The mounts the checkout declares, which the run compares with the
+    /// serving release's and warns of each that differs.
+    Checkout,
+    /// The serving release's mounts, from the daemon.
+    Release,
+}
+
 /// What a run does as a detour, beside what it does as any run.
 pub struct Mode {
     /// The application on the daemon.
@@ -254,6 +270,50 @@ pub struct Mode {
     pub app_data: bool,
     /// The run's label, or empty.
     pub label: String,
+    /// Whose mounts the detour serves with.
+    pub mounts: MountsFrom,
+}
+
+/// Settle the mounts a detour serves with once it is open (issue 907):
+/// with `--mounts release`, the serving release's table in place of the
+/// checkout's, said in a line; otherwise the checkout's, with a warning
+/// for each mount that differs from the serving release's. A mismatch
+/// is never refused, since the mounts may be changing on purpose.
+pub fn settle_mounts(
+    mode: &Mode,
+    opened: &pb::DetourOpened,
+    mounts: &mut std::collections::BTreeMap<String, muru_config::Mount>,
+) {
+    if opened.serving.is_empty() {
+        return;
+    }
+
+    if mode.mounts == MountsFrom::Release {
+        *mounts = muru_controller::detours::release_mounts(&opened.mounts);
+        muru_common::muru_println!(
+            "serving the mounts of the serving release {}: {}",
+            opened.serving,
+            if mounts.is_empty() {
+                "none".to_owned()
+            } else {
+                mounts.keys().cloned().collect::<Vec<_>>().join(", ")
+            }
+        );
+        return;
+    }
+
+    let differences =
+        muru_controller::detours::mount_differences(&opened.serving, &opened.mounts, mounts);
+
+    for line in &differences {
+        muru_common::muru_println!("warning: {line}");
+    }
+
+    if !differences.is_empty() {
+        muru_common::muru_println!(
+            "muructl detour run --mounts release serves with the serving release's mounts instead"
+        );
+    }
 }
 
 impl DetourRunArgs {
@@ -390,6 +450,7 @@ pub async fn run(args: DetourRunArgs) -> anyhow::Result<()> {
         open_preview: args.open_preview,
         app_data: args.app_data,
         label: args.label.label.clone().unwrap_or_default(),
+        mounts: args.mounts,
     };
 
     crate::run_with(run_args, None, None, Some(mode)).await

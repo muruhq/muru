@@ -605,9 +605,190 @@ pub fn secret() -> Result<String, String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// An interface as a detour's first message names it (issue 907).
+pub fn interface_name(interface: muru_config::Interface) -> &'static str {
+    match interface {
+        muru_config::Interface::Auto => "auto",
+        muru_config::Interface::Wsgi => "wsgi",
+        muru_config::Interface::Asgi => "asgi",
+        muru_config::Interface::Grpc => "grpc",
+    }
+}
+
+/// The mounts to serve a detour with, when `muructl detour run --mounts
+/// release` asks for the serving release's table (issue 907): each with
+/// its path, interface and entrypoint, and every other key as a mount's
+/// default.
+pub fn release_mounts(mounts: &[pb::DetourMount]) -> BTreeMap<String, muru_config::Mount> {
+    mounts
+        .iter()
+        .map(|mount| {
+            let interface = match mount.interface.as_str() {
+                "wsgi" => Some(muru_config::Interface::Wsgi),
+                "asgi" => Some(muru_config::Interface::Asgi),
+                "grpc" => Some(muru_config::Interface::Grpc),
+                _ => None,
+            };
+
+            (
+                mount.name.clone(),
+                muru_config::Mount {
+                    path: mount.path.clone(),
+                    entrypoint: mount.entrypoint.clone(),
+                    interface,
+                    ..muru_config::Mount::default()
+                },
+            )
+        })
+        .collect()
+}
+
+/// How a checkout's mounts differ from the serving release's, one line
+/// for each mount that differs, by name (issue 907): one the release has
+/// and the checkout does not, one the checkout has and the release does
+/// not, and one both have with another path, interface or entrypoint.
+/// None when they match.
+pub fn mount_differences(
+    serving: &str,
+    release: &[pb::DetourMount],
+    checkout: &BTreeMap<String, muru_config::Mount>,
+) -> Vec<String> {
+    let release = release_mounts(release);
+    let mut lines = Vec::new();
+
+    let described = |mount: &muru_config::Mount| {
+        let interface = mount.interface.map_or("auto", interface_name);
+
+        if mount.path.is_empty() {
+            format!("{} ({interface})", mount.entrypoint)
+        } else {
+            format!("{} at {} ({interface})", mount.entrypoint, mount.path)
+        }
+    };
+
+    for (name, theirs) in &release {
+        match checkout.get(name) {
+            None => {
+                let here = if theirs.path.is_empty() {
+                    String::new()
+                } else {
+                    let covering = checkout
+                        .iter()
+                        .filter(|(_, mine)| {
+                            !mine.path.is_empty() && covers(&mine.path, &theirs.path)
+                        })
+                        .max_by_key(|(_, mine)| mine.path.len());
+
+                    match covering {
+                        Some((other, _)) => {
+                            format!("; requests under {} reach its mount {other}", theirs.path)
+                        }
+                        None => format!(
+                            "; requests under {} reach its default entrypoint",
+                            theirs.path
+                        ),
+                    }
+                };
+
+                lines.push(format!(
+                    "the serving release {serving} mounts {} as {name}, which this checkout \
+                     does not{here}",
+                    described(theirs)
+                ));
+            }
+            Some(mine)
+                if mine.path != theirs.path
+                    || mine.entrypoint != theirs.entrypoint
+                    || mine.interface.unwrap_or(muru_config::Interface::Auto)
+                        != theirs.interface.unwrap_or(muru_config::Interface::Auto) =>
+            {
+                lines.push(format!(
+                    "mount {name} differs: the serving release {serving} has {}, this checkout {}",
+                    described(theirs),
+                    described(mine)
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+
+    for (name, mine) in checkout {
+        if !release.contains_key(name) {
+            lines.push(format!(
+                "this checkout mounts {} as {name}, which the serving release {serving} does not",
+                described(mine)
+            ));
+        }
+    }
+
+    lines
+}
+
+/// Whether a mount at `prefix` takes the requests for `path`, on segment
+/// boundaries.
+fn covers(prefix: &str, path: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    let path = path.trim_end_matches('/');
+
+    prefix.is_empty()
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_checkouts_mounts_are_compared_with_the_serving_releases_by_name() {
+        let release = |name: &str, path: &str, entrypoint: &str| pb::DetourMount {
+            name: name.to_owned(),
+            path: path.to_owned(),
+            interface: "wsgi".to_owned(),
+            entrypoint: entrypoint.to_owned(),
+        };
+        let mine = |path: &str, entrypoint: &str| muru_config::Mount {
+            path: path.to_owned(),
+            entrypoint: entrypoint.to_owned(),
+            interface: Some(muru_config::Interface::Wsgi),
+            ..Default::default()
+        };
+
+        let serving = [
+            release("app", "/app", "echo:main"),
+            release("sub", "/sub", "echo:sub"),
+        ];
+        let same = BTreeMap::from([
+            ("app".to_owned(), mine("/app", "echo:main")),
+            ("sub".to_owned(), mine("/sub", "echo:sub")),
+        ]);
+        assert!(mount_differences("echo@r4", &serving, &same).is_empty());
+        assert_eq!(release_mounts(&serving), same);
+
+        let checkout = BTreeMap::from([
+            ("sub".to_owned(), mine("/other", "echo:sub")),
+            ("extra".to_owned(), mine("/extra", "echo:extra")),
+        ]);
+        assert_eq!(
+            mount_differences("echo@r4", &serving, &checkout),
+            [
+                "the serving release echo@r4 mounts echo:main at /app (wsgi) as app, which this \
+                 checkout does not; requests under /app reach its default entrypoint",
+                "mount sub differs: the serving release echo@r4 has echo:sub at /sub (wsgi), \
+                 this checkout echo:sub at /other (wsgi)",
+                "this checkout mounts echo:extra at /extra (wsgi) as extra, which the serving \
+                 release echo@r4 does not",
+            ]
+        );
+
+        let covered = BTreeMap::from([("all".to_owned(), mine("/a", "echo:all"))]);
+        assert!(
+            mount_differences("echo@r4", &[release("app", "/a/b", "echo:main")], &covered)[0]
+                .ends_with("requests under /a/b reach its mount all")
+        );
+    }
 
     #[test]
     fn traffic_reads_each_choice_and_refuses_the_rest() {

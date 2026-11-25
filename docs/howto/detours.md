@@ -288,6 +288,35 @@ group `detour`. Conditions, rollout gates and the autoscaler leave them
 out, so a traceback in a detour never fires an overlay or holds a
 rollout.
 
+## The application's mounts
+
+A detour serves the [mounts](mounts.md) its checkout declares, in
+`[tool.muru.mounts]` or `muru.toml`. When those differ from the serving
+release's, as when the release's mounts come from an applied file, the
+detour says so as it opens, one warning for each mount that differs:
+
+```console
+$ muructl detour run
+muru: warning: the serving release shop@r4 mounts shop.api:app at /api (asgi) as api, which this checkout does not; requests under /api reach its default entrypoint
+muru: muructl detour run --mounts release serves with the serving release's mounts instead
+```
+
+The detour still opens, since you may be changing the mounts on
+purpose. `--mounts release` serves it with the serving release's mount
+table instead, each mount's path, interface and entrypoint:
+
+```console
+$ muructl detour run --mounts release
+muru: serving the mounts of the serving release shop@r4: api
+```
+
+Behind a route with
+[`strip_prefix`](virtual-hosts.md#an-application-under-a-sub-path) a
+detour is sent the path after the stripped part, with the stripped part
+as its forwarded prefix, so it sees the `SCRIPT_NAME` the serving
+release does. A request for the stripped part itself reaches the
+detour as the path `/`.
+
 ## The application's data
 
 A detour uses the run's own data directory, as `muructl run` does (see

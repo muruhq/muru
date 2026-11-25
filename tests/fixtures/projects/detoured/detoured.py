@@ -40,6 +40,8 @@ def wsgi_app(environ: dict[str, Any], start_response: Callable[..., Any]) -> Ite
             "remote_addr": environ.get("REMOTE_ADDR", ""),
             "server_port": environ.get("SERVER_PORT", ""),
             "request_id": environ.get("muru.request_id", ""),
+            "script_name": environ.get("SCRIPT_NAME", ""),
+            "path_info": environ.get("PATH_INFO", ""),
             "cookie": environ.get("HTTP_COOKIE", ""),
             "preview": environ.get("HTTP_MURU_PREVIEW", ""),
             "data_dir": os.environ.get("MURU_DATA_DIR", ""),
