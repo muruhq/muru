@@ -641,7 +641,14 @@ def test_a_daemon_restart_adopts_the_instances_still_there_and_starts_the_rest(
         ]
         events = second.muructl("events").stdout
         assert f"re-adopted the server instances (pid {survivor})" in events
-        assert "instance 1 was gone and is started again" in events
+
+        # Its end is told once, by the adoption (issue 916).
+
+        assert (
+            "instance 1 exited with signal: 9 (SIGKILL) while no daemon ran "
+            "and is started again in 1s"
+        ) in events
+        assert events.count("instance 1 exited") == 1
         assert f"instance 1 started again (pid {replacement})" in events
 
         # Both serve.

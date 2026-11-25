@@ -327,6 +327,16 @@ impl Servers {
         }
     }
 
+    /// What adoption found of each instance, by index; empty when this
+    /// daemon started them.
+    pub fn adopted(&self) -> Vec<(u32, supervisor::Adopted)> {
+        self.supervisor
+            .instances()
+            .map(supervisor::Instance::index)
+            .zip(self.supervisor.adopted().iter().cloned())
+            .collect()
+    }
+
     /// Reap instances that exited and start again those whose wait has
     /// passed, with what happened for the event stream.
     pub async fn check(&mut self) -> Vec<Report> {

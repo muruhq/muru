@@ -195,18 +195,20 @@ time. An instance that is still running is taken over as it is, with
 its relay. An instance that was waiting to be started again when the
 daemon stopped is started again within a second at the same address,
 and its waits carry on from the exits it had in a row. An instance that
-exited while no daemon was running is reported by the new daemon's
-first check, with the exit status its relay recorded, as any exit is:
+exited while no daemon was running is counted as an exit when it is
+taken over, with the exit status its relay recorded, and waits as any
+exit does before it is started again. The release stays `ready`, and its
+`release.adopted` event names the pids taken over, how each instance
+that exited ended, and when it starts again:
 
 ```
-instance 1 exited with exit status: 3; starting it again in 1s
+re-adopted the server instances (pid 48213); instance 1 exited with exit status: 3 while no daemon ran and is started again in 1s
 ```
 
-The release stays `ready`, and its `release.adopted` event names the
-pids taken over and the instances started again:
+`server.started` follows when the instance has started:
 
 ```
-re-adopted the server instances (pid 48213); instance 1 was gone and is started again
+instance 1 started again (pid 48377)
 ```
 
 The record holds the pid of each instance and of its relay, each

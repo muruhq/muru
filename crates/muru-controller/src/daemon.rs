@@ -3509,45 +3509,56 @@ fn write_record<T: serde::Serialize>(path: &Path, record: &T) {
 }
 
 /// What the event says when a managed server's instances are taken
-/// over: the pids of those that were still there, and which were gone
-/// and are started again by the next check. In the record of the
-/// instances as adopted, one that is to be started has pid 0.
-fn adoption_message(adopted: &ServersRecord) -> String {
+/// over: the pids of those that were still there, how each that ended
+/// while no daemon ran did and when it is started again (issue 916), and
+/// which were gone and are started again by the next check.
+fn adoption_message(adopted: &[(u32, crate::supervisor::Adopted)]) -> String {
+    use crate::supervisor::Adopted;
+
     let list = |words: Vec<String>| match words.as_slice() {
         [] => String::new(),
         [one] => one.clone(),
         [most @ .., last] => format!("{} and {last}", most.join(", ")),
     };
-    let (gone, there): (Vec<_>, Vec<_>) = adopted
-        .instances
-        .iter()
-        .partition(|instance| instance.pid == 0);
-    let pids: Vec<String> = there
-        .iter()
-        .map(|instance| instance.pid.to_string())
-        .collect();
-    let indexes: Vec<String> = gone
-        .iter()
-        .map(|instance| instance.index.to_string())
-        .collect();
+    let mut pids = Vec::new();
+    let mut ended = Vec::new();
+    let mut gone = Vec::new();
 
-    let taken_over = if pids.is_empty() {
+    for (index, found) in adopted {
+        match found {
+            Adopted::Kept(pid) => pids.push(pid.to_string()),
+            Adopted::Ended { exit, wait } => ended.push(format!(
+                "instance {index} {exit} while no daemon ran and is started again in {}",
+                muru_config::format_duration(*wait)
+            )),
+            Adopted::Gone => gone.push(index.to_string()),
+        }
+    }
+
+    let mut message = if pids.is_empty() {
         "none of the server instances was still there".to_owned()
     } else {
         format!("re-adopted the server instances (pid {})", pids.join(", "))
     };
 
-    match indexes.len() {
-        0 => taken_over,
-        1 => format!(
-            "{taken_over}; instance {} was gone and is started again",
-            list(indexes)
-        ),
-        _ => format!(
-            "{taken_over}; instances {} were gone and are started again",
-            list(indexes)
-        ),
+    for clause in ended {
+        message.push_str("; ");
+        message.push_str(&clause);
     }
+
+    match gone.len() {
+        0 => {}
+        1 => message.push_str(&format!(
+            "; instance {} was gone and is started again",
+            list(gone)
+        )),
+        _ => message.push_str(&format!(
+            "; instances {} were gone and are started again",
+            list(gone)
+        )),
+    }
+
+    message
 }
 
 /// Whether a process's command line names the path or is the title, which
@@ -6002,7 +6013,7 @@ impl Daemon {
             Ok(servers) => {
                 let retained_until = matches!(release.state, ReleaseState::Retained)
                     .then(|| Instant::now() + RETENTION);
-                let message = adoption_message(&servers.record());
+                let message = adoption_message(&servers.adopted());
                 self.running.insert(
                     (app.to_owned(), id.to_owned()),
                     Running {
@@ -13886,34 +13897,36 @@ mod tests {
 
     #[test]
     fn the_adoption_event_names_the_instances_kept_and_those_started_again() {
-        let adopted = |pids: &[u32]| ServersRecord {
-            instances: (0..)
-                .zip(pids)
-                .map(|(index, pid)| crate::servers::InstanceRecord {
-                    index,
-                    pid: *pid,
-                    address: String::new(),
-                    started_unix_ms: 0,
-                    quick_exits: 0,
-                    start_time: 0,
-                    relay_pid: 0,
-                    relay_start_time: 0,
-                })
-                .collect(),
-        };
+        use crate::supervisor::Adopted;
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let adopted =
+            |found: &[Adopted]| -> Vec<(u32, Adopted)> { (0..).zip(found.to_vec()).collect() };
 
         assert_eq!(
-            adoption_message(&adopted(&[41, 42])),
+            adoption_message(&adopted(&[Adopted::Kept(41), Adopted::Kept(42)])),
             "re-adopted the server instances (pid 41, 42)"
         );
         assert_eq!(
-            adoption_message(&adopted(&[41, 0])),
+            adoption_message(&adopted(&[Adopted::Kept(41), Adopted::Gone])),
             "re-adopted the server instances (pid 41); instance 1 was gone and is started again"
         );
         assert_eq!(
-            adoption_message(&adopted(&[0, 0, 0])),
+            adoption_message(&adopted(&[Adopted::Gone, Adopted::Gone, Adopted::Gone])),
             "none of the server instances was still there; \
              instances 0, 1 and 2 were gone and are started again"
+        );
+
+        // Issue 916: one that ended while no daemon ran says how, once.
+
+        let killed = Adopted::Ended {
+            exit: crate::supervisor::Exit::Status(std::process::ExitStatus::from_raw(9)),
+            wait: Duration::from_secs(1),
+        };
+        assert_eq!(
+            adoption_message(&adopted(&[Adopted::Kept(41), killed])),
+            "re-adopted the server instances (pid 41); instance 1 exited with signal: 9 (SIGKILL) \
+             while no daemon ran and is started again in 1s"
         );
     }
 
