@@ -435,6 +435,7 @@ fn workers(
     writer.whole("import_report", table.import_report.is_some());
 
     ReleaseTable {
+        metadata: BTreeMap::new(),
         kind: None,
         profile: None,
         command: Vec::new(),

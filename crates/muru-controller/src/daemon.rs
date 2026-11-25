@@ -3777,6 +3777,25 @@ impl Daemon {
                     waiting: pools.iter().map(|pool| pool.waiting as usize).sum(),
                     created: full_time(release.created_unix_ms),
                     detour: false,
+                    commit: muru_config::commit_label(&release.spec.metadata).unwrap_or_default(),
+                    git_ref: release
+                        .spec
+                        .metadata
+                        .get("ref")
+                        .map(|name| muru_config::short_ref(name).to_owned())
+                        .unwrap_or_default(),
+                    url: release
+                        .spec
+                        .metadata
+                        .get("url")
+                        .cloned()
+                        .unwrap_or_default(),
+                    description: release
+                        .spec
+                        .metadata
+                        .get("description")
+                        .cloned()
+                        .unwrap_or_default(),
                 });
             }
 
@@ -6797,7 +6816,7 @@ impl Daemon {
             "release.created",
             &subject,
             "info",
-            &format!("from {}", release.spec.source.display()),
+            &format!("from {}", crate::model::created_from(&release.spec)),
         );
 
         let id = release.id.clone();

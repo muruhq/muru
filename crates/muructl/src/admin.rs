@@ -4562,6 +4562,17 @@ pub struct DeployArgs {
     #[arg(long)]
     dry_run: bool,
 
+    /// Record KEY=VALUE with the release, such as
+    /// description=TEXT or url=URL; repeatable. Over what is filled from
+    /// git, and KEY= leaves a filled key out.
+    #[arg(long = "metadata", value_name = "KEY=VALUE", value_parser = crate::release_metadata::parse_flag)]
+    metadata: Vec<(String, String)>,
+
+    /// Fill no commit, ref or dirty flag from the git checkout the
+    /// source directory is in.
+    #[arg(long)]
+    no_git_metadata: bool,
+
     #[command(flatten)]
     socket: SocketArgs,
 
@@ -4852,6 +4863,7 @@ impl ReleaseArgs {
     /// gives them.
     pub(crate) fn request(self, app: &str, source: &str, python: String) -> pb::DeployRequest {
         pb::DeployRequest {
+            metadata: std::collections::BTreeMap::new(),
             app: app.to_owned(),
             source: source.to_owned(),
             kind: self.server.map(|_| "http".to_owned()).unwrap_or_default(),
@@ -4977,6 +4989,26 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
     }
 
     args.settings.check()?;
+
+    // Section 9.14: the commit and ref the source is at, under what the
+    // flags say, checked here before anything is sent.
+
+    let filled = if args.no_git_metadata {
+        crate::release_metadata::Filled::default()
+    } else {
+        crate::release_metadata::from_git(&source).await
+    };
+
+    if let Some(why) = &filled.failure {
+        eprintln!("muru: no commit or ref recorded from git: {why}");
+    }
+
+    let metadata = muru_config::check_metadata(&crate::release_metadata::merged(
+        filled.metadata,
+        &args.metadata,
+    ))
+    .map_err(anyhow::Error::msg)?;
+
     let mut client = client::connect(&args.socket.endpoint()?).await?;
     let python = args
         .settings
@@ -4986,6 +5018,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
         .unwrap_or_default();
 
     let request = pb::DeployRequest {
+        metadata,
         release: args.release.unwrap_or_default(),
         wait: !args.no_wait,
         hold: args.hold,
@@ -5027,7 +5060,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
         );
     } else {
         println!(
-            "muru: release {}@{} is {}{}",
+            "muru: release {}@{} is {}{}{}",
             release.app,
             release.id,
             release.state,
@@ -5037,11 +5070,32 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
                 " and held: not serving"
             } else {
                 ""
-            }
+            },
+            muru_config::metadata_origin(&release.metadata)
+                .map(|origin| format!(", {origin}"))
+                .unwrap_or_default()
         );
     }
 
     Ok(0)
+}
+
+/// A release's metadata as Muru's views list it (section 9.14): the
+/// well-known keys first, in their order, then the others by key.
+pub(crate) fn metadata_in_order(
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> Vec<(&str, &str)> {
+    let known = muru_config::METADATA_KEYS
+        .iter()
+        .filter_map(|key| metadata.get_key_value(*key));
+    let others = metadata
+        .iter()
+        .filter(|(key, _)| !muru_config::METADATA_KEYS.contains(&key.as_str()));
+
+    known
+        .chain(others)
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
 }
 
 /// A deploy's plan as people read it: the release, each setting with
@@ -5064,6 +5118,10 @@ fn print_deploy_plan(plan: &pb::DeployPlan) {
 
     if plan.new_app {
         println!("  the application {} would be created", plan.app);
+    }
+
+    for (key, value) in metadata_in_order(&plan.metadata) {
+        println!("  metadata {key} = {value}");
     }
 
     if !plan.settings.is_empty() {
@@ -7989,17 +8047,18 @@ pub async fn release_list(
     }
 
     println!(
-        "{:<24} {:<10} {:<8} {:<16} {:>9} SOURCE",
-        "RELEASE", "STATE", "SERVING", "WORKERS", "DISK"
+        "{:<24} {:<10} {:<8} {:<16} {:<13} {:>9} SOURCE",
+        "RELEASE", "STATE", "SERVING", "WORKERS", "COMMIT", "DISK"
     );
 
     for release in releases {
         println!(
-            "{:<24} {:<10} {:<8} {:<16} {:>9} {}",
+            "{:<24} {:<10} {:<8} {:<16} {:<13} {:>9} {}",
             format!("{}@{}", release.app, release.id),
             release.state,
             if release.serving { "yes" } else { "" },
             workers_column(&release),
+            commit_column(&release.metadata),
             human_size(release.disk_bytes),
             release.source
         );
@@ -8253,6 +8312,13 @@ pub async fn release_show(release: String, socket: SocketArgs, json: bool) -> an
     Ok(())
 }
 
+/// The commit a release's metadata names, as `release list` shows it
+/// (section 9.14): shortened, with `+` when its checkout had changes, or
+/// `-` for none.
+fn commit_column(metadata: &std::collections::BTreeMap<String, String>) -> String {
+    muru_config::commit_label(metadata).unwrap_or_else(|| "-".to_owned())
+}
+
 /// A release's details as the lines `release show` prints, key first.
 fn release_details(release: &pb::Release) -> Vec<(String, String)> {
     let mut lines = vec![
@@ -8275,6 +8341,12 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
     }
 
     lines.push(("source".to_owned(), release.source.clone()));
+
+    // Section 9.14: every key of its metadata, the well-known ones first.
+
+    for (key, value) in metadata_in_order(&release.metadata) {
+        lines.push((key.to_owned(), value.replace('\n', " ")));
+    }
 
     if release.websockets > 0 {
         lines.push((

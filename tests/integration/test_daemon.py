@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -796,3 +797,63 @@ def test_a_deploy_takes_nothing_from_the_release_before(daemon: Daemon) -> None:
     assert "#   shop@r2: threads = 3 ([tool.muru])" in shown
     exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
     assert "env" not in exported["app"]["shop"]["release"]["r2"]
+
+
+def test_a_deploy_records_where_its_code_came_from(daemon: Daemon, tmp_path: Path) -> None:
+    # Section 9.14, issue 866: a deploy from a git checkout records its
+    # commit and branch, and whether it has changes, beside the metadata
+    # its flags give; every view shows it.
+
+    source = tmp_path / "shop"
+    shutil.copytree(SHOP, source, ignore=shutil.ignore_patterns("__pycache__"))
+
+    identity = ["-c", "user.name=Muru", "-c", "user.email=m@example.com"]
+
+    def git(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(source), *identity, "-c", "commit.gpgsign=false", *arguments],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    git("add", ".")
+    git("commit", "-q", "-m", "shop")
+    commit = git("rev-parse", "HEAD")
+
+    line = daemon.deploy(
+        "shop", source, "--metadata", "url=https://git.example.com/shop/pull/42", git_metadata=True
+    )
+    assert line.endswith(f", commit {commit[:12]} of main"), line
+    shown = json.loads(daemon.muructl("release", "show", "shop@r1", "--json").stdout)
+    assert shown["metadata"] == {
+        "commit": commit,
+        "ref": "refs/heads/main",
+        "url": "https://git.example.com/shop/pull/42",
+    }
+    assert (
+        f"from {source.resolve()}, commit {commit[:12]} of main" in daemon.muructl("events").stdout
+    )
+
+    # A change makes the next release dirty, which the list marks; a key
+    # given empty leaves out what git filled.
+
+    (source / "notes.txt").write_text("draft\n")
+    daemon.deploy("shop", source, "--metadata", "ref=", git_metadata=True)
+    listed = daemon.muructl("release", "list", "shop").stdout
+    assert re.search(rf"shop@r2 .* {commit[:12]}\+ ", listed), listed
+    assert re.search(rf"shop@r1 .* {commit[:12]} ", listed), listed
+    second = json.loads(daemon.muructl("release", "show", "shop@r2", "--json").stdout)
+    assert second["metadata"] == {"commit": commit, "dirty": "true"}
+
+    # The export writes it, and a limit refuses a deploy before it is sent.
+
+    exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
+    assert exported["app"]["shop"]["release"]["r2"]["metadata"]["dirty"] == "true"
+    refused = daemon.muructl(
+        "deploy", "shop", str(source), "--metadata", "url=ftp://example.com", check=False
+    )
+    assert refused.returncode != 0
+    assert "must be an absolute http or https URL" in refused.stderr

@@ -27,6 +27,7 @@ mod project_commands;
 mod proto;
 mod provision;
 mod pstats;
+mod release_metadata;
 mod render;
 mod run_admin;
 mod serve;

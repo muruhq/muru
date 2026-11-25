@@ -162,6 +162,68 @@ A release whose host exits on its own is marked failed; if it was serving,
 the daemon starts it again. A deploy whose release fails to start leaves
 the previous release serving and reports the failure.
 
+### Where a release came from
+
+A release carries metadata, a small map of keys to values saying where
+its code came from. When the source directory is in a git checkout,
+`muructl deploy` records the commit (`commit`), the branch, or with a
+detached HEAD the one tag on it (`ref`), and `dirty = true` when the
+checkout has changes, untracked files included. `--metadata KEY=VALUE`,
+given as often as needed, records more and overrides what git gave:
+
+```console
+$ muructl deploy shop /srv/shop \
+    --metadata url=https://git.example.com/shop/pull/42 \
+    --metadata "description=Fix the basket total"
+muru: release shop@r7 is ready and serving, commit 4f2a9c1e0b3d of main
+```
+
+`commit`, `ref`, `dirty`, `url` and `description` are shown by name; any
+other key is kept and shown as given, so a deploy tool can record its
+own, such as `hosting.example/pr=42`. `--metadata KEY=` leaves out a key
+git filled, a `commit` given by flag leaves out the filled `dirty`, and
+`--no-git-metadata` fills nothing from git. A source directory in no
+checkout, or a machine without git, records nothing from git; a git
+command that fails or takes longer than 5 seconds records nothing either,
+says why, and the deploy goes ahead.
+
+A release keeps at most 32 keys. A key is up to 63 lowercase letters,
+digits, `.`, `_`, `-` or `/`, starting with a letter or digit; a value is
+up to 1024 bytes with no control characters other than newlines and
+tabs, and `url` must be an `http` or `https` URL; all of it together is
+at most 8 KiB. A key with an empty value is not kept. The application is
+never given the metadata, in its environment or anywhere else.
+
+The metadata stays with the release, as its settings do. `release list`
+shows the commit in its `COMMIT` column, shortened, with `+` when the
+checkout had changes and `-` for none:
+
+```console
+$ muructl release list shop
+RELEASE                  STATE      SERVING  WORKERS          COMMIT             DISK SOURCE
+shop@r7                  ready      yes      2 (2x8)          4f2a9c1e0b3d    212.4MB /srv/shop
+shop@r6                  retained            1 (2x8)          9b01c33d7a2e+   212.4MB /srv/shop
+```
+
+`release show` gives every key, the well-known ones first, the
+`release.created` event names the commit and ref
+(`from /srv/shop, commit 4f2a9c1e0b3d of main`), the dashboard's
+releases table shows the commit, linked to `url`, with the ref and the
+description, and `--json` gives the map as `metadata`. A release
+declared in a file takes it as a `metadata` table, and `config export`
+writes it there:
+
+```toml
+[app.shop.release.r7]
+source = '/srv/shop'
+metadata = { commit = '4f2a9c1e0b3d5a6b7c8d9e0f1a2b3c4d5e6f7a8b', ref = 'refs/heads/main' }
+```
+
+`muructl apply` records what the file says and fills nothing from git. A
+file whose release has metadata other than what the daemon recorded for
+it is refused, as one with other settings is: declare a new release id
+instead.
+
 ### Settings on the application
 
 A release's flags apply to that release. A setting meant to last

@@ -387,6 +387,12 @@ impl NodeData {
         self.releases().any(|release| release.event_loop.is_some())
     }
 
+    /// Whether any release's metadata says where its code came from, so
+    /// the releases table has that column (section 9.14).
+    pub fn has_origins(&self) -> bool {
+        self.releases().any(ReleaseRow::has_origin)
+    }
+
     /// Whether any group handed requests from ASGI to WSGI, so the
     /// scaling table has the column for their wait.
     pub fn has_handoff_wait(&self) -> bool {
@@ -514,6 +520,25 @@ pub struct ReleaseRow {
     /// Whether it is a development detour (section 9.13), which a run
     /// holds open rather than the daemon running it.
     pub detour: bool,
+    /// Section 9.14: the commit its metadata names, shortened, with `+`
+    /// when its checkout had changes; empty for none.
+    pub commit: String,
+    /// The branch or tag its metadata names, shortened; empty for none.
+    pub git_ref: String,
+    /// The link its metadata gives, an http or https URL; empty for none.
+    pub url: String,
+    /// The description its metadata gives; empty for none.
+    pub description: String,
+}
+
+impl ReleaseRow {
+    /// Whether the row has anything of its metadata to show.
+    pub fn has_origin(&self) -> bool {
+        !self.commit.is_empty()
+            || !self.git_ref.is_empty()
+            || !self.url.is_empty()
+            || !self.description.is_empty()
+    }
 }
 
 /// A virtual host.
@@ -1629,6 +1654,39 @@ mod tests {
         assert_eq!(side_cell(&SlotSide::of(0, 1000)), "0/1000");
         assert_eq!(SlotSide::of(0, 0), None);
         assert_eq!(side_cell(&None), "-");
+    }
+
+    #[test]
+    fn a_releases_commit_links_to_its_url_with_its_description_beside_it() {
+        let data = NodeData {
+            apps: vec![AppRow {
+                name: "shop".to_owned(),
+                releases: vec![ReleaseRow {
+                    id: "r7".to_owned(),
+                    commit: "4f2a9c1e0b3d+".to_owned(),
+                    git_ref: "main".to_owned(),
+                    url: "https://git.example.com/shop/pull/42".to_owned(),
+                    description: "Fix <the> total".to_owned(),
+                    ..ReleaseRow::default()
+                }],
+                ..AppRow::default()
+            }],
+            ..NodeData::default()
+        };
+        let page = NodeOverviewFragment { data: &data }.render().unwrap();
+
+        // Issue 866: the description is escaped, as every value is.
+
+        assert!(
+            page.contains(
+                r#"<a href="https://git.example.com/shop/pull/42"><code>4f2a9c1e0b3d+</code></a> main"#
+            ),
+            "{page}"
+        );
+        assert!(
+            page.contains("Fix &#60;the&#62; total") || page.contains("Fix &lt;the&gt; total"),
+            "{page}"
+        );
     }
 
     #[test]

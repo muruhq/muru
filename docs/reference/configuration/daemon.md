@@ -142,6 +142,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `max_lifetime` | string |  | How long a worker lives before it is replaced, for example 1h, with jitter; off when absent. |
 | `max_requests` | integer |  | Requests a worker serves before it is replaced, with jitter; off when absent. |
 | `memory` | table, {ref}`[app.NAME.memory] <config-daemon-app-name-memory>` |  | The memory policy for the workers. |
+| `metadata` | table of strings |  | What the deploy recorded about where the release's code came from: string keys to string values, `commit`, `ref`, `url`, `description` and `dirty` among them, which the release keeps and never gives the application. At most 32 keys. |
 | `mounts` | table of tables, {ref}`[app.NAME.release.ID.mounts.NAME] <config-daemon-app-name-release-id-mounts-name>` |  | Mounts by name. |
 | `preload` | string | `"auto"` | Whether the application is imported once, in the host, before the workers are forked from it. `auto`: Preload when the import check passes, otherwise import per worker. `true`: Preload, and fail the release when the import check does not pass. `false`: Import in every worker. |
 | `preload_modules` | array of strings |  | Modules the host imports after the entrypoint and the mounts, so they are loaded once before the fork; when given, they replace the list in the source's `[tool.muru]` table. |

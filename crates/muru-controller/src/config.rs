@@ -3847,8 +3847,24 @@ pub fn resolve_declared(
 /// 13.1, and never an earlier release (issue 861). Every setting a deploy flag can
 /// set layers that way; the tables (groups, mounts, logging, scaling and
 /// error pages) come from the source alone, and the environment layers
-/// by name (section 3.3).
+/// by name (section 3.3). The request's metadata is checked and kept as
+/// given (section 9.14).
 pub fn resolve_spec(
+    request: &pb::DeployRequest,
+    tables: &Tables<'_>,
+    provisioning: &crate::provision::Provisioning,
+) -> Result<ReleaseSpec, String> {
+    let metadata = muru_config::check_metadata(&request.metadata)?;
+
+    Ok(ReleaseSpec {
+        metadata,
+        ..resolve_settings(request, tables, provisioning)?
+    })
+}
+
+/// The settings of a deploy request resolved into a release spec, as
+/// `resolve_spec` gives it, with no metadata.
+fn resolve_settings(
     request: &pb::DeployRequest,
     tables: &Tables<'_>,
     provisioning: &crate::provision::Provisioning,
@@ -4455,6 +4471,7 @@ pub fn resolve_spec(
     muru_config::check_handoff(handoff, Some(interface))?;
 
     Ok(ReleaseSpec {
+        metadata: BTreeMap::new(),
         limits: crate::model::ServedLimits::from_settings(&served),
         source,
         entrypoint,
@@ -5764,6 +5781,7 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         || request.memory_check_interval_ms.is_some();
 
     Ok(muru_config::Release {
+        metadata: BTreeMap::new(),
         static_dirs: request
             .static_dirs
             .iter()
@@ -5884,6 +5902,7 @@ fn resolve_http_spec(
     muru_config::check_sendfile_dirs(&table.sendfile_roots, &source)?;
 
     Ok(ReleaseSpec {
+        metadata: BTreeMap::new(),
         limits: tables
             .limits
             .map(|declared| crate::model::ServedLimits::from_settings(&declared))
@@ -6269,6 +6288,7 @@ pub(crate) fn env_spec_from_table(
 /// A declared release as the deploy request it stands for.
 fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequest {
     pb::DeployRequest {
+        metadata: table.metadata.clone(),
         app: app.to_owned(),
         source: source.to_owned(),
         override_freeze: false,
@@ -6487,11 +6507,13 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
             error_pages: spec.error_pages.clone(),
             error_override: spec.error_override.clone(),
             maintenance: spec.maintenance.clone(),
+            metadata: spec.metadata.clone(),
             ..ReleaseTable::default()
         };
     }
 
     ReleaseTable {
+        metadata: spec.metadata.clone(),
         kind: None,
         profile: None,
         command: Vec::new(),
@@ -6769,6 +6791,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "entrypoint",
         declared.entrypoint.clone(),
         recorded.entrypoint.clone(),
+    );
+    compare(
+        "metadata",
+        format!("{:?}", declared.metadata),
+        format!("{:?}", recorded.metadata),
     );
     compare(
         "interface",
@@ -7368,6 +7395,81 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("muru-config-plan-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn release_metadata_is_exported_applied_back_and_immutable() {
+        let source = source_dir();
+        let store = Store::in_memory().unwrap();
+        store.ensure_app("shop").unwrap();
+        let spec = resolve_spec(
+            &pb::DeployRequest {
+                app: "shop".to_owned(),
+                source: source.display().to_string(),
+                entrypoint: "shop.wsgi:application".to_owned(),
+                python: "/usr/bin/python3".to_owned(),
+                metadata: [
+                    ("commit", "4f2a9c1e0b3d"),
+                    ("ref", "refs/heads/main"),
+                    ("description", ""),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+                ..Default::default()
+            },
+            &Tables::default(),
+            &crate::provision::Provisioning::off(),
+        )
+        .unwrap();
+
+        // Issue 866: an empty value is left out, and the rest is kept.
+
+        assert_eq!(spec.metadata.len(), 2);
+        assert_eq!(
+            crate::model::created_from(&spec),
+            format!("{}, commit 4f2a9c1e0b3d of main", spec.source.display())
+        );
+        store.create_release("shop", "r1", &spec).unwrap();
+        store
+            .set_release_state("shop", "r1", ReleaseState::Ready, "")
+            .unwrap();
+        store.set_app_releases("shop", Some("r1"), None).unwrap();
+
+        // The export writes it and applies back without a change; a file
+        // that gives the release other metadata is refused.
+
+        let text = export(&store, None).unwrap().to_toml().unwrap();
+        assert!(text.contains("commit = \"4f2a9c1e0b3d\""), "{text}");
+        let back = plan_with(&store, &Document::parse(&text).unwrap(), false, false);
+        assert!(
+            back.errors.is_empty() && back.changes.is_empty(),
+            "{back:?}"
+        );
+
+        let changed = text.replace("4f2a9c1e0b3d", "9b01c33d7a2e");
+        let refused = plan_with(&store, &Document::parse(&changed).unwrap(), false, false);
+        assert!(
+            refused.errors[0].contains("already exists with different settings (metadata"),
+            "{:?}",
+            refused.errors
+        );
+
+        // Metadata past its limits refuses the deploy.
+
+        let bad = resolve_spec(
+            &pb::DeployRequest {
+                app: "shop".to_owned(),
+                source: source.display().to_string(),
+                entrypoint: "shop.wsgi:application".to_owned(),
+                python: "/usr/bin/python3".to_owned(),
+                metadata: [("url".to_owned(), "ftp://example.com".to_owned())].into(),
+                ..Default::default()
+            },
+            &Tables::default(),
+            &crate::provision::Provisioning::off(),
+        );
+        assert!(bad.unwrap_err().contains("http or https"));
     }
 
     #[test]
