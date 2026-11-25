@@ -1200,6 +1200,7 @@ fn specs() -> Vec<Spec> {
                 "action": {"type": "string", "enum": ["list", "link"]},
                 "detour": {"type": "string", "description": "For link: the detour, by its release, application, label, tag or the start of its ID; the project's application's, or the one open, when left out"},
                 "host": {"type": "string", "description": "For link: one of the application's hosts, in place of its best address"},
+                "name": {"type": "string", "description": "For link: the name to build the link from, one of the names or patterns of a host that routes the application, as for a host whose names are all wildcards"},
             }),
             required: &["action"],
             command: |arguments| match needed(arguments, "action")?.as_str() {
@@ -1213,6 +1214,10 @@ fn specs() -> Vec<Spec> {
 
                     if let Some(host) = text(arguments, "host") {
                         command.extend(["--host".to_owned(), host]);
+                    }
+
+                    if let Some(name) = text(arguments, "name") {
+                        command.extend(["--name".to_owned(), name]);
                     }
 
                     Ok(command)

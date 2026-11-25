@@ -30,6 +30,7 @@ from support.daemon import Daemon, start_daemon
 
 FIXTURE = support.ROOT / "tests" / "fixtures" / "projects" / "detoured"
 GREETER = support.ROOT / "tests" / "fixtures" / "projects" / "grpcsvc" / "greeter.proto"
+STATIC = support.ROOT / "tests" / "fixtures" / "static"
 
 # The daemon's own error page replaces a 500 its releases send, which a
 # detour's traceback passes by.
@@ -416,9 +417,40 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
             '[[route]]\nhost = "sub"\npath = "/app"\napp = "detoured"\n\n'
             '[host.strip]\nnames = ["strip.test"]\n\n'
             '[[route]]\nhost = "strip"\npath = "/app"\napp = "detoured"\n'
-            'strip_prefix = "/app"\n'
+            'strip_prefix = "/app"\n\n'
+            '[host.wild]\nnames = ["*.wild.test"]\n\n'
+            '[[route]]\nhost = "wild"\npath = "/w"\napp = "detoured"\n\n'
+            '[host.files]\nnames = ["files.localhost"]\n\n'
+            f'[[route]]\nhost = "files"\nstatic = "{STATIC}"\nfallback = {{ app = "detoured" }}\n'
         )
         daemon.muructl("apply", "-f", str(hosts))
+
+        # The application's URLs: the nameless default host's by the
+        # listener's address, the static route's whose fallback it is, and
+        # a wildcard host's only under a name asked for, which the host
+        # must take.
+
+        port = daemon.port
+        listed = daemon.muructl("open", "detoured", "--list").stdout
+        assert f"http://localhost:{port}/ " in listed, listed
+        assert f"http://files.localhost:{port}/ " in listed, listed
+        assert "left out: sub.test does not resolve" in listed, listed
+        named = daemon.muructl(
+            "open", "detoured", "--print", "--name", "alice.wild.test", "--any-name"
+        ).stdout
+        assert named.strip() == f"http://alice.wild.test:{port}/w"
+        named = daemon.muructl("open", "detoured", "--print", "--name", "x.test", "--any-name")
+        assert named.stdout.strip() == f"http://x.test:{port}/", "the default host takes it"
+
+        # A preview link is for a name that reaches this machine, or the
+        # name asked for.
+
+        link = daemon.muructl("detour", "preview", "--print", cwd=project).stdout.strip()
+        assert urllib.parse.urlsplit(link).hostname in ("localhost", "files.localhost"), link
+        link = daemon.muructl(
+            "detour", "preview", "--print", "--name", "bob.wild.test", "--any-name", cwd=project
+        ).stdout.strip()
+        assert link.startswith(f"http://bob.wild.test:{port}/_muru/preview/"), link
 
         for name in ("sub.test", "strip.test"):
             page = daemon.request("/app/page", name, headers={**preview, **document})

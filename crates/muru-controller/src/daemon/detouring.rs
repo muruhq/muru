@@ -354,8 +354,10 @@ impl Daemon {
             .read()
             .expect("listeners poisoned")
             .clone();
-        let candidates = crate::urls::for_app(&request.app, &routes, &hosts, &listeners);
+        let name = (!request.name.is_empty()).then_some(request.name.as_str());
+        let candidates = crate::urls::for_app(&request.app, &routes, &hosts, &listeners, name);
         let total = candidates.len();
+        let header = muru_edge::preview::value(&detour.release, &detour.secret);
 
         let chosen: Vec<crate::urls::Candidate> = if request.all {
             candidates
@@ -371,14 +373,22 @@ impl Daemon {
             candidates.into_iter().take(1).collect()
         };
 
+        // Issue 908: the header needs no address, so an application with
+        // none still has it, and the caller is told why there is no link.
+
         if chosen.is_empty() {
-            return Err(if request.host.is_empty() {
-                format!("{} has no address to preview it at", request.app)
-            } else {
-                format!(
-                    "{} has no address on {}; muructl detour preview --list gives each",
-                    request.app, request.host
-                )
+            return Ok(admin::DetourPreview {
+                links: Vec::new(),
+                header,
+                others: u32::try_from(total).unwrap_or(u32::MAX),
+                unreachable: if total == 0 {
+                    crate::urls::no_address(&request.app, &routes, &hosts, name)
+                } else {
+                    format!(
+                        "{} has no address on {}; muructl detour preview --list gives each",
+                        request.app, request.host
+                    )
+                },
             });
         }
 
@@ -402,10 +412,10 @@ impl Daemon {
                     &format!("{}{token}", muru_edge::preview::PREFIX),
                 ),
                 address: candidate.url.clone(),
+                name: candidate.name.clone(),
+                bound: candidate.bound.to_string(),
             });
         }
-
-        let header = muru_edge::preview::value(&detour.release, &detour.secret);
 
         self.edge
             .add_preview_tokens(tokens)
@@ -416,6 +426,7 @@ impl Daemon {
             others: u32::try_from(total.saturating_sub(links.len())).unwrap_or(u32::MAX),
             links,
             header,
+            unreachable: String::new(),
         })
     }
 

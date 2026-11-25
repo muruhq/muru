@@ -165,6 +165,17 @@ and offers `http://127.0.0.1:PORT/`, which reaches the listener's
 default host. With no APP, the application is the project's, by its
 `[project]` name.
 
+A default host with no names of its own is reached by each listener's
+address, `localhost` for a loopback or wildcard listener, and a static
+route whose `fallback` is the application counts as a route to it. A
+host whose names are all patterns, such as `*.shop.test`, has no name a
+URL can carry: give it a `canonical` name, or pass one with `--name`.
+`--name NAME` builds the URL from that name, which must reach a host
+that routes the application, as the daemon picks hosts, so
+`muructl open shop --name alice.shop.test` opens
+`http://alice.shop.test:8080/` for a host named `*.shop.test`, or
+chooses one tenant among several.
+
 The browser is the program `$BROWSER` names, then `open` on macOS, and
 on Linux `wslview` under WSL, `xdg-open` or `gio open`, given the URL as
 an argument. On Linux with no display, in an SSH session with no

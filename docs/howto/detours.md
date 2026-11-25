@@ -115,12 +115,24 @@ $ muructl detour preview                      # open a link for the best address
 $ muructl detour preview --host admin.localhost
 $ muructl detour preview --list               # a link for each of the application's addresses
 $ muructl detour preview --print              # print a link, open nothing
+$ muructl detour preview --name alice.shop.test
 $ muructl detour preview --header
 Muru-Preview: dev-7f3a.3f9c0e7a51b2d4c68e1f0a9b7c5d3e21
 ```
 
+The links are for the addresses `muructl open` gives the application,
+and like `muructl open` they are only for names that reach this
+machine: a name that does not resolve here, or resolves elsewhere, is
+passed over for the next address, and when none is left the command
+says which names it left out and why. `--any-name` keeps them. `--name`
+builds the link from a name of your choosing, which must reach a host
+that routes the application, for a host whose names are all patterns or
+to choose a tenant; `muructl detour run --open-preview` takes `--name`
+and `--any-name` too.
+
 `--header` prints the header that previews the detour without a cookie,
-for curl or a test client:
+for curl or a test client, whatever the application's hosts are, since
+it needs no address:
 
 ```console
 $ curl -H "$(muructl detour preview --header)" https://shop.localhost:8443/

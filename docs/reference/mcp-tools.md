@@ -39,7 +39,7 @@ it out.
 | `websockets` | reads | `muructl websockets` | `app`, `list` |
 | `requests` | reads | `muructl requests` | `app`, `list` |
 | `overlay_preview` | reads | `muructl overlay preview` | `name` |
-| `detours` | reads | `muructl detour list`, or with `link` `muructl detour preview --print`: a one-time entry link to a detour's preview, valid for a minute, with the `Muru-Preview` header value | `action` (list, link), `detour`, `host` |
+| `detours` | reads | `muructl detour list`, or with `link` `muructl detour preview --print`: a one-time entry link to a detour's preview, valid for a minute, for an address whose name reaches this machine, with the `Muru-Preview` header value, which is given when there is no link too, with why | `action` (list, link), `detour`, `host`, `name` |
 | `skill_status` | reads | `muructl mcp skill status` | none |
 | `docs` | reads | The user guide embedded in `muructl`: the list of pages, or one page's Markdown | `page` |
 | `set_app_settings` | changes | `muructl app set` | `app`, `env`, `secrets`, `processes`, `threads`, `sync_threads`, `concurrency`, `max_requests`, `max_lifetime`, `timeouts`, `memory`, `replace` |

@@ -203,17 +203,21 @@ message PreviewDetourRequest {
   string release = 2;
   string host = 3;                  // a link for this host alone; the best address when empty
   bool all = 4;                     // a link for each of the application's addresses
+  string name = 5;                  // the name to build the links from, which a host routing the application must take; its own names when empty
 }
 
 message DetourPreview {
-  repeated DetourLink links = 1;    // best first
-  string header = 2;                // the Muru-Preview header's value, RELEASE.SECRET
+  repeated DetourLink links = 1;    // best first; none when the application has no address
+  string header = 2;                // the Muru-Preview header's value, RELEASE.SECRET, always given
   uint32 others = 3;                // the application's addresses no link was made for
+  string unreachable = 4;           // why there are no links, when there are none
 }
 
 message DetourLink {
   string url = 1;                   // the entry link
   string address = 2;               // where it leads
+  string name = 3;                  // the name in it
+  string bound = 4;                 // the address the listener it reaches is bound on
 }
 
 message ListDetoursRequest {}
@@ -1105,11 +1109,13 @@ message DashboardLoginRequest {
 
 message ApplicationUrlsRequest {
   string app = 1;
+  string name = 2;                  // the name to build the URLs from, which a host routing the application must take; its own names when empty
 }
 
 message ApplicationUrlsResponse {
   string app = 1;
   repeated ApplicationUrl urls = 2; // best first: the default route, a canonical name, https
+  string unreachable = 3;           // why there are no URLs, when there are none
 }
 
 message ApplicationUrl {

@@ -3761,7 +3761,7 @@ impl Daemon {
                     .map(|(_, by)| by.clone())
                     .unwrap_or_default(),
                 releases,
-                urls: crate::urls::for_app(&app.name, &routes, &hosts, &listeners)
+                urls: crate::urls::for_app(&app.name, &routes, &hosts, &listeners, None)
                     .into_iter()
                     .map(|candidate| candidate.url)
                     .collect(),

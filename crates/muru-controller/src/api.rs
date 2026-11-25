@@ -2811,7 +2811,9 @@ impl Admin for Service {
         &self,
         request: Request<pb::ApplicationUrlsRequest>,
     ) -> Result<Response<pb::ApplicationUrlsResponse>, Status> {
-        let app = request.into_inner().app;
+        let request = request.into_inner();
+        let app = request.app;
+        let name = (!request.name.is_empty()).then_some(request.name.as_str());
         let apps = self.handle.store.apps().map_err(internal)?;
 
         if !apps.iter().any(|known| known.name == app) {
@@ -2828,12 +2830,24 @@ impl Admin for Service {
             .expect("listeners poisoned")
             .clone();
 
-        Ok(Response::new(pb::ApplicationUrlsResponse {
-            urls: crate::urls::for_app(&app, &routes, &hosts, &listeners)
+        let urls: Vec<pb::ApplicationUrl> =
+            crate::urls::for_app(&app, &routes, &hosts, &listeners, name)
                 .into_iter()
                 .map(application_url)
-                .collect(),
+                .collect();
+
+        // Issue 908: no URL is an answer, with why, for the caller to say.
+
+        let unreachable = if urls.is_empty() {
+            crate::urls::no_address(&app, &routes, &hosts, name)
+        } else {
+            String::new()
+        };
+
+        Ok(Response::new(pb::ApplicationUrlsResponse {
+            urls,
             app,
+            unreachable,
         }))
     }
 

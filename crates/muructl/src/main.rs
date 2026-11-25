@@ -5186,7 +5186,13 @@ async fn run_with(
 
     if let (Some(mode), Some((_, opened, _))) = (&detour, &detour_held)
         && mode.open_preview
-        && let Err(error) = detour::open_preview(&mode.daemon, opened).await
+        && let Err(error) = detour::open_preview(
+            &mode.daemon,
+            opened,
+            mode.preview_name.as_deref(),
+            mode.any_name,
+        )
+        .await
     {
         muru_common::muru_println!("no preview link: {error:#}");
     }
