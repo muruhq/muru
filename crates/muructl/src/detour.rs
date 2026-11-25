@@ -808,7 +808,6 @@ pub fn hold(
 
                 match open(&daemon, &request).await {
                     Ok((stream, opened)) => {
-                        links.set_hosts(opened.hosts.clone());
                         let traffic = opened
                             .detour
                             .as_ref()

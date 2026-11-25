@@ -203,7 +203,9 @@ reached during a development run.
 In a [detour](detours.md) the toolbar is yours alone: it goes only into
 pages you reach by the detour's preview, and the paths above answer only
 your previewed requests, 404 for any other client the daemon sends to
-the detour.
+the detour. They answer whatever host name the daemon routed to the
+detour, its default host's, a wildcard's or a name added while the
+detour runs.
 
 Behind a development proxy that serves the run under a path, as
 jupyter-server-proxy and code-server do, the tag carries the path the

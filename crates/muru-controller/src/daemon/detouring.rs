@@ -85,7 +85,6 @@ impl Daemon {
         let data = crate::places::app_data(&self.locations.state.path, &record);
         let opened = admin::DetourOpened {
             detour: Some(detour.message()),
-            hosts: self.detour_hosts(&app),
             data_dir: data.data.display().to_string(),
             media_dir: data.media.display().to_string(),
             uploads_dir: data.uploads.display().to_string(),
@@ -467,26 +466,6 @@ impl Daemon {
     pub(super) fn publish_detours(&self) {
         let detours = self.detours.values().map(Detour::message).collect();
         *self.info.detours.lock().expect("detours poisoned") = detours;
-    }
-
-    /// The application's host names, patterns left out, as its URLs give
-    /// them: what the run's toolbar accepts beside loopback names.
-    fn detour_hosts(&self, app: &str) -> Vec<String> {
-        let routes = self.store.routes().unwrap_or_default();
-        let hosts = self.store.hosts().unwrap_or_default();
-        let listeners = self
-            .info
-            .listeners
-            .read()
-            .expect("listeners poisoned")
-            .clone();
-        let mut names = BTreeSet::new();
-
-        crate::urls::for_app(app, &routes, &hosts, &listeners)
-            .into_iter()
-            .map(|candidate| candidate.name)
-            .filter(|name| names.insert(name.clone()))
-            .collect()
     }
 
     /// What the detours add to the snapshot: a release of each

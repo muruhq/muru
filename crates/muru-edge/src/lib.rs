@@ -1534,6 +1534,7 @@ async fn serve<I>(
                     &shared.links,
                     recorder,
                     renderer,
+                    detour_run,
                 ));
             }
             let forwarded = routing.trust_on(&local).resolve(&peer, &mut parts.headers);

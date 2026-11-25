@@ -244,6 +244,14 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         assert daemon.request("/_muru/toolbar/toolbar.js", headers=preview).status == 200
         assert daemon.request("/_muru/toolbar/history", headers=preview).status == 200
 
+        # It answers whatever name the daemon routed to the detour, and
+        # still refuses another site's page.
+
+        for name in ("shop.lan", "x.echo.test"):
+            assert daemon.request("/_muru/toolbar/toolbar.js", name, headers=preview).status == 200
+        cross = {**preview, "Sec-Fetch-Site": "cross-site"}
+        assert daemon.request("/_muru/toolbar/history", headers=cross).status == 403
+
         # The detour is listed, with no secret, and its run is an instance
         # of kind detour that --instance reaches by its tag.
 

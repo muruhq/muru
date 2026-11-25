@@ -264,9 +264,7 @@ message DetourMessage {
 // What the daemon opened for a run.
 message DetourOpened {
   Detour detour = 1;
-  // The application's host names, patterns left out, which the run's
-  // toolbar accepts beside loopback names.
-  repeated string hosts = 2;
+  reserved 2;                       // was hosts: a detour's toolbar answers any name the daemon routes to it
   // The application's data directory and its parts on the daemon.
   string data_dir = 3;
   string media_dir = 4;

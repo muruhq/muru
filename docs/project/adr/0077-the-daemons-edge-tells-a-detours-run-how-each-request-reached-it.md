@@ -68,6 +68,15 @@ show the toolbar to clients a traffic choice sends.
   and the run's dashboard and the daemon's access log, metrics and
   dashboard show the shared traffic.
 
+- A detour's run does not check the Host of a request under its
+  reserved prefix against loopback and a list of the application's
+  names (issue 911). The list the daemon sent when the detour opened
+  left out the default host and pattern names and went stale when the
+  hosts changed, and the check, which is against DNS rebinding, adds
+  nothing when the run's one peer has already matched the request to a
+  virtual host and routed it here. The `Sec-Fetch-Site` check stays,
+  and the daemon no longer sends the list.
+
 - The value has room for more: `; base=PATH` after the word carries a
   path, percent-encoded, which issue 912 fills with the matched route's
   path.
@@ -86,5 +95,5 @@ show the toolbar to clients a traffic choice sends.
 
 ## More information
 
-Issues 913 and 912, the internal header's two uses; sections 4.20,
-4.21 and 13.12.
+Issues 913 and 912, the internal header's two uses, and 911, the
+toolbar's host names; sections 4.20, 4.21 and 13.12.

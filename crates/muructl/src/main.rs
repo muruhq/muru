@@ -4790,16 +4790,15 @@ async fn run_with(
     }
 
     // Section 4.20: the reserved prefix answers to the run's own names
-    // besides loopback, and with --toolbar the edge inserts the toolbar
-    // into HTML pages, which the start-up says.
+    // besides loopback, or for a detour to whatever name the daemon routes
+    // to it, and with --toolbar the edge inserts the toolbar into HTML
+    // pages, which the start-up says.
 
     if development && serve.is_none() {
         match &detour_held {
-            Some((_, opened, _)) => {
-                edge.links().set_hosts(opened.hosts.clone());
-                edge.links()
-                    .set_detour(opened.detour.as_ref().map(|detour| detour.traffic.clone()));
-            }
+            Some((_, opened, _)) => edge
+                .links()
+                .set_detour(opened.detour.as_ref().map(|detour| detour.traffic.clone())),
             None => edge.links().set_hosts(resolved.serving.hosts.clone()),
         }
 
