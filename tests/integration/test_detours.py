@@ -342,7 +342,7 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         # says so, by an overlay it owns, and back again.
 
         switched = daemon.muructl("detour", "traffic", "all", cwd=project)
-        assert "now takes all of detoured's traffic (was preview)" in switched.stdout
+        assert "now takes all of detoured's traffic (was previews only)" in switched.stdout
         assert served(daemon)["instance"].startswith("detour:")
         overlays = daemon.muructl("overlay", "list").stdout
         assert "detour:detoured" in overlays and "detour" in overlays
@@ -405,6 +405,26 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
             time.sleep(0.1)
 
         assert detour.log().count("now takes previews only") >= reverted, detour.log()
+
+        # A detour may take only some paths: the rest goes to the serving
+        # release, a preview's included, which the response says for the
+        # page's toolbar, whose own paths stay in the detour's scope.
+
+        scoped = daemon.muructl("detour", "traffic", "all", "--path", "/scoped", cwd=project)
+        assert "now takes all of detoured's traffic under /scoped (was previews only)" in (
+            scoped.stdout
+        ), scoped.stdout
+        assert served(daemon, "/scoped/x")["instance"].startswith("detour:")
+        assert not served(daemon, "/scopedx")["instance"].startswith("detour:")
+        outside = served(daemon, "/other", **preview)
+        assert not outside["instance"].startswith("detour:")
+        assert 'muru-release;desc="' in outside["headers"].get("server-timing", ""), outside
+        assert daemon.request("/_muru/toolbar/toolbar.js", headers=preview).status == 200
+        assert "all under /scoped" in daemon.muructl("detour", "list").stdout
+        assert "every route pinned, under /scoped" in daemon.muructl("overlay", "list").stdout
+        assert "all under /scoped now" in daemon.muructl("events").stdout
+        daemon.muructl("detour", "traffic", "preview", "--all-paths", cwd=project)
+        assert served(daemon, "/other", **preview)["instance"].startswith("detour:")
 
         # Behind a route at a sub path the toolbar lives under the route,
         # so its requests reach the detour as the page's do: the route's

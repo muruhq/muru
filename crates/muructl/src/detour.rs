@@ -121,6 +121,16 @@ pub struct TrafficArgs {
     #[arg(long, value_name = "ZONE", requires = "until")]
     timezone: Option<String>,
 
+    /// Take requests only under this client URL path, matched on segment
+    /// boundaries before any route strips it; may be given more than
+    /// once, and replaces the paths the detour has.
+    #[arg(long = "path", value_name = "PREFIX")]
+    paths: Vec<String>,
+
+    /// Take requests under every path again.
+    #[arg(long, conflicts_with = "paths")]
+    all_paths: bool,
+
     #[command(flatten)]
     output: crate::admin::JsonArgs,
 
@@ -162,6 +172,17 @@ pub struct DetourRunArgs {
     /// its releases share, in place of the run's own.
     #[arg(long)]
     app_data: bool,
+
+    /// Take requests only under this client URL path, matched on segment
+    /// boundaries before any route strips it; may be given more than
+    /// once. Every path without it.
+    #[arg(long = "path", value_name = "PREFIX")]
+    paths: Vec<String>,
+
+    /// Take requests only under the path of this checkout's mount, under
+    /// each of the application's routes; may be given more than once.
+    #[arg(long = "mount", value_name = "NAME")]
+    mount_names: Vec<String>,
 
     /// Whose mounts the detour serves with: checkout, the mounts this
     /// checkout declares, or release, those of the serving release it
@@ -295,6 +316,10 @@ pub struct Mode {
     pub label: String,
     /// Whose mounts the detour serves with.
     pub mounts: MountsFrom,
+    /// The paths `--path` gives the detour.
+    pub paths: Vec<String>,
+    /// The checkout's mounts whose paths `--mount` gives it.
+    pub mount_names: Vec<String>,
 }
 
 /// Settle the mounts a detour serves with once it is open (issue 907):
@@ -476,6 +501,8 @@ pub async fn run(args: DetourRunArgs) -> anyhow::Result<()> {
         app_data: args.app_data,
         label: args.label.label.clone().unwrap_or_default(),
         mounts: args.mounts,
+        paths: args.paths.clone(),
+        mount_names: args.mount_names.clone(),
     };
 
     crate::run_with(run_args, None, None, Some(mode)).await
@@ -541,7 +568,11 @@ fn table(detours: &[pb::Detour]) -> Vec<String> {
                     detour.label.clone()
                 },
                 detour.pid.to_string(),
-                muru_controller::detours::traffic_text(&detour.traffic, detour.until_unix_ms),
+                muru_controller::detours::listed_traffic(
+                    &detour.traffic,
+                    detour.until_unix_ms,
+                    &detour.paths,
+                ),
                 crate::instances::uptime(u64::try_from(detour.opened_unix_ms).unwrap_or_default()),
                 muru_controller::registry::home_shortened(Path::new(&detour.directory)),
             ]
@@ -620,6 +651,7 @@ pub async fn traffic(args: TrafficArgs) -> anyhow::Result<()> {
     let detours = listed(&mut client).await?;
     let detour = chosen(wanted, &detours)?;
     let before = detour.traffic.clone();
+    let paths_before = detour.paths.clone();
 
     let after = client
         .set_detour_traffic(pb::SetDetourTrafficRequest {
@@ -627,6 +659,8 @@ pub async fn traffic(args: TrafficArgs) -> anyhow::Result<()> {
             release: detour.release.clone(),
             traffic: choice,
             until_unix_ms: until,
+            paths: args.paths.clone(),
+            all_paths: args.all_paths,
         })
         .await
         .map_err(crate::admin::explain)?
@@ -637,11 +671,12 @@ pub async fn traffic(args: TrafficArgs) -> anyhow::Result<()> {
     }
 
     muru_common::muru_println!(
-        "detour {}@{} now takes {}{} (was {before})",
+        "detour {}@{} now takes {}{} (was {})",
         after.app,
         after.release,
-        takes(&after.traffic, &after.app),
-        ending(after.until_unix_ms)
+        takes(&after.traffic, &after.app, &after.paths),
+        ending(after.until_unix_ms),
+        takes(&before, &after.app, &paths_before)
     );
     Ok(())
 }
@@ -882,8 +917,10 @@ pub fn request(
     socket: &Path,
     instance_id: &str,
     project: &Path,
+    paths: Vec<String>,
 ) -> pb::OpenDetourRequest {
     pb::OpenDetourRequest {
+        paths,
         app: mode.app.clone(),
         socket: socket.display().to_string(),
         label: mode.label.clone(),
@@ -930,17 +967,101 @@ pub fn name(opened: &pb::DetourOpened) -> String {
         .unwrap_or_default()
 }
 
-/// What a traffic choice means, as a line says it.
-pub fn takes(traffic: &str, app: &str) -> String {
-    match traffic {
-        "" | "preview" => "previews only".to_owned(),
+/// What a traffic choice means, as a line says it, with the paths it is
+/// for when it is for some alone (issue 909).
+pub fn takes(traffic: &str, app: &str, paths: &[String]) -> String {
+    let scope = muru_controller::detours::scope_text(paths);
+
+    let what = match traffic {
+        "" | "preview" if scope.is_empty() => "previews only".to_owned(),
+        "" | "preview" => return format!("previews only, {scope}"),
         "all" => format!("all of {app}'s traffic"),
         other => match other.split_once('=') {
             Some(("share", share)) => format!("{share}% of {app}'s clients"),
             Some(("class", class)) => format!("the requests of client class {class}"),
             _ => other.to_owned(),
         },
+    };
+
+    if scope.is_empty() {
+        what
+    } else {
+        format!("{what} {scope}")
     }
+}
+
+/// The paths a detour is to take requests under, from `--path` and
+/// `--mount` (issue 909). A mount names the checkout's mount, whose path
+/// is taken under each of the application's routes on the daemon: after
+/// the route's `strip_prefix`, or alone on a route that strips nothing.
+pub async fn scope(
+    mode: &Mode,
+    mounts: &std::collections::BTreeMap<String, muru_config::Mount>,
+) -> anyhow::Result<Vec<String>> {
+    let mut paths = mode.paths.clone();
+
+    if !mode.mount_names.is_empty() {
+        let mut client = muru_controller::client::connect(
+            &muru_controller::client::Endpoint::unix(&mode.daemon),
+        )
+        .await
+        .with_context(|| format!("reaching the daemon at {}", mode.daemon.display()))?;
+        let routes = client
+            .list_routes(pb::ListRoutesRequest {})
+            .await
+            .map_err(crate::admin::explain)?
+            .into_inner()
+            .routes;
+        let stripped: Vec<String> = routes
+            .iter()
+            .filter(|route| route.app == mode.app || route.fallback_app == mode.app)
+            .map(|route| route.strip_prefix.trim_end_matches('/').to_owned())
+            .collect();
+
+        for name in &mode.mount_names {
+            paths.extend(mount_scope(name, mounts, &stripped)?);
+        }
+    }
+
+    muru_controller::detours::scope_paths(&paths).map_err(anyhow::Error::msg)
+}
+
+/// The client URL paths of the checkout's mount `name` under routes that
+/// strip each of `stripped` (empty for one that strips nothing); the
+/// mount's path alone when the application has no routes.
+fn mount_scope(
+    name: &str,
+    mounts: &std::collections::BTreeMap<String, muru_config::Mount>,
+    stripped: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let Some(mount) = mounts.get(name) else {
+        let known: Vec<&str> = mounts.keys().map(String::as_str).collect();
+        anyhow::bail!(
+            "this checkout has no mount {name}{}",
+            if known.is_empty() {
+                String::new()
+            } else {
+                format!("; it has {}", known.join(", "))
+            }
+        );
+    };
+
+    anyhow::ensure!(
+        !mount.path.is_empty(),
+        "mount {name} has no path, as a gRPC mount's is matched by service, so it cannot scope \
+         a detour; give --path instead"
+    );
+
+    let path = mount.path.trim_end_matches('/');
+
+    if stripped.is_empty() {
+        return Ok(vec![path.to_owned()]);
+    }
+
+    Ok(stripped
+        .iter()
+        .map(|prefix| format!("{prefix}{path}"))
+        .collect())
 }
 
 /// Hold the detour open for as long as the run runs: what the daemon
@@ -970,7 +1091,7 @@ pub fn hold(
                             "detour {}@{} now takes {}{}",
                             detour.app,
                             detour.release,
-                            takes(&detour.traffic, &detour.app),
+                            takes(&detour.traffic, &detour.app, &detour.paths),
                             ending(detour.until_unix_ms)
                         );
                     }
@@ -1131,12 +1252,61 @@ mod tests {
     }
 
     #[test]
-    fn a_traffic_choice_is_said_as_what_it_sends() {
-        assert_eq!(takes("preview", "shop"), "previews only");
-        assert_eq!(takes("all", "shop"), "all of shop's traffic");
-        assert_eq!(takes("share=10", "shop"), "10% of shop's clients");
+    fn a_mount_scopes_a_detour_under_each_route_of_the_application() {
+        let mounts = std::collections::BTreeMap::from([
+            (
+                "api".to_owned(),
+                muru_config::Mount {
+                    path: "/api/".to_owned(),
+                    entrypoint: "shop.api:app".to_owned(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "rpc".to_owned(),
+                muru_config::Mount {
+                    entrypoint: "shop.rpc:register".to_owned(),
+                    interface: Some(muru_config::Interface::Grpc),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
         assert_eq!(
-            takes("class=crawlers", "shop"),
+            mount_scope("api", &mounts, &["/app".to_owned(), String::new()]).unwrap(),
+            ["/app/api", "/api"]
+        );
+        assert_eq!(mount_scope("api", &mounts, &[]).unwrap(), ["/api"]);
+        assert!(
+            mount_scope("rpc", &mounts, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("mount rpc has no path")
+        );
+        assert!(
+            mount_scope("web", &mounts, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("this checkout has no mount web; it has api, rpc")
+        );
+    }
+
+    #[test]
+    fn a_traffic_choice_is_said_as_what_it_sends() {
+        assert_eq!(takes("preview", "shop", &[]), "previews only");
+        assert_eq!(takes("all", "shop", &[]), "all of shop's traffic");
+        assert_eq!(takes("share=10", "shop", &[]), "10% of shop's clients");
+        let scoped = ["/app/admin".to_owned(), "/app/api".to_owned()];
+        assert_eq!(
+            takes("preview", "shop", &scoped[1..]),
+            "previews only, under /app/api"
+        );
+        assert_eq!(
+            takes("all", "shop", &scoped),
+            "all of shop's traffic under /app/admin and /app/api"
+        );
+        assert_eq!(
+            takes("class=crawlers", "shop", &[]),
             "the requests of client class crawlers"
         );
     }

@@ -460,6 +460,7 @@ message AppWorkers {
   AccessLogChoice access_log = 19;      // section 11.2: the application's own access log choice; none when absent
   RequestLimits limits = 20;            // section 4.6: the release's own limits on a request, over its host's; none when absent
   string preview_secret = 21;           // section 4.21: a detour's secret, which a preview must carry as RELEASE.SECRET; empty for any other release
+  repeated string detour_paths = 22;    // section 4.21: the client URL paths a detour takes requests under, without a trailing slash; every path when empty
 }
 
 // Section 4.9: a directory of a release's own files, served by the edge

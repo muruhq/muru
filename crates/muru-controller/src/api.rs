@@ -129,7 +129,7 @@ fn detour_release(detour: pb::Detour) -> pb::Release {
         kind: "detour".to_owned(),
         traffic: format!(
             "detour, {}",
-            crate::detours::traffic_text(&detour.traffic, detour.until_unix_ms)
+            crate::detours::listed_traffic(&detour.traffic, detour.until_unix_ms, &detour.paths)
         ),
         created_unix_ms: u64::try_from(detour.opened_unix_ms).unwrap_or_default(),
         detour: Some(detour),
@@ -2267,6 +2267,18 @@ impl Admin for Service {
         let request = request.into_inner();
         let traffic =
             crate::detours::Traffic::parse(&request.traffic).map_err(Status::invalid_argument)?;
+
+        // Issue 909: the paths change only when some are given, or every
+        // path is asked for again.
+
+        let paths = if request.all_paths {
+            Some(Vec::new())
+        } else if request.paths.is_empty() {
+            None
+        } else {
+            Some(crate::detours::scope_paths(&request.paths).map_err(Status::invalid_argument)?)
+        };
+
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
             .commands
@@ -2275,6 +2287,7 @@ impl Admin for Service {
                 release: request.release,
                 traffic,
                 until_unix_ms: request.until_unix_ms,
+                paths,
                 done: done_tx,
             })
             .await
@@ -2372,21 +2385,22 @@ impl Admin for Service {
         let apps: BTreeSet<&str> = detours.iter().map(|detour| detour.app.as_str()).collect();
 
         for app in apps {
-            let traffic: Vec<(String, crate::detours::Traffic)> = detours
+            let traffic: Vec<(String, crate::detours::Traffic, Vec<String>)> = detours
                 .iter()
                 .filter(|detour| detour.app == app)
                 .filter_map(|detour| {
                     crate::detours::Traffic::parse(&detour.traffic)
                         .ok()
-                        .map(|traffic| (detour.release.clone(), traffic))
+                        .map(|traffic| (detour.release.clone(), traffic, detour.paths.clone()))
                 })
                 .collect();
             let takings: Vec<crate::detours::Taking<'_>> = traffic
                 .iter()
-                .map(|(release, traffic)| crate::detours::Taking {
+                .map(|(release, traffic, paths)| crate::detours::Taking {
                     app,
                     release,
                     traffic,
+                    paths,
                 })
                 .collect();
             let changes = crate::detours::changes(&takings);

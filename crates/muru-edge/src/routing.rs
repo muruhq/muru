@@ -354,6 +354,9 @@ pub struct Selection {
     /// Section 4.5: the leading part of the path the route strips, which
     /// becomes the application's mount point; empty when it strips none.
     pub stripped: String,
+    /// Issue 909: a request carrying a detour's preview that went to the
+    /// serving release, this one, since its path is outside the detour's.
+    pub scoped_out: bool,
 }
 
 /// Section 4.5: what is left of a path once a route's stripped part,
@@ -641,6 +644,7 @@ fn upstream_selection(upstream: &Arc<Upstream>) -> Selection {
         limits: crate::RequestLimits::default(),
         detour: None,
         stripped: String::new(),
+        scoped_out: false,
     }
 }
 
@@ -694,6 +698,55 @@ fn previewed<'a>(
     }
 
     Chosen::named(name, app, upstreams).filter(|chosen| !chosen.is_detour())
+}
+
+/// What a detour's scope is judged against (issue 909): the client URL
+/// path, before any route strips it, and the path of the route it
+/// matched, under which a detour's toolbar lives.
+#[derive(Debug, Clone, Copy)]
+pub struct Scope<'a> {
+    /// The request's path as the client sent it.
+    pub path: &'a str,
+    /// The matched route's path; empty when no route matched.
+    pub route: &'a str,
+}
+
+/// The release choice with detours' scopes applied (issue 909): a detour
+/// chosen for a path outside its scope gives way to another detour of the
+/// application the route's policy names whose scope takes the path, as
+/// when two take all of it under paths of their own, and else to the
+/// serving release. The flag says a request carrying the detour's preview
+/// was sent to the serving release so.
+fn within_scope<'a>(
+    chosen: Chosen<'a>,
+    app: &'a AppReleases,
+    policy: Option<&Policy>,
+    scope: Scope<'_>,
+    client: &Client<'_>,
+) -> (Chosen<'a>, bool) {
+    let Chosen::Pools(pools) = &chosen else {
+        return (chosen, false);
+    };
+
+    if !pools.is_detour() || pools.scope_takes(scope.path, scope.route, client) {
+        return (chosen, false);
+    }
+
+    let previewed = pools.previewed_in(client.headers);
+
+    if !previewed
+        && let Some(policy) = policy
+        && let Some(other) = app.releases.values().find(|other| {
+            other.is_detour()
+                && !Arc::ptr_eq(other, pools)
+                && policy.names(other.labels().1)
+                && other.scope_takes(scope.path, scope.route, client)
+        })
+    {
+        return (Chosen::Pools(other), false);
+    }
+
+    (Chosen::Pools(&app.serving), previewed)
 }
 
 /// Section 4.5: which of an application's releases takes a request. The
@@ -837,6 +890,9 @@ pub struct AppPools {
     limits: crate::RequestLimits,
     /// Section 4.21: a detour's secret, which a preview of it must carry.
     preview_secret: Option<Arc<str>>,
+    /// Section 4.21 (issue 909): the client URL paths a detour takes
+    /// requests under; every path when empty.
+    detour_paths: Arc<[String]>,
 }
 
 /// A path that selects a worker group (section 7.1).
@@ -1002,6 +1058,7 @@ impl AppPools {
             grpc_web: Arc::default(),
             limits: crate::RequestLimits::default(),
             preview_secret: None,
+            detour_paths: Arc::default(),
         })
     }
 
@@ -1021,6 +1078,7 @@ impl AppPools {
             grpc_web: Arc::default(),
             limits: crate::RequestLimits::default(),
             preview_secret: None,
+            detour_paths: Arc::default(),
         }
     }
 
@@ -1061,6 +1119,47 @@ impl AppPools {
     /// Whether the release is a detour, previewed only with its secret.
     fn is_detour(&self) -> bool {
         self.preview_secret.is_some()
+    }
+
+    /// The same detour, taking requests under these client URL paths
+    /// alone (issue 909); every path when there are none.
+    pub fn with_detour_paths(mut self, paths: &[String]) -> Self {
+        self.detour_paths = paths
+            .iter()
+            .map(|path| path.trim_end_matches('/').to_owned())
+            .filter(|path| !path.is_empty())
+            .collect();
+        self
+    }
+
+    /// Whether a detour takes a request for the client URL path `path`,
+    /// matched before any route strips it (issue 909): every path with no
+    /// scope, otherwise one under its paths on segment boundaries, and for
+    /// a request carrying its preview its toolbar's, under `route_path`,
+    /// the path of the route the request matched.
+    fn scope_takes(&self, path: &str, route_path: &str, client: &Client<'_>) -> bool {
+        if self.detour_paths.is_empty() {
+            return true;
+        }
+
+        let under = |prefix: &str| {
+            path == prefix
+                || path
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        };
+
+        if self.detour_paths.iter().any(|prefix| under(prefix)) {
+            return true;
+        }
+
+        let toolbar = format!(
+            "{}{}",
+            route_path.trim_end_matches('/'),
+            crate::toolbar::TOOLBAR
+        );
+
+        path.starts_with(&toolbar) && self.previewed_in(client.headers)
     }
 
     /// Whether a request carries this detour's preview, its release and
@@ -1153,6 +1252,7 @@ impl AppPools {
                     base: String::new(),
                 }),
                 stripped: String::new(),
+                scoped_out: false,
             });
         }
 
@@ -1223,6 +1323,7 @@ impl AppPools {
                 .or(self.limits),
             detour: None,
             stripped: String::new(),
+            scoped_out: false,
         })
     }
 
@@ -1616,7 +1717,8 @@ impl Routing {
 
                 pools = pools
                     .with_server(Arc::new(server))
-                    .with_preview_secret(&app.preview_secret);
+                    .with_preview_secret(&app.preview_secret)
+                    .with_detour_paths(&app.detour_paths);
             }
 
             let pools = Arc::new(pools);
@@ -2294,12 +2396,24 @@ impl Routing {
             let mut cookies = Vec::new();
 
             let selection = match (&self.default_policy, &self.default_app) {
-                (Some((app, policy)), _) => {
-                    self.selection_for(app, Some(policy), path, client, &mut cookies, origin)
-                }
-                (None, Some(app)) => {
-                    self.selection_for(app, None, path, client, &mut cookies, origin)
-                }
+                (Some((app, policy)), _) => self.selection_for(
+                    app,
+                    Some(policy),
+                    path,
+                    Scope { path, route: "/" },
+                    client,
+                    &mut cookies,
+                    origin,
+                ),
+                (None, Some(app)) => self.selection_for(
+                    app,
+                    None,
+                    path,
+                    Scope { path, route: "/" },
+                    client,
+                    &mut cookies,
+                    origin,
+                ),
                 (None, None) => self.default.select(path, client, origin),
             };
 
@@ -2402,6 +2516,10 @@ impl Routing {
                     &route.fallback_app,
                     route.traffic.as_ref(),
                     rest,
+                    Scope {
+                        path,
+                        route: &route.path,
+                    },
                     client,
                     &mut cookies,
                     origin,
@@ -2439,6 +2557,10 @@ impl Routing {
                     &route.app,
                     route.traffic.as_ref(),
                     rest,
+                    Scope {
+                        path,
+                        route: &route.path,
+                    },
                     client,
                     &mut cookies,
                     origin,
@@ -2495,7 +2617,15 @@ impl Routing {
         }
 
         let mut cookies = Vec::new();
-        self.selection_for(app, None, path, client, &mut cookies, Some(&origin))
+        self.selection_for(
+            app,
+            None,
+            path,
+            Scope { path, route: "/" },
+            client,
+            &mut cookies,
+            Some(&origin),
+        )
     }
 
     /// An upstream for a sub-request the edge makes for itself (section
@@ -2511,11 +2641,13 @@ impl Routing {
     /// snapshot does not name has no workers, and the request fails as
     /// unavailable. None when the path's mount is internal and the
     /// request may not reach it.
+    #[allow(clippy::too_many_arguments)] // each is a distinct fact of the request
     fn selection_for(
         &self,
         app: &str,
         policy: Option<&Policy>,
         path: &str,
+        scope: Scope<'_>,
         client: &Client<'_>,
         cookies: &mut Vec<String>,
         origin: Option<&Origin>,
@@ -2528,15 +2660,23 @@ impl Routing {
 
                 match pinned {
                     Some(pools) => pools.select(path, client, origin),
-                    None => choose(
-                        releases,
-                        policy,
-                        client,
-                        cookies,
-                        &self.upstreams,
-                        &self.detour_previews,
-                    )
-                    .select(path, client, origin),
+                    None => {
+                        let chosen = choose(
+                            releases,
+                            policy,
+                            client,
+                            cookies,
+                            &self.upstreams,
+                            &self.detour_previews,
+                        );
+                        let (chosen, scoped_out) =
+                            within_scope(chosen, releases, policy, scope, client);
+
+                        chosen.select(path, client, origin).map(|mut selection| {
+                            selection.scoped_out = scoped_out;
+                            selection
+                        })
+                    }
                 }
             }
             None => Some(Selection {
@@ -2555,6 +2695,7 @@ impl Routing {
                 limits: crate::RequestLimits::default(),
                 detour: None,
                 stripped: String::new(),
+                scoped_out: false,
             }),
         }
     }
@@ -3411,6 +3552,88 @@ mod tests {
             panic!("not served");
         };
         assert_eq!(selection.detour, None);
+    }
+
+    #[test]
+    fn a_detour_takes_its_paths_alone_and_its_toolbar_for_its_preview() {
+        let mut snapshot = snapshot();
+        snapshot.detours = true;
+        let detour = |release: &str, secret: &str, path: &str| pb::AppWorkers {
+            app: "shop".to_owned(),
+            release: release.to_owned(),
+            preview_secret: secret.to_owned(),
+            detour_paths: vec![path.to_owned()],
+            server: Some(pb::Upstream {
+                name: format!("shop@{release}"),
+                addresses: vec![format!("unix:/run/user/1000/muru/{release}.sock")],
+                detour: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        snapshot.apps = vec![
+            pb::AppWorkers {
+                app: "shop".to_owned(),
+                release: "r1".to_owned(),
+                serving: true,
+                ..Default::default()
+            },
+            detour("dev-a", "aa", "/app/api"),
+            detour("dev-b", "bb", "/app/admin/"),
+        ];
+        let share = |release: &str, weight: u32| pb::Share {
+            release: release.to_owned(),
+            weight,
+            upstream: String::new(),
+        };
+        snapshot.routes[0].traffic = Some(pb::Traffic {
+            shares: vec![share("dev-a", 10_000), share("dev-b", 0)],
+            ..Default::default()
+        });
+        let routing = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(Routing::from_snapshot(&snapshot, None))
+            .unwrap();
+        let ids = crate::errors::RequestIds::new();
+        let served = |path: &str, preview: Option<&str>| {
+            let mut headers = HeaderMap::new();
+
+            if let Some(value) = preview {
+                headers.insert(PREVIEW_HEADER, value.parse().unwrap());
+            }
+
+            match routing.select(
+                Some("shop.example.com"),
+                path,
+                "127.0.0.1:8080",
+                true,
+                &client(&headers, &ids),
+                None,
+            ) {
+                Decision::Serve { selection, .. } => (selection.release, selection.scoped_out),
+                _ => panic!("{path} not served"),
+            }
+        };
+        let to = |release: &str, scoped_out: bool| (release.to_owned(), scoped_out);
+
+        // Both take all under their own paths, and the rest goes to the
+        // serving release.
+
+        assert_eq!(served("/app/api/users", None), to("dev-a", false));
+        assert_eq!(served("/app/admin", None), to("dev-b", false));
+        assert_eq!(served("/app/apiary", None), to("r1", false));
+        assert_eq!(served("/_muru/toolbar/toolbar.js", None), to("r1", false));
+
+        // A preview reaches its detour only under its paths, and its
+        // toolbar's; elsewhere the serving release serves, and says so.
+
+        assert_eq!(served("/app/api", Some("dev-a.aa")), to("dev-a", false));
+        assert_eq!(served("/about", Some("dev-a.aa")), to("r1", true));
+        assert_eq!(served("/app/admin/x", Some("dev-a.aa")), to("r1", true));
+        assert_eq!(
+            served("/_muru/toolbar/toolbar.js", Some("dev-a.aa")),
+            to("dev-a", false)
+        );
     }
 
     #[test]

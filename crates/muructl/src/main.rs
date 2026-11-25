@@ -4374,7 +4374,17 @@ async fn run_with(
                 .as_ref()
                 .map(|registration| registration.id.to_string())
                 .unwrap_or_default();
-            let request = detour::request(mode, &socket, &instance_id, &project);
+
+            let paths = match detour::scope(mode, &resolved.mounts).await {
+                Ok(paths) => paths,
+                Err(error) => {
+                    drop(registration);
+                    let _ = std::fs::remove_dir_all(&run_dir);
+                    return Err(error);
+                }
+            };
+
+            let request = detour::request(mode, &socket, &instance_id, &project, paths);
 
             let (stream, opened) = match detour::open(&mode.daemon, &request).await {
                 Ok(open) => open,
@@ -4787,9 +4797,14 @@ async fn run_with(
             .as_ref()
             .map(|detour| detour.traffic.clone())
             .unwrap_or_default();
+        let paths = opened
+            .detour
+            .as_ref()
+            .map(|detour| detour.paths.clone())
+            .unwrap_or_default();
         muru_common::muru_println!(
             "traffic: {}{}",
-            detour::takes(&traffic, &mode.app),
+            detour::takes(&traffic, &mode.app, &paths),
             if traffic == "preview" {
                 "; muructl detour preview gives an entry link"
             } else {

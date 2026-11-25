@@ -250,3 +250,10 @@ Issue 873 tracks the work, with issues 874 to 882. Sections 4.21, 9.13,
 ADR 0062 (the toolbar inserted by the edge), ADR 0068 (promoting a pin),
 ADR 0069 (the instance registry) and ADR 0074 (selecting a running
 instance), whose resolver chooses among detours.
+
+The overlay laying `all`, `share=N` and `class=NAME` over each of the
+application's routes whole, and a preview reaching the detour on every
+route, are superseded by [ADR
+0077](0077-what-a-detours-run-is-told-and-the-paths-a-detour-takes.md):
+a detour may take only the paths it names, which the edge checks after
+the release choice. The rest of the record stands.

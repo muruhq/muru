@@ -64,7 +64,9 @@ impl Daemon {
             self.detours.contains_key(&(app.clone(), name.to_owned()))
         });
 
-        if let Some(refusal) = self.traffic_refusal(&app, &release, &opening.traffic) {
+        if let Some(refusal) =
+            self.traffic_refusal(&app, &release, &opening.traffic, &opening.paths)
+        {
             return Err(refusal);
         }
 
@@ -93,6 +95,8 @@ impl Daemon {
             mounts,
         };
         let describe = detour.describe();
+        let opened_traffic = detour.opening.traffic.word();
+        let opened_paths = detour.opening.paths.clone();
 
         // The run hears what was opened before anything else on its
         // stream, which is new and has room.
@@ -117,7 +121,10 @@ impl Daemon {
             "detour.opened",
             &subject,
             "info",
-            &format!("detour {subject} opened by the development run with {describe}"),
+            &format!(
+                "detour {subject} opened by the development run with {describe}, taking {}",
+                scoped(&opened_traffic, &detours::scope_text(&opened_paths))
+            ),
         );
 
         Ok((opened, serial))
@@ -244,13 +251,17 @@ impl Daemon {
         release: &str,
         traffic: Traffic,
         until_unix_ms: u64,
+        paths: Option<Vec<String>>,
         reason: Option<&str>,
     ) -> Result<admin::Detour, String> {
         let key = (app.to_owned(), release.to_owned());
 
-        if !self.detours.contains_key(&key) {
+        let Some(current) = self.detours.get(&key) else {
             return Err(format!("{app}@{release} is not an open detour"));
-        }
+        };
+
+        let paths = paths.unwrap_or_else(|| current.opening.paths.clone());
+        let scope_before = detours::scope_text(&current.opening.paths);
 
         if let Some(refusal) =
             detours::timed_refusal(&traffic, until_unix_ms, crate::model::now_unix_ms())
@@ -258,7 +269,7 @@ impl Daemon {
             return Err(refusal);
         }
 
-        if let Some(refusal) = self.traffic_refusal(app, release, &traffic) {
+        if let Some(refusal) = self.traffic_refusal(app, release, &traffic, &paths) {
             return Err(refusal);
         }
 
@@ -268,11 +279,13 @@ impl Daemon {
 
         let before = std::mem::replace(&mut detour.opening.traffic, traffic.clone());
         let until_before = std::mem::replace(&mut detour.until_unix_ms, until_unix_ms);
+        let paths_before = std::mem::replace(&mut detour.opening.paths, paths.clone());
 
         if let Err(error) = self.push_snapshot().await {
             if let Some(detour) = self.detours.get_mut(&key) {
                 detour.opening.traffic = before;
                 detour.until_unix_ms = until_before;
+                detour.opening.paths = paths_before;
             }
 
             let _ = self.push_snapshot().await;
@@ -296,8 +309,11 @@ impl Daemon {
             "info",
             &format!(
                 "detour {subject} takes {} now, {} before{}",
-                detours::traffic_text(&traffic.word(), until_unix_ms),
-                before.word(),
+                scoped(
+                    &detours::traffic_text(&traffic.word(), until_unix_ms),
+                    &detours::scope_text(&paths)
+                ),
+                scoped(&before.word(), &scope_before),
                 reason
                     .map(|reason| format!(": {reason}"))
                     .unwrap_or_default()
@@ -322,7 +338,7 @@ impl Daemon {
             let reason = "the time it was set for is over";
 
             if let Err(error) = self
-                .set_detour_traffic(&app, &release, Traffic::Preview, 0, Some(reason))
+                .set_detour_traffic(&app, &release, Traffic::Preview, 0, None, Some(reason))
                 .await
             {
                 tracing::warn!(%error, "detour {app}@{release} could not go back to preview");
@@ -438,6 +454,7 @@ impl Daemon {
                 app: detour.app(),
                 release: &detour.release,
                 traffic: &detour.opening.traffic,
+                paths: &detour.opening.paths,
             })
             .collect()
     }
@@ -445,7 +462,13 @@ impl Daemon {
     /// Why a detour of `app` cannot take `traffic` now: a rollout under
     /// way, another detour's claim, or a client class the daemon does
     /// not define.
-    fn traffic_refusal(&self, app: &str, release: &str, traffic: &Traffic) -> Option<String> {
+    fn traffic_refusal(
+        &self,
+        app: &str,
+        release: &str,
+        traffic: &Traffic,
+        paths: &[String],
+    ) -> Option<String> {
         let rollout = self
             .store
             .rollouts(Some(app))
@@ -469,6 +492,7 @@ impl Daemon {
                 app,
                 release,
                 traffic,
+                paths,
             },
             &others,
             rollout,
@@ -537,11 +561,21 @@ impl Daemon {
                     }),
                     release: detour.release.clone(),
                     preview_secret: detour.secret.clone(),
+                    detour_paths: detour.opening.paths.clone(),
                     access_log,
                     app,
                     ..Default::default()
                 }
             })
             .collect()
+    }
+}
+
+/// A detour's traffic with its scope after it: `all under /app/api`.
+fn scoped(traffic: &str, scope: &str) -> String {
+    if scope.is_empty() {
+        traffic.to_owned()
+    } else {
+        format!("{traffic} {scope}")
     }
 }

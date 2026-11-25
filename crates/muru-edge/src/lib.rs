@@ -760,6 +760,11 @@ enum Tls {
 pub const UNIX_ADDRESS: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
 
+/// The Server-Timing metric that marks a response to a request carrying
+/// a detour's preview which the detour's paths sent to the serving
+/// release, named in its description (issue 909).
+pub const SERVED_ELSEWHERE: &str = "muru-release";
+
 /// A bound edge, ready to run.
 pub struct Edge {
     listeners: Vec<(TcpListener, SocketAddr, Option<Tls>)>,
@@ -1631,6 +1636,7 @@ async fn serve<I>(
             let mut request_id = base_id.clone();
             let mut issued: Vec<String> = Vec::new();
             let mut preview_ignored = false;
+            let mut scoped_out: Option<String> = None;
             let mut handling: Option<Handling> = None;
             let mut checks = 0usize;
             let mut admitted = false;
@@ -1941,7 +1947,17 @@ async fn serve<I>(
                         }
 
                         preview_ignored = origin.is_none()
+                            && !selection.scoped_out
                             && routing::preview_ignored(&parts.headers, &selection);
+
+                        // Issue 909: a previewed request outside its
+                        // detour's paths went to the serving release,
+                        // which its page's toolbar is told.
+
+                        if origin.is_none() && selection.scoped_out {
+                            scoped_out = Some(selection.release.clone());
+                        }
+
                         context.server_name = server_name;
                         context.app = selection.app;
                         context.release = selection.release;
@@ -2466,6 +2482,19 @@ async fn serve<I>(
                 response.headers_mut().insert(
                     routing::PREVIEW_HEADER,
                     HeaderValue::from_static(routing::PREVIEW_IGNORED),
+                );
+            }
+
+            // Issue 909: the detour's toolbar shows such a request as the
+            // serving release's, which its run has no record of.
+
+            if let Some(release) = &scoped_out
+                && let Ok(value) =
+                    HeaderValue::from_str(&format!("{SERVED_ELSEWHERE};desc=\"{release}\""))
+            {
+                response.headers_mut().append(
+                    http::header::HeaderName::from_static("server-timing"),
+                    value,
                 );
             }
 

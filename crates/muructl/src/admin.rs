@@ -8290,7 +8290,11 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
         lines.push(("kind".to_owned(), "detour".to_owned()));
         lines.push((
             "traffic".to_owned(),
-            muru_controller::detours::traffic_text(&detour.traffic, detour.until_unix_ms),
+            muru_controller::detours::listed_traffic(
+                &detour.traffic,
+                detour.until_unix_ms,
+                &detour.paths,
+            ),
         ));
         lines.push(("pid".to_owned(), detour.pid.to_string()));
 

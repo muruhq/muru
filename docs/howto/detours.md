@@ -182,9 +182,9 @@ detour traffic` changes it while it runs:
 
 ```console
 $ muructl detour traffic all
-muru: detour shop@dev-7f3a now takes all of shop's traffic (was preview)
+muru: detour shop@dev-7f3a now takes all of shop's traffic (was previews only)
 $ muructl detour traffic preview
-muru: detour shop@dev-7f3a now takes previews only (was all)
+muru: detour shop@dev-7f3a now takes previews only (was all of shop's traffic)
 ```
 
 A choice other than preview is an overlay named `detour:APP`, owned by
@@ -198,14 +198,15 @@ choice.
 
 `all` and `share` are refused while a rollout of the application is
 under way, and `all` is refused while another detour of the application
-takes all of it.
+takes all of it, unless the two take different
+[paths](#taking-only-some-paths).
 
 `--for` or `--until` makes a choice last a while and then go back to
 preview on its own, so a detour is not left taking real traffic:
 
 ```console
 $ muructl detour traffic share=10 --for 10m
-muru: detour shop@dev-7f3a now takes 10% of shop's clients, until 2026-11-24T03:15:00Z, then previews only (was preview)
+muru: detour shop@dev-7f3a now takes 10% of shop's clients, until 2026-11-24T03:15:00Z, then previews only (was previews only)
 ```
 
 `--until` takes a time such as `2026-11-24T14:00`, in the local time zone
@@ -217,6 +218,58 @@ takes neither option. `detour list` and `release list` show when a
 timed choice ends, and a timed choice does not survive the daemon
 restarting, since the run opens its detour again with its own
 `--traffic`.
+
+## Taking only some paths
+
+`--path` makes the detour take only the requests under the paths it
+names, and leaves the rest to the serving release, whatever the traffic
+choice. Give it more than once for several paths; `muructl detour
+traffic` changes them while the detour runs, and `--all-paths` takes
+every path again:
+
+```console
+$ muructl detour run --path /app/api
+muru: traffic: previews only, under /app/api; muructl detour preview gives an entry link
+$ muructl detour traffic all --path /app/api --path /app/admin
+muru: detour shop@dev-7f3a now takes all of shop's traffic under /app/admin and /app/api (was previews only, under /app/api)
+$ muructl detour traffic preview --all-paths
+```
+
+A path matches on segment boundaries, as a route's does: `/app/api`
+takes `/app/api` and `/app/api/users`, not `/app/apiary`. It is the
+path as you see it in the browser, from the host's root, before any
+route's `strip_prefix` is taken off. It only chooses which requests
+reach the detour: the application in the detour sees `SCRIPT_NAME` and
+`PATH_INFO` as it would for any request, from its mounts and its
+route's `strip_prefix`.
+
+`--mount NAME` is a shorthand for the path of the checkout's mount
+`NAME` under each of the application's routes: behind a route at `/app`
+with `strip_prefix = "/app"`, a mount at `/api` is `--path /app/api`. A
+mount with no path, such as a gRPC mount, cannot be used.
+
+A preview outside the paths is served by the serving release, and the
+preview cookie is kept. Pages the detour serves still get its toolbar,
+whose paths are always the detour's for your previewed requests, and
+the toolbar's "This page" tab shows a request outside the paths as
+served by the serving release. An internal redirect from the detour,
+such as an `X-Accel-Redirect`, stays on the detour wherever it leads,
+since the detour's code chose it.
+
+Two detours of one application, from two worktrees, may both take `all`
+when their paths do not overlap, so one can work on `/app/api` and the
+other on `/app/admin`. Overlapping paths are refused, as two detours
+taking all of the application are.
+
+With some paths from the detour and the rest from the serving release,
+one browser's pages come from two releases. A login session or a CSRF
+token holds across them only when both use the same session store and
+secret key: `--app-data` gives the detour the application's data
+directory, and the rest, such as the secret key, is the detour's
+environment to match.
+
+`detour list`, `release list`, `overlay list` and the dashboard show
+the paths, as in `every route pinned, under /app/api`.
 
 ## What the daemon leaves to the run
 

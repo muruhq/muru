@@ -132,6 +132,69 @@ pub struct Opening {
     pub directory: String,
     /// What it takes.
     pub traffic: Traffic,
+    /// The client URL paths it takes requests under, normalised; every
+    /// path when empty (issue 909).
+    pub paths: Vec<String>,
+}
+
+/// A detour's scope as given (issue 909), checked and normalised: each
+/// path starts with `/` and loses a trailing slash, duplicates go, and
+/// the list is sorted. `/` alone is every path, which is no scope, so it
+/// is refused for leaving `--path` out.
+pub fn scope_paths(paths: &[String]) -> Result<Vec<String>, String> {
+    let mut scope = Vec::new();
+
+    for path in paths {
+        if !path.starts_with('/') {
+            return Err(format!("the path {path:?} must start with /"));
+        }
+
+        if path.contains("//") {
+            return Err(format!("the path {path:?} has an empty segment"));
+        }
+
+        let path = path.trim_end_matches('/');
+
+        if path.is_empty() {
+            return Err(
+                "the path / is every path; leave the paths out, or use --all-paths".to_owned(),
+            );
+        }
+
+        scope.push(path.to_owned());
+    }
+
+    scope.sort();
+    scope.dedup();
+    Ok(scope)
+}
+
+/// Whether a scope path takes a request path, on segment boundaries.
+pub fn path_covers(prefix: &str, path: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether two detours' scopes share a request: one that takes every
+/// path shares with any, and two paths do when one covers the other.
+pub fn scopes_overlap(one: &[String], other: &[String]) -> bool {
+    one.is_empty()
+        || other.is_empty()
+        || one
+            .iter()
+            .any(|a| other.iter().any(|b| path_covers(a, b) || path_covers(b, a)))
+}
+
+/// A scope as a phrase after what a detour takes: `under /app/api and
+/// /app/admin`; nothing for every path.
+pub fn scope_text(paths: &[String]) -> String {
+    match paths {
+        [] => String::new(),
+        [one] => format!("under {one}"),
+        [most @ .., last] => format!("under {} and {last}", most.join(", ")),
+    }
 }
 
 impl Opening {
@@ -158,6 +221,7 @@ impl Opening {
             pid: request.pid,
             directory: request.directory,
             traffic: Traffic::parse(&request.traffic)?,
+            paths: scope_paths(&request.paths)?,
         })
     }
 }
@@ -205,6 +269,7 @@ impl Detour {
             opened_unix_ms: self.opened_unix_ms,
             socket: self.opening.socket.display().to_string(),
             until_unix_ms: self.until_unix_ms,
+            paths: self.opening.paths.clone(),
         }
     }
 
@@ -282,6 +347,8 @@ pub struct Taking<'a> {
     pub release: &'a str,
     /// What it takes.
     pub traffic: &'a Traffic,
+    /// The client URL paths it takes them under; every path when empty.
+    pub paths: &'a [String],
 }
 
 /// Lay the detours' traffic over a route, when it is their
@@ -302,14 +369,25 @@ pub fn lay_over(route: &mut muru_config::Route, takings: &[Taking<'_>]) {
 
     let traffic = route.traffic.get_or_insert_with(Default::default);
     let mut shares = BTreeMap::new();
+    let mut pinned = BTreeMap::new();
+
+    // Issue 909: detours taking all under paths of their own, which do
+    // not overlap, are each named by the route's policy, the first with
+    // the whole of it and the rest with none, since the shares cannot
+    // add up to more; the edge sends a request outside the first's paths
+    // to the one whose paths take it. One taking every path is alone.
 
     for taking in &own {
         match taking.traffic {
             Traffic::Preview => {}
-            Traffic::All => {
-                traffic.split = BTreeMap::from([(taking.release.to_owned(), 100)]);
+            Traffic::All if taking.paths.is_empty() => {
+                pinned = BTreeMap::from([(taking.release.to_owned(), 100)]);
                 shares.clear();
                 break;
+            }
+            Traffic::All => {
+                let whole = if pinned.is_empty() { 100 } else { 0 };
+                pinned.insert(taking.release.to_owned(), whole);
             }
             Traffic::Share(share) => {
                 shares.insert(taking.release.to_owned(), *share);
@@ -322,7 +400,9 @@ pub fn lay_over(route: &mut muru_config::Route, takings: &[Taking<'_>]) {
         }
     }
 
-    if !shares.is_empty() {
+    if !pinned.is_empty() {
+        traffic.split = pinned;
+    } else if !shares.is_empty() {
         traffic.split = shares;
     }
 }
@@ -341,7 +421,12 @@ pub fn changes(takings: &[Taking<'_>]) -> Vec<String> {
                 Traffic::Class(class) => format!("client class {class} on every route"),
             };
 
-            format!("app {} to {}: {what}", taking.app, taking.release)
+            let under = match scope_text(taking.paths) {
+                scope if scope.is_empty() => scope,
+                scope => format!(", {scope}"),
+            };
+
+            format!("app {} to {}: {what}{under}", taking.app, taking.release)
         })
         .collect()
 }
@@ -353,6 +438,25 @@ pub fn traffic_text(traffic: &str, until_unix_ms: u64) -> String {
         traffic.to_owned()
     } else {
         format!("{traffic} until {}", crate::daemon::clock(until_unix_ms))
+    }
+}
+
+/// A detour's traffic as listings show it, with its paths after it when
+/// it takes some alone (issue 909): `all under /app/api until 14:30`.
+pub fn listed_traffic(traffic: &str, until_unix_ms: u64, paths: &[String]) -> String {
+    let scope = scope_text(paths);
+    let text = traffic_text(traffic, 0);
+
+    let text = if scope.is_empty() {
+        text
+    } else {
+        format!("{text} {scope}")
+    };
+
+    if until_unix_ms == 0 {
+        text
+    } else {
+        format!("{text} until {}", crate::daemon::clock(until_unix_ms))
     }
 }
 
@@ -396,11 +500,18 @@ pub fn traffic_refusal(
         )),
         Traffic::All => others
             .iter()
-            .find(|other| other.traffic == &Traffic::All)
+            .find(|other| {
+                other.traffic == &Traffic::All && scopes_overlap(taking.paths, other.paths)
+            })
             .map(|other| {
+                let under = match scope_text(other.paths) {
+                    scope if scope.is_empty() => scope,
+                    scope => format!(" {scope}"),
+                };
+
                 format!(
-                    "detour {app}@{} takes all of {app}'s traffic already; set its traffic to \
-                     preview first",
+                    "detour {app}@{} takes all of {app}'s traffic{under} already; set its traffic \
+                     to preview first, or give the two detours paths that do not overlap",
                     other.release
                 )
             }),
@@ -901,6 +1012,7 @@ mod tests {
             app: "shop",
             release,
             traffic,
+            paths: &[],
         }
     }
 
@@ -951,6 +1063,71 @@ mod tests {
             changes(&[taking("dev-1", all), taking("dev-2", preview)]),
             ["app shop to dev-1: every route pinned"]
         );
+    }
+
+    #[test]
+    fn a_detour_takes_named_paths_and_two_taking_all_must_not_overlap() {
+        static ALL: Traffic = Traffic::All;
+
+        fn scoped<'a>(release: &'a str, paths: &'a [String]) -> Taking<'a> {
+            Taking {
+                app: "shop",
+                release,
+                traffic: &ALL,
+                paths,
+            }
+        }
+
+        let all = &Traffic::All;
+        let api = ["/app/api".to_owned()];
+        let admin = ["/app/admin".to_owned()];
+        let app = ["/app".to_owned()];
+        let (api, admin, app) = (&api[..], &admin[..], &app[..]);
+
+        assert_eq!(
+            scope_paths(&[
+                "/app/api/".to_owned(),
+                "/app/admin".to_owned(),
+                "/app/api".to_owned()
+            ]),
+            Ok(vec!["/app/admin".to_owned(), "/app/api".to_owned()])
+        );
+        assert!(scope_paths(&["app".to_owned()]).is_err());
+        assert!(scope_paths(&["/".to_owned()]).is_err());
+        assert!(path_covers("/app/api", "/app/api/users"));
+        assert!(!path_covers("/app/api", "/app/apiary"));
+
+        // Two detours may each take all under paths that do not overlap,
+        // and the policy names both, the first with the whole.
+
+        assert!(
+            traffic_refusal(scoped("dev-2", admin), &[scoped("dev-1", api)], false, &[]).is_none()
+        );
+        let refused =
+            traffic_refusal(scoped("dev-2", app), &[scoped("dev-1", api)], false, &[]).unwrap();
+        assert!(
+            refused.contains("takes all of shop's traffic under /app/api already"),
+            "{refused}"
+        );
+        assert!(
+            traffic_refusal(scoped("dev-2", admin), &[taking("dev-1", all)], false, &[]).is_some()
+        );
+        assert!(
+            traffic_refusal(scoped("dev-2", admin), &[], true, &[]).is_some(),
+            "a rollout"
+        );
+
+        let mut route = route("shop");
+        lay_over(&mut route, &[scoped("dev-1", api), scoped("dev-2", admin)]);
+        assert_eq!(
+            route.traffic.unwrap().split,
+            BTreeMap::from([("dev-1".to_owned(), 100), ("dev-2".to_owned(), 0)])
+        );
+        assert_eq!(
+            changes(&[scoped("dev-1", api)]),
+            ["app shop to dev-1: every route pinned, under /app/api"]
+        );
+        assert_eq!(listed_traffic("preview", 0, api), "preview under /app/api");
     }
 
     #[test]
