@@ -91,6 +91,7 @@ def test_a_route_strips_its_prefix_for_releases_upstreams_and_fallbacks(tmp_path
 
         planned = daemon.muructl("apply", "-f", str(config), "--dry-run", check=False).stdout
         assert "to mounted, strip_prefix /app" in planned, planned
+        assert f"static {STATIC}, else mounted, strip_prefix /files" in planned, planned
         daemon.muructl("apply", "-f", str(config))
 
         # The application lives at the part: SCRIPT_NAME is the part, and
