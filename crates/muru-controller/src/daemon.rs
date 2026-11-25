@@ -7417,6 +7417,7 @@ impl Daemon {
             pycache_prefix: None,
             bytecode: None,
             clean_env: true,
+            development: false,
             app: spec.entrypoint.clone(),
             name: Some(app.to_owned()),
             release: Some(id.to_owned()),

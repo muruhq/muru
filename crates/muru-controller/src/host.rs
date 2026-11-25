@@ -153,6 +153,14 @@ pub struct MemoryReplacement {
 /// (section 6.15).
 pub const INSTRUMENTATION_VARIABLE: &str = "MURU_INSTRUMENTATION";
 
+/// The variable that is `1` in the host and workers of a development run
+/// (issue 852).
+pub const DEVELOPMENT_VARIABLE: &str = "MURU_DEVELOPMENT";
+
+/// The variable each worker is given its index within its group in
+/// (issue 852), which no host or command inherits.
+pub const WORKER_ID_VARIABLE: &str = "MURU_WORKER_ID";
+
 /// What one worker last reported to its host (sections 7.6 and 7.7).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkerStatus {
@@ -778,6 +786,10 @@ pub struct HostSpec {
     /// Whether `env` is the whole environment rather than laid over this
     /// process's own (section 8.7), as it is under the daemon.
     pub clean_env: bool,
+    /// Whether the host and its workers are a development run's, which
+    /// `MURU_DEVELOPMENT=1` tells them (issue 852): `muructl run` without
+    /// `--allow-public`, and a detour; never the daemon's or a serve's.
+    pub development: bool,
     /// The user and group the host runs as, and its umask, when the
     /// daemon is root and the application names them (section 10.9).
     pub identity: Option<Identity>,
@@ -1445,6 +1457,18 @@ impl HostProcess {
         }
 
         command.envs(spec.env.iter().map(|(name, value)| (name, value)));
+
+        // Issue 852: whether the run is a development one is Muru's to
+        // say, over anything inherited or set, and the worker's index is
+        // set in each worker alone.
+
+        if spec.development {
+            command.env(DEVELOPMENT_VARIABLE, "1");
+        } else {
+            command.env_remove(DEVELOPMENT_VARIABLE);
+        }
+
+        command.env_remove(WORKER_ID_VARIABLE);
 
         // Section 13.10: the host and its workers say which instance they
         // belong to, in their titles and their environment.

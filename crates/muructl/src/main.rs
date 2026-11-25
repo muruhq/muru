@@ -3687,7 +3687,11 @@ fn host_spec(
 
     let mut env: Vec<(String, String)> = env
         .into_iter()
-        .filter(|(name, _)| !muru_config::places::VARIABLES.contains(&name.as_str()))
+        .filter(|(name, _)| {
+            !muru_config::places::VARIABLES.contains(&name.as_str())
+                && name != muru_controller::host::DEVELOPMENT_VARIABLE
+                && name != muru_controller::host::WORKER_ID_VARIABLE
+        })
         .collect();
     env.extend(resolved.places.variables());
 
@@ -3697,6 +3701,7 @@ fn host_spec(
         pycache_prefix: None,
         bytecode: None,
         clean_env: false,
+        development: !args.allow_public,
         app: resolved.entrypoint.clone(),
         name: Some(label.to_owned()),
         release: None,
@@ -4442,9 +4447,18 @@ async fn run_with(
     // Section 9.12: what the application is served with, which a command
     // of the project run through the admin socket runs with too.
 
+    let mut served_env = spec.env.clone();
+
+    if spec.development {
+        served_env.push((
+            muru_controller::host::DEVELOPMENT_VARIABLE.to_owned(),
+            "1".to_owned(),
+        ));
+    }
+
     let served = Arc::new(run_admin::Served {
         interpreter: std::sync::Mutex::new((spec.python.clone(), spec.pythonpath.clone())),
-        env: spec.env.clone(),
+        env: served_env,
         file: args.settings_file.clone(),
     });
 

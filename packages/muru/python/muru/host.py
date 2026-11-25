@@ -628,6 +628,32 @@ def resolve_interface(spec: str, app: Any, interface: str) -> str:
     return resolved
 
 
+WORKER_ID_VARIABLE = "MURU_WORKER_ID"
+"""The worker's index within its group, set in each worker (issue 852)."""
+
+DEVELOPMENT_VARIABLE = "MURU_DEVELOPMENT"
+"""``1`` in the host and workers of a development run (issue 852)."""
+
+
+def worker_environment(group: str, within: int) -> None:
+    """Name the worker's group and its index within it in its environment, after the fork.
+
+    The index is the one ``muru.context().worker_id`` gives, reused when
+    the worker is replaced, so code that does not import ``muru`` (a
+    settings module read at import, a subprocess) can tell the workers
+    apart.
+    """
+
+    os.environ["MURU_GROUP"] = group
+    os.environ[WORKER_ID_VARIABLE] = str(within)
+
+
+def is_development() -> bool:
+    """Whether the host runs a development run, as its environment says."""
+
+    return os.environ.get(DEVELOPMENT_VARIABLE) == "1"
+
+
 def app_name(spec: str) -> str:
     """Name the application after the top-level module of its entrypoint."""
 
@@ -1849,11 +1875,12 @@ class Host:
 
         _signals.start_worker()
 
-        # Section 7.1: MURU_GROUP and the context identify the group after
-        # the fork, and the group's sizes are the worker's.
+        # Section 7.1: MURU_GROUP, MURU_WORKER_ID and the context identify
+        # the group and the worker after the fork, and the group's sizes
+        # are the worker's.
 
         group, within = self.placement[index]
-        os.environ["MURU_GROUP"] = group.name
+        worker_environment(group.name, within)
         release = self.release
         context = replace(release.context, worker_id=within, group=group.name)
         set_context(context)
@@ -5706,10 +5733,15 @@ def _main(argv: list[str] | None) -> int:
         print(f"cannot read the instrumentation list: {error}", file=sys.stderr)
         return 2
 
+    # Issue 852: the host is no worker, whatever it inherited.
+
+    os.environ.pop(WORKER_ID_VARIABLE, None)
+
     context = Context(
         app=args.name or app_name(args.app),
         release=args.release or "dev",
         process_model=process_model(args.threads),
+        development=is_development(),
     )
     set_context(context)
     release = Release(
