@@ -1519,8 +1519,14 @@ async fn serve<I>(
             // routing, and never recorded. A detour's run answers it only
             // for a request that reached it by its preview.
 
+            // Section 4.21: a detour's run puts its toolbar under the path of
+            // the route that reached it, so the toolbar's requests match the
+            // application's route as the page's do.
+
+            let toolbar_base = via.as_ref().map_or("", |via| via.base.as_str());
+
             if let Some(recorder) = shared.recorder.as_ref()
-                && toolbar::reserved(parts.uri.path())
+                && let Some(within) = toolbar::reserved_under(parts.uri.path(), toolbar_base)
             {
                 if !toolbar_for_request {
                     return Ok::<_, Infallible>(toolbar::not_found());
@@ -1531,6 +1537,7 @@ async fn serve<I>(
                     .get_or_init(|| panels::Renderer::new(shared.links.dashboard()));
                 return Ok::<_, Infallible>(toolbar::answer(
                     &parts,
+                    within,
                     &shared.links,
                     recorder,
                     renderer,
@@ -2379,7 +2386,10 @@ async fn serve<I>(
                         let dashboard = shared.links.request_page(&base_id);
                         let detour = shared.links.detour();
                         let tag = toolbar::tag(
-                            forwarded.prefix.as_deref().unwrap_or(""),
+                            &format!(
+                                "{}{toolbar_base}",
+                                forwarded.prefix.as_deref().unwrap_or("")
+                            ),
                             &base_id,
                             dashboard.as_deref(),
                             nonce.as_deref(),

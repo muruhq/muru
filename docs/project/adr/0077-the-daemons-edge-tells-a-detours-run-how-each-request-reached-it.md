@@ -77,9 +77,19 @@ show the toolbar to clients a traffic choice sends.
   virtual host and routed it here. The `Sec-Fetch-Site` check stays,
   and the daemon no longer sends the list.
 
-- The value has room for more: `; base=PATH` after the word carries a
-  path, percent-encoded, which issue 912 fills with the matched route's
-  path.
+- After the word, `; base=PATH` carries the path of the route the
+  request matched as the run receives it: the route's `path` with its
+  `strip_prefix` taken off (ADR 0078), left out when empty. The run
+  answers its reserved prefix under that path and puts it in front of
+  the inserted tag's path, after any forwarded prefix, so behind a
+  route at `/app` that strips nothing the toolbar is at
+  `/app/_muru/toolbar/` (issue 912). The toolbar's requests then match
+  the application's own route and reach the run by the same routing
+  and preview as the page. Routing `/_muru/toolbar/` itself to the
+  detour cannot work: the host's `/` may be another application's, and
+  under `all`, `share=N` or `class=NAME` such a request names no
+  application. This reserves `/app/_muru/` in the application's paths
+  under that route, as `/_muru/` is at the root under `muructl run`.
 
 ### Consequences
 

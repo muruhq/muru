@@ -1,7 +1,8 @@
 """A project served through a detour (design specification section 9.13).
 
 The WSGI application says which instance served it and what the request
-looked like to it, answers /page with an HTML page, and raises on /boom;
+looked like to it, answers a path ending in /page with an HTML page, and
+raises on /boom;
 an ASGI mount echoes WebSocket
 messages under /ws; and where grpcio is installed the tests add a gRPC
 mount whose greeter says the same. greeter_pb2 and greeter_pb2_grpc are
@@ -23,7 +24,7 @@ def wsgi_app(environ: dict[str, Any], start_response: Callable[..., Any]) -> Ite
     if environ["PATH_INFO"] == "/boom":
         raise RuntimeError("boom from the detoured fixture")
 
-    if environ["PATH_INFO"] == "/page":
+    if environ["PATH_INFO"].rsplit("/", 1)[-1] == "page":
         page = b"<!doctype html><html><head><title>page</title></head><body>page</body></html>"
         start_response(
             "200 OK",

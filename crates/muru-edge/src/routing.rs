@@ -185,9 +185,15 @@ impl Route {
     }
 
     /// What serves the route's request, told what the route strips
-    /// (section 4.5).
+    /// (section 4.5), and for a detour the route's path as its run
+    /// receives it, under which the run puts its toolbar (section 4.21).
     fn stripping(&self, mut selection: Selection) -> Selection {
         selection.stripped.clone_from(&self.strip);
+
+        if let Some(via) = &mut selection.detour {
+            via.base = after_strip(self.path.trim_end_matches('/'), &self.strip).to_owned();
+        }
+
         selection
     }
 

@@ -70,6 +70,15 @@ pub fn reserved(path: &str) -> bool {
     path.starts_with(PREFIX)
 }
 
+/// The path of a request under the reserved prefix as the toolbar reads
+/// it, when it is one: under `base`, the path of the route that reached a
+/// detour's run (section 4.21), with `base` taken off; empty for a run's
+/// own requests, whose prefix is at the root.
+pub fn reserved_under<'a>(path: &'a str, base: &str) -> Option<&'a str> {
+    let within = path.strip_prefix(base)?;
+    reserved(within).then_some(within)
+}
+
 /// Whether the toolbar is a request's: its pages get the toolbar and its
 /// requests under the reserved prefix are answered. Every request of a
 /// development run's own, and of a detour's run, `detour_run`, only one
@@ -87,13 +96,15 @@ pub fn not_found() -> Response<ResponseBody> {
 
 /// Answer a request under the reserved prefix: under the toolbar's paths,
 /// its files, a record as JSON, one of its panels drawn, or the summaries
-/// of several records, and anything else not found. Only GET and HEAD,
+/// of several records, and anything else not found, `path` being the
+/// request's path from the reserved prefix on. Only GET and HEAD,
 /// only from a loopback host or one of the run's own names, and never
 /// from another site's page. A detour's run, `detour_run`, answers any
 /// host name: its one peer is the daemon's edge, which has routed the
 /// request to it (section 4.21).
 pub fn answer(
     parts: &http::request::Parts,
+    path: &str,
     links: &Links,
     recorder: &Recorder,
     renderer: &Renderer,
@@ -109,7 +120,7 @@ pub fn answer(
         return plain(StatusCode::FORBIDDEN, why);
     }
 
-    let Some(within) = parts.uri.path().strip_prefix(TOOLBAR) else {
+    let Some(within) = path.strip_prefix(TOOLBAR) else {
         return plain(StatusCode::NOT_FOUND, "not found\n");
     };
 
@@ -1095,7 +1106,14 @@ mod tests {
                 .body(())
                 .unwrap()
                 .into_parts();
-            answer(&parts, &links, &recorder, &Renderer::new(None), false)
+            answer(
+                &parts,
+                parts.uri.path(),
+                &links,
+                &recorder,
+                &Renderer::new(None),
+                false,
+            )
         };
 
         let response = ask("/_muru/toolbar/requests?ids=B%2C1,NOSUCH,A,B%2C1");
@@ -1170,6 +1188,21 @@ mod tests {
             "<script src=\"/_muru/toolbar/toolbar.js\" data-request=\"A1\" data-detour=\"preview\" \
              async></script>"
         );
+    }
+
+    #[test]
+    fn the_reserved_prefix_lies_under_a_detours_route() {
+        assert_eq!(
+            reserved_under("/_muru/toolbar/toolbar.js", ""),
+            Some("/_muru/toolbar/toolbar.js")
+        );
+        assert_eq!(
+            reserved_under("/app/_muru/toolbar/history", "/app"),
+            Some("/_muru/toolbar/history")
+        );
+        assert_eq!(reserved_under("/_muru/toolbar/history", "/app"), None);
+        assert_eq!(reserved_under("/apple/_muru/toolbar/history", "/app"), None);
+        assert_eq!(reserved_under("/app/page", "/app"), None);
     }
 
     #[test]

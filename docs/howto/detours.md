@@ -141,6 +141,13 @@ While detours are on, the daemon's edge answers paths under
 goes to the application, so the toolbar of a detour, under
 `/_muru/toolbar/`, is reached through the preview like the pages.
 
+When the application is routed at a sub path, the toolbar lives under
+the route, so its requests match the application's route as the page's
+do: behind a route at `/app` the toolbar is at `/app/_muru/toolbar/`,
+whether the route has `strip_prefix` or not. On such a route the
+application's own paths under `/app/_muru/` are the run's while you
+preview.
+
 The toolbar appears only on pages you preview. A client that a traffic
 choice below sends to the detour gets the page as the application made
 it, with no toolbar, and the run answers its `/_muru/toolbar/` paths

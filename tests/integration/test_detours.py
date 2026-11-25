@@ -400,6 +400,33 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
 
         assert detour.log().count("now takes previews only") >= reverted, detour.log()
 
+        # Behind a route at a sub path the toolbar lives under the route,
+        # so its requests reach the detour as the page's do: the route's
+        # path when it strips nothing, the forwarded prefix when it strips.
+
+        hosts = tmp_path / "hosts.toml"
+        hosts.write_text(
+            '[host.any]\ndefault = true\n\n[[route]]\nhost = "any"\napp = "detoured"\n\n'
+            '[host.sub]\nnames = ["sub.test"]\n\n'
+            '[[route]]\nhost = "sub"\npath = "/app"\napp = "detoured"\n\n'
+            '[host.strip]\nnames = ["strip.test"]\n\n'
+            '[[route]]\nhost = "strip"\npath = "/app"\napp = "detoured"\n'
+            'strip_prefix = "/app"\n'
+        )
+        daemon.muructl("apply", "-f", str(hosts))
+
+        for name in ("sub.test", "strip.test"):
+            page = daemon.request("/app/page", name, headers={**preview, **document})
+            assert b'src="/app/_muru/toolbar/toolbar.js"' in page.body, (name, page.body)
+            script = daemon.request("/app/_muru/toolbar/toolbar.js", name, headers=preview)
+            assert script.status == 200, (name, script.body)
+            unpreviewed = daemon.request("/app/_muru/toolbar/history", name)
+            assert not json.loads(unpreviewed.body)["instance"].startswith("detour:")
+
+        assert (
+            daemon.request("/_muru/toolbar/toolbar.js", "sub.test", headers=preview).status == 404
+        )
+
         # The detour ends with its run, and the daemon's traffic is back on
         # the serving release at once.
 
