@@ -2642,6 +2642,14 @@ pub enum RelayNews {
         /// What happened, in words.
         message: String,
     },
+    /// Issue 922: the instance a relay runs as its parent has ended, as
+    /// the relay reaped it, before the relay itself exits.
+    Ended {
+        /// The instance's index.
+        index: u32,
+        /// The instance's pid.
+        pid: u32,
+    },
 }
 
 /// Hears what a release's relay reports.
@@ -3050,7 +3058,8 @@ async fn read_relay_reports(
                 message: event.message,
             }),
             crate::relay::Report::Reopened => reopens.send_modify(|count| *count += 1),
-            crate::relay::Report::Flushed => {}
+            // A host's end is its own to report, as the host exiting.
+            crate::relay::Report::Flushed | crate::relay::Report::Ended { .. } => {}
         })
         .await;
 

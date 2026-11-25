@@ -623,6 +623,18 @@ pub enum Command {
         /// Answered with each worker's reply, or why none could be asked.
         done: oneshot::Sender<Result<Vec<WorkerReply>, String>>,
     },
+    /// Issue 922: the relay of a managed server's instance reports that
+    /// the instance has ended.
+    ServerEnded {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The instance's index.
+        index: u32,
+        /// The pid that ended.
+        pid: u32,
+    },
     /// Issue 917: the probe of a managed server's instance started again
     /// has ended, on a task beside the loop.
     ServerProbed {
@@ -6502,6 +6514,14 @@ impl Daemon {
             } => {
                 self.server_probed(&app, &id, index, pid, answered).await;
             }
+            Command::ServerEnded {
+                app,
+                id,
+                index,
+                pid,
+            } => {
+                self.server_ended(&app, &id, index, pid).await;
+            }
             Command::StartHeld { app, id, done } => {
                 self.start_held(&app, &id, done).await;
             }
@@ -12276,6 +12296,28 @@ impl Daemon {
         self.publish_servers();
     }
 
+    /// Issue 922: an instance's relay reports its end, which marks the
+    /// instance starting at once and tells the edge, so the requests
+    /// that follow are held rather than refused while the relay reads
+    /// the last of its output and the next check sees the exit.
+    async fn server_ended(&mut self, app: &str, id: &str, index: u32, pid: u32) {
+        let key = (app.to_owned(), id.to_owned());
+
+        let Some(Running {
+            backend: Backend::Servers(servers),
+            ..
+        }) = self.running.get_mut(&key)
+        else {
+            return;
+        };
+
+        if servers.ended(index, pid)
+            && let Err(error) = self.push_snapshot().await
+        {
+            tracing::warn!(%error, "pushing the snapshot with an instance ended failed");
+        }
+    }
+
     /// Issue 917: an instance started again answered its probe, or did
     /// not within the readiness timeout; either way its starting mark is
     /// cleared, and the edge told, unless the probe was of a process the
@@ -13423,15 +13465,15 @@ impl Daemon {
     /// release, as its workers' do; counts are read from the host.
     fn relay_watcher(&self, subject: &str) -> crate::host::RelayWatcher {
         let events = self.events.clone();
+        let commands = self.commands.clone();
         let subject = subject.to_owned();
 
-        std::sync::Arc::new(move |news| {
-            if let crate::host::RelayNews::Event {
+        std::sync::Arc::new(move |news| match news {
+            crate::host::RelayNews::Event {
                 kind,
                 level,
                 message,
-            } = news
-            {
+            } => {
                 let level = if level == "warning" {
                     "warning"
                 } else {
@@ -13439,6 +13481,27 @@ impl Daemon {
                 };
                 events.emit(&kind, &subject, level, &message);
             }
+
+            // Issue 922: a managed server's instance ended; the loop
+            // marks it starting.
+            crate::host::RelayNews::Ended { index, pid } => {
+                let Some((app, id)) = subject.split_once('@') else {
+                    return;
+                };
+
+                let command = Command::ServerEnded {
+                    app: app.to_owned(),
+                    id: id.to_owned(),
+                    index,
+                    pid,
+                };
+                let commands = commands.clone();
+
+                tokio::spawn(async move {
+                    let _ = commands.send(command).await;
+                });
+            }
+            crate::host::RelayNews::Dropped(_) => {}
         })
     }
 

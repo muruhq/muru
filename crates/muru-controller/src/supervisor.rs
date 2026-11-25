@@ -242,7 +242,7 @@ impl Relayed {
     /// recorded, and read its reports.
     fn adopt(relay: &RelaySpec, recorded: &InstanceRecord) -> Self {
         let reopens = tokio::sync::watch::channel(0).0;
-        let reports = watch_relay(relay, recorded.index, &reopens);
+        let reports = watch_relay(relay, recorded.index, recorded.pid, &reopens);
 
         Self {
             relay: RelayProcess::Adopted,
@@ -367,10 +367,13 @@ const RELAY_START_WAIT: Duration = Duration::from_secs(10);
 
 /// Read a relay's reports from its control socket: its counts into the
 /// release's total, its events to the watcher, its reopens into
-/// `reopens`. A relay just started is given a moment to bind the socket.
+/// `reopens`, and the end of its process, by `pid`, to the watcher, when
+/// the relay reports it or its connection closes (issue 922). A relay
+/// just started is given a moment to bind the socket.
 fn watch_relay(
     relay: &RelaySpec,
     index: u32,
+    pid: u32,
     reopens: &tokio::sync::watch::Sender<u64>,
 ) -> tokio::task::JoinHandle<()> {
     let socket = relay.control(index);
@@ -380,6 +383,7 @@ fn watch_relay(
 
     tokio::spawn(async move {
         let mut counted = 0u64;
+        let mut ended = false;
 
         for _ in 0..100 {
             let result = crate::relay::watch_reports(&socket, |report| match report {
@@ -396,10 +400,23 @@ fn watch_relay(
                 }),
                 crate::relay::Report::Reopened => reopens.send_modify(|count| *count += 1),
                 crate::relay::Report::Flushed => {}
+                crate::relay::Report::Ended { .. } => {
+                    ended = true;
+                    watcher(crate::host::RelayNews::Ended { index, pid });
+                }
             })
             .await;
 
+            // Issue 922: a relay that exits as soon as it has reaped its
+            // process, with nothing left to read, can be gone before its
+            // report of the end is written, as can one too old to send
+            // it. Its connection closing says the same.
+
             if result.is_ok() {
+                if !ended {
+                    watcher(crate::host::RelayNews::Ended { index, pid });
+                }
+
                 return;
             }
 
@@ -1110,7 +1127,7 @@ impl Supervisor {
         };
 
         let reopens = tokio::sync::watch::channel(0).0;
-        let reports = watch_relay(relay, index, &reopens);
+        let reports = watch_relay(relay, index, started.pid, &reopens);
 
         Ok(Relayed {
             relay: RelayProcess::Child(child),

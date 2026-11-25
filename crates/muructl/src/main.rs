@@ -3614,6 +3614,7 @@ fn relay_watcher(
             level,
             message,
         } => events.record(&kind, &format!("{label}@{release}"), &level, &message),
+        muru_controller::host::RelayNews::Ended { .. } => {}
     })
 }
 

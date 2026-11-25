@@ -140,13 +140,15 @@ pub struct Relays {
 }
 
 /// Section 9.9 (issue 917): whether an instance is out of service at the
-/// edge as starting, from when its exit is seen, or it is adopted as
-/// gone, until its process answers the readiness probe or the readiness
-/// timeout passes.
+/// edge as starting, from when its relay reports its end (issue 922) or
+/// its exit is seen, or it is adopted as gone, until its process answers
+/// the readiness probe or the readiness timeout passes.
 #[derive(Default)]
 struct Starting {
     marked: bool,
-    /// The process being probed, once the instance has one.
+    /// The process being probed, once the instance has one; or the one
+    /// whose relay reported its end, with no probe, while the supervisor
+    /// still counts it as running.
     pid: Option<u32>,
     probe: Option<tokio::task::JoinHandle<()>>,
 }
@@ -459,7 +461,10 @@ impl Servers {
             .position(|instance| instance.index() == index)?;
         let starting = &mut self.starting[position];
 
-        if !starting.marked || starting.pid != Some(pid) {
+        // A probe the relay's report of the process's end stopped, whose
+        // outcome was already on its way, says nothing now.
+
+        if !starting.marked || starting.pid != Some(pid) || starting.probe.is_none() {
             return None;
         }
 
@@ -486,6 +491,34 @@ impl Servers {
                     .unwrap_or_default()
             ),
         })
+    }
+
+    /// Issue 922: the relay of the instance at `index` reports that its
+    /// process `pid` has ended. The instance is marked starting at once,
+    /// and its probe, if one ran, is stopped; the exit itself, its wait
+    /// and the start in its place are left to the check that sees the
+    /// relay gone, since a new relay for the index takes the old one's
+    /// control socket and record. Says whether the mark is new. A report
+    /// about a process the instance no longer has changes nothing.
+    pub fn ended(&mut self, index: u32, pid: u32) -> bool {
+        let Some(position) = self
+            .supervisor
+            .instances()
+            .position(|instance| instance.index() == index && instance.pid() == Some(pid))
+        else {
+            return false;
+        };
+
+        let starting = &mut self.starting[position];
+        let new = !starting.marked;
+
+        *starting = Starting {
+            marked: true,
+            pid: Some(pid),
+            probe: None,
+        };
+
+        new
     }
 
     /// The addresses of the instances marked starting, which the edge

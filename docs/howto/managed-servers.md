@@ -129,11 +129,13 @@ rather than failing. It waits for at most the queue timeout
 instance takes requests again; the time it waits counts towards its
 request deadline. One still waiting when the queue timeout ends is sent
 to the instances all the same, and is answered 502 `upstream_failed` if
-none takes it. At most 256 requests wait for one release in each edge process, and
-any beyond them are answered 503 `upstream_starting` with
-`Retry-After: 1`. A request that arrives in the second between an
-instance's exit and the daemon seeing it is not held, and with no other
-instance to go to is answered 502 `upstream_failed`.
+none takes it. At most 256 requests wait for one release in each edge
+process, and any beyond them are answered 503 `upstream_starting` with
+`Retry-After: 1`. An instance is out of service from the moment it
+ends, even while the last of its output is still being written to the
+release's log; a request that arrives in the instant before the edge
+hears of the end is not held, and with no other instance to go to is
+answered 502 `upstream_failed`.
 
 With every instance out of service for other reasons, such as failed
 requests, requests still try them all, and are answered 502

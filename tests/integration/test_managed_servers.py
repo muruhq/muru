@@ -596,8 +596,14 @@ def test_a_daemon_restart_readopts_the_instances(tmp_path: Path) -> None:
 
         assert report(second, "/crash")["pid"] == pid
         wait_for(lambda: not alive(pid))
-        wait_for(lambda: second.request("/").status == 200 and report(second)["pid"] != pid, 20)
+
+        # Issue 922: the relay reports the end at once, so a request sent
+        # before the daemon's next check is held, not refused, and is
+        # answered by the instance started in its place.
+
+        time.sleep(0.2)
         replacement = report(second)["pid"]
+        assert replacement != pid
     finally:
         if second is None:
             second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
