@@ -2768,6 +2768,17 @@ impl Route {
         classes.dedup();
         format!("{} client_class={}", self.path, classes.join(","))
     }
+
+    /// Whether the route sends requests to `app`: as its own application,
+    /// or as a static route's fallback (`fallback = { app = "APP" }`).
+    pub fn serves_app(&self, app: &str) -> bool {
+        let fallback = self
+            .fallback
+            .as_ref()
+            .and_then(|fallback| fallback.app.as_deref());
+
+        self.app == app || (self.static_dir.is_some() && fallback == Some(app))
+    }
 }
 
 /// A route's method restrictions (section 4.15).

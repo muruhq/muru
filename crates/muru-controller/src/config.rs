@@ -3118,13 +3118,14 @@ pub fn export(store: &Store, app: Option<&str>) -> Result<Document, StoreError> 
     }
 
     // Hosts and routes are node-wide; with one application asked for,
-    // only the routes to it and their hosts are written.
+    // only the routes to it, a static route falling back to it among
+    // them (issue 918), and their hosts are written.
 
     let routes = store.routes()?;
     let hosts = store.hosts()?;
 
     for route in routes {
-        if app.is_none_or(|name| route.app == name) {
+        if app.is_none_or(|name| route.serves_app(name)) {
             document.route.push(route);
         }
     }
@@ -8537,6 +8538,32 @@ mod tests {
             back.errors.is_empty() && back.changes.is_empty(),
             "{back:?}"
         );
+    }
+
+    #[test]
+    fn an_export_of_one_application_writes_a_static_route_falling_back_to_it() {
+        let source = source_dir();
+        let store = store_with_shop(&source);
+        let routed = Document::parse(
+            "[host.site]\nnames = ['shop.test']\n\n\
+             [[route]]\nhost = 'site'\npath = '/'\nstatic = '/srv/site'\n\
+             fallback = { app = 'shop' }\n",
+        )
+        .unwrap();
+        store.put_host("site", &routed.host["site"]).unwrap();
+        store.put_route(&routed.route[0]).unwrap();
+
+        // The static route reaches shop through its fallback (issue 918),
+        // so it comes with its host; an export of another application
+        // writes neither.
+
+        let exported = export(&store, Some("shop")).unwrap();
+        assert_eq!(exported.route, routed.route);
+        assert!(exported.host.contains_key("site"));
+
+        store.ensure_app("blog").unwrap();
+        let other = export(&store, Some("blog")).unwrap();
+        assert!(other.route.is_empty() && other.host.is_empty());
     }
 
     #[test]
