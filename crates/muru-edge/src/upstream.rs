@@ -1161,6 +1161,17 @@ pub async fn handle(
         without_preview(&mut headers);
     }
 
+    // Section 4.21: the run is told how the request reached it, whether
+    // by its preview, and under which path its route lies. The client's
+    // own header went with the other X-Muru headers.
+
+    if shared.detour {
+        headers.insert(
+            crate::detour::HEADER,
+            context.detour.clone().unwrap_or_default().value(),
+        );
+    }
+
     // Section 4.21: a detour's run is told the port the client came to,
     // since it has none of its own for SERVER_PORT.
 

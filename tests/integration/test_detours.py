@@ -180,7 +180,9 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         launcher = tmp_path / "browser"
         launcher.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{opened}'\n")
         launcher.chmod(0o755)
-        detour = Detour(project, daemon, "--open-preview", env={"BROWSER": str(launcher)})
+        detour = Detour(
+            project, daemon, "--open-preview", "--toolbar", env={"BROWSER": str(launcher)}
+        )
         detour.wait_for_log("in preview of")
         deadline = time.monotonic() + 20
 
@@ -232,6 +234,15 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         assert "server-timing" in seen["headers"]
         assert "muru-preview" not in seen["headers"]
         assert seen["preview"] == ""
+
+        # The toolbar is the developer's: a page reached by the preview
+        # gets it, and its files and records answer the preview.
+
+        document = {"Sec-Fetch-Dest": "document"}
+        page = daemon.request("/page", headers={**preview, **document})
+        assert b'src="/_muru/toolbar/toolbar.js"' in page.body, page.body
+        assert daemon.request("/_muru/toolbar/toolbar.js", headers=preview).status == 200
+        assert daemon.request("/_muru/toolbar/history", headers=preview).status == 200
 
         # The detour is listed, with no secret, and its run is an instance
         # of kind detour that --instance reaches by its tag.
@@ -325,6 +336,20 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         assert refused.returncode != 0
         assert "muructl detour traffic" in refused.stderr
         detour.wait_for_log("now takes all of detoured's traffic")
+
+        # A client the traffic choice sends to the detour gets the page as
+        # the application made it, and none of the run's records, even
+        # naming the header the daemon's edge tells the run with.
+
+        page = daemon.request("/page", headers=document)
+        assert page.status == 200 and b"_muru/toolbar" not in page.body, page.body
+
+        for forged in ({}, {"X-Muru-Detour": "preview"}):
+            for path in ("/_muru/toolbar/toolbar.js", "/_muru/toolbar/history"):
+                assert daemon.request(path, headers=forged).status == 404, (path, forged)
+
+        page = daemon.request("/page", headers={**preview, **document})
+        assert b'src="/_muru/toolbar/toolbar.js"' in page.body, page.body
 
         daemon.muructl("detour", "traffic", "detoured", "preview")
         assert not served(daemon)["instance"].startswith("detour:")

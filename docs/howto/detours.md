@@ -141,6 +141,14 @@ While detours are on, the daemon's edge answers paths under
 goes to the application, so the toolbar of a detour, under
 `/_muru/toolbar/`, is reached through the preview like the pages.
 
+The toolbar appears only on pages you preview. A client that a traffic
+choice below sends to the detour gets the page as the application made
+it, with no toolbar, and the run answers its `/_muru/toolbar/` paths
+with 404, so no one else can read the run's records of your requests.
+The run still records every request it serves: its dashboard shows
+them all, and the daemon's access log, `muructl metrics` and the
+daemon's dashboard show the shared traffic under the group `detour`.
+
 ## Sending more traffic
 
 `--traffic` chooses what the detour takes when it opens, and `muructl

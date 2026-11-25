@@ -36,6 +36,7 @@ pub mod buckets;
 pub mod classify;
 pub mod compression;
 pub mod connections;
+pub mod detour;
 pub mod development;
 pub mod endpoints;
 pub mod errors;
@@ -1503,13 +1504,28 @@ async fn serve<I>(
             let routing = shared.pools.current();
             let (mut parts, body) = request.into_parts();
 
+            // Section 4.21: the daemon's edge tells a detour's run how each
+            // request reached it, in a header only it sets. The header is
+            // taken off before anything looks at the request, and believed
+            // only on the Unix socket, which the daemon's edge alone
+            // reaches.
+
+            let detour_run = local == UNIX_ADDRESS;
+            let via = detour::Via::take(&mut parts.headers, detour_run);
+            let toolbar_for_request = toolbar::for_request(detour_run, via.as_ref());
+
             // Section 4.20: the reserved prefix is the edge's in a
             // development run that keeps records, answered from them before
-            // routing, and never recorded.
+            // routing, and never recorded. A detour's run answers it only
+            // for a request that reached it by its preview.
 
             if let Some(recorder) = shared.recorder.as_ref()
                 && toolbar::reserved(parts.uri.path())
             {
+                if !toolbar_for_request {
+                    return Ok::<_, Infallible>(toolbar::not_found());
+                }
+
                 let renderer = shared
                     .renderer
                     .get_or_init(|| panels::Renderer::new(shared.links.dashboard()));
@@ -1734,6 +1750,7 @@ async fn serve<I>(
                     noted: noted.clone(),
                     connection: Arc::clone(&connection),
                     connection_request: arrival.position,
+                    detour: None,
                 };
 
                 // Section 4.15: a client's own request draws from the
@@ -1937,6 +1954,7 @@ async fn serve<I>(
                             context.group = selection.group;
                             context.mount = selection.mount;
                             context.mount_path = selection.script_name;
+                            context.detour = selection.detour;
                             context.sendfile = selection.sendfile;
                             context.grpc_web = selection.grpc_web;
 
@@ -2130,6 +2148,7 @@ async fn serve<I>(
                                 context.group = selection.group.clone();
                                 context.mount = selection.mount.clone();
                                 context.mount_path = selection.script_name.clone();
+                                context.detour = selection.detour.clone();
                                 context.sendfile = Arc::clone(&selection.sendfile);
                                 context.grpc_web = Arc::clone(&selection.grpc_web);
                                 dispatch(
@@ -2347,7 +2366,10 @@ async fn serve<I>(
 
             let mut response = response;
 
-            if shared.links.toolbar_on() && noted.as_ref().is_some_and(|noted| noted.recorded()) {
+            if shared.links.toolbar_on()
+                && toolbar_for_request
+                && noted.as_ref().is_some_and(|noted| noted.recorded())
+            {
                 match toolbar::insertable(&method, &parts.headers, &response) {
                     Ok(nonce) => {
                         let dashboard = shared.links.request_page(&base_id);

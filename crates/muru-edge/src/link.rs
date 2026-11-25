@@ -1336,6 +1336,9 @@ pub struct Context<'a> {
     pub connection: Arc<crate::development::Connection>,
     /// The request's position on it, 1 for the first.
     pub connection_request: u64,
+    /// Section 4.21: how the request reached the detour it goes to, which
+    /// the detour's run is told; none for anything else.
+    pub detour: Option<crate::detour::Via>,
 }
 
 impl<'a> Context<'a> {
@@ -1388,6 +1391,7 @@ impl<'a> Context<'a> {
             noted: self.noted.clone(),
             connection: Arc::clone(&self.connection),
             connection_request: self.connection_request,
+            detour: None,
         }
     }
 }

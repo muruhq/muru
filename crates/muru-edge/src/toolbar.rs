@@ -70,6 +70,21 @@ pub fn reserved(path: &str) -> bool {
     path.starts_with(PREFIX)
 }
 
+/// Whether the toolbar is a request's: its pages get the toolbar and its
+/// requests under the reserved prefix are answered. Every request of a
+/// development run's own, and of a detour's run, `detour_run`, only one
+/// that the daemon's edge says reached it by its preview (section 4.21):
+/// the developer's, never a client's that a traffic choice sent there.
+pub fn for_request(detour_run: bool, via: Option<&crate::detour::Via>) -> bool {
+    !detour_run || via.is_some_and(|via| via.previewed)
+}
+
+/// The answer under the reserved prefix to a request the toolbar is not
+/// for.
+pub fn not_found() -> Response<ResponseBody> {
+    plain(StatusCode::NOT_FOUND, "not found\n")
+}
+
 /// Answer a request under the reserved prefix: under the toolbar's paths,
 /// its files, a record as JSON, one of its panels drawn, or the summaries
 /// of several records, and anything else not found. Only GET and HEAD,

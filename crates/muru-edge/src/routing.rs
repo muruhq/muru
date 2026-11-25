@@ -331,6 +331,9 @@ pub struct Selection {
     /// The limits on a request of what serves it (section 4.6): the
     /// mount's over the worker group's over the release's.
     pub limits: crate::RequestLimits,
+    /// Section 4.21: how the request reached a detour, which its run is
+    /// told; none for anything else.
+    pub detour: Option<crate::detour::Via>,
 }
 
 /// What a request brings to the release choice (section 9.4): its
@@ -591,6 +594,7 @@ fn upstream_selection(upstream: &Arc<Upstream>) -> Selection {
         grpc_web: Arc::default(),
         static_path: None,
         limits: crate::RequestLimits::default(),
+        detour: None,
     }
 }
 
@@ -1013,6 +1017,15 @@ impl AppPools {
         self.preview_secret.is_some()
     }
 
+    /// Whether a request carries this detour's preview, its release and
+    /// secret, by header or cookie, whatever chose the detour for it.
+    fn previewed_in(&self, headers: &HeaderMap) -> bool {
+        named_preview(headers)
+            .as_deref()
+            .and_then(|name| name.split_once('.'))
+            .is_some_and(|(release, secret)| release == self.release && self.previewed_by(secret))
+    }
+
     /// Whether a preview's secret is the detour's, compared in constant
     /// time.
     fn previewed_by(&self, secret: &str) -> bool {
@@ -1089,6 +1102,10 @@ impl AppPools {
                 grpc_web: Arc::default(),
                 static_path: None,
                 limits: self.limits,
+                detour: self.is_detour().then(|| crate::detour::Via {
+                    previewed: self.previewed_in(client.headers),
+                    base: String::new(),
+                }),
             });
         }
 
@@ -1157,6 +1174,7 @@ impl AppPools {
                 .map_or_else(crate::RequestLimits::default, |mount| mount.limits)
                 .or(group_limits)
                 .or(self.limits),
+            detour: None,
         })
     }
 
@@ -2478,6 +2496,7 @@ impl Routing {
                 grpc_web: Arc::default(),
                 static_path: None,
                 limits: crate::RequestLimits::default(),
+                detour: None,
             }),
         }
     }
@@ -3198,6 +3217,40 @@ mod tests {
             panic!("not served");
         };
         assert!(!preview_ignored(&header("dev-7f3a.0f1e"), &selection));
+
+        // The run is told the request carries its preview; one a traffic
+        // choice sends it carries none, and a release that is no detour
+        // tells nothing.
+
+        assert_eq!(
+            selection.detour,
+            Some(crate::detour::Via {
+                previewed: true,
+                base: String::new(),
+            })
+        );
+        let detour = &routing.apps["shop"].releases["dev-7f3a"];
+        let unpreviewed = HeaderMap::new();
+        let sent = detour
+            .select("/", &client(&unpreviewed, &ids), None)
+            .unwrap();
+        assert_eq!(sent.detour.map(|via| via.previewed), Some(false));
+        let wrong = header("dev-7f3a.0f1f");
+        let sent = detour.select("/", &client(&wrong, &ids), None).unwrap();
+        assert_eq!(sent.detour.map(|via| via.previewed), Some(false));
+
+        let decision = routing.select(
+            Some("shop.example.com"),
+            "/",
+            "127.0.0.1:8080",
+            true,
+            &client(&header("r2"), &ids),
+            None,
+        );
+        let Decision::Serve { selection, .. } = decision else {
+            panic!("not served");
+        };
+        assert_eq!(selection.detour, None);
     }
 
     #[test]

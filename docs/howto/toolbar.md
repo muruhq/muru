@@ -200,6 +200,11 @@ points at your machine. A request a browser makes from another site's
 page is refused. A route of the application under `/_muru/` is not
 reached during a development run.
 
+In a [detour](detours.md) the toolbar is yours alone: it goes only into
+pages you reach by the detour's preview, and the paths above answer only
+your previewed requests, 404 for any other client the daemon sends to
+the detour.
+
 Behind a development proxy that serves the run under a path, as
 jupyter-server-proxy and code-server do, the tag carries the path the
 proxy sends in `X-Forwarded-Prefix`.
