@@ -448,6 +448,7 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
         support.unavailable("muructl or the extension is not built")
     run_dir = support.short_dir("muru-run-")
     port = support.free_port()
+    dashboard = support.free_port()
     location = [
         "--config",
         str(tmp_path / "muru.toml"),
@@ -461,8 +462,13 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
         str(tmp_path / "cache"),
     ]
 
+    # Issue 851: every start says where it listens and serves its
+    # dashboard, so nothing depends on a default port being free.
+
+    serving = ["--listen", f"127.0.0.1:{port}", "--dashboard", f"127.0.0.1:{dashboard}"]
+
     started = subprocess.run(
-        [str(muructl), "daemon", "start", "--listen", f"127.0.0.1:{port}", *location],
+        [str(muructl), "daemon", "start", *serving, *location],
         capture_output=True,
         text=True,
         check=False,
@@ -473,7 +479,11 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
         assert started.returncode == 0, started.stdout + started.stderr
         assert "daemon started" in started.stdout
         again = subprocess.run(
-            [str(muructl), "up", *location], capture_output=True, text=True, check=False, timeout=60
+            [str(muructl), "up", *serving, *location],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
         )
         assert "already running" in again.stdout
         pid = again.stdout.split("(pid ")[1].split(")")[0]
@@ -491,7 +501,11 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
         assert "detached" in detached.stdout, detached.stdout + detached.stderr
         assert not (run_dir / "daemon.pid").exists()
         restarted = subprocess.run(
-            [str(muructl), "up", *location], capture_output=True, text=True, check=False, timeout=60
+            [str(muructl), "up", *serving, *location],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
         )
         assert restarted.returncode == 0, restarted.stdout + restarted.stderr
         status = subprocess.run(
@@ -502,6 +516,7 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
             timeout=60,
         )
         assert f"http://127.0.0.1:{port}" in status.stdout
+        assert f"127.0.0.1:{dashboard}" in status.stdout, status.stdout
         assert f"logs     {tmp_path / 'logs'}\n" in status.stdout
         assert "cache    " in status.stdout and "config   " in status.stdout
     finally:
