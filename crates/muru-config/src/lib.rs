@@ -1116,6 +1116,153 @@ pub struct Release {
     /// with the release on request, with inputs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub commands: BTreeMap<String, CommandTable>,
+    /// What the deploy recorded about where the release's code came from
+    /// (section 9.14): string keys to string values, `commit`, `ref`,
+    /// `url`, `description` and `dirty` among them, which the release
+    /// keeps and never gives the application. At most 32 keys.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// The most keys a release's metadata holds (section 9.14).
+pub const METADATA_MAX_KEYS: usize = 32;
+
+/// The longest key of a release's metadata, in bytes.
+pub const METADATA_MAX_KEY: usize = 63;
+
+/// The longest value of a release's metadata, in bytes.
+pub const METADATA_MAX_VALUE: usize = 1024;
+
+/// The most bytes a release's metadata holds, its keys and values
+/// together.
+pub const METADATA_MAX_TOTAL: usize = 8 * 1024;
+
+/// The metadata keys Muru's own views show by name (section 9.14), in
+/// the order they show them.
+pub const METADATA_KEYS: [&str; 5] = ["commit", "ref", "dirty", "url", "description"];
+
+/// Check a release's metadata against the limits of section 9.14 and
+/// give it as kept: a key with an empty value is left out. The error
+/// names the key at fault.
+pub fn check_metadata(
+    metadata: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let kept: BTreeMap<String, String> = metadata
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+
+    if kept.len() > METADATA_MAX_KEYS {
+        return Err(format!(
+            "metadata has {} keys, more than the {METADATA_MAX_KEYS} a release keeps",
+            kept.len()
+        ));
+    }
+
+    let mut total = 0;
+
+    for (key, value) in &kept {
+        let lead = key.bytes().next();
+        let allowed = |byte: u8| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-/".contains(&byte)
+        };
+
+        if key.len() > METADATA_MAX_KEY
+            || !lead.is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || !key.bytes().all(allowed)
+        {
+            return Err(format!(
+                "metadata key {key:?} must be 1 to {METADATA_MAX_KEY} lowercase letters, digits, \
+                 '.', '_', '-' or '/', starting with a letter or digit"
+            ));
+        }
+
+        if value.len() > METADATA_MAX_VALUE {
+            return Err(format!(
+                "metadata {key}: the value is {} bytes, more than {METADATA_MAX_VALUE}",
+                value.len()
+            ));
+        }
+
+        if value
+            .chars()
+            .any(|character| character.is_control() && character != '\n' && character != '\t')
+        {
+            return Err(format!(
+                "metadata {key}: the value holds a control character other than a newline or tab"
+            ));
+        }
+
+        if key == "url" && !(value.starts_with("https://") || value.starts_with("http://")) {
+            return Err(format!(
+                "metadata url {value:?} must be an absolute http or https URL"
+            ));
+        }
+
+        total += key.len() + value.len();
+    }
+
+    if total > METADATA_MAX_TOTAL {
+        return Err(format!(
+            "metadata holds {total} bytes, more than the {METADATA_MAX_TOTAL} a release keeps"
+        ));
+    }
+
+    Ok(kept)
+}
+
+/// A commit as Muru's views show it: a git commit of 40 or 64
+/// hexadecimal digits shortened to 12, anything else as given.
+pub fn short_commit(commit: &str) -> &str {
+    let hex = commit.bytes().all(|byte| byte.is_ascii_hexdigit());
+
+    if hex && (commit.len() == 40 || commit.len() == 64) {
+        &commit[..12]
+    } else {
+        commit
+    }
+}
+
+/// A ref as Muru's views show it: a branch or tag without its
+/// `refs/heads/` or `refs/tags/`, anything else as given.
+pub fn short_ref(name: &str) -> &str {
+    name.strip_prefix("refs/heads/")
+        .or_else(|| name.strip_prefix("refs/tags/"))
+        .unwrap_or(name)
+}
+
+/// The commit a release's metadata names as a list shows it: shortened,
+/// followed by `+` when its checkout had changes; none without one.
+pub fn commit_label(metadata: &BTreeMap<String, String>) -> Option<String> {
+    let commit = short_commit(metadata.get("commit")?);
+
+    if metadata.get("dirty").map(String::as_str) == Some("true") {
+        Some(format!("{commit}+"))
+    } else {
+        Some(commit.to_owned())
+    }
+}
+
+/// Where a release's code came from, in words, from its metadata:
+/// `commit 4f2a9c1e0b3d of main`, with `, uncommitted changes` when it
+/// was dirty; none when the metadata names no commit or ref.
+pub fn metadata_origin(metadata: &BTreeMap<String, String>) -> Option<String> {
+    let commit = metadata.get("commit").map(|commit| short_commit(commit));
+    let name = metadata.get("ref").map(|name| short_ref(name));
+
+    let origin = match (commit, name) {
+        (Some(commit), Some(name)) => format!("commit {commit} of {name}"),
+        (Some(commit), None) => format!("commit {commit}"),
+        (None, Some(name)) => format!("ref {name}"),
+        (None, None) => return None,
+    };
+
+    if metadata.get("dirty").map(String::as_str) == Some("true") {
+        Some(format!("{origin}, uncommitted changes"))
+    } else {
+        Some(origin)
+    }
 }
 
 /// How a worker group is scaled (section 7.2).
@@ -2767,6 +2914,17 @@ impl Route {
         classes.sort();
         classes.dedup();
         format!("{} client_class={}", self.path, classes.join(","))
+    }
+
+    /// Whether the route sends requests to `app`: as its own application,
+    /// or as a static route's fallback (`fallback = { app = "APP" }`).
+    pub fn serves_app(&self, app: &str) -> bool {
+        let fallback = self
+            .fallback
+            .as_ref()
+            .and_then(|fallback| fallback.app.as_deref());
+
+        self.app == app || (self.static_dir.is_some() && fallback == Some(app))
     }
 }
 
@@ -7051,6 +7209,71 @@ pub fn parse_pyproject(text: &str) -> Result<Option<ToolMuru>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_metadata_is_kept_within_its_limits() {
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect()
+        };
+
+        // Issue 866: the well-known keys and a prefixed key of a tool's
+        // own are kept, and an empty value is left out.
+
+        let given = map(&[
+            ("commit", "4f2a9c1e0b3d"),
+            ("ref", "refs/heads/main"),
+            ("url", "https://git.example.com/shop/pull/42"),
+            ("description", "Fix the basket total\nand its tax"),
+            ("hosting.example/pr", "42"),
+            ("dirty", ""),
+        ]);
+        let kept = check_metadata(&given).unwrap();
+        assert_eq!(kept.len(), 5);
+        assert!(!kept.contains_key("dirty"));
+
+        let refused = |pairs: &[(&str, &str)]| check_metadata(&map(pairs)).unwrap_err();
+        assert!(refused(&[("Commit", "x")]).contains("lowercase letters"));
+        assert!(refused(&[("-x", "x")]).contains("starting with a letter or digit"));
+        assert!(refused(&[(&"k".repeat(64), "x")]).contains("1 to 63"));
+        assert!(refused(&[("note", &"v".repeat(1025))]).contains("more than 1024"));
+        assert!(refused(&[("note", "a\u{7}b")]).contains("control character"));
+        assert!(refused(&[("url", "javascript:alert(1)")]).contains("http or https"));
+
+        let many: BTreeMap<String, String> =
+            (0..33).map(|n| (format!("k{n}"), "v".to_owned())).collect();
+        assert!(check_metadata(&many).unwrap_err().contains("33 keys"));
+
+        let large: BTreeMap<String, String> = (0..9)
+            .map(|n| (format!("k{n}"), "v".repeat(1000)))
+            .collect();
+        assert!(
+            check_metadata(&large)
+                .unwrap_err()
+                .contains("more than the 8192")
+        );
+
+        // The views shorten a git commit and a branch or tag.
+
+        let commit = "4f2a9c1e0b3d5a6b7c8d9e0f1a2b3c4d5e6f7a8b";
+        assert_eq!(short_commit(commit), "4f2a9c1e0b3d");
+        assert_eq!(short_commit("v1.0.0-12-g4f2a9c1"), "v1.0.0-12-g4f2a9c1");
+        assert_eq!(short_ref("refs/tags/v1.0.0"), "v1.0.0");
+        assert_eq!(
+            metadata_origin(&map(&[
+                ("commit", commit),
+                ("ref", "refs/heads/main"),
+                ("dirty", "true")
+            ])),
+            Some("commit 4f2a9c1e0b3d of main, uncommitted changes".to_owned())
+        );
+        assert_eq!(
+            metadata_origin(&map(&[("url", "https://example.com")])),
+            None
+        );
+    }
 
     #[test]
     fn media_is_a_root_of_every_mount_and_static_data_and_uploads_are_refused() {

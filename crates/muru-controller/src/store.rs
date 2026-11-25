@@ -1994,6 +1994,7 @@ pub(crate) mod tests {
     /// A release's spec, for this crate's tests.
     pub(crate) fn spec() -> ReleaseSpec {
         ReleaseSpec {
+            metadata: std::collections::BTreeMap::new(),
             limits: crate::model::ServedLimits::default(),
             source: PathBuf::from("/srv/shop"),
             entrypoint: "shop.wsgi:application".to_owned(),

@@ -888,3 +888,20 @@ def test_the_hosts_streams_tag_each_line_they_start(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(host, "_in_worker", True)
     stream.write("four\n")
     assert written.getvalue().endswith(f"{tag}three\nfour\n")
+
+
+def test_a_worker_is_named_by_its_group_and_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MURU_GROUP", raising=False)
+    monkeypatch.delenv("MURU_WORKER_ID", raising=False)
+    host.worker_environment("reports", 2)
+    assert os.environ["MURU_GROUP"] == "reports"
+    assert os.environ["MURU_WORKER_ID"] == "2"
+
+
+def test_development_is_what_the_environment_says(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MURU_DEVELOPMENT", raising=False)
+    assert not host.is_development()
+    monkeypatch.setenv("MURU_DEVELOPMENT", "1")
+    assert host.is_development()
+    monkeypatch.setenv("MURU_DEVELOPMENT", "0")
+    assert not host.is_development()

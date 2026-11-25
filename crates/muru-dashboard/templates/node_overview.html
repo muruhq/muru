@@ -9,7 +9,7 @@
 </div>
 <h2 style="margin-top:1rem">Applications and releases</h2>
 <table>
-  <tr><th>Release</th><th>State</th><th>Serving</th><th class="num">Workers</th>{% if data.has_threads() %}<th class="num">Threads</th>{% endif %}{% if data.has_event_loop() %}<th class="num">Loop</th>{% endif %}<th class="num">WebSockets</th><th class="num">Queued</th><th>Created</th><th>Note</th></tr>
+  <tr><th>Release</th><th>State</th><th>Serving</th><th class="num">Workers</th>{% if data.has_threads() %}<th class="num">Threads</th>{% endif %}{% if data.has_event_loop() %}<th class="num">Loop</th>{% endif %}<th class="num">WebSockets</th><th class="num">Queued</th>{% if data.has_origins() %}<th>Code</th>{% endif %}<th>Created</th><th>Note</th></tr>
   {% for app in data.apps %}
   {% for release in app.releases %}
   <tr>
@@ -21,6 +21,7 @@
     {% if data.has_event_loop() %}<td class="num">{{ crate::side_cell(release.event_loop) }}</td>{% endif %}
     <td class="num">{{ release.websockets }}</td>
     <td class="num">{{ release.waiting }}</td>
+    {% if data.has_origins() %}<td>{% if !release.commit.is_empty() %}{% if !release.url.is_empty() %}<a href="{{ release.url }}"><code>{{ release.commit }}</code></a>{% else %}<code>{{ release.commit }}</code>{% endif %}{% else if !release.url.is_empty() %}<a href="{{ release.url }}">link</a>{% endif %}{% if !release.git_ref.is_empty() %} {{ release.git_ref }}{% endif %}{% if !release.description.is_empty() %}<br>{{ release.description }}{% endif %}</td>{% endif %}
     <td><time datetime="{{ release.created }}">{{ release.created }}</time></td>
     <td>{{ release.message }}</td>
   </tr>

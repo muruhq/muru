@@ -49,6 +49,12 @@ def test_paths_reach_their_groups_in_development(development: support.Server) ->
     root = served_by(development.get("/"))
     assert root["group"] == "default" and root["env_group"] == "default"
 
+    # Issue 852: the worker's index and the development run are in the
+    # environment as well as the context.
+
+    assert root["env_worker"] == str(root["worker"])
+    assert root["development"] is True and root["env_development"] == "1"
+
     reports = served_by(development.get("/reports/daily"))
     assert reports["group"] == "reports" and reports["env_group"] == "reports"
     assert served_by(development.get("/reportsx"))["group"] == "default", "segment boundary"
@@ -171,7 +177,10 @@ def test_groups_under_the_daemon_from_the_table_and_the_file(
 
     assert daemon.deploy("grouped", GROUPED) == "muru: release grouped@r1 is ready and serving"
     assert served_by(daemon.request("/reports/x"))["group"] == "reports"
-    assert served_by(daemon.request("/"))["group"] == "default"
+    root = served_by(daemon.request("/"))
+    assert root["group"] == "default"
+    assert root["env_worker"] == str(root["worker"])
+    assert root["development"] is False and root["env_development"] is None
     assert served_by(daemon.request("/batch/nightly"))["group"] == "batch"
     assert served_by(daemon.request("/files/up", method="POST"))["group"] == "uploads"
     assert served_by(daemon.request("/files/up"))["group"] == "default"

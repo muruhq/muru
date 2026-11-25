@@ -2423,6 +2423,13 @@
           "$ref": "#/$defs/Memory",
           "description": "The memory policy for the workers."
         },
+        "metadata": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "What the deploy recorded about where the release's code came from: string keys to string values, `commit`, `ref`, `url`, `description` and `dirty` among them, which the release keeps and never gives the application. At most 32 keys.",
+          "type": "object"
+        },
         "mounts": {
           "additionalProperties": {
             "$ref": "#/$defs/Mount"

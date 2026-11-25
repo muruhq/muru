@@ -63,7 +63,7 @@ What collection still costs a worker after this sequence is measured rather than
 
 ## 6.3 Hooks
 
-Hooks live in a module named by the hooks setting. Each receives a context object with app, release, group, worker_id, interface and process_model.
+Hooks live in a module named by the hooks setting. Each receives a context object with app, release, group, worker_id, interface, process_model and development.
 
 | Hook | Runs in | Typical use |
 | --- | --- | --- |
@@ -166,7 +166,7 @@ The daemon starts hosts itself and imports applications as modules, so applicati
 
 | API | Purpose |
 | --- | --- |
-| muru.context() | Current app, release, group, worker id, interface, process model. Returns development defaults outside Muru |
+| muru.context() | Current app, release, group, worker id, interface, process model, and whether the run is a development one (`development`, issue 852: muructl run without --allow-public, or a detour, as MURU_DEVELOPMENT says). Returns development defaults outside Muru, where `development` is False |
 | muru.loop() | The worker's event loop, for WSGI code that schedules work on it; None when the worker has none |
 | muru.asgi.register(app) | Run an ASGI application's lifespan in this worker, from a post_fork hook (section 6.14) |
 | muru.HandoffNotEnabled | RuntimeError raised by a handoff the request's mount does not enable (section 6.14) |

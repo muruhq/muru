@@ -26,6 +26,7 @@ def test_context_defaults_outside_muru(monkeypatch: pytest.MonkeyPatch) -> None:
     assert context == Context()
     assert context.worker_id is None
     assert context.process_model == "threaded"
+    assert context.development is False
 
 
 def test_context_is_what_the_host_set(monkeypatch: pytest.MonkeyPatch) -> None:

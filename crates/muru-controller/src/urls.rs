@@ -82,13 +82,7 @@ type Rank = (usize, u8, u8, usize, usize, usize);
 /// Whether a route reaches `app`: its own application, or a static
 /// route's fallback (issue 908); an internal route never does.
 fn reaches(route: &Route, app: &str) -> bool {
-    let fallback = route
-        .fallback
-        .as_ref()
-        .and_then(|fallback| fallback.app.as_deref());
-
-    route.internal != Some(true)
-        && (route.app == app || (route.static_dir.is_some() && fallback == Some(app)))
+    route.internal != Some(true) && route.serves_app(app)
 }
 
 /// How well one of a host's names or patterns takes `name`, the better

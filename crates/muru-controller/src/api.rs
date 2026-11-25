@@ -858,6 +858,10 @@ impl Admin for Service {
             .unwrap_or_default();
 
         Ok(Response::new(pb::DeployPlan {
+            metadata: spec
+                .as_ref()
+                .map(|spec| spec.metadata.clone())
+                .unwrap_or_default(),
             app: request.app.clone(),
             release: id,
             new_app: app.is_none(),
@@ -3489,7 +3493,7 @@ impl Service {
         )
         .map_err(crate::store::StoreError::Decode)?;
         store.create_release(app, id, spec)?;
-        let source = spec.source.display();
+        let source = crate::model::created_from(spec);
 
         if added == Added::Stopped {
             store.set_release_state(app, id, ReleaseState::Stopped, "declared and not started")?;
@@ -4581,6 +4585,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
     pb::Release {
         traffic: String::new(),
         detour: None,
+        metadata: release.spec.metadata.clone(),
         app: release.app,
         id: release.id,
         state: release.state.as_str().to_owned(),

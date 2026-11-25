@@ -13,14 +13,15 @@ runs:
 | --- | --- |
 | `app` | The application name as `muructl deploy` gave it; under `muructl run` and `muructl serve` the name the terminal and the commands use: `--name` (or `MURU_SERVE_NAME` for `muructl serve`) when given, else `[project] name` from the project's `pyproject.toml`, with underscores and dots as hyphens, else the entrypoint's top-level module with underscores as hyphens, so `shop_site.wsgi:application` is `shop-site` |
 | `release` | The release identifier; under `muructl run` the one the terminal names, `r1`, then `r2` after a reload |
-| `group` | The worker group; `default` until worker groups arrive |
-| `worker_id` | The worker's index from 0, or `None` in the host (and outside Muru) |
+| `group` | The [worker group](../howto/worker-groups.md); `default` for the release's own workers and in the host |
+| `worker_id` | The worker's index within its group, from 0, or `None` in the host (and outside Muru); the environment variable `MURU_WORKER_ID` holds the same in a worker |
 | `interface` | `wsgi`, `asgi` or `grpc`, detected from the callable or declared with `--interface` |
 | `process_model` | `threaded`, `process-per-request` (one thread per worker) or `free-threaded` (on a free-threaded interpreter) for WSGI; `async` for ASGI |
+| `development` | `True` in a development run, `muructl run` without `--allow-public` or `muructl detour run`, where `MURU_DEVELOPMENT` is `1` as well; `False` under the daemon and `muructl serve` |
 
 Outside Muru the defaults are `app="default"`, `release="dev"`,
-`group="default"`, `worker_id=None`, `interface="wsgi"` and
-`process_model="threaded"`.
+`group="default"`, `worker_id=None`, `interface="wsgi"`,
+`process_model="threaded"` and `development=False`.
 
 ## Lifecycle hooks
 

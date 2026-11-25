@@ -658,6 +658,20 @@ pub struct ReleaseSpec {
     /// Section 9.12: the commands the application declares, by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<CommandSpec>,
+    /// Section 9.14: what the deploy recorded of where the code came
+    /// from, as checked against the limits; never in the environment.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// Where a release's code came from, as its `release.created` event says
+/// after "from": the source directory, and the commit and ref its
+/// metadata names (section 9.14).
+pub fn created_from(spec: &ReleaseSpec) -> String {
+    match muru_config::metadata_origin(&spec.metadata) {
+        Some(origin) => format!("{}, {origin}", spec.source.display()),
+        None => spec.source.display().to_string(),
+    }
 }
 
 impl ReleaseSpec {

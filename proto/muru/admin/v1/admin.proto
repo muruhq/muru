@@ -865,6 +865,7 @@ message DeployRequest {
   optional bool build_source_builds = 57;   // allow sdists to be built on the node; the table's, else false, when absent
   optional bool build_compile_bytecode = 58; // compile bytecode at build time; the table's, else true, when absent
   optional uint64 exit_grace_ms = 59;      // how long a worker has for its shutdown work after its requests have had theirs
+  map<string, string> metadata = 60;        // where the code came from (commit, ref, url, description, dirty and any other key), kept with the release
 }
 
 // What a deploy would do. With refusals nothing would be deployed.
@@ -883,6 +884,7 @@ message DeployPlan {
   repeated string refusals = 12;    // what would refuse the deploy
   string retained = 13;             // what the release it replaces would keep, such as "1 worker to a group"
   repeated DeployEnv env = 14;      // the variables and secrets it would get, by name, never by value
+  map<string, string> metadata = 15; // the metadata it would record, as checked
 }
 
 // A variable a planned release would get, and where it would come from.
@@ -1276,6 +1278,7 @@ message Release {
   repeated GatePassed gates = 37;   // the gates it has passed, in order
   string traffic = 38;              // its shares of the routes that split traffic, where they differ from what serving implies (issue 759)
   Detour detour = 39;               // a detour's run and traffic, for kind detour
+  map<string, string> metadata = 40; // what its deploy recorded of where its code came from
 }
 
 // A gate a release passed: a run of a command at a point in its life.

@@ -189,8 +189,8 @@ does not serve, which that check rules out, answers 503
 
 Each worker knows its group: `muru.context().group` is the group's name,
 `muru.context().worker_id` the worker's index within the group, and the
-environment variable `MURU_GROUP` is set before the application is
-imported in the worker, so a post-fork hook can size caches or pools for
+environment variables `MURU_GROUP` and `MURU_WORKER_ID` hold the same
+before the application is imported in the worker, so a post-fork hook can size caches or pools for
 the group it is in. Groups share the interpreter and everything imported
 before the fork; differences must be applied after it.
 
