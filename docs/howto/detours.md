@@ -115,12 +115,24 @@ $ muructl detour preview                      # open a link for the best address
 $ muructl detour preview --host admin.localhost
 $ muructl detour preview --list               # a link for each of the application's addresses
 $ muructl detour preview --print              # print a link, open nothing
+$ muructl detour preview --name alice.shop.test
 $ muructl detour preview --header
 Muru-Preview: dev-7f3a.3f9c0e7a51b2d4c68e1f0a9b7c5d3e21
 ```
 
+The links are for the addresses `muructl open` gives the application,
+and like `muructl open` they are only for names that reach this
+machine: a name that does not resolve here, or resolves elsewhere, is
+passed over for the next address, and when none is left the command
+says which names it left out and why. `--any-name` keeps them. `--name`
+builds the link from a name of your choosing, which must reach a host
+that routes the application, for a host whose names are all patterns or
+to choose a tenant; `muructl detour run --open-preview` takes `--name`
+and `--any-name` too.
+
 `--header` prints the header that previews the detour without a cookie,
-for curl or a test client:
+for curl or a test client, whatever the application's hosts are, since
+it needs no address:
 
 ```console
 $ curl -H "$(muructl detour preview --header)" https://shop.localhost:8443/
@@ -141,6 +153,21 @@ While detours are on, the daemon's edge answers paths under
 goes to the application, so the toolbar of a detour, under
 `/_muru/toolbar/`, is reached through the preview like the pages.
 
+When the application is routed at a sub path, the toolbar lives under
+the route, so its requests match the application's route as the page's
+do: behind a route at `/app` the toolbar is at `/app/_muru/toolbar/`,
+whether the route has `strip_prefix` or not. On such a route the
+application's own paths under `/app/_muru/` are the run's while you
+preview.
+
+The toolbar appears only on pages you preview. A client that a traffic
+choice below sends to the detour gets the page as the application made
+it, with no toolbar, and the run answers its `/_muru/toolbar/` paths
+with 404, so no one else can read the run's records of your requests.
+The run still records every request it serves: its dashboard shows
+them all, and the daemon's access log, `muructl metrics` and the
+daemon's dashboard show the shared traffic under the group `detour`.
+
 ## Sending more traffic
 
 `--traffic` chooses what the detour takes when it opens, and `muructl
@@ -155,9 +182,9 @@ detour traffic` changes it while it runs:
 
 ```console
 $ muructl detour traffic all
-muru: detour shop@dev-7f3a now takes all of shop's traffic (was preview)
+muru: detour shop@dev-7f3a now takes all of shop's traffic (was previews only)
 $ muructl detour traffic preview
-muru: detour shop@dev-7f3a now takes previews only (was all)
+muru: detour shop@dev-7f3a now takes previews only (was all of shop's traffic)
 ```
 
 A choice other than preview is an overlay named `detour:APP`, owned by
@@ -171,14 +198,15 @@ choice.
 
 `all` and `share` are refused while a rollout of the application is
 under way, and `all` is refused while another detour of the application
-takes all of it.
+takes all of it, unless the two take different
+[paths](#taking-only-some-paths).
 
 `--for` or `--until` makes a choice last a while and then go back to
 preview on its own, so a detour is not left taking real traffic:
 
 ```console
 $ muructl detour traffic share=10 --for 10m
-muru: detour shop@dev-7f3a now takes 10% of shop's clients, until 2026-11-24T03:15:00Z, then previews only (was preview)
+muru: detour shop@dev-7f3a now takes 10% of shop's clients, until 2026-11-24T03:15:00Z, then previews only (was previews only)
 ```
 
 `--until` takes a time such as `2026-11-24T14:00`, in the local time zone
@@ -190,6 +218,58 @@ takes neither option. `detour list` and `release list` show when a
 timed choice ends, and a timed choice does not survive the daemon
 restarting, since the run opens its detour again with its own
 `--traffic`.
+
+## Taking only some paths
+
+`--path` makes the detour take only the requests under the paths it
+names, and leaves the rest to the serving release, whatever the traffic
+choice. Give it more than once for several paths; `muructl detour
+traffic` changes them while the detour runs, and `--all-paths` takes
+every path again:
+
+```console
+$ muructl detour run --path /app/api
+muru: traffic: previews only, under /app/api; muructl detour preview gives an entry link
+$ muructl detour traffic all --path /app/api --path /app/admin
+muru: detour shop@dev-7f3a now takes all of shop's traffic under /app/admin and /app/api (was previews only, under /app/api)
+$ muructl detour traffic preview --all-paths
+```
+
+A path matches on segment boundaries, as a route's does: `/app/api`
+takes `/app/api` and `/app/api/users`, not `/app/apiary`. It is the
+path as you see it in the browser, from the host's root, before any
+route's `strip_prefix` is taken off. It only chooses which requests
+reach the detour: the application in the detour sees `SCRIPT_NAME` and
+`PATH_INFO` as it would for any request, from its mounts and its
+route's `strip_prefix`.
+
+`--mount NAME` is a shorthand for the path of the checkout's mount
+`NAME` under each of the application's routes: behind a route at `/app`
+with `strip_prefix = "/app"`, a mount at `/api` is `--path /app/api`. A
+mount with no path, such as a gRPC mount, cannot be used.
+
+A preview outside the paths is served by the serving release, and the
+preview cookie is kept. Pages the detour serves still get its toolbar,
+whose paths are always the detour's for your previewed requests, and
+the toolbar's "This page" tab shows a request outside the paths as
+served by the serving release. An internal redirect from the detour,
+such as an `X-Accel-Redirect`, stays on the detour wherever it leads,
+since the detour's code chose it.
+
+Two detours of one application, from two worktrees, may both take `all`
+when their paths do not overlap, so one can work on `/app/api` and the
+other on `/app/admin`. Overlapping paths are refused, as two detours
+taking all of the application are.
+
+With some paths from the detour and the rest from the serving release,
+one browser's pages come from two releases. A login session or a CSRF
+token holds across them only when both use the same session store and
+secret key: `--app-data` gives the detour the application's data
+directory, and the rest, such as the secret key, is the detour's
+environment to match.
+
+`detour list`, `release list`, `overlay list` and the dashboard show
+the paths, as in `every route pinned, under /app/api`.
 
 ## What the daemon leaves to the run
 
@@ -272,6 +352,35 @@ the dashboard, under the application with the detour's release and the
 group `detour`. Conditions, rollout gates and the autoscaler leave them
 out, so a traceback in a detour never fires an overlay or holds a
 rollout.
+
+## The application's mounts
+
+A detour serves the [mounts](mounts.md) its checkout declares, in
+`[tool.muru.mounts]` or `muru.toml`. When those differ from the serving
+release's, as when the release's mounts come from an applied file, the
+detour says so as it opens, one warning for each mount that differs:
+
+```console
+$ muructl detour run
+muru: warning: the serving release shop@r4 mounts shop.api:app at /api (asgi) as api, which this checkout does not; requests under /api reach its default entrypoint
+muru: muructl detour run --mounts release serves with the serving release's mounts instead
+```
+
+The detour still opens, since you may be changing the mounts on
+purpose. `--mounts release` serves it with the serving release's mount
+table instead, each mount's path, interface and entrypoint:
+
+```console
+$ muructl detour run --mounts release
+muru: serving the mounts of the serving release shop@r4: api
+```
+
+Behind a route with
+[`strip_prefix`](virtual-hosts.md#an-application-under-a-sub-path) a
+detour is sent the path after the stripped part, with the stripped part
+as its forwarded prefix, so it sees the `SCRIPT_NAME` the serving
+release does. A request for the stripped part itself reaches the
+detour as the path `/`.
 
 ## The application's data
 

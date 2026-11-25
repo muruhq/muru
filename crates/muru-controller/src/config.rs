@@ -1803,6 +1803,27 @@ fn plan_routes(store: &Store, document: &Document, defined: &Defined, plan: &mut
             }
         }
 
+        // Section 4.5: what the route strips is a leading part of its
+        // own path, and a static route strips only for its fallback.
+
+        if let Err(error) = muru_config::check_strip_prefix(route) {
+            plan.errors
+                .push(format!("route {} {}: {error}", route.host, route.path));
+            valid = false;
+        }
+
+        let static_fallback = fallback_app.is_some() || fallback_upstream.is_some();
+
+        if route.strip_prefix.is_some() && route.static_dir.is_some() && !static_fallback {
+            plan.errors.push(format!(
+                "route {} {}: strip_prefix applies to a static route's fallback application or \
+                 upstream, and this route has none; the directory is served relative to the \
+                 route's path already",
+                route.host, route.path
+            ));
+            valid = false;
+        }
+
         // Section 4.15: the route's rate limits, method restrictions and
         // mode.
 
@@ -2038,18 +2059,21 @@ fn plan_routes(store: &Store, document: &Document, defined: &Defined, plan: &mut
                     new: recorded.is_none(),
                 },
                 detail: {
-                    let target = if route.upstream.is_empty() {
-                        route.app.clone()
-                    } else {
-                        format!("upstream {}", route.upstream)
+                    let mut detail = match (&route.static_dir, &route.traffic) {
+                        (Some(directory), _) => describe_static_route(directory, route),
+                        (None, Some(traffic)) => {
+                            format!(
+                                "to {}, {}",
+                                route_target(route),
+                                describe_traffic(Some(traffic))
+                            )
+                        }
+                        (None, None) => format!("to {}", route_target(route)),
                     };
 
-                    let mut detail = match &route.traffic {
-                        Some(traffic) => {
-                            format!("to {target}, {}", describe_traffic(Some(traffic)))
-                        }
-                        None => format!("to {target}"),
-                    };
+                    if let Some(prefix) = &route.strip_prefix {
+                        detail.push_str(&format!(", strip_prefix {prefix}"));
+                    }
 
                     if route.internal == Some(true) {
                         detail.push_str(", internal");
@@ -3027,6 +3051,31 @@ fn write(
     };
 
     Ok(Some(outcome.to_owned()))
+}
+
+/// What a route that is not static sends its requests to, as a plan's
+/// line says it: the application, or the upstream.
+fn route_target(route: &muru_config::Route) -> String {
+    if route.upstream.is_empty() {
+        route.app.clone()
+    } else {
+        format!("upstream {}", route.upstream)
+    }
+}
+
+/// What serves a static route, as a plan's line says it and the route
+/// list does: the directory, then what takes a request no file answers.
+fn describe_static_route(directory: &str, route: &muru_config::Route) -> String {
+    let fallback = route.fallback.as_ref();
+
+    match (
+        fallback.and_then(|fallback| fallback.app.as_deref()),
+        fallback.and_then(|fallback| fallback.upstream.as_deref()),
+    ) {
+        (Some(app), _) => format!("static {directory}, else {app}"),
+        (None, Some(upstream)) => format!("static {directory}, else upstream {upstream}"),
+        (None, None) => format!("static {directory}"),
+    }
 }
 
 /// Desired state as a document: each application with the release that
@@ -7258,6 +7307,36 @@ fn release_order(id: &str) -> (u8, u64, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_static_routes_plan_line_names_its_directory_and_fallback() {
+        let route = |keys: &str| -> muru_config::Route {
+            toml::from_str(&format!("host = 'site'\npath = '/files'\n{keys}")).unwrap()
+        };
+
+        assert_eq!(
+            describe_static_route("/srv/site", &route("static = '/srv/site'")),
+            "static /srv/site"
+        );
+        assert_eq!(
+            describe_static_route(
+                "/srv/site",
+                &route("static = '/srv/site'\nfallback = { app = 'shop' }")
+            ),
+            "static /srv/site, else shop"
+        );
+        assert_eq!(
+            describe_static_route(
+                "/srv/site",
+                &route("static = '/srv/site'\nfallback = { upstream = 'legacy' }")
+            ),
+            "static /srv/site, else upstream legacy"
+        );
+        assert_eq!(
+            route_target(&route("upstream = 'legacy'")),
+            "upstream legacy"
+        );
+    }
     use crate::model::ReleaseState;
 
     fn store_with_shop(source: &Path) -> Store {

@@ -36,6 +36,7 @@ pub mod buckets;
 pub mod classify;
 pub mod compression;
 pub mod connections;
+pub mod detour;
 pub mod development;
 pub mod endpoints;
 pub mod errors;
@@ -758,6 +759,11 @@ enum Tls {
 /// 13.12).
 pub const UNIX_ADDRESS: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+
+/// The Server-Timing metric that marks a response to a request carrying
+/// a detour's preview which the detour's paths sent to the serving
+/// release, named in its description (issue 909).
+pub const SERVED_ELSEWHERE: &str = "muru-release";
 
 /// A bound edge, ready to run.
 pub struct Edge {
@@ -1503,21 +1509,44 @@ async fn serve<I>(
             let routing = shared.pools.current();
             let (mut parts, body) = request.into_parts();
 
+            // Section 4.21: the daemon's edge tells a detour's run how each
+            // request reached it, in a header only it sets. The header is
+            // taken off before anything looks at the request, and believed
+            // only on the Unix socket, which the daemon's edge alone
+            // reaches.
+
+            let detour_run = local == UNIX_ADDRESS;
+            let via = detour::Via::take(&mut parts.headers, detour_run);
+            let toolbar_for_request = toolbar::for_request(detour_run, via.as_ref());
+
             // Section 4.20: the reserved prefix is the edge's in a
             // development run that keeps records, answered from them before
-            // routing, and never recorded.
+            // routing, and never recorded. A detour's run answers it only
+            // for a request that reached it by its preview.
+
+            // Section 4.21: a detour's run puts its toolbar under the path of
+            // the route that reached it, so the toolbar's requests match the
+            // application's route as the page's do.
+
+            let toolbar_base = via.as_ref().map_or("", |via| via.base.as_str());
 
             if let Some(recorder) = shared.recorder.as_ref()
-                && toolbar::reserved(parts.uri.path())
+                && let Some(within) = toolbar::reserved_under(parts.uri.path(), toolbar_base)
             {
+                if !toolbar_for_request {
+                    return Ok::<_, Infallible>(toolbar::not_found());
+                }
+
                 let renderer = shared
                     .renderer
                     .get_or_init(|| panels::Renderer::new(shared.links.dashboard()));
                 return Ok::<_, Infallible>(toolbar::answer(
                     &parts,
+                    within,
                     &shared.links,
                     recorder,
                     renderer,
+                    detour_run,
                 ));
             }
             let forwarded = routing.trust_on(&local).resolve(&peer, &mut parts.headers);
@@ -1607,6 +1636,7 @@ async fn serve<I>(
             let mut request_id = base_id.clone();
             let mut issued: Vec<String> = Vec::new();
             let mut preview_ignored = false;
+            let mut scoped_out: Option<String> = None;
             let mut handling: Option<Handling> = None;
             let mut checks = 0usize;
             let mut admitted = false;
@@ -1710,6 +1740,7 @@ async fn serve<I>(
                     snapshot: routing.version(),
                     mount: String::new(),
                     mount_path: String::new(),
+                    stripped: String::new(),
                     sendfile: Arc::default(),
                     precompressed: precompressed_for(
                         compression,
@@ -1734,6 +1765,7 @@ async fn serve<I>(
                     noted: noted.clone(),
                     connection: Arc::clone(&connection),
                     connection_request: arrival.position,
+                    detour: None,
                 };
 
                 // Section 4.15: a client's own request draws from the
@@ -1915,7 +1947,17 @@ async fn serve<I>(
                         }
 
                         preview_ignored = origin.is_none()
+                            && !selection.scoped_out
                             && routing::preview_ignored(&parts.headers, &selection);
+
+                        // Issue 909: a previewed request outside its
+                        // detour's paths went to the serving release,
+                        // which its page's toolbar is told.
+
+                        if origin.is_none() && selection.scoped_out {
+                            scoped_out = Some(selection.release.clone());
+                        }
+
                         context.server_name = server_name;
                         context.app = selection.app;
                         context.release = selection.release;
@@ -1937,6 +1979,8 @@ async fn serve<I>(
                             context.group = selection.group;
                             context.mount = selection.mount;
                             context.mount_path = selection.script_name;
+                            context.stripped = selection.stripped;
+                            context.detour = selection.detour;
                             context.sendfile = selection.sendfile;
                             context.grpc_web = selection.grpc_web;
 
@@ -1957,7 +2001,7 @@ async fn serve<I>(
 
                             if let Some(static_path) = &selection.static_path {
                                 let path = parts.uri.path().to_owned();
-                                let within = path
+                                let within = routing::after_strip(&path, &context.stripped)
                                     .strip_prefix(static_path.prefix.trim_end_matches('/'))
                                     .unwrap_or("")
                                     .to_owned();
@@ -2130,6 +2174,8 @@ async fn serve<I>(
                                 context.group = selection.group.clone();
                                 context.mount = selection.mount.clone();
                                 context.mount_path = selection.script_name.clone();
+                                context.stripped = selection.stripped.clone();
+                                context.detour = selection.detour.clone();
                                 context.sendfile = Arc::clone(&selection.sendfile);
                                 context.grpc_web = Arc::clone(&selection.grpc_web);
                                 dispatch(
@@ -2347,13 +2393,19 @@ async fn serve<I>(
 
             let mut response = response;
 
-            if shared.links.toolbar_on() && noted.as_ref().is_some_and(|noted| noted.recorded()) {
+            if shared.links.toolbar_on()
+                && toolbar_for_request
+                && noted.as_ref().is_some_and(|noted| noted.recorded())
+            {
                 match toolbar::insertable(&method, &parts.headers, &response) {
                     Ok(nonce) => {
                         let dashboard = shared.links.request_page(&base_id);
                         let detour = shared.links.detour();
                         let tag = toolbar::tag(
-                            forwarded.prefix.as_deref().unwrap_or(""),
+                            &format!(
+                                "{}{toolbar_base}",
+                                forwarded.prefix.as_deref().unwrap_or("")
+                            ),
                             &base_id,
                             dashboard.as_deref(),
                             nonce.as_deref(),
@@ -2430,6 +2482,19 @@ async fn serve<I>(
                 response.headers_mut().insert(
                     routing::PREVIEW_HEADER,
                     HeaderValue::from_static(routing::PREVIEW_IGNORED),
+                );
+            }
+
+            // Issue 909: the detour's toolbar shows such a request as the
+            // serving release's, which its run has no record of.
+
+            if let Some(release) = &scoped_out
+                && let Ok(value) =
+                    HeaderValue::from_str(&format!("{SERVED_ELSEWHERE};desc=\"{release}\""))
+            {
+                response.headers_mut().append(
+                    http::header::HeaderName::from_static("server-timing"),
+                    value,
                 );
             }
 
@@ -2669,9 +2734,13 @@ pub(crate) fn request_head(
         None => Bytes::copy_from_slice(parts.uri.path().as_bytes()),
     };
 
+    // Section 4.5: what the route strips is the application's mount
+    // point, between the proxy's prefix and the mount's path.
+
     let script_name = format!(
-        "{}{}",
+        "{}{}{}",
         context.prefix.as_deref().unwrap_or_default(),
+        context.stripped,
         context.mount_path
     );
 

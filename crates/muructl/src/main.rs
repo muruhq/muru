@@ -3888,8 +3888,15 @@ async fn reread(
     serve: Option<&serve::Mode>,
     label: &str,
     spec: &HostSpec,
+    mounts: Option<&std::collections::BTreeMap<String, muru_config::Mount>>,
 ) -> anyhow::Result<Reread> {
     let mut resolved = resolve_for(args, serve)?;
+
+    // Issue 907: a detour serving the serving release's mounts keeps them.
+
+    if let Some(mounts) = mounts {
+        resolved.mounts.clone_from(mounts);
+    }
 
     if args.single {
         resolved.processes = 1;
@@ -4355,6 +4362,11 @@ async fn run_with(
     // reason and nothing started, and the daemon's host names and data
     // directory are known to what starts.
 
+    // Issue 907: with --mounts release, the serving release's mounts,
+    // which a settings file read again on reload does not replace.
+
+    let mut release_mounts = None;
+
     let detour_opened = match &detour {
         Some(mode) => {
             let (listener, socket) = detour::bind(&run_dir)?;
@@ -4362,7 +4374,17 @@ async fn run_with(
                 .as_ref()
                 .map(|registration| registration.id.to_string())
                 .unwrap_or_default();
-            let request = detour::request(mode, &socket, &instance_id, &project);
+
+            let paths = match detour::scope(mode, &resolved.mounts).await {
+                Ok(paths) => paths,
+                Err(error) => {
+                    drop(registration);
+                    let _ = std::fs::remove_dir_all(&run_dir);
+                    return Err(error);
+                }
+            };
+
+            let request = detour::request(mode, &socket, &instance_id, &project, paths);
 
             let (stream, opened) = match detour::open(&mode.daemon, &request).await {
                 Ok(open) => open,
@@ -4372,6 +4394,27 @@ async fn run_with(
                     return Err(error);
                 }
             };
+
+            // Issue 907: the mounts the detour serves with, the checkout's
+            // compared with the serving release's, or the release's.
+
+            detour::settle_mounts(mode, &opened, &mut resolved.mounts);
+
+            if mode.mounts == detour::MountsFrom::Release {
+                if let Err(error) = muru_controller::config::check_groups_and_mounts(
+                    &resolved.groups,
+                    &resolved.mounts,
+                ) {
+                    drop(registration);
+                    let _ = std::fs::remove_dir_all(&run_dir);
+                    anyhow::bail!(
+                        "the serving release's mounts do not fit this checkout's worker groups: \
+                         {error}"
+                    );
+                }
+
+                release_mounts = Some(resolved.mounts.clone());
+            }
 
             if mode.app_data {
                 resolved.places.data = Some(muru_config::places::DataDirs {
@@ -4754,9 +4797,14 @@ async fn run_with(
             .as_ref()
             .map(|detour| detour.traffic.clone())
             .unwrap_or_default();
+        let paths = opened
+            .detour
+            .as_ref()
+            .map(|detour| detour.paths.clone())
+            .unwrap_or_default();
         muru_common::muru_println!(
             "traffic: {}{}",
-            detour::takes(&traffic, &mode.app),
+            detour::takes(&traffic, &mode.app, &paths),
             if traffic == "preview" {
                 "; muructl detour preview gives an entry link"
             } else {
@@ -4790,16 +4838,15 @@ async fn run_with(
     }
 
     // Section 4.20: the reserved prefix answers to the run's own names
-    // besides loopback, and with --toolbar the edge inserts the toolbar
-    // into HTML pages, which the start-up says.
+    // besides loopback, or for a detour to whatever name the daemon routes
+    // to it, and with --toolbar the edge inserts the toolbar into HTML
+    // pages, which the start-up says.
 
     if development && serve.is_none() {
         match &detour_held {
-            Some((_, opened, _)) => {
-                edge.links().set_hosts(opened.hosts.clone());
-                edge.links()
-                    .set_detour(opened.detour.as_ref().map(|detour| detour.traffic.clone()));
-            }
+            Some((_, opened, _)) => edge
+                .links()
+                .set_detour(opened.detour.as_ref().map(|detour| detour.traffic.clone())),
             None => edge.links().set_hosts(resolved.serving.hosts.clone()),
         }
 
@@ -5154,7 +5201,13 @@ async fn run_with(
 
     if let (Some(mode), Some((_, opened, _))) = (&detour, &detour_held)
         && mode.open_preview
-        && let Err(error) = detour::open_preview(&mode.daemon, opened).await
+        && let Err(error) = detour::open_preview(
+            &mode.daemon,
+            opened,
+            mode.preview_name.as_deref(),
+            mode.any_name,
+        )
+        .await
     {
         muru_common::muru_println!("no preview link: {error:#}");
     }
@@ -5471,7 +5524,7 @@ async fn run_with(
                 // be used leave the current release serving.
 
                 if is_settings_file(&paths, &settings_files(&args, &resolved.project)) {
-                    let next = match reread(&args, serve.as_ref(), &label, &spec).await {
+                    let next = match reread(&args, serve.as_ref(), &label, &spec, release_mounts.as_ref()).await {
                         Ok(next) => next,
                         Err(error) => {
                             muru_common::muru_println!("{error:#}; release r{} keeps serving", current.release);

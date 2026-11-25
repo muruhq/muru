@@ -2609,6 +2609,18 @@ pub struct Route {
     #[serde(default = "root_path")]
     #[schemars(extend("default" = "/"))]
     pub path: String,
+    /// The leading part of `path` that is where the application lives:
+    /// `path` itself, or a leading part of it whole segments long, so
+    /// `/sub` of `/sub/path` and never `/su` (section 4.5). An
+    /// application's release gets it as SCRIPT_NAME, after a trusted
+    /// X-Forwarded-Prefix and before a mount's path, and its mounts and
+    /// worker groups are matched against the rest of the path. An
+    /// upstream, a managed HTTP release or a detour is sent the rest of
+    /// the path, with this part appended to X-Forwarded-Prefix. A static
+    /// route takes it only with a fallback, which it applies to. Without
+    /// it nothing is stripped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip_prefix: Option<String>,
     /// The client classes (section 4.14) the route takes; every request
     /// without it. Among routes with the same path, one naming the
     /// request's class comes first.
@@ -2770,6 +2782,45 @@ pub struct Methods {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "read_only"))]
     pub answer: Option<String>,
+}
+
+/// The part a route's `strip_prefix` takes off the front of its requests'
+/// paths, as the edge strips it: the value without a trailing slash, and
+/// empty for none or for `/`, which strips nothing.
+pub fn stripped_part(strip_prefix: Option<&str>) -> &str {
+    strip_prefix.map_or("", |prefix| prefix.trim_end_matches('/'))
+}
+
+/// Check a route's `strip_prefix` (section 4.5): a path that is the
+/// route's own `path`, or a leading part of it on segment boundaries, so
+/// it can never reach past the route's path into a segment that varies
+/// from request to request. A trailing slash on either makes no
+/// difference.
+pub fn check_strip_prefix(route: &Route) -> Result<(), String> {
+    let Some(prefix) = route.strip_prefix.as_deref() else {
+        return Ok(());
+    };
+
+    if !prefix.starts_with('/') {
+        return Err(format!("strip_prefix {prefix} must start with /"));
+    }
+
+    let stripped = stripped_part(Some(prefix));
+    let path = route.path.trim_end_matches('/');
+
+    let leading = stripped.is_empty()
+        || path == stripped
+        || path
+            .strip_prefix(stripped)
+            .is_some_and(|rest| rest.starts_with('/'));
+
+    if !leading || prefix.contains("//") {
+        return Err(format!(
+            "strip_prefix {prefix} is not a leading part of its path on segment boundaries"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Check a route's rate limit names, method restrictions and mode.
@@ -7436,6 +7487,48 @@ mod tests {
     }
 
     #[test]
+    fn strip_prefix_is_a_leading_part_of_the_routes_path_on_segment_boundaries() {
+        let route = |path: &str, strip: &str| {
+            upload_route(&format!("path = '{path}'\nstrip_prefix = '{strip}'"))
+        };
+
+        for (path, strip) in [
+            ("/sub/path/api", "/sub/path"),
+            ("/sub/path/api", "/sub/path/"),
+            ("/sub/path/api", "/sub/path/api"),
+            ("/sub/path/api/", "/sub/path/api"),
+            ("/app", "/app/"),
+            ("/app", "/"),
+        ] {
+            assert!(
+                check_strip_prefix(&route(path, strip)).is_ok(),
+                "{path} {strip}"
+            );
+        }
+
+        for (path, strip) in [
+            ("/sub/path/api", "/sub/pa"),
+            ("/sub/path/api", "/sub/path/api/users"),
+            ("/app", "/other"),
+            ("/app", "app"),
+            ("/a/b", "/a//b"),
+        ] {
+            assert!(
+                check_strip_prefix(&route(path, strip)).is_err(),
+                "{path} {strip}"
+            );
+        }
+
+        assert_eq!(
+            check_strip_prefix(&route("/sub/path/api", "/sub/pa")).unwrap_err(),
+            "strip_prefix /sub/pa is not a leading part of its path on segment boundaries"
+        );
+        assert_eq!(stripped_part(Some("/sub/path/")), "/sub/path");
+        assert_eq!(stripped_part(Some("/")), "");
+        assert_eq!(stripped_part(None), "");
+    }
+
+    #[test]
     fn route_policies_are_checked() {
         let route = |keys: &str| upload_route(keys);
         assert!(
@@ -7735,6 +7828,7 @@ traffic = { classes = { ai-crawler = 'r1' } }"
             name: Some("shop-root".to_owned()),
             host: "shop".to_owned(),
             path: "/".to_owned(),
+            strip_prefix: None,
             matches: None,
             app: "shop".to_owned(),
             upstream: String::new(),

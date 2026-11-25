@@ -1200,6 +1200,7 @@ fn specs() -> Vec<Spec> {
                 "action": {"type": "string", "enum": ["list", "link"]},
                 "detour": {"type": "string", "description": "For link: the detour, by its release, application, label, tag or the start of its ID; the project's application's, or the one open, when left out"},
                 "host": {"type": "string", "description": "For link: one of the application's hosts, in place of its best address"},
+                "name": {"type": "string", "description": "For link: the name to build the link from, one of the names or patterns of a host that routes the application, as for a host whose names are all wildcards"},
             }),
             required: &["action"],
             command: |arguments| match needed(arguments, "action")?.as_str() {
@@ -1215,6 +1216,10 @@ fn specs() -> Vec<Spec> {
                         command.extend(["--host".to_owned(), host]);
                     }
 
+                    if let Some(name) = text(arguments, "name") {
+                        command.extend(["--name".to_owned(), name]);
+                    }
+
                     Ok(command)
                 }
                 other => Err(format!("{other:?} is not list or link")),
@@ -1228,6 +1233,8 @@ fn specs() -> Vec<Spec> {
                 "detour": {"type": "string", "description": "The detour, by its release, application, label, tag or the start of its ID; the project's application's, or the one open, when left out"},
                 "traffic": {"type": "string", "description": "preview, all, share=N or class=NAME"},
                 "for": {"type": "string", "description": "How long the choice lasts before the detour takes preview again, such as 10m; until changed when left out. Not with preview"},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Client URL paths such as [\"/app/api\"] the detour takes requests under alone, in place of those it has; left as they are when left out"},
+                "all_paths": {"type": "boolean", "description": "Take requests under every path again"},
             }),
             required: &["traffic"],
             command: |arguments| {
@@ -1241,6 +1248,16 @@ fn specs() -> Vec<Spec> {
 
                 if let Some(duration) = text(arguments, "for") {
                     command.extend(["--for".to_owned(), duration]);
+                }
+
+                if let Some(paths) = arguments.get("paths").and_then(Value::as_array) {
+                    for path in paths.iter().filter_map(Value::as_str) {
+                        command.extend(["--path".to_owned(), path.to_owned()]);
+                    }
+                }
+
+                if flag(arguments, "all_paths") {
+                    command.push("--all-paths".to_owned());
                 }
 
                 Ok(command)

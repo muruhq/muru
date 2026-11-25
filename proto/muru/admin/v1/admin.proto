@@ -203,17 +203,21 @@ message PreviewDetourRequest {
   string release = 2;
   string host = 3;                  // a link for this host alone; the best address when empty
   bool all = 4;                     // a link for each of the application's addresses
+  string name = 5;                  // the name to build the links from, which a host routing the application must take; its own names when empty
 }
 
 message DetourPreview {
-  repeated DetourLink links = 1;    // best first
-  string header = 2;                // the Muru-Preview header's value, RELEASE.SECRET
+  repeated DetourLink links = 1;    // best first; none when the application has no address
+  string header = 2;                // the Muru-Preview header's value, RELEASE.SECRET, always given
   uint32 others = 3;                // the application's addresses no link was made for
+  string unreachable = 4;           // why there are no links, when there are none
 }
 
 message DetourLink {
   string url = 1;                   // the entry link
   string address = 2;               // where it leads
+  string name = 3;                  // the name in it
+  string bound = 4;                 // the address the listener it reaches is bound on
 }
 
 message ListDetoursRequest {}
@@ -229,6 +233,11 @@ message SetDetourTrafficRequest {
   // When the choice ends and the detour takes preview again; never when
   // 0. Refused with preview, which has nothing to end.
   uint64 until_unix_ms = 4;
+  // The client URL paths the detour takes requests under, in place of
+  // those it has; left as they are when empty, unless all_paths.
+  repeated string paths = 5;
+  // Take requests under every path again.
+  bool all_paths = 6;
 }
 
 // A development run asking to put itself behind the daemon's edge.
@@ -247,6 +256,9 @@ message OpenDetourRequest {
   string directory = 6;
   // What the detour takes: preview (or empty), all, share=N or class=NAME.
   string traffic = 7;
+  // The client URL paths it takes requests under, each on segment
+  // boundaries; every path when empty.
+  repeated string paths = 8;
 }
 
 // One message on a detour's stream.
@@ -264,13 +276,23 @@ message DetourMessage {
 // What the daemon opened for a run.
 message DetourOpened {
   Detour detour = 1;
-  // The application's host names, patterns left out, which the run's
-  // toolbar accepts beside loopback names.
-  repeated string hosts = 2;
+  reserved 2;                       // was hosts: a detour's toolbar answers any name the daemon routes to it
   // The application's data directory and its parts on the daemon.
   string data_dir = 3;
   string media_dir = 4;
   string uploads_dir = 5;
+  // The serving release the detour stands in for, app@release, and its
+  // named mounts, which the run compares with its own or serves with.
+  string serving = 6;
+  repeated DetourMount mounts = 7;
+}
+
+// A named mount of the serving release, as a detour's run sees it.
+message DetourMount {
+  string name = 1;
+  string path = 2;                  // empty for a gRPC mount
+  string interface = 3;             // auto, wsgi, asgi or grpc
+  string entrypoint = 4;
 }
 
 // An open detour, as listings show it. Never its secret.
@@ -289,6 +311,8 @@ message Detour {
   string socket = 9;
   // When its traffic goes back to preview on its own; 0 for never.
   uint64 until_unix_ms = 10;
+  // The client URL paths it takes requests under; every path when empty.
+  repeated string paths = 11;
 }
 
 // A probe's question: live, ready or startup, of the
@@ -1095,11 +1119,13 @@ message DashboardLoginRequest {
 
 message ApplicationUrlsRequest {
   string app = 1;
+  string name = 2;                  // the name to build the URLs from, which a host routing the application must take; its own names when empty
 }
 
 message ApplicationUrlsResponse {
   string app = 1;
   repeated ApplicationUrl urls = 2; // best first: the default route, a canonical name, https
+  string unreachable = 3;           // why there are no URLs, when there are none
 }
 
 message ApplicationUrl {
@@ -1526,6 +1552,7 @@ message Route {
   string compression = 19;          // "off" when the route turns compression off, "set" when it has other settings of its own
   string request_headers = 20;      // what the route removes from and sets on requests, as one phrase
   string response_headers = 21;     // what the route removes from, sets on and adds to responses, as one phrase
+  string strip_prefix = 22;         // the leading part of the path the application lives under, as configured; none when empty
 }
 
 message ListUpstreamsRequest {}

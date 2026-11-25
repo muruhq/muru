@@ -1287,6 +1287,10 @@ pub struct Context<'a> {
     pub mount: String,
     /// The mount's path, joined to SCRIPT_NAME.
     pub mount_path: String,
+    /// Section 4.5: the leading part of the path the route strips, which
+    /// joins SCRIPT_NAME before the mount's path, or for an upstream is
+    /// taken off the path and sent in X-Forwarded-Prefix.
+    pub stripped: String,
     /// The file hints by path the upstream or managed server may give
     /// (section 4.9), which the edge opens; a worker opens its own.
     pub sendfile: Arc<Sendfile>,
@@ -1336,6 +1340,9 @@ pub struct Context<'a> {
     pub connection: Arc<crate::development::Connection>,
     /// The request's position on it, 1 for the first.
     pub connection_request: u64,
+    /// Section 4.21: how the request reached the detour it goes to, which
+    /// the detour's run is told; none for anything else.
+    pub detour: Option<crate::detour::Via>,
 }
 
 impl<'a> Context<'a> {
@@ -1368,6 +1375,7 @@ impl<'a> Context<'a> {
             snapshot: self.snapshot,
             mount: String::new(),
             mount_path: String::new(),
+            stripped: String::new(),
             sendfile: Arc::default(),
             precompressed: Vec::new(),
             grpc_web: Arc::default(),
@@ -1388,6 +1396,7 @@ impl<'a> Context<'a> {
             noted: self.noted.clone(),
             connection: Arc::clone(&self.connection),
             connection_request: self.connection_request,
+            detour: None,
         }
     }
 }

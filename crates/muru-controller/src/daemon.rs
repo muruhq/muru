@@ -718,6 +718,9 @@ pub enum Command {
         traffic: crate::detours::Traffic,
         /// When it goes back to preview, Unix milliseconds; 0 for never.
         until_unix_ms: u64,
+        /// The paths it is to take requests under, every path when
+        /// empty; left as they are when none.
+        paths: Option<Vec<String>>,
         /// Answered with the detour as it is now, or why not.
         done: oneshot::Sender<Result<muru_proto::admin::v1::Detour, String>>,
     },
@@ -3734,9 +3737,10 @@ impl Daemon {
                         message: format!(
                             "{}, traffic {}",
                             detour.describe(),
-                            crate::detours::traffic_text(
+                            crate::detours::listed_traffic(
                                 &detour.opening.traffic.word(),
-                                detour.until_unix_ms
+                                detour.until_unix_ms,
+                                &detour.opening.paths
                             )
                         ),
                         created: full_time(
@@ -3761,7 +3765,7 @@ impl Daemon {
                     .map(|(_, by)| by.clone())
                     .unwrap_or_default(),
                 releases,
-                urls: crate::urls::for_app(&app.name, &routes, &hosts, &listeners)
+                urls: crate::urls::for_app(&app.name, &routes, &hosts, &listeners, None)
                     .into_iter()
                     .map(|candidate| candidate.url)
                     .collect(),
@@ -6654,10 +6658,11 @@ impl Daemon {
                 release,
                 traffic,
                 until_unix_ms,
+                paths,
                 done,
             } => {
                 let _ = done.send(
-                    self.set_detour_traffic(&app, &release, traffic, until_unix_ms, None)
+                    self.set_detour_traffic(&app, &release, traffic, until_unix_ms, paths, None)
                         .await,
                 );
             }
@@ -8461,6 +8466,7 @@ impl Daemon {
 
                 apps.push(pb::AppWorkers {
                     preview_secret: String::new(),
+                    detour_paths: Vec::new(),
                     limits: spec.as_ref().and_then(|spec| spec.limits.message()),
                     app: name.clone(),
                     release: id.clone(),
@@ -8711,6 +8717,7 @@ impl Daemon {
                 .and_then(|limits| request_limits_message(&limits)),
                 traffic: self.route_traffic(&route, &included, &rollouts),
                 client_classes: route.classes().to_vec(),
+                strip_prefix: muru_config::stripped_part(route.strip_prefix.as_deref()).to_owned(),
                 host: route.host,
                 path: route.path,
                 app: route.app,

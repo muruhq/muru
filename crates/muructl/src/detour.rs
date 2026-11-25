@@ -77,8 +77,18 @@ pub struct PreviewArgs {
 
     /// Print the Muru-Preview header that previews the detour without a
     /// cookie, for curl or a test client.
-    #[arg(long, conflicts_with_all = ["list", "print", "host"])]
+    #[arg(long, conflicts_with_all = ["list", "print", "host", "name"])]
     header: bool,
+
+    /// Build the link from this name, which must be one of the names or
+    /// patterns of a host that routes the application, such as one name
+    /// of a host whose names are all wildcards.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
+    /// Keep names that resolve to another machine.
+    #[arg(long)]
+    any_name: bool,
 
     #[command(flatten)]
     output: crate::admin::JsonArgs,
@@ -111,6 +121,16 @@ pub struct TrafficArgs {
     #[arg(long, value_name = "ZONE", requires = "until")]
     timezone: Option<String>,
 
+    /// Take requests only under this client URL path, matched on segment
+    /// boundaries before any route strips it; may be given more than
+    /// once, and replaces the paths the detour has.
+    #[arg(long = "path", value_name = "PREFIX")]
+    paths: Vec<String>,
+
+    /// Take requests under every path again.
+    #[arg(long, conflicts_with = "paths")]
+    all_paths: bool,
+
     #[command(flatten)]
     output: crate::admin::JsonArgs,
 
@@ -139,10 +159,36 @@ pub struct DetourRunArgs {
     #[arg(long)]
     open_preview: bool,
 
+    /// With --open-preview, build the link from this name, which must be
+    /// one of the names or patterns of a host that routes the application.
+    #[arg(long, value_name = "NAME", requires = "open_preview")]
+    name: Option<String>,
+
+    /// With --open-preview, keep names that resolve to another machine.
+    #[arg(long, requires = "open_preview")]
+    any_name: bool,
+
     /// Give the run the application's data directory on the daemon, which
     /// its releases share, in place of the run's own.
     #[arg(long)]
     app_data: bool,
+
+    /// Take requests only under this client URL path, matched on segment
+    /// boundaries before any route strips it; may be given more than
+    /// once. Every path without it.
+    #[arg(long = "path", value_name = "PREFIX")]
+    paths: Vec<String>,
+
+    /// Take requests only under the path of this checkout's mount, under
+    /// each of the application's routes; may be given more than once.
+    #[arg(long = "mount", value_name = "NAME")]
+    mount_names: Vec<String>,
+
+    /// Whose mounts the detour serves with: checkout, the mounts this
+    /// checkout declares, or release, those of the serving release it
+    /// stands in for.
+    #[arg(long, value_enum, value_name = "FROM", default_value = "checkout")]
+    mounts: MountsFrom,
 
     #[command(flatten)]
     pub label: crate::instances::LabelArgs,
@@ -240,6 +286,16 @@ struct RunOnly {
     args: crate::RunArgs,
 }
 
+/// Whose mount table a detour serves with (issue 907).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MountsFrom {
+    /// The mounts the checkout declares, which the run compares with the
+    /// serving release's and warns of each that differs.
+    Checkout,
+    /// The serving release's mounts, from the daemon.
+    Release,
+}
+
 /// What a run does as a detour, beside what it does as any run.
 pub struct Mode {
     /// The application on the daemon.
@@ -250,10 +306,62 @@ pub struct Mode {
     pub traffic: String,
     /// Open an entry link once the detour is open.
     pub open_preview: bool,
+    /// The name to build that link from, when one is given.
+    pub preview_name: Option<String>,
+    /// Keep names that resolve to another machine for that link.
+    pub any_name: bool,
     /// Use the application's data directory on the daemon.
     pub app_data: bool,
     /// The run's label, or empty.
     pub label: String,
+    /// Whose mounts the detour serves with.
+    pub mounts: MountsFrom,
+    /// The paths `--path` gives the detour.
+    pub paths: Vec<String>,
+    /// The checkout's mounts whose paths `--mount` gives it.
+    pub mount_names: Vec<String>,
+}
+
+/// Settle the mounts a detour serves with once it is open (issue 907):
+/// with `--mounts release`, the serving release's table in place of the
+/// checkout's, said in a line; otherwise the checkout's, with a warning
+/// for each mount that differs from the serving release's. A mismatch
+/// is never refused, since the mounts may be changing on purpose.
+pub fn settle_mounts(
+    mode: &Mode,
+    opened: &pb::DetourOpened,
+    mounts: &mut std::collections::BTreeMap<String, muru_config::Mount>,
+) {
+    if opened.serving.is_empty() {
+        return;
+    }
+
+    if mode.mounts == MountsFrom::Release {
+        *mounts = muru_controller::detours::release_mounts(&opened.mounts);
+        muru_common::muru_println!(
+            "serving the mounts of the serving release {}: {}",
+            opened.serving,
+            if mounts.is_empty() {
+                "none".to_owned()
+            } else {
+                mounts.keys().cloned().collect::<Vec<_>>().join(", ")
+            }
+        );
+        return;
+    }
+
+    let differences =
+        muru_controller::detours::mount_differences(&opened.serving, &opened.mounts, mounts);
+
+    for line in &differences {
+        muru_common::muru_println!("warning: {line}");
+    }
+
+    if !differences.is_empty() {
+        muru_common::muru_println!(
+            "muructl detour run --mounts release serves with the serving release's mounts instead"
+        );
+    }
 }
 
 impl DetourRunArgs {
@@ -388,8 +496,13 @@ pub async fn run(args: DetourRunArgs) -> anyhow::Result<()> {
         daemon,
         traffic: args.traffic.clone(),
         open_preview: args.open_preview,
+        preview_name: args.name.clone(),
+        any_name: args.any_name,
         app_data: args.app_data,
         label: args.label.label.clone().unwrap_or_default(),
+        mounts: args.mounts,
+        paths: args.paths.clone(),
+        mount_names: args.mount_names.clone(),
     };
 
     crate::run_with(run_args, None, None, Some(mode)).await
@@ -455,7 +568,11 @@ fn table(detours: &[pb::Detour]) -> Vec<String> {
                     detour.label.clone()
                 },
                 detour.pid.to_string(),
-                muru_controller::detours::traffic_text(&detour.traffic, detour.until_unix_ms),
+                muru_controller::detours::listed_traffic(
+                    &detour.traffic,
+                    detour.until_unix_ms,
+                    &detour.paths,
+                ),
                 crate::instances::uptime(u64::try_from(detour.opened_unix_ms).unwrap_or_default()),
                 muru_controller::registry::home_shortened(Path::new(&detour.directory)),
             ]
@@ -534,6 +651,7 @@ pub async fn traffic(args: TrafficArgs) -> anyhow::Result<()> {
     let detours = listed(&mut client).await?;
     let detour = chosen(wanted, &detours)?;
     let before = detour.traffic.clone();
+    let paths_before = detour.paths.clone();
 
     let after = client
         .set_detour_traffic(pb::SetDetourTrafficRequest {
@@ -541,6 +659,8 @@ pub async fn traffic(args: TrafficArgs) -> anyhow::Result<()> {
             release: detour.release.clone(),
             traffic: choice,
             until_unix_ms: until,
+            paths: args.paths.clone(),
+            all_paths: args.all_paths,
         })
         .await
         .map_err(crate::admin::explain)?
@@ -551,11 +671,12 @@ pub async fn traffic(args: TrafficArgs) -> anyhow::Result<()> {
     }
 
     muru_common::muru_println!(
-        "detour {}@{} now takes {}{} (was {before})",
+        "detour {}@{} now takes {}{} (was {})",
         after.app,
         after.release,
-        takes(&after.traffic, &after.app),
-        ending(after.until_unix_ms)
+        takes(&after.traffic, &after.app, &after.paths),
+        ending(after.until_unix_ms),
+        takes(&before, &after.app, &paths_before)
     );
     Ok(())
 }
@@ -579,6 +700,7 @@ async fn mint(
     detour: &pb::Detour,
     host: Option<&str>,
     all: bool,
+    name: Option<&str>,
 ) -> anyhow::Result<pb::DetourPreview> {
     Ok(client
         .preview_detour(pb::PreviewDetourRequest {
@@ -586,20 +708,77 @@ async fn mint(
             release: detour.release.clone(),
             host: host.unwrap_or_default().to_owned(),
             all,
+            name: name.unwrap_or_default().to_owned(),
         })
         .await
         .map_err(crate::admin::explain)?
         .into_inner())
 }
 
+/// The entry links whose names reach this machine, as `muructl open`
+/// checks its URLs, with why each name left out was (issue 908); every
+/// link with `any_name`.
+fn reachable_links(
+    preview: &pb::DetourPreview,
+    any_name: bool,
+) -> (Vec<pb::DetourLink>, Vec<String>) {
+    let choices = preview
+        .links
+        .iter()
+        .map(|link| crate::open::Choice {
+            url: link.url.clone(),
+            scheme: String::new(),
+            name: link.name.clone(),
+            bound: link.bound.clone(),
+            route: String::new(),
+            host: String::new(),
+            why: link.address.clone(),
+        })
+        .collect();
+    let (kept, left_out) = crate::open::reachable_here(choices, any_name);
+    let links = kept
+        .into_iter()
+        .filter_map(|choice| {
+            preview
+                .links
+                .iter()
+                .find(|link| link.url == choice.url)
+                .cloned()
+        })
+        .collect();
+
+    (links, left_out)
+}
+
+/// The link to open: the first whose name reaches this machine, or why
+/// there is none.
+fn chosen_link(
+    preview: &pb::DetourPreview,
+    any_name: bool,
+) -> anyhow::Result<(pb::DetourLink, usize)> {
+    if preview.links.is_empty() {
+        anyhow::bail!(
+            "{}; muructl detour preview --header gives the header that previews it",
+            preview.unreachable
+        );
+    }
+
+    let (links, left_out) = reachable_links(preview, any_name);
+
+    match links.first() {
+        Some(link) => Ok((link.clone(), links.len() - 1)),
+        None => anyhow::bail!(
+            "none of the application's names reaches this machine: {}; pass --name with one \
+             that does, or --any-name to keep them",
+            left_out.join("; ")
+        ),
+    }
+}
+
 /// Open an entry link in the browser, saying where it leads and how
 /// many other addresses there are.
-fn open_link(preview: &pb::DetourPreview, detour: &str) {
-    let Some(link) = preview.links.first() else {
-        return;
-    };
-
-    let others = match preview.others {
+fn open_link(link: &pb::DetourLink, others: usize, detour: &str) {
+    let others = match others {
         0 => String::new(),
         1 => " (1 other address: muructl detour preview --list)".to_owned(),
         count => format!(" ({count} other addresses: muructl detour preview --list)"),
@@ -616,12 +795,44 @@ pub async fn preview(args: PreviewArgs) -> anyhow::Result<()> {
     let detours = listed(&mut client).await?;
     let detour = chosen(args.detour.as_deref(), &detours)?.clone();
     let name = format!("{}@{}", detour.app, detour.release);
-    let preview = mint(&mut client, &detour, args.host.as_deref(), args.list).await?;
 
-    // An agent or a script is given the links and opens nothing.
+    // Every address's link is asked for, so the first whose name reaches
+    // this machine can be chosen; a host asked for gives its one.
+
+    let preview = mint(
+        &mut client,
+        &detour,
+        args.host.as_deref(),
+        args.host.is_none(),
+        args.name.as_deref(),
+    )
+    .await?;
+
+    // An agent or a script is given the header and the link chosen, or
+    // every link that reaches this machine with --list, or why there is
+    // none, and opens nothing.
 
     if args.output.json {
-        return crate::admin::print_answer(&preview);
+        let mut answer = preview.clone();
+
+        if !answer.links.is_empty() {
+            let (links, left_out) = reachable_links(&preview, args.any_name);
+            answer.others = u32::try_from(links.len().saturating_sub(1)).unwrap_or(u32::MAX);
+            answer.links = if args.list {
+                links
+            } else {
+                links.into_iter().take(1).collect()
+            };
+
+            if answer.links.is_empty() {
+                answer.unreachable = format!(
+                    "none of the application's names reaches this machine: {}",
+                    left_out.join("; ")
+                );
+            }
+        }
+
+        return crate::admin::print_answer(&answer);
     }
 
     if args.header {
@@ -630,22 +841,32 @@ pub async fn preview(args: PreviewArgs) -> anyhow::Result<()> {
     }
 
     if args.list {
-        for link in &preview.links {
+        anyhow::ensure!(
+            !preview.links.is_empty(),
+            "{}; muructl detour preview --header gives the header that previews it",
+            preview.unreachable
+        );
+        let (links, left_out) = reachable_links(&preview, args.any_name);
+
+        for link in &links {
             println!("{}  {}", link.url, link.address);
         }
 
-        return Ok(());
-    }
-
-    if args.print {
-        if let Some(link) = preview.links.first() {
-            println!("{}", link.url);
+        for left in left_out {
+            println!("left out: {left}");
         }
 
         return Ok(());
     }
 
-    open_link(&preview, &name);
+    let (link, others) = chosen_link(&preview, args.any_name)?;
+
+    if args.print {
+        println!("{}", link.url);
+        return Ok(());
+    }
+
+    open_link(&link, others, &name);
 
     // The browser is given a moment to start before muructl exits.
 
@@ -655,15 +876,21 @@ pub async fn preview(args: PreviewArgs) -> anyhow::Result<()> {
 
 /// `--open-preview`: an entry link for the detour just opened, in the
 /// browser.
-pub async fn open_preview(daemon: &Path, opened: &pb::DetourOpened) -> anyhow::Result<()> {
+pub async fn open_preview(
+    daemon: &Path,
+    opened: &pb::DetourOpened,
+    name_asked: Option<&str>,
+    any_name: bool,
+) -> anyhow::Result<()> {
     let Some(detour) = &opened.detour else {
         return Ok(());
     };
 
     let mut client =
         muru_controller::client::connect(&muru_controller::client::Endpoint::unix(daemon)).await?;
-    let preview = mint(&mut client, detour, None, false).await?;
-    open_link(&preview, &name(opened));
+    let preview = mint(&mut client, detour, None, true, name_asked).await?;
+    let (link, others) = chosen_link(&preview, any_name)?;
+    open_link(&link, others, &name(opened));
     Ok(())
 }
 
@@ -690,8 +917,10 @@ pub fn request(
     socket: &Path,
     instance_id: &str,
     project: &Path,
+    paths: Vec<String>,
 ) -> pb::OpenDetourRequest {
     pb::OpenDetourRequest {
+        paths,
         app: mode.app.clone(),
         socket: socket.display().to_string(),
         label: mode.label.clone(),
@@ -738,17 +967,101 @@ pub fn name(opened: &pb::DetourOpened) -> String {
         .unwrap_or_default()
 }
 
-/// What a traffic choice means, as a line says it.
-pub fn takes(traffic: &str, app: &str) -> String {
-    match traffic {
-        "" | "preview" => "previews only".to_owned(),
+/// What a traffic choice means, as a line says it, with the paths it is
+/// for when it is for some alone (issue 909).
+pub fn takes(traffic: &str, app: &str, paths: &[String]) -> String {
+    let scope = muru_controller::detours::scope_text(paths);
+
+    let what = match traffic {
+        "" | "preview" if scope.is_empty() => "previews only".to_owned(),
+        "" | "preview" => return format!("previews only, {scope}"),
         "all" => format!("all of {app}'s traffic"),
         other => match other.split_once('=') {
             Some(("share", share)) => format!("{share}% of {app}'s clients"),
             Some(("class", class)) => format!("the requests of client class {class}"),
             _ => other.to_owned(),
         },
+    };
+
+    if scope.is_empty() {
+        what
+    } else {
+        format!("{what} {scope}")
     }
+}
+
+/// The paths a detour is to take requests under, from `--path` and
+/// `--mount` (issue 909). A mount names the checkout's mount, whose path
+/// is taken under each of the application's routes on the daemon: after
+/// the route's `strip_prefix`, or alone on a route that strips nothing.
+pub async fn scope(
+    mode: &Mode,
+    mounts: &std::collections::BTreeMap<String, muru_config::Mount>,
+) -> anyhow::Result<Vec<String>> {
+    let mut paths = mode.paths.clone();
+
+    if !mode.mount_names.is_empty() {
+        let mut client = muru_controller::client::connect(
+            &muru_controller::client::Endpoint::unix(&mode.daemon),
+        )
+        .await
+        .with_context(|| format!("reaching the daemon at {}", mode.daemon.display()))?;
+        let routes = client
+            .list_routes(pb::ListRoutesRequest {})
+            .await
+            .map_err(crate::admin::explain)?
+            .into_inner()
+            .routes;
+        let stripped: Vec<String> = routes
+            .iter()
+            .filter(|route| route.app == mode.app || route.fallback_app == mode.app)
+            .map(|route| route.strip_prefix.trim_end_matches('/').to_owned())
+            .collect();
+
+        for name in &mode.mount_names {
+            paths.extend(mount_scope(name, mounts, &stripped)?);
+        }
+    }
+
+    muru_controller::detours::scope_paths(&paths).map_err(anyhow::Error::msg)
+}
+
+/// The client URL paths of the checkout's mount `name` under routes that
+/// strip each of `stripped` (empty for one that strips nothing); the
+/// mount's path alone when the application has no routes.
+fn mount_scope(
+    name: &str,
+    mounts: &std::collections::BTreeMap<String, muru_config::Mount>,
+    stripped: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let Some(mount) = mounts.get(name) else {
+        let known: Vec<&str> = mounts.keys().map(String::as_str).collect();
+        anyhow::bail!(
+            "this checkout has no mount {name}{}",
+            if known.is_empty() {
+                String::new()
+            } else {
+                format!("; it has {}", known.join(", "))
+            }
+        );
+    };
+
+    anyhow::ensure!(
+        !mount.path.is_empty(),
+        "mount {name} has no path, as a gRPC mount's is matched by service, so it cannot scope \
+         a detour; give --path instead"
+    );
+
+    let path = mount.path.trim_end_matches('/');
+
+    if stripped.is_empty() {
+        return Ok(vec![path.to_owned()]);
+    }
+
+    Ok(stripped
+        .iter()
+        .map(|prefix| format!("{prefix}{path}"))
+        .collect())
 }
 
 /// Hold the detour open for as long as the run runs: what the daemon
@@ -778,7 +1091,7 @@ pub fn hold(
                             "detour {}@{} now takes {}{}",
                             detour.app,
                             detour.release,
-                            takes(&detour.traffic, &detour.app),
+                            takes(&detour.traffic, &detour.app, &detour.paths),
                             ending(detour.until_unix_ms)
                         );
                     }
@@ -808,7 +1121,6 @@ pub fn hold(
 
                 match open(&daemon, &request).await {
                     Ok((stream, opened)) => {
-                        links.set_hosts(opened.hosts.clone());
                         let traffic = opened
                             .detour
                             .as_ref()
@@ -940,12 +1252,61 @@ mod tests {
     }
 
     #[test]
-    fn a_traffic_choice_is_said_as_what_it_sends() {
-        assert_eq!(takes("preview", "shop"), "previews only");
-        assert_eq!(takes("all", "shop"), "all of shop's traffic");
-        assert_eq!(takes("share=10", "shop"), "10% of shop's clients");
+    fn a_mount_scopes_a_detour_under_each_route_of_the_application() {
+        let mounts = std::collections::BTreeMap::from([
+            (
+                "api".to_owned(),
+                muru_config::Mount {
+                    path: "/api/".to_owned(),
+                    entrypoint: "shop.api:app".to_owned(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "rpc".to_owned(),
+                muru_config::Mount {
+                    entrypoint: "shop.rpc:register".to_owned(),
+                    interface: Some(muru_config::Interface::Grpc),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
         assert_eq!(
-            takes("class=crawlers", "shop"),
+            mount_scope("api", &mounts, &["/app".to_owned(), String::new()]).unwrap(),
+            ["/app/api", "/api"]
+        );
+        assert_eq!(mount_scope("api", &mounts, &[]).unwrap(), ["/api"]);
+        assert!(
+            mount_scope("rpc", &mounts, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("mount rpc has no path")
+        );
+        assert!(
+            mount_scope("web", &mounts, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("this checkout has no mount web; it has api, rpc")
+        );
+    }
+
+    #[test]
+    fn a_traffic_choice_is_said_as_what_it_sends() {
+        assert_eq!(takes("preview", "shop", &[]), "previews only");
+        assert_eq!(takes("all", "shop", &[]), "all of shop's traffic");
+        assert_eq!(takes("share=10", "shop", &[]), "10% of shop's clients");
+        let scoped = ["/app/admin".to_owned(), "/app/api".to_owned()];
+        assert_eq!(
+            takes("preview", "shop", &scoped[1..]),
+            "previews only, under /app/api"
+        );
+        assert_eq!(
+            takes("all", "shop", &scoped),
+            "all of shop's traffic under /app/admin and /app/api"
+        );
+        assert_eq!(
+            takes("class=crawlers", "shop", &[]),
             "the requests of client class crawlers"
         );
     }
