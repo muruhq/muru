@@ -623,6 +623,20 @@ pub enum Command {
         /// Answered with each worker's reply, or why none could be asked.
         done: oneshot::Sender<Result<Vec<WorkerReply>, String>>,
     },
+    /// Issue 917: the probe of a managed server's instance started again
+    /// has ended, on a task beside the loop.
+    ServerProbed {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The instance's index.
+        index: u32,
+        /// The pid the probe was of.
+        pid: u32,
+        /// Whether it answered within the readiness timeout.
+        answered: bool,
+    },
     /// Issue 699: a release's stop, on a task beside the loop, has ended.
     Stopped {
         /// The application.
@@ -1203,6 +1217,7 @@ impl Backend {
         self.servers().map(|servers| pb::Upstream {
             name: format!("{app}@{id}"),
             addresses: servers.addresses(),
+            starting: servers.starting(),
             protocol: "http1".to_owned(),
             trust_muru_headers: true,
             eject_after: 3,
@@ -3506,6 +3521,28 @@ fn write_record<T: serde::Serialize>(path: &Path, record: &T) {
     if let Err(error) = written {
         tracing::error!(%error, path = %path.display(), "writing a record failed");
     }
+}
+
+/// What a managed server's probes of its instances started again report
+/// to (issue 917): a command to the loop, which takes the outcome.
+fn probed(commands: &mpsc::Sender<Command>, app: &str, id: &str) -> crate::servers::Probed {
+    let commands = commands.clone();
+    let (app, id) = (app.to_owned(), id.to_owned());
+
+    Arc::new(move |index, pid, answered| {
+        let commands = commands.clone();
+        let command = Command::ServerProbed {
+            app: app.clone(),
+            id: id.clone(),
+            index,
+            pid,
+            answered,
+        };
+
+        tokio::spawn(async move {
+            let _ = commands.send(command).await;
+        });
+    })
 }
 
 /// What the event says when a managed server's instances are taken
@@ -6455,6 +6492,15 @@ impl Daemon {
                 timed_out,
             } => {
                 self.stopped(&app, &id, &why, timed_out).await;
+            }
+            Command::ServerProbed {
+                app,
+                id,
+                index,
+                pid,
+                answered,
+            } => {
+                self.server_probed(&app, &id, index, pid, answered).await;
             }
             Command::StartHeld { app, id, done } => {
                 self.start_held(&app, &id, done).await;
@@ -12139,13 +12185,18 @@ impl Daemon {
     async fn check_hosts(&mut self) {
         let mut exited = Vec::new();
         let mut reports = Vec::new();
+        let mut marks_changed = false;
 
         for (key, running) in &mut self.running {
             // Section 9.9: a managed server's instances are started
-            // again where they crash; the release stays up.
+            // again where they crash; the release stays up, and an
+            // instance started again is out of service as starting until
+            // it answers (issue 917), which the edge hears in a snapshot.
 
             if let Backend::Servers(servers) = &mut running.backend {
-                let changes = servers.check().await;
+                let marked = servers.starting();
+                let changes = servers.check(&probed(&self.commands, &key.0, &key.1)).await;
+                marks_changed |= servers.starting() != marked;
 
                 if !changes.is_empty() {
                     let run_dir = self
@@ -12217,7 +12268,42 @@ impl Daemon {
             }
         }
 
+        if marks_changed && let Err(error) = self.push_snapshot().await {
+            tracing::warn!(%error, "pushing the snapshot with the instances starting failed");
+        }
+
         self.publish_servers();
+    }
+
+    /// Issue 917: an instance started again answered its probe, or did
+    /// not within the readiness timeout; either way its starting mark is
+    /// cleared, and the edge told, unless the probe was of a process the
+    /// instance no longer has.
+    async fn server_probed(&mut self, app: &str, id: &str, index: u32, pid: u32, answered: bool) {
+        let key = (app.to_owned(), id.to_owned());
+
+        let Some(Running {
+            backend: Backend::Servers(servers),
+            ..
+        }) = self.running.get_mut(&key)
+        else {
+            return;
+        };
+
+        let Some(report) = servers.probed(index, pid, answered) else {
+            return;
+        };
+
+        if let Err(error) = self.push_snapshot().await {
+            tracing::warn!(%error, "pushing the snapshot with an instance ready failed");
+        }
+
+        self.events.emit(
+            report.kind,
+            &format!("{app}@{id}"),
+            report.level,
+            &report.message,
+        );
     }
 
     /// Section 8.7: what a release's processes start from, from the
@@ -13808,6 +13894,7 @@ fn upstream_message(name: &str, table: &muru_config::Upstream) -> anyhow::Result
         sendfile_roots: table.sendfile_roots.clone(),
         sendfile_header: table.sendfile_header.clone().unwrap_or_default(),
         detour: false,
+        starting: Vec::new(),
         connect_timeout_ms: millis(table.connect_timeout.as_deref()),
         probe: health.map(|health| pb::UpstreamProbe {
             path: health.path.clone().unwrap_or_default(),

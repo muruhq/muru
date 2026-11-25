@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -123,6 +123,12 @@ struct Address {
     text: String,
     target: Target,
     state: Mutex<State>,
+    /// Section 9.9 (issue 917): the daemon says the address is still
+    /// starting, a managed server's instance started again that has not
+    /// yet answered its readiness probe. It takes no requests while
+    /// others are in service, and its failures are not counted, so it is
+    /// never ejected for them.
+    starting: AtomicBool,
     /// HTTP/1.1 connections between requests, newest last, each with
     /// when it stops being used.
     idle: Mutex<VecDeque<(http1::SendRequest<OutBody>, Instant)>>,
@@ -152,6 +158,7 @@ impl Address {
             text: text.to_owned(),
             target,
             state: Mutex::new(State::default()),
+            starting: AtomicBool::new(false),
             idle: Mutex::new(VecDeque::new()),
             h2: Mutex::new(None),
         })
@@ -170,6 +177,10 @@ impl Address {
     }
 
     fn admission(&self, now: Instant) -> Admission {
+        if self.is_starting() {
+            return Admission::Closed;
+        }
+
         let state = self.state.lock().expect("upstream state poisoned");
 
         if state.probed == Some(false) {
@@ -181,6 +192,11 @@ impl Address {
             Some(until) if now < until || state.trying => Admission::Closed,
             Some(_) => Admission::Trial,
         }
+    }
+
+    /// Whether the daemon says the address is still starting.
+    fn is_starting(&self) -> bool {
+        self.starting.load(Ordering::Relaxed)
     }
 
     /// Whether the address takes requests now.
@@ -215,8 +231,13 @@ impl Address {
     }
 
     /// A request could not be sent or got no response head: after
-    /// enough in a row, the address is ejected, for longer each time.
+    /// enough in a row, the address is ejected, for longer each time. A
+    /// failure of an address that is still starting is not counted.
     fn failed(&self, upstream: &str, eject_after: u32, eject_for: Duration) {
+        if self.is_starting() {
+            return;
+        }
+
         let mut state = self.state.lock().expect("upstream state poisoned");
         state.failures += 1;
         let trial_failed = std::mem::take(&mut state.trying);
@@ -307,7 +328,8 @@ struct Shared {
 
 impl Shared {
     /// The addresses a request tries, in turn from where the last
-    /// request left off: those in service, and among them, at its turn,
+    /// request left off: those in service (not ejected, unhealthy or
+    /// starting), and among them, at its turn,
     /// one whose ejection is over and which may take its one trial
     /// request (section 4.13), so that an address comes back while the
     /// others serve. When none is in service or due a trial, every
@@ -455,6 +477,12 @@ impl Upstream {
             .map(|text| Address::new(text).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("addresses: {error}"))?;
+
+        for address in &addresses {
+            if message.starting.contains(&address.text) {
+                address.starting.store(true, Ordering::Relaxed);
+            }
+        }
 
         let protocol = match message.protocol.as_str() {
             "" | "http1" => Protocol::Http1,
@@ -1908,6 +1936,42 @@ mod tests {
         shared.addresses[0].failed("legacy@r1", 1, Duration::from_secs(5));
         shared.addresses[1].failed("legacy@r1", 1, Duration::from_secs(5));
         assert_eq!(texts(Instant::now()).len(), 2);
+    }
+
+    #[test]
+    fn a_starting_address_is_out_of_service_and_never_ejected() {
+        let upstream = Upstream::from_message(&pb::Upstream {
+            name: "legacy@r1".to_owned(),
+            addresses: vec!["127.0.0.1:9001".to_owned(), "127.0.0.1:9002".to_owned()],
+            starting: vec!["127.0.0.1:9002".to_owned()],
+            eject_after: 1,
+            eject_for_ms: 5_000,
+            ..Default::default()
+        })
+        .unwrap();
+        let shared = &upstream.shared;
+        let texts = || -> Vec<String> {
+            shared
+                .in_turn(Instant::now())
+                .into_iter()
+                .map(|(address, _)| address.text.clone())
+                .collect()
+        };
+
+        // Issue 917: the starting address takes nothing while the other
+        // serves, and its failures, as when it is tried with every
+        // address out, are not counted against it.
+
+        assert_eq!(texts(), ["127.0.0.1:9001"]);
+        shared.addresses[1].failed("legacy@r1", 1, Duration::from_secs(5));
+        let state = shared.addresses[1].state.lock().unwrap();
+        assert_eq!((state.failures, state.ejected_until), (0, None));
+        drop(state);
+
+        // With the other ejected, the starting one is still tried.
+
+        shared.addresses[0].failed("legacy@r1", 1, Duration::from_secs(5));
+        assert_eq!(texts().len(), 2);
     }
 
     #[test]

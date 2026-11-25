@@ -247,6 +247,7 @@ message Upstream {
   repeated string sendfile_roots = 13;  // section 4.9: directories an X-Muru-Sendfile path must lie in, when trusted
   string sendfile_header = 14;          // a second header honoured as X-Muru-Sendfile is, such as X-Sendfile; none when empty
   bool detour = 15;                     // section 4.21: a detour's run, reached over h2c for gRPC and http1 otherwise, whatever protocol says
+  repeated string starting = 16;        // section 9.9: addresses still starting, out of service but never ejected for it, until the daemon finds them ready
 }
 
 // How an upstream's addresses are probed.

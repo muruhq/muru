@@ -612,18 +612,34 @@ def test_a_daemon_restart_adopts_the_instances_still_there_and_starts_the_rest(
 ) -> None:
     first = start_daemon(tmp_path)
     second = None
+    ready = tmp_path / "ready"
+    ready.touch()
 
     try:
-        deploy_server(first, "legacy", "--bind", "port", "--instances", "2")
+        deploy_server(
+            first,
+            "legacy",
+            "--bind",
+            "port",
+            "--instances",
+            "2",
+            "--readiness",
+            "/healthz",
+            "--env",
+            f"LEGACY_READY={ready}",
+        )
         before = instances(first, "legacy@r1")
         survivor, lost = before[0]["pid"], before[1]["pid"]
 
         # The daemon detaches, and one instance exits while none is there.
+        # Whatever is started in its place answers its readiness probe
+        # only once the file is back.
 
         assert "detached" in first.muructl("daemon", "stop").stdout
         first.process.wait(timeout=30)
         os.kill(lost, signal.SIGKILL)
         wait_for(lambda: not alive(lost))
+        ready.unlink()
 
         # The next daemon takes over the instance that is still there, as
         # it was, and starts the other again at its address. The release
@@ -651,13 +667,19 @@ def test_a_daemon_restart_adopts_the_instances_still_there_and_starts_the_rest(
         assert events.count("instance 1 exited") == 1
         assert f"instance 1 started again (pid {replacement})" in events
 
-        # Both serve.
+        # Issue 917: started again but not ready, the instance takes no
+        # requests, and none fails, until it answers its probe; then both
+        # serve.
 
         def serving() -> set[int]:
             responses = [second.request(f"/n/{n}") for n in range(8)]
-            return {json.loads(r.body)["pid"] for r in responses if r.status == 200}
+            assert [r.status for r in responses] == [200] * 8
+            return {json.loads(r.body)["pid"] for r in responses}
 
+        assert serving() == {survivor}
+        ready.touch()
         wait_for(lambda: serving() == {survivor, replacement}, 20)
+        assert "instance 1 answers and takes requests again" in second.muructl("events").stdout
     finally:
         if second is None:
             second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)

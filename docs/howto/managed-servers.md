@@ -106,10 +106,24 @@ still running when the wait ends are killed, and the instance starts on
 the daemon's next check, a second later. They are also killed if the
 daemon stops or upgrades before the wait ends.
 
-While an instance is
-down its requests go to the others, or are answered 502
-`upstream_failed` when there is none, and `muru_upstream_health` reports
-each instance by address under the release's name. The instance count is
+An instance that has exited is out of service until it is started
+again and answers the readiness probe, the same probe the release's
+start waits on, tried every 100 ms. While it is, requests go to the
+other instances, and its refused connections do not count against it.
+Once it answers, a `server.ready` event says so and it takes requests
+again:
+
+```
+instance 1 answers and takes requests again
+```
+
+An instance that has not answered when the readiness timeout ends takes
+requests all the same, with a `server.ready` warning, and is set aside
+for a while if they fail, as any instance is after three failed requests
+in a row. With every instance out of service, requests still try them
+all, and are answered 502 `upstream_failed` when none takes them.
+`muru_upstream_health` reports each instance by address under the
+release's name, 0 while it is out of service. The instance count is
 fixed: `muructl scale` refuses a managed server.
 
 Draining stops new requests at the edge, waits for those in flight, then
