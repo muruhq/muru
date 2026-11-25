@@ -13,7 +13,7 @@ specification is maintained.
 
 | Key | Value |
 | --- | --- |
-| REQUEST_METHOD, SCRIPT_NAME, PATH_INFO, QUERY_STRING | from the request; SCRIPT_NAME is the trusted prefix plus the mount path |
+| REQUEST_METHOD, SCRIPT_NAME, PATH_INFO, QUERY_STRING | from the request; SCRIPT_NAME is the trusted prefix, then the part the route strips (`strip_prefix`, section 4.5), then the mount path |
 | CONTENT_TYPE, CONTENT_LENGTH | from headers; CONTENT_LENGTH also set for buffered chunked bodies |
 | SERVER_NAME, SERVER_PORT, SERVER_PROTOCOL | matched or canonical host name, resolved port, client protocol (HTTP/1.1, HTTP/2, HTTP/3) |
 | REMOTE_ADDR, REMOTE_PORT | resolved client; REMOTE_PORT only when known |

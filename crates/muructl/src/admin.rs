@@ -7775,6 +7775,12 @@ pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             target = format!("{target} ({})", parts.join(", "));
         }
 
+        // Section 4.5: the part of the path the application lives under.
+
+        if !route.strip_prefix.is_empty() {
+            target.push_str(&format!(" [strip_prefix {}]", route.strip_prefix));
+        }
+
         // Section 4.10: reachable by internal redirect only, and from
         // which other applications.
 

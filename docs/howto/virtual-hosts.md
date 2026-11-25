@@ -121,6 +121,75 @@ the reason `no_host` and a body that names no application, a
 `routing.no_host` event says so at warning level, and `muructl status`
 and `muructl daemon status` carry a line about it.
 
+## An application under a sub path
+
+`strip_prefix` names the leading part of a route's path that is where
+the application lives. The application gets that part as `SCRIPT_NAME`
+(ASGI: `root_path`) and the rest of the path as `PATH_INFO`, so the URLs
+it builds point under the sub path, and the release need not know its
+URL:
+
+```toml
+[[route]]
+host = "shop"
+path = "/app"
+app = "shop"
+strip_prefix = "/app"
+```
+
+| Request | `SCRIPT_NAME` | `PATH_INFO` |
+| --- | --- | --- |
+| `/app` | `/app` | `""` |
+| `/app/` | `/app` | `/` |
+| `/app/orders` | `/app` | `/orders` |
+| `/app/orders`, with a trusted `X-Forwarded-Prefix: /pfx` | `/pfx/app` | `/orders` |
+
+`strip_prefix` is the route's `path` or a leading part of it, whole
+segments long, and `muructl apply` refuses anything else:
+
+```console
+$ muructl apply -f muru.daemon.toml
+muru: plan
+  route site /sub/path/api: strip_prefix /sub/pa is not a leading part of its path on segment boundaries
+```
+
+A route narrower than the application's mount point strips only that
+part, so several routes give the application the same base, such as a
+second route that is there for its policy:
+
+```toml
+[[route]]
+host = "shop"
+path = "/sub/path"
+app = "shop"
+strip_prefix = "/sub/path"
+
+[[route]]
+host = "shop"
+path = "/sub/path/admin"
+app = "shop"
+auth = { app = "sso", path = "/check" }
+strip_prefix = "/sub/path"
+```
+
+| Request | Route | `SCRIPT_NAME` | `PATH_INFO` |
+| --- | --- | --- | --- |
+| `/sub/path/users` | `/sub/path` | `/sub/path` | `/users` |
+| `/sub/path/admin/users` | `/sub/path/admin` | `/sub/path` | `/admin/users` |
+
+The release's [mounts](mounts.md) and worker groups are matched against
+the rest of the path, so behind such a route a mount at `/api` serves
+`/sub/path/api/...` with `SCRIPT_NAME=/sub/path/api`. An
+[upstream](upstreams.md), a [managed server](managed-servers.md) or a
+[detour](detours.md) is sent the rest of the path, `/` for the stripped
+part itself, with the stripped part in `X-Forwarded-Prefix`. A static
+route takes `strip_prefix` only with a `fallback`, which gets it; its
+files are served relative to its path as they are. An internal redirect
+takes the `strip_prefix` of the route it lands on.
+
+`muructl apply --dry-run` shows the key in the route's line and
+`muructl route list` as `[strip_prefix /app]`.
+
 ## TLS
 
 A host's `tls` table names its certificate chain (leaf first) and private

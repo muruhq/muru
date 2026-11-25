@@ -50,7 +50,23 @@ a declared length is read in full first and sent with a `Content-Length`;
 a declared length is streamed. A message carrying both `Content-Length`
 and `Transfer-Encoding` is read by its `Transfer-Encoding` and re-framed,
 and an invalid `Content-Length` is refused with 400 before routing. The
-path arrives as the client sent it, prefix included.
+path arrives as the client sent it, prefix included, unless the route
+strips part of it with `strip_prefix`: then the upstream is sent the
+rest of the path and the stripped part in `X-Forwarded-Prefix`, after
+any prefix a trusted proxy sent. With this route, a request for
+`/legacy/v1/orders?id=3` reaches the upstream as `GET /v1/orders?id=3`
+with `X-Forwarded-Prefix: /legacy`:
+
+```toml
+[[route]]
+host = "site"
+path = "/legacy/v1"
+upstream = "legacy"
+strip_prefix = "/legacy"
+```
+
+See [an application under a sub path](virtual-hosts.md#an-application-under-a-sub-path)
+for how `strip_prefix` is checked.
 
 The upstream's response goes back with its headers, less hop-by-hop
 ones. A WebSocket upgrade is passed to an `http1` upstream and the bytes

@@ -1727,6 +1727,7 @@ async fn serve<I>(
                     snapshot: routing.version(),
                     mount: String::new(),
                     mount_path: String::new(),
+                    stripped: String::new(),
                     sendfile: Arc::default(),
                     precompressed: precompressed_for(
                         compression,
@@ -1955,6 +1956,7 @@ async fn serve<I>(
                             context.group = selection.group;
                             context.mount = selection.mount;
                             context.mount_path = selection.script_name;
+                            context.stripped = selection.stripped;
                             context.detour = selection.detour;
                             context.sendfile = selection.sendfile;
                             context.grpc_web = selection.grpc_web;
@@ -1976,7 +1978,7 @@ async fn serve<I>(
 
                             if let Some(static_path) = &selection.static_path {
                                 let path = parts.uri.path().to_owned();
-                                let within = path
+                                let within = routing::after_strip(&path, &context.stripped)
                                     .strip_prefix(static_path.prefix.trim_end_matches('/'))
                                     .unwrap_or("")
                                     .to_owned();
@@ -2149,6 +2151,7 @@ async fn serve<I>(
                                 context.group = selection.group.clone();
                                 context.mount = selection.mount.clone();
                                 context.mount_path = selection.script_name.clone();
+                                context.stripped = selection.stripped.clone();
                                 context.detour = selection.detour.clone();
                                 context.sendfile = Arc::clone(&selection.sendfile);
                                 context.grpc_web = Arc::clone(&selection.grpc_web);
@@ -2692,9 +2695,13 @@ pub(crate) fn request_head(
         None => Bytes::copy_from_slice(parts.uri.path().as_bytes()),
     };
 
+    // Section 4.5: what the route strips is the application's mount
+    // point, between the proxy's prefix and the mount's path.
+
     let script_name = format!(
-        "{}{}",
+        "{}{}{}",
         context.prefix.as_deref().unwrap_or_default(),
+        context.stripped,
         context.mount_path
     );
 

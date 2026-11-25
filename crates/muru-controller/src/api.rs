@@ -2909,6 +2909,7 @@ impl Admin for Service {
                 .into_iter()
                 .map(|route| pb::Route {
                     client_classes: route.classes().to_vec(),
+                    strip_prefix: route.strip_prefix.clone().unwrap_or_default(),
                     traffic_classes: route
                         .traffic
                         .as_ref()

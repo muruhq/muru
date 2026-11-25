@@ -1803,6 +1803,27 @@ fn plan_routes(store: &Store, document: &Document, defined: &Defined, plan: &mut
             }
         }
 
+        // Section 4.5: what the route strips is a leading part of its
+        // own path, and a static route strips only for its fallback.
+
+        if let Err(error) = muru_config::check_strip_prefix(route) {
+            plan.errors
+                .push(format!("route {} {}: {error}", route.host, route.path));
+            valid = false;
+        }
+
+        let static_fallback = fallback_app.is_some() || fallback_upstream.is_some();
+
+        if route.strip_prefix.is_some() && route.static_dir.is_some() && !static_fallback {
+            plan.errors.push(format!(
+                "route {} {}: strip_prefix applies to a static route's fallback application or \
+                 upstream, and this route has none; the directory is served relative to the \
+                 route's path already",
+                route.host, route.path
+            ));
+            valid = false;
+        }
+
         // Section 4.15: the route's rate limits, method restrictions and
         // mode.
 
@@ -2050,6 +2071,10 @@ fn plan_routes(store: &Store, document: &Document, defined: &Defined, plan: &mut
                         }
                         None => format!("to {target}"),
                     };
+
+                    if let Some(prefix) = &route.strip_prefix {
+                        detail.push_str(&format!(", strip_prefix {prefix}"));
+                    }
 
                     if route.internal == Some(true) {
                         detail.push_str(", internal");

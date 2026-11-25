@@ -2757,6 +2757,10 @@
           "description": "The directory served by the edge, instead of an application. A relative path is taken from the file's directory.",
           "type": "string"
         },
+        "strip_prefix": {
+          "description": "The leading part of `path` that is where the application lives: `path` itself, or a leading part of it whole segments long, so `/sub` of `/sub/path` and never `/su`. An application's release gets it as SCRIPT_NAME, after a trusted X-Forwarded-Prefix and before a mount's path, and its mounts and worker groups are matched against the rest of the path. An upstream, a managed HTTP release or a detour is sent the rest of the path, with this part appended to X-Forwarded-Prefix. A static route takes it only with a fallback, which it applies to. Without it nothing is stripped.",
+          "type": "string"
+        },
         "timeouts": {
           "$ref": "#/$defs/RequestTimeouts",
           "description": "The timeouts of the route's requests, each replacing the host's, or else the daemon's `[limits]` value."

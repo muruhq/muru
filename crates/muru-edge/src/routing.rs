@@ -116,6 +116,10 @@ impl Maintenance {
 
 struct Route {
     path: String,
+    /// Section 4.5: the leading part of `path` that becomes the
+    /// application's mount point, without a trailing slash; empty when
+    /// the route strips nothing.
+    strip: String,
     /// The client classes the route takes (section 4.14); every request
     /// when empty.
     classes: Vec<String>,
@@ -178,6 +182,13 @@ impl Route {
     /// 4.10): its own application's always may, another's when listed.
     fn accepts(&self, app: &str) -> bool {
         self.owner() == app || self.accept_redirects_from.iter().any(|name| name == app)
+    }
+
+    /// What serves the route's request, told what the route strips
+    /// (section 4.5).
+    fn stripping(&self, mut selection: Selection) -> Selection {
+        selection.stripped.clone_from(&self.strip);
+        selection
     }
 
     /// Whether the route takes a request for `path` from a client of
@@ -334,6 +345,34 @@ pub struct Selection {
     /// Section 4.21: how the request reached a detour, which its run is
     /// told; none for anything else.
     pub detour: Option<crate::detour::Via>,
+    /// Section 4.5: the leading part of the path the route strips, which
+    /// becomes the application's mount point; empty when it strips none.
+    pub stripped: String,
+}
+
+/// Section 4.5: what is left of a path once a route's stripped part,
+/// `stripped`, is taken off. The request matched the route's path on
+/// segment boundaries, so its first segments are the stripped part's
+/// and this is a split after them: empty for the stripped part itself.
+/// A path that does not begin with it is left whole.
+pub fn after_strip<'a>(path: &'a str, stripped: &str) -> &'a str {
+    if stripped.is_empty() {
+        return path;
+    }
+
+    path.strip_prefix(stripped)
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        .unwrap_or(path)
+}
+
+/// The path a release's mounts, worker groups and directories are
+/// matched against behind a route that strips `stripped`: the rest of
+/// the path, `/` when nothing is left.
+fn mount_path_of<'a>(path: &'a str, stripped: &str) -> &'a str {
+    match after_strip(path, stripped) {
+        "" => "/",
+        rest => rest,
+    }
 }
 
 /// What a request brings to the release choice (section 9.4): its
@@ -595,6 +634,7 @@ fn upstream_selection(upstream: &Arc<Upstream>) -> Selection {
         static_path: None,
         limits: crate::RequestLimits::default(),
         detour: None,
+        stripped: String::new(),
     }
 }
 
@@ -1106,6 +1146,7 @@ impl AppPools {
                     previewed: self.previewed_in(client.headers),
                     base: String::new(),
                 }),
+                stripped: String::new(),
             });
         }
 
@@ -1175,6 +1216,7 @@ impl AppPools {
                 .or(group_limits)
                 .or(self.limits),
             detour: None,
+            stripped: String::new(),
         })
     }
 
@@ -1900,6 +1942,7 @@ impl Routing {
                     compression,
                     request_headers,
                     response_headers,
+                    strip: route.strip_prefix.trim_end_matches('/').to_owned(),
                     path: route.path.clone(),
                     classes: route.client_classes.clone(),
                     app: route.app.clone(),
@@ -2338,6 +2381,11 @@ impl Routing {
 
         let mut cookies = Vec::new();
 
+        // Section 4.5: the release's mounts and groups are matched against
+        // what is left of the path once the route's stripped part is off.
+
+        let rest = mount_path_of(path, &route.strip);
+
         if let Some(static_route) = &route.static_route {
             let fallback = if let Some(upstream) = &route.fallback_upstream {
                 Some(upstream_selection(upstream))
@@ -2347,12 +2395,13 @@ impl Routing {
                 self.selection_for(
                     &route.fallback_app,
                     route.traffic.as_ref(),
-                    path,
+                    rest,
                     client,
                     &mut cookies,
                     origin,
                 )
-            };
+            }
+            .map(|selection| route.stripping(selection));
             let served = fallback
                 .as_ref()
                 .map_or_else(crate::RequestLimits::default, |selection| selection.limits);
@@ -2383,7 +2432,7 @@ impl Routing {
                 let Some(selection) = self.selection_for(
                     &route.app,
                     route.traffic.as_ref(),
-                    path,
+                    rest,
                     client,
                     &mut cookies,
                     origin,
@@ -2393,6 +2442,8 @@ impl Routing {
                 selection
             }
         };
+
+        let selection = route.stripping(selection);
 
         // SERVER_NAME is the name the request matched with, or the
         // canonical name when the host says so (section 4.3).
@@ -2497,6 +2548,7 @@ impl Routing {
                 static_path: None,
                 limits: crate::RequestLimits::default(),
                 detour: None,
+                stripped: String::new(),
             }),
         }
     }
@@ -2723,6 +2775,108 @@ mod tests {
             .unwrap()
             .block_on(Routing::from_snapshot(&snapshot(), None))
             .unwrap()
+    }
+
+    #[test]
+    fn a_route_strips_a_leading_part_and_mounts_match_the_rest() {
+        let mut snapshot = snapshot();
+        snapshot.routes = vec![
+            pb::Route {
+                host: "shop".to_owned(),
+                path: "/sub/path/api".to_owned(),
+                app: "shop".to_owned(),
+                strip_prefix: "/sub/path".to_owned(),
+                ..Default::default()
+            },
+            pb::Route {
+                host: "shop".to_owned(),
+                path: "/whole/".to_owned(),
+                app: "shop".to_owned(),
+                strip_prefix: "/whole".to_owned(),
+                ..Default::default()
+            },
+            pb::Route {
+                host: "shop".to_owned(),
+                path: "/legacy/v1".to_owned(),
+                upstream: "legacy".to_owned(),
+                strip_prefix: "/legacy".to_owned(),
+                ..Default::default()
+            },
+            pb::Route {
+                host: "shop".to_owned(),
+                path: "/".to_owned(),
+                app: "shop".to_owned(),
+                ..Default::default()
+            },
+        ];
+        snapshot.upstreams.push(pb::Upstream {
+            name: "legacy".to_owned(),
+            addresses: vec!["127.0.0.1:9000".to_owned()],
+            ..Default::default()
+        });
+        snapshot.apps.push(pb::AppWorkers {
+            app: "shop".to_owned(),
+            release: "r1".to_owned(),
+            serving: true,
+            mounts: vec![pb::Mount {
+                name: "api".to_owned(),
+                path: "/api".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let routing = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(Routing::from_snapshot(&snapshot, None))
+            .unwrap();
+        let ids = crate::errors::RequestIds::new();
+        let headers = HeaderMap::new();
+        let served = |path: &str| match routing.select(
+            Some("shop.example.com"),
+            path,
+            "127.0.0.1:8080",
+            true,
+            &client(&headers, &ids),
+            None,
+        ) {
+            Decision::Serve { selection, .. } => {
+                (selection.stripped, selection.mount, selection.script_name)
+            }
+            _ => panic!("{path} not served"),
+        };
+        let owned = |stripped: &str, mount: &str, script: &str| {
+            (stripped.to_owned(), mount.to_owned(), script.to_owned())
+        };
+
+        // The mount is matched against what is left once the route's
+        // part is off, so a mount's path is relative to it.
+
+        assert_eq!(
+            served("/sub/path/api/users"),
+            owned("/sub/path", "api", "/api")
+        );
+        assert_eq!(served("/sub/path/api"), owned("/sub/path", "api", "/api"));
+
+        // A route with a trailing slash strips the same, and the part
+        // itself leaves nothing; a route that strips nothing is as before.
+
+        assert_eq!(served("/whole/x"), owned("/whole", "", ""));
+        assert_eq!(served("/api/x"), owned("", "api", "/api"));
+        assert_eq!(served("/wholesale"), owned("", "", ""));
+
+        // An upstream's route strips the same.
+
+        assert_eq!(served("/legacy/v1/orders").0, "/legacy");
+
+        // The split is after the part's segments: what is left keeps the
+        // client's spelling, dot segments and encoded slashes included.
+
+        assert_eq!(after_strip("/sub/path/x", "/sub/path"), "/x");
+        assert_eq!(after_strip("/sub/path", "/sub/path"), "");
+        assert_eq!(after_strip("/sub/path/", "/sub/path"), "/");
+        assert_eq!(after_strip("/sub/path/..%2Fx", "/sub/path"), "/..%2Fx");
+        assert_eq!(after_strip("/sub/pathway", "/sub/path"), "/sub/pathway");
+        assert_eq!(after_strip("/x", ""), "/x");
     }
 
     #[test]

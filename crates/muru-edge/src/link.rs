@@ -1287,6 +1287,10 @@ pub struct Context<'a> {
     pub mount: String,
     /// The mount's path, joined to SCRIPT_NAME.
     pub mount_path: String,
+    /// Section 4.5: the leading part of the path the route strips, which
+    /// joins SCRIPT_NAME before the mount's path, or for an upstream is
+    /// taken off the path and sent in X-Forwarded-Prefix.
+    pub stripped: String,
     /// The file hints by path the upstream or managed server may give
     /// (section 4.9), which the edge opens; a worker opens its own.
     pub sendfile: Arc<Sendfile>,
@@ -1371,6 +1375,7 @@ impl<'a> Context<'a> {
             snapshot: self.snapshot,
             mount: String::new(),
             mount_path: String::new(),
+            stripped: String::new(),
             sendfile: Arc::default(),
             precompressed: Vec::new(),
             grpc_web: Arc::default(),

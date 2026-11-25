@@ -363,6 +363,7 @@ pub async fn check(auth: &Auth, check: Check<'_>) -> Outcome {
     context.group = selection.group;
     context.mount = selection.mount;
     context.mount_path = selection.script_name;
+    context.stripped = selection.stripped;
     context.detour = selection.detour;
 
     let handled = crate::dispatch(

@@ -1524,6 +1524,7 @@ message Route {
   string compression = 19;          // "off" when the route turns compression off, "set" when it has other settings of its own
   string request_headers = 20;      // what the route removes from and sets on requests, as one phrase
   string response_headers = 21;     // what the route removes from, sets on and adds to responses, as one phrase
+  string strip_prefix = 22;         // the leading part of the path the application lives under, as configured; none when empty
 }
 
 message ListUpstreamsRequest {}

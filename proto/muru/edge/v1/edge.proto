@@ -393,6 +393,7 @@ message Route {
   CompressionChoice compression = 28;   // section 4.17: the route's own compression settings, over the host's; none when absent
   HeaderRules request_headers = 29;     // section 4.7: applied to the route's requests after the host's
   HeaderRules response_headers = 30;    // applied to every response to the route's requests after the host's
+  string strip_prefix = 31;             // section 4.5: the leading part of path that becomes the application's mount point, without a trailing slash; none when empty
 }
 
 // Section 4.11: how a route's uploads are received before dispatch.

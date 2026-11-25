@@ -8711,6 +8711,7 @@ impl Daemon {
                 .and_then(|limits| request_limits_message(&limits)),
                 traffic: self.route_traffic(&route, &included, &rollouts),
                 client_classes: route.classes().to_vec(),
+                strip_prefix: muru_config::stripped_part(route.strip_prefix.as_deref()).to_owned(),
                 host: route.host,
                 path: route.path,
                 app: route.app,

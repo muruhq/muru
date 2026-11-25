@@ -1187,6 +1187,22 @@ pub async fn handle(
         headers.insert(HeaderName::from_static("x-forwarded-port"), value);
     }
 
+    // Section 4.5: behind a route that strips part of the path, the
+    // upstream is sent the rest, and the stripped part is appended to the
+    // trusted forwarded prefix, as a gateway's strip-prefix does.
+
+    let target = target_after_strip(parts, &context.stripped);
+
+    if !context.stripped.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&format!(
+            "{}{}",
+            context.prefix.as_deref().unwrap_or_default(),
+            context.stripped
+        ))
+    {
+        headers.insert(HeaderName::from_static("x-forwarded-prefix"), value);
+    }
+
     // gRPC servers look for `te: trailers`, the one value HTTP/2 allows,
     // which goes as a hop-by-hop header otherwise.
 
@@ -1237,7 +1253,7 @@ pub async fn handle(
     let _ = failing.dispatched.set(dispatched);
     failing.note_in_flight(|in_flight| in_flight.upstream());
     let mut slot = Some(build_request(
-        parts,
+        &target,
         &method,
         shared,
         protocol,
@@ -1282,7 +1298,7 @@ pub async fn handle(
                         );
                         address.idle.lock().expect("upstream idle poisoned").clear();
                         slot = Some(build_request(
-                            parts,
+                            &target,
                             &method,
                             shared,
                             protocol,
@@ -1656,11 +1672,28 @@ fn outgoing_headers(
     headers
 }
 
+/// The request's path and query as an upstream is sent them: with the
+/// route's stripped part taken off the path (section 4.5), and `/` when
+/// nothing is left, since a request names a path.
+fn target_after_strip(parts: &http::request::Parts, stripped: &str) -> String {
+    let path = parts.uri.path();
+
+    let rest = match crate::routing::after_strip(path, stripped) {
+        "" => "/",
+        rest => rest,
+    };
+
+    match parts.uri.query() {
+        Some(query) => format!("{rest}?{query}"),
+        None => rest.to_owned(),
+    }
+}
+
 /// The request as sent over `protocol`: origin form over HTTP/1.1, the
 /// full URI with the host as its authority over HTTP/2.
 #[allow(clippy::too_many_arguments)]
 fn build_request(
-    parts: &http::request::Parts,
+    target: &str,
     method: &http::Method,
     shared: &Shared,
     protocol: Protocol,
@@ -1669,11 +1702,6 @@ fn build_request(
     length: Option<u64>,
     body: OutBody,
 ) -> Request<OutBody> {
-    let target = parts
-        .uri
-        .path_and_query()
-        .map_or_else(|| parts.uri.path().to_owned(), |target| target.to_string());
-
     let (uri, version) = if protocol.is_h2() {
         headers.remove(HOST);
         (
