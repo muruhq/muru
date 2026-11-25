@@ -50,7 +50,7 @@ def test_a_release_starts_from_a_clean_environment(tmp_path: Path) -> None:
         plan = daemon.muructl(
             "deploy", "shop", str(SHOP), "--python", sys.executable, "--dry-run", "--env", "ADDED=x"
         ).stdout
-        assert "env DECLARED (the previous release)" in plan, plan
+        assert "DECLARED" not in plan, plan
         assert "env ADDED (--env)" in plan, plan
         assert "env PASSED_ON (passed from the daemon)" in plan, plan
         assert "env HOME (passed from the daemon)" in plan, plan

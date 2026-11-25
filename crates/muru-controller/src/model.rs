@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use muru_config::{FactoryPhase, Interface, Preload, ScalingMode, ServerBind, ServerProfile};
@@ -113,7 +113,7 @@ impl FromStr for ReleaseState {
 pub struct StaticSpec {
     /// The path prefix.
     pub path: String,
-    /// The directory, absolute.
+    /// The directory: absolute, or relative to the place `within` names.
     pub dir: PathBuf,
     /// The files tried, in order, when a directory is requested.
     pub index: Vec<String>,
@@ -146,6 +146,9 @@ pub enum Within {
     Media,
     /// `static:`, the release's directory of built static files.
     Static,
+    /// `source:`, or a relative path: the release's own source (issue
+    /// 900).
+    Source,
 }
 
 impl Within {
@@ -154,16 +157,19 @@ impl Within {
         match self {
             Self::Media => "media:",
             Self::Static => "static:",
+            Self::Source => "source:",
         }
     }
 }
 
 impl StaticSpec {
     /// The directory served: `dir` itself, or `dir` inside the place
-    /// Muru provides, or none when the release does not have it.
-    pub fn directory(&self, places: &crate::places::Places) -> Option<PathBuf> {
+    /// it names, the release's `source` or a place Muru provides, or none
+    /// when the release does not have it.
+    pub fn directory(&self, source: &Path, places: &crate::places::Places) -> Option<PathBuf> {
         let base = match self.within {
             None => return Some(self.dir.clone()),
+            Some(Within::Source) => source.to_path_buf(),
             Some(Within::Media) => places.data.as_ref().map(|dirs| dirs.media.clone())?,
             Some(Within::Static) => places.static_dir.clone()?,
         };
@@ -181,9 +187,10 @@ impl StaticSpec {
     /// applications run as their own users.
     pub fn message(
         &self,
+        source: &Path,
         places: &crate::places::Places,
     ) -> Option<muru_proto::edge::v1::StaticDir> {
-        let dir = self.directory(places)?;
+        let dir = self.directory(source, places)?;
 
         Some(muru_proto::edge::v1::StaticDir {
             owner: (self.within == Some(Within::Media))
@@ -651,6 +658,20 @@ pub struct ReleaseSpec {
     /// Section 9.12: the commands the application declares, by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<CommandSpec>,
+    /// Section 9.14: what the deploy recorded of where the code came
+    /// from, as checked against the limits; never in the environment.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// Where a release's code came from, as its `release.created` event says
+/// after "from": the source directory, and the commit and ref its
+/// metadata names (section 9.14).
+pub fn created_from(spec: &ReleaseSpec) -> String {
+    match muru_config::metadata_origin(&spec.metadata) {
+        Some(origin) => format!("{}, {origin}", spec.source.display()),
+        None => spec.source.display().to_string(),
+    }
 }
 
 impl ReleaseSpec {
@@ -911,8 +932,8 @@ pub struct CommandInputSpec {
 }
 
 /// Section 3.3: where each of a release's settings came from, by key:
-/// the release table or deploy flags, the source's [tool.muru] table,
-/// the previous release, or the default. It records how the settings
+/// the release table or deploy flags, the application's settings, the
+/// source's [tool.muru] table, or the default. It records how the settings
 /// were reached, not what they are, so two specs are equal whatever
 /// their layers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1632,6 +1653,9 @@ pub struct App {
     pub media_dir: Option<String>,
     /// Where its uploads part is, a relative one in the data directory.
     pub uploads_dir: Option<String>,
+    /// The release settings every release deployed from now takes
+    /// (issue 899).
+    pub settings: crate::app_settings::AppSettings,
 }
 
 impl App {

@@ -28,6 +28,14 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the instances get to be ready when the release says nothing.
 pub const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The event of an instance started again that answers its readiness
+/// probe, or is taken into service without (issue 917).
+const READY_EVENT: &str = "server.ready";
+
+/// Hears how the probe of an instance started again ended: its index, the
+/// pid probed and whether it answered in time.
+pub type Probed = Arc<dyn Fn(u32, u32, bool) + Send + Sync>;
+
 /// The events the instances of a managed server are reported under.
 const EVENTS: EventNames = EventNames {
     exited: "server.exited",
@@ -131,10 +139,47 @@ pub struct Relays {
     pub watcher: crate::host::RelayWatcher,
 }
 
+/// Section 9.9 (issue 917): whether an instance is out of service at the
+/// edge as starting, from when its relay reports its end (issue 922) or
+/// its exit is seen, or it is adopted as gone, until its process answers
+/// the readiness probe or the readiness timeout passes.
+#[derive(Default)]
+struct Starting {
+    marked: bool,
+    /// The process being probed, once the instance has one; or the one
+    /// whose relay reported its end, with no probe, while the supervisor
+    /// still counts it as running.
+    pid: Option<u32>,
+    probe: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Starting {
+    /// Marked, with no process to probe yet.
+    fn marked() -> Self {
+        Self {
+            marked: true,
+            pid: None,
+            probe: None,
+        }
+    }
+}
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        if let Some(probe) = self.probe.take() {
+            probe.abort();
+        }
+    }
+}
+
 /// The instances of one managed HTTP release: their processes, which a
 /// supervisor runs, and where each listens.
 pub struct Servers {
     readiness_path: Option<String>,
+    /// How long an instance started again gets to answer its probe.
+    readiness_timeout: Duration,
+    /// Each instance's starting mark, in the supervisor's order.
+    starting: Vec<Starting>,
     run_dir: PathBuf,
     /// Each instance's address, in the supervisor's order.
     binds: Vec<Bind>,
@@ -189,6 +234,8 @@ impl Servers {
 
         Ok(Self {
             readiness_path: spec.readiness_path.clone(),
+            readiness_timeout: readiness_timeout(spec),
+            starting: binds.iter().map(|_| Starting::default()).collect(),
             run_dir: run_dir.to_path_buf(),
             binds,
             supervisor,
@@ -209,6 +256,10 @@ impl Servers {
     /// have by now. Such an instance is taken over only if something
     /// answers HTTP at its address as well, and is otherwise started
     /// again, with the process that has its pid left alone.
+    ///
+    /// An instance not taken over is marked starting, out of service
+    /// until it is started again and answers (issue 917); one taken over
+    /// is not, having been ready under the daemon before.
     #[allow(clippy::too_many_arguments)]
     pub async fn adopt(
         spec: &HttpServerSpec,
@@ -266,8 +317,18 @@ impl Servers {
             &processes,
         )?;
 
+        let starting = supervisor
+            .instances()
+            .map(|instance| match instance.pid() {
+                Some(_) => Starting::default(),
+                None => Starting::marked(),
+            })
+            .collect();
+
         Ok(Self {
             readiness_path: spec.readiness_path.clone(),
+            readiness_timeout: readiness_timeout(spec),
+            starting,
             run_dir: run_dir.to_path_buf(),
             binds,
             supervisor,
@@ -327,10 +388,148 @@ impl Servers {
         }
     }
 
+    /// What adoption found of each instance, by index; empty when this
+    /// daemon started them.
+    pub fn adopted(&self) -> Vec<(u32, supervisor::Adopted)> {
+        self.supervisor
+            .instances()
+            .map(supervisor::Instance::index)
+            .zip(self.supervisor.adopted().iter().cloned())
+            .collect()
+    }
+
     /// Reap instances that exited and start again those whose wait has
     /// passed, with what happened for the event stream.
-    pub async fn check(&mut self) -> Vec<Report> {
-        self.supervisor.check().await
+    ///
+    /// An instance whose exit is seen is marked starting, and one
+    /// started again is probed beside the daemon's loop as the release's
+    /// start probes its instances, every 100 ms until it answers or the
+    /// readiness timeout passes; `probed` hears how that ended, and
+    /// `probed` here takes the answer (issue 917).
+    pub async fn check(&mut self, probed: &Probed) -> Vec<Report> {
+        let reports = self.supervisor.check().await;
+        let pids: Vec<Option<u32>> = self
+            .supervisor
+            .instances()
+            .map(supervisor::Instance::pid)
+            .collect();
+        let indexes: Vec<u32> = self
+            .supervisor
+            .instances()
+            .map(supervisor::Instance::index)
+            .collect();
+
+        for (position, pid) in pids.into_iter().enumerate() {
+            let starting = &mut self.starting[position];
+
+            match pid {
+                None if !starting.marked || starting.pid.is_some() => {
+                    *starting = Starting::marked();
+                }
+                Some(pid) if starting.marked && starting.pid != Some(pid) => {
+                    let bind = self.binds[position].clone();
+                    let path = self.readiness_path.clone();
+                    let timeout = self.readiness_timeout;
+                    let probed = Arc::clone(probed);
+                    let index = indexes[position];
+
+                    *starting = Starting {
+                        marked: true,
+                        pid: Some(pid),
+                        probe: Some(tokio::spawn(async move {
+                            let answered = answers_within(&bind, path.as_deref(), timeout).await;
+                            probed(index, pid, answered);
+                        })),
+                    };
+                }
+                _ => {}
+            }
+        }
+
+        reports
+    }
+
+    /// Take the outcome of the probe of the instance at `index`, whose
+    /// process was `pid`: the mark is cleared, whether it answered or the
+    /// readiness timeout passed, which is reported as a warning since
+    /// the instance is then left to the edge's ejection. A probe of a
+    /// process the instance no longer has changes nothing.
+    pub fn probed(&mut self, index: u32, pid: u32, answered: bool) -> Option<Report> {
+        let position = self
+            .supervisor
+            .instances()
+            .position(|instance| instance.index() == index)?;
+        let starting = &mut self.starting[position];
+
+        // A probe the relay's report of the process's end stopped, whose
+        // outcome was already on its way, says nothing now.
+
+        if !starting.marked || starting.pid != Some(pid) || starting.probe.is_none() {
+            return None;
+        }
+
+        *starting = Starting::default();
+
+        if answered {
+            return Some(Report {
+                kind: READY_EVENT,
+                level: "info",
+                message: format!("instance {index} answers and takes requests again"),
+            });
+        }
+
+        Some(Report {
+            kind: READY_EVENT,
+            level: "warning",
+            message: format!(
+                "instance {index} did not answer within {}{}; it takes requests again, \
+                 and is set aside if they fail",
+                muru_config::format_duration(self.readiness_timeout),
+                self.readiness_path
+                    .as_deref()
+                    .map(|path| format!(" ({path} did not answer 2xx or 3xx)"))
+                    .unwrap_or_default()
+            ),
+        })
+    }
+
+    /// Issue 922: the relay of the instance at `index` reports that its
+    /// process `pid` has ended. The instance is marked starting at once,
+    /// and its probe, if one ran, is stopped; the exit itself, its wait
+    /// and the start in its place are left to the check that sees the
+    /// relay gone, since a new relay for the index takes the old one's
+    /// control socket and record. Says whether the mark is new. A report
+    /// about a process the instance no longer has changes nothing.
+    pub fn ended(&mut self, index: u32, pid: u32) -> bool {
+        let Some(position) = self
+            .supervisor
+            .instances()
+            .position(|instance| instance.index() == index && instance.pid() == Some(pid))
+        else {
+            return false;
+        };
+
+        let starting = &mut self.starting[position];
+        let new = !starting.marked;
+
+        *starting = Starting {
+            marked: true,
+            pid: Some(pid),
+            probe: None,
+        };
+
+        new
+    }
+
+    /// The addresses of the instances marked starting, which the edge
+    /// keeps out of service without ejecting them.
+    pub fn starting(&self) -> Vec<String> {
+        self.binds
+            .iter()
+            .zip(&self.starting)
+            .filter(|(_, starting)| starting.marked)
+            .map(|(bind, _)| bind.address())
+            .collect()
     }
 
     /// Have each instance's relay open the release log again by name;
@@ -401,6 +600,32 @@ impl Servers {
     /// detaches.
     pub fn release(self) {
         self.supervisor.release();
+    }
+}
+
+/// How long the release's instances get to be ready.
+fn readiness_timeout(spec: &HttpServerSpec) -> Duration {
+    Duration::from_millis(spec.readiness_timeout_ms)
+}
+
+/// Whether an instance answers its readiness probe within `timeout`,
+/// probed every 100 ms as the release's start probes it.
+async fn answers_within(bind: &Bind, path: Option<&str>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+
+        if probe(bind, path, PROBE_TIMEOUT.min(left)).await {
+            return true;
+        }
+
+        if Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(PROBE_INTERVAL.min(deadline.saturating_duration_since(Instant::now())))
+            .await;
     }
 }
 

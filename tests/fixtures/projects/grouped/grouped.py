@@ -34,6 +34,9 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
             "group": context().group,
             "env_group": os.environ.get("MURU_GROUP"),
             "worker": context().worker_id,
+            "env_worker": os.environ.get("MURU_WORKER_ID"),
+            "development": context().development,
+            "env_development": os.environ.get("MURU_DEVELOPMENT"),
             "pid": os.getpid(),
             "path": environ["PATH_INFO"],
         }

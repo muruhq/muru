@@ -623,6 +623,32 @@ pub enum Command {
         /// Answered with each worker's reply, or why none could be asked.
         done: oneshot::Sender<Result<Vec<WorkerReply>, String>>,
     },
+    /// Issue 922: the relay of a managed server's instance reports that
+    /// the instance has ended.
+    ServerEnded {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The instance's index.
+        index: u32,
+        /// The pid that ended.
+        pid: u32,
+    },
+    /// Issue 917: the probe of a managed server's instance started again
+    /// has ended, on a task beside the loop.
+    ServerProbed {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The instance's index.
+        index: u32,
+        /// The pid the probe was of.
+        pid: u32,
+        /// Whether it answered within the readiness timeout.
+        answered: bool,
+    },
     /// Issue 699: a release's stop, on a task beside the loop, has ended.
     Stopped {
         /// The application.
@@ -718,6 +744,9 @@ pub enum Command {
         traffic: crate::detours::Traffic,
         /// When it goes back to preview, Unix milliseconds; 0 for never.
         until_unix_ms: u64,
+        /// The paths it is to take requests under, every path when
+        /// empty; left as they are when none.
+        paths: Option<Vec<String>>,
         /// Answered with the detour as it is now, or why not.
         done: oneshot::Sender<Result<muru_proto::admin::v1::Detour, String>>,
     },
@@ -1200,6 +1229,7 @@ impl Backend {
         self.servers().map(|servers| pb::Upstream {
             name: format!("{app}@{id}"),
             addresses: servers.addresses(),
+            starting: servers.starting(),
             protocol: "http1".to_owned(),
             trust_muru_headers: true,
             eject_after: 3,
@@ -3505,46 +3535,79 @@ fn write_record<T: serde::Serialize>(path: &Path, record: &T) {
     }
 }
 
+/// What a managed server's probes of its instances started again report
+/// to (issue 917): a command to the loop, which takes the outcome.
+fn probed(commands: &mpsc::Sender<Command>, app: &str, id: &str) -> crate::servers::Probed {
+    let commands = commands.clone();
+    let (app, id) = (app.to_owned(), id.to_owned());
+
+    Arc::new(move |index, pid, answered| {
+        let commands = commands.clone();
+        let command = Command::ServerProbed {
+            app: app.clone(),
+            id: id.clone(),
+            index,
+            pid,
+            answered,
+        };
+
+        tokio::spawn(async move {
+            let _ = commands.send(command).await;
+        });
+    })
+}
+
 /// What the event says when a managed server's instances are taken
-/// over: the pids of those that were still there, and which were gone
-/// and are started again by the next check. In the record of the
-/// instances as adopted, one that is to be started has pid 0.
-fn adoption_message(adopted: &ServersRecord) -> String {
+/// over: the pids of those that were still there, how each that ended
+/// while no daemon ran did and when it is started again (issue 916), and
+/// which were gone and are started again by the next check.
+fn adoption_message(adopted: &[(u32, crate::supervisor::Adopted)]) -> String {
+    use crate::supervisor::Adopted;
+
     let list = |words: Vec<String>| match words.as_slice() {
         [] => String::new(),
         [one] => one.clone(),
         [most @ .., last] => format!("{} and {last}", most.join(", ")),
     };
-    let (gone, there): (Vec<_>, Vec<_>) = adopted
-        .instances
-        .iter()
-        .partition(|instance| instance.pid == 0);
-    let pids: Vec<String> = there
-        .iter()
-        .map(|instance| instance.pid.to_string())
-        .collect();
-    let indexes: Vec<String> = gone
-        .iter()
-        .map(|instance| instance.index.to_string())
-        .collect();
+    let mut pids = Vec::new();
+    let mut ended = Vec::new();
+    let mut gone = Vec::new();
 
-    let taken_over = if pids.is_empty() {
+    for (index, found) in adopted {
+        match found {
+            Adopted::Kept(pid) => pids.push(pid.to_string()),
+            Adopted::Ended { exit, wait } => ended.push(format!(
+                "instance {index} {exit} while no daemon ran and is started again in {}",
+                muru_config::format_duration(*wait)
+            )),
+            Adopted::Gone => gone.push(index.to_string()),
+        }
+    }
+
+    let mut message = if pids.is_empty() {
         "none of the server instances was still there".to_owned()
     } else {
         format!("re-adopted the server instances (pid {})", pids.join(", "))
     };
 
-    match indexes.len() {
-        0 => taken_over,
-        1 => format!(
-            "{taken_over}; instance {} was gone and is started again",
-            list(indexes)
-        ),
-        _ => format!(
-            "{taken_over}; instances {} were gone and are started again",
-            list(indexes)
-        ),
+    for clause in ended {
+        message.push_str("; ");
+        message.push_str(&clause);
     }
+
+    match gone.len() {
+        0 => {}
+        1 => message.push_str(&format!(
+            "; instance {} was gone and is started again",
+            list(gone)
+        )),
+        _ => message.push_str(&format!(
+            "; instances {} were gone and are started again",
+            list(gone)
+        )),
+    }
+
+    message
 }
 
 /// Whether a process's command line names the path or is the title, which
@@ -3714,6 +3777,25 @@ impl Daemon {
                     waiting: pools.iter().map(|pool| pool.waiting as usize).sum(),
                     created: full_time(release.created_unix_ms),
                     detour: false,
+                    commit: muru_config::commit_label(&release.spec.metadata).unwrap_or_default(),
+                    git_ref: release
+                        .spec
+                        .metadata
+                        .get("ref")
+                        .map(|name| muru_config::short_ref(name).to_owned())
+                        .unwrap_or_default(),
+                    url: release
+                        .spec
+                        .metadata
+                        .get("url")
+                        .cloned()
+                        .unwrap_or_default(),
+                    description: release
+                        .spec
+                        .metadata
+                        .get("description")
+                        .cloned()
+                        .unwrap_or_default(),
                 });
             }
 
@@ -3734,9 +3816,10 @@ impl Daemon {
                         message: format!(
                             "{}, traffic {}",
                             detour.describe(),
-                            crate::detours::traffic_text(
+                            crate::detours::listed_traffic(
                                 &detour.opening.traffic.word(),
-                                detour.until_unix_ms
+                                detour.until_unix_ms,
+                                &detour.opening.paths
                             )
                         ),
                         created: full_time(
@@ -3761,7 +3844,7 @@ impl Daemon {
                     .map(|(_, by)| by.clone())
                     .unwrap_or_default(),
                 releases,
-                urls: crate::urls::for_app(&app.name, &routes, &hosts, &listeners)
+                urls: crate::urls::for_app(&app.name, &routes, &hosts, &listeners, None)
                     .into_iter()
                     .map(|candidate| candidate.url)
                     .collect(),
@@ -5998,7 +6081,7 @@ impl Daemon {
             Ok(servers) => {
                 let retained_until = matches!(release.state, ReleaseState::Retained)
                     .then(|| Instant::now() + RETENTION);
-                let message = adoption_message(&servers.record());
+                let message = adoption_message(&servers.adopted());
                 self.running.insert(
                     (app.to_owned(), id.to_owned()),
                     Running {
@@ -6441,6 +6524,23 @@ impl Daemon {
             } => {
                 self.stopped(&app, &id, &why, timed_out).await;
             }
+            Command::ServerProbed {
+                app,
+                id,
+                index,
+                pid,
+                answered,
+            } => {
+                self.server_probed(&app, &id, index, pid, answered).await;
+            }
+            Command::ServerEnded {
+                app,
+                id,
+                index,
+                pid,
+            } => {
+                self.server_ended(&app, &id, index, pid).await;
+            }
             Command::StartHeld { app, id, done } => {
                 self.start_held(&app, &id, done).await;
             }
@@ -6654,10 +6754,11 @@ impl Daemon {
                 release,
                 traffic,
                 until_unix_ms,
+                paths,
                 done,
             } => {
                 let _ = done.send(
-                    self.set_detour_traffic(&app, &release, traffic, until_unix_ms, None)
+                    self.set_detour_traffic(&app, &release, traffic, until_unix_ms, paths, None)
                         .await,
                 );
             }
@@ -6715,7 +6816,7 @@ impl Daemon {
             "release.created",
             &subject,
             "info",
-            &format!("from {}", release.spec.source.display()),
+            &format!("from {}", crate::model::created_from(&release.spec)),
         );
 
         let id = release.id.clone();
@@ -7355,6 +7456,7 @@ impl Daemon {
             pycache_prefix: None,
             bytecode: None,
             clean_env: true,
+            development: false,
             app: spec.entrypoint.clone(),
             name: Some(app.to_owned()),
             release: Some(id.to_owned()),
@@ -8461,6 +8563,7 @@ impl Daemon {
 
                 apps.push(pb::AppWorkers {
                     preview_secret: String::new(),
+                    detour_paths: Vec::new(),
                     limits: spec.as_ref().and_then(|spec| spec.limits.message()),
                     app: name.clone(),
                     release: id.clone(),
@@ -8490,7 +8593,7 @@ impl Daemon {
                                 .spec
                                 .static_dirs
                                 .iter()
-                                .filter_map(|entry| entry.message(&places))
+                                .filter_map(|entry| entry.message(&release.spec.source, &places))
                                 .collect()
                         })
                         .unwrap_or_default(),
@@ -8711,6 +8814,7 @@ impl Daemon {
                 .and_then(|limits| request_limits_message(&limits)),
                 traffic: self.route_traffic(&route, &included, &rollouts),
                 client_classes: route.classes().to_vec(),
+                strip_prefix: muru_config::stripped_part(route.strip_prefix.as_deref()).to_owned(),
                 host: route.host,
                 path: route.path,
                 app: route.app,
@@ -12121,13 +12225,18 @@ impl Daemon {
     async fn check_hosts(&mut self) {
         let mut exited = Vec::new();
         let mut reports = Vec::new();
+        let mut marks_changed = false;
 
         for (key, running) in &mut self.running {
             // Section 9.9: a managed server's instances are started
-            // again where they crash; the release stays up.
+            // again where they crash; the release stays up, and an
+            // instance started again is out of service as starting until
+            // it answers (issue 917), which the edge hears in a snapshot.
 
             if let Backend::Servers(servers) = &mut running.backend {
-                let changes = servers.check().await;
+                let marked = servers.starting();
+                let changes = servers.check(&probed(&self.commands, &key.0, &key.1)).await;
+                marks_changed |= servers.starting() != marked;
 
                 if !changes.is_empty() {
                     let run_dir = self
@@ -12199,7 +12308,64 @@ impl Daemon {
             }
         }
 
+        if marks_changed && let Err(error) = self.push_snapshot().await {
+            tracing::warn!(%error, "pushing the snapshot with the instances starting failed");
+        }
+
         self.publish_servers();
+    }
+
+    /// Issue 922: an instance's relay reports its end, which marks the
+    /// instance starting at once and tells the edge, so the requests
+    /// that follow are held rather than refused while the relay reads
+    /// the last of its output and the next check sees the exit.
+    async fn server_ended(&mut self, app: &str, id: &str, index: u32, pid: u32) {
+        let key = (app.to_owned(), id.to_owned());
+
+        let Some(Running {
+            backend: Backend::Servers(servers),
+            ..
+        }) = self.running.get_mut(&key)
+        else {
+            return;
+        };
+
+        if servers.ended(index, pid)
+            && let Err(error) = self.push_snapshot().await
+        {
+            tracing::warn!(%error, "pushing the snapshot with an instance ended failed");
+        }
+    }
+
+    /// Issue 917: an instance started again answered its probe, or did
+    /// not within the readiness timeout; either way its starting mark is
+    /// cleared, and the edge told, unless the probe was of a process the
+    /// instance no longer has.
+    async fn server_probed(&mut self, app: &str, id: &str, index: u32, pid: u32, answered: bool) {
+        let key = (app.to_owned(), id.to_owned());
+
+        let Some(Running {
+            backend: Backend::Servers(servers),
+            ..
+        }) = self.running.get_mut(&key)
+        else {
+            return;
+        };
+
+        let Some(report) = servers.probed(index, pid, answered) else {
+            return;
+        };
+
+        if let Err(error) = self.push_snapshot().await {
+            tracing::warn!(%error, "pushing the snapshot with an instance ready failed");
+        }
+
+        self.events.emit(
+            report.kind,
+            &format!("{app}@{id}"),
+            report.level,
+            &report.message,
+        );
     }
 
     /// Section 8.7: what a release's processes start from, from the
@@ -13318,15 +13484,15 @@ impl Daemon {
     /// release, as its workers' do; counts are read from the host.
     fn relay_watcher(&self, subject: &str) -> crate::host::RelayWatcher {
         let events = self.events.clone();
+        let commands = self.commands.clone();
         let subject = subject.to_owned();
 
-        std::sync::Arc::new(move |news| {
-            if let crate::host::RelayNews::Event {
+        std::sync::Arc::new(move |news| match news {
+            crate::host::RelayNews::Event {
                 kind,
                 level,
                 message,
-            } = news
-            {
+            } => {
                 let level = if level == "warning" {
                     "warning"
                 } else {
@@ -13334,6 +13500,27 @@ impl Daemon {
                 };
                 events.emit(&kind, &subject, level, &message);
             }
+
+            // Issue 922: a managed server's instance ended; the loop
+            // marks it starting.
+            crate::host::RelayNews::Ended { index, pid } => {
+                let Some((app, id)) = subject.split_once('@') else {
+                    return;
+                };
+
+                let command = Command::ServerEnded {
+                    app: app.to_owned(),
+                    id: id.to_owned(),
+                    index,
+                    pid,
+                };
+                let commands = commands.clone();
+
+                tokio::spawn(async move {
+                    let _ = commands.send(command).await;
+                });
+            }
+            crate::host::RelayNews::Dropped(_) => {}
         })
     }
 
@@ -13790,6 +13977,7 @@ fn upstream_message(name: &str, table: &muru_config::Upstream) -> anyhow::Result
         sendfile_roots: table.sendfile_roots.clone(),
         sendfile_header: table.sendfile_header.clone().unwrap_or_default(),
         detour: false,
+        starting: Vec::new(),
         connect_timeout_ms: millis(table.connect_timeout.as_deref()),
         probe: health.map(|health| pb::UpstreamProbe {
             path: health.path.clone().unwrap_or_default(),
@@ -13879,34 +14067,36 @@ mod tests {
 
     #[test]
     fn the_adoption_event_names_the_instances_kept_and_those_started_again() {
-        let adopted = |pids: &[u32]| ServersRecord {
-            instances: (0..)
-                .zip(pids)
-                .map(|(index, pid)| crate::servers::InstanceRecord {
-                    index,
-                    pid: *pid,
-                    address: String::new(),
-                    started_unix_ms: 0,
-                    quick_exits: 0,
-                    start_time: 0,
-                    relay_pid: 0,
-                    relay_start_time: 0,
-                })
-                .collect(),
-        };
+        use crate::supervisor::Adopted;
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let adopted =
+            |found: &[Adopted]| -> Vec<(u32, Adopted)> { (0..).zip(found.to_vec()).collect() };
 
         assert_eq!(
-            adoption_message(&adopted(&[41, 42])),
+            adoption_message(&adopted(&[Adopted::Kept(41), Adopted::Kept(42)])),
             "re-adopted the server instances (pid 41, 42)"
         );
         assert_eq!(
-            adoption_message(&adopted(&[41, 0])),
+            adoption_message(&adopted(&[Adopted::Kept(41), Adopted::Gone])),
             "re-adopted the server instances (pid 41); instance 1 was gone and is started again"
         );
         assert_eq!(
-            adoption_message(&adopted(&[0, 0, 0])),
+            adoption_message(&adopted(&[Adopted::Gone, Adopted::Gone, Adopted::Gone])),
             "none of the server instances was still there; \
              instances 0, 1 and 2 were gone and are started again"
+        );
+
+        // Issue 916: one that ended while no daemon ran says how, once.
+
+        let killed = Adopted::Ended {
+            exit: crate::supervisor::Exit::Status(std::process::ExitStatus::from_raw(9)),
+            wait: Duration::from_secs(1),
+        };
+        assert_eq!(
+            adoption_message(&adopted(&[Adopted::Kept(41), killed])),
+            "re-adopted the server instances (pid 41); instance 1 exited with signal: 9 (SIGKILL) \
+             while no daemon ran and is started again in 1s"
         );
     }
 

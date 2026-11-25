@@ -412,6 +412,11 @@ def test_wrap_application_wraps_every_entry_point_in_each_worker(tmp_path: Path)
     try:
         assert server.get("/").header("X-Wrapped") == "wsgi"
         worker = server.worker_pids()[0]
+
+        # The worker imports on its first request, and its lines can reach
+        # the log after the response does (issue 904).
+
+        assert server.wait_for_log("WRAP entrypoint - wsgi")
         assert wrap_lines(server) == [
             f"WRAP load_finished serve pid={worker}",
             f"WRAP entrypoint - wsgi pid={worker}",

@@ -395,6 +395,15 @@
     return found && found.description ? found.description : null;
   };
 
+  // Section 4.21: a request outside a detour's paths was served by the
+  // serving release, which the daemon's edge names, and this run has no
+  // record of.
+
+  const servedElsewhere = (entry) => {
+    const found = (entry.serverTiming || []).find((timing) => timing.name === "muru-release");
+    return found && found.description ? found.description : null;
+  };
+
   const add = (entry) => {
     const address = new URL(entry.name, location.href);
     const sameOrigin = address.origin === location.origin;
@@ -412,6 +421,7 @@
       address,
       sameOrigin,
       cached,
+      servedBy: cached ? null : servedElsewhere(entry),
       requestId: cached ? null : muruId(entry) || (navigation ? id : null),
     });
   };
@@ -526,6 +536,7 @@
     "Redirects that led to the page are not shown.",
     "A response from the browser's cache is marked cache, since no request reached Muru.",
     "A request to another origin has the browser's figures only.",
+    "Under a detour that takes only some paths, a request outside them is served by the serving release, which this run has no record of.",
   ];
 
   const drawRow = (row, total, labels) => {
@@ -570,7 +581,7 @@
       line.append(cell(String(known.logs), known.logs ? "num warning" : "num muted"));
       line.append(cell(String(known.errors), known.errors ? "num error" : "num muted"));
     } else {
-      const why = row.cached ? "cache" : !row.sameOrigin ? "another origin" : !row.requestId ? "no record" : known === null ? "no longer kept" : "…";
+      const why = row.cached ? "cache" : !row.sameOrigin ? "another origin" : row.servedBy ? `served by the serving release ${row.servedBy}` : !row.requestId ? "no record" : known === null ? "no longer kept" : "…";
       const reason = cell(why, "muted");
       reason.colSpan = 4;
       line.append(reason);

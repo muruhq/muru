@@ -27,6 +27,26 @@ from support import server as support
 
 SHOP = support.ROOT / "tests" / "fixtures" / "projects" / "shop"
 FACTORY = support.ROOT / "tests" / "fixtures" / "projects" / "factory"
+TUTORIAL_RELEASES = support.ROOT / "docs" / "tutorials" / "code" / "releases"
+
+
+def tutorial_site(directory: Path) -> Path:
+    """The deploy tutorials' `site` directory: a copy of each release the
+    pages include, beside a `.venv` that is this interpreter's, which each
+    release's `[tool.muru]` names as `../.venv/bin/python`."""
+
+    site = directory / "site"
+    site.mkdir()
+    (site / ".venv").symlink_to(Path(sys.prefix), target_is_directory=True)
+
+    for release in sorted(TUTORIAL_RELEASES.iterdir()):
+        target = site / release.name
+        target.mkdir()
+
+        for name in ["app.py", "pyproject.toml"]:
+            (target / name).write_text((release / name).read_text())
+
+    return site
 
 
 def stamp(at: float) -> str:
@@ -59,11 +79,15 @@ class Daemon:
         check: bool = True,
         stdin: str | None = None,
         cwd: Path | None = None,
+        git_metadata: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         """Run a muructl command against this daemon, with `stdin` as its input, in `cwd`.
 
         Commands that work from the daemon's files rather than its socket
-        (the secret commands) get the daemon's locations instead.
+        (the secret commands) get the daemon's locations instead. A deploy
+        records nothing from git unless `git_metadata` says to, since the
+        fixtures are in Muru's own checkout, whose commit and changes would
+        follow every deploy line.
         """
 
         muructl = support.muructl_path()
@@ -82,6 +106,9 @@ class Daemon:
             ]
         else:
             where = ["--socket", str(self.run_dir / "admin.sock")]
+
+        if arguments and arguments[0] == "deploy" and not git_metadata:
+            where = [*where, "--no-git-metadata"]
 
         # A command after -- belongs to the server a deploy runs, so the
         # daemon's own options go before it.
@@ -127,10 +154,18 @@ class Daemon:
 
         return completed
 
-    def deploy(self, app: str, source: Path, *arguments: str) -> str:
+    def deploy(self, app: str, source: Path, *arguments: str, git_metadata: bool = False) -> str:
         """Deploy and return the line muructl printed."""
 
-        completed = self.muructl("deploy", app, str(source), "--python", sys.executable, *arguments)
+        completed = self.muructl(
+            "deploy",
+            app,
+            str(source),
+            "--python",
+            sys.executable,
+            *arguments,
+            git_metadata=git_metadata,
+        )
         return completed.stdout.strip()
 
     def get(self, path: str = "/") -> support.Response:

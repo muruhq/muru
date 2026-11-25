@@ -30,6 +30,7 @@ from support.daemon import Daemon, start_daemon
 
 FIXTURE = support.ROOT / "tests" / "fixtures" / "projects" / "detoured"
 GREETER = support.ROOT / "tests" / "fixtures" / "projects" / "grpcsvc" / "greeter.proto"
+STATIC = support.ROOT / "tests" / "fixtures" / "static"
 
 # The daemon's own error page replaces a 500 its releases send, which a
 # detour's traceback passes by.
@@ -53,6 +54,7 @@ class Detour:
         assert muructl is not None
         self.log_path = project.parent / "detour.out"
         self.handle = self.log_path.open("ab")
+        self.start = self.handle.tell()
         self.process = subprocess.Popen(
             [
                 str(muructl),
@@ -75,7 +77,11 @@ class Detour:
         self.wait_for_log("admin socket")
 
     def log(self) -> str:
-        return self.log_path.read_text(errors="replace")
+        """What this run has written, after what runs before it wrote."""
+
+        with self.log_path.open("rb") as log:
+            log.seek(self.start)
+            return log.read().decode(errors="replace")
 
     def wait_for_log(self, text: str, timeout: float = 60.0) -> None:
         deadline = time.monotonic() + timeout
@@ -180,7 +186,9 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         launcher = tmp_path / "browser"
         launcher.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{opened}'\n")
         launcher.chmod(0o755)
-        detour = Detour(project, daemon, "--open-preview", env={"BROWSER": str(launcher)})
+        detour = Detour(
+            project, daemon, "--open-preview", "--toolbar", env={"BROWSER": str(launcher)}
+        )
         detour.wait_for_log("in preview of")
         deadline = time.monotonic() + 20
 
@@ -232,6 +240,23 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         assert "server-timing" in seen["headers"]
         assert "muru-preview" not in seen["headers"]
         assert seen["preview"] == ""
+
+        # The toolbar is the developer's: a page reached by the preview
+        # gets it, and its files and records answer the preview.
+
+        document = {"Sec-Fetch-Dest": "document"}
+        page = daemon.request("/page", headers={**preview, **document})
+        assert b'src="/_muru/toolbar/toolbar.js"' in page.body, page.body
+        assert daemon.request("/_muru/toolbar/toolbar.js", headers=preview).status == 200
+        assert daemon.request("/_muru/toolbar/history", headers=preview).status == 200
+
+        # It answers whatever name the daemon routed to the detour, and
+        # still refuses another site's page.
+
+        for name in ("shop.lan", "x.echo.test"):
+            assert daemon.request("/_muru/toolbar/toolbar.js", name, headers=preview).status == 200
+        cross = {**preview, "Sec-Fetch-Site": "cross-site"}
+        assert daemon.request("/_muru/toolbar/history", headers=cross).status == 403
 
         # The detour is listed, with no secret, and its run is an instance
         # of kind detour that --instance reaches by its tag.
@@ -317,7 +342,7 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         # says so, by an overlay it owns, and back again.
 
         switched = daemon.muructl("detour", "traffic", "all", cwd=project)
-        assert "now takes all of detoured's traffic (was preview)" in switched.stdout
+        assert "now takes all of detoured's traffic (was previews only)" in switched.stdout
         assert served(daemon)["instance"].startswith("detour:")
         overlays = daemon.muructl("overlay", "list").stdout
         assert "detour:detoured" in overlays and "detour" in overlays
@@ -325,6 +350,20 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         assert refused.returncode != 0
         assert "muructl detour traffic" in refused.stderr
         detour.wait_for_log("now takes all of detoured's traffic")
+
+        # A client the traffic choice sends to the detour gets the page as
+        # the application made it, and none of the run's records, even
+        # naming the header the daemon's edge tells the run with.
+
+        page = daemon.request("/page", headers=document)
+        assert page.status == 200 and b"_muru/toolbar" not in page.body, page.body
+
+        for forged in ({}, {"X-Muru-Detour": "preview"}):
+            for path in ("/_muru/toolbar/toolbar.js", "/_muru/toolbar/history"):
+                assert daemon.request(path, headers=forged).status == 404, (path, forged)
+
+        page = daemon.request("/page", headers={**preview, **document})
+        assert b'src="/_muru/toolbar/toolbar.js"' in page.body, page.body
 
         daemon.muructl("detour", "traffic", "detoured", "preview")
         assert not served(daemon)["instance"].startswith("detour:")
@@ -367,6 +406,99 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
 
         assert detour.log().count("now takes previews only") >= reverted, detour.log()
 
+        # A detour may take only some paths: the rest goes to the serving
+        # release, a preview's included, which the response says for the
+        # page's toolbar, whose own paths stay in the detour's scope.
+
+        scoped = daemon.muructl("detour", "traffic", "all", "--path", "/scoped", cwd=project)
+        assert "now takes all of detoured's traffic under /scoped (was previews only)" in (
+            scoped.stdout
+        ), scoped.stdout
+        assert served(daemon, "/scoped/x")["instance"].startswith("detour:")
+        assert not served(daemon, "/scopedx")["instance"].startswith("detour:")
+        outside = served(daemon, "/other", **preview)
+        assert not outside["instance"].startswith("detour:")
+        assert 'muru-release;desc="' in outside["headers"].get("server-timing", ""), outside
+        assert daemon.request("/_muru/toolbar/toolbar.js", headers=preview).status == 200
+        assert "all under /scoped" in daemon.muructl("detour", "list").stdout
+        assert "every route pinned, under /scoped" in daemon.muructl("overlay", "list").stdout
+        assert "all under /scoped now" in daemon.muructl("events").stdout
+        daemon.muructl("detour", "traffic", "preview", "--all-paths", cwd=project)
+        assert served(daemon, "/other", **preview)["instance"].startswith("detour:")
+
+        # Behind a route at a sub path the toolbar lives under the route,
+        # so its requests reach the detour as the page's do: the route's
+        # path when it strips nothing, the forwarded prefix when it strips.
+
+        hosts = tmp_path / "hosts.toml"
+        hosts.write_text(
+            '[host.any]\ndefault = true\n\n[[route]]\nhost = "any"\napp = "detoured"\n\n'
+            '[host.sub]\nnames = ["sub.test"]\n\n'
+            '[[route]]\nhost = "sub"\npath = "/app"\napp = "detoured"\n\n'
+            '[host.strip]\nnames = ["strip.test"]\n\n'
+            '[[route]]\nhost = "strip"\npath = "/app"\napp = "detoured"\n'
+            'strip_prefix = "/app"\n\n'
+            '[host.wild]\nnames = ["*.wild.test"]\n\n'
+            '[[route]]\nhost = "wild"\npath = "/w"\napp = "detoured"\n\n'
+            '[host.files]\nnames = ["files.localhost"]\n\n'
+            f'[[route]]\nhost = "files"\nstatic = "{STATIC}"\nfallback = {{ app = "detoured" }}\n'
+        )
+        daemon.muructl("apply", "-f", str(hosts))
+
+        # The application's URLs: the nameless default host's by the
+        # listener's address, the static route's whose fallback it is, and
+        # a wildcard host's only under a name asked for, which the host
+        # must take.
+
+        port = daemon.port
+        listed = daemon.muructl("open", "detoured", "--list").stdout
+        assert f"http://localhost:{port}/ " in listed, listed
+        assert f"http://files.localhost:{port}/ " in listed, listed
+        assert "left out: sub.test does not resolve" in listed, listed
+        named = daemon.muructl(
+            "open", "detoured", "--print", "--name", "alice.wild.test", "--any-name"
+        ).stdout
+        assert named.strip() == f"http://alice.wild.test:{port}/w"
+        named = daemon.muructl("open", "detoured", "--print", "--name", "x.test", "--any-name")
+        assert named.stdout.strip() == f"http://x.test:{port}/", "the default host takes it"
+
+        # A preview link is for a name that reaches this machine, or the
+        # name asked for.
+
+        link = daemon.muructl("detour", "preview", "--print", cwd=project).stdout.strip()
+        assert urllib.parse.urlsplit(link).hostname in ("localhost", "files.localhost"), link
+        link = daemon.muructl(
+            "detour", "preview", "--print", "--name", "bob.wild.test", "--any-name", cwd=project
+        ).stdout.strip()
+        assert link.startswith(f"http://bob.wild.test:{port}/_muru/preview/"), link
+
+        for name in ("sub.test", "strip.test"):
+            page = daemon.request("/app/page", name, headers={**preview, **document})
+            assert b'src="/app/_muru/toolbar/toolbar.js"' in page.body, (name, page.body)
+            script = daemon.request("/app/_muru/toolbar/toolbar.js", name, headers=preview)
+            assert script.status == 200, (name, script.body)
+            unpreviewed = daemon.request("/app/_muru/toolbar/history", name)
+            assert not json.loads(unpreviewed.body)["instance"].startswith("detour:")
+
+        assert (
+            daemon.request("/_muru/toolbar/toolbar.js", "sub.test", headers=preview).status == 404
+        )
+
+        # Behind the stripping route the detour sees what the release it
+        # stands in for does; for the stripped part itself it is sent the
+        # path /, as any upstream is.
+
+        through = daemon.request("/app/foo", "strip.test", headers=preview)
+        release = daemon.request("/app/foo", "strip.test")
+
+        for response in (through, release):
+            report = json.loads(response.body)
+            assert (report["script_name"], report["path_info"]) == ("/app", "/foo")
+
+        assert json.loads(through.body)["instance"].startswith("detour:")
+        bare_part = json.loads(daemon.request("/app", "strip.test", headers=preview).body)
+        assert (bare_part["script_name"], bare_part["path_info"]) == ("/app", "/")
+
         # The detour ends with its run, and the daemon's traffic is back on
         # the serving release at once.
 
@@ -381,6 +513,45 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         assert "Max-Age=0" in stale["headers"].get("set-cookie", "")
         events = daemon.events()
         assert "detour.opened" in events and "detour.closed" in events
+
+        # A checkout whose mounts differ from the serving release's says
+        # so as its detour opens, and serves its own; with --mounts
+        # release it serves the release's.
+
+        bare = tmp_path / "bare"
+        bare.mkdir()
+        for module in project.glob("*.py"):
+            shutil.copy(module, bare / module.name)
+
+        (bare / "muru.toml").write_text('entrypoint = "detoured:wsgi_app"\nthreads = 2\n')
+        detour = Detour(bare, daemon, "detoured")
+        detour.wait_for_log("on detour detoured@")
+        assert "warning: the serving release detoured@" in detour.log(), detour.log()
+        assert "mounts detoured:asgi_app at /ws (auto) as ws, which this checkout does not" in (
+            detour.log()
+        )
+        assert "--mounts release" in detour.log()
+        bare_value = daemon.muructl("detour", "preview", "--header", cwd=bare).stdout
+        bare_preview = dict([bare_value.strip().split(": ", 1)])
+        own = served(daemon, "/ws/x", **bare_preview)
+        assert own["instance"].startswith("detour:")
+        assert (own["script_name"], own["path_info"]) == ("", "/ws/x")
+        detour.stop()
+
+        detour = Detour(bare, daemon, "detoured", "--mounts", "release")
+        detour.wait_for_log("on detour detoured@")
+        assert "serving the mounts of the serving release detoured@" in detour.log()
+        assert "warning: the serving release" not in detour.log()
+        bare_value = daemon.muructl("detour", "preview", "--header", cwd=bare).stdout
+        bare_preview = dict([bare_value.strip().split(": ", 1)])
+
+        with websockets.connect(
+            f"ws://127.0.0.1:{daemon.port}/ws/echo", additional_headers=bare_preview
+        ) as socket:
+            socket.send("mounted")
+            assert socket.recv(timeout=10).split()[1] == "mounted"
+
+        detour.stop()
     finally:
         if detour is not None:
             detour.stop()

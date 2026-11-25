@@ -70,26 +70,57 @@ pub fn reserved(path: &str) -> bool {
     path.starts_with(PREFIX)
 }
 
+/// The path of a request under the reserved prefix as the toolbar reads
+/// it, when it is one: under `base`, the path of the route that reached a
+/// detour's run (section 4.21), with `base` taken off; empty for a run's
+/// own requests, whose prefix is at the root.
+pub fn reserved_under<'a>(path: &'a str, base: &str) -> Option<&'a str> {
+    let within = path.strip_prefix(base)?;
+    reserved(within).then_some(within)
+}
+
+/// Whether the toolbar is a request's: its pages get the toolbar and its
+/// requests under the reserved prefix are answered. Every request of a
+/// development run's own, and of a detour's run, `detour_run`, only one
+/// that the daemon's edge says reached it by its preview (section 4.21):
+/// the developer's, never a client's that a traffic choice sent there.
+pub fn for_request(detour_run: bool, via: Option<&crate::detour::Via>) -> bool {
+    !detour_run || via.is_some_and(|via| via.previewed)
+}
+
+/// The answer under the reserved prefix to a request the toolbar is not
+/// for.
+pub fn not_found() -> Response<ResponseBody> {
+    plain(StatusCode::NOT_FOUND, "not found\n")
+}
+
 /// Answer a request under the reserved prefix: under the toolbar's paths,
 /// its files, a record as JSON, one of its panels drawn, or the summaries
-/// of several records, and anything else not found. Only GET and HEAD,
+/// of several records, and anything else not found, `path` being the
+/// request's path from the reserved prefix on. Only GET and HEAD,
 /// only from a loopback host or one of the run's own names, and never
-/// from another site's page.
+/// from another site's page. A detour's run, `detour_run`, answers any
+/// host name: its one peer is the daemon's edge, which has routed the
+/// request to it (section 4.21).
 pub fn answer(
     parts: &http::request::Parts,
+    path: &str,
     links: &Links,
     recorder: &Recorder,
     renderer: &Renderer,
+    detour_run: bool,
 ) -> Response<ResponseBody> {
     if parts.method != Method::GET && parts.method != Method::HEAD {
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served here\n");
     }
 
-    if let Err(why) = allowed(&parts.headers, &links.hosts()) {
+    let hosts = (!detour_run).then(|| links.hosts());
+
+    if let Err(why) = allowed(&parts.headers, hosts.as_deref()) {
         return plain(StatusCode::FORBIDDEN, why);
     }
 
-    let Some(within) = parts.uri.path().strip_prefix(TOOLBAR) else {
+    let Some(within) = path.strip_prefix(TOOLBAR) else {
         return plain(StatusCode::NOT_FOUND, "not found\n");
     };
 
@@ -410,19 +441,23 @@ fn not_kept(request_id: &str) -> Response<ResponseBody> {
 }
 
 /// Why a request to the reserved prefix is refused, if it is: a Host
-/// that is neither loopback nor one of the run's names (DNS rebinding),
-/// or a fetch from another site's page.
-pub fn allowed(headers: &HeaderMap, hosts: &[String]) -> Result<(), &'static str> {
-    let host = headers
-        .get(http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(crate::routing::host_only)
-        .unwrap_or_default();
+/// that is neither loopback nor one of the run's names `hosts` (DNS
+/// rebinding), or a fetch from another site's page. With no `hosts` the
+/// Host is not looked at, which is a detour's run: the daemon's edge has
+/// matched the request to one of its virtual hosts already.
+pub fn allowed(headers: &HeaderMap, hosts: Option<&[String]>) -> Result<(), &'static str> {
+    if let Some(hosts) = hosts {
+        let host = headers
+            .get(http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .map(crate::routing::host_only)
+            .unwrap_or_default();
 
-    let named = hosts.iter().any(|name| name.eq_ignore_ascii_case(&host));
+        let named = hosts.iter().any(|name| name.eq_ignore_ascii_case(&host));
 
-    if !named && !loopback(&host) {
-        return Err("the toolbar answers only to loopback and the run's own host names\n");
+        if !named && !loopback(&host) {
+            return Err("the toolbar answers only to loopback and the run's own host names\n");
+        }
     }
 
     // Section 4.20: the toolbar's own requests are same-origin; a page
@@ -1071,7 +1106,14 @@ mod tests {
                 .body(())
                 .unwrap()
                 .into_parts();
-            answer(&parts, &links, &recorder, &Renderer::new(None))
+            answer(
+                &parts,
+                parts.uri.path(),
+                &links,
+                &recorder,
+                &Renderer::new(None),
+                false,
+            )
         };
 
         let response = ask("/_muru/toolbar/requests?ids=B%2C1,NOSUCH,A,B%2C1");
@@ -1149,6 +1191,21 @@ mod tests {
     }
 
     #[test]
+    fn the_reserved_prefix_lies_under_a_detours_route() {
+        assert_eq!(
+            reserved_under("/_muru/toolbar/toolbar.js", ""),
+            Some("/_muru/toolbar/toolbar.js")
+        );
+        assert_eq!(
+            reserved_under("/app/_muru/toolbar/history", "/app"),
+            Some("/_muru/toolbar/history")
+        );
+        assert_eq!(reserved_under("/_muru/toolbar/history", "/app"), None);
+        assert_eq!(reserved_under("/apple/_muru/toolbar/history", "/app"), None);
+        assert_eq!(reserved_under("/app/page", "/app"), None);
+    }
+
+    #[test]
     fn only_a_loopback_or_named_host_and_its_own_pages_are_answered() {
         let headers = |host: &'static str, site: Option<&'static str>| {
             let mut headers = HeaderMap::new();
@@ -1162,17 +1219,48 @@ mod tests {
         };
         let hosts = vec!["shop.test".to_owned()];
 
-        assert!(allowed(&headers("127.0.0.1:8080", Some("same-origin")), &hosts).is_ok());
-        assert!(allowed(&headers("[::1]:8080", None), &hosts).is_ok());
-        assert!(allowed(&headers("localhost:8080", Some("none")), &hosts).is_ok());
-        assert!(allowed(&headers("app.localhost", None), &hosts).is_ok());
-        assert!(allowed(&headers("shop.test:8443", None), &hosts).is_ok());
         assert!(
-            allowed(&headers("attacker.example", None), &hosts).is_err(),
+            allowed(
+                &headers("127.0.0.1:8080", Some("same-origin")),
+                Some(hosts.as_slice())
+            )
+            .is_ok()
+        );
+        assert!(allowed(&headers("[::1]:8080", None), Some(hosts.as_slice())).is_ok());
+        assert!(
+            allowed(
+                &headers("localhost:8080", Some("none")),
+                Some(hosts.as_slice())
+            )
+            .is_ok()
+        );
+        assert!(allowed(&headers("app.localhost", None), Some(hosts.as_slice())).is_ok());
+        assert!(allowed(&headers("shop.test:8443", None), Some(hosts.as_slice())).is_ok());
+        assert!(
+            allowed(&headers("attacker.example", None), Some(hosts.as_slice())).is_err(),
             "rebinding"
         );
-        assert!(allowed(&headers("127.0.0.1", Some("cross-site")), &hosts).is_err());
-        assert!(allowed(&headers("127.0.0.1", Some("same-site")), &hosts).is_err());
+        assert!(
+            allowed(
+                &headers("127.0.0.1", Some("cross-site")),
+                Some(hosts.as_slice())
+            )
+            .is_err()
+        );
+        assert!(
+            allowed(
+                &headers("127.0.0.1", Some("same-site")),
+                Some(hosts.as_slice())
+            )
+            .is_err()
+        );
+
+        // A detour's run answers whatever name the daemon routed to it,
+        // and still never another site's page.
+
+        assert!(allowed(&headers("x.echo.test", None), None).is_ok());
+        assert!(allowed(&headers("shop.lan", Some("same-origin")), None).is_ok());
+        assert!(allowed(&headers("shop.lan", Some("cross-site")), None).is_err());
     }
 
     #[test]

@@ -13,7 +13,7 @@ specification is maintained.
 
 | Key | Value |
 | --- | --- |
-| REQUEST_METHOD, SCRIPT_NAME, PATH_INFO, QUERY_STRING | from the request; SCRIPT_NAME is the trusted prefix plus the mount path |
+| REQUEST_METHOD, SCRIPT_NAME, PATH_INFO, QUERY_STRING | from the request; SCRIPT_NAME is the trusted prefix, then the part the route strips (`strip_prefix`, section 4.5), then the mount path |
 | CONTENT_TYPE, CONTENT_LENGTH | from headers; CONTENT_LENGTH also set for buffered chunked bodies |
 | SERVER_NAME, SERVER_PORT, SERVER_PROTOCOL | matched or canonical host name, resolved port, client protocol (HTTP/1.1, HTTP/2, HTTP/3) |
 | REMOTE_ADDR, REMOTE_PORT | resolved client; REMOTE_PORT only when known |
@@ -50,16 +50,19 @@ Standard ASGI 3.0 keys (type, asgi, http_version, method, scheme, path, raw_path
 | Variable | Meaning |
 | --- | --- |
 | MURU_APP, MURU_RELEASE | application and release, also for a command run with the release (section 9.12); a command muructl runs itself for a project has no MURU_RELEASE |
-| MURU_GROUP, MURU_WORKER_ID | worker group and worker id, set after fork |
-| MURU_RELEASE_DIR, MURU_RUN_DIR | release source (also the working directory) and run directory |
+| MURU_GROUP, MURU_WORKER_ID | worker group, and the worker's index within its group, the same as `muru.context().worker_id` and reused when a worker is replaced, set in each worker after the fork; neither is set in the host or a command (issue 852) |
+| MURU_RELEASE_DIR | release source (also the working directory) |
+| MURU_COMMAND | the declared command that runs, in a command (section 9.12) |
 | MURU_DATA_DIR, MURU_MEDIA_DIR, MURU_UPLOADS_DIR | the application's data directory, shared by every release, and its media part (served by file hints and `media:` static entries) and uploads part (never served, `upload.save()`'s default) (section 13.8, issue 849); unset under muructl serve without a data directory |
 | MURU_STATIC_DIR | the release's own directory of built static files, `static:` in static entries (section 13.8, issue 850) |
-| MURU_INTERFACE, MURU_PROCESSES, MURU_THREADS | default mount interface and process model |
 | MURU_LOG_LEVEL, MURU_LOG_FORMAT | Python logging defaults |
-| MURU_DEVELOPMENT | set to 1 in muructl run |
+| MURU_DEVELOPMENT | 1 in the host, workers and commands of a development run: muructl run without --allow-public, and a detour; never under the daemon or muructl serve (issue 852). `muru.context().development` says the same |
+| MURU_HTTP_BIND, MURU_SERVER_INDEX, PORT | for each instance of a managed HTTP server (section 9.9): where it listens, as the upstream names it (`unix:/path` or `127.0.0.1:PORT`), its index from 0, and for a port bind the port |
 | MURU_UNDER_INIT | set to 1 by the built-in init of a container's PID 1 for the command it runs (section 6.10), which a daemon takes as the reason to shut down on SIGTERM |
 
-MURU_* variables cannot be overridden by application or release settings. MURU_DATA_DIR, MURU_MEDIA_DIR, MURU_UPLOADS_DIR and MURU_STATIC_DIR are never read by muructl as configuration, and under muructl run and muructl serve, which pass on the environment they were started with, one the process has no place for is removed rather than inherited.
+MURU_* variables cannot be overridden by application or release settings. MURU_DATA_DIR, MURU_MEDIA_DIR, MURU_UPLOADS_DIR and MURU_STATIC_DIR are never read by muructl as configuration, and under muructl run and muructl serve, which pass on the environment they were started with, one the process has no place for is removed rather than inherited; so are MURU_DEVELOPMENT outside a development run and MURU_WORKER_ID outside a worker.
+
+The interface, process count and thread count are not variables (issue 852). Interface is a mount's, a release can mix WSGI and ASGI, and with a factory it is settled in each worker; the process count changes while workers run, by the autoscaler or a scale, so a value fixed at the fork goes stale; and threads are not one number, since mounts and groups have pools of their own. `muru.context()` gives the default mount's interface and the process model. The run directory is not given to the application either: under the daemon it is shared by every application and holds the admin and worker sockets, and muructl reads MURU_RUN_DIR only as a location (D.4).
 
 ## D.4 Environment variables read by muructl
 

@@ -242,7 +242,7 @@ impl Relayed {
     /// recorded, and read its reports.
     fn adopt(relay: &RelaySpec, recorded: &InstanceRecord) -> Self {
         let reopens = tokio::sync::watch::channel(0).0;
-        let reports = watch_relay(relay, recorded.index, &reopens);
+        let reports = watch_relay(relay, recorded.index, recorded.pid, &reopens);
 
         Self {
             relay: RelayProcess::Adopted,
@@ -367,10 +367,13 @@ const RELAY_START_WAIT: Duration = Duration::from_secs(10);
 
 /// Read a relay's reports from its control socket: its counts into the
 /// release's total, its events to the watcher, its reopens into
-/// `reopens`. A relay just started is given a moment to bind the socket.
+/// `reopens`, and the end of its process, by `pid`, to the watcher, when
+/// the relay reports it or its connection closes (issue 922). A relay
+/// just started is given a moment to bind the socket.
 fn watch_relay(
     relay: &RelaySpec,
     index: u32,
+    pid: u32,
     reopens: &tokio::sync::watch::Sender<u64>,
 ) -> tokio::task::JoinHandle<()> {
     let socket = relay.control(index);
@@ -380,6 +383,7 @@ fn watch_relay(
 
     tokio::spawn(async move {
         let mut counted = 0u64;
+        let mut ended = false;
 
         for _ in 0..100 {
             let result = crate::relay::watch_reports(&socket, |report| match report {
@@ -396,10 +400,23 @@ fn watch_relay(
                 }),
                 crate::relay::Report::Reopened => reopens.send_modify(|count| *count += 1),
                 crate::relay::Report::Flushed => {}
+                crate::relay::Report::Ended { .. } => {
+                    ended = true;
+                    watcher(crate::host::RelayNews::Ended { index, pid });
+                }
             })
             .await;
 
+            // Issue 922: a relay that exits as soon as it has reaped its
+            // process, with nothing left to read, can be gone before its
+            // report of the end is written, as can one too old to send
+            // it. Its connection closing says the same.
+
             if result.is_ok() {
+                if !ended {
+                    watcher(crate::host::RelayNews::Ended { index, pid });
+                }
+
                 return;
             }
 
@@ -645,9 +662,6 @@ pub struct Instance {
     due: Option<Instant>,
     /// What the process that exited left running, until it has gone.
     leftover: Option<Leftover>,
-    /// How a process that ended while no daemon looked did, as its relay
-    /// recorded it, for the first check to report.
-    ended: Option<Exit>,
 }
 
 impl Instance {
@@ -661,7 +675,6 @@ impl Instance {
             quick_exits: 0,
             due: None,
             leftover: None,
-            ended: None,
         }
     }
 
@@ -699,6 +712,25 @@ impl Instance {
             relay_start_time: self.process.as_ref().map_or(0, |process| process.relay().1),
         }
     }
+}
+
+/// What adoption found of one instance, for the event that says so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Adopted {
+    /// Its process was there and is taken over, with this pid.
+    Kept(u32),
+    /// It ended while no daemon looked, as its relay recorded, and is
+    /// started again after `wait`, as after any exit (issue 916).
+    Ended {
+        /// How it ended.
+        exit: Exit,
+        /// The wait before it is started again.
+        wait: Duration,
+    },
+    /// It was not there, with no record of how it ended, or it was
+    /// waiting to be started when the record was written; it is started
+    /// at once.
+    Gone,
 }
 
 /// A change the supervisor reports, for the event stream.
@@ -753,6 +785,9 @@ pub struct Supervisor {
     spec: Spec,
     policy: RestartPolicy,
     instances: Vec<Instance>,
+    /// What adoption found of each instance, in order; empty for
+    /// instances this daemon started.
+    adopted: Vec<Adopted>,
 }
 
 impl Supervisor {
@@ -774,6 +809,7 @@ impl Supervisor {
             spec,
             policy,
             instances,
+            adopted: Vec::new(),
         };
 
         for position in 0..supervisor.instances.len() {
@@ -792,11 +828,15 @@ impl Supervisor {
     /// Adoption is instance by instance. One whose process is still
     /// there is taken over: it is stopped with signals rather than
     /// waited for, and when it exits it is started again as a child of
-    /// this daemon. One that is not there, because it exited while no
-    /// daemon was looking or was waiting to be started when the record
-    /// was written (pid 0), is an instance that exited: it is due at
-    /// once, so the next `check` starts it. Only a record that names no
-    /// instance is refused.
+    /// this daemon. One whose relay recorded how it ended while no
+    /// daemon was looking has its exit counted here, as `check` counts
+    /// one, and waits as long before it is started again, so that the
+    /// exit is reported once, by adoption, and not again by the first
+    /// check (issue 916). One that is not there with no such record, or
+    /// was waiting to be started when the record was written (pid 0),
+    /// is due at once, so the next `check` starts it. `adopted` says
+    /// which each was. Only a record that names no instance is
+    /// refused.
     ///
     /// The waits between starts carry on as if the daemon had not
     /// changed: an instance's exits in a row are as recorded, and one
@@ -825,63 +865,79 @@ impl Supervisor {
         );
         let now = Instant::now();
         let now_unix_ms = crate::model::now_unix_ms();
+        let mut found = Vec::with_capacity(instances.len());
+
+        // How long a recorded process has run, by the wall clock; a
+        // record that does not say when it started gives none.
+
+        let since = |recorded: &InstanceRecord| {
+            let run = match recorded.started_unix_ms {
+                0 => Duration::ZERO,
+                started => Duration::from_millis(now_unix_ms.saturating_sub(started)),
+            };
+
+            now.checked_sub(run).unwrap_or(now)
+        };
+
         let instances = record
             .instances
             .iter()
             .zip(instances)
             .map(|(recorded, instance)| {
-                let instance = Instance {
+                let mut instance = Instance {
                     quick_exits: recorded.quick_exits,
                     ..Instance::new(recorded.index, instance)
                 };
 
                 // A process under a relay is the relay's to report on: one
-                // that ended while no daemon looked is reported by the
-                // first check, with the status the relay recorded.
+                // that ended while no daemon looked has the status the
+                // relay recorded, and its exit counts as `check` counts
+                // one, the run since its recorded start deciding whether
+                // the waits start over.
 
                 if let Some(relay) = spec.relay.as_ref().filter(|_| recorded.relay_pid != 0) {
                     let mut relayed = Relayed::adopt(relay, recorded);
                     let running = relayed.relay_running().unwrap_or(false);
 
                     if !running {
-                        return Instance {
-                            ended: Some(relayed.ended()),
-                            ..instance
-                        };
+                        let exit = relayed.ended();
+
+                        if now.saturating_duration_since(since(recorded)) >= policy.stable_after {
+                            instance.quick_exits = 0;
+                        }
+
+                        instance.quick_exits += 1;
+                        let wait = policy.restart_after(&exit, instance.quick_exits);
+                        instance.due = Some(now + wait);
+                        found.push(Adopted::Ended { exit, wait });
+                        return instance;
                     }
 
-                    let run = match recorded.started_unix_ms {
-                        0 => Duration::ZERO,
-                        started => Duration::from_millis(now_unix_ms.saturating_sub(started)),
-                    };
+                    found.push(Adopted::Kept(recorded.pid));
 
                     return Instance {
                         process: Some(Process::Relayed(Box::new(relayed))),
-                        started: now.checked_sub(run).unwrap_or(now),
+                        started: since(recorded),
                         started_unix_ms: recorded.started_unix_ms,
                         ..instance
                     };
                 }
 
                 if still_running(recorded.pid, recorded.start_time) {
-                    // How long it has run, by the wall clock; a record
-                    // that does not say when it started gives none.
-
-                    let run = match recorded.started_unix_ms {
-                        0 => Duration::ZERO,
-                        started => Duration::from_millis(now_unix_ms.saturating_sub(started)),
-                    };
+                    found.push(Adopted::Kept(recorded.pid));
 
                     Instance {
                         process: Some(Process::Adopted {
                             pid: recorded.pid,
                             start_time: recorded.start_time,
                         }),
-                        started: now.checked_sub(run).unwrap_or(now),
+                        started: since(recorded),
                         started_unix_ms: recorded.started_unix_ms,
                         ..instance
                     }
                 } else {
+                    found.push(Adopted::Gone);
+
                     Instance {
                         due: Some(now),
                         ..instance
@@ -894,6 +950,7 @@ impl Supervisor {
             spec,
             policy,
             instances,
+            adopted: found,
         })
     }
 
@@ -1070,7 +1127,7 @@ impl Supervisor {
         };
 
         let reopens = tokio::sync::watch::channel(0).0;
-        let reports = watch_relay(relay, index, &reopens);
+        let reports = watch_relay(relay, index, started.pid, &reopens);
 
         Ok(Relayed {
             relay: RelayProcess::Child(child),
@@ -1106,9 +1163,7 @@ impl Supervisor {
         let mut reports = Vec::new();
 
         for position in 0..self.instances.len() {
-            let ended = self.instances[position].ended.take();
-
-            if let Some(exit) = ended.or_else(|| self.try_exited(position).ok().flatten()) {
+            if let Some(exit) = self.try_exited(position).ok().flatten() {
                 let instance = &mut self.instances[position];
                 let left_behind = instance
                     .process
@@ -1214,6 +1269,12 @@ impl Supervisor {
         }
 
         reports
+    }
+
+    /// What adoption found of each instance, in order; empty when this
+    /// daemon started them.
+    pub fn adopted(&self) -> &[Adopted] {
+        &self.adopted
     }
 
     /// The instances, in the order they were started in.

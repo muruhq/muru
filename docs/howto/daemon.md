@@ -42,16 +42,17 @@ from the directory's `[tool.muru]` table unless a flag overrides them,
 exactly as `muructl run` reads them. Release ids are `r1`, `r2` and so
 on unless `--release` names one.
 
-A deploy takes what neither its flags nor the source's table give from
-the release before it, so a `--timeout soft=3s` or `--env DEBUG=1` given
-once stays in force through later deploys until a flag or the table
-changes it. Environment variables and secrets carry by name. The tables
-in `[tool.muru]`, worker groups, mounts, logging, scaling and error
-pages, come from the source alone, so a source that drops a group drops
-it. The interpreter is the source directory's `.venv` when it has one,
-otherwise the previous release's, otherwise `--python`. `--fresh` deploys
-from the flags, the source and the defaults alone, ignoring the previous
-release.
+A release's settings come from its flags, then the [settings on its
+application](#settings-on-the-application), then the source's
+`[tool.muru]` table, then the defaults. Nothing comes from the release
+before it, so a `--timeout soft=3s` or `--env DEBUG=1` given for one
+deploy applies to that release alone, and after a rollback the next
+deploy is what its own flags, the application and the source say. The
+tables in `[tool.muru]`, worker groups, mounts, static entries, logging,
+scaling and error pages, come from the source alone, so a source that
+drops a group or a static entry drops it. The interpreter is `--python`,
+else the source directory's `.venv`, else the source's own Python
+request.
 
 `deploy --dry-run` asks the daemon what the deploy would do and changes
 nothing. It prints the id the release would take, each setting with the
@@ -67,15 +68,14 @@ muru: plan (nothing changed): release shop@r4, shop.wsgi:application 4x8 from /s
   processes = 4                         (deploy flags)
   threads = 8                           ([tool.muru])
   sync_threads = 8                      (default)
-  max_requests = 5000                   (the previous release)
+  max_requests = 5000                   (the application)
   ...
   env DEBUG (--env)
-  env SHOP_DATABASE (the previous release)
+  env SHOP_DATABASE (the application)
   env SENTRY_ENVIRONMENT ([tool.muru.env])
-  secret STRIPE_KEY = vault/stripe (the previous release)
+  secret STRIPE_KEY = vault/stripe (the application)
   env HTTP_PROXY (passed from the daemon)
   env PATH (passed from the daemon)
-  settings nothing else gives come from shop@r3; --fresh takes none
   the release would take over from shop@r3, which would stay warm for 1800s with 1 worker to a group
 ```
 
@@ -162,6 +162,114 @@ A release whose host exits on its own is marked failed; if it was serving,
 the daemon starts it again. A deploy whose release fails to start leaves
 the previous release serving and reports the failure.
 
+### Where a release came from
+
+A release carries metadata, a small map of keys to values saying where
+its code came from. When the source directory is in a git checkout,
+`muructl deploy` records the commit (`commit`), the branch, or with a
+detached HEAD the one tag on it (`ref`), and `dirty = true` when the
+checkout has changes, untracked files included. `--metadata KEY=VALUE`,
+given as often as needed, records more and overrides what git gave:
+
+```console
+$ muructl deploy shop /srv/shop \
+    --metadata url=https://git.example.com/shop/pull/42 \
+    --metadata "description=Fix the basket total"
+muru: release shop@r7 is ready and serving, commit 4f2a9c1e0b3d of main
+```
+
+`commit`, `ref`, `dirty`, `url` and `description` are shown by name; any
+other key is kept and shown as given, so a deploy tool can record its
+own, such as `hosting.example/pr=42`. `--metadata KEY=` leaves out a key
+git filled, a `commit` given by flag leaves out the filled `dirty`, and
+`--no-git-metadata` fills nothing from git. A source directory in no
+checkout, or a machine without git, records nothing from git; a git
+command that fails or takes longer than 5 seconds records nothing either,
+says why, and the deploy goes ahead.
+
+A release keeps at most 32 keys. A key is up to 63 lowercase letters,
+digits, `.`, `_`, `-` or `/`, starting with a letter or digit; a value is
+up to 1024 bytes with no control characters other than newlines and
+tabs, and `url` must be an `http` or `https` URL; all of it together is
+at most 8 KiB. A key with an empty value is not kept. The application is
+never given the metadata, in its environment or anywhere else.
+
+The metadata stays with the release, as its settings do. `release list`
+shows the commit in its `COMMIT` column, shortened, with `+` when the
+checkout had changes and `-` for none:
+
+```console
+$ muructl release list shop
+RELEASE                  STATE      SERVING  WORKERS          COMMIT             DISK SOURCE
+shop@r7                  ready      yes      2 (2x8)          4f2a9c1e0b3d    212.4MB /srv/shop
+shop@r6                  retained            1 (2x8)          9b01c33d7a2e+   212.4MB /srv/shop
+```
+
+`release show` gives every key, the well-known ones first, the
+`release.created` event names the commit and ref
+(`from /srv/shop, commit 4f2a9c1e0b3d of main`), the dashboard's
+releases table shows the commit, linked to `url`, with the ref and the
+description, and `--json` gives the map as `metadata`. A release
+declared in a file takes it as a `metadata` table, and `config export`
+writes it there:
+
+```toml
+[app.shop.release.r7]
+source = '/srv/shop'
+metadata = { commit = '4f2a9c1e0b3d5a6b7c8d9e0f1a2b3c4d5e6f7a8b', ref = 'refs/heads/main' }
+```
+
+`muructl apply` records what the file says and fills nothing from git. A
+file whose release has metadata other than what the daemon recorded for
+it is refused, as one with other settings is: declare a new release id
+instead.
+
+### Settings on the application
+
+A release's flags apply to that release. A setting meant to last
+through every deploy goes on the application, when it belongs to the
+deployment, such as a database URL, a secret or this node's worker
+count, or in `[tool.muru]` when it follows the code:
+
+```console
+$ muructl app set shop --env SHOP_DATABASE=postgres://db/shop --secret STRIPE_KEY=vault:stripe --processes 4
+muru: shop's settings are changed for the releases deployed from now; no running release changes
+processes = 4
+env.SHOP_DATABASE = postgres://db/shop
+env.STRIPE_KEY = secret vault:stripe
+```
+
+Every release deployed after that takes them, over the source's
+`[tool.muru]` and under the deploy's own flags, so `--processes 2` on one
+deploy gives that release 2 and leaves the application's 4 for the next.
+Variables and secrets layer by name: a release gets every name from the
+application, the source and its flags, and the flag wins for a name
+given in more than one. A secret is kept as its reference, never its
+value. No release that is running changes; the settings take effect at
+the next deploy. Setting them on an application that does not exist yet
+creates it, so they can be in place before its first release.
+
+`muructl app set` takes the deploy flags for the variables and secrets,
+`--processes`, `--threads`, `--sync-threads`, `--concurrency`,
+`--max-requests`, `--max-lifetime`, `--timeout NAME=DURATION` and
+`--memory KEY=VALUE`, and `--replace` removes the settings not given.
+The entrypoint, interface, interpreter and the other settings that say
+what the code is stay with the source and the deploy, as do the tables.
+`muructl app unset` removes settings by key, and `muructl app show`
+lists them:
+
+```
+muructl app unset shop env.SHOP_DATABASE processes
+muructl app unset shop timeouts.hard_timeout memory.soft_limit
+muructl app unset shop --all
+muructl app show shop
+```
+
+The same settings go on an application's table in a file given to
+`muructl apply` (see [declaring applications in
+files](#declaring-applications-in-files)), and `muructl config export`
+writes them there.
+
 ### What a release's environment holds
 
 A release's host, workers, commands and managed servers start from a
@@ -186,8 +294,9 @@ clean environment, whoever started the daemon and from wherever:
    pass_env = ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE", "AWS_*"]
    ```
 
-4. What the release declares, in `[tool.muru.env]`, with `--env` and as
-   secrets, which overrides the base and `pass_env` but not what Muru sets.
+4. What the release declares, in `[tool.muru.env]`, on its application,
+   with `--env` and as secrets, which overrides the base and `pass_env`
+   but not what Muru sets.
 
 Anything else the daemon's own environment holds does not reach a
 release. A release that needs another variable declares it, or the
@@ -234,10 +343,32 @@ those of the
 `[tool.muru]` table (`entrypoint`, `interface`, `factory`,
 `factory_phase`, `python`, `processes`, `threads`, `sync_threads`,
 `concurrency`, `preload`, `hooks` and `preload_modules`), and what a
-table leaves out comes
-from the source's `[tool.muru]` table and then the defaults, exactly as
-a deploy resolves them. A directory applies every `.toml` file in it, in
-name order, as one configuration.
+table leaves out comes from the application's settings, then the
+source's `[tool.muru]` table and then the defaults, exactly as a deploy
+resolves them. A directory applies every `.toml` file in it, in name
+order, as one configuration.
+
+The application's own table holds the [settings on the
+application](#settings-on-the-application) that `muructl app set` sets,
+with the same keys: `env`, `processes`, `threads`, `sync_threads`,
+`concurrency`, `max_requests`, `max_lifetime`, a `timeouts` table of the
+host's timeouts and a `memory` table. The file states them in full, as
+it states the application's user, so applying a file whose application
+has none removes those `muructl app set` gave, and `muructl config
+export` writes them, so settings made at a terminal can be kept in a
+file:
+
+```toml
+[app.shop]
+processes = 4
+
+[app.shop.env]
+SHOP_DATABASE = "postgres://db/shop"
+STRIPE_KEY = { secret = { store = "vault", key = "stripe" } }
+
+[app.shop.release.r1]
+source = "/srv/shop"
+```
 
 So a release's table needs only its `source` when the project's own
 file says the rest:
@@ -296,9 +427,10 @@ directory it can read.
   code applies from there. With no source the current directory is
   written as its full path.
 - **The settings** come from the flags, then the source's settings,
-  then the defaults. Nothing comes from a release the application
-  already has, so applying the file gives the release that `muructl
-  deploy --fresh` gives for the same flags.
+  then the defaults. Nothing comes from a release or the settings the
+  application already has, so applying the file gives the release
+  `muructl deploy` gives for the same flags to an application with no
+  settings of its own.
 - **The interpreter** is written when `--python` or the source's
   settings name one. Otherwise the table has no `python` key, and the
   daemon finds the interpreter when the file is applied, as it does for
@@ -441,8 +573,9 @@ spelled out, and the application's `serving` key naming it, and the
 releases its routes' splits and client classes name, so applying the
 file back to the daemon it came from changes nothing and, applied to
 another node, it starts those releases held. A release neither is left
-out. `--app NAME` writes one application, and `--json` the same document
-as JSON. A [rollout](rollouts.md) under way is not part of the file;
+out. `--app NAME` writes one application with the routes that reach it,
+a static route whose `fallback` is the application among them, and
+their hosts, and `--json` the same document as JSON. A [rollout](rollouts.md) under way is not part of the file;
 with `--resolve-rollouts` it is written as where it stands, the
 candidate declared beside the serving release and the application's
 routes splitting traffic between them at the candidate's current share.
@@ -452,9 +585,9 @@ holds that the file does not, with exit code 2 when they differ.
 
 `muructl config show [APP] --effective` writes the same document headed
 by each serving release's settings and where each came from: the
-release table of an applied file or the deploy's flags, the source's
-`[tool.muru]` table, the source's `.venv` for the interpreter, the
-previous release, or the default:
+release table of an applied file or the deploy's flags, the
+application's settings, the source's `[tool.muru]` table, the source's
+`.venv` for the interpreter, or the default:
 
 ```console
 $ muructl config show shop --effective
@@ -465,7 +598,7 @@ $ muructl config show shop --effective
 #   shop@r3: entrypoint = shop.wsgi:application ([tool.muru])
 #   shop@r3: python = /srv/shop/.venv/bin/python (the source's .venv)
 #   shop@r3: processes = 4 (deploy flags)
-#   shop@r3: threads = 8 (the previous release)
+#   shop@r3: threads = 8 (the application)
 #   shop@r3: sync_threads = 8 (default)
 ...
 ```

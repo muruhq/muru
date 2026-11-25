@@ -405,8 +405,9 @@ pub struct Mount {
     pub cgi_local_redirect: Option<bool>,
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the file to be served (section 4.9); the release's
-    /// when absent, and an empty list refuses every hint. A relative
-    /// path is taken from the release's source directory.
+    /// when absent, and an empty list refuses every hint. `source:SUBDIR`,
+    /// or a relative path, is taken from the release's source directory,
+    /// and `media:SUBDIR` from the media part.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "the release's"))]
     pub sendfile_roots: Option<Vec<String>>,
@@ -1092,8 +1093,9 @@ pub struct Release {
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the file to be served (section 4.9), for the default
     /// mount and any mount that does not say otherwise; with none every
-    /// hint is refused. A relative path is taken from the release's
-    /// `source`.
+    /// hint is refused. `source:SUBDIR`, or a relative path, is taken
+    /// from the release's `source`, and `media:SUBDIR` from the media
+    /// part.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sendfile_roots: Vec<String>,
     /// A second response header honoured as `X-Muru-Sendfile` is, such
@@ -1114,6 +1116,153 @@ pub struct Release {
     /// with the release on request, with inputs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub commands: BTreeMap<String, CommandTable>,
+    /// What the deploy recorded about where the release's code came from
+    /// (section 9.14): string keys to string values, `commit`, `ref`,
+    /// `url`, `description` and `dirty` among them, which the release
+    /// keeps and never gives the application. At most 32 keys.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// The most keys a release's metadata holds (section 9.14).
+pub const METADATA_MAX_KEYS: usize = 32;
+
+/// The longest key of a release's metadata, in bytes.
+pub const METADATA_MAX_KEY: usize = 63;
+
+/// The longest value of a release's metadata, in bytes.
+pub const METADATA_MAX_VALUE: usize = 1024;
+
+/// The most bytes a release's metadata holds, its keys and values
+/// together.
+pub const METADATA_MAX_TOTAL: usize = 8 * 1024;
+
+/// The metadata keys Muru's own views show by name (section 9.14), in
+/// the order they show them.
+pub const METADATA_KEYS: [&str; 5] = ["commit", "ref", "dirty", "url", "description"];
+
+/// Check a release's metadata against the limits of section 9.14 and
+/// give it as kept: a key with an empty value is left out. The error
+/// names the key at fault.
+pub fn check_metadata(
+    metadata: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let kept: BTreeMap<String, String> = metadata
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+
+    if kept.len() > METADATA_MAX_KEYS {
+        return Err(format!(
+            "metadata has {} keys, more than the {METADATA_MAX_KEYS} a release keeps",
+            kept.len()
+        ));
+    }
+
+    let mut total = 0;
+
+    for (key, value) in &kept {
+        let lead = key.bytes().next();
+        let allowed = |byte: u8| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-/".contains(&byte)
+        };
+
+        if key.len() > METADATA_MAX_KEY
+            || !lead.is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || !key.bytes().all(allowed)
+        {
+            return Err(format!(
+                "metadata key {key:?} must be 1 to {METADATA_MAX_KEY} lowercase letters, digits, \
+                 '.', '_', '-' or '/', starting with a letter or digit"
+            ));
+        }
+
+        if value.len() > METADATA_MAX_VALUE {
+            return Err(format!(
+                "metadata {key}: the value is {} bytes, more than {METADATA_MAX_VALUE}",
+                value.len()
+            ));
+        }
+
+        if value
+            .chars()
+            .any(|character| character.is_control() && character != '\n' && character != '\t')
+        {
+            return Err(format!(
+                "metadata {key}: the value holds a control character other than a newline or tab"
+            ));
+        }
+
+        if key == "url" && !(value.starts_with("https://") || value.starts_with("http://")) {
+            return Err(format!(
+                "metadata url {value:?} must be an absolute http or https URL"
+            ));
+        }
+
+        total += key.len() + value.len();
+    }
+
+    if total > METADATA_MAX_TOTAL {
+        return Err(format!(
+            "metadata holds {total} bytes, more than the {METADATA_MAX_TOTAL} a release keeps"
+        ));
+    }
+
+    Ok(kept)
+}
+
+/// A commit as Muru's views show it: a git commit of 40 or 64
+/// hexadecimal digits shortened to 12, anything else as given.
+pub fn short_commit(commit: &str) -> &str {
+    let hex = commit.bytes().all(|byte| byte.is_ascii_hexdigit());
+
+    if hex && (commit.len() == 40 || commit.len() == 64) {
+        &commit[..12]
+    } else {
+        commit
+    }
+}
+
+/// A ref as Muru's views show it: a branch or tag without its
+/// `refs/heads/` or `refs/tags/`, anything else as given.
+pub fn short_ref(name: &str) -> &str {
+    name.strip_prefix("refs/heads/")
+        .or_else(|| name.strip_prefix("refs/tags/"))
+        .unwrap_or(name)
+}
+
+/// The commit a release's metadata names as a list shows it: shortened,
+/// followed by `+` when its checkout had changes; none without one.
+pub fn commit_label(metadata: &BTreeMap<String, String>) -> Option<String> {
+    let commit = short_commit(metadata.get("commit")?);
+
+    if metadata.get("dirty").map(String::as_str) == Some("true") {
+        Some(format!("{commit}+"))
+    } else {
+        Some(commit.to_owned())
+    }
+}
+
+/// Where a release's code came from, in words, from its metadata:
+/// `commit 4f2a9c1e0b3d of main`, with `, uncommitted changes` when it
+/// was dirty; none when the metadata names no commit or ref.
+pub fn metadata_origin(metadata: &BTreeMap<String, String>) -> Option<String> {
+    let commit = metadata.get("commit").map(|commit| short_commit(commit));
+    let name = metadata.get("ref").map(|name| short_ref(name));
+
+    let origin = match (commit, name) {
+        (Some(commit), Some(name)) => format!("commit {commit} of {name}"),
+        (Some(commit), None) => format!("commit {commit}"),
+        (None, Some(name)) => format!("ref {name}"),
+        (None, None) => return None,
+    };
+
+    if metadata.get("dirty").map(String::as_str) == Some("true") {
+        Some(format!("{origin}, uncommitted changes"))
+    } else {
+        Some(origin)
+    }
 }
 
 /// How a worker group is scaled (section 7.2).
@@ -2607,6 +2756,18 @@ pub struct Route {
     #[serde(default = "root_path")]
     #[schemars(extend("default" = "/"))]
     pub path: String,
+    /// The leading part of `path` that is where the application lives:
+    /// `path` itself, or a leading part of it whole segments long, so
+    /// `/sub` of `/sub/path` and never `/su` (section 4.5). An
+    /// application's release gets it as SCRIPT_NAME, after a trusted
+    /// X-Forwarded-Prefix and before a mount's path, and its mounts and
+    /// worker groups are matched against the rest of the path. An
+    /// upstream, a managed HTTP release or a detour is sent the rest of
+    /// the path, with this part appended to X-Forwarded-Prefix. A static
+    /// route takes it only with a fallback, which it applies to. Without
+    /// it nothing is stripped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip_prefix: Option<String>,
     /// The client classes (section 4.14) the route takes; every request
     /// without it. Among routes with the same path, one naming the
     /// request's class comes first.
@@ -2754,6 +2915,17 @@ impl Route {
         classes.dedup();
         format!("{} client_class={}", self.path, classes.join(","))
     }
+
+    /// Whether the route sends requests to `app`: as its own application,
+    /// or as a static route's fallback (`fallback = { app = "APP" }`).
+    pub fn serves_app(&self, app: &str) -> bool {
+        let fallback = self
+            .fallback
+            .as_ref()
+            .and_then(|fallback| fallback.app.as_deref());
+
+        self.app == app || (self.static_dir.is_some() && fallback == Some(app))
+    }
 }
 
 /// A route's method restrictions (section 4.15).
@@ -2768,6 +2940,45 @@ pub struct Methods {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "read_only"))]
     pub answer: Option<String>,
+}
+
+/// The part a route's `strip_prefix` takes off the front of its requests'
+/// paths, as the edge strips it: the value without a trailing slash, and
+/// empty for none or for `/`, which strips nothing.
+pub fn stripped_part(strip_prefix: Option<&str>) -> &str {
+    strip_prefix.map_or("", |prefix| prefix.trim_end_matches('/'))
+}
+
+/// Check a route's `strip_prefix` (section 4.5): a path that is the
+/// route's own `path`, or a leading part of it on segment boundaries, so
+/// it can never reach past the route's path into a segment that varies
+/// from request to request. A trailing slash on either makes no
+/// difference.
+pub fn check_strip_prefix(route: &Route) -> Result<(), String> {
+    let Some(prefix) = route.strip_prefix.as_deref() else {
+        return Ok(());
+    };
+
+    if !prefix.starts_with('/') {
+        return Err(format!("strip_prefix {prefix} must start with /"));
+    }
+
+    let stripped = stripped_part(Some(prefix));
+    let path = route.path.trim_end_matches('/');
+
+    let leading = stripped.is_empty()
+        || path == stripped
+        || path
+            .strip_prefix(stripped)
+            .is_some_and(|rest| rest.starts_with('/'));
+
+    if !leading || prefix.contains("//") {
+        return Err(format!(
+            "strip_prefix {prefix} is not a leading part of its path on segment boundaries"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Check a route's rate limit names, method restrictions and mode.
@@ -4186,10 +4397,11 @@ pub struct StaticDir {
     /// boundaries, and `/` is not allowed, since every path would then
     /// be looked up as a file first.
     pub path: String,
-    /// The directory: relative to the source directory, absolute,
+    /// The directory: `source:` for the release's source directory,
     /// `static:` for the release's built static files or `media:` for
     /// the application's media part, each with an optional directory
-    /// inside it after the colon.
+    /// inside it after the colon; or a path, absolute, or relative to the
+    /// source directory as `source:` is.
     pub dir: String,
     /// The files tried, in order, when a directory is requested.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -5170,7 +5382,7 @@ pub fn check_sendfile(roots: &[String], header: Option<&str>) -> Result<(), Stri
                      which a [[tool.muru.static]] entry serves"
                 ));
             }
-            places::Place::Media(_) | places::Place::Path(_) => {}
+            places::Place::Media(_) | places::Place::Path(_) | places::Place::Source(_) => {}
         }
     }
 
@@ -5196,9 +5408,9 @@ pub fn check_sendfile(roots: &[String], header: Option<&str>) -> Result<(), Stri
 }
 
 /// Where a release's `sendfile_roots` entry is (section 4.9): an
-/// absolute one as it is written, a relative one in the release's source
-/// directory, and `media:` in the application's media part (issue 849),
-/// or nowhere when it has none.
+/// absolute one as it is written, a relative one or `source:` in the
+/// release's source directory (issue 900), and `media:` in the
+/// application's media part (issue 849), or nowhere when it has none.
 pub fn sendfile_root(
     root: &str,
     source: &std::path::Path,
@@ -5213,6 +5425,11 @@ pub fn sendfile_root(
             }
         }),
         Ok(places::Place::Static(_)) | Err(_) => None,
+        Ok(places::Place::Source(rest)) => Some(if rest.is_empty() {
+            source.to_path_buf()
+        } else {
+            source.join(rest)
+        }),
         Ok(places::Place::Path(_)) => {
             let path = std::path::Path::new(root);
 
@@ -5261,15 +5478,17 @@ pub fn worker_root_paths(
     paths
 }
 
-/// Check that each relative `sendfile_roots` entry is a directory in the
-/// release's source (section 4.9), as a static entry's directory must be:
-/// a root that travels with the project is part of the release. An
-/// absolute root is the operator's, and may be made or mounted later.
+/// Check that each relative or `source:` `sendfile_roots` entry is a
+/// directory in the release's source (section 4.9), as a static entry's
+/// directory must be: a root that travels with the project is part of the
+/// release. An absolute root is the operator's, and may be made or
+/// mounted later.
 pub fn check_sendfile_dirs(roots: &[String], source: &std::path::Path) -> Result<(), String> {
-    for root in roots.iter().filter(|root| {
-        !root.starts_with('/') && matches!(places::Place::parse(root), Ok(places::Place::Path(_)))
+    for (root, within) in roots.iter().filter_map(|root| {
+        let within = places::Place::parse(root).ok()?.in_source()?;
+        Some((root, within))
     }) {
-        let path = source.join(root);
+        let path = source.join(within);
 
         if !path.is_dir() {
             return Err(format!(
@@ -5426,6 +5645,84 @@ pub struct App {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "uploads"))]
     pub uploads_dir: Option<String>,
+    /// Environment variables every release deployed after this is
+    /// applied takes, over the source's `[tool.muru.env]` and under the
+    /// release's own; a secret is given by reference, never by value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvValue>,
+    /// Worker processes for every release, over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 1"))]
+    pub processes: Option<usize>,
+    /// Application threads per worker for every release, over the
+    /// source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 4"))]
+    pub threads: Option<usize>,
+    /// Threads for synchronous code called from an ASGI application, for
+    /// every release, over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 8"))]
+    pub sync_threads: Option<usize>,
+    /// Requests an ASGI worker's event loop takes at once, for every
+    /// release, over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 1000"))]
+    pub concurrency: Option<usize>,
+    /// Requests a worker serves before it is replaced, for every release,
+    /// over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else never"))]
+    pub max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced, for every release,
+    /// over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else never"))]
+    pub max_lifetime: Option<String>,
+    /// The host's timeouts for every release, each over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<HostTimeouts>,
+    /// The memory policy for every release, each key over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
+}
+
+/// The host's timeouts an application's table sets for its releases:
+/// those of a release's `timeouts` table that a deploy flag can set, and
+/// not the limits on the requests the edge serves, which belong to a
+/// release, a route or a virtual host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostTimeouts {
+    /// How long a request may run in a worker before it is interrupted
+    /// by raising `muru.RequestTimeout` in its thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_timeout: Option<String>,
+    /// How long a request may run in a worker before the worker is
+    /// replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_timeout: Option<String>,
+    /// How long a worker being replaced is given to finish its other
+    /// requests before it is told to stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_drain_grace: Option<String>,
+    /// How long a worker told to stop is given before it is killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_timeout: Option<String>,
+    /// How long a worker told to stop keeps its open WebSockets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket_drain_grace: Option<String>,
+    /// How long a worker has for its shutdown work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_grace: Option<String>,
+    /// How long an ASGI worker's event loop may go without running
+    /// before the worker is replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_stall_timeout: Option<String>,
+    /// How long a worker may go with no thread running Python before it
+    /// is replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gil_stall_timeout: Option<String>,
 }
 
 /// The `[metrics]` table (section 11.1): where the daemon serves the
@@ -5998,6 +6295,11 @@ pub struct RunSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub timestamps: Option<bool>,
+    /// Tracing with wrapture for `muructl run`, as a boolean or a table
+    /// with `config`, in place of the project's `tracing`. The daemon and
+    /// `muructl serve` take the project's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracing: Option<Tracing>,
     /// A `.env` file whose variables the run starts with, relative to the
     /// project. Its values override `[tool.muru.env]`. None is read unless
     /// this names one.
@@ -6048,6 +6350,7 @@ impl RunSettings {
             compression: over.compression.or(self.compression),
             toolbar: over.toolbar.or(self.toolbar),
             timestamps: over.timestamps.or(self.timestamps),
+            tracing: over.tracing.clone().or_else(|| self.tracing.clone()),
             env_file: over.env_file.clone().or_else(|| self.env_file.clone()),
             data_dir: over.data_dir.clone().or_else(|| self.data_dir.clone()),
         }
@@ -6434,8 +6737,9 @@ pub struct ToolMuru {
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the file to be served (section 4.9), for the default
     /// mount and any mount that does not say otherwise; with none every
-    /// hint is refused. A relative path is taken from the project's
-    /// directory, the release's source.
+    /// hint is refused. `source:SUBDIR`, or a relative path, is taken
+    /// from the project's directory, the release's source, and
+    /// `media:SUBDIR` from the media part.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sendfile_roots: Vec<String>,
     /// A second response header honoured as `X-Muru-Sendfile` is, such
@@ -6907,6 +7211,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn release_metadata_is_kept_within_its_limits() {
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect()
+        };
+
+        // Issue 866: the well-known keys and a prefixed key of a tool's
+        // own are kept, and an empty value is left out.
+
+        let given = map(&[
+            ("commit", "4f2a9c1e0b3d"),
+            ("ref", "refs/heads/main"),
+            ("url", "https://git.example.com/shop/pull/42"),
+            ("description", "Fix the basket total\nand its tax"),
+            ("hosting.example/pr", "42"),
+            ("dirty", ""),
+        ]);
+        let kept = check_metadata(&given).unwrap();
+        assert_eq!(kept.len(), 5);
+        assert!(!kept.contains_key("dirty"));
+
+        let refused = |pairs: &[(&str, &str)]| check_metadata(&map(pairs)).unwrap_err();
+        assert!(refused(&[("Commit", "x")]).contains("lowercase letters"));
+        assert!(refused(&[("-x", "x")]).contains("starting with a letter or digit"));
+        assert!(refused(&[(&"k".repeat(64), "x")]).contains("1 to 63"));
+        assert!(refused(&[("note", &"v".repeat(1025))]).contains("more than 1024"));
+        assert!(refused(&[("note", "a\u{7}b")]).contains("control character"));
+        assert!(refused(&[("url", "javascript:alert(1)")]).contains("http or https"));
+
+        let many: BTreeMap<String, String> =
+            (0..33).map(|n| (format!("k{n}"), "v".to_owned())).collect();
+        assert!(check_metadata(&many).unwrap_err().contains("33 keys"));
+
+        let large: BTreeMap<String, String> = (0..9)
+            .map(|n| (format!("k{n}"), "v".repeat(1000)))
+            .collect();
+        assert!(
+            check_metadata(&large)
+                .unwrap_err()
+                .contains("more than the 8192")
+        );
+
+        // The views shorten a git commit and a branch or tag.
+
+        let commit = "4f2a9c1e0b3d5a6b7c8d9e0f1a2b3c4d5e6f7a8b";
+        assert_eq!(short_commit(commit), "4f2a9c1e0b3d");
+        assert_eq!(short_commit("v1.0.0-12-g4f2a9c1"), "v1.0.0-12-g4f2a9c1");
+        assert_eq!(short_ref("refs/tags/v1.0.0"), "v1.0.0");
+        assert_eq!(
+            metadata_origin(&map(&[
+                ("commit", commit),
+                ("ref", "refs/heads/main"),
+                ("dirty", "true")
+            ])),
+            Some("commit 4f2a9c1e0b3d of main, uncommitted changes".to_owned())
+        );
+        assert_eq!(
+            metadata_origin(&map(&[("url", "https://example.com")])),
+            None
+        );
+    }
+
+    #[test]
     fn media_is_a_root_of_every_mount_and_static_data_and_uploads_are_refused() {
         let source = Path::new("/src/shop");
         let media = Path::new("/srv/data/shop/media");
@@ -7341,6 +7710,48 @@ mod tests {
     }
 
     #[test]
+    fn strip_prefix_is_a_leading_part_of_the_routes_path_on_segment_boundaries() {
+        let route = |path: &str, strip: &str| {
+            upload_route(&format!("path = '{path}'\nstrip_prefix = '{strip}'"))
+        };
+
+        for (path, strip) in [
+            ("/sub/path/api", "/sub/path"),
+            ("/sub/path/api", "/sub/path/"),
+            ("/sub/path/api", "/sub/path/api"),
+            ("/sub/path/api/", "/sub/path/api"),
+            ("/app", "/app/"),
+            ("/app", "/"),
+        ] {
+            assert!(
+                check_strip_prefix(&route(path, strip)).is_ok(),
+                "{path} {strip}"
+            );
+        }
+
+        for (path, strip) in [
+            ("/sub/path/api", "/sub/pa"),
+            ("/sub/path/api", "/sub/path/api/users"),
+            ("/app", "/other"),
+            ("/app", "app"),
+            ("/a/b", "/a//b"),
+        ] {
+            assert!(
+                check_strip_prefix(&route(path, strip)).is_err(),
+                "{path} {strip}"
+            );
+        }
+
+        assert_eq!(
+            check_strip_prefix(&route("/sub/path/api", "/sub/pa")).unwrap_err(),
+            "strip_prefix /sub/pa is not a leading part of its path on segment boundaries"
+        );
+        assert_eq!(stripped_part(Some("/sub/path/")), "/sub/path");
+        assert_eq!(stripped_part(Some("/")), "");
+        assert_eq!(stripped_part(None), "");
+    }
+
+    #[test]
     fn route_policies_are_checked() {
         let route = |keys: &str| upload_route(keys);
         assert!(
@@ -7640,6 +8051,7 @@ traffic = { classes = { ai-crawler = 'r1' } }"
             name: Some("shop-root".to_owned()),
             host: "shop".to_owned(),
             path: "/".to_owned(),
+            strip_prefix: None,
             matches: None,
             app: "shop".to_owned(),
             upstream: String::new(),
@@ -8006,6 +8418,31 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(error.starts_with("tracing: "), "{error}");
 
         assert_eq!(parse_local("", None).unwrap().tracing, None);
+    }
+
+    #[test]
+    fn the_run_table_takes_tracing_and_the_local_run_table_wins() {
+        let table = parse_muru_toml("[run]\ntracing = true\n").unwrap();
+        let run = table.run.unwrap();
+        assert_eq!(run.tracing, Some(Tracing::Enabled(true)));
+
+        let table = parse_muru_toml("[run.tracing]\nconfig = 'dev.toml'\n").unwrap();
+        assert_eq!(
+            table.run.unwrap().tracing,
+            Some(Tracing::Settings(TracingSettings {
+                config: Some("dev.toml".to_owned())
+            }))
+        );
+
+        let off = RunSettings {
+            tracing: Some(Tracing::Enabled(false)),
+            ..RunSettings::default()
+        };
+        assert_eq!(run.layered(&off).tracing, Some(Tracing::Enabled(false)));
+        assert_eq!(
+            run.layered(&RunSettings::default()).tracing,
+            Some(Tracing::Enabled(true))
+        );
     }
 
     #[test]

@@ -64,7 +64,9 @@ impl Daemon {
             self.detours.contains_key(&(app.clone(), name.to_owned()))
         });
 
-        if let Some(refusal) = self.traffic_refusal(&app, &release, &opening.traffic) {
+        if let Some(refusal) =
+            self.traffic_refusal(&app, &release, &opening.traffic, &opening.paths)
+        {
             return Err(refusal);
         }
 
@@ -83,14 +85,18 @@ impl Daemon {
         };
 
         let data = crate::places::app_data(&self.locations.state.path, &record);
+        let (serving, mounts) = self.serving_mounts(&app);
         let opened = admin::DetourOpened {
             detour: Some(detour.message()),
-            hosts: self.detour_hosts(&app),
             data_dir: data.data.display().to_string(),
             media_dir: data.media.display().to_string(),
             uploads_dir: data.uploads.display().to_string(),
+            serving,
+            mounts,
         };
         let describe = detour.describe();
+        let opened_traffic = detour.opening.traffic.word();
+        let opened_paths = detour.opening.paths.clone();
 
         // The run hears what was opened before anything else on its
         // stream, which is new and has room.
@@ -115,7 +121,10 @@ impl Daemon {
             "detour.opened",
             &subject,
             "info",
-            &format!("detour {subject} opened by the development run with {describe}"),
+            &format!(
+                "detour {subject} opened by the development run with {describe}, taking {}",
+                scoped(&opened_traffic, &detours::scope_text(&opened_paths))
+            ),
         );
 
         Ok((opened, serial))
@@ -242,13 +251,17 @@ impl Daemon {
         release: &str,
         traffic: Traffic,
         until_unix_ms: u64,
+        paths: Option<Vec<String>>,
         reason: Option<&str>,
     ) -> Result<admin::Detour, String> {
         let key = (app.to_owned(), release.to_owned());
 
-        if !self.detours.contains_key(&key) {
+        let Some(current) = self.detours.get(&key) else {
             return Err(format!("{app}@{release} is not an open detour"));
-        }
+        };
+
+        let paths = paths.unwrap_or_else(|| current.opening.paths.clone());
+        let scope_before = detours::scope_text(&current.opening.paths);
 
         if let Some(refusal) =
             detours::timed_refusal(&traffic, until_unix_ms, crate::model::now_unix_ms())
@@ -256,7 +269,7 @@ impl Daemon {
             return Err(refusal);
         }
 
-        if let Some(refusal) = self.traffic_refusal(app, release, &traffic) {
+        if let Some(refusal) = self.traffic_refusal(app, release, &traffic, &paths) {
             return Err(refusal);
         }
 
@@ -266,11 +279,13 @@ impl Daemon {
 
         let before = std::mem::replace(&mut detour.opening.traffic, traffic.clone());
         let until_before = std::mem::replace(&mut detour.until_unix_ms, until_unix_ms);
+        let paths_before = std::mem::replace(&mut detour.opening.paths, paths.clone());
 
         if let Err(error) = self.push_snapshot().await {
             if let Some(detour) = self.detours.get_mut(&key) {
                 detour.opening.traffic = before;
                 detour.until_unix_ms = until_before;
+                detour.opening.paths = paths_before;
             }
 
             let _ = self.push_snapshot().await;
@@ -294,8 +309,11 @@ impl Daemon {
             "info",
             &format!(
                 "detour {subject} takes {} now, {} before{}",
-                detours::traffic_text(&traffic.word(), until_unix_ms),
-                before.word(),
+                scoped(
+                    &detours::traffic_text(&traffic.word(), until_unix_ms),
+                    &detours::scope_text(&paths)
+                ),
+                scoped(&before.word(), &scope_before),
                 reason
                     .map(|reason| format!(": {reason}"))
                     .unwrap_or_default()
@@ -320,7 +338,7 @@ impl Daemon {
             let reason = "the time it was set for is over";
 
             if let Err(error) = self
-                .set_detour_traffic(&app, &release, Traffic::Preview, 0, Some(reason))
+                .set_detour_traffic(&app, &release, Traffic::Preview, 0, None, Some(reason))
                 .await
             {
                 tracing::warn!(%error, "detour {app}@{release} could not go back to preview");
@@ -352,8 +370,10 @@ impl Daemon {
             .read()
             .expect("listeners poisoned")
             .clone();
-        let candidates = crate::urls::for_app(&request.app, &routes, &hosts, &listeners);
+        let name = (!request.name.is_empty()).then_some(request.name.as_str());
+        let candidates = crate::urls::for_app(&request.app, &routes, &hosts, &listeners, name);
         let total = candidates.len();
+        let header = muru_edge::preview::value(&detour.release, &detour.secret);
 
         let chosen: Vec<crate::urls::Candidate> = if request.all {
             candidates
@@ -369,14 +389,22 @@ impl Daemon {
             candidates.into_iter().take(1).collect()
         };
 
+        // Issue 908: the header needs no address, so an application with
+        // none still has it, and the caller is told why there is no link.
+
         if chosen.is_empty() {
-            return Err(if request.host.is_empty() {
-                format!("{} has no address to preview it at", request.app)
-            } else {
-                format!(
-                    "{} has no address on {}; muructl detour preview --list gives each",
-                    request.app, request.host
-                )
+            return Ok(admin::DetourPreview {
+                links: Vec::new(),
+                header,
+                others: u32::try_from(total).unwrap_or(u32::MAX),
+                unreachable: if total == 0 {
+                    crate::urls::no_address(&request.app, &routes, &hosts, name)
+                } else {
+                    format!(
+                        "{} has no address on {}; muructl detour preview --list gives each",
+                        request.app, request.host
+                    )
+                },
             });
         }
 
@@ -400,10 +428,10 @@ impl Daemon {
                     &format!("{}{token}", muru_edge::preview::PREFIX),
                 ),
                 address: candidate.url.clone(),
+                name: candidate.name.clone(),
+                bound: candidate.bound.to_string(),
             });
         }
-
-        let header = muru_edge::preview::value(&detour.release, &detour.secret);
 
         self.edge
             .add_preview_tokens(tokens)
@@ -414,6 +442,7 @@ impl Daemon {
             others: u32::try_from(total.saturating_sub(links.len())).unwrap_or(u32::MAX),
             links,
             header,
+            unreachable: String::new(),
         })
     }
 
@@ -425,6 +454,7 @@ impl Daemon {
                 app: detour.app(),
                 release: &detour.release,
                 traffic: &detour.opening.traffic,
+                paths: &detour.opening.paths,
             })
             .collect()
     }
@@ -432,7 +462,13 @@ impl Daemon {
     /// Why a detour of `app` cannot take `traffic` now: a rollout under
     /// way, another detour's claim, or a client class the daemon does
     /// not define.
-    fn traffic_refusal(&self, app: &str, release: &str, traffic: &Traffic) -> Option<String> {
+    fn traffic_refusal(
+        &self,
+        app: &str,
+        release: &str,
+        traffic: &Traffic,
+        paths: &[String],
+    ) -> Option<String> {
         let rollout = self
             .store
             .rollouts(Some(app))
@@ -456,6 +492,7 @@ impl Daemon {
                 app,
                 release,
                 traffic,
+                paths,
             },
             &others,
             rollout,
@@ -463,30 +500,39 @@ impl Daemon {
         )
     }
 
+    /// The serving release of an application, as app@release, and its
+    /// named mounts, which a detour's run compares with its own (issue
+    /// 907).
+    fn serving_mounts(&self, app: &str) -> (String, Vec<admin::DetourMount>) {
+        let Some(id) = self.serving.get(app) else {
+            return (String::new(), Vec::new());
+        };
+
+        let mounts = self
+            .store
+            .release(app, id)
+            .map(|release| {
+                release
+                    .spec
+                    .mounts
+                    .iter()
+                    .map(|mount| admin::DetourMount {
+                        name: mount.name.clone(),
+                        path: mount.path.clone(),
+                        interface: crate::detours::interface_name(mount.interface).to_owned(),
+                        entrypoint: mount.entrypoint.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        (format!("{app}@{id}"), mounts)
+    }
+
     /// Publish the open detours for the API.
     pub(super) fn publish_detours(&self) {
         let detours = self.detours.values().map(Detour::message).collect();
         *self.info.detours.lock().expect("detours poisoned") = detours;
-    }
-
-    /// The application's host names, patterns left out, as its URLs give
-    /// them: what the run's toolbar accepts beside loopback names.
-    fn detour_hosts(&self, app: &str) -> Vec<String> {
-        let routes = self.store.routes().unwrap_or_default();
-        let hosts = self.store.hosts().unwrap_or_default();
-        let listeners = self
-            .info
-            .listeners
-            .read()
-            .expect("listeners poisoned")
-            .clone();
-        let mut names = BTreeSet::new();
-
-        crate::urls::for_app(app, &routes, &hosts, &listeners)
-            .into_iter()
-            .map(|candidate| candidate.name)
-            .filter(|name| names.insert(name.clone()))
-            .collect()
     }
 
     /// What the detours add to the snapshot: a release of each
@@ -515,11 +561,21 @@ impl Daemon {
                     }),
                     release: detour.release.clone(),
                     preview_secret: detour.secret.clone(),
+                    detour_paths: detour.opening.paths.clone(),
                     access_log,
                     app,
                     ..Default::default()
                 }
             })
             .collect()
+    }
+}
+
+/// A detour's traffic with its scope after it: `all under /app/api`.
+fn scoped(traffic: &str, scope: &str) -> String {
+    if scope.is_empty() {
+        traffic.to_owned()
+    } else {
+        format!("{traffic} {scope}")
     }
 }

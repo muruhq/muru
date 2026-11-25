@@ -596,8 +596,14 @@ def test_a_daemon_restart_readopts_the_instances(tmp_path: Path) -> None:
 
         assert report(second, "/crash")["pid"] == pid
         wait_for(lambda: not alive(pid))
-        wait_for(lambda: second.request("/").status == 200 and report(second)["pid"] != pid, 20)
+
+        # Issue 922: the relay reports the end at once, so a request sent
+        # before the daemon's next check is held, not refused, and is
+        # answered by the instance started in its place.
+
+        time.sleep(0.2)
         replacement = report(second)["pid"]
+        assert replacement != pid
     finally:
         if second is None:
             second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
@@ -612,18 +618,35 @@ def test_a_daemon_restart_adopts_the_instances_still_there_and_starts_the_rest(
 ) -> None:
     first = start_daemon(tmp_path)
     second = None
+    ready = tmp_path / "ready"
+    ready.touch()
+    last: set[int] = set()
 
     try:
-        deploy_server(first, "legacy", "--bind", "port", "--instances", "2")
+        deploy_server(
+            first,
+            "legacy",
+            "--bind",
+            "port",
+            "--instances",
+            "2",
+            "--readiness",
+            "/healthz",
+            "--env",
+            f"LEGACY_READY={ready}",
+        )
         before = instances(first, "legacy@r1")
         survivor, lost = before[0]["pid"], before[1]["pid"]
 
         # The daemon detaches, and one instance exits while none is there.
+        # Whatever is started in its place answers its readiness probe
+        # only once the file is back.
 
         assert "detached" in first.muructl("daemon", "stop").stdout
         first.process.wait(timeout=30)
         os.kill(lost, signal.SIGKILL)
         wait_for(lambda: not alive(lost))
+        ready.unlink()
 
         # The next daemon takes over the instance that is still there, as
         # it was, and starts the other again at its address. The release
@@ -641,25 +664,62 @@ def test_a_daemon_restart_adopts_the_instances_still_there_and_starts_the_rest(
         ]
         events = second.muructl("events").stdout
         assert f"re-adopted the server instances (pid {survivor})" in events
-        assert "instance 1 was gone and is started again" in events
+
+        # Its end is told once, by the adoption (issue 916).
+
+        assert (
+            "instance 1 exited with signal: 9 (SIGKILL) while no daemon ran "
+            "and is started again in 1s"
+        ) in events
+        assert events.count("instance 1 exited") == 1
         assert f"instance 1 started again (pid {replacement})" in events
 
-        # Both serve.
+        # Issue 917: started again but not ready, the instance takes no
+        # requests, and none fails, until it answers its probe; then both
+        # serve.
 
         def serving() -> set[int]:
             responses = [second.request(f"/n/{n}") for n in range(8)]
-            return {json.loads(r.body)["pid"] for r in responses if r.status == 200}
+            assert [r.status for r in responses] == [200] * 8
+            return {json.loads(r.body)["pid"] for r in responses}
 
+        assert serving() == {survivor}
+        ready.touch()
         wait_for(lambda: serving() == {survivor, replacement}, 20)
+        assert "instance 1 answers and takes requests again" in second.muructl("events").stdout
+
+        # Issue 919: with both started again and neither ready, a request
+        # waits for one to answer rather than failing.
+
+        ready.unlink()
+        os.kill(survivor, signal.SIGKILL)
+        os.kill(replacement, signal.SIGKILL)
+        wait_for(
+            lambda: all(
+                instance["pid"] not in (0, survivor, replacement)
+                for instance in instances(second, "legacy@r1")
+            ),
+            20,
+        )
+        answers: list[support.Response] = []
+        held = threading.Thread(target=lambda: answers.append(second.request("/held")))
+        held.start()
+        time.sleep(0.5)
+        assert held.is_alive()
+        ready.touch()
+        held.join(timeout=10)
+        assert [answer.status for answer in answers] == [200]
+        last = {instance["pid"] for instance in instances(second, "legacy@r1")}
+        assert json.loads(answers[0].body)["pid"] in last
     finally:
         if second is None:
             second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
 
         second.stop(shutdown=True)
 
-    # The shutdown stops them both: the survivor was not left behind.
+    # The shutdown stops them all: the survivor was not left behind.
 
-    wait_for(lambda: not alive(survivor) and not alive(replacement))
+    wait_for(lambda: not any(alive(pid) for pid in {survivor, replacement, *last}))
 
 
 def test_instance_lines_are_timed_tagged_and_kept_through_a_rotation(tmp_path: Path) -> None:

@@ -360,6 +360,14 @@ pub enum Report {
     /// The answer to a flush this client asked for: what the relay's
     /// pipes held when it asked, and what it had queued, is written.
     Flushed,
+    /// Issue 922: the process the relay runs as its parent has ended and
+    /// been reaped, with its wait status. It comes as soon as the relay
+    /// reaps it, before the relay has read the process's pipes to their
+    /// end and exited, and to a client that connects later at once.
+    Ended {
+        /// The wait status, as waitpid gives it.
+        status: i32,
+    },
 }
 
 /// A line a client sends on the relay's control socket.
@@ -405,6 +413,9 @@ struct Shared {
     reopens: watch::Sender<u64>,
     status: watch::Sender<Status>,
     events: broadcast::Sender<Event>,
+    /// The wait status of the process the relay runs, once it has reaped
+    /// it, for the control socket to report (issue 922).
+    ended: watch::Sender<Option<i32>>,
     tag: String,
 }
 
@@ -430,6 +441,7 @@ impl Shared {
             reopens: watch::channel(0).0,
             status: watch::channel(Status::default()).0,
             events: broadcast::channel(16).0,
+            ended: watch::channel(None).0,
             tag: format!("muru.relay[{}]: ", std::process::id()),
         }
     }
@@ -1424,6 +1436,7 @@ async fn exec_loop(args: RelayArgs, exec: Exec, shared: Arc<Shared>) -> anyhow::
                 record.status = Some(status.map_or(0, ExitStatusExt::into_raw));
                 record.ended_unix_ms = crate::model::now_unix_ms();
                 record.write(&exec.record);
+                shared.ended.send_replace(record.status);
                 exited_at = Some(Instant::now());
             }
             () = tokio::time::sleep(Duration::from_millis(100)), if exited_at.is_some() => {}
@@ -1836,8 +1849,9 @@ impl Lines {
 }
 
 /// Serve the control socket: each client gets the status at once and
-/// whenever it changes, at most once a second, and every event, and may
-/// ask for flushes, which are handed to `flushes`.
+/// whenever it changes, at most once a second, every event, and the end
+/// of the process the relay runs, and may ask for flushes, which are
+/// handed to `flushes`.
 fn serve_control(
     path: &Path,
     shared: &Arc<Shared>,
@@ -1853,7 +1867,15 @@ fn serve_control(
             let status = shared.status.subscribe();
             let events = shared.events.subscribe();
             let reopens = shared.reopens.subscribe();
-            tokio::spawn(report_to(stream, status, events, reopens, flushes.clone()));
+            let ended = shared.ended.subscribe();
+            tokio::spawn(report_to(
+                stream,
+                status,
+                events,
+                reopens,
+                ended,
+                flushes.clone(),
+            ));
         }
     });
 
@@ -1867,9 +1889,21 @@ async fn report_to(
     mut status: watch::Receiver<Status>,
     mut events: broadcast::Receiver<Event>,
     mut reopens: watch::Receiver<u64>,
+    mut ended: watch::Receiver<Option<i32>>,
     flushes: mpsc::UnboundedSender<FlushAnswer>,
 ) {
     let (read, mut stream) = stream.into_split();
+
+    // A client that connects after the process ended hears so first.
+
+    let already = *ended.borrow_and_update();
+
+    if let Some(status) = already
+        && send(&mut stream, &Report::Ended { status }).await.is_err()
+    {
+        return;
+    }
+
     let mut requests = BufReader::new(read).lines();
     let mut asking = true;
     let (flushed_tx, mut flushed) = mpsc::unbounded_channel::<()>();
@@ -1936,6 +1970,19 @@ async fn report_to(
             changed = reopens.changed() => {
                 if changed.is_err() || send(&mut stream, &Report::Reopened).await.is_err() {
                     return;
+                }
+            }
+            changed = ended.changed() => {
+                let status = *ended.borrow_and_update();
+
+                match (changed, status) {
+                    (Err(_), _) => return,
+                    (Ok(()), Some(status)) => {
+                        if send(&mut stream, &Report::Ended { status }).await.is_err() {
+                            return;
+                        }
+                    }
+                    (Ok(()), None) => {}
                 }
             }
         }
@@ -2435,6 +2482,74 @@ mod tests {
                 .map(|status| std::process::ExitStatus::from_raw(status).code()),
             Some(Some(3))
         );
+    }
+
+    #[test]
+    fn a_relay_reports_its_processs_end_before_it_has_read_the_last_of_its_output() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("relay-0.sock");
+
+        // The process leaves a child behind that holds its output for a
+        // second, so the relay reads on after the process has ended.
+
+        let args = RelayArgs {
+            connect: None,
+            control: control.clone(),
+            host_output_fd: None,
+            log_file: Some(dir.path().join("release.log")),
+            also_log_file: None,
+            queue: DEFAULT_QUEUE,
+            overflow: Overflow::DropOldest,
+            release: None,
+            exec: Some(Exec {
+                argv: ["/bin/sh", "-c", "sleep 1 & exit 3"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                record: dir.path().join("relay-0.toml"),
+                tag: String::new(),
+                stdout_tag: String::new(),
+                name: "instance 0".to_owned(),
+                stop_signal: libc::SIGTERM,
+                stop_group: false,
+            }),
+        };
+        let relay = std::thread::spawn(move || run(args));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Issue 922: the end comes on the control socket while the relay
+        // still runs, to a client that may connect after it.
+
+        let status = runtime.block_on(async {
+            let stream = loop {
+                match UnixStream::connect(&control).await {
+                    Ok(stream) => break stream,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            };
+
+            let mut lines = BufReader::new(stream).lines();
+
+            loop {
+                let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+
+                if let Ok(Report::Ended { status }) = serde_json::from_str::<Report>(&line) {
+                    break status;
+                }
+            }
+        });
+
+        assert!(!relay.is_finished(), "the relay was still reading");
+        assert_eq!(std::process::ExitStatus::from_raw(status).code(), Some(3));
+        relay.join().unwrap().unwrap();
     }
 
     #[test]

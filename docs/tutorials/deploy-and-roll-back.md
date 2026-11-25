@@ -36,6 +36,13 @@ Save this as `v1/app.py`:
 `muru.context()` tells the application where it runs, so each response
 says which release answered it.
 
+Save this as `v1/pyproject.toml`, which tells Muru what to run and with
+which interpreter, the project's virtualenv one directory up:
+
+```{literalinclude} code/releases/v1/pyproject.toml
+:language: toml
+```
+
 ## Start the daemon
 
 ```
@@ -60,7 +67,7 @@ and what is deployed.
 ## Deploy the first release
 
 ```
-muructl deploy hello v1 --entrypoint app:application --python .venv/bin/python
+muructl deploy hello v1
 ```
 
 ```
@@ -79,9 +86,12 @@ curl http://127.0.0.1:8080/
 Hello from hello@r1
 ```
 
-The entrypoint and the interpreter are recorded with the release, and the
-next deploy of `hello` takes them from it, so they are needed only the
-first time. A project can also name them in its `[tool.muru]` table.
+The entrypoint and the interpreter come from the release's own
+`[tool.muru]` table, and each release below is a copy of `v1` with that
+file in it, so no deploy needs them as flags. A flag given to a deploy,
+such as `--processes 2`, applies to that release alone; a setting meant
+for every release goes in the table, or on the application with
+`muructl app set`.
 
 `muructl release list hello` shows the release, and `muructl events` the
 story so far:

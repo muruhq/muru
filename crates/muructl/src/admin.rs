@@ -4502,8 +4502,9 @@ pub struct ReleaseArgs {
     pub(crate) sendfile_header: Option<String>,
 
     /// A directory of the application's own files the edge serves under
-    /// a path prefix, as PREFIX=DIR with DIR relative to the source, over
-    /// the source's [[tool.muru.static]] entries by prefix. Repeatable.
+    /// a path prefix, as PREFIX=DIR, with DIR source:SUBDIR or relative
+    /// for a directory in the source, static: or media:, over the
+    /// source's [[tool.muru.static]] entries by prefix. Repeatable.
     #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = crate::parse_static_setting)]
     pub(crate) static_dirs: Vec<(String, String)>,
 
@@ -4545,12 +4546,6 @@ pub struct DeployArgs {
     #[arg(long)]
     override_freeze: bool,
 
-    /// Take nothing from the previous release: every setting a flag can
-    /// set comes from the flags, the source's [tool.muru] table or the
-    /// default, the interpreter included.
-    #[arg(long)]
-    fresh: bool,
-
     /// How long the release this one replaces stays warm for an instant
     /// rollback (default 30m; 0 stops it as soon as it has drained).
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
@@ -4566,6 +4561,17 @@ pub struct DeployArgs {
     /// settings would come from, and change nothing.
     #[arg(long)]
     dry_run: bool,
+
+    /// Record KEY=VALUE with the release, such as
+    /// description=TEXT or url=URL; repeatable. Over what is filled from
+    /// git, and KEY= leaves a filled key out.
+    #[arg(long = "metadata", value_name = "KEY=VALUE", value_parser = crate::release_metadata::parse_flag)]
+    metadata: Vec<(String, String)>,
+
+    /// Fill no commit, ref or dirty flag from the git checkout the
+    /// source directory is in.
+    #[arg(long)]
+    no_git_metadata: bool,
 
     #[command(flatten)]
     socket: SocketArgs,
@@ -4857,6 +4863,7 @@ impl ReleaseArgs {
     /// gives them.
     pub(crate) fn request(self, app: &str, source: &str, python: String) -> pb::DeployRequest {
         pb::DeployRequest {
+            metadata: std::collections::BTreeMap::new(),
             app: app.to_owned(),
             source: source.to_owned(),
             kind: self.server.map(|_| "http".to_owned()).unwrap_or_default(),
@@ -4903,7 +4910,6 @@ impl ReleaseArgs {
             wait: true,
             hold: false,
             override_freeze: false,
-            fresh: false,
             reflection: None,
             grpc_web_origins: Vec::new(),
             retain_ms: None,
@@ -4983,6 +4989,26 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
     }
 
     args.settings.check()?;
+
+    // Section 9.14: the commit and ref the source is at, under what the
+    // flags say, checked here before anything is sent.
+
+    let filled = if args.no_git_metadata {
+        crate::release_metadata::Filled::default()
+    } else {
+        crate::release_metadata::from_git(&source).await
+    };
+
+    if let Some(why) = &filled.failure {
+        eprintln!("muru: no commit or ref recorded from git: {why}");
+    }
+
+    let metadata = muru_config::check_metadata(&crate::release_metadata::merged(
+        filled.metadata,
+        &args.metadata,
+    ))
+    .map_err(anyhow::Error::msg)?;
+
     let mut client = client::connect(&args.socket.endpoint()?).await?;
     let python = args
         .settings
@@ -4992,11 +5018,11 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
         .unwrap_or_default();
 
     let request = pb::DeployRequest {
+        metadata,
         release: args.release.unwrap_or_default(),
         wait: !args.no_wait,
         hold: args.hold,
         override_freeze: args.override_freeze,
-        fresh: args.fresh,
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
         retain_workers: args.retain_workers,
         ..args
@@ -5034,7 +5060,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
         );
     } else {
         println!(
-            "muru: release {}@{} is {}{}",
+            "muru: release {}@{} is {}{}{}",
             release.app,
             release.id,
             release.state,
@@ -5044,11 +5070,32 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
                 " and held: not serving"
             } else {
                 ""
-            }
+            },
+            muru_config::metadata_origin(&release.metadata)
+                .map(|origin| format!(", {origin}"))
+                .unwrap_or_default()
         );
     }
 
     Ok(0)
+}
+
+/// A release's metadata as Muru's views list it (section 9.14): the
+/// well-known keys first, in their order, then the others by key.
+pub(crate) fn metadata_in_order(
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> Vec<(&str, &str)> {
+    let known = muru_config::METADATA_KEYS
+        .iter()
+        .filter_map(|key| metadata.get_key_value(*key));
+    let others = metadata
+        .iter()
+        .filter(|(key, _)| !muru_config::METADATA_KEYS.contains(&key.as_str()));
+
+    known
+        .chain(others)
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
 }
 
 /// A deploy's plan as people read it: the release, each setting with
@@ -5071,6 +5118,10 @@ fn print_deploy_plan(plan: &pb::DeployPlan) {
 
     if plan.new_app {
         println!("  the application {} would be created", plan.app);
+    }
+
+    for (key, value) in metadata_in_order(&plan.metadata) {
+        println!("  metadata {key} = {value}");
     }
 
     if !plan.settings.is_empty() {
@@ -5107,13 +5158,6 @@ fn print_deploy_plan(plan: &pb::DeployPlan) {
                 entry.name, entry.layer
             ),
         }
-    }
-
-    if !plan.settings_from.is_empty() {
-        println!(
-            "  settings nothing else gives come from {}@{}; --fresh takes none",
-            plan.app, plan.settings_from
-        );
     }
 
     if plan.builds {
@@ -6267,6 +6311,268 @@ pub enum AppCommand {
     /// Its data directory is kept unless --data. Refused while a route
     /// sends it traffic. Asks first; without a terminal it needs --yes.
     Remove(Box<AppRemoveArgs>),
+
+    /// Set release settings on the application, which every release
+    /// deployed from now takes over the source's [tool.muru], and under a
+    /// deploy's own flags: variables, secrets, worker counts, recycling,
+    /// the host's timeouts and the memory policy. No running release
+    /// changes. The application is created when it does not exist.
+    Set(Box<AppSetArgs>),
+
+    /// Remove release settings from the application, by key: processes,
+    /// threads, sync_threads, concurrency, max_requests, max_lifetime,
+    /// timeouts.KEY, memory.KEY, env.NAME, or env for every variable.
+    Unset(Box<AppUnsetArgs>),
+
+    /// Show the release settings the application gives its releases.
+    Show {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
+    },
+}
+
+/// What `muructl app set` takes: the deploy flags an application's
+/// settings hold.
+#[derive(Args, Clone)]
+pub struct AppSetArgs {
+    /// The application.
+    app: String,
+
+    /// Worker processes.
+    #[arg(long)]
+    processes: Option<u32>,
+
+    /// Application threads per worker.
+    #[arg(long)]
+    threads: Option<u32>,
+
+    /// Threads for synchronous code called from an ASGI application.
+    #[arg(long, value_name = "N")]
+    sync_threads: Option<u32>,
+
+    /// Requests an ASGI worker's event loop takes at once.
+    #[arg(long, value_name = "N")]
+    concurrency: Option<u32>,
+
+    /// Replace a worker after this many requests, with jitter.
+    #[arg(long, value_name = "N")]
+    max_requests: Option<u64>,
+
+    /// Replace a worker after this long, for example 1h, with jitter.
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    max_lifetime: Option<Duration>,
+
+    /// A host timeout as NAME=DURATION, as deploy --timeout takes it:
+    /// soft, hard, hard_drain_grace, shutdown, websocket_drain_grace,
+    /// exit_grace, loop_stall or gil_stall. Repeatable.
+    #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
+    timeouts: Vec<(String, Duration)>,
+
+    /// A memory setting as KEY=VALUE, as deploy --memory takes it:
+    /// measure, soft_limit, soft_for, reclaim_first, hard_limit or
+    /// check_interval. Repeatable.
+    #[arg(long = "memory", value_name = "KEY=VALUE", value_parser = crate::parse_memory_setting)]
+    memory: Vec<(String, String)>,
+
+    /// An environment variable as NAME=VALUE. Repeatable.
+    #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env_setting)]
+    env: Vec<(String, String)>,
+
+    /// A secret as NAME=STORE:KEY, delivered as the variable, or
+    /// NAME=STORE:KEY:file for a file named by NAME_FILE; the reference is
+    /// kept, never the value. Repeatable.
+    #[arg(long = "secret", value_name = "NAME=STORE:KEY[:file]", value_parser = parse_secret_setting)]
+    secrets: Vec<(String, String, String, bool)>,
+
+    /// Remove every setting the application has first, so it holds only
+    /// those given here.
+    #[arg(long)]
+    replace: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+/// What `muructl app unset` takes.
+#[derive(Args, Clone)]
+pub struct AppUnsetArgs {
+    /// The application.
+    app: String,
+
+    /// The settings to remove, by key.
+    #[arg(value_name = "KEY", required_unless_present = "all")]
+    keys: Vec<String>,
+
+    /// Remove every setting.
+    #[arg(long, conflicts_with = "keys")]
+    all: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
+}
+
+impl AppSetArgs {
+    /// The settings given, as the admin message carries them.
+    fn settings(&self) -> pb::AppSettings {
+        let timeout = |name: &str| timeout_ms(&self.timeouts, name);
+
+        pb::AppSettings {
+            env: self
+                .env
+                .iter()
+                .map(|(name, value)| pb::EnvEntry {
+                    name: name.clone(),
+                    value: value.clone(),
+                    ..Default::default()
+                })
+                .chain(
+                    self.secrets
+                        .iter()
+                        .map(|(name, store, key, as_file)| pb::EnvEntry {
+                            name: name.clone(),
+                            secret_store: store.clone(),
+                            secret_key: key.clone(),
+                            as_file: *as_file,
+                            ..Default::default()
+                        }),
+                )
+                .collect(),
+            processes: self.processes,
+            threads: self.threads,
+            sync_threads: self.sync_threads,
+            concurrency: self.concurrency,
+            max_requests: self.max_requests,
+            max_lifetime_ms: self
+                .max_lifetime
+                .map(|lifetime| lifetime.as_millis() as u64),
+            soft_timeout_ms: timeout("soft"),
+            hard_timeout_ms: timeout("hard"),
+            hard_drain_grace_ms: timeout("hard_drain_grace"),
+            shutdown_timeout_ms: timeout("shutdown"),
+            websocket_drain_grace_ms: timeout("websocket_drain_grace"),
+            exit_grace_ms: timeout("exit_grace"),
+            loop_stall_timeout_ms: timeout("loop_stall"),
+            gil_stall_timeout_ms: timeout("gil_stall"),
+            memory_measure: memory_setting(&self.memory, "measure").unwrap_or_default(),
+            memory_soft_limit: memory_setting(&self.memory, "soft_limit")
+                .and_then(|text| muru_config::parse_size(&text).ok()),
+            memory_soft_for_ms: memory_setting(&self.memory, "soft_for")
+                .and_then(|text| muru_config::parse_duration(&text).ok())
+                .map(|duration| duration.as_millis() as u64),
+            memory_reclaim_first: memory_setting(&self.memory, "reclaim_first")
+                .map(|text| text == "true"),
+            memory_hard_limit: memory_setting(&self.memory, "hard_limit")
+                .and_then(|text| muru_config::parse_size(&text).ok()),
+            memory_check_interval_ms: memory_setting(&self.memory, "check_interval")
+                .and_then(|text| muru_config::parse_duration(&text).ok())
+                .map(|duration| duration.as_millis() as u64),
+        }
+    }
+}
+
+/// Set an application's release settings.
+pub async fn app_set(args: AppSetArgs) -> anyhow::Result<()> {
+    let settings = args.settings();
+
+    anyhow::ensure!(
+        args.replace || settings != pb::AppSettings::default(),
+        "give a setting to set, such as --env NAME=VALUE or --processes N; \
+         `muructl app unset` removes them"
+    );
+
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
+    let answer = client
+        .set_app_settings(pb::SetAppSettingsRequest {
+            app: args.app.clone(),
+            set: Some(settings),
+            unset: Vec::new(),
+            clear: args.replace,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    report_app_settings(&args.app, &answer, args.output.json)
+}
+
+/// Remove some of an application's release settings, or all of them.
+pub async fn app_unset(args: AppUnsetArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
+    let answer = client
+        .set_app_settings(pb::SetAppSettingsRequest {
+            app: args.app.clone(),
+            set: None,
+            unset: args.keys.clone(),
+            clear: args.all,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    report_app_settings(&args.app, &answer, args.output.json)
+}
+
+/// Show an application's release settings.
+pub async fn app_show(app: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.endpoint()?).await?;
+    let answer = client
+        .get_app(pb::GetAppRequest { name: app.clone() })
+        .await
+        .map_err(explain)?
+        .into_inner();
+    let settings = answer.settings.unwrap_or_default();
+
+    if json {
+        return print_answer(&settings);
+    }
+
+    print_app_settings(&app, &settings)
+}
+
+/// What `app set` and `app unset` say: that the change waits for the next
+/// deploy, then the settings as they now are.
+fn report_app_settings(app: &str, settings: &pb::AppSettings, json: bool) -> anyhow::Result<()> {
+    if json {
+        return print_answer(settings);
+    }
+
+    println!(
+        "muru: {app}'s settings are changed for the releases deployed from now; \
+         no running release changes"
+    );
+    print_app_settings(app, settings)
+}
+
+/// An application's settings, a line a key, a secret by its reference.
+fn print_app_settings(app: &str, settings: &pb::AppSettings) -> anyhow::Result<()> {
+    let lines = muru_controller::app_settings::AppSettings::from_message(settings)
+        .map_err(|error| anyhow::anyhow!(error))?
+        .lines();
+
+    if lines.is_empty() {
+        println!(
+            "{app} has no settings of its own; its releases take the flags they are deployed \
+             with, the source's [tool.muru] and the defaults"
+        );
+    }
+
+    for (key, value) in lines {
+        println!("{key} = {value}");
+    }
+
+    Ok(())
 }
 
 /// What `muructl app remove` takes.
@@ -7527,6 +7833,12 @@ pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             target = format!("{target} ({})", parts.join(", "));
         }
 
+        // Section 4.5: the part of the path the application lives under.
+
+        if !route.strip_prefix.is_empty() {
+            target.push_str(&format!(" [strip_prefix {}]", route.strip_prefix));
+        }
+
         // Section 4.10: reachable by internal redirect only, and from
         // which other applications.
 
@@ -7735,17 +8047,18 @@ pub async fn release_list(
     }
 
     println!(
-        "{:<24} {:<10} {:<8} {:<16} {:>9} SOURCE",
-        "RELEASE", "STATE", "SERVING", "WORKERS", "DISK"
+        "{:<24} {:<10} {:<8} {:<16} {:<13} {:>9} SOURCE",
+        "RELEASE", "STATE", "SERVING", "WORKERS", "COMMIT", "DISK"
     );
 
     for release in releases {
         println!(
-            "{:<24} {:<10} {:<8} {:<16} {:>9} {}",
+            "{:<24} {:<10} {:<8} {:<16} {:<13} {:>9} {}",
             format!("{}@{}", release.app, release.id),
             release.state,
             if release.serving { "yes" } else { "" },
             workers_column(&release),
+            commit_column(&release.metadata),
             human_size(release.disk_bytes),
             release.source
         );
@@ -7999,6 +8312,13 @@ pub async fn release_show(release: String, socket: SocketArgs, json: bool) -> an
     Ok(())
 }
 
+/// The commit a release's metadata names, as `release list` shows it
+/// (section 9.14): shortened, with `+` when its checkout had changes, or
+/// `-` for none.
+fn commit_column(metadata: &std::collections::BTreeMap<String, String>) -> String {
+    muru_config::commit_label(metadata).unwrap_or_else(|| "-".to_owned())
+}
+
 /// A release's details as the lines `release show` prints, key first.
 fn release_details(release: &pb::Release) -> Vec<(String, String)> {
     let mut lines = vec![
@@ -8022,6 +8342,12 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
 
     lines.push(("source".to_owned(), release.source.clone()));
 
+    // Section 9.14: every key of its metadata, the well-known ones first.
+
+    for (key, value) in metadata_in_order(&release.metadata) {
+        lines.push((key.to_owned(), value.replace('\n', " ")));
+    }
+
     if release.websockets > 0 {
         lines.push((
             "websockets".to_owned(),
@@ -8036,7 +8362,11 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
         lines.push(("kind".to_owned(), "detour".to_owned()));
         lines.push((
             "traffic".to_owned(),
-            muru_controller::detours::traffic_text(&detour.traffic, detour.until_unix_ms),
+            muru_controller::detours::listed_traffic(
+                &detour.traffic,
+                detour.until_unix_ms,
+                &detour.paths,
+            ),
         ));
         lines.push(("pid".to_owned(), detour.pid.to_string()));
 

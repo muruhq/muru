@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -448,6 +449,7 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
         support.unavailable("muructl or the extension is not built")
     run_dir = support.short_dir("muru-run-")
     port = support.free_port()
+    dashboard = support.free_port()
     location = [
         "--config",
         str(tmp_path / "muru.toml"),
@@ -461,8 +463,13 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
         str(tmp_path / "cache"),
     ]
 
+    # Issue 851: every start says where it listens and serves its
+    # dashboard, so nothing depends on a default port being free.
+
+    serving = ["--listen", f"127.0.0.1:{port}", "--dashboard", f"127.0.0.1:{dashboard}"]
+
     started = subprocess.run(
-        [str(muructl), "daemon", "start", "--listen", f"127.0.0.1:{port}", *location],
+        [str(muructl), "daemon", "start", *serving, *location],
         capture_output=True,
         text=True,
         check=False,
@@ -473,7 +480,11 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
         assert started.returncode == 0, started.stdout + started.stderr
         assert "daemon started" in started.stdout
         again = subprocess.run(
-            [str(muructl), "up", *location], capture_output=True, text=True, check=False, timeout=60
+            [str(muructl), "up", *serving, *location],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
         )
         assert "already running" in again.stdout
         pid = again.stdout.split("(pid ")[1].split(")")[0]
@@ -491,7 +502,11 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
         assert "detached" in detached.stdout, detached.stdout + detached.stderr
         assert not (run_dir / "daemon.pid").exists()
         restarted = subprocess.run(
-            [str(muructl), "up", *location], capture_output=True, text=True, check=False, timeout=60
+            [str(muructl), "up", *serving, *location],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
         )
         assert restarted.returncode == 0, restarted.stdout + restarted.stderr
         status = subprocess.run(
@@ -502,6 +517,7 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
             timeout=60,
         )
         assert f"http://127.0.0.1:{port}" in status.stdout
+        assert f"127.0.0.1:{dashboard}" in status.stdout, status.stdout
         assert f"logs     {tmp_path / 'logs'}\n" in status.stdout
         assert "cache    " in status.stdout and "config   " in status.stdout
     finally:
@@ -766,25 +782,78 @@ def test_the_daemons_file_is_named_only_where_it_is_read(daemon: Daemon, tmp_pat
     assert "not an address" in run(MURU_DAEMON_CONFIG=str(config))
 
 
-def test_a_deploy_carries_settings_from_the_previous_release(daemon: Daemon) -> None:
-    # Section 3.3: what neither the flags nor the source's table give
-    # comes from the release before, a timeout, a memory key and an
-    # environment variable alike, and --fresh starts from the defaults.
+def test_a_deploy_takes_nothing_from_the_release_before(daemon: Daemon) -> None:
+    # Section 3.3, issue 861: a flag applies to its own release alone. What
+    # neither the next deploy's flags nor the source's table give is the
+    # default, a timeout, a memory key and an environment variable alike.
 
     daemon.deploy(
         "shop", SHOP, "--timeout", "soft=3s", "--memory", "soft_limit=800MB", "--env", "DEBUG=1"
     )
     daemon.deploy("shop", SHOP)
     shown = daemon.muructl("config", "show", "shop", "--effective").stdout
-    assert "#   shop@r2: timeouts.soft_timeout = 3s (the previous release)" in shown
-    assert "#   shop@r2: memory.soft_limit = 800MB (the previous release)" in shown
+    assert "#   shop@r2: timeouts.soft_timeout = off (default)" in shown
+    assert "#   shop@r2: memory.soft_limit = off (default)" in shown
     assert "#   shop@r2: threads = 3 ([tool.muru])" in shown
     exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
-    assert exported["app"]["shop"]["release"]["r2"]["env"] == {"DEBUG": "1"}
+    assert "env" not in exported["app"]["shop"]["release"]["r2"]
 
-    daemon.deploy("shop", SHOP, "--fresh")
-    shown = daemon.muructl("config", "show", "shop", "--effective").stdout
-    assert "#   shop@r3: timeouts.soft_timeout = off (default)" in shown
-    assert "#   shop@r3: memory.soft_limit = off (default)" in shown
+
+def test_a_deploy_records_where_its_code_came_from(daemon: Daemon, tmp_path: Path) -> None:
+    # Section 9.14, issue 866: a deploy from a git checkout records its
+    # commit and branch, and whether it has changes, beside the metadata
+    # its flags give; every view shows it.
+
+    source = tmp_path / "shop"
+    shutil.copytree(SHOP, source, ignore=shutil.ignore_patterns("__pycache__"))
+
+    identity = ["-c", "user.name=Muru", "-c", "user.email=m@example.com"]
+
+    def git(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(source), *identity, "-c", "commit.gpgsign=false", *arguments],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    git("add", ".")
+    git("commit", "-q", "-m", "shop")
+    commit = git("rev-parse", "HEAD")
+
+    line = daemon.deploy(
+        "shop", source, "--metadata", "url=https://git.example.com/shop/pull/42", git_metadata=True
+    )
+    assert line.endswith(f", commit {commit[:12]} of main"), line
+    shown = json.loads(daemon.muructl("release", "show", "shop@r1", "--json").stdout)
+    assert shown["metadata"] == {
+        "commit": commit,
+        "ref": "refs/heads/main",
+        "url": "https://git.example.com/shop/pull/42",
+    }
+    assert (
+        f"from {source.resolve()}, commit {commit[:12]} of main" in daemon.muructl("events").stdout
+    )
+
+    # A change makes the next release dirty, which the list marks; a key
+    # given empty leaves out what git filled.
+
+    (source / "notes.txt").write_text("draft\n")
+    daemon.deploy("shop", source, "--metadata", "ref=", git_metadata=True)
+    listed = daemon.muructl("release", "list", "shop").stdout
+    assert re.search(rf"shop@r2 .* {commit[:12]}\+ ", listed), listed
+    assert re.search(rf"shop@r1 .* {commit[:12]} ", listed), listed
+    second = json.loads(daemon.muructl("release", "show", "shop@r2", "--json").stdout)
+    assert second["metadata"] == {"commit": commit, "dirty": "true"}
+
+    # The export writes it, and a limit refuses a deploy before it is sent.
+
     exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
-    assert "env" not in exported["app"]["shop"]["release"]["r3"]
+    assert exported["app"]["shop"]["release"]["r2"]["metadata"]["dirty"] == "true"
+    refused = daemon.muructl(
+        "deploy", "shop", str(source), "--metadata", "url=ftp://example.com", check=False
+    )
+    assert refused.returncode != 0
+    assert "must be an absolute http or https URL" in refused.stderr

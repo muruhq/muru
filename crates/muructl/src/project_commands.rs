@@ -147,7 +147,18 @@ pub fn check(
 /// application is served with.
 pub fn prepare(context: &Context, request: CommandRequest) -> Result<Prepared, String> {
     let declared_command = check(&context.project, context.file.as_deref(), &request)?;
-    let (places, unset) = crate::places::variables(&context.places);
+    let (places, mut unset) = crate::places::variables(&context.places);
+
+    // Issue 852: a command is no worker, and is a development run's only
+    // when the run gave it the variable, whatever muructl inherited.
+
+    unset.push(muru_controller::host::WORKER_ID_VARIABLE.to_owned());
+
+    let development = muru_controller::host::DEVELOPMENT_VARIABLE;
+
+    if !context.env.iter().any(|(name, _)| name == development) {
+        unset.push(development.to_owned());
+    }
 
     let env = muru_controller::commands::environment(
         context.env.clone(),
@@ -352,7 +363,6 @@ pub async fn own(args: &ProjectArgs, request: &CommandRequest) -> anyhow::Result
         flag: settings.python.as_deref(),
         table: table.python.as_deref(),
         project: &project,
-        previous: None,
         always: false,
         uv: uv.as_ref(),
         isolation: &isolation,
@@ -495,13 +505,28 @@ mod tests {
             value(&prepared, "MURU_STATIC_DIR"),
             Some("/state/runs/shop-1/static")
         );
-        assert!(prepared.unset.is_empty());
+        assert_eq!(prepared.unset, ["MURU_WORKER_ID", "MURU_DEVELOPMENT"]);
 
         let mut without = context(dir.path());
         without.places = muru_controller::places::Places::default();
         let prepared = prepare(&without, CommandRequest::OneOff(vec!["true".to_owned()])).unwrap();
         assert_eq!(value(&prepared, "MURU_DATA_DIR"), None);
-        assert_eq!(prepared.unset.len(), 4, "{:?}", prepared.unset);
+        assert_eq!(prepared.unset.len(), 6, "{:?}", prepared.unset);
+
+        // Issue 852: a development run's command is told so, and none
+        // inherits a worker's index.
+
+        let mut development = context(dir.path());
+        development
+            .env
+            .push(("MURU_DEVELOPMENT".to_owned(), "1".to_owned()));
+        let prepared = prepare(
+            &development,
+            CommandRequest::OneOff(vec!["true".to_owned()]),
+        )
+        .unwrap();
+        assert_eq!(value(&prepared, "MURU_DEVELOPMENT"), Some("1"));
+        assert_eq!(prepared.unset, ["MURU_WORKER_ID"]);
     }
 
     #[test]

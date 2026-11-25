@@ -68,6 +68,15 @@ joined. For ASGI, `root_path` is the mount's path and `path` is the whole
 path, as the ASGI specification asks. `muru.context().interface` names
 the default mount's interface.
 
+A mount's path is a URL path from the host's root, whatever path the
+route that reaches the release has: behind a route at `/app`, a mount at
+`/sub` serves `/sub/...`, and `/app/sub/x` goes to the default
+entrypoint. When that route has
+[`strip_prefix`](virtual-hosts.md#an-application-under-a-sub-path), the
+mount's path is relative to the stripped part instead: with
+`strip_prefix = "/app"`, the mount at `/sub` serves `/app/sub/...` with
+`SCRIPT_NAME=/app/sub`.
+
 A worker with any ASGI mount runs one event loop, and every ASGI
 application on it, the default mount's or a named one's, has its own
 lifespan: each is started before the worker is ready and shut down when

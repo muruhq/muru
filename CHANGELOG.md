@@ -9,6 +9,77 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a36 (2026-11-25)
+
+### Added
+
+- Added `MURU_WORKER_ID`, the worker's index within its group, to each worker's environment, and `MURU_DEVELOPMENT=1` with the new `muru.context().development` to a development run (`muructl run` without `--allow-public`, and a detour). The environment variables reference now lists these and the variables a managed server's instances are given, `MURU_HTTP_BIND`, `MURU_SERVER_INDEX` and `PORT`. ([#852](https://github.com/muruhq/muru/issues/852))
+- Added `muructl proto`, which writes out the admin API's `.proto` files
+  this muructl was built from (`export`, with `--descriptor-set` for a
+  compiled descriptor set), checks a copy against them (`status`), and
+  prints or lists them, so a client's stubs come from the release
+  installed. ([#858](https://github.com/muruhq/muru/issues/858))
+- `[tool.muru.run]` (and `[run]` in `muru.toml` and `muru.local.toml`) took
+  `tracing`, so a project could trace every `muructl run` and nothing else,
+  and `muructl run` and `muructl detour run` gained `--tracing` and
+  `--no-tracing`. ([#860](https://github.com/muruhq/muru/issues/860))
+- Added release metadata: `muructl deploy` records the commit, the branch or tag, and whether the checkout had changes when the source is a git checkout, and `--metadata KEY=VALUE` records more, such as `url` and `description`. `release list` shows the commit, `release show`, `--json`, the dashboard and the `release.created` event show the rest, and `config export` writes it as a release table's `metadata`. ([#866](https://github.com/muruhq/muru/issues/866))
+- An application held release settings of its own, which every release
+  deployed after they were set took over the source's `[tool.muru]` and
+  under the deploy's flags: variables, secrets by reference, worker counts,
+  recycling, the host's timeouts and the memory policy. `muructl app set`,
+  `app unset` and `app show` managed them, `[app.NAME]` in a file given to
+  `muructl apply` took the same keys, `muructl config export` wrote them,
+  and the MCP tools `app_settings`, `set_app_settings` and
+  `unset_app_settings` ran the same commands. ([#899](https://github.com/muruhq/muru/issues/899))
+- `source:` and `source:SUBDIR` named the release's source directory, or a
+  directory in it, in a static entry's `dir`, `--static` and
+  `sendfile_roots`, beside `static:` and `media:`. A plain relative path
+  meant the same, and both were recorded by place, so `muructl config
+  export` wrote `source:SUBDIR` rather than the absolute path one source
+  resolved to. ([#900](https://github.com/muruhq/muru/issues/900))
+- Added `muructl detour run --mounts release`, which serves a detour with the serving release's mounts, and a warning as a detour opens for each of its checkout's mounts that differs from the serving release's, which were otherwise changed silently. ([#907](https://github.com/muruhq/muru/issues/907))
+- Added path-scoped detours: `muructl detour run --path PREFIX` (or `--mount NAME`) and `muructl detour traffic --path PREFIX` make a detour take only the requests under those client URL paths, for previews and every traffic choice alike, leaving the rest to the serving release, and `--all-paths` takes every path again. Two detours of one application may take all of it under paths that do not overlap. ([#909](https://github.com/muruhq/muru/issues/909))
+- Added `strip_prefix` to routes: the leading part of a route's path where the application lives, which an application's release gets as `SCRIPT_NAME` with its mounts matched against the rest of the path, and which an upstream, a managed HTTP release or a detour gets as `X-Forwarded-Prefix`, with the rest of the path as the path sent. ([#910](https://github.com/muruhq/muru/issues/910))
+- Added a wait at the edge for a managed server whose every instance is starting again: a request now waits up to the queue timeout for an instance to answer and is sent as soon as one does, instead of failing on a refused connection, so a release with one instance no longer fails the requests that arrive while it restarts. Too many waiting requests are answered 503 `upstream_starting`. ([#919](https://github.com/muruhq/muru/issues/919))
+
+### Changed
+
+- A managed server's instance that exits, or that a restarted daemon finds gone, is now out of service until it is started again and answers its readiness probe, rather than taking requests from the moment its process starts and being set aside after three refused connections. A `server.ready` event says when it takes requests again, and a warning says when it did not answer within the readiness timeout and takes them all the same. ([#917](https://github.com/muruhq/muru/issues/917))
+
+### Removed
+
+- A deploy took nothing from the release before it: a setting given by flag
+  applied to that release alone, a source without static entries served
+  none of another source's files, and the interpreter never came from an
+  earlier release. Settings meant to last go on the application, with
+  `muructl app set` or `[app.NAME]`. `muructl deploy --fresh`, the deploy
+  request's `fresh`, the deploy plan's `settings_from` and the layer
+  `the previous release` were removed. ([#861](https://github.com/muruhq/muru/issues/861))
+
+### Fixed
+
+- Fixed an upstream address, or a managed server's instance, that was ejected while another address served never being tried again: once its ejection is over it now takes its one trial request at its turn and is back in service when it answers. ([#905](https://github.com/muruhq/muru/issues/905))
+- Fixed applications reached only through a default host with no names, through hosts whose names are all patterns, or as a static route's fallback having no URL: `muructl open`, `muructl detour preview`, `--open-preview`, the MCP `detours` tool and the dashboard now give the default host's listener addresses and the fallback's route, `detour preview --header` works whatever the hosts are, and an application behind pattern names says to give the host a canonical name or pass one with the new `--name`. Preview links are now checked to reach this machine, as `muructl open`'s are. ([#908](https://github.com/muruhq/muru/issues/908))
+- Fixed a detour's toolbar refusing its files and records with 403 when the page was reached by a name the daemon routes to the detour but had not told the run: the default host's names, wildcard and pattern names, and names added after the detour opened. A detour's toolbar now answers any host name, and still refuses another site's pages. ([#911](https://github.com/muruhq/muru/issues/911))
+- Fixed a detour's toolbar being unreachable (404 `no_route`) when its application is routed at a sub path such as `/app`: the toolbar now lives under the route, at `/app/_muru/toolbar/`, with or without the route's `strip_prefix`. ([#912](https://github.com/muruhq/muru/issues/912))
+- Fixed `muructl apply` describing a static route's change as `to ` with nothing after it: the line now names the directory and the fallback, as `static DIR, else APP`. ([#915](https://github.com/muruhq/muru/issues/915))
+- Fixed a re-adopted managed server reporting an instance that exited while no daemon ran twice, once as gone and again as a fresh exit: the `release.adopted` event now says how the instance ended and when it is started again, and the exit is not reported a second time. ([#916](https://github.com/muruhq/muru/issues/916))
+- Fixed `muructl config export --app NAME` leaving out a static route whose `fallback` sends requests to the application, and the route's host: the exported file now carries every route that reaches the application. ([#918](https://github.com/muruhq/muru/issues/918))
+- Fixed a managed server's instance that exited taking requests until the daemon's next check noticed, up to several seconds when a process it left behind still held its output: its relay now reports the end at once, so the instance is out of service, and requests to a lone instance wait for it, from the moment it ends. ([#922](https://github.com/muruhq/muru/issues/922))
+
+### Security
+
+- A detour's toolbar is now shown only on pages reached by the detour's preview, and its `/_muru/toolbar/` paths answer only previewed requests: a client that `muructl detour traffic all`, `share=N` or `class=NAME` sends to the detour gets the page without the toolbar and can no longer read the run's request records. ([#913](https://github.com/muruhq/muru/issues/913))
+
+### Documentation
+
+- The comments of the admin API's `.proto` file, which `muructl proto`
+  gives out, described each call and field without citing the design
+  specification. ([#902](https://github.com/muruhq/muru/issues/902))
+- Corrected the documentation of what a route's path does: it selects requests and does not set `SCRIPT_NAME`, and a mount's path is a URL path from the host's root unless the route that reaches the release has `strip_prefix`. ([#906](https://github.com/muruhq/muru/issues/906))
+
+
 ## 0.1.0a35 (2026-11-24)
 
 ### Added

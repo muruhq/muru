@@ -247,6 +247,7 @@ message Upstream {
   repeated string sendfile_roots = 13;  // section 4.9: directories an X-Muru-Sendfile path must lie in, when trusted
   string sendfile_header = 14;          // a second header honoured as X-Muru-Sendfile is, such as X-Sendfile; none when empty
   bool detour = 15;                     // section 4.21: a detour's run, reached over h2c for gRPC and http1 otherwise, whatever protocol says
+  repeated string starting = 16;        // section 9.9: addresses still starting, out of service but never ejected for it, until the daemon finds them ready
 }
 
 // How an upstream's addresses are probed.
@@ -393,6 +394,7 @@ message Route {
   CompressionChoice compression = 28;   // section 4.17: the route's own compression settings, over the host's; none when absent
   HeaderRules request_headers = 29;     // section 4.7: applied to the route's requests after the host's
   HeaderRules response_headers = 30;    // applied to every response to the route's requests after the host's
+  string strip_prefix = 31;             // section 4.5: the leading part of path that becomes the application's mount point, without a trailing slash; none when empty
 }
 
 // Section 4.11: how a route's uploads are received before dispatch.
@@ -459,6 +461,7 @@ message AppWorkers {
   AccessLogChoice access_log = 19;      // section 11.2: the application's own access log choice; none when absent
   RequestLimits limits = 20;            // section 4.6: the release's own limits on a request, over its host's; none when absent
   string preview_secret = 21;           // section 4.21: a detour's secret, which a preview must carry as RELEASE.SECRET; empty for any other release
+  repeated string detour_paths = 22;    // section 4.21: the client URL paths a detour takes requests under, without a trailing slash; every path when empty
 }
 
 // Section 4.9: a directory of a release's own files, served by the edge

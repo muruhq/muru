@@ -7,7 +7,7 @@
 //! gradually, and probes of a configured path mark each address healthy
 //! or not.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +35,14 @@ use crate::routing::RedirectFlags;
 
 /// The reason an upstream that could not answer is reported with.
 pub const FAILED_REASON: &str = "upstream_failed";
+
+/// The reason a request is refused while every address of a managed
+/// server is starting and `MAX_HELD` requests already wait (issue 919).
+pub const STARTING_REASON: &str = "upstream_starting";
+
+/// The most requests one upstream holds at a time, in one edge process,
+/// while every one of its addresses is starting (issue 919).
+const MAX_HELD: usize = 256;
 
 /// How long a connection may take to open when the upstream does not say.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -283,6 +291,28 @@ struct Probe {
     healthy_after: u32,
 }
 
+/// Section 9.9: the addresses the daemon says are still starting, each a
+/// managed server's instance started again that has not yet answered its
+/// readiness probe (issue 917), and the requests held while every
+/// address is (issue 919). The upstreams that successive snapshots make
+/// under one name share it, so a request held on an earlier snapshot's
+/// upstream hears the snapshot that clears a mark.
+#[derive(Default)]
+struct Starting {
+    addresses: tokio::sync::watch::Sender<HashSet<String>>,
+    /// Requests held now.
+    held: AtomicUsize,
+}
+
+/// Counts a request as held while it lives.
+struct Held<'a>(&'a AtomicUsize);
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// What requests and the probe task share.
 struct Shared {
     name: String,
@@ -303,9 +333,92 @@ struct Shared {
     eject_for: Duration,
     /// The address the next request starts with.
     next: AtomicUsize,
+    starting: Arc<Starting>,
 }
 
 impl Shared {
+    /// The addresses a request tries, in turn from where the last
+    /// request left off: those in service (not ejected, unhealthy or
+    /// starting), and among them, at its turn,
+    /// one whose ejection is over and which may take its one trial
+    /// request (section 4.13), so that an address comes back while the
+    /// others serve. When none is in service or due a trial, every
+    /// address, which is better than answering nothing.
+    fn in_turn(&self, now: Instant) -> Vec<(&Arc<Address>, Admission)> {
+        let count = self.addresses.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let in_order = (0..count).map(|offset| &self.addresses[(start + offset) % count]);
+        let starting = self.starting.addresses.borrow();
+
+        let candidates: Vec<(&Arc<Address>, Admission)> = in_order
+            .clone()
+            .map(|address| {
+                if starting.contains(&address.text) {
+                    (address, Admission::Closed)
+                } else {
+                    (address, address.admission(now))
+                }
+            })
+            .filter(|(_, admission)| *admission != Admission::Closed)
+            .collect();
+
+        if candidates.is_empty() {
+            return in_order
+                .map(|address| (address, Admission::Closed))
+                .collect();
+        }
+
+        candidates
+    }
+
+    /// A request to `address` failed, which counts against it unless the
+    /// address is still starting (issue 917): it is never ejected, or its
+    /// ejection lengthened, for refusing connections while it starts.
+    fn failed(&self, address: &Address) {
+        if self.starting.addresses.borrow().contains(&address.text) {
+            return;
+        }
+
+        address.failed(&self.name, self.eject_after, self.eject_for);
+    }
+
+    /// Whether every address is still starting, by the marks given.
+    fn all_starting(&self, starting: &HashSet<String>) -> bool {
+        self.addresses
+            .iter()
+            .all(|address| starting.contains(&address.text))
+    }
+
+    /// Section 9.9 (issue 919): with every address still starting, hold
+    /// the request until a snapshot brings one into service, for as long
+    /// as `wait` within the request's `deadline`; the time held counts
+    /// against the deadline, which was set when the request arrived. A
+    /// request held to its bound goes on to be tried as any other is.
+    /// When `MAX_HELD` requests are held already the request is refused,
+    /// which `Err` says.
+    async fn hold(&self, wait: Duration, deadline: Instant) -> Result<(), ()> {
+        let mut marks = self.starting.addresses.subscribe();
+
+        if !self.all_starting(&marks.borrow_and_update()) {
+            return Ok(());
+        }
+
+        if self.starting.held.fetch_add(1, Ordering::Relaxed) >= MAX_HELD {
+            self.starting.held.fetch_sub(1, Ordering::Relaxed);
+            return Err(());
+        }
+
+        let _held = Held(&self.starting.held);
+        let until = tokio::time::Instant::from_std((Instant::now() + wait).min(deadline));
+
+        loop {
+            match tokio::time::timeout_at(until, marks.changed()).await {
+                Ok(Ok(())) if self.all_starting(&marks.borrow_and_update()) => {}
+                _ => return Ok(()),
+            }
+        }
+    }
+
     /// The deadline for a client's request to the upstream: the limits'
     /// for any upstream, none to speak of for a detour (section 4.21).
     fn request_deadline(&self, limits: &crate::Limits) -> Duration {
@@ -419,6 +532,16 @@ impl Drop for Upstream {
 impl Upstream {
     /// Compile an upstream from a snapshot, starting its probes.
     pub fn from_message(message: &pb::Upstream) -> Result<Self, String> {
+        Self::from_message_after(message, None)
+    }
+
+    /// Compile an upstream from a snapshot as `from_message` does, taking
+    /// over the starting marks of `earlier`, the upstream of the same
+    /// name the previous snapshot made, with the requests it holds.
+    pub fn from_message_after(
+        message: &pb::Upstream,
+        earlier: Option<&Upstream>,
+    ) -> Result<Self, String> {
         if message.addresses.is_empty() {
             return Err("addresses names nowhere".to_owned());
         }
@@ -429,6 +552,15 @@ impl Upstream {
             .map(|text| Address::new(text).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("addresses: {error}"))?;
+
+        // The marks an earlier snapshot's upstream of the same name
+        // shares are replaced, which wakes the requests it holds.
+
+        let starting =
+            earlier.map_or_else(Arc::default, |earlier| Arc::clone(&earlier.shared.starting));
+        starting
+            .addresses
+            .send_replace(message.starting.iter().cloned().collect());
 
         let protocol = match message.protocol.as_str() {
             "" | "http1" => Protocol::Http1,
@@ -479,6 +611,7 @@ impl Upstream {
             eject_after: message.eject_after,
             eject_for: millis(message.eject_for_ms, DEFAULT_EJECT_FOR),
             next: AtomicUsize::new(0),
+            starting,
         });
 
         let probe = message.probe.as_ref().map(|probe| {
@@ -517,6 +650,13 @@ impl Upstream {
     /// the detour and not as long as one snapshot.
     pub fn carry_relays(&mut self, earlier: &Upstream) {
         self.ended = Arc::clone(&earlier.ended);
+    }
+
+    /// Let go of the requests held for an address to come into service,
+    /// as a snapshot that leaves the upstream out does: they are tried
+    /// as they are.
+    pub fn release_held(&self) {
+        self.shared.starting.addresses.send_replace(HashSet::new());
     }
 
     /// Close every WebSocket relayed through the upstream, as the end of
@@ -1135,6 +1275,17 @@ pub async fn handle(
         without_preview(&mut headers);
     }
 
+    // Section 4.21: the run is told how the request reached it, whether
+    // by its preview, and under which path its route lies. The client's
+    // own header went with the other X-Muru headers.
+
+    if shared.detour {
+        headers.insert(
+            crate::detour::HEADER,
+            context.detour.clone().unwrap_or_default().value(),
+        );
+    }
+
     // Section 4.21: a detour's run is told the port the client came to,
     // since it has none of its own for SERVER_PORT.
 
@@ -1148,6 +1299,22 @@ pub async fn handle(
         )
     {
         headers.insert(HeaderName::from_static("x-forwarded-port"), value);
+    }
+
+    // Section 4.5: behind a route that strips part of the path, the
+    // upstream is sent the rest, and the stripped part is appended to the
+    // trusted forwarded prefix, as a gateway's strip-prefix does.
+
+    let target = target_after_strip(parts, &context.stripped);
+
+    if !context.stripped.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&format!(
+            "{}{}",
+            context.prefix.as_deref().unwrap_or_default(),
+            context.stripped
+        ))
+    {
+        headers.insert(HeaderName::from_static("x-forwarded-prefix"), value);
     }
 
     // gRPC servers look for `te: trailers`, the one value HTTP/2 allows,
@@ -1183,36 +1350,22 @@ pub async fn handle(
         None => context.arrived + shared.request_deadline(limits),
     };
 
-    // The addresses in turn from where the last request left off: those
-    // in service first, then one that is due a trial after an ejection,
-    // and when nothing is in service every address, which is better than
-    // answering nothing.
+    // Section 9.9 (issue 919): with every address of a managed server
+    // starting, the request waits for one to answer, within the queue
+    // timeout and its deadline, rather than failing on a refused
+    // connection.
 
-    let count = shared.addresses.len();
-    let start = shared.next.fetch_add(1, Ordering::Relaxed);
-    let now = Instant::now();
-    let in_order: Vec<&Arc<Address>> = (0..count)
-        .map(|offset| &shared.addresses[(start + offset) % count])
-        .collect();
-    let mut candidates: Vec<&Arc<Address>> = in_order
-        .iter()
-        .copied()
-        .filter(|address| address.admission(now) == Admission::Open)
-        .collect();
-
-    let trials = candidates.is_empty();
-
-    if trials {
-        candidates = in_order
-            .iter()
-            .copied()
-            .filter(|address| address.admission(now) == Admission::Trial)
-            .collect();
+    if shared.hold(limits.queue_timeout, deadline).await.is_err() {
+        let mut problem = Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            STARTING_REASON,
+            "Every instance of the server was starting, and too many requests were waiting for one.",
+        );
+        problem.retry_after = Some(1);
+        return Handled::Response(failing.respond(problem));
     }
 
-    if candidates.is_empty() {
-        candidates = in_order.clone();
-    }
+    let candidates = shared.in_turn(Instant::now());
 
     // A request that may go again if a kept connection turns out to have
     // been closed by the server: one whose method is idempotent and whose
@@ -1229,7 +1382,7 @@ pub async fn handle(
     let _ = failing.dispatched.set(dispatched);
     failing.note_in_flight(|in_flight| in_flight.upstream());
     let mut slot = Some(build_request(
-        parts,
+        &target,
         &method,
         shared,
         protocol,
@@ -1244,7 +1397,7 @@ pub async fn handle(
     // A request that was never sent stays in the slot for the next
     // address; one that went out in part cannot be sent again.
 
-    for address in candidates {
+    for (address, admission) in candidates {
         if slot.is_none() {
             break;
         }
@@ -1252,7 +1405,7 @@ pub async fn handle(
         // An address due a trial takes one request at a time; the claim
         // is made here, so an address never tried keeps none.
 
-        if trials && !address.claim_trial() {
+        if admission == Admission::Trial && !address.claim_trial() {
             continue;
         }
 
@@ -1274,7 +1427,7 @@ pub async fn handle(
                         );
                         address.idle.lock().expect("upstream idle poisoned").clear();
                         slot = Some(build_request(
-                            parts,
+                            &target,
                             &method,
                             shared,
                             protocol,
@@ -1304,7 +1457,7 @@ pub async fn handle(
                     address = %address.text,
                     "upstream request could not be sent: {error}"
                 );
-                address.failed(&shared.name, shared.eject_after, shared.eject_for);
+                shared.failed(address);
                 last_error = error;
             }
             Err(Failure::Sent(error) | Failure::Dropped(error)) => {
@@ -1313,7 +1466,7 @@ pub async fn handle(
                     address = %address.text,
                     "upstream request failed: {error}"
                 );
-                address.failed(&shared.name, shared.eject_after, shared.eject_for);
+                shared.failed(address);
                 return Handled::Response(failing.respond(Problem::new(
                     StatusCode::BAD_GATEWAY,
                     FAILED_REASON,
@@ -1321,7 +1474,7 @@ pub async fn handle(
                 )));
             }
             Err(Failure::Timeout) => {
-                address.failed(&shared.name, shared.eject_after, shared.eject_for);
+                shared.failed(address);
                 return Handled::Response(failing.respond(Problem::new(
                     StatusCode::GATEWAY_TIMEOUT,
                     "deadline",
@@ -1648,11 +1801,28 @@ fn outgoing_headers(
     headers
 }
 
+/// The request's path and query as an upstream is sent them: with the
+/// route's stripped part taken off the path (section 4.5), and `/` when
+/// nothing is left, since a request names a path.
+fn target_after_strip(parts: &http::request::Parts, stripped: &str) -> String {
+    let path = parts.uri.path();
+
+    let rest = match crate::routing::after_strip(path, stripped) {
+        "" => "/",
+        rest => rest,
+    };
+
+    match parts.uri.query() {
+        Some(query) => format!("{rest}?{query}"),
+        None => rest.to_owned(),
+    }
+}
+
 /// The request as sent over `protocol`: origin form over HTTP/1.1, the
 /// full URI with the host as its authority over HTTP/2.
 #[allow(clippy::too_many_arguments)]
 fn build_request(
-    parts: &http::request::Parts,
+    target: &str,
     method: &http::Method,
     shared: &Shared,
     protocol: Protocol,
@@ -1661,11 +1831,6 @@ fn build_request(
     length: Option<u64>,
     body: OutBody,
 ) -> Request<OutBody> {
-    let target = parts
-        .uri
-        .path_and_query()
-        .map_or_else(|| parts.uri.path().to_owned(), |target| target.to_string());
-
     let (uri, version) = if protocol.is_h2() {
         headers.remove(HOST);
         (
@@ -1815,6 +1980,158 @@ mod tests {
         assert_eq!(with("timeout=1"), Duration::ZERO);
         assert_eq!(with("timeout=600"), IDLE_FOR);
         assert_eq!(with("timeout=soon"), IDLE_FOR);
+    }
+
+    #[test]
+    fn an_ejected_address_gets_its_trial_at_its_turn_while_the_others_serve() {
+        let upstream = Upstream::from_message(&pb::Upstream {
+            name: "legacy@r1".to_owned(),
+            addresses: vec!["127.0.0.1:9001".to_owned(), "127.0.0.1:9002".to_owned()],
+            eject_after: 1,
+            eject_for_ms: 5_000,
+            ..Default::default()
+        })
+        .unwrap();
+        let shared = &upstream.shared;
+        let texts = |now: Instant| -> Vec<(String, Admission)> {
+            shared
+                .in_turn(now)
+                .into_iter()
+                .map(|(address, admission)| (address.text.clone(), admission))
+                .collect()
+        };
+        let now = Instant::now();
+
+        // Ejected, the second address is left out while its time runs.
+
+        shared.addresses[1].failed("legacy@r1", 1, Duration::from_secs(5));
+        assert_eq!(texts(now), [("127.0.0.1:9001".to_owned(), Admission::Open)]);
+
+        // Once it is up, the address takes its turn again beside the one
+        // in service, rather than only when nothing else serves.
+
+        let later = now + Duration::from_secs(6);
+        let turns = [texts(later), texts(later)];
+        assert!(
+            turns
+                .iter()
+                .any(|turn| turn.first().map(|(_, admission)| *admission) == Some(Admission::Trial)),
+            "{turns:?}"
+        );
+        assert!(turns.iter().all(|turn| turn.len() == 2), "{turns:?}");
+
+        // A trial in flight closes it to the rest, and its success puts
+        // it back in service.
+
+        assert!(shared.addresses[1].claim_trial());
+        assert_eq!(texts(later).len(), 1);
+        shared.addresses[1].succeeded("legacy@r1");
+        assert!(
+            texts(later)
+                .iter()
+                .all(|(_, admission)| *admission == Admission::Open)
+        );
+
+        // With every address out, a request still tries them all.
+
+        shared.addresses[0].failed("legacy@r1", 1, Duration::from_secs(5));
+        shared.addresses[1].failed("legacy@r1", 1, Duration::from_secs(5));
+        assert_eq!(texts(Instant::now()).len(), 2);
+    }
+
+    #[test]
+    fn a_starting_address_is_out_of_service_and_never_ejected() {
+        let upstream = Upstream::from_message(&pb::Upstream {
+            name: "legacy@r1".to_owned(),
+            addresses: vec!["127.0.0.1:9001".to_owned(), "127.0.0.1:9002".to_owned()],
+            starting: vec!["127.0.0.1:9002".to_owned()],
+            eject_after: 1,
+            eject_for_ms: 5_000,
+            ..Default::default()
+        })
+        .unwrap();
+        let shared = &upstream.shared;
+        let texts = || -> Vec<String> {
+            shared
+                .in_turn(Instant::now())
+                .into_iter()
+                .map(|(address, _)| address.text.clone())
+                .collect()
+        };
+
+        // Issue 917: the starting address takes nothing while the other
+        // serves, and its failures, as when it is tried with every
+        // address out, are not counted against it.
+
+        assert_eq!(texts(), ["127.0.0.1:9001"]);
+        shared.failed(&shared.addresses[1]);
+        let state = shared.addresses[1].state.lock().unwrap();
+        assert_eq!((state.failures, state.ejected_until), (0, None));
+        drop(state);
+
+        // With the other ejected, the starting one is still tried.
+
+        shared.failed(&shared.addresses[0]);
+        assert_eq!(texts().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_request_waits_while_every_address_starts_until_a_snapshot_clears_one() {
+        let message = |starting: &[&str]| pb::Upstream {
+            name: "legacy@r1".to_owned(),
+            addresses: vec!["127.0.0.1:9001".to_owned()],
+            starting: starting.iter().map(|text| (*text).to_owned()).collect(),
+            ..Default::default()
+        };
+        let first = Arc::new(Upstream::from_message(&message(&["127.0.0.1:9001"])).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        // Issue 919: held on the first snapshot's upstream, the request
+        // goes on when the next snapshot clears the mark.
+
+        let held = {
+            let first = Arc::clone(&first);
+            tokio::spawn(async move { first.shared.hold(Duration::from_secs(20), deadline).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!held.is_finished());
+        assert_eq!(first.shared.starting.held.load(Ordering::Relaxed), 1);
+        let second = Upstream::from_message_after(&message(&[]), Some(&first)).unwrap();
+        let waited = tokio::time::timeout(Duration::from_secs(2), held).await;
+        assert_eq!(waited.unwrap().unwrap(), Ok(()));
+        assert_eq!(second.shared.starting.held.load(Ordering::Relaxed), 0);
+
+        // Starting again, a request waits for as long as it may and is
+        // then tried; past the limit on requests held, one is refused.
+
+        let third =
+            Upstream::from_message_after(&message(&["127.0.0.1:9001"]), Some(&second)).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            third
+                .shared
+                .hold(Duration::from_millis(100), deadline)
+                .await,
+            Ok(())
+        );
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        third
+            .shared
+            .starting
+            .held
+            .store(MAX_HELD, Ordering::Relaxed);
+        assert_eq!(
+            third.shared.hold(Duration::from_secs(5), deadline).await,
+            Err(())
+        );
+
+        // With an address not starting, nothing waits.
+
+        let open = Upstream::from_message(&message(&[])).unwrap();
+        assert_eq!(
+            open.shared.hold(Duration::from_secs(5), deadline).await,
+            Ok(())
+        );
     }
 
     #[test]

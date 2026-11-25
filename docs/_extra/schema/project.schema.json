@@ -706,7 +706,7 @@
           "x-default": "the release's"
         },
         "sendfile_roots": {
-          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served; the release's when absent, and an empty list refuses every hint. A relative path is taken from the release's source directory.",
+          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served; the release's when absent, and an empty list refuses every hint. `source:SUBDIR`, or a relative path, is taken from the release's source directory, and `media:SUBDIR` from the media part.",
           "items": {
             "type": "string"
           },
@@ -934,6 +934,10 @@
           "default": false,
           "description": "Whether the edge inserts the development toolbar into the run's HTML pages.",
           "type": "boolean"
+        },
+        "tracing": {
+          "$ref": "#/$defs/Tracing",
+          "description": "Tracing with wrapture for `muructl run`, as a boolean or a table with `config`, in place of the project's `tracing`. The daemon and `muructl serve` take the project's."
         }
       },
       "type": "object"
@@ -1342,7 +1346,7 @@
           "type": "string"
         },
         "dir": {
-          "description": "The directory: relative to the source directory, absolute, `static:` for the release's built static files or `media:` for the application's media part, each with an optional directory inside it after the colon.",
+          "description": "The directory: `source:` for the release's source directory, `static:` for the release's built static files or `media:` for the application's media part, each with an optional directory inside it after the colon; or a path, absolute, or relative to the source directory as `source:` is.",
           "type": "string"
         },
         "fallback": {
@@ -1656,7 +1660,7 @@
       "type": "string"
     },
     "sendfile_roots": {
-      "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. A relative path is taken from the project's directory, the release's source.",
+      "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. `source:SUBDIR`, or a relative path, is taken from the project's directory, the release's source, and `media:SUBDIR` from the media part.",
       "items": {
         "type": "string"
       },

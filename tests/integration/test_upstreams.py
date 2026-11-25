@@ -179,6 +179,7 @@ class Fixture:
         self.closer = Closer()
         self.brief = Closer(keep_alive="timeout=1, max=100")
         self.dead_port = support.free_port()
+        self.late_port = support.free_port()
         self.ws_port = support.free_port()
         self.ws_server: Server = serve(echo, "127.0.0.1", self.ws_port)
         self.ws_thread = threading.Thread(target=self.ws_server.serve_forever, daemon=True)
@@ -221,6 +222,10 @@ addresses = ['{self.socket.address}']
 [upstream.pair]
 addresses = ['127.0.0.1:{self.dead_port}', '127.0.0.1:{self.other.port}']
 health = {{ eject_after = 1, eject_for = '30s' }}
+
+[upstream.revived]
+addresses = ['127.0.0.1:{self.late_port}', '127.0.0.1:{self.other.port}']
+health = {{ eject_after = 1, eject_for = '1s' }}
 
 [upstream.probed]
 addresses = ['127.0.0.1:{self.other.port}', '127.0.0.1:{self.legacy.port}']
@@ -287,6 +292,11 @@ upstream = 'socket'
 host = 'site'
 path = '/pair/'
 upstream = 'pair'
+
+[[route]]
+host = 'site'
+path = '/revived/'
+upstream = 'revived'
 
 [[route]]
 host = 'site'
@@ -503,6 +513,22 @@ def test_a_dead_address_is_ejected_and_the_live_one_answers(site: Fixture) -> No
     response = call(site.daemon.port, "/gone/x", {"Accept": "application/json"})
     assert response.status == 502
     assert json.loads(response.body)["reason"] == "upstream_failed"
+
+    # An address ejected while the other serves gets its trial request
+    # once its time is up, and is back in service when it answers, as a
+    # managed server's instance that was started again late is.
+
+    for _ in range(4):
+        assert report(call(site.daemon.port, "/revived/x"))["upstream"] == "other"
+
+    late = Upstream("late", port=site.late_port)
+
+    try:
+        time.sleep(1.2)
+        seen = {report(call(site.daemon.port, "/revived/x"))["upstream"] for _ in range(6)}
+        assert seen == {"late", "other"}
+    finally:
+        late.stop()
 
 
 def test_a_kept_connection_the_server_closed_is_retried_for_an_idempotent_request(

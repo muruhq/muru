@@ -129,7 +129,7 @@ fn detour_release(detour: pb::Detour) -> pb::Release {
         kind: "detour".to_owned(),
         traffic: format!(
             "detour, {}",
-            crate::detours::traffic_text(&detour.traffic, detour.until_unix_ms)
+            crate::detours::listed_traffic(&detour.traffic, detour.until_unix_ms, &detour.paths)
         ),
         created_unix_ms: u64::try_from(detour.opened_unix_ms).unwrap_or_default(),
         detour: Some(detour),
@@ -474,6 +474,94 @@ impl Admin for Service {
         Ok(Response::new(app_message(app, maintenance)))
     }
 
+    async fn set_app_settings(
+        &self,
+        request: Request<pb::SetAppSettingsRequest>,
+    ) -> Result<Response<pb::AppSettings>, Status> {
+        let request = request.into_inner();
+
+        if !crate::model::valid_name(&request.app) {
+            return Err(Status::invalid_argument(format!(
+                "{:?} is not a valid application name: lowercase letters, digits and hyphens, up to 63 characters",
+                request.app
+            )));
+        }
+
+        let given = crate::app_settings::AppSettings::from_message(
+            &request.set.clone().unwrap_or_default(),
+        )
+        .map_err(Status::invalid_argument)?;
+
+        // A key both set and removed says two things at once.
+
+        let set_keys: Vec<String> = given.lines().into_iter().map(|(key, _)| key).collect();
+
+        if let Some(key) = request.unset.iter().find(|key| {
+            set_keys
+                .iter()
+                .any(|set| set == *key || (key.as_str() == "env" && set.starts_with("env.")))
+        }) {
+            return Err(Status::invalid_argument(format!(
+                "{key} is both set and removed"
+            )));
+        }
+
+        let before = self
+            .handle
+            .store
+            .app(&request.app)
+            .map(|app| app.settings)
+            .unwrap_or_default();
+
+        let settings = self
+            .handle
+            .store
+            .update_app_settings(&request.app, |settings| {
+                if request.clear {
+                    *settings = crate::app_settings::AppSettings::default();
+                }
+
+                for key in &request.unset {
+                    settings.unset(key)?;
+                }
+
+                *settings = settings.with(&given);
+                Ok(())
+            })
+            .map_err(internal)?
+            .map_err(Status::invalid_argument)?;
+
+        // Section 11.5: the change is an event, naming the keys and never
+        // a value, since a variable may hold something private.
+
+        if settings != before {
+            let keys = |settings: &crate::app_settings::AppSettings| -> BTreeMap<String, String> {
+                settings.lines().into_iter().collect()
+            };
+            let (old, new) = (keys(&before), keys(&settings));
+            let changed: Vec<&str> = old
+                .keys()
+                .chain(new.keys())
+                .filter(|key| old.get(*key) != new.get(*key))
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+
+            self.handle.events.emit(
+                "app.settings_changed",
+                &request.app,
+                "notice",
+                &format!(
+                    "the application's settings changed: {}; releases deployed from now take them",
+                    changed.join(", ")
+                ),
+            );
+        }
+
+        Ok(Response::new(settings.to_message()))
+    }
+
     async fn dashboard_login(
         &self,
         request: Request<pb::DashboardLoginRequest>,
@@ -758,11 +846,6 @@ impl Admin for Service {
             }
         }
 
-        let previous = app
-            .as_ref()
-            .filter(|_| !request.fresh)
-            .and_then(|app| app.current.clone().or_else(|| app.previous.clone()));
-
         // What the serving release would keep once it is replaced.
 
         let retained = app
@@ -775,6 +858,10 @@ impl Admin for Service {
             .unwrap_or_default();
 
         Ok(Response::new(pb::DeployPlan {
+            metadata: spec
+                .as_ref()
+                .map(|spec| spec.metadata.clone())
+                .unwrap_or_default(),
             app: request.app.clone(),
             release: id,
             new_app: app.is_none(),
@@ -799,9 +886,6 @@ impl Admin for Service {
                 .unwrap_or_default(),
             builds: spec.as_ref().is_some_and(|spec| spec.build.builds),
             serving: app.and_then(|app| app.current).unwrap_or_default(),
-            settings_from: previous
-                .filter(|_| spec.as_ref().is_some_and(|spec| spec.http.is_none()))
-                .unwrap_or_default(),
             hold: request.hold,
             retain_ms: request
                 .retain_ms
@@ -2187,6 +2271,18 @@ impl Admin for Service {
         let request = request.into_inner();
         let traffic =
             crate::detours::Traffic::parse(&request.traffic).map_err(Status::invalid_argument)?;
+
+        // Issue 909: the paths change only when some are given, or every
+        // path is asked for again.
+
+        let paths = if request.all_paths {
+            Some(Vec::new())
+        } else if request.paths.is_empty() {
+            None
+        } else {
+            Some(crate::detours::scope_paths(&request.paths).map_err(Status::invalid_argument)?)
+        };
+
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
             .commands
@@ -2195,6 +2291,7 @@ impl Admin for Service {
                 release: request.release,
                 traffic,
                 until_unix_ms: request.until_unix_ms,
+                paths,
                 done: done_tx,
             })
             .await
@@ -2292,21 +2389,22 @@ impl Admin for Service {
         let apps: BTreeSet<&str> = detours.iter().map(|detour| detour.app.as_str()).collect();
 
         for app in apps {
-            let traffic: Vec<(String, crate::detours::Traffic)> = detours
+            let traffic: Vec<(String, crate::detours::Traffic, Vec<String>)> = detours
                 .iter()
                 .filter(|detour| detour.app == app)
                 .filter_map(|detour| {
                     crate::detours::Traffic::parse(&detour.traffic)
                         .ok()
-                        .map(|traffic| (detour.release.clone(), traffic))
+                        .map(|traffic| (detour.release.clone(), traffic, detour.paths.clone()))
                 })
                 .collect();
             let takings: Vec<crate::detours::Taking<'_>> = traffic
                 .iter()
-                .map(|(release, traffic)| crate::detours::Taking {
+                .map(|(release, traffic, paths)| crate::detours::Taking {
                     app,
                     release,
                     traffic,
+                    paths,
                 })
                 .collect();
             let changes = crate::detours::changes(&takings);
@@ -2731,7 +2829,9 @@ impl Admin for Service {
         &self,
         request: Request<pb::ApplicationUrlsRequest>,
     ) -> Result<Response<pb::ApplicationUrlsResponse>, Status> {
-        let app = request.into_inner().app;
+        let request = request.into_inner();
+        let app = request.app;
+        let name = (!request.name.is_empty()).then_some(request.name.as_str());
         let apps = self.handle.store.apps().map_err(internal)?;
 
         if !apps.iter().any(|known| known.name == app) {
@@ -2748,12 +2848,24 @@ impl Admin for Service {
             .expect("listeners poisoned")
             .clone();
 
-        Ok(Response::new(pb::ApplicationUrlsResponse {
-            urls: crate::urls::for_app(&app, &routes, &hosts, &listeners)
+        let urls: Vec<pb::ApplicationUrl> =
+            crate::urls::for_app(&app, &routes, &hosts, &listeners, name)
                 .into_iter()
                 .map(application_url)
-                .collect(),
+                .collect();
+
+        // Issue 908: no URL is an answer, with why, for the caller to say.
+
+        let unreachable = if urls.is_empty() {
+            crate::urls::no_address(&app, &routes, &hosts, name)
+        } else {
+            String::new()
+        };
+
+        Ok(Response::new(pb::ApplicationUrlsResponse {
+            urls,
             app,
+            unreachable,
         }))
     }
 
@@ -2829,6 +2941,7 @@ impl Admin for Service {
                 .into_iter()
                 .map(|route| pb::Route {
                     client_classes: route.classes().to_vec(),
+                    strip_prefix: route.strip_prefix.clone().unwrap_or_default(),
                     traffic_classes: route
                         .traffic
                         .as_ref()
@@ -3204,32 +3317,28 @@ struct Deploying {
 
 impl Service {
     /// Resolve a deploy request into the release it describes. Section
-    /// 3.3: a deploy takes what its flags and the source do not give
-    /// from the release before it, unless it is fresh. Resolution may
-    /// run uv and the interpreter, so it is off the runtime's threads.
+    /// 3.3: a deploy takes what its flags do not give from the
+    /// application's settings, then the source, then the defaults, and
+    /// nothing from the release before it (issues 861 and 899).
+    /// Resolution may run uv and the interpreter, so it is off the
+    /// runtime's threads.
     async fn resolve_deploy(
         &self,
         request: &pb::DeployRequest,
         provisioning: crate::provision::Provisioning,
     ) -> Result<Result<ReleaseSpec, String>, Status> {
-        let previous = if request.fresh {
-            None
-        } else {
-            self.handle
-                .store
-                .app(&request.app)
-                .ok()
-                .and_then(|app| app.current.or(app.previous))
-                .and_then(|id| self.handle.store.release(&request.app, &id).ok())
-                .map(|release| release.spec)
-        };
-
+        let settings = self
+            .handle
+            .store
+            .app(&request.app)
+            .map(|app| app.settings)
+            .unwrap_or_default();
         let resolving = request.clone();
 
         tokio::task::spawn_blocking(move || {
-            config::resolve_spec(
+            crate::app_settings::resolve(
                 &resolving,
-                previous.as_ref(),
+                &settings,
                 &config::Tables::default(),
                 &provisioning,
             )
@@ -3384,7 +3493,7 @@ impl Service {
         )
         .map_err(crate::store::StoreError::Decode)?;
         store.create_release(app, id, spec)?;
-        let source = spec.source.display();
+        let source = crate::model::created_from(spec);
 
         if added == Added::Stopped {
             store.set_release_state(app, id, ReleaseState::Stopped, "declared and not started")?;
@@ -4062,6 +4171,7 @@ fn app_message(app: crate::model::App, (maintenance, by): (bool, String)) -> pb:
         maintenance,
         maintenance_overlay: by,
         priority: app.priority,
+        settings: Some(app.settings.to_message()),
     }
 }
 
@@ -4475,6 +4585,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
     pb::Release {
         traffic: String::new(),
         detour: None,
+        metadata: release.spec.metadata.clone(),
         app: release.app,
         id: release.id,
         state: release.state.as_str().to_owned(),

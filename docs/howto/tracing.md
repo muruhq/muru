@@ -161,6 +161,30 @@ edge for that request. The daemon and `muructl serve` add nothing for the
 toolbar, so tracing costs there only what the wrapture configuration's
 own sinks do.
 
+## Tracing every development run
+
+`tracing` in the project's run table, `[tool.muru.run]` (or `[run]` in a
+`muru.toml`), takes the place of the project's `tracing` for `muructl
+run` and nowhere else, so a project can trace every development run for
+everyone who checks it out, beside the toolbar, while the daemon and
+`muructl serve` go untraced:
+
+```toml
+[tool.muru.run]
+toolbar = true
+tracing = true
+```
+
+It takes the same values, `true`, `false` or a table with `config`:
+
+```toml
+[tool.muru.run.tracing]
+config = "tracing/dev.toml"
+```
+
+`muructl run --tracing` turns tracing on for one run, and `--no-tracing`
+turns it off, over every settings file.
+
 ## Tracing on one machine
 
 `tracing` in a project's `muru.local.toml` takes the place of the
@@ -179,9 +203,12 @@ or, with a configuration of their own:
 config = "my-tracing.toml"
 ```
 
-The project still needs wrapture in its dependencies, and the
-`tracing_middleware` keys stay the project's. `muructl run --print-config`
-shows which file `tracing` came from.
+Its `[run]` table takes `tracing` too, as it takes every key of the
+project's run table. The order, highest first, is the flags,
+`muru.local.toml`'s `tracing`, its `[run]` table's, the project's run
+table's, then `[tool.muru]`'s. The project still needs wrapture in its
+dependencies, and the `tracing_middleware` keys stay the project's.
+`muructl run --print-config` shows which file `tracing` came from.
 
 ## Preloading and the workers
 

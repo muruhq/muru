@@ -34,6 +34,9 @@ class Context:
     process_model: str = "threaded"
     """threaded, process-per-request, async, async-with-sync-pool or free-threaded."""
 
+    development: bool = False
+    """True in a development run: ``muructl run`` without ``--allow-public``, or a detour."""
+
 
 _current: Context | None = None
 

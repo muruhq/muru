@@ -1,7 +1,8 @@
 # Environment variables
 
 The variables Muru sets for an application's host and workers, its
-[commands](../howto/commands.md) and `muructl exec`. Muru alone sets
+[commands](../howto/commands.md), `muructl exec` and the instances of a
+[managed server](../howto/managed-servers.md). Muru alone sets
 them: a variable of the same name in `[tool.muru.env]`, from `muructl
 deploy --env` or in the shell that started `muructl` is replaced, and a
 place the application does not have is left unset rather than
@@ -18,6 +19,11 @@ inherited.
 | `MURU_STATIC_DIR` | The release's own directory of built static files, named `static:` in [static entries](../howto/static-files.md#built-files) |
 | `MURU_COMMAND` | The declared command that runs, in a command |
 | `MURU_GROUP` | The worker's group, in a worker |
+| `MURU_WORKER_ID` | The worker's index within its group, from 0, in a worker: the same as `muru.context().worker_id`, and given to the worker that replaces it. Not set in the host or a command |
+| `MURU_DEVELOPMENT` | `1` in a development run, `muructl run` without `--allow-public` or `muructl detour run`, for its host, workers and commands; not set under the daemon or `muructl serve`. `muru.context().development` says the same |
+| `MURU_HTTP_BIND` | Where a managed server's instance listens: `unix:/path` or `127.0.0.1:PORT` |
+| `MURU_SERVER_INDEX` | A managed server's instance's index, from 0 |
+| `PORT` | The port a managed server's instance listens on, when it binds a port |
 | `MURU_LOG_LEVEL`, `MURU_LOG_FORMAT` | Python logging's defaults |
 
 Where the data and static directories are depends on how the

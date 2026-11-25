@@ -7,11 +7,15 @@ string literals in the Rust crates and the runtime library that name a
 section, a phase or an ADR by number; comments and docstrings, which are
 for the code's readers, are left alone. The help muructl renders from doc
 comments is checked by a unit test in muructl, since clap assembles it.
+The `.proto` files `muructl proto` gives out to clients of the admin API
+are checked whole, comments included, since their comments document the
+clients' generated stubs.
 
 Usage: check-user-text.py [FILE...]
 
-With no files, every Rust source under crates/ and every module of the
-runtime library is checked; named files outside those, and tests, are
+With no files, every Rust source under crates/, every module of the
+runtime library and every file given out under proto/muru/admin/ is
+checked; named files outside those, and tests, are
 skipped. Exits 1 when any string names one.
 """
 
@@ -22,7 +26,7 @@ import re
 import subprocess
 import sys
 
-DESIGN = re.compile(r"\b(?:sections? [0-9]|phase [0-9]|ADR [0-9])", re.IGNORECASE)
+DESIGN = re.compile(r"\b(?:sections? [0-9]|phase [0-9]|ADR [0-9]|appendix [A-Z]\b)", re.IGNORECASE)
 RAW = re.compile(r'r(#*)"')
 CHARACTER = re.compile(r"'(?:\\.|[^\\'])'")
 
@@ -101,18 +105,24 @@ def python_strings(text: str) -> list[tuple[int, str]]:
 
 
 def checked(name: str) -> bool:
-    """Say whether a file holds text users see: a crate's source or a runtime module, not a test."""
+    """Say whether a file holds text users see: source, a runtime module or a .proto given out."""
 
     source = name.startswith("crates/") and name.endswith(".rs")
     runtime = name.startswith("packages/muru/python/muru/") and name.endswith(".py")
-    return (source or runtime) and "/tests/" not in name
+    return (source or runtime or given_out(name)) and "/tests/" not in name
+
+
+def given_out(name: str) -> bool:
+    """Say whether a file is a .proto file `muructl proto` gives out."""
+
+    return name.startswith("proto/muru/admin/") and name.endswith(".proto")
 
 
 def default_files() -> list[str]:
     """List the Rust sources and the runtime library's modules git knows."""
 
     listed = subprocess.run(
-        ["git", "ls-files", "crates/*.rs", "packages/muru/python/muru/*.py"],
+        ["git", "ls-files", "crates/*.rs", "packages/muru/python/muru/*.py", "proto/*.proto"],
         capture_output=True,
         text=True,
         check=True,
@@ -130,7 +140,9 @@ def main(arguments: list[str]) -> int:
         with open(name, encoding="utf-8") as source:
             text = source.read()
 
-        if name.endswith(".rs"):
+        if given_out(name):
+            strings = list(enumerate(text.splitlines(), start=1))
+        elif name.endswith(".rs"):
             strings = [(text.count("\n", 0, at) + 1, value) for at, value in rust_strings(text)]
         else:
             strings = python_strings(text)

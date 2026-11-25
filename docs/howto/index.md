@@ -139,6 +139,12 @@ Recipes for specific tasks, assuming you already know the basics. The
 - [Coding agents](coding-agents.md): an AI coding agent driving Muru
   over MCP during a coding session.
 
+## Your own tools
+
+- [Writing a client of the admin API](admin-api-client.md): the
+  `.proto` files of the installed release, stubs generated from them,
+  and calls to the admin socket.
+
 ```{toctree}
 :hidden:
 
@@ -199,4 +205,5 @@ instrumentation
 tracing
 lazy-imports
 coding-agents
+admin-api-client
 ```

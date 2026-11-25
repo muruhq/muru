@@ -77,6 +77,12 @@ pub struct OpenArgs {
     #[arg(long)]
     any_name: bool,
 
+    /// On a daemon, build the URL from this name, which must be one of the
+    /// names or patterns of a host that routes the application, such as
+    /// one name of a host whose names are all wildcards.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
     #[command(flatten)]
     socket: crate::admin::SocketArgs,
 }
@@ -217,6 +223,12 @@ fn resolve(name: &str) -> Vec<IpAddr> {
         .to_socket_addrs()
         .map(|found| found.map(|address| address.ip()).collect())
         .unwrap_or_default()
+}
+
+/// The choices kept for this machine, as `reachable` keeps them, with
+/// the names resolved by the system's resolver.
+pub fn reachable_here(choices: Vec<Choice>, any_name: bool) -> (Vec<Choice>, Vec<String>) {
+    reachable(choices, any_name, &resolve)
 }
 
 /// The choices kept for this machine, with the names left out and why;
@@ -367,8 +379,15 @@ pub async fn open(args: OpenArgs) -> anyhow::Result<()> {
     // The application: a run's from its record, a daemon's from its
     // routing.
 
-    let (choices, app) = match &record {
+    let (choices, app, unreachable) = match &record {
         Some(record) => {
+            anyhow::ensure!(
+                args.name.is_none(),
+                "--name chooses among a daemon's virtual host names; the {} answers to its \
+                 --host names",
+                describe(record)
+            );
+
             if let Some(app) = args.app()
                 && record.app.as_deref() != Some(app)
             {
@@ -379,7 +398,7 @@ pub async fn open(args: OpenArgs) -> anyhow::Result<()> {
                 );
             }
 
-            (record_choices(record), record.app.clone())
+            (record_choices(record), record.app.clone(), String::new())
         }
         None => {
             let app = match args.app() {
@@ -394,12 +413,16 @@ pub async fn open(args: OpenArgs) -> anyhow::Result<()> {
 
             let mut client = client::connect(&endpoint).await?;
             let answer = client
-                .application_urls(pb::ApplicationUrlsRequest { app: app.clone() })
+                .application_urls(pb::ApplicationUrlsRequest {
+                    app: app.clone(),
+                    name: args.name.clone().unwrap_or_default(),
+                })
                 .await
                 .map_err(|status| anyhow::anyhow!("{}", status.message()))?
                 .into_inner();
+            let unreachable = answer.unreachable.clone();
 
-            (daemon_choices(answer), Some(app))
+            (daemon_choices(answer), Some(app), unreachable)
         }
     };
 
@@ -441,6 +464,10 @@ pub async fn open(args: OpenArgs) -> anyhow::Result<()> {
 
     let Some(first) = choices.first() else {
         let Some(fallback) = fallback else {
+            if !unreachable.is_empty() {
+                anyhow::bail!("{unreachable}");
+            }
+
             anyhow::bail!(
                 "{} has no address to open: no route on a listener reaches it",
                 app.as_deref().unwrap_or("the application")

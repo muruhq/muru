@@ -212,7 +212,7 @@ def test_what_a_deploy_would_refuse_is_refused_and_nothing_is_written(tmp_path: 
     # The flags that say how a deploy is carried out, and where a daemon
     # is, are not render's.
 
-    for flag in ["--hold", "--no-wait", "--fresh", "--override-freeze", "--socket=x", "--system"]:
+    for flag in ["--hold", "--no-wait", "--override-freeze", "--socket=x", "--system"]:
         refused = render("shop", str(SHOP), flag)
         assert refused.returncode == 2, flag
         assert "unexpected argument" in refused.stderr, refused.stderr
@@ -271,20 +271,17 @@ def test_a_rendered_release_is_applied_held_and_a_deploy_is_planned(
     assert printed.startswith("muru: plan (nothing changed): release shop@r2, "), printed
     assert "processes = 3" in printed and "(deploy flags)" in printed
     assert "threads = 3" in printed and "([tool.muru])" in printed
-    assert "max_requests = 500" in printed and "(the previous release)" in printed
-    assert "settings nothing else gives come from shop@next; --fresh takes none" in printed
+    assert "(the previous release)" not in printed, printed
     assert (
         "would take over from shop@next, which would stay warm for 1800s with 1 worker" in printed
     )
     assert daemon.releases("shop") == before
 
     as_json = json.loads(
-        daemon.muructl(
-            "deploy", "shop", str(SHOP), "--fresh", "--hold", "--dry-run", "--json", *python
-        ).stdout
+        daemon.muructl("deploy", "shop", str(SHOP), "--hold", "--dry-run", "--json", *python).stdout
     )
     assert as_json["release"] == "r2" and as_json["hold"] is True
-    assert as_json["serving"] == "next" and as_json["settings_from"] == ""
+    assert as_json["serving"] == "next" and "settings_from" not in as_json
     layers = {setting["key"]: setting["layer"] for setting in as_json["settings"]}
     assert layers["threads"] == "[tool.muru]" and layers["sync_threads"] == "default"
 

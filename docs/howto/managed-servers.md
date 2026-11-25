@@ -106,10 +106,42 @@ still running when the wait ends are killed, and the instance starts on
 the daemon's next check, a second later. They are also killed if the
 daemon stops or upgrades before the wait ends.
 
-While an instance is
-down its requests go to the others, or are answered 502
-`upstream_failed` when there is none, and `muru_upstream_health` reports
-each instance by address under the release's name. The instance count is
+An instance that has exited is out of service until it is started
+again and answers the readiness probe, the same probe the release's
+start waits on, tried every 100 ms. While it is, requests go to the
+other instances, and its refused connections do not count against it.
+Once it answers, a `server.ready` event says so and it takes requests
+again:
+
+```
+instance 1 answers and takes requests again
+```
+
+An instance that has not answered when the readiness timeout ends takes
+requests all the same, with a `server.ready` warning, and is set aside
+for a while if they fail, as any instance is after three failed requests
+in a row.
+
+When every instance is starting, as when a release with one instance
+has that instance started again, a request waits for one to answer
+rather than failing. It waits for at most the queue timeout
+(`queue_timeout`, 5 seconds by default) and is sent as soon as an
+instance takes requests again; the time it waits counts towards its
+request deadline. One still waiting when the queue timeout ends is sent
+to the instances all the same, and is answered 502 `upstream_failed` if
+none takes it. At most 256 requests wait for one release in each edge
+process, and any beyond them are answered 503 `upstream_starting` with
+`Retry-After: 1`. An instance is out of service from the moment it
+ends, even while the last of its output is still being written to the
+release's log; a request that arrives in the instant before the edge
+hears of the end is not held, and with no other instance to go to is
+answered 502 `upstream_failed`.
+
+With every instance out of service for other reasons, such as failed
+requests, requests still try them all, and are answered 502
+`upstream_failed` when none takes them.
+`muru_upstream_health` reports each instance by address under the
+release's name, 0 while it is out of service. The instance count is
 fixed: `muructl scale` refuses a managed server.
 
 Draining stops new requests at the edge, waits for those in flight, then
@@ -195,18 +227,20 @@ time. An instance that is still running is taken over as it is, with
 its relay. An instance that was waiting to be started again when the
 daemon stopped is started again within a second at the same address,
 and its waits carry on from the exits it had in a row. An instance that
-exited while no daemon was running is reported by the new daemon's
-first check, with the exit status its relay recorded, as any exit is:
+exited while no daemon was running is counted as an exit when it is
+taken over, with the exit status its relay recorded, and waits as any
+exit does before it is started again. The release stays `ready`, and its
+`release.adopted` event names the pids taken over, how each instance
+that exited ended, and when it starts again:
 
 ```
-instance 1 exited with exit status: 3; starting it again in 1s
+re-adopted the server instances (pid 48213); instance 1 exited with exit status: 3 while no daemon ran and is started again in 1s
 ```
 
-The release stays `ready`, and its `release.adopted` event names the
-pids taken over and the instances started again:
+`server.started` follows when the instance has started:
 
 ```
-re-adopted the server instances (pid 48213); instance 1 was gone and is started again
+instance 1 started again (pid 48377)
 ```
 
 The record holds the pid of each instance and of its relay, each

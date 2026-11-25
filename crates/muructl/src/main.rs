@@ -24,8 +24,10 @@ mod places;
 mod print_config;
 mod processes;
 mod project_commands;
+mod proto;
 mod provision;
 mod pstats;
+mod release_metadata;
 mod render;
 mod run_admin;
 mod serve;
@@ -338,6 +340,14 @@ enum Command {
     Mcp {
         #[command(subcommand)]
         command: mcp::McpCommand,
+    },
+
+    /// The admin API's .proto files this muructl was built from, for a
+    /// client that generates its own stubs: write them out, check a copy,
+    /// print or list them.
+    Proto {
+        #[command(subcommand)]
+        command: proto::ProtoCommand,
     },
 
     /// Serve a directory of files with no configuration,
@@ -745,6 +755,15 @@ struct RunArgs {
     #[arg(long)]
     no_timestamps: bool,
 
+    /// Trace this run with wrapture, with the configuration wrapture
+    /// finds itself, over the settings files' tracing.
+    #[arg(long, conflicts_with = "no_tracing")]
+    tracing: bool,
+
+    /// No tracing for this run, over settings files that turn it on.
+    #[arg(long)]
+    no_tracing: bool,
+
     /// Serve an address other than loopback. Development behaviours are
     /// then off (no tracebacks in error pages, the 10MB body limit, no
     /// dashboard unless asked for), but this is still not the supported
@@ -820,8 +839,9 @@ struct RunArgs {
     single: bool,
 
     /// A directory of the application's own files the edge serves under
-    /// a path prefix, as PREFIX=DIR with DIR relative to the project,
-    /// over the [[tool.muru.static]] entries by prefix. Repeatable.
+    /// a path prefix, as PREFIX=DIR, with DIR source:SUBDIR or relative
+    /// for a directory in the project, static: or media:, over the
+    /// [[tool.muru.static]] entries by prefix. Repeatable.
     #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = parse_static_setting)]
     static_dirs: Vec<(String, String)>,
 
@@ -1348,6 +1368,13 @@ fn main() -> anyhow::Result<()> {
                     admin::app_list(socket, output.json).await
                 }
                 admin::AppCommand::Remove(args) => admin::app_remove(*args).await,
+                admin::AppCommand::Set(args) => admin::app_set(*args).await,
+                admin::AppCommand::Unset(args) => admin::app_unset(*args).await,
+                admin::AppCommand::Show {
+                    app,
+                    socket,
+                    output,
+                } => admin::app_show(app, socket, output.json).await,
             }
         }),
         Command::Data {
@@ -1485,6 +1512,7 @@ fn main() -> anyhow::Result<()> {
         Command::Websockets(args) => runtime.block_on(admin::websockets(args)),
         Command::Requests(args) => runtime.block_on(admin::requests(args)),
         Command::Mcp { command } => runtime.block_on(mcp::run(command)),
+        Command::Proto { command } => proto::run(command),
         Command::Exec(args) => exit_with(runtime, admin::exec(args)),
         Command::Commands {
             command: admin::CommandCommand::List(args),
@@ -1611,7 +1639,7 @@ pub(crate) fn apply_timeouts(limits: &mut muru_edge::Limits, timeouts: &[(String
 pub(crate) fn parse_static_setting(text: &str) -> Result<(String, String), String> {
     let (prefix, directory) = text
         .split_once('=')
-        .ok_or_else(|| format!("{text:?} is not PREFIX=DIR, for example /static/=static"))?;
+        .ok_or_else(|| format!("{text:?} is not PREFIX=DIR, for example /static/=source:static"))?;
     let entry = muru_config::StaticDir {
         path: prefix.trim().to_owned(),
         dir: directory.trim().to_owned(),
@@ -2174,8 +2202,8 @@ struct Resolved {
     /// The instrumentation modules (section 6.15): muru.local.toml's,
     /// then the table's.
     instrumentation: Vec<muru_config::Instrumentation>,
-    /// `tracing` (section 11.6) as written: muru.local.toml's, else the
-    /// table's.
+    /// `tracing` (section 11.6) as written: a flag's, else
+    /// muru.local.toml's, else a run table's, else the table's.
     tracing: Option<muru_config::Tracing>,
     /// The muru.local.toml `tracing` came from, when it came from one.
     tracing_from_local: Option<PathBuf>,
@@ -2432,11 +2460,24 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     // Section 11.6: tracing is set up by a module of Muru's own, at the
-    // head of the list the host is given. muru.local.toml's tracing takes
-    // the place of the project's, for this machine's runs.
+    // head of the list the host is given. The flags, then muru.local.toml's
+    // tracing, then the run tables (muru.local.toml's over the project's)
+    // take the place of the project's tracing, for runs alone.
 
-    let tracing_from_local = local_tracing.is_some().then(|| local.clone()).flatten();
-    let tracing = local_tracing.or_else(|| table.tracing.clone());
+    let tracing_flag = match (args.tracing, args.no_tracing) {
+        (true, _) => Some(muru_config::Tracing::Enabled(true)),
+        (_, true) => Some(muru_config::Tracing::Enabled(false)),
+        _ => None,
+    };
+
+    let tracing_from_local = (tracing_flag.is_none() && local_tracing.is_some())
+        .then(|| local.clone())
+        .flatten();
+    let tracing = tracing_flag
+        .or(local_tracing)
+        .or_else(|| local_run.tracing.clone())
+        .or_else(|| run_table.tracing.clone())
+        .or_else(|| table.tracing.clone());
 
     let tracing_entry = muru_config::tracing_instrumentation(
         tracing.as_ref(),
@@ -3131,7 +3172,6 @@ fn interpreter(
         flag: if built { None } else { args.python.as_deref() },
         table: resolved.python.as_deref(),
         project: &resolved.project,
-        previous: None,
         always: false,
         uv: uv.as_ref(),
         isolation: &isolation,
@@ -3575,6 +3615,7 @@ fn relay_watcher(
             level,
             message,
         } => events.record(&kind, &format!("{label}@{release}"), &level, &message),
+        muru_controller::host::RelayNews::Ended { .. } => {}
     })
 }
 
@@ -3648,7 +3689,11 @@ fn host_spec(
 
     let mut env: Vec<(String, String)> = env
         .into_iter()
-        .filter(|(name, _)| !muru_config::places::VARIABLES.contains(&name.as_str()))
+        .filter(|(name, _)| {
+            !muru_config::places::VARIABLES.contains(&name.as_str())
+                && name != muru_controller::host::DEVELOPMENT_VARIABLE
+                && name != muru_controller::host::WORKER_ID_VARIABLE
+        })
         .collect();
     env.extend(resolved.places.variables());
 
@@ -3658,6 +3703,7 @@ fn host_spec(
         pycache_prefix: None,
         bytecode: None,
         clean_env: false,
+        development: !args.allow_public,
         app: resolved.entrypoint.clone(),
         name: Some(label.to_owned()),
         release: None,
@@ -3849,8 +3895,15 @@ async fn reread(
     serve: Option<&serve::Mode>,
     label: &str,
     spec: &HostSpec,
+    mounts: Option<&std::collections::BTreeMap<String, muru_config::Mount>>,
 ) -> anyhow::Result<Reread> {
     let mut resolved = resolve_for(args, serve)?;
+
+    // Issue 907: a detour serving the serving release's mounts keeps them.
+
+    if let Some(mounts) = mounts {
+        resolved.mounts.clone_from(mounts);
+    }
 
     if args.single {
         resolved.processes = 1;
@@ -4316,6 +4369,11 @@ async fn run_with(
     // reason and nothing started, and the daemon's host names and data
     // directory are known to what starts.
 
+    // Issue 907: with --mounts release, the serving release's mounts,
+    // which a settings file read again on reload does not replace.
+
+    let mut release_mounts = None;
+
     let detour_opened = match &detour {
         Some(mode) => {
             let (listener, socket) = detour::bind(&run_dir)?;
@@ -4323,7 +4381,17 @@ async fn run_with(
                 .as_ref()
                 .map(|registration| registration.id.to_string())
                 .unwrap_or_default();
-            let request = detour::request(mode, &socket, &instance_id, &project);
+
+            let paths = match detour::scope(mode, &resolved.mounts).await {
+                Ok(paths) => paths,
+                Err(error) => {
+                    drop(registration);
+                    let _ = std::fs::remove_dir_all(&run_dir);
+                    return Err(error);
+                }
+            };
+
+            let request = detour::request(mode, &socket, &instance_id, &project, paths);
 
             let (stream, opened) = match detour::open(&mode.daemon, &request).await {
                 Ok(open) => open,
@@ -4333,6 +4401,27 @@ async fn run_with(
                     return Err(error);
                 }
             };
+
+            // Issue 907: the mounts the detour serves with, the checkout's
+            // compared with the serving release's, or the release's.
+
+            detour::settle_mounts(mode, &opened, &mut resolved.mounts);
+
+            if mode.mounts == detour::MountsFrom::Release {
+                if let Err(error) = muru_controller::config::check_groups_and_mounts(
+                    &resolved.groups,
+                    &resolved.mounts,
+                ) {
+                    drop(registration);
+                    let _ = std::fs::remove_dir_all(&run_dir);
+                    anyhow::bail!(
+                        "the serving release's mounts do not fit this checkout's worker groups: \
+                         {error}"
+                    );
+                }
+
+                release_mounts = Some(resolved.mounts.clone());
+            }
 
             if mode.app_data {
                 resolved.places.data = Some(muru_config::places::DataDirs {
@@ -4360,9 +4449,18 @@ async fn run_with(
     // Section 9.12: what the application is served with, which a command
     // of the project run through the admin socket runs with too.
 
+    let mut served_env = spec.env.clone();
+
+    if spec.development {
+        served_env.push((
+            muru_controller::host::DEVELOPMENT_VARIABLE.to_owned(),
+            "1".to_owned(),
+        ));
+    }
+
     let served = Arc::new(run_admin::Served {
         interpreter: std::sync::Mutex::new((spec.python.clone(), spec.pythonpath.clone())),
-        env: spec.env.clone(),
+        env: served_env,
         file: args.settings_file.clone(),
     });
 
@@ -4715,9 +4813,14 @@ async fn run_with(
             .as_ref()
             .map(|detour| detour.traffic.clone())
             .unwrap_or_default();
+        let paths = opened
+            .detour
+            .as_ref()
+            .map(|detour| detour.paths.clone())
+            .unwrap_or_default();
         muru_common::muru_println!(
             "traffic: {}{}",
-            detour::takes(&traffic, &mode.app),
+            detour::takes(&traffic, &mode.app, &paths),
             if traffic == "preview" {
                 "; muructl detour preview gives an entry link"
             } else {
@@ -4751,16 +4854,15 @@ async fn run_with(
     }
 
     // Section 4.20: the reserved prefix answers to the run's own names
-    // besides loopback, and with --toolbar the edge inserts the toolbar
-    // into HTML pages, which the start-up says.
+    // besides loopback, or for a detour to whatever name the daemon routes
+    // to it, and with --toolbar the edge inserts the toolbar into HTML
+    // pages, which the start-up says.
 
     if development && serve.is_none() {
         match &detour_held {
-            Some((_, opened, _)) => {
-                edge.links().set_hosts(opened.hosts.clone());
-                edge.links()
-                    .set_detour(opened.detour.as_ref().map(|detour| detour.traffic.clone()));
-            }
+            Some((_, opened, _)) => edge
+                .links()
+                .set_detour(opened.detour.as_ref().map(|detour| detour.traffic.clone())),
             None => edge.links().set_hosts(resolved.serving.hosts.clone()),
         }
 
@@ -5115,7 +5217,13 @@ async fn run_with(
 
     if let (Some(mode), Some((_, opened, _))) = (&detour, &detour_held)
         && mode.open_preview
-        && let Err(error) = detour::open_preview(&mode.daemon, opened).await
+        && let Err(error) = detour::open_preview(
+            &mode.daemon,
+            opened,
+            mode.preview_name.as_deref(),
+            mode.any_name,
+        )
+        .await
     {
         muru_common::muru_println!("no preview link: {error:#}");
     }
@@ -5432,7 +5540,7 @@ async fn run_with(
                 // be used leave the current release serving.
 
                 if is_settings_file(&paths, &settings_files(&args, &resolved.project)) {
-                    let next = match reread(&args, serve.as_ref(), &label, &spec).await {
+                    let next = match reread(&args, serve.as_ref(), &label, &spec, release_mounts.as_ref()).await {
                         Ok(next) => next,
                         Err(error) => {
                             muru_common::muru_println!("{error:#}; release r{} keeps serving", current.release);

@@ -24,9 +24,9 @@ and where the runtime library comes from.
    `.python-version` file, then `requires-python` in `[project]`, which
    is a constraint and chooses only when nothing else does.
 
-5. **What was there before.** Under the daemon, the previous release's
-   interpreter; then `python3` on `PATH`, with a line saying no
-   environment was found.
+5. **`python3` on `PATH`**, with a line saying no environment was
+   found. A release never takes an earlier release's interpreter, which
+   may be in another source's `.venv`.
 
 A request is in uv's syntax: `3.13`, `3.14t` for a free-threaded build,
 `>=3.12`, or `cpython@3.13`. uv looks at every Python on the machine,

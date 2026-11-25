@@ -71,6 +71,14 @@ pub enum Action {
         /// The choice, empty for the `[logs]` table's.
         access_log: crate::model::AccessLogSpec,
     },
+    /// Set the application's own release settings (issue 899), which
+    /// the releases deployed after the apply take.
+    SetAppSettings {
+        /// The application.
+        app: String,
+        /// The settings, empty for none.
+        settings: Box<crate::app_settings::AppSettings>,
+    },
     /// Create a release with this spec and, as `added` says, move
     /// traffic to it, start it held, or leave it stopped.
     Deploy {
@@ -242,6 +250,7 @@ impl Action {
             Action::SetAppPriority { .. } => "set-priority",
             Action::SetAppData { .. } => "set-data",
             Action::SetAppAccessLog { .. } => "set-access-log",
+            Action::SetAppSettings { .. } => "set-settings",
             Action::Deploy { .. } => "deploy",
             Action::Promote { .. } => "promote",
             Action::RemoveRelease { .. } => "remove-release",
@@ -335,7 +344,8 @@ impl Change {
             | Action::SetAppIdentity { app, .. }
             | Action::SetAppPriority { app, .. }
             | Action::SetAppData { app, .. }
-            | Action::SetAppAccessLog { app, .. } => app.clone(),
+            | Action::SetAppAccessLog { app, .. }
+            | Action::SetAppSettings { app, .. } => app.clone(),
             Action::Deploy { app, id, .. }
             | Action::Promote { app, id }
             | Action::RemoveRelease { app, id } => {
@@ -835,9 +845,41 @@ fn plan_app(
         });
     }
 
+    // Issue 899: the application's own release settings, which the
+    // document states in full, as it states the rest of the table. The
+    // keys alone are shown, since a variable's value may be private.
+
+    let settings = match crate::app_settings::AppSettings::from_table(app) {
+        Ok(settings) => settings,
+        Err(error) => {
+            plan.errors.push(format!("{name}: {error}"));
+            return None;
+        }
+    };
+
+    if stored
+        .as_ref()
+        .map_or(!settings.is_empty(), |stored| stored.settings != settings)
+    {
+        let keys: Vec<String> = settings.lines().into_iter().map(|(key, _)| key).collect();
+
+        plan.changes.push(Change {
+            detail: if keys.is_empty() {
+                "no settings of its own".to_owned()
+            } else {
+                keys.join(", ")
+            },
+            action: Action::SetAppSettings {
+                app: name.to_owned(),
+                settings: Box::new(settings.clone()),
+            },
+        });
+    }
+
     // Releases are resolved as a deploy would resolve them, from the
-    // table and the source's own [tool.muru], never from an earlier
-    // release, so a file means the same thing wherever it is applied.
+    // table, the document's settings for the application and the
+    // source's own [tool.muru], never from an earlier release, so a file
+    // means the same thing wherever it is applied.
 
     let mut deploys = Vec::new();
 
@@ -867,7 +909,7 @@ fn plan_app(
             continue;
         };
 
-        let spec = match resolve_declared(name, table, source, provisioning) {
+        let spec = match resolve_declared(name, table, &settings, source, provisioning) {
             Ok(spec) => spec,
             Err(error) => {
                 plan.errors.push(format!("{name}@{id}: {error}"));
@@ -1761,6 +1803,27 @@ fn plan_routes(store: &Store, document: &Document, defined: &Defined, plan: &mut
             }
         }
 
+        // Section 4.5: what the route strips is a leading part of its
+        // own path, and a static route strips only for its fallback.
+
+        if let Err(error) = muru_config::check_strip_prefix(route) {
+            plan.errors
+                .push(format!("route {} {}: {error}", route.host, route.path));
+            valid = false;
+        }
+
+        let static_fallback = fallback_app.is_some() || fallback_upstream.is_some();
+
+        if route.strip_prefix.is_some() && route.static_dir.is_some() && !static_fallback {
+            plan.errors.push(format!(
+                "route {} {}: strip_prefix applies to a static route's fallback application or \
+                 upstream, and this route has none; the directory is served relative to the \
+                 route's path already",
+                route.host, route.path
+            ));
+            valid = false;
+        }
+
         // Section 4.15: the route's rate limits, method restrictions and
         // mode.
 
@@ -1996,18 +2059,21 @@ fn plan_routes(store: &Store, document: &Document, defined: &Defined, plan: &mut
                     new: recorded.is_none(),
                 },
                 detail: {
-                    let target = if route.upstream.is_empty() {
-                        route.app.clone()
-                    } else {
-                        format!("upstream {}", route.upstream)
+                    let mut detail = match (&route.static_dir, &route.traffic) {
+                        (Some(directory), _) => describe_static_route(directory, route),
+                        (None, Some(traffic)) => {
+                            format!(
+                                "to {}, {}",
+                                route_target(route),
+                                describe_traffic(Some(traffic))
+                            )
+                        }
+                        (None, None) => format!("to {}", route_target(route)),
                     };
 
-                    let mut detail = match &route.traffic {
-                        Some(traffic) => {
-                            format!("to {target}, {}", describe_traffic(Some(traffic)))
-                        }
-                        None => format!("to {target}"),
-                    };
+                    if let Some(prefix) = &route.strip_prefix {
+                        detail.push_str(&format!(", strip_prefix {prefix}"));
+                    }
 
                     if route.internal == Some(true) {
                         detail.push_str(", internal");
@@ -2919,6 +2985,9 @@ fn write(
         Action::SetAppAccessLog { app, access_log } => {
             writes.set_app_access_log(app, access_log).map(|()| "set")?
         }
+        Action::SetAppSettings { app, settings } => {
+            writes.set_app_settings(app, settings).map(|()| "set")?
+        }
         Action::PutHost { name, host, new } => writes.put_host(name, host).map(|()| made(*new))?,
         Action::RemoveHost { name } => writes.delete_host(name).map(|()| "removed")?,
         Action::PutRoute { route, new } => writes.put_route(route).map(|()| made(*new))?,
@@ -2984,6 +3053,31 @@ fn write(
     Ok(Some(outcome.to_owned()))
 }
 
+/// What a route that is not static sends its requests to, as a plan's
+/// line says it: the application, or the upstream.
+fn route_target(route: &muru_config::Route) -> String {
+    if route.upstream.is_empty() {
+        route.app.clone()
+    } else {
+        format!("upstream {}", route.upstream)
+    }
+}
+
+/// What serves a static route, as a plan's line says it and the route
+/// list does: the directory, then what takes a request no file answers.
+fn describe_static_route(directory: &str, route: &muru_config::Route) -> String {
+    let fallback = route.fallback.as_ref();
+
+    match (
+        fallback.and_then(|fallback| fallback.app.as_deref()),
+        fallback.and_then(|fallback| fallback.upstream.as_deref()),
+    ) {
+        (Some(app), _) => format!("static {directory}, else {app}"),
+        (None, Some(upstream)) => format!("static {directory}, else upstream {upstream}"),
+        (None, None) => format!("static {directory}"),
+    }
+}
+
 /// Desired state as a document: each application with the release that
 /// serves it, which its `serving` names, and the releases its routes'
 /// traffic names, and the hosts and routes. Applying it back changes
@@ -3011,6 +3105,7 @@ pub fn export(store: &Store, app: Option<&str>) -> Result<Document, StoreError> 
             uploads_dir: app.uploads_dir.clone(),
             ..AppTable::default()
         };
+        app.settings.write_table(&mut table);
 
         if let Some(current) = &app.current {
             let release = store.release(&app.name, current)?;
@@ -3023,13 +3118,14 @@ pub fn export(store: &Store, app: Option<&str>) -> Result<Document, StoreError> 
     }
 
     // Hosts and routes are node-wide; with one application asked for,
-    // only the routes to it and their hosts are written.
+    // only the routes to it, a static route falling back to it among
+    // them (issue 918), and their hosts are written.
 
     let routes = store.routes()?;
     let hosts = store.hosts()?;
 
     for route in routes {
-        if app.is_none_or(|name| route.app == name) {
+        if app.is_none_or(|name| route.serves_app(name)) {
             document.route.push(route);
         }
     }
@@ -3683,14 +3779,14 @@ pub fn logging_layers(
 }
 
 /// Section 3.3: the layer a release setting came from, the first of
-/// the request, the source's [tool.muru] table and the previous release
-/// that gives it, else the default.
-fn layer(given: bool, table: bool, previous: bool, declared: bool) -> &'static str {
-    match (given, table, previous) {
-        (true, _, _) if declared => "the release table",
-        (true, _, _) => "deploy flags",
-        (_, true, _) => "[tool.muru]",
-        (_, _, true) => "the previous release",
+/// the request and the source's [tool.muru] table that gives it, else
+/// the default. The application's settings are laid under the request
+/// before it is resolved and named after (issue 899).
+fn layer(given: bool, table: bool, declared: bool) -> &'static str {
+    match (given, table) {
+        (true, _) if declared => "the release table",
+        (true, _) => "deploy flags",
+        (_, true) => "[tool.muru]",
         _ => "default",
     }
 }
@@ -3710,6 +3806,7 @@ pub const DEFAULT_CONCURRENCY: u32 = 1000;
 pub fn resolve_declared(
     app: &str,
     table: &ReleaseTable,
+    settings: &crate::app_settings::AppSettings,
     source: &str,
     provisioning: &crate::provision::Provisioning,
 ) -> Result<ReleaseSpec, String> {
@@ -3737,32 +3834,41 @@ pub fn resolve_declared(
         declared: true,
     };
 
-    resolve_spec(
+    crate::app_settings::resolve(
         &request_from(app, table, source),
-        None,
+        settings,
         &tables,
         provisioning,
     )
 }
 
 /// Resolve a deploy request into a release spec: the request's settings,
-/// then the source's [tool.muru] table, then the previous release when
-/// one is given (a deploy that is not fresh) and it ran native workers,
-/// then the defaults of section 13.1. Every setting a deploy flag can
+/// then the source's [tool.muru] table, then the defaults of section
+/// 13.1, and never an earlier release (issue 861). Every setting a deploy flag can
 /// set layers that way; the tables (groups, mounts, logging, scaling and
 /// error pages) come from the source alone, and the environment layers
-/// by name (section 3.3).
+/// by name (section 3.3). The request's metadata is checked and kept as
+/// given (section 9.14).
 pub fn resolve_spec(
     request: &pb::DeployRequest,
-    previous: Option<&ReleaseSpec>,
     tables: &Tables<'_>,
     provisioning: &crate::provision::Provisioning,
 ) -> Result<ReleaseSpec, String> {
-    // Section 9.9: a managed server's release has no workers, entrypoint
-    // or interpreter of its own, so the native release after it, the
-    // cutover, starts from the defaults.
+    let metadata = muru_config::check_metadata(&request.metadata)?;
 
-    let previous = previous.filter(|previous| previous.http.is_none());
+    Ok(ReleaseSpec {
+        metadata,
+        ..resolve_settings(request, tables, provisioning)?
+    })
+}
+
+/// The settings of a deploy request resolved into a release spec, as
+/// `resolve_spec` gives it, with no metadata.
+fn resolve_settings(
+    request: &pb::DeployRequest,
+    tables: &Tables<'_>,
+    provisioning: &crate::provision::Provisioning,
+) -> Result<ReleaseSpec, String> {
     let Tables {
         groups,
         mounts,
@@ -3811,12 +3917,10 @@ pub fn resolve_spec(
     // The entrypoint from the request replaces the table's with its
     // factory settings, as muructl run does (section 13.1).
 
-    let (entrypoint, from_table, from_previous) = if !request.entrypoint.is_empty() {
-        (request.entrypoint.clone(), false, false)
+    let (entrypoint, from_table) = if !request.entrypoint.is_empty() {
+        (request.entrypoint.clone(), false)
     } else if let Some(entrypoint) = table.entrypoint.clone() {
-        (entrypoint, true, false)
-    } else if let Some(previous) = previous {
-        (previous.entrypoint.clone(), false, true)
+        (entrypoint, true)
     } else {
         return Err(format!(
             "{} has no entrypoint in its [tool.muru] table; give one as module:callable",
@@ -3835,7 +3939,6 @@ pub fn resolve_spec(
                 .factory_phase
                 .unwrap_or(muru_config::FactoryPhase::Worker),
         ),
-        (None, _) if from_previous => previous.and_then(|previous| previous.factory),
         (None, _) => None,
     };
 
@@ -3846,20 +3949,14 @@ pub fn resolve_spec(
     let build = resolve_build(request, &table, &source, provisioning)?;
 
     // Section 8.1: the interpreter as given, else the source's own
-    // virtualenv, else a request resolved through uv, else what the
-    // previous release ran, else the python3 on the path; probed, so an
+    // virtualenv, else a request resolved through uv, else the python3
+    // on the path; probed, so an
     // interpreter that cannot run Muru fails the deploy here. A release
     // that builds takes a request over the source's virtualenv, since the
     // request says what to build with.
 
-    let (python, interpreter) = resolve_interpreter(
-        request,
-        &table,
-        previous,
-        &source,
-        provisioning,
-        build.builds,
-    )?;
+    let (python, interpreter) =
+        resolve_interpreter(request, &table, &source, provisioning, build.builds)?;
 
     // Section 8.2: where bytecode goes, and whether the source already
     // holds bytecode for the interpreter, which a redirected release then
@@ -3889,22 +3986,18 @@ pub fn resolve_spec(
     let processes = request
         .processes
         .or(table.processes.map(|value| value as u32))
-        .or(previous.map(|previous| previous.processes))
         .unwrap_or(DEFAULT_PROCESSES);
     let threads = request
         .threads
         .or(table.threads.map(|value| value as u32))
-        .or(previous.map(|previous| previous.threads))
         .unwrap_or(DEFAULT_THREADS);
     let sync_threads = request
         .sync_threads
         .or(table.sync_threads.map(|value| value as u32))
-        .or(previous.map(|previous| previous.sync_threads))
         .unwrap_or(DEFAULT_SYNC_THREADS);
     let concurrency = request
         .concurrency
         .or(table.concurrency.map(|value| value as u32))
-        .or(previous.map(|previous| previous.concurrency))
         .unwrap_or(DEFAULT_CONCURRENCY);
     let groups = groups.unwrap_or(&table.groups);
     let mounts = mounts.unwrap_or(&table.mounts);
@@ -3995,44 +4088,35 @@ pub fn resolve_spec(
     let accel_redirect = request
         .accel_redirect
         .or(table.accel_redirect)
-        .or(previous.map(|previous| previous.accel_redirect))
         .unwrap_or(false);
     let cgi_local_redirect = request
         .cgi_local_redirect
         .or(table.cgi_local_redirect)
-        .or(previous.map(|previous| previous.cgi_local_redirect))
         .unwrap_or(false);
 
-    // Section 4.9: the file hint keys, from the request, else the table,
-    // else the previous release.
+    // Section 4.9: the file hint keys, from the request, else the table.
 
-    let sendfile_roots = if !request.sendfile_roots.is_empty() {
-        request.sendfile_roots.clone()
-    } else if !table.sendfile_roots.is_empty() {
-        table.sendfile_roots.clone()
+    let sendfile_roots: Vec<String> = if request.sendfile_roots.is_empty() {
+        &table.sendfile_roots
     } else {
-        previous
-            .map(|previous| previous.sendfile_roots.clone())
-            .unwrap_or_default()
-    };
+        &request.sendfile_roots
+    }
+    .iter()
+    .map(|root| root_by_place(root))
+    .collect();
     let sendfile_header = request
         .sendfile_header
         .clone()
-        .or_else(|| table.sendfile_header.clone())
-        .or_else(|| previous.and_then(|previous| previous.sendfile_header.clone()));
+        .or_else(|| table.sendfile_header.clone());
     muru_config::check_sendfile(&sendfile_roots, sendfile_header.as_deref())?;
     muru_config::check_sendfile_dirs(&sendfile_roots, &source)?;
 
     // Section 6.13: the origins gRPC-Web answers with CORS, likewise.
 
-    let grpc_web_origins = if !request.grpc_web_origins.is_empty() {
-        request.grpc_web_origins.clone()
-    } else if !table.grpc_web_origins.is_empty() {
+    let grpc_web_origins = if request.grpc_web_origins.is_empty() {
         table.grpc_web_origins.clone()
     } else {
-        previous
-            .map(|previous| previous.grpc_web_origins.clone())
-            .unwrap_or_default()
+        request.grpc_web_origins.clone()
     };
     muru_config::check_origins(&grpc_web_origins)?;
 
@@ -4040,7 +4124,8 @@ pub fn resolve_spec(
         let path = mount.path.trim_end_matches('/').to_owned();
         let mount_roots = mount
             .sendfile_roots
-            .clone()
+            .as_ref()
+            .map(|roots| roots.iter().map(|root| root_by_place(root)).collect())
             .unwrap_or_else(|| sendfile_roots.clone());
         let mount_header = mount
             .sendfile_header
@@ -4078,21 +4163,17 @@ pub fn resolve_spec(
     }
 
     // Section 4.9: the release's own directories of files, by path: the
-    // previous release's, then the table's, then the request's; each
-    // directory resolved under the source and checked to exist.
+    // table's, then the request's; each directory resolved under the
+    // source and checked to exist.
 
     let static_dirs = resolve_static_dirs(
-        previous.map_or(&[][..], |previous| &previous.static_dirs),
         static_dirs.unwrap_or(&table.static_dirs),
         &request.static_dirs,
         &source,
     )?;
 
     // Section 7.6 and 7.7: the host's own timeouts and recycling, from
-    // the request, else the table, else the previous release, else the
-    // defaults of appendix C.
-
-    let carried = previous.map(|previous| &previous.timeouts);
+    // the request, else the table, else the defaults of appendix C.
 
     let table_timeouts = table.timeouts.clone().unwrap_or_default();
     let duration_ms =
@@ -4109,62 +4190,53 @@ pub fn resolve_spec(
         request.max_lifetime_ms,
         table.max_lifetime.as_ref(),
         "max_lifetime",
-    )?
-    .or(previous.and_then(|previous| previous.max_lifetime_ms));
+    )?;
     let timeouts = crate::model::WorkerTimeouts {
         soft_timeout_ms: duration_ms(
             request.soft_timeout_ms,
             table_timeouts.soft_timeout.as_ref(),
             "soft_timeout",
-        )?
-        .or(carried.and_then(|carried| carried.soft_timeout_ms)),
+        )?,
         hard_timeout_ms: duration_ms(
             request.hard_timeout_ms,
             table_timeouts.hard_timeout.as_ref(),
             "hard_timeout",
-        )?
-        .or(carried.and_then(|carried| carried.hard_timeout_ms)),
+        )?,
         hard_drain_grace_ms: duration_ms(
             request.hard_drain_grace_ms,
             table_timeouts.hard_drain_grace.as_ref(),
             "hard_drain_grace",
         )?
-        .or(carried.map(|carried| carried.hard_drain_grace_ms))
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().hard_drain_grace_ms),
         shutdown_timeout_ms: duration_ms(
             request.shutdown_timeout_ms,
             table_timeouts.shutdown_timeout.as_ref(),
             "shutdown_timeout",
         )?
-        .or(carried.map(|carried| carried.shutdown_timeout_ms))
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().shutdown_timeout_ms),
         websocket_drain_grace_ms: duration_ms(
             request.websocket_drain_grace_ms,
             table_timeouts.websocket_drain_grace.as_ref(),
             "websocket_drain_grace",
         )?
-        .or(carried.map(|carried| carried.websocket_drain_grace_ms))
         .unwrap_or_default(),
         exit_grace_ms: duration_ms(
             request.exit_grace_ms,
             table_timeouts.exit_grace.as_ref(),
             "exit_grace",
         )?
-        .or(carried.map(|carried| carried.exit_grace_ms))
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().exit_grace_ms),
         loop_stall_timeout_ms: duration_ms(
             request.loop_stall_timeout_ms,
             table_timeouts.loop_stall_timeout.as_ref(),
             "loop_stall_timeout",
         )?
-        .or(carried.map(|carried| carried.loop_stall_timeout_ms))
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().loop_stall_timeout_ms),
         gil_stall_timeout_ms: duration_ms(
             request.gil_stall_timeout_ms,
             table_timeouts.gil_stall_timeout.as_ref(),
             "gil_stall_timeout",
         )?
-        .or(carried.map(|carried| carried.gil_stall_timeout_ms))
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().gil_stall_timeout_ms),
     };
 
@@ -4188,13 +4260,9 @@ pub fn resolve_spec(
             }
         };
     let defaults = crate::model::MemoryPolicy::default();
-    let kept = previous.map(|previous| &previous.memory);
     let memory = crate::model::MemoryPolicy {
         measure: match request.memory_measure.as_str() {
-            "" => table_memory
-                .measure
-                .or(kept.map(|kept| kept.measure))
-                .unwrap_or(defaults.measure),
+            "" => table_memory.measure.unwrap_or(defaults.measure),
             given => given
                 .parse()
                 .map_err(|error: muru_config::ParseError| format!("memory.measure: {error}"))?,
@@ -4203,32 +4271,27 @@ pub fn resolve_spec(
             request.memory_soft_limit,
             table_memory.soft_limit.as_ref(),
             "soft_limit",
-        )?
-        .or(kept.and_then(|kept| kept.soft_limit)),
+        )?,
         soft_for_ms: duration_ms(
             request.memory_soft_for_ms,
             table_memory.soft_for.as_ref(),
             "memory.soft_for",
         )?
-        .or(kept.map(|kept| kept.soft_for_ms))
         .unwrap_or(defaults.soft_for_ms),
         reclaim_first: request
             .memory_reclaim_first
             .or(table_memory.reclaim_first)
-            .or(kept.map(|kept| kept.reclaim_first))
             .unwrap_or(defaults.reclaim_first),
         hard_limit: size(
             request.memory_hard_limit,
             table_memory.hard_limit.as_ref(),
             "hard_limit",
-        )?
-        .or(kept.and_then(|kept| kept.hard_limit)),
+        )?,
         check_interval_ms: duration_ms(
             request.memory_check_interval_ms,
             table_memory.check_interval.as_ref(),
             "memory.check_interval",
         )?
-        .or(kept.map(|kept| kept.check_interval_ms))
         .unwrap_or(defaults.check_interval_ms),
     };
 
@@ -4262,7 +4325,6 @@ pub fn resolve_spec(
     }
 
     let (env, env_layers) = resolve_env_specs(
-        previous.map_or(&[][..], |previous| &previous.env),
         &table.env,
         if tables.declared {
             "the release table"
@@ -4299,7 +4361,7 @@ pub fn resolve_spec(
         &source,
     )?;
 
-    let mut layers = resolve_layers(request, &table, previous, tables.declared, &source);
+    let mut layers = resolve_layers(request, &table, tables.declared, &source);
     layers.0.extend(env_layers);
 
     // Section 11.4: Python logging defaults, the source's table with a
@@ -4388,10 +4450,7 @@ pub fn resolve_spec(
     }
 
     let interface = match request.interface.as_str() {
-        "" => table
-            .interface
-            .or(previous.map(|previous| previous.interface))
-            .unwrap_or(muru_config::Interface::Auto),
+        "" => table.interface.unwrap_or(muru_config::Interface::Auto),
         given => given
             .parse()
             .map_err(|error: muru_config::ParseError| error.to_string())?,
@@ -4401,9 +4460,7 @@ pub fn resolve_spec(
     // interface it hands from when that is declared.
 
     let handoff = match request.handoff.as_str() {
-        "" => table
-            .handoff
-            .or_else(|| previous.and_then(|previous| previous.handoff)),
+        "" => table.handoff,
         given => Some(
             given
                 .parse()
@@ -4414,6 +4471,7 @@ pub fn resolve_spec(
     muru_config::check_handoff(handoff, Some(interface))?;
 
     Ok(ReleaseSpec {
+        metadata: BTreeMap::new(),
         limits: crate::model::ServedLimits::from_settings(&served),
         source,
         entrypoint,
@@ -4424,28 +4482,20 @@ pub fn resolve_spec(
         sync_threads,
         concurrency,
         preload: match request.preload.as_str() {
-            "" => table
-                .preload
-                .or(previous.map(|previous| previous.preload))
-                .unwrap_or(muru_config::Preload::Auto),
+            "" => table.preload.unwrap_or(muru_config::Preload::Auto),
             given => given
                 .parse()
                 .map_err(|error: muru_config::ParseError| error.to_string())?,
         },
         hooks: (!request.hooks.is_empty())
             .then(|| request.hooks.clone())
-            .or(table.hooks)
-            .or_else(|| previous.and_then(|previous| previous.hooks.clone())),
+            .or(table.hooks),
         preload_modules,
         instrumentation,
         lazy_imports,
         import_report,
         factory,
-        reflection: request
-            .reflection
-            .or(table.reflection)
-            .or(previous.map(|previous| previous.reflection))
-            .unwrap_or(false),
+        reflection: request.reflection.or(table.reflection).unwrap_or(false),
         handoff,
         grpc_web_origins,
         groups: resolved_groups,
@@ -4456,10 +4506,7 @@ pub fn resolve_spec(
         sendfile_roots,
         sendfile_header,
         logging: python_logging,
-        max_requests: request
-            .max_requests
-            .or(table.max_requests)
-            .or(previous.and_then(|previous| previous.max_requests)),
+        max_requests: request.max_requests.or(table.max_requests),
         max_lifetime_ms,
         timeouts,
         memory,
@@ -4883,11 +4930,10 @@ fn resolve_build(
 
 /// Section 8.1: the release's interpreter and what the probe found. With
 /// provisioning off, the order before probing existed: the request's
-/// value as a path, the source's .venv, the previous release's, python3.
+/// value as a path, the source's .venv, python3.
 fn resolve_interpreter(
     request: &pb::DeployRequest,
     table: &muru_config::ToolMuru,
-    previous: Option<&ReleaseSpec>,
     source: &Path,
     provisioning: &crate::provision::Provisioning,
     builds: bool,
@@ -4900,8 +4946,6 @@ fn resolve_interpreter(
 
             if venv.is_file() {
                 venv
-            } else if let Some(previous) = previous {
-                previous.python.clone()
             } else {
                 PathBuf::from("python3")
             }
@@ -4915,7 +4959,6 @@ fn resolve_interpreter(
         flag: (!request.python.is_empty()).then_some(request.python.as_str()),
         table: table.python.as_deref(),
         project: source,
-        previous: previous.map(|previous| previous.python.as_path()),
         always: builds,
         uv: provisioning.uv.as_ref(),
         isolation: &provisioning.isolation,
@@ -4949,13 +4992,11 @@ fn resolve_interpreter(
 fn resolve_layers(
     request: &pb::DeployRequest,
     table: &muru_config::ToolMuru,
-    previous: Option<&ReleaseSpec>,
     declared: bool,
     source: &Path,
 ) -> crate::model::Layers {
     let timeouts = table.timeouts.clone().unwrap_or_default();
     let memory = table.memory.clone().unwrap_or_default();
-    let before = previous.is_some();
     let venv = source.join(".venv").join("bin").join("python").is_file();
 
     let python = if request.python.is_empty() && venv {
@@ -4965,7 +5006,7 @@ fn resolve_layers(
     {
         "the project's Python request"
     } else {
-        layer(!request.python.is_empty(), false, before, declared)
+        layer(!request.python.is_empty(), false, declared)
     };
 
     let keys = [
@@ -4974,7 +5015,6 @@ fn resolve_layers(
             layer(
                 !request.entrypoint.is_empty(),
                 table.entrypoint.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -4987,7 +5027,6 @@ fn resolve_layers(
                     .build
                     .as_ref()
                     .is_some_and(|build| build.when.is_some()),
-                false,
                 declared,
             ),
         ),
@@ -4996,7 +5035,6 @@ fn resolve_layers(
             layer(
                 !request.bytecode.is_empty(),
                 table.bytecode.is_some(),
-                false,
                 declared,
             ),
         ),
@@ -5005,7 +5043,6 @@ fn resolve_layers(
             layer(
                 !request.interface.is_empty(),
                 table.interface.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5014,7 +5051,6 @@ fn resolve_layers(
             layer(
                 !request.preload.is_empty(),
                 table.preload.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5023,25 +5059,18 @@ fn resolve_layers(
             layer(
                 request.processes.is_some(),
                 table.processes.is_some(),
-                before,
                 declared,
             ),
         ),
         (
             "threads",
-            layer(
-                request.threads.is_some(),
-                table.threads.is_some(),
-                before,
-                declared,
-            ),
+            layer(request.threads.is_some(), table.threads.is_some(), declared),
         ),
         (
             "sync_threads",
             layer(
                 request.sync_threads.is_some(),
                 table.sync_threads.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5050,7 +5079,6 @@ fn resolve_layers(
             layer(
                 request.concurrency.is_some(),
                 table.concurrency.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5059,7 +5087,6 @@ fn resolve_layers(
             layer(
                 request.max_requests.is_some(),
                 table.max_requests.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5068,7 +5095,6 @@ fn resolve_layers(
             layer(
                 request.max_lifetime_ms.is_some(),
                 table.max_lifetime.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5077,7 +5103,6 @@ fn resolve_layers(
             layer(
                 request.soft_timeout_ms.is_some(),
                 timeouts.soft_timeout.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5086,7 +5111,6 @@ fn resolve_layers(
             layer(
                 request.hard_timeout_ms.is_some(),
                 timeouts.hard_timeout.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5095,7 +5119,6 @@ fn resolve_layers(
             layer(
                 request.hard_drain_grace_ms.is_some(),
                 timeouts.hard_drain_grace.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5104,7 +5127,6 @@ fn resolve_layers(
             layer(
                 request.websocket_drain_grace_ms.is_some(),
                 timeouts.websocket_drain_grace.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5113,7 +5135,6 @@ fn resolve_layers(
             layer(
                 request.exit_grace_ms.is_some(),
                 timeouts.exit_grace.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5122,7 +5143,6 @@ fn resolve_layers(
             layer(
                 request.shutdown_timeout_ms.is_some(),
                 timeouts.shutdown_timeout.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5131,7 +5151,6 @@ fn resolve_layers(
             layer(
                 request.loop_stall_timeout_ms.is_some(),
                 timeouts.loop_stall_timeout.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5140,7 +5159,6 @@ fn resolve_layers(
             layer(
                 request.gil_stall_timeout_ms.is_some(),
                 timeouts.gil_stall_timeout.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5149,7 +5167,6 @@ fn resolve_layers(
             layer(
                 !request.memory_measure.is_empty(),
                 memory.measure.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5158,7 +5175,6 @@ fn resolve_layers(
             layer(
                 request.memory_soft_limit.is_some(),
                 memory.soft_limit.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5167,7 +5183,6 @@ fn resolve_layers(
             layer(
                 request.memory_soft_for_ms.is_some(),
                 memory.soft_for.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5176,7 +5191,6 @@ fn resolve_layers(
             layer(
                 request.memory_reclaim_first.is_some(),
                 memory.reclaim_first.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5185,7 +5199,6 @@ fn resolve_layers(
             layer(
                 request.memory_hard_limit.is_some(),
                 memory.hard_limit.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5194,7 +5207,6 @@ fn resolve_layers(
             layer(
                 request.memory_check_interval_ms.is_some(),
                 memory.check_interval.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5203,7 +5215,6 @@ fn resolve_layers(
             layer(
                 request.accel_redirect.is_some(),
                 table.accel_redirect.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5212,7 +5223,6 @@ fn resolve_layers(
             layer(
                 request.cgi_local_redirect.is_some(),
                 table.cgi_local_redirect.is_some(),
-                before,
                 declared,
             ),
         ),
@@ -5520,20 +5530,17 @@ pub fn route_layers(store: &Store, document: &Document, node: &muru_edge::Limits
 }
 
 /// Section 4.9: the release's own directories of files, layered by
-/// path prefix: the previous release's, the table's, then the request's,
-/// each directory taken under the source when relative and checked to
-/// be one.
+/// path prefix: the table's, then the request's, each directory taken
+/// under the source when relative and checked to be one. Nothing comes
+/// from an earlier release (issue 861), whose directory may be in
+/// another source.
 fn resolve_static_dirs(
-    previous: &[StaticSpec],
     table: &[muru_config::StaticDir],
     request: &[pb::StaticDir],
     source: &Path,
 ) -> Result<Vec<StaticSpec>, String> {
     muru_config::check_static(table)?;
-    let mut by_path: BTreeMap<String, StaticSpec> = previous
-        .iter()
-        .map(|entry| (prefix_key(&entry.path), entry.clone()))
-        .collect();
+    let mut by_path: BTreeMap<String, StaticSpec> = BTreeMap::new();
 
     for entry in table {
         by_path.insert(prefix_key(&entry.path), static_spec(entry, source)?);
@@ -5552,6 +5559,28 @@ fn resolve_static_dirs(
     Ok(by_path.into_values().collect())
 }
 
+/// A directory in the source as a release records it: relative, with
+/// `.` left out, so `./assets`, `assets/` and `source:assets` are one.
+fn in_source(within: &str) -> PathBuf {
+    Path::new(within)
+        .components()
+        .filter(|component| matches!(component, std::path::Component::Normal(_)))
+        .collect()
+}
+
+/// A file hint root as a release records it (issue 900): one in the
+/// source, `source:SUBDIR` or a relative path, by its place, so an
+/// export names it as `source:SUBDIR`; any other as it is written.
+fn root_by_place(root: &str) -> String {
+    match muru_config::places::Place::parse(root)
+        .ok()
+        .and_then(|place| place.in_source())
+    {
+        Some(within) => format!("source:{}", in_source(within).display()),
+        None => root.to_owned(),
+    }
+}
+
 /// A prefix as paths are matched by it, without a trailing slash.
 fn prefix_key(path: &str) -> String {
     muru_edge::routing::group_prefix(path)
@@ -5560,24 +5589,36 @@ fn prefix_key(path: &str) -> String {
 /// One of the release's own directories, resolved and checked. One in a
 /// place Muru provides (issues 849 and 850), `media:` or `static:`, is
 /// kept by its place, since that is resolved when the release runs, and
-/// is not checked: the application fills it.
+/// is not checked: the application fills it. One in the source, written
+/// `source:SUBDIR` or as a relative path (issue 900), is kept by its
+/// place too, so the release's own source is what it names, and is
+/// checked to be a directory there.
 fn static_spec(entry: &muru_config::StaticDir, source: &Path) -> Result<StaticSpec, String> {
     let place = muru_config::places::Place::parse(&entry.dir)
         .map_err(|error| format!("static {}: {error}", entry.path))?;
 
-    let (dir, within) = match place {
-        muru_config::places::Place::Media(rest) => {
+    let (dir, within) = match (place, place.in_source()) {
+        (muru_config::places::Place::Media(rest), _) => {
             (PathBuf::from(rest), Some(crate::model::Within::Media))
         }
-        muru_config::places::Place::Static(rest) => {
+        (muru_config::places::Place::Static(rest), _) => {
             (PathBuf::from(rest), Some(crate::model::Within::Static))
         }
-        muru_config::places::Place::Path(text) => {
-            let dir = if Path::new(text).is_absolute() {
-                PathBuf::from(text)
-            } else {
-                source.join(text)
-            };
+        (_, Some(within)) => {
+            let dir = in_source(within);
+
+            if !source.join(&dir).is_dir() {
+                return Err(format!(
+                    "static {}: {} is not a directory",
+                    entry.path,
+                    source.join(&dir).display()
+                ));
+            }
+
+            (dir, Some(crate::model::Within::Source))
+        }
+        (_, None) => {
+            let dir = PathBuf::from(&entry.dir);
 
             if !dir.is_dir() {
                 return Err(format!(
@@ -5615,23 +5656,15 @@ fn static_spec(entry: &muru_config::StaticDir, source: &Path) -> Result<StaticSp
 
 /// Section 10.8: the environment, the table's entries with the
 /// request's over them, references kept as references.
-/// The release's variables, by name: the previous release's, then its
-/// table's, then the request's, each with the layer it came from under
-/// `env.NAME` (section 3.3).
+/// The release's variables, by name: its table's, then the request's,
+/// each with the layer it came from under `env.NAME` (section 3.3).
 fn resolve_env_specs(
-    previous: &[EnvSpec],
     table: &BTreeMap<String, muru_config::EnvValue>,
     table_layer: &str,
     request: &[pb::EnvEntry],
 ) -> Result<(Vec<EnvSpec>, BTreeMap<String, String>), String> {
-    let mut env_table: BTreeMap<String, EnvSpec> = previous
-        .iter()
-        .map(|spec| (spec.name.clone(), spec.clone()))
-        .collect();
-    let mut layers: BTreeMap<String, String> = previous
-        .iter()
-        .map(|spec| (env_layer(&spec.name), "the previous release".to_owned()))
-        .collect();
+    let mut env_table: BTreeMap<String, EnvSpec> = BTreeMap::new();
+    let mut layers: BTreeMap<String, String> = BTreeMap::new();
 
     for (name, value) in table {
         env_table.insert(name.clone(), env_spec_from_table(name, value)?);
@@ -5748,6 +5781,7 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         || request.memory_check_interval_ms.is_some();
 
     Ok(muru_config::Release {
+        metadata: BTreeMap::new(),
         static_dirs: request
             .static_dirs
             .iter()
@@ -5861,13 +5895,14 @@ fn resolve_http_spec(
         return Err("shutdown_timeout must be longer than nothing".to_owned());
     }
 
-    let (env, env_layers) = resolve_env_specs(&[], &BTreeMap::new(), "", &request.env)?;
+    let (env, env_layers) = resolve_env_specs(&BTreeMap::new(), "", &request.env)?;
     let (error_pages, error_override, maintenance) =
         resolve_error_tables(tables, &BTreeMap::new(), None, None, &source)?;
     muru_config::check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())?;
     muru_config::check_sendfile_dirs(&table.sendfile_roots, &source)?;
 
     Ok(ReleaseSpec {
+        metadata: BTreeMap::new(),
         limits: tables
             .limits
             .map(|declared| crate::model::ServedLimits::from_settings(&declared))
@@ -5895,7 +5930,11 @@ fn resolve_http_spec(
         static_dirs: Vec::new(),
         accel_redirect: false,
         cgi_local_redirect: false,
-        sendfile_roots: table.sendfile_roots.clone(),
+        sendfile_roots: table
+            .sendfile_roots
+            .iter()
+            .map(|root| root_by_place(root))
+            .collect(),
         sendfile_header: table.sendfile_header.clone(),
         logging: muru_config::PythonLogging::default(),
         max_requests: None,
@@ -6208,7 +6247,10 @@ fn parse_or<T: std::str::FromStr<Err = muru_config::ParseError>>(
 }
 
 /// One variable of an `[env]` table as the spec records it.
-fn env_spec_from_table(name: &str, value: &muru_config::EnvValue) -> Result<EnvSpec, String> {
+pub(crate) fn env_spec_from_table(
+    name: &str,
+    value: &muru_config::EnvValue,
+) -> Result<EnvSpec, String> {
     muru_config::check_env_name(name)?;
 
     Ok(match value {
@@ -6246,10 +6288,10 @@ fn env_spec_from_table(name: &str, value: &muru_config::EnvValue) -> Result<EnvS
 /// A declared release as the deploy request it stands for.
 fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequest {
     pb::DeployRequest {
+        metadata: table.metadata.clone(),
         app: app.to_owned(),
         source: source.to_owned(),
         override_freeze: false,
-        fresh: false,
         static_dirs: Vec::new(),
         retain_workers: None,
         kind: table
@@ -6465,11 +6507,13 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
             error_pages: spec.error_pages.clone(),
             error_override: spec.error_override.clone(),
             maintenance: spec.maintenance.clone(),
+            metadata: spec.metadata.clone(),
             ..ReleaseTable::default()
         };
     }
 
     ReleaseTable {
+        metadata: spec.metadata.clone(),
         kind: None,
         profile: None,
         command: Vec::new(),
@@ -6635,7 +6679,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
 }
 
 /// The environment as the table that declares it, secrets as references.
-fn env_table_from(env: &[EnvSpec]) -> BTreeMap<String, muru_config::EnvValue> {
+pub(crate) fn env_table_from(env: &[EnvSpec]) -> BTreeMap<String, muru_config::EnvValue> {
     env.iter()
         .map(|entry| {
             let value = match (&entry.secret_store, &entry.secret_key) {
@@ -6747,6 +6791,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "entrypoint",
         declared.entrypoint.clone(),
         recorded.entrypoint.clone(),
+    );
+    compare(
+        "metadata",
+        format!("{:?}", declared.metadata),
+        format!("{:?}", recorded.metadata),
     );
     compare(
         "interface",
@@ -7286,6 +7335,36 @@ fn release_order(id: &str) -> (u8, u64, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_static_routes_plan_line_names_its_directory_and_fallback() {
+        let route = |keys: &str| -> muru_config::Route {
+            toml::from_str(&format!("host = 'site'\npath = '/files'\n{keys}")).unwrap()
+        };
+
+        assert_eq!(
+            describe_static_route("/srv/site", &route("static = '/srv/site'")),
+            "static /srv/site"
+        );
+        assert_eq!(
+            describe_static_route(
+                "/srv/site",
+                &route("static = '/srv/site'\nfallback = { app = 'shop' }")
+            ),
+            "static /srv/site, else shop"
+        );
+        assert_eq!(
+            describe_static_route(
+                "/srv/site",
+                &route("static = '/srv/site'\nfallback = { upstream = 'legacy' }")
+            ),
+            "static /srv/site, else upstream legacy"
+        );
+        assert_eq!(
+            route_target(&route("upstream = 'legacy'")),
+            "upstream legacy"
+        );
+    }
     use crate::model::ReleaseState;
 
     fn store_with_shop(source: &Path) -> Store {
@@ -7299,7 +7378,6 @@ mod tests {
                 python: "/usr/bin/python3".to_owned(),
                 ..Default::default()
             },
-            None,
             &Tables::default(),
             &crate::provision::Provisioning::off(),
         )
@@ -7317,6 +7395,81 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("muru-config-plan-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn release_metadata_is_exported_applied_back_and_immutable() {
+        let source = source_dir();
+        let store = Store::in_memory().unwrap();
+        store.ensure_app("shop").unwrap();
+        let spec = resolve_spec(
+            &pb::DeployRequest {
+                app: "shop".to_owned(),
+                source: source.display().to_string(),
+                entrypoint: "shop.wsgi:application".to_owned(),
+                python: "/usr/bin/python3".to_owned(),
+                metadata: [
+                    ("commit", "4f2a9c1e0b3d"),
+                    ("ref", "refs/heads/main"),
+                    ("description", ""),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+                ..Default::default()
+            },
+            &Tables::default(),
+            &crate::provision::Provisioning::off(),
+        )
+        .unwrap();
+
+        // Issue 866: an empty value is left out, and the rest is kept.
+
+        assert_eq!(spec.metadata.len(), 2);
+        assert_eq!(
+            crate::model::created_from(&spec),
+            format!("{}, commit 4f2a9c1e0b3d of main", spec.source.display())
+        );
+        store.create_release("shop", "r1", &spec).unwrap();
+        store
+            .set_release_state("shop", "r1", ReleaseState::Ready, "")
+            .unwrap();
+        store.set_app_releases("shop", Some("r1"), None).unwrap();
+
+        // The export writes it and applies back without a change; a file
+        // that gives the release other metadata is refused.
+
+        let text = export(&store, None).unwrap().to_toml().unwrap();
+        assert!(text.contains("commit = \"4f2a9c1e0b3d\""), "{text}");
+        let back = plan_with(&store, &Document::parse(&text).unwrap(), false, false);
+        assert!(
+            back.errors.is_empty() && back.changes.is_empty(),
+            "{back:?}"
+        );
+
+        let changed = text.replace("4f2a9c1e0b3d", "9b01c33d7a2e");
+        let refused = plan_with(&store, &Document::parse(&changed).unwrap(), false, false);
+        assert!(
+            refused.errors[0].contains("already exists with different settings (metadata"),
+            "{:?}",
+            refused.errors
+        );
+
+        // Metadata past its limits refuses the deploy.
+
+        let bad = resolve_spec(
+            &pb::DeployRequest {
+                app: "shop".to_owned(),
+                source: source.display().to_string(),
+                entrypoint: "shop.wsgi:application".to_owned(),
+                python: "/usr/bin/python3".to_owned(),
+                metadata: [("url".to_owned(), "ftp://example.com".to_owned())].into(),
+                ..Default::default()
+            },
+            &Tables::default(),
+            &crate::provision::Provisioning::off(),
+        );
+        assert!(bad.unwrap_err().contains("http or https"));
     }
 
     #[test]
@@ -7433,10 +7586,11 @@ mod tests {
             "shop@r1: timeouts.soft_timeout = off (default)"
         );
 
-        // A deploy takes what it does not give from the release before;
-        // a declared release names its table.
+        // A deploy takes nothing from the release before it (issue 861):
+        // what its flags and the source do not give is the default, and
+        // with no entrypoint anywhere it is refused. A declared release
+        // names its table.
 
-        let previous = store.release("shop", "r1").unwrap().spec;
         let request = pb::DeployRequest {
             app: "shop".to_owned(),
             source: source.display().to_string(),
@@ -7444,18 +7598,135 @@ mod tests {
             ..Default::default()
         };
         let off = crate::provision::Provisioning::off();
-        let next = resolve_spec(&request, Some(&previous), &Tables::default(), &off).unwrap();
-        assert_eq!(next.layers.0["entrypoint"], "the previous release");
+        let error = resolve_spec(&request, &Tables::default(), &off).unwrap_err();
+        assert!(error.contains("has no entrypoint"), "{error}");
+
+        let request = pb::DeployRequest {
+            entrypoint: "shop.wsgi:application".to_owned(),
+            ..request
+        };
+        let next = resolve_spec(&request, &Tables::default(), &off).unwrap();
+        assert_eq!(next.layers.0["entrypoint"], "deploy flags");
         assert_eq!(next.layers.0["threads"], "deploy flags");
-        assert_eq!(next.layers.0["sync_threads"], "the previous release");
+        assert_eq!(next.layers.0["sync_threads"], "default");
 
         let declared = Tables {
             declared: true,
             ..Tables::default()
         };
-        let spec = resolve_spec(&request, Some(&previous), &declared, &off).unwrap();
+        let spec = resolve_spec(&request, &declared, &off).unwrap();
         assert_eq!(spec.layers.0["threads"], "the release table");
         assert_eq!(spec, next, "layers are not settings");
+    }
+
+    #[test]
+    fn the_applications_settings_are_a_layer_an_export_writes_and_applies_back() {
+        let source = source_dir();
+        let store = store_with_shop(&source);
+        let settings = crate::app_settings::AppSettings::from_message(&pb::AppSettings {
+            threads: Some(3),
+            env: vec![pb::EnvEntry {
+                name: "DATABASE_URL".to_owned(),
+                value: "postgres://db/shop".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        store.set_app_settings("shop", &settings).unwrap();
+
+        // A deploy that does not give them takes them, under its own
+        // flags, and records where they came from.
+
+        let request = pb::DeployRequest {
+            app: "shop".to_owned(),
+            source: source.display().to_string(),
+            entrypoint: "shop.wsgi:application".to_owned(),
+            processes: Some(2),
+            ..Default::default()
+        };
+        let off = crate::provision::Provisioning::off();
+        let spec =
+            crate::app_settings::resolve(&request, &settings, &Tables::default(), &off).unwrap();
+        assert_eq!((spec.processes, spec.threads), (2, 3));
+        assert_eq!(spec.layers.0["threads"], "the application");
+        assert_eq!(spec.layers.0["env.DATABASE_URL"], "the application");
+        assert_eq!(spec.layers.0["processes"], "deploy flags");
+
+        // The export writes them on the application's table, and applying
+        // it back changes nothing; a document without them removes them.
+
+        let planned =
+            |document: &Document| plan(&store, document, true, false, &Defined::default(), &off);
+        let text = export(&store, None).unwrap().to_toml().unwrap();
+        let document = Document::parse(&text).unwrap();
+        assert_eq!(document.app["shop"].threads, Some(3), "{text}");
+        assert!(
+            document.app["shop"].env.contains_key("DATABASE_URL"),
+            "{text}"
+        );
+        assert!(planned(&document).changes.is_empty());
+
+        let mut without = document.clone();
+        let app = without.app.get_mut("shop").unwrap();
+        app.threads = None;
+        app.env.clear();
+        let changes = planned(&without).changes;
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].action.name(), "set-settings");
+        assert_eq!(changes[0].detail, "no settings of its own");
+
+        let mut zero = document;
+        zero.app.get_mut("shop").unwrap().processes = Some(0);
+        assert_eq!(
+            planned(&zero).errors,
+            ["shop: processes must be more than 0"]
+        );
+    }
+
+    #[test]
+    fn a_directory_in_the_source_is_recorded_by_its_place() {
+        // Issue 900: source:SUBDIR and a relative path name one directory
+        // of the release's own source, kept relative to it, written back
+        // as source:SUBDIR, and checked to be there.
+
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("assets")).unwrap();
+        std::fs::create_dir_all(source.path().join("downloads")).unwrap();
+
+        let entry = |dir: &str| muru_config::StaticDir {
+            path: "/assets/".to_owned(),
+            dir: dir.to_owned(),
+            ..Default::default()
+        };
+
+        for dir in ["assets", "./assets/", "source:assets"] {
+            let spec = static_spec(&entry(dir), source.path()).unwrap();
+            assert_eq!(spec.within, Some(crate::model::Within::Source), "{dir}");
+            assert_eq!(spec.dir, Path::new("assets"), "{dir}");
+            assert_eq!(spec.table().dir, "source:assets", "{dir}");
+            assert_eq!(
+                spec.directory(Path::new("/srv/r2"), &crate::places::Places::default()),
+                Some(PathBuf::from("/srv/r2/assets"))
+            );
+        }
+
+        let whole = static_spec(&entry("source:"), source.path()).unwrap();
+        assert_eq!(whole.table().dir, "source:");
+
+        let error = static_spec(&entry("source:gone"), source.path()).unwrap_err();
+        assert!(error.contains("is not a directory"), "{error}");
+
+        let absolute = source.path().join("assets").display().to_string();
+        let spec = static_spec(&entry(&absolute), source.path()).unwrap();
+        assert_eq!((spec.within, spec.table().dir), (None, absolute));
+
+        // File hint roots in the source are kept as source:SUBDIR too.
+
+        assert_eq!(root_by_place("downloads"), "source:downloads");
+        assert_eq!(root_by_place("source:./downloads"), "source:downloads");
+        assert_eq!(root_by_place("media:"), "media:");
+        assert_eq!(root_by_place("/srv/files"), "/srv/files");
     }
 
     #[test]
@@ -7537,6 +7808,7 @@ mod tests {
             resolve_declared(
                 "shop",
                 &document.app["shop"].release["r1"],
+                &crate::app_settings::AppSettings::default(),
                 &source.display().to_string(),
                 &crate::provision::Provisioning::off(),
             )
@@ -7623,6 +7895,7 @@ mod tests {
             resolve_declared(
                 "shop",
                 &document.app["shop"].release["r1"],
+                &crate::app_settings::AppSettings::default(),
                 &source.display().to_string(),
                 &crate::provision::Provisioning::off(),
             )
@@ -7683,6 +7956,7 @@ mod tests {
             resolve_declared(
                 "shop",
                 table,
+                &crate::app_settings::AppSettings::default(),
                 &source.display().to_string(),
                 &crate::provision::Provisioning::off(),
             )
@@ -8366,6 +8640,32 @@ mod tests {
             back.errors.is_empty() && back.changes.is_empty(),
             "{back:?}"
         );
+    }
+
+    #[test]
+    fn an_export_of_one_application_writes_a_static_route_falling_back_to_it() {
+        let source = source_dir();
+        let store = store_with_shop(&source);
+        let routed = Document::parse(
+            "[host.site]\nnames = ['shop.test']\n\n\
+             [[route]]\nhost = 'site'\npath = '/'\nstatic = '/srv/site'\n\
+             fallback = { app = 'shop' }\n",
+        )
+        .unwrap();
+        store.put_host("site", &routed.host["site"]).unwrap();
+        store.put_route(&routed.route[0]).unwrap();
+
+        // The static route reaches shop through its fallback (issue 918),
+        // so it comes with its host; an export of another application
+        // writes neither.
+
+        let exported = export(&store, Some("shop")).unwrap();
+        assert_eq!(exported.route, routed.route);
+        assert!(exported.host.contains_key("site"));
+
+        store.ensure_app("blog").unwrap();
+        let other = export(&store, Some("blog")).unwrap();
+        assert!(other.route.is_empty() && other.host.is_empty());
     }
 
     #[test]

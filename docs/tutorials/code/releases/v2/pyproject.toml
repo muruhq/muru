@@ -1,0 +1,3 @@
+[tool.muru]
+entrypoint = "app:application"
+python = "../.venv/bin/python"
