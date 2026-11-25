@@ -1637,6 +1637,7 @@ impl Routing {
     ) -> anyhow::Result<Self> {
         let mut apps: HashMap<String, AppReleases> = HashMap::new();
         let mut upstreams: HashMap<String, Arc<Upstream>> = HashMap::new();
+        let mut carried: HashSet<String> = HashSet::new();
 
         for message in &snapshot.upstreams {
             let upstream = Upstream::from_message(message)
@@ -1703,16 +1704,21 @@ impl Routing {
             // for its workers, as an upstream named after the release.
 
             if let Some(server) = &app.server {
-                let mut server = Upstream::from_message(server)
+                // Section 9.9: the upstream takes over the starting marks,
+                // and the requests held on them, of the one the last
+                // routing had for the release (issue 919).
+
+                let earlier = previous.and_then(|previous| previous.server_named(&server.name));
+                let mut server = Upstream::from_message_after(server, earlier.as_deref())
                     .map_err(|error| anyhow::anyhow!("{}@{}: {error}", app.app, app.release))?;
+                carried.insert(server.name().to_owned());
 
                 // Section 4.21: a detour's WebSockets outlast the snapshot.
 
                 if server.is_detour()
-                    && let Some(earlier) =
-                        previous.and_then(|previous| previous.server_named(server.name()))
+                    && let Some(earlier) = &earlier
                 {
-                    server.carry_relays(&earlier);
+                    server.carry_relays(earlier);
                 }
 
                 pools = pools
@@ -2101,6 +2107,20 @@ impl Routing {
                     route.classes.is_empty(),
                 )
             });
+        }
+
+        // Section 9.9 (issue 919): a managed server the snapshot leaves
+        // out lets go of the requests held for its instances, which are
+        // tried as they are rather than waiting out their bound.
+
+        if let Some(previous) = previous {
+            for pools in previous.app_pools() {
+                if let Some(server) = pools.server()
+                    && !carried.contains(server.name())
+                {
+                    server.release_held();
+                }
+            }
         }
 
         Ok(routing)

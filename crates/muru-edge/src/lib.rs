@@ -2605,6 +2605,7 @@ fn capacity_failure(reason: &str) -> bool {
         "no_workers"
             | "queue_full"
             | "cold_start_timeout"
+            | "upstream_starting"
             | "draining"
             | "release_failed"
             | "edge_overloaded"

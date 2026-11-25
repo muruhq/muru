@@ -120,8 +120,24 @@ instance 1 answers and takes requests again
 An instance that has not answered when the readiness timeout ends takes
 requests all the same, with a `server.ready` warning, and is set aside
 for a while if they fail, as any instance is after three failed requests
-in a row. With every instance out of service, requests still try them
-all, and are answered 502 `upstream_failed` when none takes them.
+in a row.
+
+When every instance is starting, as when a release with one instance
+has that instance started again, a request waits for one to answer
+rather than failing. It waits for at most the queue timeout
+(`queue_timeout`, 5 seconds by default) and is sent as soon as an
+instance takes requests again; the time it waits counts towards its
+request deadline. One still waiting when the queue timeout ends is sent
+to the instances all the same, and is answered 502 `upstream_failed` if
+none takes it. At most 256 requests wait for one release in each edge process, and
+any beyond them are answered 503 `upstream_starting` with
+`Retry-After: 1`. A request that arrives in the second between an
+instance's exit and the daemon seeing it is not held, and with no other
+instance to go to is answered 502 `upstream_failed`.
+
+With every instance out of service for other reasons, such as failed
+requests, requests still try them all, and are answered 502
+`upstream_failed` when none takes them.
 `muru_upstream_health` reports each instance by address under the
 release's name, 0 while it is out of service. The instance count is
 fixed: `muructl scale` refuses a managed server.
