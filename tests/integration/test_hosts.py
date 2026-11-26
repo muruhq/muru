@@ -524,3 +524,32 @@ def test_a_restarted_daemon_takes_both_listeners_back(tmp_path: Path) -> None:
     finally:
         if first.process.poll() is None:
             first.stop()
+
+
+def test_a_restarted_daemon_serves_on_the_listeners_its_file_names(tmp_path: Path) -> None:
+    # Issue 930: an edge re-adopted after a detach kept the listeners it
+    # was started with, whatever the new daemon's file said, until a
+    # reload. A start reads the file as a reload does.
+
+    old, new = support.free_port(), support.free_port()
+    first = start_daemon(tmp_path, listeners=[(old, False)])
+
+    try:
+        first.deploy("shop", SHOP)
+        assert first.get("/").status == 200
+        first.stop(shutdown=False)
+
+        second = start_daemon(tmp_path, run_dir=first.run_dir, listeners=[(new, False)])
+
+        try:
+            assert "re-adopted the edge" in second.log()
+            status = second.muructl("status").stdout
+            assert f"http://127.0.0.1:{new}" in status, status
+            assert f"http://127.0.0.1:{old}" not in status, status
+            assert second.request("/", port=new).status == 200
+            assert "edge.replaced" in second.events()
+        finally:
+            second.stop()
+    finally:
+        if first.process.poll() is None:
+            first.stop()

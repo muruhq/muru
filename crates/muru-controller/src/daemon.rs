@@ -2048,6 +2048,15 @@ struct Daemon {
     booted: bool,
 }
 
+/// The listeners as a start says them: each as a URL, joined with `and`.
+fn serving_on_text(listeners: &[(SocketAddr, bool)]) -> String {
+    listeners
+        .iter()
+        .map(|(address, tls)| format!("{}://{address}", if *tls { "https" } else { "http" }))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 /// Run the daemon until it is told to stop: bind the edge, serve the admin
 /// API, start the releases that were serving, then reconcile commands as
 /// they arrive.
@@ -2182,6 +2191,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     };
 
     let booted = adopted.is_none();
+    let wanted_listeners = settings.listeners.clone();
 
     let edge = match adopted {
         Some(edge) => {
@@ -2384,11 +2394,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     };
 
     let mut api = tokio::spawn(api);
-    let serving_on = listeners
-        .iter()
-        .map(|(address, tls)| format!("{}://{address}", if *tls { "https" } else { "http" }))
-        .collect::<Vec<_>>()
-        .join(" and ");
+    let serving_on = serving_on_text(&listeners);
 
     match &config.upgraded_from {
         Some(before) => events.emit(
@@ -2524,13 +2530,37 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         tracing::warn!(%error, "pushing the first snapshot failed");
     }
 
+    // Issue 930: a start and a reload read the file the same way. An
+    // edge re-adopted after a detach has the listeners it was started
+    // with, so a file that now names others takes a new edge, as a reload
+    // gives it, where the old listeners served until the next reload.
+
+    let relisten = if daemon.booted {
+        None
+    } else {
+        daemon
+            .bind_listeners(&wanted_listeners)
+            .map_err(anyhow::Error::msg)?
+    };
+
     // Section 13.4: an upgraded daemon replaces the edge with one from
     // its own image once the hosts are re-adopted and the snapshot is
     // whole again.
 
-    if config.upgraded_from.is_some() {
-        let _ = daemon.replace_edge(None, "the same listeners").await;
+    match relisten {
+        Some((listeners, what)) => {
+            daemon
+                .replace_edge(Some(listeners), &what)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+        None if config.upgraded_from.is_some() => {
+            let _ = daemon.replace_edge(None, "the same listeners").await;
+        }
+        None => {}
     }
+
+    let serving_on = serving_on_text(&daemon.edge.listeners());
 
     // Section 7.4: the edge says when a request waits for a group with
     // no workers.
