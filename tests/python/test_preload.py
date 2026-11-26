@@ -35,8 +35,14 @@ def test_thread_count_sees_a_new_thread() -> None:
     # earlier test joined may still be leaving the operating system's
     # count, which a join does not wait for (issue 947).
 
+    # The interpreter finds the package where this one did, which in the
+    # tests is a path pytest adds and no installed distribution.
+
     script = """
+import sys
 import threading
+
+sys.path.insert(0, sys.argv[1])
 
 from muru import preload
 
@@ -54,7 +60,11 @@ finally:
 assert after == before + 1, (before, after)
 """
     counted = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, check=False, timeout=60
+        [sys.executable, "-c", script, str(Path(preload.__file__).parents[1])],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
     )
     assert counted.returncode == 0, counted.stderr
 
