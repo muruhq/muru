@@ -5687,6 +5687,114 @@ pub struct App {
     pub memory: Option<Memory>,
 }
 
+impl App {
+    /// Whether the table sets any of the application's own settings:
+    /// every key but its releases and its schedules, which add up across
+    /// the files of an apply where these are declared in one.
+    pub fn sets_own(&self) -> bool {
+        // Destructured in full, so that a key added to the table is
+        // counted here or this does not compile (issue 925).
+
+        let Self {
+            release: _,
+            schedule: _,
+            serving,
+            user,
+            group,
+            umask,
+            priority,
+            access_log,
+            access_log_exclude,
+            slow,
+            data_dir,
+            media_dir,
+            uploads_dir,
+            env,
+            processes,
+            threads,
+            sync_threads,
+            concurrency,
+            max_requests,
+            max_lifetime,
+            timeouts,
+            memory,
+        } = self;
+
+        serving.is_some()
+            || user.is_some()
+            || group.is_some()
+            || umask.is_some()
+            || priority.is_some()
+            || access_log.is_some()
+            || !access_log_exclude.is_empty()
+            || slow.is_some()
+            || data_dir.is_some()
+            || media_dir.is_some()
+            || uploads_dir.is_some()
+            || !env.is_empty()
+            || processes.is_some()
+            || threads.is_some()
+            || sync_threads.is_some()
+            || concurrency.is_some()
+            || max_requests.is_some()
+            || max_lifetime.is_some()
+            || timeouts.is_some()
+            || memory.is_some()
+    }
+
+    /// Take another table's own settings in place of this one's, and give
+    /// back its releases and its schedules, which the caller adds.
+    fn take_own(&mut self, other: Self) -> (BTreeMap<String, Release>, Vec<CapacitySchedule>) {
+        let Self {
+            release,
+            schedule,
+            serving,
+            user,
+            group,
+            umask,
+            priority,
+            access_log,
+            access_log_exclude,
+            slow,
+            data_dir,
+            media_dir,
+            uploads_dir,
+            env,
+            processes,
+            threads,
+            sync_threads,
+            concurrency,
+            max_requests,
+            max_lifetime,
+            timeouts,
+            memory,
+        } = other;
+
+        self.serving = serving;
+        self.user = user;
+        self.group = group;
+        self.umask = umask;
+        self.priority = priority;
+        self.access_log = access_log;
+        self.access_log_exclude = access_log_exclude;
+        self.slow = slow;
+        self.data_dir = data_dir;
+        self.media_dir = media_dir;
+        self.uploads_dir = uploads_dir;
+        self.env = env;
+        self.processes = processes;
+        self.threads = threads;
+        self.sync_threads = sync_threads;
+        self.concurrency = concurrency;
+        self.max_requests = max_requests;
+        self.max_lifetime = max_lifetime;
+        self.timeouts = timeouts;
+        self.memory = memory;
+
+        (release, schedule)
+    }
+}
+
 /// The host's timeouts an application's table sets for its releases:
 /// those of a release's `timeouts` table that a deploy flag can set, and
 /// not the limits on the requests the edge serves, which belong to a
@@ -5935,48 +6043,27 @@ impl Document {
         for (name, app) in other.app {
             let entry = self.app.entry(name.clone()).or_default();
 
-            // The identity (section 10.9) comes along; a later file that
-            // sets it replaces an earlier one's.
+            // An application's own settings are declared in one file
+            // (ADR 0082): a second file that sets any of them is refused,
+            // as a host declared twice is, where a later file's used to
+            // replace an earlier one's in the order of the files' names.
 
-            if app.user.is_some() || app.group.is_some() || app.umask.is_some() {
-                entry.user = app.user;
-                entry.group = app.group;
-                entry.umask = app.umask;
+            let sets = app.sets_own();
+
+            if sets && entry.sets_own() {
+                return Err(format!(
+                    "app {name} has settings declared twice; an application's own settings go \
+                     in one file"
+                ));
             }
 
-            if app.priority.is_some() {
-                entry.priority = app.priority;
-            }
+            let (releases, schedules) = if sets {
+                entry.take_own(app)
+            } else {
+                (app.release, app.schedule)
+            };
 
-            // Issue 849: so do the data directory and its parts, together,
-            // since a relative part is taken from the data directory.
-
-            if app.data_dir.is_some() || app.media_dir.is_some() || app.uploads_dir.is_some() {
-                entry.data_dir = app.data_dir;
-                entry.media_dir = app.media_dir;
-                entry.uploads_dir = app.uploads_dir;
-            }
-
-            // Section 10.4: so does the release that serves.
-
-            if app.serving.is_some() {
-                entry.serving = app.serving;
-            }
-
-            // Section 11.2: so does the access log choice, key by key,
-            // and the paths it leaves out add up.
-
-            if app.access_log.is_some() {
-                entry.access_log = app.access_log;
-            }
-
-            if app.slow.is_some() {
-                entry.slow = app.slow;
-            }
-
-            entry.access_log_exclude.extend(app.access_log_exclude);
-
-            for (id, release) in app.release {
+            for (id, release) in releases {
                 if entry.release.contains_key(&id) {
                     return Err(format!("release {name}@{id} is declared twice"));
                 }
@@ -5984,7 +6071,7 @@ impl Document {
                 entry.release.insert(id, release);
             }
 
-            for schedule in app.schedule {
+            for schedule in schedules {
                 if entry.schedule.iter().any(|seen| seen.name == schedule.name) {
                     return Err(format!(
                         "schedule {} of {name} is declared twice",
@@ -8150,31 +8237,47 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         first.merge(second).unwrap();
         assert_eq!(first.app["shop"].release.len(), 2);
 
-        // The application's own keys come along: the access log choice
-        // key by key, its excluded paths adding up.
+        // The application's own settings come along from the one file
+        // that declares them, every key of the table (issue 925): the
+        // settings its releases take were dropped here.
 
-        let quiet = Document::parse(
-            "[app.shop]\naccess_log = 'errors'\nslow = '2s'\naccess_log_exclude = ['/a']\n",
+        let own = Document::parse(
+            "[app.shop]\naccess_log = 'errors'\nslow = '2s'\naccess_log_exclude = ['/a']\n\
+             data_dir = '/srv/shop'\nmedia_dir = 'files'\nserving = 'r2'\npriority = 3\n\
+             user = 'shop'\nprocesses = 4\nthreads = 2\nsync_threads = 6\nconcurrency = 50\n\
+             max_requests = 1000\nmax_lifetime = '1h'\n\
+             [app.shop.env]\nA = '1'\n\
+             [app.shop.timeouts]\nhard_timeout = '30s'\n\
+             [app.shop.memory]\nsoft_limit = '200MB'\n",
         )
         .unwrap();
-        first.merge(quiet).unwrap();
-        let quieter =
-            Document::parse("[app.shop]\naccess_log = 'off'\naccess_log_exclude = ['/b']\n")
-                .unwrap();
-        first.merge(quieter).unwrap();
+        let declared = own.app["shop"].clone();
+        first.merge(own).unwrap();
         let shop = &first.app["shop"];
-        assert_eq!(shop.access_log.as_deref(), Some("off"));
-        assert_eq!(shop.slow.as_deref(), Some("2s"));
-        assert_eq!(shop.access_log_exclude, ["/a", "/b"]);
+        assert_eq!(shop.release.len(), 2, "the releases of other files stay");
 
-        // Issue 849: the data directory and its parts come along together.
+        let mut merged = shop.clone();
+        merged.release.clear();
+        assert_eq!(merged, declared, "every setting of the table came along");
 
-        let data =
-            Document::parse("[app.shop]\ndata_dir = '/srv/shop'\nmedia_dir = 'files'\n").unwrap();
-        first.merge(data).unwrap();
-        let shop = &first.app["shop"];
-        assert_eq!(shop.data_dir.as_deref(), Some("/srv/shop"));
-        assert_eq!(shop.media_dir.as_deref(), Some("files"));
+        // A second file that sets any of them is refused, as a host
+        // declared twice is (ADR 0082), where the later file's value used
+        // to replace the earlier one's.
+
+        for text in [
+            "[app.shop]\naccess_log = 'off'\n",
+            "[app.shop]\npriority = 5\n",
+            "[app.shop.env]\nB = '2'\n",
+            "[app.shop.memory]\nhard_limit = '300MB'\n",
+        ] {
+            let error = first.merge(Document::parse(text).unwrap()).unwrap_err();
+            assert_eq!(
+                error,
+                "app shop has settings declared twice; an application's own settings go in one \
+                 file",
+                "{text}"
+            );
+        }
 
         let again = Document::parse("[app.shop.release.r2]\nentrypoint = 'a:c'\n").unwrap();
         let error = first.merge(again).unwrap_err();

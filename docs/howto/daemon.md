@@ -346,7 +346,10 @@ those of the
 table leaves out comes from the application's settings, then the
 source's `[tool.muru]` table and then the defaults, exactly as a deploy
 resolves them. A directory applies every `.toml` file in it, in name
-order, as one configuration.
+order, as one configuration. Releases of one application add up across
+the files, and so do routes; a release, a host or an upstream declared
+in two files is refused, and so is an application whose own settings
+two files set: the keys of its `[app.NAME]` table go in one file.
 
 The application's own table holds the [settings on the
 application](#settings-on-the-application) that `muructl app set` sets,
