@@ -260,10 +260,11 @@ pub struct Config {
 pub struct StartApply {
     /// The paths, as the messages name them.
     pub paths: String,
-    /// The files as one document, or why they could not be read as one.
-    pub document: Result<String, String>,
-    /// Also remove what the files do not contain.
-    pub prune: bool,
+    /// The files, a deployment to a document, or why they could not be
+    /// read.
+    pub documents: Result<Vec<String>, String>,
+    /// How far the apply's removals reach.
+    pub prune: crate::deployments::Prune,
 }
 
 /// An error on one line, for an event and a log line: a TOML parse
@@ -295,17 +296,29 @@ impl StartApply {
         defined: &crate::config::Defined,
         provisioning: &crate::provision::Provisioning,
     ) -> (bool, String) {
-        let document = match self
-            .document
+        let declared = match self
+            .documents
             .as_ref()
             .map_err(Clone::clone)
-            .and_then(|text| muru_config::Document::parse(text))
-        {
-            Ok(document) => document,
+            .and_then(|texts| {
+                let parsed = texts
+                    .iter()
+                    .map(|text| muru_config::Document::parse(text))
+                    .collect::<Result<Vec<_>, _>>()?;
+                crate::deployments::fold(parsed)
+            }) {
+            Ok(declared) => declared,
             Err(error) => return (false, format!("cannot be applied: {}", on_one_line(&error))),
         };
 
-        let plan = crate::config::plan(store, &document, self.prune, false, defined, provisioning);
+        let plan = crate::config::plan_declared(
+            store,
+            &declared,
+            self.prune,
+            false,
+            defined,
+            provisioning,
+        );
 
         if !plan.errors.is_empty() {
             return (
@@ -330,14 +343,15 @@ impl StartApply {
     /// does, and say what came of it: the summary of a success, or the
     /// report of a failure.
     async fn run(self, socket: PathBuf) -> Result<String, String> {
-        let document = self.document.map_err(|error| on_one_line(&error))?;
+        let documents = self.documents.map_err(|error| on_one_line(&error))?;
         let mut client = crate::client::connect(&crate::client::Endpoint::unix(&socket))
             .await
             .map_err(|error| error.to_string())?;
         let report = client
             .apply_config(muru_proto::admin::v1::ApplyConfigRequest {
-                document,
-                prune: self.prune,
+                documents,
+                prune: self.prune.any(),
+                prune_all: self.prune == crate::deployments::Prune::All,
                 ..muru_proto::admin::v1::ApplyConfigRequest::default()
             })
             .await

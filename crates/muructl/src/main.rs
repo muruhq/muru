@@ -1497,6 +1497,18 @@ fn main() -> anyhow::Result<()> {
             admin::DeploymentCommand::Diff { file, json, socket } => {
                 exit_with(runtime, admin::config_diff(file, json, socket))
             }
+            admin::DeploymentCommand::List { socket, output } => {
+                runtime.block_on(admin::deployment_list(socket, output.json))
+            }
+            admin::DeploymentCommand::Remove {
+                name,
+                dry_run,
+                yes,
+                socket,
+            } => exit_with(
+                runtime,
+                admin::deployment_remove(name, dry_run, yes, socket),
+            ),
         },
         Command::Events {
             follow,

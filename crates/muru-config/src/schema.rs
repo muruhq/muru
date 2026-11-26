@@ -164,7 +164,8 @@ struct LocalBuild {
 /// The top-level keys of a document that say what the daemon serves, and
 /// belong to applied files alone (ADR 0079). Every other key but the
 /// shared ones is the daemon's own.
-pub const DEPLOYMENT_TABLES: [&str; 5] = ["app", "host", "route", "upstream", "overlay"];
+pub const DEPLOYMENT_TABLES: [&str; 6] =
+    ["deployment", "app", "host", "route", "upstream", "overlay"];
 
 /// The top-level keys both files take: the daemon's file defines them
 /// for the node, and an applied file for what it declares.

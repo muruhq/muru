@@ -5850,6 +5850,13 @@ pub struct Metrics {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
+    /// The deployment the file's tables belong to: a named set of
+    /// applications, hosts, routes and the rest that is applied, pruned
+    /// and removed together. Files with the same name are one deployment.
+    /// A key of applied files alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "default"))]
+    pub deployment: Option<String>,
     /// How the daemon itself runs (ADR 0026).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon: Option<Daemon>,
@@ -5952,6 +5959,7 @@ impl Document {
         // given to one file or the other here, or this does not compile.
 
         let Self {
+            deployment: _,
             daemon,
             tools,
             listener,
@@ -6006,6 +6014,11 @@ impl Document {
     /// own file may hold none (ADR 0079).
     pub fn deployment_tables(&self) -> Vec<String> {
         let mut tables = Vec::new();
+
+        if self.deployment.is_some() {
+            tables.push("the deployment key".to_owned());
+        }
+
         tables.extend(self.app.keys().map(|name| format!("[app.{name}]")));
         tables.extend(self.host.keys().map(|name| format!("[host.{name}]")));
 
@@ -6027,6 +6040,19 @@ impl Document {
     /// applications and releases are added. A host or a release declared
     /// in both is an error.
     pub fn merge(&mut self, other: Document) -> Result<(), String> {
+        // Files are folded together one deployment at a time (ADR 0080),
+        // so two names here are a mistake of the caller's.
+
+        match (&self.deployment, &other.deployment) {
+            (Some(ours), Some(theirs)) if ours != theirs => {
+                return Err(format!(
+                    "files of the deployments {ours} and {theirs} cannot be read as one"
+                ));
+            }
+            (None, Some(theirs)) => self.deployment = Some(theirs.clone()),
+            _ => {}
+        }
+
         self.listener.extend(other.listener);
         self.route.extend(other.route);
         self.client_class.extend(other.client_class);

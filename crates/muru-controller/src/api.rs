@@ -488,6 +488,22 @@ impl Admin for Service {
             )));
         }
 
+        // ADR 0080: an application a named deployment owns has its
+        // settings from that deployment's files, which state them in
+        // full. A setting made here would be gone at their next apply,
+        // with nothing failing until a release ran without it.
+
+        if let Some(deployment) = crate::deployments::stored(&self.handle.store)
+            .get(&(crate::deployments::Kind::App, request.app.clone()))
+        {
+            return Err(Status::failed_precondition(format!(
+                "{app} belongs to the deployment {deployment}, whose files state its settings: \
+                 change [app.{app}] there and apply, or give the value to one release with \
+                 muructl deploy",
+                app = request.app
+            )));
+        }
+
         let given = crate::app_settings::AppSettings::from_message(
             &request.set.clone().unwrap_or_default(),
         )
@@ -560,7 +576,30 @@ impl Admin for Service {
             );
         }
 
-        Ok(Response::new(settings.to_message()))
+        // In `default` the change stands until files that state the
+        // application's table are applied again, which is said when
+        // such files wrote the settings last.
+
+        let applied = self
+            .handle
+            .store
+            .settings_applied(&request.app, true)
+            .unwrap_or(false);
+
+        let notice = if applied {
+            format!(
+                "applied files last wrote {}'s settings, and state them in full: their next \
+                 apply removes what they do not carry",
+                request.app
+            )
+        } else {
+            String::new()
+        };
+
+        Ok(Response::new(pb::AppSettings {
+            notice,
+            ..settings.to_message()
+        }))
     }
 
     async fn dashboard_login(
@@ -3062,9 +3101,15 @@ impl Admin for Service {
     ) -> Result<Response<pb::ConfigReport>, Status> {
         let request = request.into_inner();
 
-        let document = match muru_config::Document::parse(&request.document) {
-            Ok(document) => document,
+        let declared = match declared_by(&request.document, &request.documents) {
+            Ok(declared) => declared,
             Err(error) => return Ok(Response::new(parse_failure(error))),
+        };
+
+        let prune = match (request.prune, request.prune_all) {
+            (_, true) => crate::deployments::Prune::All,
+            (true, false) => crate::deployments::Prune::Files,
+            (false, false) => crate::deployments::Prune::No,
         };
 
         // Section 10.10: an apply waits for the one under way to end, and
@@ -3092,10 +3137,10 @@ impl Admin for Service {
             .read()
             .expect("defined names poisoned")
             .clone();
-        let mut plan = config::plan(
+        let mut plan = config::plan_declared(
             &self.handle.store,
-            &document,
-            request.prune,
+            &declared,
+            prune,
             request.hold,
             &defined,
             &self.handle.info.provisioning,
@@ -3169,7 +3214,11 @@ impl Admin for Service {
         // phase then writes the rest in one transaction and gives the edge
         // one snapshot of it.
 
-        let tls = document.host.values().any(|host| host.tls.is_some());
+        let tls = declared
+            .document
+            .host
+            .values()
+            .any(|host| host.tls.is_some());
         let starts = plan.changes.iter().any(|change| {
             matches!(
                 change.action,
@@ -3220,17 +3269,37 @@ impl Admin for Service {
         Ok(Response::new(report))
     }
 
+    async fn list_deployments(
+        &self,
+        _: Request<pb::ListDeploymentsRequest>,
+    ) -> Result<Response<pb::ListDeploymentsResponse>, Status> {
+        let deployments = crate::deployments::list(&self.handle.store)
+            .into_iter()
+            .map(|(name, summary)| pb::Deployment {
+                name,
+                apps: summary.apps,
+                hosts: summary.hosts as u32,
+                routes: summary.routes as u32,
+                others: summary.others as u32,
+            })
+            .collect();
+
+        Ok(Response::new(pb::ListDeploymentsResponse { deployments }))
+    }
+
     async fn diff_config(
         &self,
         request: Request<pb::DiffConfigRequest>,
     ) -> Result<Response<pb::ConfigReport>, Status> {
-        let document = match muru_config::Document::parse(&request.into_inner().document) {
-            Ok(document) => document,
+        let request = request.into_inner();
+
+        let declared = match declared_by(&request.document, &request.documents) {
+            Ok(declared) => declared,
             Err(error) => return Ok(Response::new(parse_failure(error))),
         };
 
-        // A diff shows both directions: what the document would add and
-        // what desired state holds beyond it.
+        // A diff shows both directions: what the files would add and what
+        // the deployments they name hold beyond them.
 
         let defined = self
             .handle
@@ -3239,10 +3308,10 @@ impl Admin for Service {
             .read()
             .expect("defined names poisoned")
             .clone();
-        let mut plan = config::plan(
+        let mut plan = config::plan_declared(
             &self.handle.store,
-            &document,
-            true,
+            &declared,
+            crate::deployments::Prune::Files,
             false,
             &defined,
             &self.handle.info.provisioning,
@@ -3591,6 +3660,12 @@ impl Service {
 
         report.applied = true;
         let mut failures = 0;
+
+        // ADR 0080: who owns what the files declared.
+
+        if let Err(error) = self.handle.store.set_owners(&plan.owners) {
+            tracing::warn!(%error, "recording the deployments of what was applied failed");
+        }
 
         // Section 9.1: what the files declare, for release prune to leave.
 
@@ -4117,6 +4192,25 @@ struct Planned {
 }
 
 /// A report with one parse error and nothing else.
+/// What an apply's request declares: its documents, one to a deployment,
+/// or the single document of a request that names no deployments.
+fn declared_by(
+    document: &str,
+    documents: &[String],
+) -> Result<crate::deployments::Declared, String> {
+    let texts: Vec<&str> = if documents.is_empty() {
+        vec![document]
+    } else {
+        documents.iter().map(String::as_str).collect()
+    };
+    let parsed = texts
+        .into_iter()
+        .map(muru_config::Document::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    crate::deployments::fold(parsed)
+}
+
 fn parse_failure(error: String) -> pb::ConfigReport {
     pb::ConfigReport {
         errors: vec![error],
@@ -4160,7 +4254,7 @@ fn report_message(plan: &Plan) -> pb::ConfigReport {
             .collect(),
         unchanged: plan.unchanged,
         applied: false,
-        notes: Vec::new(),
+        notes: plan.notes.clone(),
         snapshot_error: String::new(),
     }
 }

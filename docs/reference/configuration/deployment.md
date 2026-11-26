@@ -14,6 +14,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `app` | table of tables, {ref}`[app.NAME] <config-deployment-app-name>` |  | Applications by name. |
 | `client_class` | array of tables, {ref}`[[client_class]] <config-deployment-client-class>` |  | Client classification rules, in order, from the daemon's own file or an applied one. |
 | `condition` | table of tables, {ref}`[condition.NAME] <config-deployment-condition-name>` |  | Named conditions over Muru's own signals, from the daemon's own file or an applied one. |
+| `deployment` | string | `"default"` | The deployment the file's tables belong to: a named set of applications, hosts, routes and the rest that is applied, pruned and removed together. Files with the same name are one deployment. A key of applied files alone. |
 | `host` | table of tables, {ref}`[host.NAME] <config-deployment-host-name>` |  | Virtual hosts by name. |
 | `overlay` | table of tables, {ref}`[overlay.NAME] <config-deployment-overlay-name>` |  | Overlays by name: partial configuration laid over the routes and applications while active. |
 | `rate_limit` | table of tables, {ref}`[rate_limit.NAME] <config-deployment-rate-limit-name>` |  | Rate limits by name, from the daemon's own file or an applied one. |

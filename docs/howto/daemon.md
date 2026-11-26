@@ -570,7 +570,8 @@ them, else stopped.
 `--dry-run` prints the plan and changes nothing. For each release that
 would take over from one that serves, it says how long that one stays
 warm. `--prune` also removes the routes, hosts, releases and
-applications the files do not contain: the routes and hosts with the
+applications the files do not contain, of the
+[deployments](#deployments) they name: the routes and hosts with the
 rest of the files, and the releases and applications after the edge has
 the snapshot, a running release draining and stopping first. A release
 the files do not declare is left for a later `--prune` while it is the
@@ -708,6 +709,86 @@ muru: plan (nothing changed)
 warning: shop@r2 was made serving by a command, not by applied files; this apply moves the application's traffic to shop@r1
 ```
 
+### Deployments
+
+A node that serves unrelated things can keep each as a deployment of
+its own: a named set of applications, hosts, routes and the rest that
+is applied, pruned and removed together. A `deployment` key at the top
+of a file names the one its tables belong to:
+
+```toml
+deployment = "shop"
+
+[app.shop.release.r1]
+source = "/srv/shop"
+
+[host.shop]
+names = ["shop.example.com"]
+
+[[route]]
+host = "shop"
+app = "shop"
+```
+
+Files with the same name are one deployment, and one apply may carry
+several: the files given are read a deployment at a time, and applied
+together. Files with no key belong to the deployment named `default`,
+and so does what commands make, so a node with one set of files, or
+none, names nothing.
+
+```console
+$ muructl deployment list
+NAME                     APPS                             HOSTS ROUTES  OTHER
+api                      api                                  0      1      0
+default                  landing                              0      0      0
+shop                     shop                                 1      1      0
+```
+
+- **Names are shared across the node.** A route in one deployment may
+  send requests to an application in another, and may be on a host
+  another declares.
+- **Only its owner changes an object.** An apply that declares an
+  object another named deployment owns is refused, naming that
+  deployment.
+- **A named deployment takes an object from `default` by declaring
+  it**, which is how an application made by command moves to files.
+  The apply says `app landing moves from the deployment default to
+  site`.
+- **`--prune` reaches only the deployments the files name.** It removes
+  what they own and the files no longer declare, and leaves every other
+  deployment alone. `--prune=all` reaches every deployment, `default`
+  among them, so the files are the whole of what the daemon serves: a
+  deployment they do not mention is removed, and so is an application
+  made by command.
+- **Nothing is removed while another deployment names it.** A prune
+  that would remove a host, an application, an upstream, a client class
+  or a rate limit that a route of another deployment names is refused,
+  naming the route. Take that route out first, or apply both
+  deployments together.
+
+`muructl deployment remove NAME` removes a deployment as a unit. It
+lists what goes, asks, drains what the deployment runs, and removes its
+applications with their releases, its hosts, routes and the rest:
+
+```console
+$ muructl deployment remove shop
+muru: plan (nothing changed)
+  remove-route    route shop /             not declared
+  remove-host     host shop                not declared
+  remove-release  shop@r1                  ready and not declared
+  remove-app      shop                     not declared
+Remove the deployment shop? [y/N]
+```
+
+`--dry-run` only lists, and `--yes` goes ahead without asking. It is
+refused as a prune is while another deployment names something of it.
+`muructl deployment remove default` removes what `default` holds and
+leaves it in place, empty. Application data directories are kept.
+
+What you would remove together belongs together. A host that
+separately released applications share goes in a deployment of its
+own, and each application's deployment holds its routes on that host.
+
 ### Files and commands on one application
 
 An application that applied files declare gets its releases and its
@@ -715,6 +796,13 @@ settings from the files, and one that no file declares gets them from
 `muructl deploy` and `muructl app set`. Hosts and routes are declared
 in files either way, and a route may name an application no file
 declares.
+
+`muructl app set` and `muructl app unset` are refused on an application
+a named deployment owns, since that deployment's files state its
+settings: change `[app.NAME]` there and apply, or give the value to one
+release with `muructl deploy`. In `default` they work, and say when
+applied files wrote the settings last, since their next apply removes
+what they do not carry.
 
 `muructl deploy` on an application the files declare is for an
 emergency. It works, and says that the files do not have the release:
@@ -749,7 +837,8 @@ muru: start apply of /home/me/deploy.d: 2 changes applied
 
 It takes a file or a directory and may be given more than once.
 `--prune` beside it also removes what the files do not contain, as on
-`muructl apply`.
+`muructl apply`, and `--prune=all` makes the files the whole of what
+the daemon serves at each start.
 
 - **Ready means applied.** The command returns, and the daemon answers
   its [probes](#probes) and tells a service manager that it is ready,

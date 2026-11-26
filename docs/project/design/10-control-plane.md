@@ -215,7 +215,7 @@ The admin API's calls for detours (section 9.13, ADR 0075) are on the admin sock
 
 ## 10.13 Deployments
 
-What the daemon serves is held in deployments (ADRs 0080 and 0082). None of this section is built yet; it is the intended design that issues 862, 894 and 450 and those filed with them work towards.
+What the daemon serves is held in deployments (ADRs 0080 and 0082).
 
 - **A deployment is a named set of objects applied together.** A `deployment` key at the top of a file names it. Each object an apply creates records the deployment that owns it: applications with their settings and releases, hosts, routes, upstreams, overlays, and the deployment's own client classes, rate limits and conditions. There is always a deployment named `default`: files with no key belong to it, and so does what commands make, except that a release made by muructl deploy belongs to its application's deployment. A node with one set of files, or none, names nothing.
 - **Names stay node-wide.** A route in one deployment may name a host, an application or a class in another, and any deployment may put a route on any host. Ownership says who may change a thing, not who may refer to it.

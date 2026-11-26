@@ -112,6 +112,16 @@ def test_an_applied_file_sets_the_applications_settings(tmp_path: Path) -> None:
         shown = json.loads(daemon.muructl("app", "show", "shop", "--json").stdout)
         assert shown.get("env", []) == [] and shown["processes"] == 3, shown
 
+        # Applied files wrote the settings last, so a change by command
+        # says that their next apply takes it away.
+
+        by_hand = daemon.muructl("app", "set", "shop", "--threads", "2")
+        assert (
+            "muru: warning: applied files last wrote shop's settings, and state them in full: "
+            "their next apply removes what they do not carry"
+        ) in by_hand.stderr, by_hand.stderr
+        assert "warning" not in daemon.muructl("app", "set", "shop", "--threads", "3").stderr
+
         # The application's own settings go in one file of an apply: a
         # second file that sets any of them is refused, where the later
         # file's used to win.

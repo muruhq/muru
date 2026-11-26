@@ -1246,9 +1246,18 @@ pub struct DaemonRunArgs {
     #[arg(long, value_name = "FILE or DIR")]
     apply: Vec<PathBuf>,
 
-    /// With --apply: also remove what the files do not contain.
-    #[arg(long, requires = "apply")]
-    prune: bool,
+    /// With --apply: also remove what the files do not contain, of the
+    /// deployments they name; with --prune=all, of every deployment, so
+    /// the files are the whole of what the daemon serves.
+    #[arg(
+        long,
+        requires = "apply",
+        value_name = "REACH",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "files"
+    )]
+    prune: Option<PruneScope>,
 
     /// Set by a daemon that re-executed itself for an upgrade: the
     /// version it ran before.
@@ -1390,14 +1399,12 @@ fn start_apply(args: &DaemonRunArgs) -> Option<muru_controller::daemon::StartApp
         .iter()
         .map(|path| path.display().to_string())
         .collect();
-    let document = load_documents(&args.apply)
-        .and_then(|document| document.to_toml().context("writing the configuration"))
-        .map_err(|error| format!("{error:#}"));
+    let documents = load_documents(&args.apply).map_err(|error| format!("{error:#}"));
 
     Some(muru_controller::daemon::StartApply {
         paths: paths.join(" and "),
-        document,
-        prune: args.prune,
+        documents,
+        prune: PruneScope::reach(args.prune),
     })
 }
 
@@ -1492,8 +1499,8 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
             .arg(std::path::absolute(path).unwrap_or_else(|_| path.clone()));
     }
 
-    if args.prune {
-        command.arg("--prune");
+    if let Some(scope) = args.prune {
+        command.arg(scope.flag());
     }
 
     command.args(args.locations.as_arguments());
@@ -1660,8 +1667,8 @@ fn apply_to_running(args: &DaemonRunArgs, socket: &Path) -> anyhow::Result<()> {
         command.arg("-f").arg(path);
     }
 
-    if args.prune {
-        command.arg("--prune");
+    if let Some(scope) = args.prune {
+        command.arg(scope.flag());
     }
 
     let status = command.status().context("running muructl apply")?;
@@ -6666,6 +6673,7 @@ impl AppSetArgs {
             memory_check_interval_ms: memory_setting(&self.memory, "check_interval")
                 .and_then(|text| muru_config::parse_duration(&text).ok())
                 .map(|duration| duration.as_millis() as u64),
+            notice: String::new(),
         }
     }
 }
@@ -6740,6 +6748,11 @@ fn report_app_settings(app: &str, settings: &pb::AppSettings, json: bool) -> any
         "muru: {app}'s settings are changed for the releases deployed from now; \
          no running release changes"
     );
+
+    if !settings.notice.is_empty() {
+        eprintln!("muru: warning: {}", settings.notice);
+    }
+
     print_app_settings(app, settings)
 }
 
@@ -8940,9 +8953,17 @@ pub struct ApplyArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Also remove the applications and releases the files do not contain.
-    #[arg(long)]
-    prune: bool,
+    /// Also remove what the files do not contain, of the deployments
+    /// they name; with --prune=all, of every deployment, so the files
+    /// are the whole of what the daemon serves.
+    #[arg(
+        long,
+        value_name = "REACH",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "files"
+    )]
+    prune: Option<PruneScope>,
 
     /// Deploy or promote releases of applications an overlay freezes;
     /// recorded as an event.
@@ -8983,13 +9004,15 @@ pub struct ApplyArgs {
 /// changed or everything applied, 2 for a dry run with changes planned
 /// and 1 for errors.
 pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
-    let document = load_documents(&args.file)?;
+    let documents = load_documents(&args.file)?;
     let mut client = client::connect(&args.socket.endpoint()?).await?;
     let report = client
         .apply_config(pb::ApplyConfigRequest {
-            document: document.to_toml().context("writing the configuration")?,
+            documents,
+            document: String::new(),
+            prune_all: args.prune == Some(PruneScope::All),
             dry_run: args.dry_run,
-            prune: args.prune,
+            prune: args.prune.is_some(),
             override_freeze: args.override_freeze,
             hold: args.hold,
             no_wait: args.no_wait,
@@ -9011,6 +9034,39 @@ pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
 /// The configuration subcommands.
 #[derive(Subcommand)]
 pub enum DeploymentCommand {
+    /// List the deployments: the named sets of applications, hosts and
+    /// routes this daemon serves, each applied, pruned and removed
+    /// together. default holds what files with no deployment key and
+    /// commands made.
+    List {
+        #[command(flatten)]
+        socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
+    },
+
+    /// Remove a deployment as a unit: drain what it runs and remove its
+    /// applications with their releases, its hosts, routes and the rest,
+    /// after listing what goes and asking. Refused while another
+    /// deployment's route names something of it. default is emptied and
+    /// kept. Application data directories are kept.
+    Remove {
+        /// The deployment.
+        name: String,
+
+        /// Only list what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Do it without asking.
+        #[arg(long)]
+        yes: bool,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
     /// Write desired state as a file that applies back without changes.
     Export {
         /// One application rather than all.
@@ -9168,6 +9224,112 @@ pub async fn config_show(
     Ok(())
 }
 
+/// List the deployments with what each holds.
+pub async fn deployment_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.endpoint()?).await?;
+    let answer = client
+        .list_deployments(pb::ListDeploymentsRequest {})
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if json {
+        return print_answer(&answer);
+    }
+
+    println!(
+        "{:<24} {:<32} {:>5} {:>6} {:>6}",
+        "NAME", "APPS", "HOSTS", "ROUTES", "OTHER"
+    );
+
+    for deployment in &answer.deployments {
+        let apps = if deployment.apps.is_empty() {
+            "-".to_owned()
+        } else {
+            deployment.apps.join(", ")
+        };
+        println!(
+            "{:<24} {:<32} {:>5} {:>6} {:>6}",
+            deployment.name, apps, deployment.hosts, deployment.routes, deployment.others
+        );
+    }
+
+    Ok(())
+}
+
+/// Remove a deployment as a unit: what an apply of no files for it, with
+/// a prune, removes. The exit code is 0 when it went or there was nothing
+/// to remove, and 1 for a refusal or a failure.
+pub async fn deployment_remove(
+    name: String,
+    dry_run: bool,
+    yes: bool,
+    socket: SocketArgs,
+) -> anyhow::Result<i32> {
+    let mut client = client::connect(&socket.endpoint()?).await?;
+    let known = client
+        .list_deployments(pb::ListDeploymentsRequest {})
+        .await
+        .map_err(explain)?
+        .into_inner()
+        .deployments;
+
+    if !known.iter().any(|deployment| deployment.name == name) {
+        anyhow::bail!("there is no deployment {name}; muructl deployment list shows them");
+    }
+
+    // A deployment's files with nothing in them, pruned: everything it
+    // owns goes, and nothing of any other deployment.
+
+    let document = if name == muru_controller::deployments::DEFAULT {
+        String::new()
+    } else {
+        format!("deployment = \"{name}\"\n")
+    };
+    let request = pb::ApplyConfigRequest {
+        documents: vec![document],
+        prune: true,
+        dry_run: true,
+        ..pb::ApplyConfigRequest::default()
+    };
+    let plan = client
+        .apply_config(request.clone())
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if plan.changes.is_empty() && plan.errors.is_empty() {
+        println!("muru: the deployment {name} holds nothing");
+        return Ok(0);
+    }
+
+    print_report(&plan, true);
+
+    if !plan.errors.is_empty() {
+        return Ok(1);
+    }
+
+    if dry_run {
+        return Ok(0);
+    }
+
+    if !confirm(&format!("Remove the deployment {name}?"), yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(0);
+    }
+
+    let report = client
+        .apply_config(pb::ApplyConfigRequest {
+            dry_run: false,
+            ..request
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+    print_report(&report, false);
+    Ok(exit_code(&report, false))
+}
+
 /// Compare a file with desired state. The exit code is 0 when they
 /// match, 2 when they differ and 1 for errors.
 pub async fn config_diff(
@@ -9175,11 +9337,12 @@ pub async fn config_diff(
     json: bool,
     socket: SocketArgs,
 ) -> anyhow::Result<i32> {
-    let document = load_documents(&file)?;
+    let documents = load_documents(&file)?;
     let mut client = client::connect(&socket.endpoint()?).await?;
     let report = client
         .diff_config(pb::DiffConfigRequest {
-            document: document.to_toml().context("writing the configuration")?,
+            documents,
+            document: String::new(),
         })
         .await
         .map_err(explain)?
@@ -9300,7 +9463,7 @@ fn resolve_route_overlay(route: &mut muru_config::RouteOverlay, absolute: &dyn F
 
 /// The files `-f` names, read as one document: each file as it is, and
 /// of a directory its .toml files in name order.
-fn load_documents(paths: &[PathBuf]) -> anyhow::Result<muru_config::Document> {
+fn load_documents(paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
     let mut files = Vec::new();
 
     for path in paths {
@@ -9348,7 +9511,11 @@ fn load_documents(paths: &[PathBuf]) -> anyhow::Result<muru_config::Document> {
         files.extend(found);
     }
 
-    let mut document = muru_config::Document::default();
+    // Files are read a deployment at a time: those with the same
+    // `deployment` key, or with none, are one document (ADR 0080).
+
+    let mut deployments: std::collections::BTreeMap<String, muru_config::Document> =
+        std::collections::BTreeMap::new();
 
     for file in files {
         let text = std::fs::read_to_string(&file)
@@ -9392,12 +9559,46 @@ fn load_documents(paths: &[PathBuf]) -> anyhow::Result<muru_config::Document> {
             std::env::current_dir().map_or(base.clone(), |cwd| cwd.join(&base))
         });
         resolve_paths(&mut parsed, &base);
-        document
+        deployments
+            .entry(parsed.deployment.clone().unwrap_or_default())
+            .or_default()
             .merge(parsed)
             .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
     }
 
-    Ok(document)
+    deployments
+        .into_values()
+        .map(|document| document.to_toml().context("writing the configuration"))
+        .collect()
+}
+
+/// How far `--prune` reaches: the deployments the files name, which is
+/// the flag alone, or every deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PruneScope {
+    /// The deployments the files name.
+    Files,
+    /// Every deployment, so the files are the whole of what is served.
+    All,
+}
+
+impl PruneScope {
+    /// The flag that asks for it.
+    fn flag(self) -> &'static str {
+        match self {
+            PruneScope::Files => "--prune",
+            PruneScope::All => "--prune=all",
+        }
+    }
+
+    /// The reach a flag asks for, none without it.
+    fn reach(scope: Option<PruneScope>) -> muru_controller::deployments::Prune {
+        match scope {
+            None => muru_controller::deployments::Prune::No,
+            Some(PruneScope::Files) => muru_controller::deployments::Prune::Files,
+            Some(PruneScope::All) => muru_controller::deployments::Prune::All,
+        }
+    }
 }
 
 /// Print a report as people read it.

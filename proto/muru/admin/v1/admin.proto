@@ -102,6 +102,9 @@ service Admin {
   // one with desired state, or export desired state as one.
   rpc ApplyConfig(ApplyConfigRequest) returns (ConfigReport);
   rpc DiffConfig(DiffConfigRequest) returns (ConfigReport);
+  // The deployments, each with what it holds (issue 936). default is
+  // always among them.
+  rpc ListDeployments(ListDeploymentsRequest) returns (ListDeploymentsResponse);
   rpc ExportConfig(ExportConfigRequest) returns (ExportConfigResponse);
 
   // Logs: a release's output or the access log,
@@ -788,6 +791,7 @@ message AppSettings {
   optional bool memory_reclaim_first = 19;
   optional uint64 memory_hard_limit = 20;    // bytes
   optional uint64 memory_check_interval_ms = 21;
+  string notice = 22;                        // on a change's answer: what its caller should be told, as that applied files last wrote these settings (issue 936)
 }
 
 // Set some of an application's settings and remove others. The settings
@@ -1461,10 +1465,28 @@ message ApplyConfigRequest {
   bool no_wait = 6;                 // return once those releases are recorded, without waiting for them to serve
   optional uint64 retain_ms = 7;    // how long a release the apply replaces stays warm; 30 minutes when absent
   optional uint32 retain_workers = 8; // the workers each of its groups keeps meanwhile; when absent 1, or 0 for a group whose min_workers is 0
+  repeated string documents = 9;    // the files a deployment to a document, each with its deployment key, in place of document (issue 936)
+  bool prune_all = 10;              // with prune: reach every deployment, those the documents do not name among them
+}
+
+message ListDeploymentsRequest {}
+
+// A named set of objects applied, pruned and removed together.
+message Deployment {
+  string name = 1;
+  repeated string apps = 2;         // the applications it owns
+  uint32 hosts = 3;
+  uint32 routes = 4;
+  uint32 others = 5;                // its upstreams, overlays, client classes, rate limits and conditions
+}
+
+message ListDeploymentsResponse {
+  repeated Deployment deployments = 1;
 }
 
 message DiffConfigRequest {
   string document = 1;
+  repeated string documents = 2;    // a deployment to a document, in place of document
 }
 
 // What an apply would do, or did. With errors nothing is applied.

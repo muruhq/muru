@@ -33,6 +33,13 @@ pub struct RenderArgs {
     #[arg(long, value_name = "ID")]
     release: Option<String>,
 
+    /// Write this deployment's name at the top, as deployment = "NAME",
+    /// for a file that holds this one release. Leave it off when adding
+    /// the table to a file, where the line would follow a table and be
+    /// read as a key of it.
+    #[arg(long, value_name = "NAME")]
+    deployment: Option<String>,
+
     /// Record KEY=VALUE with the release, such as description=TEXT or
     /// url=URL; repeatable. Over what is filled from git, and KEY=
     /// leaves a filled key out.
@@ -130,11 +137,21 @@ pub async fn render(args: RenderArgs) -> anyhow::Result<()> {
     ))
     .map_err(anyhow::Error::msg)?;
 
+    if let Some(name) = &args.deployment
+        && !muru_controller::model::valid_name(name)
+    {
+        anyhow::bail!(
+            "{name:?} is not a valid deployment name: lowercase letters, digits and hyphens, up \
+             to 63 characters"
+        );
+    }
+
     let RenderArgs {
         app,
         settings,
         full,
         json,
+        deployment,
         ..
     } = args;
     let request = settings.request(&app, &read.display().to_string(), python);
@@ -143,6 +160,7 @@ pub async fn render(args: RenderArgs) -> anyhow::Result<()> {
     rendered.table.metadata = metadata;
 
     let document = muru_config::Document {
+        deployment,
         app: BTreeMap::from([(
             app.clone(),
             muru_config::App {

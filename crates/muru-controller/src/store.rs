@@ -175,6 +175,12 @@ CREATE TABLE IF NOT EXISTS import_reports (
     report TEXT NOT NULL,
     PRIMARY KEY (app, release)
 );
+CREATE TABLE IF NOT EXISTS ownership (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    deployment TEXT NOT NULL,
+    PRIMARY KEY (kind, key)
+);
 CREATE TABLE IF NOT EXISTS log_periods (
     path TEXT PRIMARY KEY,
     period TEXT NOT NULL
@@ -438,6 +444,27 @@ impl Store {
         self.with(|connection| Writes { connection }.set_app_settings(name, settings))
     }
 
+    /// Whether applied files last wrote the application's settings, and
+    /// with `forget` no longer: a command is about to write them.
+    pub fn settings_applied(&self, name: &str, forget: bool) -> Result<bool, StoreError> {
+        self.with(|connection| {
+            let applied: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM ownership WHERE kind = 'settings' AND key = ?1",
+                [name],
+                |row| row.get(0),
+            )?;
+
+            if forget {
+                connection.execute(
+                    "DELETE FROM ownership WHERE kind = 'settings' AND key = ?1",
+                    [name],
+                )?;
+            }
+
+            Ok(applied > 0)
+        })
+    }
+
     /// Change the application's own release settings in one step under
     /// the store's lock, creating the application when it does not exist:
     /// `change` is given the settings as they are, and what it leaves is
@@ -628,6 +655,60 @@ impl Store {
             let rows = statement.query_map([app], |row| row.get::<_, String>(0))?;
             rows.collect::<Result<BTreeSet<_>, _>>()
                 .map_err(StoreError::from)
+        })
+    }
+
+    /// The named deployment recorded for each object (ADR 0080), by kind
+    /// and name. An object with no record belongs to `default`, and a
+    /// record may outlive its object, which the caller passes over.
+    pub fn ownership(&self) -> Result<crate::deployments::Owners, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT kind, key, deployment FROM ownership")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut owners = crate::deployments::Owners::new();
+
+            for row in rows {
+                let (kind, key, deployment) = row?;
+
+                if let Some(kind) = crate::deployments::Kind::parse(&kind) {
+                    owners.insert((kind, key), deployment);
+                }
+            }
+
+            Ok(owners)
+        })
+    }
+
+    /// Record who owns the objects an apply declared: a named deployment
+    /// for each of its own, and no record for one that is `default`'s.
+    pub fn set_owners(&self, owners: &crate::deployments::Owners) -> Result<(), StoreError> {
+        self.with(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+
+            for ((kind, key), deployment) in owners {
+                if deployment == crate::deployments::DEFAULT {
+                    transaction.execute(
+                        "DELETE FROM ownership WHERE kind = ?1 AND key = ?2",
+                        params![kind.as_str(), key],
+                    )?;
+                } else {
+                    transaction.execute(
+                        "INSERT INTO ownership (kind, key, deployment) VALUES (?1, ?2, ?3) \
+                         ON CONFLICT(kind, key) DO UPDATE SET deployment = excluded.deployment",
+                        params![kind.as_str(), key, deployment],
+                    )?;
+                }
+            }
+
+            transaction.commit()?;
+            Ok(())
         })
     }
 
@@ -1808,6 +1889,18 @@ impl Writes<'_> {
             "UPDATE apps SET current_release = ?2, previous_release = ?3, serving_origin = NULL, \
                  resource_version = resource_version + 1 WHERE name = ?1",
             params![name, current, previous],
+        )?;
+        Ok(())
+    }
+
+    /// Remember that applied files wrote the application's settings:
+    /// muructl app set then says that their next apply takes its change
+    /// away (ADR 0080).
+    pub fn mark_settings_applied(&self, name: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO ownership (kind, key, deployment) VALUES ('settings', ?1, 'apply') \
+             ON CONFLICT(kind, key) DO NOTHING",
+            params![name],
         )?;
         Ok(())
     }

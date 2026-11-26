@@ -2910,6 +2910,11 @@
       "description": "Named conditions over Muru's own signals, from the daemon's own file or an applied one.",
       "type": "object"
     },
+    "deployment": {
+      "default": "default",
+      "description": "The deployment the file's tables belong to: a named set of applications, hosts, routes and the rest that is applied, pruned and removed together. Files with the same name are one deployment. A key of applied files alone.",
+      "type": "string"
+    },
     "host": {
       "additionalProperties": {
         "$ref": "#/$defs/Host"

@@ -386,6 +386,12 @@ pub struct Plan {
     /// The releases the document declares, by application, which `release
     /// prune` leaves unless forced (section 9.1).
     pub declared: Vec<(String, Vec<String>)>,
+    /// The deployment of each object the files declare (ADR 0080), which
+    /// is recorded once the apply has been carried out.
+    pub owners: crate::deployments::Owners,
+    /// What the apply does besides its changes, said in its report: an
+    /// object that moves from `default` to a named deployment.
+    pub notes: Vec<String>,
     /// The removals a prune leaves for later: a release the files do not
     /// declare that serves or that a rollback restores (ADR 0082). An
     /// apply does not carry them out, and a diff shows them, since the
@@ -522,7 +528,69 @@ pub fn plan(
     defined: &Defined,
     provisioning: &crate::provision::Provisioning,
 ) -> Plan {
-    let mut plan = Plan::default();
+    let declared = match crate::deployments::fold(vec![document.clone()]) {
+        Ok(declared) => declared,
+        Err(error) => {
+            return Plan {
+                errors: vec![error],
+                ..Plan::default()
+            };
+        }
+    };
+
+    let prune = if prune {
+        crate::deployments::Prune::Files
+    } else {
+        crate::deployments::Prune::No
+    };
+
+    plan_declared(store, &declared, prune, hold, defined, provisioning)
+}
+
+/// Compare what the files of an apply declare with desired state, as
+/// [`plan`] does for one document, with each object's deployment and a
+/// prune that reaches the deployments the files name, or all of them
+/// (ADR 0080).
+pub fn plan_declared(
+    store: &Store,
+    declared: &crate::deployments::Declared,
+    prune: crate::deployments::Prune,
+    hold: bool,
+    defined: &Defined,
+    provisioning: &crate::provision::Provisioning,
+) -> Plan {
+    let document = &declared.document;
+    let mut plan = Plan {
+        owners: declared.owners.clone(),
+        ..Plan::default()
+    };
+
+    // ADR 0080: only its owner changes an object. One another named
+    // deployment owns is refused, and one of `default`'s that a named
+    // deployment declares moves to it, which is how a node run by command
+    // moves to files.
+
+    let owned = crate::deployments::stored(store);
+    let there = crate::deployments::stored_objects(store);
+
+    for ((kind, key), owner) in &declared.owners {
+        match owned.get(&(*kind, key.clone())) {
+            Some(other) if other != owner => plan.errors.push(format!(
+                "{} {key} belongs to the deployment {other}, and an apply of the deployment \
+                 {owner} does not change it",
+                kind.as_str()
+            )),
+            None if owner != crate::deployments::DEFAULT
+                && there.contains(&(*kind, key.clone())) =>
+            {
+                plan.notes.push(format!(
+                    "{} {key} moves from the deployment default to {owner}",
+                    kind.as_str()
+                ));
+            }
+            _ => {}
+        }
+    }
 
     // ADR 0079: the daemon's own tables are no part of what an apply
     // changes, and one in an applied file is refused, where some were
@@ -538,9 +606,23 @@ pub fn plan(
     // Sections 4.14 and 4.15: the document's classes and limits come
     // first, so what follows may name them.
 
-    plan_clients(store, document, defined, prune, &mut plan);
+    plan_clients(store, document, defined, prune.any(), &mut plan);
     let file_conditions = &defined.conditions;
-    let defined = &defined.with_applied(store, document, prune);
+
+    // What a prune reaches of the store, by its owner: what the
+    // deployments the files name own, or with `all` everything. What it
+    // does not reach stays, and may be named.
+
+    let reach = |kind: crate::deployments::Kind, key: &str| {
+        prune == crate::deployments::Prune::All
+            || declared.named.contains(
+                owned
+                    .get(&(kind, key.to_owned()))
+                    .map_or(crate::deployments::DEFAULT, String::as_str),
+            )
+    };
+    let stays = |kind: crate::deployments::Kind, key: &str| !prune.any() || !reach(kind, key);
+    let defined = &defined.with_applied(store, document, &stays);
 
     let mut promotions = Vec::new();
     let route_apps: BTreeMap<String, String> = document
@@ -563,7 +645,10 @@ pub fn plan(
     for (name, app) in &document.app {
         plan.declared
             .push((name.clone(), app.release.keys().cloned().collect()));
-        let applying = Applying { prune, hold };
+        let applying = Applying {
+            prune: prune.any(),
+            hold,
+        };
         promotions.extend(plan_app(
             store,
             name,
@@ -595,13 +680,13 @@ pub fn plan(
     plan_hosts(store, document, &defined.rate_limits, &mut plan);
     plan_upstreams(store, document, &mut plan);
     plan_routes(store, document, defined, &mut plan);
-    plan_overlays(store, document, defined, prune, &mut plan);
+    plan_overlays(store, document, defined, prune.any(), &mut plan);
     plan_conditions(store, document, file_conditions, &mut plan);
     plan.changes.extend(promotions);
     plan_budget(document, defined, &mut plan);
 
-    if prune {
-        plan_removals(store, document, &mut plan);
+    if prune.any() {
+        plan_removals(store, document, &reach, &mut plan);
     }
 
     if let Some(refusal) = apply_no_host_refusal(store, &plan.changes) {
@@ -1135,7 +1220,14 @@ pub struct Defined {
 impl Defined {
     /// These names with the classes and limits of applied files: those
     /// `document` declares and, without `prune`, those recorded.
-    fn with_applied(&self, store: &Store, document: &Document, prune: bool) -> Defined {
+    fn with_applied(
+        &self,
+        store: &Store,
+        document: &Document,
+        stays: &dyn Fn(crate::deployments::Kind, &str) -> bool,
+    ) -> Defined {
+        use crate::deployments::Kind;
+
         let mut all = self.clone();
         all.client_classes
             .extend(document.client_class.iter().map(|class| class.name.clone()));
@@ -1147,26 +1239,32 @@ impl Defined {
                 .or_insert_with(|| condition.clone());
         }
 
-        if !prune {
-            for (name, condition) in store.conditions().unwrap_or_default() {
+        // What is recorded and stays through this apply may be named
+        // too: everything without a prune, and with one what it does not
+        // reach, which is another deployment's (ADR 0080).
+
+        for (name, condition) in store.conditions().unwrap_or_default() {
+            if stays(Kind::Condition, &name) {
                 all.conditions.entry(name).or_insert(condition);
             }
-
-            all.client_classes.extend(
-                store
-                    .client_classes()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(_, class)| class.name),
-            );
-            all.rate_limits.extend(
-                store
-                    .rate_limits()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(name, _)| name),
-            );
         }
+
+        all.client_classes.extend(
+            store
+                .client_classes()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, class)| class.name)
+                .filter(|name| stays(Kind::ClientClass, name)),
+        );
+        all.rate_limits.extend(
+            store
+                .rate_limits()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| stays(Kind::RateLimit, name)),
+        );
 
         all
     }
@@ -2721,14 +2819,69 @@ pub fn describe_traffic(traffic: Option<&muru_config::Traffic>) -> String {
 /// With prune, routes, hosts, releases and applications in desired state
 /// that the document does not declare go, in that order. A release or an
 /// application a route the document keeps still names is refused.
-fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
+fn plan_removals(
+    store: &Store,
+    document: &Document,
+    reach: &dyn Fn(crate::deployments::Kind, &str) -> bool,
+    plan: &mut Plan,
+) {
+    use crate::deployments::Kind;
+
+    // ADR 0080: nothing is removed while another deployment names it. A
+    // route the prune does not reach stays as it is, so what it sends
+    // requests to, and the host it is on, must stay too.
+
+    let kept_routes: Vec<muru_config::Route> = store
+        .routes()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|route| {
+            !reach(
+                Kind::Route,
+                &crate::deployments::route_key(&route.host, &route.key()),
+            )
+        })
+        .collect();
+    let named_elsewhere = |kind: Kind, name: &str| {
+        kept_routes
+            .iter()
+            .find(|route| match kind {
+                Kind::App => {
+                    route.app == name
+                        || route
+                            .fallback
+                            .as_ref()
+                            .is_some_and(|fallback| fallback.app.as_deref() == Some(name))
+                }
+                Kind::Host => route.host == name,
+                Kind::Upstream => route.upstream == name,
+                Kind::ClientClass => route.classes().iter().any(|class| class == name),
+                Kind::RateLimit => route.rate_limits.iter().any(|limit| limit == name),
+                _ => false,
+            })
+            .map(|route| {
+                format!(
+                    "{} {name} is not removed: route {} {} of another deployment names it; take \
+                     that route out first, or apply both deployments together",
+                    kind.as_str(),
+                    route.host,
+                    route.key()
+                )
+            })
+    };
+
     for route in store.routes().unwrap_or_default() {
         let declared = document
             .route
             .iter()
             .any(|candidate| candidate.host == route.host && candidate.key() == route.key());
 
-        if !declared {
+        if !declared
+            && reach(
+                Kind::Route,
+                &crate::deployments::route_key(&route.host, &route.key()),
+            )
+        {
             plan.changes.push(Change {
                 action: Action::RemoveRoute {
                     path: route.key(),
@@ -2740,7 +2893,12 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
     }
 
     for (name, _) in store.hosts().unwrap_or_default() {
-        if !document.host.contains_key(&name) {
+        if !document.host.contains_key(&name) && reach(Kind::Host, &name) {
+            if let Some(refusal) = named_elsewhere(Kind::Host, &name) {
+                plan.errors.push(refusal);
+                continue;
+            }
+
             plan.changes.push(Change {
                 action: Action::RemoveHost { name },
                 detail: "not declared".to_owned(),
@@ -2753,7 +2911,13 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
             .client_class
             .iter()
             .any(|declared| declared.name == class.name)
+            && reach(Kind::ClientClass, &class.name)
         {
+            if let Some(refusal) = named_elsewhere(Kind::ClientClass, &class.name) {
+                plan.errors.push(refusal);
+                continue;
+            }
+
             plan.changes.push(Change {
                 action: Action::RemoveClientClass { name: class.name },
                 detail: "not declared".to_owned(),
@@ -2762,7 +2926,12 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
     }
 
     for (name, _) in store.rate_limits().unwrap_or_default() {
-        if !document.rate_limit.contains_key(&name) {
+        if !document.rate_limit.contains_key(&name) && reach(Kind::RateLimit, &name) {
+            if let Some(refusal) = named_elsewhere(Kind::RateLimit, &name) {
+                plan.errors.push(refusal);
+                continue;
+            }
+
             plan.changes.push(Change {
                 action: Action::RemoveRateLimit { name },
                 detail: "not declared".to_owned(),
@@ -2771,7 +2940,12 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
     }
 
     for (name, _) in store.upstreams().unwrap_or_default() {
-        if !document.upstream.contains_key(&name) {
+        if !document.upstream.contains_key(&name) && reach(Kind::Upstream, &name) {
+            if let Some(refusal) = named_elsewhere(Kind::Upstream, &name) {
+                plan.errors.push(refusal);
+                continue;
+            }
+
             plan.changes.push(Change {
                 action: Action::RemoveUpstream { name },
                 detail: "not declared".to_owned(),
@@ -2780,7 +2954,7 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
     }
 
     for (name, _) in store.conditions().unwrap_or_default() {
-        if !document.condition.contains_key(&name) {
+        if !document.condition.contains_key(&name) && reach(Kind::Condition, &name) {
             plan.changes.push(Change {
                 action: Action::RemoveCondition { name },
                 detail: "not declared".to_owned(),
@@ -2794,6 +2968,7 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         if !document.overlay.contains_key(&name)
             && !schedules.contains_key(&name)
             && !crate::overlays::is_temporary(&name)
+            && reach(Kind::Overlay, &name)
         {
             plan.changes.push(Change {
                 action: Action::RemoveOverlay { name },
@@ -2807,7 +2982,22 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
     };
 
     for app in apps {
+        // An application the prune does not reach is another
+        // deployment's, releases and all.
+
+        if !reach(Kind::App, &app.name) {
+            continue;
+        }
+
         let declared = document.app.get(&app.name);
+
+        if declared.is_none()
+            && let Some(refusal) = named_elsewhere(Kind::App, &app.name)
+        {
+            plan.errors.push(refusal);
+            continue;
+        }
+
         let Ok(releases) = store.releases(Some(&app.name)) else {
             continue;
         };
@@ -3052,7 +3242,8 @@ fn write(
             writes.set_app_access_log(app, access_log).map(|()| "set")?
         }
         Action::SetAppSettings { app, settings } => {
-            writes.set_app_settings(app, settings).map(|()| "set")?
+            writes.set_app_settings(app, settings)?;
+            writes.mark_settings_applied(app).map(|()| "set")?
         }
         Action::PutHost { name, host, new } => writes.put_host(name, host).map(|()| made(*new))?,
         Action::RemoveHost { name } => writes.delete_host(name).map(|()| "removed")?,
