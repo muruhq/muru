@@ -578,9 +578,10 @@ the files do not declare is left for a later `--prune` while it is the
 one a rollback restores, the plan saying so, as `muructl release prune`
 leaves it. The release
 that serves each application after the apply must be declared, or the
-apply is refused, since `--prune` would remove it, and so must every
-release a route the files keep names in its traffic, and every
-application such a route sends requests to. `--json` writes the report
+apply is refused, since `--prune` would remove it, and so must
+everything else the files name that it would remove: an application or
+a host a route is for, a release in a route's traffic, a rate limit on
+a host. `--json` writes the report
 as JSON. The exit code is 0 when there is nothing to do or everything
 applied, 2 for a dry run with changes planned, and 1 for errors, for a
 release that did not start, for a change that failed, and for a
@@ -746,7 +747,11 @@ shop                     shop                                 1      1      0
 
 - **Names are shared across the node.** A route in one deployment may
   send requests to an application in another, and may be on a host
-  another declares.
+  another declares. A deployment groups objects and is no part of their
+  names, so two deployments cannot each have an upstream named
+  `legacy`. Where several deployments define things of the same kind,
+  start each name with its deployment's: `backends-legacy`,
+  `backends-partner`.
 - **Only its owner changes an object.** An apply that declares an
   object another named deployment owns is refused, naming that
   deployment.
@@ -761,10 +766,20 @@ shop                     shop                                 1      1      0
   deployment they do not mention is removed, and so is an application
   made by command.
 - **Nothing is removed while another deployment names it.** A prune
-  that would remove a host, an application, an upstream, a client class
-  or a rate limit that a route of another deployment names is refused,
-  naming the route. Take that route out first, or apply both
+  that would remove something an object of another deployment names is
+  refused, naming both. That holds for everything one object names in
+  another: a route its host, its application or upstream, its client
+  classes, its rate limits and the releases in its traffic; a host its
+  rate limits; a rate limit and a worker group their client classes; an
+  overlay its condition, its applications, its routes and what it
+  changes them to. Take the reference out first, or apply both
   deployments together.
+
+  ```console
+  $ muructl apply -f shop.toml --prune
+  muru: nothing applied; the configuration has errors:
+    rate_limit steady is not removed: host api of deployment api names it; take that out first, or apply both deployments together
+  ```
 
 `muructl deployment remove NAME` removes a deployment as a unit. It
 lists what goes, asks, drains what the deployment runs, and removes its

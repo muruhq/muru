@@ -41,6 +41,7 @@ pub mod places;
 pub mod probes;
 pub mod processes;
 pub mod provision;
+pub mod references;
 pub mod registry;
 pub mod relay;
 pub mod reload;

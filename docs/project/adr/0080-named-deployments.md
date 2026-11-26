@@ -79,6 +79,33 @@ applications, and no scope at all is the fault being fixed.
   go in one apply. Removing the other deployment's routes with the
   host, or leaving them recorded and matching nothing, were not taken.
 
+  The check is one rule over the whole plan and not a list of cases:
+  nothing that stays after the apply, in the store or in the files,
+  may name something the apply removes. One function for each kind of
+  object lists what it names, so a reference added to the format is
+  added in one place. It covers what a route names (its host, what
+  serves it, falls back for it and decides for it, its client classes
+  and rate limits, the releases and upstreams of its traffic), a
+  host's rate limits, a rate limit's client classes, a worker group's
+  client classes and hosts, and everything an overlay names. It also
+  refuses a `--prune=all` whose files keep a route on a host the same
+  apply removes. The first version looked only at routes, and at part
+  of what a route names (issue 944). A condition's labels stay
+  unchecked (ADR 0079).
+
+- **Names are not scoped by deployment.** A deployment groups objects
+  for applying, pruning and removing, and says who may change them; it
+  is not part of a name. Scoping names by deployment, with `default`
+  as a global scope that a deployment's own names shadow, was
+  considered and not taken: a name in a log, a metric label or a
+  command would no longer say which object it is without its
+  deployment, moving an object from `default` to a named deployment
+  would change what its name means to everything that names it, and
+  shadowing would let a new object in one deployment silently change
+  what another's reference resolves to. A node that wants the grouping
+  to show in names prefixes them with the deployment's name by
+  convention.
+
 - **Two deployments may not declare a route for the same host, path and
   class.** Apply already refuses two such routes in the files it is
   given; the refusal extends to a route another deployment holds.

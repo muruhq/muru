@@ -689,6 +689,12 @@ pub fn plan_declared(
         plan_removals(store, document, &reach, &mut plan);
     }
 
+    // ADR 0080: nothing that stays may name something this apply
+    // removes, in the files or in another deployment.
+
+    let dangling = crate::references::left_naming_removed(store, declared, &plan);
+    plan.errors.extend(dangling);
+
     if let Some(refusal) = apply_no_host_refusal(store, &plan.changes) {
         plan.errors.push(refusal);
     }
@@ -2817,8 +2823,9 @@ pub fn describe_traffic(traffic: Option<&muru_config::Traffic>) -> String {
 }
 
 /// With prune, routes, hosts, releases and applications in desired state
-/// that the document does not declare go, in that order. A release or an
-/// application a route the document keeps still names is refused.
+/// that the document does not declare go, in that order. Whether anything
+/// that stays still names one of them is checked once the plan is whole
+/// (`references::left_naming_removed`).
 fn plan_removals(
     store: &Store,
     document: &Document,
@@ -2826,49 +2833,6 @@ fn plan_removals(
     plan: &mut Plan,
 ) {
     use crate::deployments::Kind;
-
-    // ADR 0080: nothing is removed while another deployment names it. A
-    // route the prune does not reach stays as it is, so what it sends
-    // requests to, and the host it is on, must stay too.
-
-    let kept_routes: Vec<muru_config::Route> = store
-        .routes()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|route| {
-            !reach(
-                Kind::Route,
-                &crate::deployments::route_key(&route.host, &route.key()),
-            )
-        })
-        .collect();
-    let named_elsewhere = |kind: Kind, name: &str| {
-        kept_routes
-            .iter()
-            .find(|route| match kind {
-                Kind::App => {
-                    route.app == name
-                        || route
-                            .fallback
-                            .as_ref()
-                            .is_some_and(|fallback| fallback.app.as_deref() == Some(name))
-                }
-                Kind::Host => route.host == name,
-                Kind::Upstream => route.upstream == name,
-                Kind::ClientClass => route.classes().iter().any(|class| class == name),
-                Kind::RateLimit => route.rate_limits.iter().any(|limit| limit == name),
-                _ => false,
-            })
-            .map(|route| {
-                format!(
-                    "{} {name} is not removed: route {} {} of another deployment names it; take \
-                     that route out first, or apply both deployments together",
-                    kind.as_str(),
-                    route.host,
-                    route.key()
-                )
-            })
-    };
 
     for route in store.routes().unwrap_or_default() {
         let declared = document
@@ -2894,11 +2858,6 @@ fn plan_removals(
 
     for (name, _) in store.hosts().unwrap_or_default() {
         if !document.host.contains_key(&name) && reach(Kind::Host, &name) {
-            if let Some(refusal) = named_elsewhere(Kind::Host, &name) {
-                plan.errors.push(refusal);
-                continue;
-            }
-
             plan.changes.push(Change {
                 action: Action::RemoveHost { name },
                 detail: "not declared".to_owned(),
@@ -2913,11 +2872,6 @@ fn plan_removals(
             .any(|declared| declared.name == class.name)
             && reach(Kind::ClientClass, &class.name)
         {
-            if let Some(refusal) = named_elsewhere(Kind::ClientClass, &class.name) {
-                plan.errors.push(refusal);
-                continue;
-            }
-
             plan.changes.push(Change {
                 action: Action::RemoveClientClass { name: class.name },
                 detail: "not declared".to_owned(),
@@ -2927,11 +2881,6 @@ fn plan_removals(
 
     for (name, _) in store.rate_limits().unwrap_or_default() {
         if !document.rate_limit.contains_key(&name) && reach(Kind::RateLimit, &name) {
-            if let Some(refusal) = named_elsewhere(Kind::RateLimit, &name) {
-                plan.errors.push(refusal);
-                continue;
-            }
-
             plan.changes.push(Change {
                 action: Action::RemoveRateLimit { name },
                 detail: "not declared".to_owned(),
@@ -2941,11 +2890,6 @@ fn plan_removals(
 
     for (name, _) in store.upstreams().unwrap_or_default() {
         if !document.upstream.contains_key(&name) && reach(Kind::Upstream, &name) {
-            if let Some(refusal) = named_elsewhere(Kind::Upstream, &name) {
-                plan.errors.push(refusal);
-                continue;
-            }
-
             plan.changes.push(Change {
                 action: Action::RemoveUpstream { name },
                 detail: "not declared".to_owned(),
@@ -2991,13 +2935,6 @@ fn plan_removals(
 
         let declared = document.app.get(&app.name);
 
-        if declared.is_none()
-            && let Some(refusal) = named_elsewhere(Kind::App, &app.name)
-        {
-            plan.errors.push(refusal);
-            continue;
-        }
-
         let Ok(releases) = store.releases(Some(&app.name)) else {
             continue;
         };
@@ -3030,23 +2967,6 @@ fn plan_removals(
             }
 
             if !kept {
-                // A route the files keep must not lose a release its
-                // traffic names.
-
-                let named = (app.name.clone(), release.id.clone());
-
-                for route in document
-                    .route
-                    .iter()
-                    .filter(|route| traffic_releases(route).contains(&named))
-                {
-                    plan.errors.push(format!(
-                        "route {} {}: traffic names {}@{}, which the files do not declare, so \
-                         --prune would remove it; declare it, or take it out of the route's traffic",
-                        route.host, route.path, app.name, release.id
-                    ));
-                }
-
                 plan.changes.push(Change {
                     action: Action::RemoveRelease {
                         app: app.name.clone(),
@@ -3058,24 +2978,6 @@ fn plan_removals(
         }
 
         if declared.is_none() {
-            // Nor an application it sends requests to.
-
-            let routed = |route: &&RouteTable| {
-                route.app == app.name
-                    || route
-                        .fallback
-                        .as_ref()
-                        .is_some_and(|fallback| fallback.app.as_deref() == Some(app.name.as_str()))
-            };
-
-            for route in document.route.iter().filter(routed) {
-                plan.errors.push(format!(
-                    "route {} {}: names application {}, which the files do not declare, so \
-                     --prune would remove it; declare it, or take the route out",
-                    route.host, route.path, app.name
-                ));
-            }
-
             plan.changes.push(Change {
                 action: Action::RemoveApp {
                     app: app.name.clone(),
@@ -8970,8 +8872,8 @@ mod tests {
         assert_eq!(
             refused.errors,
             vec![
-                "route shop /: traffic names shop@r2, which the files do not declare, so --prune \
-                 would remove it; declare it, or take it out of the route's traffic"
+                "route shop /: names release shop@r2, which the files do not declare, so --prune \
+                 would remove it; declare it, or take the name out"
             ]
         );
         assert!(
@@ -8989,7 +8891,7 @@ mod tests {
         let orphaned = plan_with(&store, &with(&["r1", "r2"], blog), true, false);
         assert_eq!(orphaned.errors.len(), 1, "{:?}", orphaned.errors);
         assert!(
-            orphaned.errors[0].starts_with("route shop /blog: names application blog"),
+            orphaned.errors[0].starts_with("route shop /blog: names app blog"),
             "{}",
             orphaned.errors[0]
         );

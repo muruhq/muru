@@ -37,6 +37,22 @@ API_FILE = (
 )
 
 
+# What shop also defines, and what api names of it beside the host its
+# route is on: a rate limit by a host of its own, and a client class by a
+# rate limit and by a worker group.
+
+SHARED = (
+    "\n[[client_class]]\nname = 'partner'\nheaders = { X-Partner = '.+' }\n\n"
+    "[rate_limit.steady]\nrate = '100/m'\n"
+)
+API_NAMES = (
+    "\n[app.api.release.r1.groups.partners]\npaths = ['/partners/*']\n"
+    "match = { client_class = ['partner'] }\n\n"
+    "[host.api]\nnames = ['api.test']\nrate_limits = ['steady']\n\n"
+    "[rate_limit.partners]\nrate = '10/s'\nmatch = { client_class = ['partner'] }\n"
+)
+
+
 def said(completed: subprocess.CompletedProcess[str]) -> str:
     return completed.stdout + completed.stderr
 
@@ -44,8 +60,8 @@ def said(completed: subprocess.CompletedProcess[str]) -> str:
 def test_deployments_own_what_they_declare(daemon: Daemon, tmp_path: Path) -> None:
     files = tmp_path / "deploy.d"
     files.mkdir()
-    (files / "shop.toml").write_text(SHOP_FILE)
-    (files / "api.toml").write_text(API_FILE)
+    (files / "shop.toml").write_text(SHOP_FILE + SHARED)
+    (files / "api.toml").write_text(API_FILE + API_NAMES)
 
     def apply(*arguments: str) -> subprocess.CompletedProcess[str]:
         return daemon.muructl("apply", *arguments, check=False)
@@ -65,7 +81,7 @@ def test_deployments_own_what_they_declare(daemon: Daemon, tmp_path: Path) -> No
     # Only its owner changes an object.
 
     stolen = tmp_path / "stolen.toml"
-    stolen.write_text(SHOP_FILE + release("api", threads=2))
+    stolen.write_text(SHOP_FILE + SHARED + release("api", threads=2))
     refused = apply("-f", str(stolen), "--dry-run")
     assert refused.returncode == 1
     assert (
@@ -77,22 +93,48 @@ def test_deployments_own_what_they_declare(daemon: Daemon, tmp_path: Path) -> No
     # is on shop's host.
 
     hostless = tmp_path / "hostless.toml"
-    hostless.write_text("deployment = 'shop'\n\n" + release("shop"))
+    hostless.write_text("deployment = 'shop'\n\n" + release("shop") + SHARED)
     kept = apply("-f", str(hostless), "--prune", "--dry-run")
     assert kept.returncode == 1
-    assert ("host shop is not removed: route shop /api of another deployment names it") in said(
-        kept
-    ), said(kept)
+    assert "host shop is not removed: route shop /api of deployment api names it" in said(kept), (
+        said(kept)
+    )
+
+    # Whatever kind names it: a host its rate limit, and a rate limit and
+    # a worker group their client class (issue 944).
+
+    bare = tmp_path / "bare.toml"
+    bare.write_text(SHOP_FILE)
+    kept = apply("-f", str(bare), "--prune", "--dry-run")
+    assert kept.returncode == 1
+
+    for refusal in [
+        "rate_limit steady is not removed: host api of deployment api names it",
+        "client_class partner is not removed: rate_limit partners of deployment api names it",
+        "client_class partner is not removed: api@r1: worker group partners of deployment api "
+        "names it",
+    ]:
+        assert refusal in said(kept), said(kept)
 
     # A prune reaches the deployments the files name and no others, and
     # with =all every deployment, default among them.
 
     own = apply("-f", str(files / "api.toml"), "--prune", "--dry-run")
     assert own.returncode == 0 and "no changes" in own.stdout, said(own)
-    everything = apply("-f", str(files / "api.toml"), "--prune=all", "--dry-run")
+    everything = apply("-f", str(files / "shop.toml"), "--prune=all", "--dry-run")
     assert everything.returncode == 2, said(everything)
     removed = {line.split()[1] for line in everything.stdout.splitlines() if "remove-app" in line}
-    assert removed == {"landing", "shop"}, everything.stdout
+    assert removed == {"landing", "api"}, everything.stdout
+
+    # What the files keep may not name what the same apply removes: with
+    # api's files alone, its route would be left on a host that goes.
+
+    orphaned = apply("-f", str(files / "api.toml"), "--prune=all", "--dry-run")
+    assert orphaned.returncode == 1
+    assert (
+        "route shop /api: names host shop, which the files do not declare, so --prune would "
+        "remove it"
+    ) in said(orphaned), said(orphaned)
 
     # A named deployment's settings are its files': app set is refused
     # there, and works on what a command made.
@@ -125,9 +167,7 @@ def test_deployments_own_what_they_declare(daemon: Daemon, tmp_path: Path) -> No
         return daemon.muructl("deployment", "remove", *arguments, check=False)
 
     blocked = remove("shop", "--yes")
-    assert blocked.returncode == 1 and "of another deployment names it" in said(blocked), said(
-        blocked
-    )
+    assert blocked.returncode == 1 and "of deployment api names it" in said(blocked), said(blocked)
     assert remove("nowhere", "--yes").returncode != 0
     listed = remove("api", "--dry-run")
     assert listed.returncode == 0 and "remove-app" in listed.stdout, said(listed)
