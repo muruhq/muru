@@ -16,6 +16,7 @@ use tonic::{Request, Response, Status};
 
 use crate::config::{self, Action, Added, Plan};
 use crate::daemon::{CertificateChanges, Command, Handle, RolloutAction};
+use crate::deployments::Kind;
 use crate::model::{
     Event, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutStep, now_unix_ms,
 };
@@ -68,6 +69,69 @@ struct Service {
 }
 
 impl Service {
+    /// An application's data directory, while the application is known.
+    fn data_dir(&self, app: &str) -> Option<PathBuf> {
+        let record = self.handle.store.app(app).ok()?;
+        Some(crate::places::app_data(&self.handle.info.locations.state.path, &record).data)
+    }
+
+    /// Issue 943: with `remove_data`, each application the plan removes
+    /// says the data directory that goes with it, and how much it holds.
+    async fn note_data(&self, plan: &mut Plan) {
+        for change in &mut plan.changes {
+            let Action::RemoveApp { app } = &change.action else {
+                continue;
+            };
+
+            let Some(data) = self.data_dir(app).filter(|data| data.exists()) else {
+                continue;
+            };
+
+            let measured = data.clone();
+            let size = tokio::task::spawn_blocking(move || crate::disk::measure(&measured))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .map_or(0, |taken| taken.freed);
+            change.detail.push_str(&format!(
+                ", with its data directory {} ({})",
+                data.display(),
+                crate::disk::human_size(size)
+            ));
+        }
+    }
+
+    /// Remove the data directory of an application an apply has removed,
+    /// when there is one to remove, and say how the removal ended.
+    async fn remove_data(&self, app: &str, data: Option<PathBuf>) -> Result<String, String> {
+        let Some(data) = data else {
+            return Ok("removed".to_owned());
+        };
+
+        let path = data.clone();
+        let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&path))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|removed| removed.map_err(|error| error.to_string()));
+
+        match removed {
+            Ok(()) => {
+                self.handle.events.emit(
+                    "app.data_removed",
+                    app,
+                    "notice",
+                    &format!("the data directory {} was removed", data.display()),
+                );
+                Ok("removed, with its data directory".to_owned())
+            }
+            Err(error) => Err(format!(
+                "the application was removed, and removing its data directory {} did not \
+                 work: {error}",
+                data.display()
+            )),
+        }
+    }
+
     /// The open detours, as the daemon last published them.
     fn detours(&self) -> Vec<pb::Detour> {
         self.handle
@@ -451,12 +515,16 @@ impl Admin for Service {
     ) -> Result<Response<pb::ListAppsResponse>, Status> {
         let apps = self.handle.store.apps().map_err(internal)?;
         let maintenance = app_maintenance(&self.handle.store).map_err(internal)?;
+        let owners = self.handle.store.ownership().map_err(internal)?;
         Ok(Response::new(pb::ListAppsResponse {
             apps: apps
                 .into_iter()
                 .map(|app| {
                     let maintenance = maintenance(&app.name);
-                    app_message(app, maintenance)
+                    pb::App {
+                        deployment: owner_of(&owners, Kind::App, &app.name),
+                        ..app_message(app, maintenance)
+                    }
                 })
                 .collect(),
         }))
@@ -472,7 +540,11 @@ impl Admin for Service {
             .app(&request.into_inner().name)
             .map_err(not_found)?;
         let maintenance = app_maintenance(&self.handle.store).map_err(internal)?(&app.name);
-        Ok(Response::new(app_message(app, maintenance)))
+        let owners = self.handle.store.ownership().map_err(internal)?;
+        Ok(Response::new(pb::App {
+            deployment: owner_of(&owners, Kind::App, &app.name),
+            ..app_message(app, maintenance)
+        }))
     }
 
     async fn set_app_settings(
@@ -2427,6 +2499,7 @@ impl Admin for Service {
             .lock()
             .expect("conditions poisoned")
             .clone();
+        let owners = store.ownership().map_err(internal)?;
         let overlays = store
             .overlays()
             .map_err(internal)?
@@ -2443,6 +2516,11 @@ impl Admin for Service {
                     .map(|status| status.state.as_str().to_owned())
                     .unwrap_or_default();
                 pb::OverlayInfo {
+                    deployment: if crate::overlays::is_temporary(&name) {
+                        String::new()
+                    } else {
+                        owner_of(&owners, Kind::Overlay, &name)
+                    },
                     condition,
                     condition_state,
                     active: state.is_some_and(|state| state.active),
@@ -2959,10 +3037,12 @@ impl Admin for Service {
     ) -> Result<Response<pb::ListHostsResponse>, Status> {
         let hosts = self.handle.store.hosts().map_err(internal)?;
         let maintenance = self.handle.store.host_maintenance().map_err(internal)?;
+        let owners = self.handle.store.ownership().map_err(internal)?;
         Ok(Response::new(pb::ListHostsResponse {
             hosts: hosts
                 .into_iter()
                 .map(|(name, host)| pb::Host {
+                    deployment: owner_of(&owners, Kind::Host, &name),
                     maintenance: maintenance.iter().any(|(host, _)| *host == name),
                     access_log_format: host.access_log_format.clone().unwrap_or_default(),
                     access_log_file: host.access_log_file.clone().unwrap_or_default(),
@@ -2997,10 +3077,12 @@ impl Admin for Service {
         _: Request<pb::ListUpstreamsRequest>,
     ) -> Result<Response<pb::ListUpstreamsResponse>, Status> {
         let upstreams = self.handle.store.upstreams().map_err(internal)?;
+        let owners = self.handle.store.ownership().map_err(internal)?;
         Ok(Response::new(pb::ListUpstreamsResponse {
             upstreams: upstreams
                 .into_iter()
                 .map(|(name, upstream)| pb::Upstream {
+                    deployment: owner_of(&owners, Kind::Upstream, &name),
                     name,
                     addresses: upstream.addresses,
                     protocol: upstream.protocol.unwrap_or_else(|| "http1".to_owned()),
@@ -3020,10 +3102,16 @@ impl Admin for Service {
         _: Request<pb::ListRoutesRequest>,
     ) -> Result<Response<pb::ListRoutesResponse>, Status> {
         let routes = self.handle.store.routes().map_err(internal)?;
+        let owners = self.handle.store.ownership().map_err(internal)?;
         Ok(Response::new(pb::ListRoutesResponse {
             routes: routes
                 .into_iter()
                 .map(|route| pb::Route {
+                    deployment: owner_of(
+                        &owners,
+                        Kind::Route,
+                        &crate::deployments::route_key(&route.host, &route.key()),
+                    ),
                     client_classes: route.classes().to_vec(),
                     strip_prefix: route.strip_prefix.clone().unwrap_or_default(),
                     traffic_classes: route
@@ -3167,6 +3255,10 @@ impl Admin for Service {
             }
         }
 
+        if request.remove_data {
+            self.note_data(&mut plan).await;
+        }
+
         let mut report = report_message(&plan);
 
         if waited {
@@ -3180,6 +3272,7 @@ impl Admin for Service {
         // over from. The plan says which it holds.
 
         let deploying = Deploying {
+            remove_data: request.remove_data,
             wait: !request.no_wait,
             retain: crate::daemon::Retention {
                 lasts: request
@@ -3455,6 +3548,9 @@ struct Prepared {
 /// How an apply deploys the releases it adds and promotes the ones
 /// `serving` names (section 10.4).
 struct Deploying {
+    /// Whether the data directory of each application the apply removes
+    /// goes with it (issue 943).
+    remove_data: bool,
     /// Wait for each to serve or fail.
     wait: bool,
     /// How long a release one of them replaces stays warm, and with how
@@ -3713,12 +3809,20 @@ impl Service {
                     )
                     .await
                 }
-                Action::RemoveApp { app } => self
-                    .handle
-                    .store
-                    .delete_app(app)
-                    .map(|()| "removed".to_owned())
-                    .map_err(|error| error.to_string()),
+                Action::RemoveApp { app } => {
+                    // Issue 943: its data directory goes with it when
+                    // asked, found before the record that says where it
+                    // is has gone.
+
+                    let data = self
+                        .data_dir(app)
+                        .filter(|data| deploying.remove_data && data.exists());
+
+                    match self.handle.store.delete_app(app) {
+                        Ok(()) => self.remove_data(app, data).await,
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
                 _ => continue,
             };
 
@@ -4265,6 +4369,14 @@ fn early_report(report: &pb::ConfigReport) -> pb::ConfigReport {
     early
 }
 
+/// The deployment that owns an object, `default` when none is recorded.
+fn owner_of(owners: &crate::deployments::Owners, kind: Kind, key: &str) -> String {
+    owners
+        .get(&(kind, key.to_owned()))
+        .map_or(crate::deployments::DEFAULT, String::as_str)
+        .to_owned()
+}
+
 fn report_message(plan: &Plan) -> pb::ConfigReport {
     pb::ConfigReport {
         errors: plan.errors.clone(),
@@ -4332,6 +4444,7 @@ fn app_maintenance(
 
 fn app_message(app: crate::model::App, (maintenance, by): (bool, String)) -> pb::App {
     pb::App {
+        deployment: String::new(),
         name: app.name,
         current_release: app.current.unwrap_or_default(),
         previous_release: app.previous.unwrap_or_default(),

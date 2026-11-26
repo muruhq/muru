@@ -74,9 +74,35 @@ def test_deployments_own_what_they_declare(daemon: Daemon, tmp_path: Path) -> No
     # deployments, a route in one naming a host another adds.
 
     daemon.deploy("landing", SHOP)
+    assert "DEPLOYMENT" not in daemon.muructl("app", "list").stdout
     applied = apply("-f", str(files))
     assert applied.returncode == 0, said(applied)
     assert deployments() == {"api": ["api"], "default": ["landing"], "shop": ["shop"]}
+
+    # The lists say whose each object is once a deployment is named,
+    # and show one deployment's, and show prints one as its files would
+    # state it (issue 943).
+
+    def listed_as(kind: str, *arguments: str) -> list[dict[str, str]]:
+        answer = json.loads(daemon.muructl(kind, "list", "--json", *arguments).stdout)
+        return list(next(iter(answer.values()), []))
+
+    table = daemon.muructl("app", "list").stdout.splitlines()
+    assert table[0].split()[:2] == ["APP", "DEPLOYMENT"], table
+    assert ["api", "api"] in [line.split()[:2] for line in table], table
+    assert {app["name"]: app["deployment"] for app in listed_as("app")} == {
+        "api": "api",
+        "landing": "default",
+        "shop": "shop",
+    }
+    assert [app["name"] for app in listed_as("app", "--deployment", "shop")] == ["shop"]
+    assert [route["path"] for route in listed_as("route", "--deployment", "api")] == ["/api"]
+    assert [host["name"] for host in listed_as("host", "--deployment", "api")] == ["api"]
+    assert "DEPLOYMENT" in daemon.muructl("route", "list").stdout
+    hosts = [line.split()[:2] for line in daemon.muructl("host", "list").stdout.splitlines()]
+    assert ["HOST", "DEPLOYMENT"] in hosts and ["api", "api"] in hosts, hosts
+    shown = tomllib.loads(daemon.muructl("deployment", "show", "api").stdout)
+    assert shown["deployment"] == "api" and list(shown["app"]) == ["api"], shown
 
     # Only its owner changes an object.
 
@@ -171,10 +197,24 @@ def test_deployments_own_what_they_declare(daemon: Daemon, tmp_path: Path) -> No
     assert remove("nowhere", "--yes").returncode != 0
     listed = remove("api", "--dry-run")
     assert listed.returncode == 0 and "remove-app" in listed.stdout, said(listed)
+    assert "with its data directory" not in listed.stdout, listed.stdout
     assert "api" in deployments()
 
-    assert remove("api", "--yes").returncode == 0
+    # The applications' data directories stay unless --data, which lists
+    # each with what it holds before anything goes.
+
+    data = daemon.base / "state" / "data"
+    (data / "api").mkdir(parents=True, exist_ok=True)
+    (data / "api" / "kept.txt").write_text("x" * 2048)
+    (data / "shop").mkdir(parents=True, exist_ok=True)
+    listed = remove("api", "--data", "--dry-run")
+    assert f"with its data directory {data / 'api'} (" in listed.stdout, listed.stdout
+    assert (data / "api").exists()
+
+    assert remove("api", "--data", "--yes").returncode == 0
+    assert not (data / "api").exists()
     assert remove("shop", "--yes").returncode == 0
+    assert (data / "shop").exists()
     assert deployments() == {"default": [], "site": ["landing"]}
     assert "holds nothing" in remove("default", "--yes").stdout
 

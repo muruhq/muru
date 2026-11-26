@@ -6494,6 +6494,10 @@ async fn wait_rollout(
 pub enum AppCommand {
     /// List the applications.
     List {
+        /// Only what this deployment owns.
+        #[arg(long, value_name = "NAME")]
+        deployment: Option<String>,
+
         #[command(flatten)]
         socket: SocketArgs,
 
@@ -6804,9 +6808,39 @@ pub struct AppRemoveArgs {
 }
 
 /// List applications.
-pub async fn app_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
+/// Keep what one deployment owns, when one is named.
+fn of_deployment<T>(items: &mut Vec<T>, deployment: Option<&str>, owner: impl Fn(&T) -> &str) {
+    if let Some(deployment) = deployment {
+        items.retain(|item| owner(item) == deployment);
+    }
+}
+
+/// Whether a list has a DEPLOYMENT column: when something in it belongs
+/// to a named deployment. A node that names none sees the lists as they
+/// are without deployments.
+fn names_deployments<'a>(mut owners: impl Iterator<Item = &'a str>) -> bool {
+    owners.any(|owner| !owner.is_empty() && owner != muru_controller::deployments::DEFAULT)
+}
+
+/// The DEPLOYMENT column's cell, or nothing when the list has none.
+fn deployment_cell(shown: bool, deployment: &str) -> String {
+    if shown {
+        format!("{:<16} ", or_dash(deployment))
+    } else {
+        String::new()
+    }
+}
+
+pub async fn app_list(
+    socket: SocketArgs,
+    json: bool,
+    deployment: Option<String>,
+) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.endpoint()?).await?;
-    let answer = client.list_apps(pb::ListAppsRequest {}).await?.into_inner();
+    let mut answer = client.list_apps(pb::ListAppsRequest {}).await?.into_inner();
+    of_deployment(&mut answer.apps, deployment.as_deref(), |app| {
+        &app.deployment
+    });
 
     if json {
         return print_answer(&answer);
@@ -6819,7 +6853,14 @@ pub async fn app_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {:<12} {:<12} USER", "APP", "CURRENT", "PREVIOUS");
+    let owned = names_deployments(apps.iter().map(|app| app.deployment.as_str()));
+    println!(
+        "{:<20} {}{:<12} {:<12} USER",
+        "APP",
+        deployment_cell(owned, "DEPLOYMENT"),
+        "CURRENT",
+        "PREVIOUS"
+    );
 
     for app in apps {
         let user = if app.user.is_empty() {
@@ -6830,8 +6871,9 @@ pub async fn app_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             format!("{}:{}", app.user, app.group)
         };
         println!(
-            "{:<20} {:<12} {:<12} {user}{}{}{}",
+            "{:<20} {}{:<12} {:<12} {user}{}{}{}",
             app.name,
+            deployment_cell(owned, &app.deployment),
             or_dash(&app.current_release),
             or_dash(&app.previous_release),
             if app.umask.is_empty() {
@@ -7325,6 +7367,10 @@ fn round_figure(value: f64) -> f64 {
 pub enum OverlayCommand {
     /// Every overlay, whether it is active and what it changes.
     List {
+        /// Only what this deployment owns.
+        #[arg(long, value_name = "NAME")]
+        deployment: Option<String>,
+
         #[command(flatten)]
         socket: SocketArgs,
 
@@ -7399,8 +7445,12 @@ pub enum OverlayCommand {
 /// List, activate, end, preview or promote overlays.
 pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
     let (name, action, until, socket, json) = match command {
-        OverlayCommand::List { socket, output } => {
-            return list_overlays(&socket, output.json).await;
+        OverlayCommand::List {
+            deployment,
+            socket,
+            output,
+        } => {
+            return list_overlays(&socket, output.json, deployment).await;
         }
         OverlayCommand::Preview {
             name,
@@ -7514,13 +7564,20 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn list_overlays(socket: &SocketArgs, json: bool) -> anyhow::Result<()> {
+async fn list_overlays(
+    socket: &SocketArgs,
+    json: bool,
+    deployment: Option<String>,
+) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.endpoint()?).await?;
-    let answer = client
+    let mut answer = client
         .list_overlays(pb::ListOverlaysRequest {})
         .await
         .map_err(explain)?
         .into_inner();
+    of_deployment(&mut answer.overlays, deployment.as_deref(), |overlay| {
+        &overlay.deployment
+    });
 
     if json {
         return print_answer(&answer);
@@ -7552,15 +7609,23 @@ fn overlay_table(overlays: &[pb::OverlayInfo]) -> Vec<String> {
             .max(least)
     };
     let (name, state, trigger) = (width(0, 24), width(1, 10), width(2, 34));
+    let owned = names_deployments(overlays.iter().map(|overlay| overlay.deployment.as_str()));
     let mut lines = vec![format!(
-        "{:<name$} {:<state$} {:<trigger$} CHANGES",
-        "OVERLAY", "STATE", "TRIGGER"
+        "{:<name$} {}{:<state$} {:<trigger$} CHANGES",
+        "OVERLAY",
+        deployment_cell(owned, "DEPLOYMENT"),
+        "STATE",
+        "TRIGGER"
     )];
 
-    for row in &rows {
+    for (row, overlay) in rows.iter().zip(overlays) {
         lines.push(format!(
-            "{:<name$} {:<state$} {:<trigger$} {}",
-            row[0], row[1], row[2], row[3]
+            "{:<name$} {}{:<state$} {:<trigger$} {}",
+            row[0],
+            deployment_cell(owned, &overlay.deployment),
+            row[1],
+            row[2],
+            row[3]
         ));
     }
 
@@ -7772,6 +7837,10 @@ pub async fn dashboard(command: DashboardCommand) -> anyhow::Result<()> {
 pub enum HostCommand {
     /// List the virtual hosts.
     List {
+        /// Only what this deployment owns.
+        #[arg(long, value_name = "NAME")]
+        deployment: Option<String>,
+
         #[command(flatten)]
         socket: SocketArgs,
 
@@ -7781,12 +7850,19 @@ pub enum HostCommand {
 }
 
 /// List virtual hosts.
-pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
+pub async fn host_list(
+    socket: SocketArgs,
+    json: bool,
+    deployment: Option<String>,
+) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.endpoint()?).await?;
-    let answer = client
+    let mut answer = client
         .list_hosts(pb::ListHostsRequest {})
         .await?
         .into_inner();
+    of_deployment(&mut answer.hosts, deployment.as_deref(), |host| {
+        &host.deployment
+    });
 
     if json {
         return print_answer(&answer);
@@ -7799,7 +7875,14 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("{:<16} {:<8} {:<10} NAMES", "HOST", "TLS", "LISTENERS");
+    let owned = names_deployments(hosts.iter().map(|host| host.deployment.as_str()));
+    println!(
+        "{:<16} {}{:<8} {:<10} NAMES",
+        "HOST",
+        deployment_cell(owned, "DEPLOYMENT"),
+        "TLS",
+        "LISTENERS"
+    );
 
     for host in hosts {
         let mut names = host.names.join(", ");
@@ -7867,8 +7950,9 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
         }
 
         println!(
-            "{:<16} {:<8} {:<10} {names}",
+            "{:<16} {}{:<8} {:<10} {names}",
             host.name,
+            deployment_cell(owned, &host.deployment),
             if host.tls { "yes" } else { "" },
             if host.listeners.is_empty() {
                 "all".to_owned()
@@ -7896,6 +7980,10 @@ fn timeouts_note(timeouts: &std::collections::BTreeMap<String, String>) -> Strin
 pub enum UpstreamCommand {
     /// List the HTTP upstreams.
     List {
+        /// Only what this deployment owns.
+        #[arg(long, value_name = "NAME")]
+        deployment: Option<String>,
+
         #[command(flatten)]
         socket: SocketArgs,
 
@@ -7905,12 +7993,19 @@ pub enum UpstreamCommand {
 }
 
 /// List HTTP upstreams.
-pub async fn upstream_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
+pub async fn upstream_list(
+    socket: SocketArgs,
+    json: bool,
+    deployment: Option<String>,
+) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.endpoint()?).await?;
-    let answer = client
+    let mut answer = client
         .list_upstreams(pb::ListUpstreamsRequest {})
         .await?
         .into_inner();
+    of_deployment(&mut answer.upstreams, deployment.as_deref(), |upstream| {
+        &upstream.deployment
+    });
 
     if json {
         return print_answer(&answer);
@@ -7923,9 +8018,17 @@ pub async fn upstream_list(socket: SocketArgs, json: bool) -> anyhow::Result<()>
         return Ok(());
     }
 
+    let owned = names_deployments(
+        upstreams
+            .iter()
+            .map(|upstream| upstream.deployment.as_str()),
+    );
     println!(
-        "{:<16} {:<8} {:<6} ADDRESSES",
-        "UPSTREAM", "PROTOCOL", "TLS"
+        "{:<16} {}{:<8} {:<6} ADDRESSES",
+        "UPSTREAM",
+        deployment_cell(owned, "DEPLOYMENT"),
+        "PROTOCOL",
+        "TLS"
     );
 
     for upstream in upstreams {
@@ -7940,8 +8043,9 @@ pub async fn upstream_list(socket: SocketArgs, json: bool) -> anyhow::Result<()>
         }
 
         println!(
-            "{:<16} {:<8} {:<6} {addresses}",
+            "{:<16} {}{:<8} {:<6} {addresses}",
             upstream.name,
+            deployment_cell(owned, &upstream.deployment),
             upstream.protocol,
             if upstream.tls { "yes" } else { "" }
         );
@@ -7955,6 +8059,10 @@ pub async fn upstream_list(socket: SocketArgs, json: bool) -> anyhow::Result<()>
 pub enum RouteCommand {
     /// List the routes.
     List {
+        /// Only what this deployment owns.
+        #[arg(long, value_name = "NAME")]
+        deployment: Option<String>,
+
         #[command(flatten)]
         socket: SocketArgs,
 
@@ -7964,12 +8072,19 @@ pub enum RouteCommand {
 }
 
 /// List routes.
-pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
+pub async fn route_list(
+    socket: SocketArgs,
+    json: bool,
+    deployment: Option<String>,
+) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.endpoint()?).await?;
-    let answer = client
+    let mut answer = client
         .list_routes(pb::ListRoutesRequest {})
         .await?
         .into_inner();
+    of_deployment(&mut answer.routes, deployment.as_deref(), |route| {
+        &route.deployment
+    });
 
     if json {
         return print_answer(&answer);
@@ -7982,7 +8097,13 @@ pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("{:<16} {:<24} TARGET", "HOST", "PATH");
+    let owned = names_deployments(routes.iter().map(|route| route.deployment.as_str()));
+    println!(
+        "{:<16} {:<24} {}TARGET",
+        "HOST",
+        "PATH",
+        deployment_cell(owned, "DEPLOYMENT")
+    );
 
     for route in routes {
         // Section 4.13: an upstream as the target, or behind the files.
@@ -8094,7 +8215,12 @@ pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             target.push_str(&format!(" [for {}]", route.client_classes.join(", ")));
         }
 
-        println!("{:<16} {:<24} {target}", route.host, route.path);
+        println!(
+            "{:<16} {:<24} {}{target}",
+            route.host,
+            route.path,
+            deployment_cell(owned, &route.deployment)
+        );
     }
 
     Ok(())
@@ -9018,6 +9144,7 @@ pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
             no_wait: args.no_wait,
             retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
             retain_workers: args.retain_workers,
+            remove_data: false,
         })
         .await
         .map_err(explain)?
@@ -9049,11 +9176,15 @@ pub enum DeploymentCommand {
     /// Remove a deployment as a unit: drain what it runs and remove its
     /// applications with their releases, its hosts, routes and the rest,
     /// after listing what goes and asking. Refused while another
-    /// deployment's route names something of it. default is emptied and
-    /// kept. Application data directories are kept.
+    /// deployment names something of it. default is emptied and kept.
+    /// Application data directories are kept unless --data.
     Remove {
         /// The deployment.
         name: String,
+
+        /// Also remove the data directories of its applications.
+        #[arg(long)]
+        data: bool,
 
         /// Only list what would be removed.
         #[arg(long)]
@@ -9108,7 +9239,12 @@ pub enum DeploymentCommand {
     /// Show desired state; with --effective, as the active overlays leave
     /// it, with what each sets that is in force.
     Show {
+        /// One deployment rather than everything, as its files would
+        /// state it.
+        name: Option<String>,
+
         /// One application rather than all.
+        #[arg(long, value_name = "APP", conflicts_with = "name")]
         app: Option<String>,
 
         /// Apply the active overlays and attribute what they set.
@@ -9266,6 +9402,7 @@ pub async fn config_export(exporting: Exporting, socket: SocketArgs) -> anyhow::
 /// Show desired state, or with `effective` the state the active overlays
 /// make of it, headed by what each sets that is in force.
 pub async fn config_show(
+    deployment: Option<String>,
     app: Option<String>,
     effective: bool,
     socket: SocketArgs,
@@ -9275,6 +9412,7 @@ pub async fn config_show(
     let export = client
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
+            deployment: deployment.unwrap_or_default(),
             effective,
             resolve_rollouts: false,
             ..pb::ExportConfigRequest::default()
@@ -9364,6 +9502,7 @@ pub async fn deployment_list(socket: SocketArgs, json: bool) -> anyhow::Result<(
 /// to remove, and 1 for a refusal or a failure.
 pub async fn deployment_remove(
     name: String,
+    data: bool,
     dry_run: bool,
     yes: bool,
     socket: SocketArgs,
@@ -9392,6 +9531,7 @@ pub async fn deployment_remove(
         documents: vec![document],
         prune: true,
         dry_run: true,
+        remove_data: data,
         ..pb::ApplyConfigRequest::default()
     };
     let plan = client
@@ -12557,15 +12697,7 @@ pub async fn cache_clear(args: CacheClearArgs) -> anyhow::Result<()> {
 
 /// A byte count for a reader, in the units sizes are given in.
 pub(crate) fn human_size(bytes: u64) -> String {
-    const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
-
-    for (scale, unit) in UNITS {
-        if bytes >= scale {
-            return format!("{:.1}{unit}", bytes as f64 / scale as f64);
-        }
-    }
-
-    format!("{bytes}B")
+    muru_controller::disk::human_size(bytes)
 }
 
 /// An access log record as the compact line a development run prints,

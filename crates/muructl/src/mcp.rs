@@ -1120,6 +1120,7 @@ fn specs() -> Vec<Spec> {
             changes: false,
             properties: json!({
                 "action": {"type": "string", "enum": ["show", "diff"]},
+                "deployment": {"type": "string", "description": "For show: one deployment only, as its files would state it"},
                 "app": {"type": "string", "description": "For show: one application only"},
                 "effective": {"type": "boolean", "description": "For show: as the active overlays leave it"},
                 "file": {"type": "string", "description": "For diff: the file or directory"},
@@ -1128,7 +1129,11 @@ fn specs() -> Vec<Spec> {
             command: |arguments| match needed(arguments, "action")?.as_str() {
                 "show" => {
                     let mut command = words(&["deployment", "show"]);
-                    command.extend(text(arguments, "app"));
+                    command.extend(text(arguments, "deployment"));
+
+                    if let Some(app) = text(arguments, "app") {
+                        command.extend(["--app".to_owned(), app]);
+                    }
 
                     if flag(arguments, "effective") {
                         command.push("--effective".to_owned());

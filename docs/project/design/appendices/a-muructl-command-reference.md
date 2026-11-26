@@ -39,7 +39,7 @@ Commands that act on a running system use the admin API (Appendix B). A command 
 | Configuration | muructl deployment export [NAME] | Export desired state: one deployment, --dir DIR for a file per deployment, or --app APP with --as NAME. Flags: --resolve-rollouts, --redact, --format | 10.4, 10.13 |
 | Configuration | muructl deployment remove NAME | Remove a deployment as a unit, draining what it runs, after listing it and asking; `default` is emptied and kept. Flags: --dry-run, --data, --yes | 10.13 |
 | Configuration | muructl deployment diff -f FILE | Compare a file with desired state | 10.4 |
-| Configuration | muructl deployment show RELEASE --effective | Merged settings with their sources | 3.3 |
+| Configuration | muructl deployment show --app APP --effective | Merged settings with their sources | 3.3 |
 | Configuration | muructl deployment schema, muructl daemon config schema | Print the JSON Schema for deployment files, or for the daemon's file | 10.3 |
 | Applications | muructl app create, list, show, delete | Manage applications | 3.1 |
 | Applications | muructl app remove APP | Drain whatever runs and remove the application and all its releases, with their environments, bytecode and logs; refused while a route sends it traffic. Asks first. Flags: --dry-run, --yes, --json | 9.1 |

@@ -34,7 +34,7 @@ it out.
 | `debug` | reads | `muructl debug status`, `stacks`, `tasks`, `memory` or `inspect`, never with `--env`; or `debug request`, a development run's record of one request | `what` (status, stacks, tasks, memory, inspect, request), `target`, `worker`, `request_id` (for request) |
 | `imports` | reads | `muructl debug imports`: the import report of a release's load, with its advice and the modules the workers loaded since the fork | `target`, `worker`, `load_target` (as `--target`), `top`, `min_ms`, `package`, `module`, `all` (as `--all`) |
 | `scale_status` | reads | `muructl scale status` | `target` |
-| `deployment` | reads | `muructl deployment show` or `deployment diff` | `action` (show, diff), `app`, `effective`, `file` |
+| `deployment` | reads | `muructl deployment show` or `deployment diff` | `action` (show, diff), `deployment`, `app`, `effective`, `file` |
 | `metrics` | reads | `muructl metrics`, the samples kept to those whose name starts with `prefix` | `prefix` |
 | `websockets` | reads | `muructl websockets` | `app`, `list` |
 | `requests` | reads | `muructl requests` | `app`, `list` |

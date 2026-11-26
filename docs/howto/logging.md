@@ -171,7 +171,7 @@ each release with where it comes from: `daemon configuration`,
 `[tool.muru]` or `the release table`:
 
 ```console
-$ muructl deployment show shop --effective
+$ muructl deployment show --app shop --effective
 ...
 #   shop@r3: logging.python.format = json (daemon configuration)
 #   shop@r3: logging.python.level = INFO ([tool.muru])

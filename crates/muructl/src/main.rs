@@ -1376,9 +1376,11 @@ fn main() -> anyhow::Result<()> {
         Command::Render(args) => runtime.block_on(render::render(*args)),
         Command::App { command } => runtime.block_on(async move {
             match command {
-                admin::AppCommand::List { socket, output } => {
-                    admin::app_list(socket, output.json).await
-                }
+                admin::AppCommand::List {
+                    deployment,
+                    socket,
+                    output,
+                } => admin::app_list(socket, output.json, deployment).await,
                 admin::AppCommand::Remove(args) => admin::app_remove(*args).await,
                 admin::AppCommand::Set(args) => admin::app_set(*args).await,
                 admin::AppCommand::Unset(args) => admin::app_unset(*args).await,
@@ -1419,14 +1421,29 @@ fn main() -> anyhow::Result<()> {
             }
         }),
         Command::Host {
-            command: admin::HostCommand::List { socket, output },
-        } => runtime.block_on(admin::host_list(socket, output.json)),
+            command:
+                admin::HostCommand::List {
+                    deployment,
+                    socket,
+                    output,
+                },
+        } => runtime.block_on(admin::host_list(socket, output.json, deployment)),
         Command::Route {
-            command: admin::RouteCommand::List { socket, output },
-        } => runtime.block_on(admin::route_list(socket, output.json)),
+            command:
+                admin::RouteCommand::List {
+                    deployment,
+                    socket,
+                    output,
+                },
+        } => runtime.block_on(admin::route_list(socket, output.json, deployment)),
         Command::Upstream {
-            command: admin::UpstreamCommand::List { socket, output },
-        } => runtime.block_on(admin::upstream_list(socket, output.json)),
+            command:
+                admin::UpstreamCommand::List {
+                    deployment,
+                    socket,
+                    output,
+                },
+        } => runtime.block_on(admin::upstream_list(socket, output.json, deployment)),
         Command::Rollback {
             app,
             socket,
@@ -1502,11 +1519,18 @@ fn main() -> anyhow::Result<()> {
                 socket,
             )),
             admin::DeploymentCommand::Show {
+                name,
                 app,
                 effective,
                 socket,
                 output,
-            } => runtime.block_on(admin::config_show(app, effective, socket, output.json)),
+            } => runtime.block_on(admin::config_show(
+                name,
+                app,
+                effective,
+                socket,
+                output.json,
+            )),
             admin::DeploymentCommand::Diff { file, json, socket } => {
                 exit_with(runtime, admin::config_diff(file, json, socket))
             }
@@ -1515,12 +1539,13 @@ fn main() -> anyhow::Result<()> {
             }
             admin::DeploymentCommand::Remove {
                 name,
+                data,
                 dry_run,
                 yes,
                 socket,
             } => exit_with(
                 runtime,
-                admin::deployment_remove(name, dry_run, yes, socket),
+                admin::deployment_remove(name, data, dry_run, yes, socket),
             ),
         },
         Command::Events {

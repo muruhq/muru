@@ -763,6 +763,7 @@ message App {
   int32 priority = 10;              // the node's budget admits higher priorities' scale-ups first
   string maintenance_overlay = 11;  // the active overlay whose maintenance setting is in force, if one is (issue 757)
   AppSettings settings = 12;        // the release settings every release deployed from now takes (issue 899)
+  string deployment = 13;           // the deployment that owns it (issue 943)
 }
 
 // An application's own release settings (issue 899): what every release
@@ -1423,6 +1424,7 @@ message OverlayInfo {
   uint64 starts_unix_ms = 8;        // when its schedule's window begins, if that is to come; 0 otherwise
   string condition = 9;             // the named condition it follows, if any
   string condition_state = 10;      // that condition's state: firing, resolved or unknown
+  string deployment = 11;           // the deployment that owns it; none for one a detour or a command made for a time (issue 943)
 }
 
 message ControlOverlayRequest {
@@ -1467,6 +1469,7 @@ message ApplyConfigRequest {
   optional uint32 retain_workers = 8; // the workers each of its groups keeps meanwhile; when absent 1, or 0 for a group whose min_workers is 0
   repeated string documents = 9;    // the files a deployment to a document, each with its deployment key, in place of document (issue 936)
   bool prune_all = 10;              // with prune: reach every deployment, those the documents do not name among them
+  bool remove_data = 11;            // also remove the data directory of each application the apply removes (issue 943)
 }
 
 message ListDeploymentsRequest {}
@@ -1552,6 +1555,7 @@ message Host {
   string access_log_format = 18;      // how the host's access records are written, when it says: json or combined
   string access_log_file = 19;        // the file in the log directory that takes the host's access records, when it names one
   string access_log_query = 20;       // what the host's access records keep of the query string, when it says: keep, mask or drop
+  string deployment = 21;             // the deployment that owns it (issue 943)
 }
 
 message ListRoutesRequest {}
@@ -1583,6 +1587,7 @@ message Route {
   string request_headers = 20;      // what the route removes from and sets on requests, as one phrase
   string response_headers = 21;     // what the route removes from, sets on and adds to responses, as one phrase
   string strip_prefix = 22;         // the leading part of the path the application lives under, as configured; none when empty
+  string deployment = 23;           // the deployment that owns it (issue 943)
 }
 
 message ListUpstreamsRequest {}
@@ -1599,6 +1604,7 @@ message Upstream {
   bool tls = 4;
   string health_path = 5;           // the path probed, when one is
   bool trust_muru_headers = 6;
+  string deployment = 7;            // the deployment that owns it (issue 943)
 }
 
 // One release's share of a route's requests, in percent.

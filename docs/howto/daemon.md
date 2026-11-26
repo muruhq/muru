@@ -606,14 +606,15 @@ routes splitting traffic between them at the candidate's current share.
 both directions, listing what the file would add and what the daemon
 holds that the file does not, with exit code 2 when they differ.
 
-`muructl deployment show [APP] --effective` writes the same document headed
+`muructl deployment show --effective`, with `--app APP` for one
+application, writes the same document headed
 by each serving release's settings and where each came from: the
 release table of an applied file or the deploy's flags, the
 application's settings, the source's `[tool.muru]` table, the source's
 `.venv` for the interpreter, or the default:
 
 ```console
-$ muructl deployment show shop --effective
+$ muructl deployment show --app shop --effective
 # Muru effective state: muructl 0.1.0 on web1, 2026-11-02T02:10:00Z, state version 812.
 # No active overlay changes this configuration.
 
@@ -745,6 +746,24 @@ default                  landing                              0      0      0
 shop                     shop                                 1      1      0
 ```
 
+Once a deployment is named, `muructl app list`, `host list`, `route
+list`, `upstream list` and `overlay list` say whose each object is, and
+`--deployment NAME` on any of them lists one deployment's:
+
+```console
+$ muructl app list
+APP                  DEPLOYMENT       CURRENT      PREVIOUS     USER
+api                  api              r1           -            -
+landing              default          r1           -            -
+shop                 shop             r1           -            -
+$ muructl route list --deployment api
+HOST             PATH                     DEPLOYMENT       TARGET
+shop             /api                     api              api
+```
+
+`muructl deployment show NAME` prints one deployment as its files would
+state it, with its `deployment` key at the top.
+
 - **Names are shared across the node.** A route in one deployment may
   send requests to an application in another, and may be on a host
   another declares. A deployment groups objects and is no part of their
@@ -798,7 +817,19 @@ Remove the deployment shop? [y/N]
 `--dry-run` only lists, and `--yes` goes ahead without asking. It is
 refused as a prune is while another deployment names something of it.
 `muructl deployment remove default` removes what `default` holds and
-leaves it in place, empty. Application data directories are kept.
+leaves it in place, empty.
+
+Application data directories are kept. `--data` removes them with their
+applications, and the list says each with what it holds before it asks:
+
+```console
+$ muructl deployment remove api --data
+muru: plan (nothing changed)
+  remove-route    route shop /api          not declared
+  remove-release  api@r1                   ready and not declared
+  remove-app      api                      not declared, with its data directory /var/lib/muru/data/api (296.0KB)
+Remove the deployment api? [y/N]
+```
 
 `muructl deployment export` follows the same division. A file carries
 one `deployment` key, so a daemon with named deployments is exported

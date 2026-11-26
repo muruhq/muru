@@ -245,7 +245,8 @@ def test_config_show_effective_attributes_values_to_overlays(site: Site) -> None
     base = tomllib.loads(site.daemon.muructl("deployment", "show").stdout)
     assert "mode" not in base["route"][0]
     assert (
-        "route root" in site.daemon.muructl("deployment", "show", "clients", "--effective").stdout
+        "route root"
+        in site.daemon.muructl("deployment", "show", "--app", "clients", "--effective").stdout
     )
     site.overlay("end", "read-only")
 

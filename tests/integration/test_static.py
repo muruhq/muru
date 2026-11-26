@@ -386,7 +386,7 @@ def test_an_applications_own_directories_under_run_and_deploy(tmp_path: Path) ->
         daemon.deploy("files", project)
         assert daemon.get("/assets/site.css").status == 200
         assert daemon.get("/fixture/fox.txt").status == 404, "the flag's entry is not carried"
-        exported = daemon.muructl("deployment", "show", "files").stdout
+        exported = daemon.muructl("deployment", "show", "--app", "files").stdout
         assert "[[app.files.release.r2.static]]" in exported
         assert str(STATIC) not in exported, exported
         assert 'dir = "source:assets"' in exported, exported
@@ -400,7 +400,7 @@ def test_an_applications_own_directories_under_run_and_deploy(tmp_path: Path) ->
         (bare / "pyproject.toml").write_text("[tool.muru]\nentrypoint = 'app:application'\n")
         daemon.deploy("files", bare)
         assert daemon.get("/assets/site.css").body != b"body { color: red }\n"
-        assert "static" not in daemon.muructl("deployment", "show", "files").stdout
+        assert "static" not in daemon.muructl("deployment", "show", "--app", "files").stdout
 
         refused = daemon.muructl(
             "deploy", "files", str(project), "--static", "/gone/=nowhere", check=False
