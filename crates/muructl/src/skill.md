@@ -148,5 +148,15 @@ directory and `deploy`'s settings, without the daemon.
   Check it before starting a run, and after stopping one, to see what
   was left running.
 
+- The daemon's own configuration file holds the node's settings, such
+  as listeners, limits and `[daemon] detours`, and nothing of what it
+  serves. `daemon_config` shows it (`full` for every setting with its
+  default) or checks it. `set_daemon_config` sets one key by its dotted
+  path, or takes it out when given no value; the file is checked before
+  it is written, and the daemon reloads it. A setting the answer lists
+  under `stale` is read only when the daemon starts: give `restart`, and
+  the daemon restarts in place with everything it serves still serving.
+
 - Do not stop, upgrade or reconfigure the daemon unless asked: other
-  applications may share it.
+  applications may share it. When asked to change a setting, change
+  that one key and leave the rest of the file as it is.

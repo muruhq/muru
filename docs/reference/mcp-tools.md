@@ -35,6 +35,7 @@ it out.
 | `imports` | reads | `muructl debug imports`: the import report of a release's load, with its advice and the modules the workers loaded since the fork | `target`, `worker`, `load_target` (as `--target`), `top`, `min_ms`, `package`, `module`, `all` (as `--all`) |
 | `scale_status` | reads | `muructl scale status` | `target` |
 | `deployment` | reads | `muructl deployment show` or `deployment diff` | `action` (show, diff), `deployment`, `app`, `effective`, `file` |
+| `daemon_config` | reads | `muructl daemon config show` or `daemon config check`: the daemon's own configuration file | `action` (show, check), `full` |
 | `metrics` | reads | `muructl metrics`, the samples kept to those whose name starts with `prefix` | `prefix` |
 | `websockets` | reads | `muructl websockets` | `app`, `list` |
 | `requests` | reads | `muructl requests` | `app`, `list` |
@@ -69,11 +70,14 @@ it out.
 | `rotate_logs` | changes | `muructl logs rotate` | `target` (app@release), `access`, `host`, `all` |
 | `truncate_logs` | changes | `muructl logs truncate`, refused unless `yes` is true | `target` (app@release), `access`, `host`, `all`, `keep`, `yes` |
 | `reload_config` | changes | `muructl daemon reload` | none |
+| `set_daemon_config` | changes | `muructl daemon config set`, or `daemon config unset` when no `value` is given: one key of the daemon's own configuration file, checked, written and reloaded; with `restart`, the daemon restarted in place when the change needs it | `key`, `value`, `restart` |
 
 Every tool is annotated for the client as reading or changing things, and
 none reaches beyond the daemon. Stopping, shutting down and upgrading the
 daemon, `muructl exec`, and `debug exec` and `debug attach`, are not
-offered: `run_command` runs only what an application declares.
+offered: `run_command` runs only what an application declares. Of the
+commands that change the daemon's own file, `edit` and `replace` are not
+offered either: a tool changes one key at a time.
 `run_command` refuses a secret input given in `inputs`, so a secret's
 value never passes through the agent; give it in `secret_inputs` as an
 entry of one of the daemon's [secret stores](../howto/secrets.md).

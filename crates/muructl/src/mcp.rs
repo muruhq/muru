@@ -1986,6 +1986,70 @@ fn specs() -> Vec<Spec> {
             required: &[],
             command: |_| Ok(words(&["daemon", "reload"])),
         },
+        Spec {
+            name: "daemon_config",
+            description: "The daemon's own configuration file, the node's settings such as listeners and limits, which is not what it serves: show it as written (full for every setting with its default and where each value came from), or check it as the daemon checks it at a start or reload.",
+            changes: false,
+            properties: json!({
+                "action": {"type": "string", "enum": ["show", "check"]},
+                "full": {"type": "boolean", "description": "For show: every setting, with the default of each the file leaves out"},
+            }),
+            required: &["action"],
+            command: |arguments| match needed(arguments, "action")?.as_str() {
+                "show" => {
+                    let mut command = words(&["daemon", "config", "show"]);
+
+                    if flag(arguments, "full") {
+                        command.push("--full".to_owned());
+                    }
+
+                    Ok(command)
+                }
+                "check" => Ok(words(&["daemon", "config", "check"])),
+                other => Err(format!("no daemon_config action {other}")),
+            },
+        },
+        Spec {
+            name: "set_daemon_config",
+            description: "Set one key of the daemon's own configuration file by its dotted path, such as limits.max_body_size or daemon.detours, or take the key out when no value is given. The result is checked before the file is written, and the daemon reloads it. A setting read only at start (the answer's stale lists them) takes effect at a restart, which restart asks for: the daemon re-executes in place, and what it serves keeps serving.",
+            changes: true,
+            properties: json!({
+                "key": {"type": "string", "description": "TABLE.KEY"},
+                "value": {"description": "The value: a string, number, boolean or array. Leave out to take the key out of the file."},
+                "restart": {"type": "boolean", "description": "Restart the daemon in place when the change needs it"},
+            }),
+            required: &["key"],
+            command: |arguments| {
+                let key = needed(arguments, "key")?;
+
+                let mut command = match arguments.get("value") {
+                    None | Some(Value::Null) => {
+                        vec![
+                            "daemon".to_owned(),
+                            "config".to_owned(),
+                            "unset".to_owned(),
+                            key,
+                        ]
+                    }
+                    Some(Value::String(value)) => [
+                        words(&["daemon", "config", "set"]),
+                        vec![key, value.clone()],
+                    ]
+                    .concat(),
+                    Some(value) => [
+                        words(&["daemon", "config", "set"]),
+                        vec![key, value.to_string()],
+                    ]
+                    .concat(),
+                };
+
+                if flag(arguments, "restart") {
+                    command.push("--restart".to_owned());
+                }
+
+                Ok(command)
+            },
+        },
     ]
 }
 
@@ -2000,6 +2064,54 @@ mod tests {
         let specs = specs();
         let spec = specs.iter().find(|spec| spec.name == name).expect("a tool");
         (spec.command)(arguments.as_object().expect("an object"))
+    }
+
+    #[test]
+    fn the_daemons_file_is_read_and_changed_one_key_at_a_time() {
+        // Issue 941: show and check read; a value sets the key, in TOML
+        // whatever its JSON type, and none takes the key out.
+
+        let words = |text: &str| -> Result<Vec<String>, String> {
+            Ok(text.split(' ').map(str::to_owned).collect())
+        };
+
+        assert_eq!(
+            command("daemon_config", json!({"action": "show", "full": true})),
+            words("daemon config show --full")
+        );
+        assert_eq!(
+            command("daemon_config", json!({"action": "check"})),
+            words("daemon config check")
+        );
+        assert_eq!(
+            command(
+                "set_daemon_config",
+                json!({"key": "daemon.detours", "value": true, "restart": true})
+            ),
+            words("daemon config set daemon.detours true --restart")
+        );
+        assert_eq!(
+            command(
+                "set_daemon_config",
+                json!({"key": "limits.max_body_size", "value": "50MB"})
+            ),
+            words("daemon config set limits.max_body_size 50MB")
+        );
+        assert_eq!(
+            command(
+                "set_daemon_config",
+                json!({"key": "proxy.trusted", "value": ["10.0.0.0/8"]})
+            ),
+            words("daemon config set proxy.trusted [\"10.0.0.0/8\"]")
+        );
+        assert_eq!(
+            command("set_daemon_config", json!({"key": "limits.max_body_size"})),
+            words("daemon config unset limits.max_body_size")
+        );
+
+        let specs = specs();
+        let changes = |name: &str| specs.iter().find(|spec| spec.name == name).unwrap().changes;
+        assert!(!changes("daemon_config") && changes("set_daemon_config"));
     }
 
     #[test]
