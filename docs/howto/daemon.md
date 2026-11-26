@@ -1292,6 +1292,98 @@ refusing a connection. Releases keep the runtime library they started
 with until a new release replaces them. [Upgrading Muru](upgrading.md)
 covers the command, development runs, the daemon and releases.
 
+## The daemon's configuration file
+
+The daemon reads one file of its own, which says how it runs: its
+listeners, limits, logs, metrics and the rest. It need not exist;
+without it the daemon serves HTTP on 127.0.0.1:8080 with the defaults.
+What the daemon serves is not in it: an application, a host or a route
+there is refused, and goes in a file for [`muructl
+apply`](#declaring-applications-in-files).
+
+`muructl daemon config` finds the file, shows it, checks it and changes
+it. A running daemon says which file it reads; with none running it is
+the file a daemon started with the same options would read.
+
+```console
+$ muructl daemon config path
+/home/me/.config/muru/muru.toml (not present)
+```
+
+`set` changes one key by its dotted path. It checks the result as the
+daemon would, writes the file whole, keeping its comments and layout,
+and has the running daemon reload:
+
+```console
+$ muructl daemon config set limits.max_body_size 50MB
+muru: wrote /home/me/.config/muru/muru.toml
+muru: reloaded /home/me/.config/muru/muru.toml: changed [limits] (the edge has it); ...
+```
+
+A value that is TOML, such as `true`, `4` or `["a", "b"]`, is taken as
+it is, and anything else as a string. `unset` takes a key out. A key in
+a list of entries, such as a `[[listener]]`, is changed with `edit`.
+
+A few settings are read only when the daemon starts. The file is
+written, and the reload says the daemon keeps what it started with:
+
+```console
+$ muructl daemon config set daemon.detours true
+muru: wrote /home/me/.config/muru/muru.toml
+muru: reloaded /home/me/.config/muru/muru.toml: ...; [daemon] detours changed and is read at start, so the daemon keeps what it started with until it is restarted; ...
+```
+
+`muructl daemon stop` and `muructl daemon start` restart the daemon
+with its hosts and its edge serving throughout.
+
+`edit` opens the file in `$VISUAL`, else `$EDITOR`, else `vi`, starting
+from a short commented file when there is none. It checks what was
+saved before it writes anything, and a file with a mistake is never
+written:
+
+```console
+$ muructl daemon config edit
+muru: /home/me/.config/muru/muru.toml: "50 megs" is not a size such as 10MB or 512KB
+Edit again? [Y/n]
+```
+
+The file is an ordinary file, and can be changed by other means: an
+editor of your own, a checkout, configuration management. `check` says
+whether the daemon would take it, and `muructl daemon reload` applies
+it:
+
+```console
+$ muructl daemon config check
+muru: /home/me/.config/muru/muru.toml is valid
+$ muructl daemon reload
+```
+
+`check FILE` checks a file that is somewhere else, its relative paths
+taken from its own directory, as a daemon started with `--config FILE`
+would read it. `replace FILE` installs a whole file as the daemon's,
+checked in the daemon's place, written and reloaded, and takes `-` for
+standard input, for a script that generates the file:
+
+```console
+$ ./make-config | muructl daemon config replace -
+```
+
+`set`, `unset`, `edit` and `replace` take `--check`, which checks the
+result and writes nothing, and `--no-reload`, which writes the file and
+leaves the daemon as it is. With no daemon running they write the file
+and say that the daemon reads it when it starts. A file this user may
+not write, as a system daemon's is to anyone but root, is refused
+before anything is edited, with the way to run the command with the
+rights to.
+
+`show` prints the file as it is written. `show --full` prints every
+setting of its plain tables: what the file sets, marked so, and as
+comments the default of every other key, with the flags the daemon was
+started with that stand over the file. The result is itself a file the
+daemon takes. A flag such as `--listen` holds over the file until the
+daemon is started without it, and a change to a key such a flag stands
+over is written with a warning saying so.
+
 ## Reloading the configuration
 
 `muructl daemon reload`, or SIGHUP, reads the daemon's configuration

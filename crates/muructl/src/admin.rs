@@ -1183,6 +1183,15 @@ pub enum DaemonCommand {
         #[command(flatten)]
         output: JsonArgs,
     },
+
+    /// The daemon's own configuration file: where it is, what it holds,
+    /// whether the daemon would take it, and changes that are checked,
+    /// written and reloaded. What the daemon serves is not in it: that
+    /// is muructl apply's.
+    Config {
+        #[command(subcommand)]
+        command: crate::daemon_config::DaemonConfigCommand,
+    },
 }
 
 /// What `daemon run` and `daemon start` take.
@@ -10945,7 +10954,7 @@ pub(crate) fn daemon_locations(socket: &SocketArgs, files: &DaemonFileArgs) -> L
 /// find the daemon. A socket file that is absent, or one left behind that
 /// refuses the connection, is no daemon. Anything else, such as a
 /// permission refused, is left for the connection to report.
-fn no_daemon(socket: &SocketArgs, path: &Path) -> bool {
+pub(crate) fn no_daemon(socket: &SocketArgs, path: &Path) -> bool {
     socket.given_socket().is_none()
         && match path.try_exists() {
             Ok(false) => true,

@@ -1018,6 +1018,8 @@ pub struct Info {
     pub instance_id: crate::registry::InstanceId,
     /// Section 9.13: the open detours, as the daemon last published them.
     pub detours: std::sync::Mutex<Vec<muru_proto::admin::v1::Detour>>,
+    /// The flags the daemon was started with that stand over its file.
+    pub start_flags: Vec<String>,
 }
 
 /// What runs for one release now, for the API.
@@ -1975,6 +1977,9 @@ struct Daemon {
     access_overrides: Vec<muru_edge::access::Override>,
     /// The command line's settings, laid over the file on every reload.
     overrides: crate::settings::Overrides,
+    /// The settings read only at start, as this daemon started with
+    /// them, which a reload compares the file's with.
+    read_at_start: Vec<(&'static str, String)>,
     /// The event sinks delivering (section 11.5), reconciled on reload.
     sinks: crate::sinks::Sinks,
     /// Section 4.2: each TLS host's last good certificate chain and key
@@ -2192,6 +2197,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let booted = adopted.is_none();
     let wanted_listeners = settings.listeners.clone();
+    let read_at_start = settings.at_start();
 
     let edge = match adopted {
         Some(edge) => {
@@ -2286,6 +2292,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         cgroup_limits: std::sync::Mutex::new(None),
         instance_id,
         detours: std::sync::Mutex::new(Vec::new()),
+        start_flags: config.overrides.flags(),
     });
     let underway = crate::commands::Underway::default();
     let runs = crate::runs::Runs::new(
@@ -2475,6 +2482,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         access_log: settings.access_log.clone(),
         access_overrides: Vec::new(),
         overrides: config.overrides,
+        read_at_start,
         sinks,
         certificates: HashMap::new(),
         budget_table: settings.budget,
@@ -4126,6 +4134,15 @@ impl Daemon {
         let clients = settings.client_rules.policies(&self.store)?;
         let listeners = self.bind_listeners(&settings.listeners)?;
         let mut report = crate::reload::Report::new(&path);
+
+        // Issue 894: what is read only at start and now differs from what
+        // this daemon started with, which a restart applies.
+
+        for ((setting, started), (_, now)) in self.read_at_start.iter().zip(settings.at_start()) {
+            if *started != now {
+                report.stale(setting);
+            }
+        }
 
         // Section 4.4: the tables the edge takes from each snapshot, and
         // the limits with them (section 4.6).

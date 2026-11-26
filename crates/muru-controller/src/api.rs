@@ -440,6 +440,7 @@ impl Admin for Service {
             config: info.locations.config.path.display().to_string(),
             log_dir: info.locations.logs.path.display().to_string(),
             cache_dir: info.locations.cache.path.display().to_string(),
+            start_flags: info.start_flags.clone(),
             limits: info.cgroup_limits.lock().expect("limits poisoned").clone(),
         }))
     }

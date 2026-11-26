@@ -446,6 +446,7 @@ message Status {
   string instance_id = 24;          // the instance's ID, 32 hex digits, as its registry entry has it, so a client can check it reached the instance it meant
   string hostname = 25;             // the machine's hostname
   string name = 26;                 // the instance's name: user, system or a named instance's; empty for a run, a serve or a daemon whose locations were given by flags
+  repeated string start_flags = 27; // the flags the daemon was started with that stand over its configuration file: --listen, --metrics, --dashboard, --user (issue 894)
 }
 
 message ListWebSocketsRequest {

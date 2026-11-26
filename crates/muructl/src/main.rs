@@ -9,6 +9,7 @@
 
 mod admin;
 mod browser;
+mod daemon_config;
 mod dashboard;
 mod detour;
 mod devcert;
@@ -1342,6 +1343,7 @@ fn main() -> anyhow::Result<()> {
                 admin::DaemonCommand::Status { .. } => {
                     unreachable!("daemon status is matched on its own")
                 }
+                admin::DaemonCommand::Config { command } => daemon_config::run(command).await,
             }
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),

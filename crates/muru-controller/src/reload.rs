@@ -25,6 +25,7 @@ pub struct Report {
     unchanged: Vec<String>,
     failed: Vec<String>,
     kept: Vec<String>,
+    stale: Vec<String>,
 }
 
 impl Report {
@@ -58,6 +59,12 @@ impl Report {
         self.kept.push(format!("{what} ({why})"));
     }
 
+    /// A setting read only at start differs from what the daemon started
+    /// with, so the file's value waits for a restart (issue 894).
+    pub fn stale(&mut self, setting: &str) {
+        self.stale.push(setting.to_owned());
+    }
+
     /// Whether every change was applied.
     pub fn is_ok(&self) -> bool {
         self.failed.is_empty()
@@ -85,6 +92,14 @@ impl Report {
         }
 
         parts.extend(self.kept.iter().cloned());
+
+        if !self.stale.is_empty() {
+            parts.push(format!(
+                "{} changed and {} read at start, so the daemon keeps what it started with until it is restarted",
+                named_list(&self.stale),
+                if self.stale.len() == 1 { "is" } else { "are" }
+            ));
+        }
 
         parts.push(format!("{} are read at start", named_list(READ_AT_START)));
         format!("reloaded {}: {}", self.path.display(), parts.join("; "))
@@ -120,6 +135,29 @@ fn named_list<S: AsRef<str>>(items: &[S]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_setting_read_at_start_that_changed_is_named() {
+        // Issue 894: the file's value waits for a restart, and the
+        // reload says so instead of naming the start-only settings alike
+        // whether or not one changed.
+
+        let mut report = Report::new(Path::new("muru.toml"));
+        report.unchanged("[proxy]");
+        report.stale("[daemon] detours");
+        assert!(report.is_ok());
+        assert!(report.message().contains(
+            "; [daemon] detours changed and is read at start, so the daemon keeps what it \
+             started with until it is restarted; "
+        ));
+
+        report.stale("[metrics]");
+        assert!(
+            report
+                .message()
+                .contains("[daemon] detours and [metrics] changed and are read at start")
+        );
+    }
 
     #[test]
     fn nothing_changed_says_so() {
