@@ -1028,12 +1028,26 @@ def test_a_run_killed_outright_leaves_a_stale_entry_that_is_not_reached(runtime:
 
     server = start(runtime)
     socket_path = server.admin_socket()
+
+    # Issue 948: the registry is the machine's own, and may hold entries
+    # of other instances whose record cannot be read, which are passed
+    # over as discovery passes them over.
+
+    def pid_of(entry: Path) -> int | None:
+        try:
+            return int(json.loads((entry / "instance.json").read_text())["pid"])
+        except (OSError, ValueError, KeyError):
+            return None
+
     entries = [
         entry
         for entry in support.user_registry().iterdir()
-        if not entry.name.startswith(".")
-        and json.loads((entry / "instance.json").read_text())["pid"] == server.process.pid
+        if not entry.name.startswith(".") and pid_of(entry) == server.process.pid
     ]
+
+    if len(entries) != 1:
+        server.stop()
+
     assert len(entries) == 1, entries
     record = json.loads((entries[0] / "instance.json").read_text())
     assert record["kind"] == "run" and record["app"] == "plain-wsgi"

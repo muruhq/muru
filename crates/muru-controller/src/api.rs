@@ -2249,11 +2249,14 @@ impl Admin for Service {
             .send(Command::Reload { done: done_tx })
             .await
             .map_err(|_| Status::unavailable(STOPPING))?;
-        let message = done_rx
+        let reloaded = done_rx
             .await
             .map_err(|_| Status::unavailable(STOPPING))?
             .map_err(Status::failed_precondition)?;
-        Ok(Response::new(pb::ReloadConfigResponse { message }))
+        Ok(Response::new(pb::ReloadConfigResponse {
+            message: reloaded.message,
+            stale: reloaded.stale,
+        }))
     }
 
     async fn list_events(
@@ -2736,6 +2739,25 @@ impl Admin for Service {
         Ok(Response::new(pb::UpgradeDaemonResponse {
             executable: upgrade.executable.display().to_string(),
             version: upgrade.version,
+        }))
+    }
+
+    async fn restart_daemon(
+        &self,
+        _: Request<pb::RestartDaemonRequest>,
+    ) -> Result<Response<pb::RestartDaemonResponse>, Status> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Restart { done: done_tx })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let restart = done_rx
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(pb::RestartDaemonResponse {
+            executable: restart.executable.display().to_string(),
         }))
     }
 

@@ -40,7 +40,7 @@ server's log, one line when it starts, naming what it serves and how
 many tools it offers, and a warning for each call it refuses:
 
 ```
-muru: MCP server for the daemon at /run/user/501/muru/admin.sock: 30 tools (15 with --read-only)
+muru: MCP server for the daemon at /run/user/501/muru/admin.sock: 32 tools (16 with --read-only)
 muru: warning: refused a call to deploy: the server is read-only
 ```
 

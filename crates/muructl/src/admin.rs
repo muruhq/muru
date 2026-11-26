@@ -723,7 +723,7 @@ impl SocketArgs {
 
     /// The daemon's log, for a command of the daemon's own that names
     /// it: where the instance's options and the daemon's files put it.
-    fn daemon_log(&self, files: &DaemonFileArgs) -> PathBuf {
+    pub(crate) fn daemon_log(&self, files: &DaemonFileArgs) -> PathBuf {
         Locations::resolve(&Options {
             run_dir: self.locations.run_dir.clone(),
             system: self.locations.system,
@@ -1170,6 +1170,23 @@ pub enum DaemonCommand {
         files: DaemonFileArgs,
     },
 
+    /// Re-execute the daemon from the muructl it runs, so that it reads
+    /// its configuration file afresh, the settings read only at start
+    /// among them: hosts and the edge keep serving, and the daemon
+    /// keeps its pid.
+    Restart {
+        /// How long to wait for the restarted daemon to be ready.
+        #[arg(long, value_name = "DURATION", default_value = "120s", value_parser = muru_config::parse_duration)]
+        timeout: Duration,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+
+        /// The daemon's own files, as it was started with them.
+        #[command(flatten)]
+        files: DaemonFileArgs,
+    },
+
     /// Show the daemon's status, or where its files would be when none
     /// is running, exiting 3 then.
     Status {
@@ -1264,6 +1281,10 @@ pub struct DaemonRunArgs {
     #[arg(long, hide = true, value_name = "VERSION")]
     upgraded_from: Option<String>,
 
+    /// Set by a daemon that re-executed itself for a restart.
+    #[arg(long, hide = true)]
+    restarted: bool,
+
     /// Set by a daemon that re-executed itself for an upgrade: the
     /// descriptors that hold its locks on the state and run directories.
     #[arg(long, hide = true, value_name = "FDS")]
@@ -1273,26 +1294,28 @@ pub struct DaemonRunArgs {
     locations: LocationArgs,
 }
 
-/// The arguments a daemon re-executes itself with on an upgrade: its own,
-/// with --upgraded-from naming this version in place of any earlier one.
-/// The descriptors that hold its locks are added when it re-executes, in
-/// place of any it was given.
-fn upgrade_arguments() -> Vec<std::ffi::OsString> {
-    let mut arguments: Vec<std::ffi::OsString> =
-        muru_common::title::args_os().into_iter().skip(1).collect();
+/// The arguments a daemon re-executes itself with on an upgrade or a
+/// restart: its own, without the flags an earlier re-execution gave it.
+/// The flag that says which this one is, and the descriptors that hold
+/// its locks, are added when it re-executes.
+fn reexec_arguments() -> Vec<std::ffi::OsString> {
+    without_reexec_flags(muru_common::title::args_os().into_iter().skip(1).collect())
+}
 
-    for flag in [
-        "--upgraded-from",
-        muru_controller::ownership::HELD_LOCKS_FLAG,
+/// Arguments without the flags a re-execution adds, each with its value
+/// when it takes one.
+fn without_reexec_flags(mut arguments: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    for (flag, takes_value) in [
+        (muru_controller::daemon::UPGRADED_FROM_FLAG, true),
+        (muru_controller::daemon::RESTARTED_FLAG, false),
+        (muru_controller::ownership::HELD_LOCKS_FLAG, true),
     ] {
         if let Some(at) = arguments.iter().position(|argument| argument == flag) {
-            let end = (at + 2).min(arguments.len());
+            let end = (at + 1 + usize::from(takes_value)).min(arguments.len());
             arguments.drain(at..end);
         }
     }
 
-    arguments.push("--upgraded-from".into());
-    arguments.push(env!("CARGO_PKG_VERSION").into());
     arguments
 }
 
@@ -1376,8 +1399,9 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         overrides,
         access_log,
         executable: std::env::current_exe().context("finding the muructl executable")?,
-        upgrade_arguments: upgrade_arguments(),
+        reexec_arguments: reexec_arguments(),
         upgraded_from: args.upgraded_from.clone(),
+        restarted: args.restarted,
         rename_check: rename_check(),
         ownership,
         start_apply: start_apply(&args),
@@ -1880,6 +1904,113 @@ pub async fn daemon_stop(
         timeout.as_secs(),
         socket.daemon_log(&files).display()
     )
+}
+
+/// Re-execute the daemon from the binary it runs and wait until it is
+/// ready again.
+pub async fn daemon_restart(
+    socket: SocketArgs,
+    files: DaemonFileArgs,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    restart_at(
+        &socket.socket()?,
+        &socket.daemon_log(&files),
+        timeout,
+        false,
+    )
+    .await
+}
+
+/// Restart the daemon whose admin socket is at `path`, whose log is
+/// `log`, and wait until it is ready again, saying nothing of how it
+/// goes when `quiet`.
+pub async fn restart_at(
+    path: &Path,
+    log: &Path,
+    timeout: Duration,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    let mut client = client::connect(&client::Endpoint::unix(path)).await?;
+    let before = client
+        .get_status(pb::GetStatusRequest {})
+        .await?
+        .into_inner();
+    let response = client
+        .restart_daemon(pb::RestartDaemonRequest {})
+        .await
+        .map_err(|status| anyhow::anyhow!("{}", status.message()))?
+        .into_inner();
+
+    if !quiet {
+        println!(
+            "muru: daemon (pid {}) re-executing from {}",
+            before.pid, response.executable
+        );
+    }
+
+    // The daemon answers again from the new image with a new start time,
+    // and is ready once it has re-adopted the hosts and the edge.
+
+    let started = Instant::now();
+    let mut answered = false;
+
+    while started.elapsed() < timeout {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let status = status_within(path, remaining.min(STOP_EXCHANGE)).await;
+
+        if let Some(status) = status.filter(|now| now.started_unix_ms != before.started_unix_ms) {
+            answered = true;
+
+            if ready_within(path, remaining.min(STOP_EXCHANGE)).await {
+                if !quiet {
+                    println!("muru: daemon restarted (pid {})", status.pid);
+                }
+
+                return Ok(());
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    if answered {
+        anyhow::bail!(
+            "the daemon re-executed (pid {}) but was not ready within {} seconds; see muructl \
+             events",
+            before.pid,
+            timeout.as_secs()
+        )
+    }
+
+    anyhow::bail!(
+        "the daemon (pid {}) did not answer again within {} seconds; see {}",
+        before.pid,
+        timeout.as_secs(),
+        log.display()
+    )
+}
+
+/// Whether the daemon at `path` says within `bound` that it has started
+/// all it restores.
+async fn ready_within(path: &Path, bound: Duration) -> bool {
+    let exchange = async {
+        let mut client = client::connect(&client::Endpoint::unix(path)).await.ok()?;
+        client
+            .probe(pb::ProbeRequest {
+                probe: "startup".to_owned(),
+                ..pb::ProbeRequest::default()
+            })
+            .await
+            .ok()
+            .map(|answer| answer.into_inner().ok)
+    };
+
+    tokio::time::timeout(bound, exchange)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
 /// Re-execute the daemon from the installed binary and wait until it
@@ -12895,6 +13026,23 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_re_execution_drops_the_flags_of_the_one_before() {
+        // Issue 940: a restart after an upgrade, or an upgrade after a
+        // restart, says only what it is itself.
+
+        let arguments =
+            |text: &str| -> Vec<std::ffi::OsString> { text.split(' ').map(Into::into).collect() };
+
+        assert_eq!(
+            super::without_reexec_flags(arguments(
+                "daemon run --upgraded-from 1.2.0 --restarted --apply /etc/muru/deploy.d \
+                 --held-locks 5,6"
+            )),
+            arguments("daemon run --apply /etc/muru/deploy.d")
+        );
+    }
+
     use super::condition_wait;
     use super::format_access_line;
     use super::limits_lines;

@@ -150,6 +150,11 @@ service Admin {
   // the edge keep serving and the new image takes them over.
   rpc UpgradeDaemon(UpgradeDaemonRequest) returns (UpgradeDaemonResponse);
 
+  // Re-exec the daemon from the binary it runs, so that it reads its
+  // configuration file afresh. The edge is left as it is. Refused when
+  // the installed binary is of another version, which is an upgrade.
+  rpc RestartDaemon(RestartDaemonRequest) returns (RestartDaemonResponse);
+
   // Ask a release's workers something: status, stacks,
   // tasks, inspect or logging, through the host's control connection.
   // Dumping stacks and setting a log level are operations of this one
@@ -1456,6 +1461,12 @@ message UpgradeDaemonResponse {
   string version = 2;               // the version that binary reports
 }
 
+message RestartDaemonRequest {}
+
+message RestartDaemonResponse {
+  string executable = 1;            // the binary the daemon re-executes from
+}
+
 // A document as muructl apply reads it: TOML with [app.NAME.release.ID]
 // tables, source paths already absolute.
 message ApplyConfigRequest {
@@ -1931,4 +1942,5 @@ message ReloadConfigRequest {}
 
 message ReloadConfigResponse {
   string message = 1;               // what was reloaded
+  repeated string stale = 2;        // settings read at start that differ from what the daemon started with
 }

@@ -1344,6 +1344,11 @@ fn main() -> anyhow::Result<()> {
                     socket,
                     files,
                 } => admin::daemon_upgrade(socket, files, timeout).await,
+                admin::DaemonCommand::Restart {
+                    timeout,
+                    socket,
+                    files,
+                } => admin::daemon_restart(socket, files, timeout).await,
                 admin::DaemonCommand::Status { .. } => {
                     unreachable!("daemon status is matched on its own")
                 }

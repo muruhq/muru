@@ -2161,6 +2161,7 @@ impl Admin for Service {
         list_deployments(pb::ListDeploymentsRequest) -> pb::ListDeploymentsResponse, "muructl deployment list";
         reload_config(pb::ReloadConfigRequest) -> pb::ReloadConfigResponse, "muructl daemon reload";
         upgrade_daemon(pb::UpgradeDaemonRequest) -> pb::UpgradeDaemonResponse, "muructl daemon upgrade";
+        restart_daemon(pb::RestartDaemonRequest) -> pb::RestartDaemonResponse, "muructl daemon restart";
         list_overlays(pb::ListOverlaysRequest) -> pb::ListOverlaysResponse, "muructl overlay";
         control_overlay(pb::ControlOverlayRequest) -> pb::ControlOverlayResponse, "muructl overlay";
         preview_overlay(pb::PreviewOverlayRequest) -> pb::PreviewOverlayResponse, "muructl overlay";

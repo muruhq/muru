@@ -65,6 +65,12 @@ impl Report {
         self.stale.push(setting.to_owned());
     }
 
+    /// The settings read at start that differ from what the daemon
+    /// started with.
+    pub fn waiting(&self) -> Vec<String> {
+        self.stale.clone()
+    }
+
     /// Whether every change was applied.
     pub fn is_ok(&self) -> bool {
         self.failed.is_empty()
