@@ -98,7 +98,7 @@ def test_render_writes_the_groups() -> None:
     muructl = support.muructl_path()
     assert muructl is not None
     completed = subprocess.run(
-        [str(muructl), "render", "grouped", str(GROUPED)],
+        [str(muructl), "render", "grouped", str(GROUPED), "--release", "r1", "--no-git-metadata"],
         capture_output=True,
         text=True,
         check=True,

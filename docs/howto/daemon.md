@@ -426,12 +426,12 @@ where no daemon does, such as a job that writes the file for a later
 step to commit. It reads the source's settings, so the source is a
 directory it can read.
 
-- **The release id** is the one `--release` names. With none the table
-  is written as `r1`.
+- **The release id** is the one `--release` names, which is required:
+  an id of your choosing, such as a date or a commit.
 - **The source** is written as the command line gives it. A relative
   path stays relative, and `muructl apply` takes it from the file's
-  directory, so `muructl render shop . > muru.deploy.toml` beside the
-  code applies from there. With no source the current directory is
+  directory, so `muructl render shop . --release 2026-11-06 >
+  muru.deploy.toml` beside the code applies from there. With no source the current directory is
   written as its full path.
 - **The settings** come from the flags, then the source's settings,
   then the defaults. Nothing comes from a release or the settings the
@@ -445,6 +445,10 @@ directory it can read.
   built by the daemon when the file is applied.
 - **Secrets** are written as the references `--secret` gives. No secret
   store is read.
+- **Where the code came from** is written as a deploy records it: a
+  `metadata` table with the commit and ref of the git checkout the
+  source is in, and what `--metadata KEY=VALUE` gives over them.
+  `--no-git-metadata` fills nothing from git.
 
 A command line that a deploy would refuse is refused with the same
 message, and nothing is printed. `--json` writes the document as JSON.

@@ -1364,7 +1364,7 @@ fn main() -> anyhow::Result<()> {
         Command::Secret { command } => runtime.block_on(admin::secret(command)),
         Command::Logging { command } => runtime.block_on(admin::logging(command)),
         Command::Deploy(args) => exit_with(runtime, admin::deploy(*args)),
-        Command::Render(args) => render::render(*args),
+        Command::Render(args) => runtime.block_on(render::render(*args)),
         Command::App { command } => runtime.block_on(async move {
             match command {
                 admin::AppCommand::List { socket, output } => {

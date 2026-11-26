@@ -112,7 +112,7 @@ def test_render_writes_the_mounts() -> None:
     muructl = support.muructl_path()
     assert muructl is not None
     completed = subprocess.run(
-        [str(muructl), "render", "mounted", str(MOUNTED)],
+        [str(muructl), "render", "mounted", str(MOUNTED), "--release", "r1", "--no-git-metadata"],
         capture_output=True,
         text=True,
         check=True,

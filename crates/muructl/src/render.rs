@@ -15,9 +15,6 @@ use muru_controller::render::{Origin, Rendered};
 use crate::admin::ReleaseArgs;
 use crate::print_config::{COMMAND_LINE, DEFAULT, table_name};
 
-/// The release id a table is written under when none is named.
-const FIRST_RELEASE: &str = "r1";
-
 /// What `render` takes.
 #[derive(Args)]
 pub struct RenderArgs {
@@ -31,9 +28,21 @@ pub struct RenderArgs {
     #[command(flatten)]
     settings: ReleaseArgs,
 
-    /// The release id the table is written under (default: r1).
+    /// The release id the table is written under: yours to choose, such
+    /// as a date or a commit.
     #[arg(long, value_name = "ID")]
     release: Option<String>,
+
+    /// Record KEY=VALUE with the release, such as description=TEXT or
+    /// url=URL; repeatable. Over what is filled from git, and KEY=
+    /// leaves a filled key out.
+    #[arg(long = "metadata", value_name = "KEY=VALUE", value_parser = crate::release_metadata::parse_flag)]
+    metadata: Vec<(String, String)>,
+
+    /// Fill no commit, ref or dirty flag from the git checkout the
+    /// source directory is in.
+    #[arg(long)]
+    no_git_metadata: bool,
 
     /// Write every setting, the defaults included, each with where it
     /// came from.
@@ -46,8 +55,19 @@ pub struct RenderArgs {
 }
 
 /// Write the release the command line describes to standard output.
-pub fn render(args: RenderArgs) -> anyhow::Result<()> {
+pub async fn render(args: RenderArgs) -> anyhow::Result<()> {
     args.settings.check()?;
+
+    // A file's release is named by whoever writes the file. A default
+    // made two renders into one file a release declared twice, and a
+    // counter belongs to one node (ADR 0079).
+
+    let Some(id) = args.release.clone() else {
+        anyhow::bail!(
+            "name the release with --release ID: an id of your choosing, such as a date \
+             (--release 2026-11-26) or a commit"
+        );
+    };
 
     if !muru_controller::model::valid_name(&args.app) {
         anyhow::bail!(
@@ -56,10 +76,6 @@ pub fn render(args: RenderArgs) -> anyhow::Result<()> {
         );
     }
 
-    let id = args
-        .release
-        .clone()
-        .unwrap_or_else(|| FIRST_RELEASE.to_owned());
     let id = id.as_str();
 
     if !muru_controller::model::valid_name(id) {
@@ -93,6 +109,27 @@ pub fn render(args: RenderArgs) -> anyhow::Result<()> {
         .as_ref()
         .map(|python| python.display().to_string())
         .unwrap_or_default();
+
+    // Section 9.14: the commit and ref the source is at, under what the
+    // flags say, as a deploy records them, so a release made through a
+    // file says where its code came from too.
+
+    let filled = if args.no_git_metadata {
+        crate::release_metadata::Filled::default()
+    } else {
+        crate::release_metadata::from_git(&read).await
+    };
+
+    if let Some(why) = &filled.failure {
+        eprintln!("muru: no commit or ref recorded from git: {why}");
+    }
+
+    let metadata = muru_config::check_metadata(&crate::release_metadata::merged(
+        filled.metadata,
+        &args.metadata,
+    ))
+    .map_err(anyhow::Error::msg)?;
+
     let RenderArgs {
         app,
         settings,
@@ -100,10 +137,10 @@ pub fn render(args: RenderArgs) -> anyhow::Result<()> {
         json,
         ..
     } = args;
-    let named = args.release.is_some();
     let request = settings.request(&app, &read.display().to_string(), python);
-    let rendered =
+    let mut rendered =
         muru_controller::render::render(&request, &written, full).map_err(anyhow::Error::msg)?;
+    rendered.table.metadata = metadata;
 
     let document = muru_config::Document {
         app: BTreeMap::from([(
@@ -126,7 +163,7 @@ pub fn render(args: RenderArgs) -> anyhow::Result<()> {
         .file
         .as_deref()
         .map(|file| table_name(Some(file), ""));
-    let mut out = header(&rendered, project.as_deref(), &written, full, named);
+    let mut out = header(&rendered, project.as_deref(), &written, full);
 
     if full {
         // The opening comment names the file in full; beside each
@@ -151,13 +188,7 @@ pub fn render(args: RenderArgs) -> anyhow::Result<()> {
 
 /// The comment the file opens with: what it is, how it is used and how
 /// its settings were arrived at.
-fn header(
-    rendered: &Rendered,
-    project: Option<&str>,
-    source: &str,
-    full: bool,
-    named: bool,
-) -> String {
+fn header(rendered: &Rendered, project: Option<&str>, source: &str, full: bool) -> String {
     let name = muru_config::DEPLOY_FILE;
     let mut out = format!(
         "# The release this command line describes, as a table for muructl apply.\n\
@@ -181,14 +212,6 @@ fn header(
     } else {
         "# A setting left at its default is not written; --full writes those too.\n"
     });
-
-    if !named {
-        let _ = writeln!(
-            out,
-            "# The release is written as {FIRST_RELEASE}. An applied file names its own releases,\n\
-             # where muructl deploy numbers them; name this one with --release."
-        );
-    }
 
     if Path::new(source).is_relative() {
         let key = if rendered.table.cwd.is_some() {
