@@ -122,6 +122,9 @@ Recipes for specific tasks, assuming you already know the basics. The
 - [Inspecting workers](debugging.md): stacks, profiles, memory and a
   debugger in running workers, a report to attach to a bug report, and
   a bundle of a whole system for triage.
+- [Check Muru itself](doctor.md): every socket and file of an
+  installation with its owner and condition, checks of one part against
+  another, and the state store read on its own.
 - [Inspecting requests in development](toolbar.md): the debug toolbar
   on each page, timings in the browser, and a record of each request a
   development run serves.
@@ -202,6 +205,7 @@ metrics
 events
 dashboard
 debugging
+doctor
 toolbar
 panels
 instrumentation

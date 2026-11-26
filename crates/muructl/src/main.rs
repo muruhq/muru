@@ -15,6 +15,7 @@ mod dashboard;
 mod detour;
 mod devcert;
 mod diagnostics;
+mod doctor;
 mod edge;
 mod imports;
 mod init;
@@ -278,6 +279,12 @@ enum Command {
         #[command(subcommand)]
         command: admin::DebugCommand,
     },
+
+    /// Check Muru itself: list every socket and file of an installation
+    /// with what it is for, who owns it and its condition, and check one
+    /// part against another. Reads and never changes anything, works with
+    /// no daemon running, and exits 1 when a check fails.
+    Doctor(Box<doctor::DoctorArgs>),
 
     /// The Muru instances on this machine: daemons, development runs and
     /// serves, and what they left behind.
@@ -1361,6 +1368,7 @@ fn main() -> anyhow::Result<()> {
         Command::Up(args) => runtime.block_on(admin::up(args)),
         Command::Debug { command } => runtime.block_on(admin::debug(command)),
         Command::Open(args) => runtime.block_on(open::open(*args)),
+        Command::Doctor(args) => exit_with(runtime, doctor::doctor(*args)),
         Command::Instance { command } => match command {
             instances::InstanceCommand::List(args) => exit_with(runtime, instances::list(args)),
             instances::InstanceCommand::Prune(args) => runtime.block_on(instances::prune(args)),

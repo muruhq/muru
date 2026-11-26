@@ -1819,7 +1819,7 @@ const STOP_EXCHANGE: Duration = Duration::from_secs(5);
 
 /// Ask the daemon at `path` for its status, within `bound`. None when
 /// there is no daemon there, it refused, or it did not answer in time.
-async fn status_within(path: &Path, bound: Duration) -> Option<pb::Status> {
+pub(crate) async fn status_within(path: &Path, bound: Duration) -> Option<pb::Status> {
     let exchange = async {
         let mut client = client::connect(&client::Endpoint::unix(path)).await.ok()?;
         client
