@@ -119,6 +119,68 @@ def test_connection_opened_before_the_handover_is_answered(daemon: Daemon) -> No
     wait_until_gone(edge_before)
 
 
+def test_a_daemon_of_the_earlier_layout_is_not_upgraded_in_place(daemon: Daemon) -> None:
+    # Issue 948: a daemon from before the runtime files moved keeps its
+    # lock in a file in its run directory, which is how one is told. It
+    # is not asked to re-execute, since this version reads its records
+    # from the state directory and would start without the edge and
+    # hosts that daemon runs.
+
+    daemon.deploy("shop", SHOP, "--processes", "1")
+    edge_before = edge_pid_of(daemon)
+    (daemon.run_dir / "daemon.lock").write_text(f"pid={daemon.process.pid}\n")
+
+    refused = daemon.muructl("daemon", "upgrade", check=False)
+    said = refused.stdout + refused.stderr
+    assert refused.returncode != 0, said
+    assert f"keeps its runtime files in its run directory {daemon.run_dir}" in said, said
+    assert "muructl daemon stop --shutdown" in said, said
+
+    # Nothing was re-executed: the same daemon and edge still serve.
+
+    (daemon.run_dir / "daemon.lock").unlink()
+    assert edge_pid_of(daemon) == edge_before
+    assert daemon.get("/").status == 200
+
+
+def test_a_start_beside_what_an_earlier_layout_left_running_is_refused(tmp_path: Path) -> None:
+    # The records of an edge and hosts in the run directory are an
+    # earlier version's, which this one cannot take over.
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    run_dir = support.short_dir("muru-run-")
+    (run_dir / "edge.toml").write_text("pid = 1\n")
+
+    started = subprocess.run(
+        [
+            str(muructl),
+            "daemon",
+            "run",
+            "--listen",
+            f"127.0.0.1:{support.free_port()}",
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--run-dir",
+            str(run_dir),
+            "--log-dir",
+            str(tmp_path / "logs"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--config",
+            str(tmp_path / "muru.toml"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    said = started.stdout + started.stderr
+    assert started.returncode != 0, said
+    assert "an earlier version of Muru started" in said, said
+    assert "muructl daemon stop --shutdown" in said, said
+
+
 def test_upgraded_daemon_can_detach_and_shut_down_cleanly(tmp_path: Path) -> None:
     first = start_daemon(tmp_path)
     second = None

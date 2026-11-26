@@ -2026,6 +2026,26 @@ pub async fn daemon_upgrade(
         .get_status(pb::GetStatusRequest {})
         .await?
         .into_inner();
+
+    // Section 13.8 (issue 948): a daemon that keeps its lock and records
+    // in its run directory is from before they moved to the state
+    // directory. This version would start without the edge and the hosts
+    // that daemon runs, which would be left running with nothing
+    // looking after them, so it is not asked to re-execute.
+
+    if muru_controller::locations::earlier_daemon_owns(Path::new(&before.run_dir)) {
+        anyhow::bail!(
+            "the daemon (pid {}, version {}) keeps its runtime files in its run directory {}, \
+             and this version of Muru keeps them in the state directory, so it cannot take \
+             over that daemon's edge and releases and does not upgrade it in place; stop it and \
+             its releases with muructl daemon stop --shutdown, then start it again with \
+             muructl daemon start",
+            before.pid,
+            before.version,
+            before.run_dir
+        );
+    }
+
     let response = client
         .upgrade_daemon(pb::UpgradeDaemonRequest {})
         .await
@@ -8802,6 +8822,12 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
 
     if !release.message.is_empty() {
         lines.push(("message".to_owned(), release.message.clone()));
+    }
+
+    // Section 13.8: the number that names its host's directories.
+
+    if release.number > 0 {
+        lines.push(("number".to_owned(), release.number.to_string()));
     }
 
     lines.push(("source".to_owned(), release.source.clone()));

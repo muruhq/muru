@@ -48,7 +48,7 @@ umask = '027'           # octal; the daemon's own when left out
 The settings go in the application's table for `muructl apply`, are
 exported with it, and `muructl app list` shows them. Changing them
 takes effect on the next release that starts: the daemon looks the user
-and group up, gives the release's run directory, its secret files and
+and group up, gives the release's socket directory, its secret files and
 its log to that user, and starts the host with that identity, which the
 workers inherit. A user or group that does not exist fails the release.
 

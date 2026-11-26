@@ -46,11 +46,25 @@ pub const LABEL_VARIABLE: &str = "MURU_INSTANCE_LABEL";
 /// The system daemon's registry, which any user may read.
 pub const SYSTEM_REGISTRY: &str = "/run/muru/registry";
 
-/// The caller's own registry: `registry` in the default runtime location
-/// for whoever runs, whatever `--run-dir` or `MURU_RUN_DIR` says, so it
-/// is always in the same place. Root's is the system registry.
+/// The caller's own registry: `registry` in the account's state
+/// location, whatever `--state-dir`, `MURU_STATE_DIR`, `XDG_STATE_HOME`
+/// or `HOME` says, so it is always in the same place for a user. It holds regular files, so it is never in
+/// the runtime location, which on macOS is under `/tmp`, where files are
+/// deleted by age while their owner still runs (issue 948). Root's is
+/// the system registry, which stays in `/run/muru`: that is not cleaned
+/// by age, it is emptied at boot as the instances it lists are, and
+/// every user must be able to read it, which the system state directory
+/// does not allow. A user with no home directory, as a container given
+/// an arbitrary user ID has, keeps it in the default runtime location,
+/// where nothing cleans by age inside a container.
 pub fn user_registry() -> PathBuf {
-    crate::locations::default_runtime().join("registry")
+    if crate::locations::caller_is_root() {
+        return PathBuf::from(SYSTEM_REGISTRY);
+    }
+
+    crate::locations::account_state()
+        .unwrap_or_else(crate::locations::default_user_runtime)
+        .join("registry")
 }
 
 /// An instance's ID: 128 random bits, written as 32 hex digits and shown
@@ -232,9 +246,15 @@ pub struct Record {
     pub uid: u32,
     /// How to reach its admin API.
     pub admin: Endpoint,
-    /// Its run directory: a daemon's or a serve's, or a run's own
-    /// directory under the run directory it was started with.
+    /// Its run directory, where its sockets are: a daemon's or a serve's,
+    /// or a run's own directory under the run directory it was started
+    /// with.
     pub run_dir: PathBuf,
+    /// Where it keeps its runtime files (section 13.8): `run` in a
+    /// daemon's state directory, or a run's own directory of them; none
+    /// for a serve, which keeps them with its sockets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_dir: Option<PathBuf>,
     /// A daemon's state directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_dir: Option<PathBuf>,
@@ -299,6 +319,7 @@ impl Record {
             uid,
             admin,
             run_dir,
+            files_dir: None,
             state_dir: None,
             config: None,
             log_dir: None,

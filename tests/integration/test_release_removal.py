@@ -214,7 +214,8 @@ def test_app_remove_drains_and_goes_only_once_no_route_sends_traffic(tmp_path: P
     try:
         daemon.muructl("apply", "-f", str(site(routed=True)))
         seed_files(tmp_path, "shop", "r1")
-        record = tomllib.loads((daemon.run_dir / "apps/shop/r2/host.toml").read_text())
+        host_files = daemon.host_files("shop@r2")
+        record = tomllib.loads((host_files / "host.toml").read_text())
         pid = record["pid"]
 
         # A route sends it traffic: refused, and nothing changes.
@@ -222,7 +223,7 @@ def test_app_remove_drains_and_goes_only_once_no_route_sends_traffic(tmp_path: P
         refused = daemon.muructl("app", "remove", "shop", "--yes", check=False)
         assert refused.returncode != 0 and "route" in refused.stderr
         assert alive(pid)
-        assert (daemon.run_dir / "apps/shop/r2").exists()
+        assert (host_files / "host.toml").exists()
 
         # With the route gone, the question comes first.
 

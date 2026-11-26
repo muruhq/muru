@@ -74,6 +74,10 @@ struct Inner {
     events: Events,
     /// The daemon's log directory, under which each run's output is.
     logs: PathBuf,
+    /// The directory in the runtime location under which each detached
+    /// run's relay binds its socket, in a directory named as the run's
+    /// own among the runtime files is (section 13.8).
+    sockets: PathBuf,
     /// How many ended runs of each command are kept.
     keep: AtomicUsize,
     /// Each detached run being watched, by id: where its stop goes.
@@ -92,12 +96,20 @@ struct Watched {
 
 impl Runs {
     /// The runs of a daemon with this store, event stream and log
-    /// directory, keeping `keep` ended runs of each command.
-    pub fn new(store: Arc<Store>, events: Events, logs: PathBuf, keep: usize) -> Self {
+    /// directory, the relays of detached ones binding their sockets under
+    /// `sockets`, keeping `keep` ended runs of each command.
+    pub fn new(
+        store: Arc<Store>,
+        events: Events,
+        logs: PathBuf,
+        sockets: PathBuf,
+        keep: usize,
+    ) -> Self {
         Self(Arc::new(Inner {
             store,
             events,
             logs,
+            sockets,
             keep: AtomicUsize::new(keep),
             watched: Mutex::new(HashMap::new()),
         }))
@@ -261,7 +273,18 @@ impl Runs {
             let _ = std::fs::remove_dir_all(&run.secrets);
         }
 
+        if let Some(sockets) = self.socket_dir(run) {
+            let _ = std::fs::remove_dir_all(sockets);
+        }
+
         self.prune(&run.app, &run.name);
+    }
+
+    /// Where a detached run's relay binds its socket: the directory under
+    /// the runtime location named as the run's own directory is.
+    fn socket_dir(&self, run: &RunRecord) -> Option<PathBuf> {
+        let files = run_dir(run)?;
+        Some(self.0.sockets.join(files.file_name()?))
     }
 
     /// Forget the ended runs of a command beyond those kept, and remove
@@ -294,7 +317,9 @@ impl Runs {
         let run = self.0.store.run(id).map_err(|error| error.to_string())?;
         let release_log = prepared.log.clone().unwrap_or_else(|| file.clone());
 
-        match spawn_relay(&prepared, id, &file, &release_log, executable).await {
+        let sockets = self.socket_dir(&run);
+
+        match spawn_relay(&prepared, sockets, id, &file, &release_log, executable).await {
             Ok((relay, started)) => {
                 if let Err(error) = self.0.store.set_run_process(
                     id,
@@ -352,7 +377,9 @@ impl Runs {
         let runs = self.clone();
         let id = run.id;
         let relay_named = (run.relay_pid, run.relay_start_time);
-        let control = run_dir(&run).map(|dir| dir.join(crate::relay::CONTROL_SOCKET));
+        let control = self
+            .socket_dir(&run)
+            .map(|dir| dir.join(crate::relay::CONTROL_SOCKET));
 
         let task = tokio::spawn(async move {
             let ending = watch_run(&runs, &run, relay, stops).await;
@@ -545,6 +572,7 @@ type Spawned = (tokio::process::Child, ProcessRecord);
 /// a session of its own, and wait for it to say how that went.
 async fn spawn_relay(
     prepared: &Prepared,
+    sockets: Option<PathBuf>,
     id: u64,
     file: &Path,
     release_log: &Path,
@@ -554,12 +582,16 @@ async fn spawn_relay(
         .secrets
         .clone()
         .context("a detached run needs a directory of its own")?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let sockets = sockets.context("a detached run needs a directory for its relay's socket")?;
 
-    if let Some(identity) = prepared.identity {
-        identity
-            .own(&dir)
-            .with_context(|| format!("giving {} to the application's user", dir.display()))?;
+    for made in [&dir, &sockets] {
+        std::fs::create_dir_all(made).with_context(|| format!("creating {}", made.display()))?;
+
+        if let Some(identity) = prepared.identity {
+            identity
+                .own(made)
+                .with_context(|| format!("giving {} to the application's user", made.display()))?;
+        }
     }
 
     let log = std::fs::OpenOptions::new()
@@ -574,7 +606,7 @@ async fn spawn_relay(
         .arg("relay")
         .arg("run")
         .arg("--control")
-        .arg(dir.join(crate::relay::CONTROL_SOCKET))
+        .arg(sockets.join(crate::relay::CONTROL_SOCKET))
         .arg("--record")
         .arg(dir.join(crate::relay::RECORD))
         .arg("--log-file")
@@ -737,6 +769,23 @@ async fn watch_run(
             }
         }
     }
+}
+
+/// The name of a run's own directory, among the runtime files and, for a
+/// detached run's socket, in the runtime location: the daemon's start in
+/// base 36 and the run's count since, so it is short and never another
+/// run's, whichever daemon started it.
+pub fn directory_name(started_unix_ms: u64, count: u64) -> String {
+    let mut digits = Vec::new();
+    let mut left = started_unix_ms;
+
+    while left > 0 || digits.is_empty() {
+        digits.push(std::char::from_digit((left % 36) as u32, 36).unwrap_or('0'));
+        left /= 36;
+    }
+
+    let start: String = digits.iter().rev().collect();
+    format!("{start}-{count}")
 }
 
 /// The directory a detached run's relay keeps its record in.

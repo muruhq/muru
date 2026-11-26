@@ -419,10 +419,12 @@ app = "legacy"
 
     # Drained for good, the instance is stopped and its socket removed.
 
+    sockets = daemon.host_sockets("legacy@r1")
+    assert sockets.is_dir()
     daemon.muructl("drain", "legacy@r1")
     wait_for(lambda: states().get("legacy@r1") == ("stopped", ""), 30)
     wait_for(lambda: not alive(pid))
-    assert not list((daemon.run_dir / "apps" / "legacy" / "r1").glob("**/server-*.sock"))
+    assert not sockets.exists()
 
 
 def test_a_gunicorn_deployment_cuts_over_to_native_workers_under_load(
@@ -833,7 +835,7 @@ def test_a_recorded_pid_that_another_process_has_is_not_adopted(tmp_path: Path) 
         os.kill(pid, signal.SIGKILL)
         wait_for(lambda: not alive(pid))
         bystander = subprocess.Popen(["/bin/sleep", "600"])
-        record = first.run_dir / "apps" / "legacy" / "r1" / "servers.toml"
+        record = first.files_dir / "h" / "1" / "servers.toml"
         text = record.read_text()
         assert f"pid = {pid}\n" in text
         assert "start_time = " in text and "start_time = 0\n" not in text

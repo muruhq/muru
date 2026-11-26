@@ -4431,6 +4431,27 @@ async fn run_with(
         serve::group_writable(&run_dir, 0o770);
     }
 
+    // Section 13.8 (issue 948): each host's sockets go in a directory
+    // named by its number under the run's own, and its regular files in
+    // the directory of the same number under the run's files, which are
+    // in the user state location. A serve keeps both in its run
+    // directory, which is the container's and is not cleaned by age.
+
+    let files_dir = match (&serve, registration.as_ref().and_then(|r| r.files())) {
+        (None, Some(files)) => files.to_path_buf(),
+        _ => run_dir.clone(),
+    };
+
+    let host_dirs = |release: u32| {
+        muru_controller::locations::HostDirs::numbered(&run_dir, &files_dir, release.into())
+    };
+
+    if let Err(message) = muru_controller::locations::check_socket_room(&run_dir) {
+        drop(registration);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        anyhow::bail!(message);
+    }
+
     // Section 13.12: the detour's socket is bound and the detour opened
     // before the host starts, so a refusal ends the run with the daemon's
     // reason and nothing started, and the daemon's host names and data
@@ -4620,7 +4641,7 @@ async fn run_with(
 
     let mut current = HostProcess::start(
         &spec,
-        &run_dir,
+        &host_dirs(1),
         1,
         &logs,
         relay_watcher(&label, "r1", &run_events),
@@ -5697,7 +5718,7 @@ async fn run_with(
 
                     let watcher = relay_watcher(&label, &format!("r{release}"), &run_events);
 
-                    let mut next = match HostProcess::start(&spec, &run_dir, release, &logs, watcher) {
+                    let mut next = match HostProcess::start(&spec, &host_dirs(release), release, &logs, watcher) {
                         Ok(next) => next,
                         Err(error) => {
                             muru_common::muru_println!("release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);

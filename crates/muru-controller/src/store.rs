@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS releases (
     resource_version INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (app, id)
 );
+CREATE TABLE IF NOT EXISTS release_numbers (last INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS hosts (
     name TEXT PRIMARY KEY,
     spec TEXT NOT NULL,
@@ -196,7 +197,7 @@ CREATE TABLE IF NOT EXISTS log_files_seen (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// The store.
 pub struct Store {
@@ -212,6 +213,7 @@ impl Store {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.execute_batch(SCHEMA)?;
         add_identity_columns(&connection)?;
+        number_releases(&connection)?;
 
         // Version 1 had applications, releases and events; version 2
         // added hosts and routes and version 3 the event sink cursors,
@@ -237,7 +239,9 @@ impl Store {
         // overlays by their conditions (issue 689), version 20 the import
         // report of each release's load (issue 741), and version 21 where
         // the application's data directory and its parts are (issue 849),
-        // added to an older table here.
+        // added to an older table here, and version 22 the number of each
+        // release (issue 948), given here to the releases of an older
+        // store.
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -296,6 +300,7 @@ impl Store {
         let connection = Connection::open_in_memory()?;
         connection.execute_batch(SCHEMA)?;
         add_identity_columns(&connection)?;
+        number_releases(&connection)?;
         connection.execute("INSERT INTO schema (version) VALUES (?1)", [SCHEMA_VERSION])?;
 
         Ok(Self {
@@ -536,7 +541,7 @@ impl Store {
     pub fn releases(&self, app: Option<&str>) -> Result<Vec<Release>, StoreError> {
         self.with(|connection| {
             let mut statement = connection.prepare(
-                "SELECT app, id, spec, state, message, created_unix_ms, resource_version \
+                "SELECT app, id, spec, state, message, created_unix_ms, resource_version, number \
                  FROM releases WHERE (?1 IS NULL OR app = ?1) ORDER BY created_unix_ms DESC, id DESC",
             )?;
             let rows = statement.query_map([app], release_from_row)?;
@@ -549,7 +554,7 @@ impl Store {
         self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT app, id, spec, state, message, created_unix_ms, resource_version \
+                    "SELECT app, id, spec, state, message, created_unix_ms, resource_version, number \
                      FROM releases WHERE app = ?1 AND id = ?2",
                     [app, id],
                     release_from_row,
@@ -569,9 +574,21 @@ impl Store {
         let encoded =
             toml::to_string(spec).map_err(|error| StoreError::Decode(error.to_string()))?;
         self.with(|connection| {
+            // The release's number (section 13.8, issue 948): the next of
+            // a count that only goes up, so a number never names two
+            // releases of a store, whatever was removed in between.
+
+            connection.execute("UPDATE release_numbers SET last = last + 1", [])?;
             connection.execute(
-                "INSERT INTO releases (app, id, spec, state, created_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![app, id, encoded, ReleaseState::Pending.as_str(), now_unix_ms() as i64],
+                "INSERT INTO releases (app, id, spec, state, created_unix_ms, number) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, (SELECT last FROM release_numbers))",
+                params![
+                    app,
+                    id,
+                    encoded,
+                    ReleaseState::Pending.as_str(),
+                    now_unix_ms() as i64
+                ],
             )?;
             Ok(())
         })?;
@@ -1744,8 +1761,46 @@ fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
     add_columns(
         connection,
         "releases",
-        &[("declared", "INTEGER NOT NULL DEFAULT 0")],
+        &[
+            ("declared", "INTEGER NOT NULL DEFAULT 0"),
+            ("number", "INTEGER"),
+        ],
     )
+}
+
+/// Give every release a number (version 22, issue 948): the count the
+/// numbers come from is started where the highest number is, and the
+/// releases of an older store, which have none, are numbered oldest
+/// first. A number names the release's host directory (section 13.8),
+/// which is why it is short and never an application's name or an ID.
+fn number_releases(connection: &Connection) -> Result<(), StoreError> {
+    let counted: i64 =
+        connection.query_row("SELECT COUNT(*) FROM release_numbers", [], |row| row.get(0))?;
+
+    if counted == 0 {
+        connection.execute(
+            "INSERT INTO release_numbers (last) SELECT COALESCE(MAX(number), 0) FROM releases",
+            [],
+        )?;
+    }
+
+    let unnumbered: Vec<i64> = {
+        let mut statement = connection.prepare(
+            "SELECT rowid FROM releases WHERE number IS NULL ORDER BY created_unix_ms, rowid",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+
+    for row in unnumbered {
+        connection.execute("UPDATE release_numbers SET last = last + 1", [])?;
+        connection.execute(
+            "UPDATE releases SET number = (SELECT last FROM release_numbers) WHERE rowid = ?1",
+            [row],
+        )?;
+    }
+
+    Ok(())
 }
 
 /// The columns a run is read from, in `run_from_row`'s order.
@@ -2111,6 +2166,7 @@ fn release_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Release> {
         message: row.get(4)?,
         created_unix_ms: row.get::<_, i64>(5)? as u64,
         resource_version: row.get::<_, i64>(6)? as u64,
+        number: row.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
     })
 }
 
@@ -2192,6 +2248,57 @@ pub(crate) mod tests {
         );
         assert_eq!(store.app("shop").unwrap().current.as_deref(), Some("r1"));
         assert!(store.release("shop", "r9").is_err());
+    }
+
+    #[test]
+    fn a_release_has_a_number_that_is_never_given_twice() {
+        let store = Store::in_memory().unwrap();
+        store.ensure_app("shop").unwrap();
+        store.ensure_app("blog").unwrap();
+
+        let first = store.create_release("shop", "r1", &spec()).unwrap();
+        let second = store.create_release("blog", "r1", &spec()).unwrap();
+        assert_eq!((first.number, second.number), (1, 2));
+
+        // The highest number is not given again once its release is gone.
+
+        store.delete_release("blog", "r1").unwrap();
+        let third = store.create_release("blog", "r2", &spec()).unwrap();
+        assert_eq!(third.number, 3);
+        assert_eq!(store.releases(None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_releases_of_an_older_store_are_numbered_oldest_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("muru.sqlite");
+
+        {
+            let store = Store::open(&path).unwrap();
+            store.ensure_app("shop").unwrap();
+            store.create_release("shop", "r1", &spec()).unwrap();
+            store.create_release("shop", "r2", &spec()).unwrap();
+
+            store
+                .with(|connection| {
+                    connection.execute("UPDATE releases SET number = NULL", [])?;
+                    connection.execute("DELETE FROM release_numbers", [])?;
+                    connection.execute(
+                        "UPDATE releases SET created_unix_ms = 5 WHERE id = 'r2'",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.release("shop", "r2").unwrap().number, 1);
+        assert_eq!(store.release("shop", "r1").unwrap().number, 2);
+        assert_eq!(
+            store.create_release("shop", "r3", &spec()).unwrap().number,
+            3
+        );
     }
 
     #[test]

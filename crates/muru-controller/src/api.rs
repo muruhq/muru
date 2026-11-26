@@ -4933,6 +4933,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
             .and_then(|interpreter| interpreter.request.clone())
             .unwrap_or_default(),
         environment,
+        number: release.number,
         build_when: release.spec.build.when.as_str().to_owned(),
         bytecode,
         gates,

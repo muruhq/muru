@@ -196,7 +196,7 @@ taken from the line the run prints:
 ```console
 $ muructl run --port 18631 > run.log 2>&1 &
 $ grep 'pid' run.log
-muru: pid 4211, written to /run/user/1000/muru/run-7f3a9c2e/pid
+muru: pid 4211, written to /home/dev/.local/state/muru/run/run-7f3a9c2e/pid
 $ kill -INT 4211
 ```
 

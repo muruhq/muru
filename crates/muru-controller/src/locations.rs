@@ -3,6 +3,16 @@
 //! Muru has no fixed paths. Each location is resolved from the first of:
 //! an explicit option, an environment variable, a directory systemd
 //! provides, or the default for the mode the daemon runs in.
+//!
+//! The runtime location holds sockets and nothing else (issue 948, ADR
+//! 0083). A socket's path is limited to about a hundred bytes, so the
+//! location is short, which on macOS means `/tmp`, where a nightly job
+//! deletes regular files nobody has touched for three days and leaves
+//! sockets alone. Every regular file a running instance keeps (its lock,
+//! its pid file, the records a restarted daemon re-adopts from) is in
+//! `run` under the state directory instead, in the same shape: a host's
+//! sockets are in `RUN/h/N` and its files in `STATE/run/h/N`, where N is
+//! the release's number.
 
 use std::env;
 use std::path::PathBuf;
@@ -110,7 +120,8 @@ pub struct Locations {
     pub config: Location,
     /// The state store, built environments and other durable files.
     pub state: Location,
-    /// The admin socket and per-release run directories.
+    /// The sockets: the admin socket, the edge's and each host's. Nothing
+    /// else is kept here (see [`Locations::files`]).
     pub run: Location,
     /// Log files, when file sinks are configured.
     pub logs: Location,
@@ -122,23 +133,124 @@ pub struct Locations {
 /// included: sun_path is 104 bytes on macOS and 108 on Linux.
 pub const SOCKET_PATH_LIMIT: usize = if cfg!(target_os = "macos") { 104 } else { 108 };
 
-/// What a worker's socket path takes below the run directory besides the
-/// application's name: `/apps/APP/RID/RID/worker-N-gG.sock` with a release
-/// id of four characters and two digits each for the worker and its
-/// generation.
-const SOCKET_PATH_OVERHEAD: usize =
-    "/apps/".len() + "/r999".len() * 2 + "/worker-99-g99.sock".len();
+/// The directory, in the runtime location and in the runtime files, that
+/// holds one directory per host, named by a number.
+pub const HOSTS_DIR: &str = "h";
 
-/// The room an application's name must have in the socket path for the
-/// run directory to be accepted at all.
-const SHORTEST_NAME_ROOM: usize = 8;
+/// The directory in the runtime location that holds the edge's sockets:
+/// the edge's own, so that it can bind them as the service user.
+pub const EDGE_DIR: &str = "e";
+
+/// The directory in the state directory that holds the runtime files.
+pub const FILES_DIR: &str = "run";
+
+/// The longest a socket's path is below the run directory, whatever the
+/// application, the release and its groups are called: a host's
+/// directory with a number of five digits, and in it the socket of a
+/// named group's worker, with two digits each for the group, the worker
+/// and its generation.
+pub const SOCKET_PATH_OVERHEAD: usize = "/h/99999".len() + "/worker-99-99-g99.sock".len();
+
+/// What a development run's own directory adds to that, between the run
+/// directory and its hosts: `/run-` and the eight digits of its short ID.
+pub const RUN_PATH_OVERHEAD: usize = "/run-01234567".len();
+
+/// The directory of host `number` under `base`, which is a runtime
+/// location or its runtime files.
+pub fn host_dir(base: &std::path::Path, number: u64) -> PathBuf {
+    base.join(HOSTS_DIR).join(number.to_string())
+}
+
+/// The two directories of one host, or of the instances of one managed
+/// server release: its sockets in the runtime location, and its files
+/// among the runtime files (section 13.8, issue 948).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDirs {
+    /// Where its sockets are bound: the workers', its control socket and
+    /// its relay's.
+    pub sockets: PathBuf,
+    /// Where its regular files are: its relay's record, and what the
+    /// host and its starter leave for each other.
+    pub files: PathBuf,
+}
+
+impl HostDirs {
+    /// The directories of host `number` under a runtime location and its
+    /// runtime files.
+    pub fn numbered(sockets: &std::path::Path, files: &std::path::Path, number: u64) -> Self {
+        Self {
+            sockets: host_dir(sockets, number),
+            files: host_dir(files, number),
+        }
+    }
+
+    /// One directory as both, where nothing deletes files by age: the
+    /// run directory of `muructl serve`, which is the container's.
+    pub fn together(directory: &std::path::Path) -> Self {
+        Self {
+            sockets: directory.to_path_buf(),
+            files: directory.to_path_buf(),
+        }
+    }
+
+    /// Make both directories. They are made whenever they are needed and
+    /// never assumed, since an empty directory under `/tmp` is removed by
+    /// age as a file is.
+    pub fn create(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.sockets)?;
+        std::fs::create_dir_all(&self.files)
+    }
+
+    /// Remove both directories and what is in them.
+    pub fn remove(&self) {
+        let _ = std::fs::remove_dir_all(&self.sockets);
+        let _ = std::fs::remove_dir_all(&self.files);
+    }
+}
+
+/// Whether the daemon that owns the run directory `run` is one from
+/// before the runtime files moved to the state directory (issue 948): it
+/// keeps its lock in a file there, which this version never makes.
+pub fn earlier_daemon_owns(run: &std::path::Path) -> bool {
+    run.join("daemon.lock").is_file()
+}
+
+/// Whether the run directory `run` holds the records of an edge or of
+/// hosts that such an earlier daemon started and did not stop: this
+/// version reads its records from the state directory, so it could
+/// neither take them over nor know they are there.
+pub fn earlier_daemon_left(run: &std::path::Path) -> bool {
+    run.join("edge.toml").is_file() || run.join("apps").is_dir()
+}
+
+/// Check that the longest socket path under `sockets`, the directory of a
+/// daemon or of a development run, fits the platform's limit.
+pub fn check_socket_room(sockets: &std::path::Path) -> Result<(), String> {
+    let length = sockets.as_os_str().len();
+    let longest = length + SOCKET_PATH_OVERHEAD;
+
+    // The limit counts the NUL that ends the path.
+
+    if longest >= SOCKET_PATH_LIMIT {
+        return Err(format!(
+            "the run directory {} is {length} bytes long, and a worker's socket path under it \
+             can be {longest} bytes, past the {} this platform allows; give --run-dir or \
+             MURU_RUN_DIR a shorter path",
+            sockets.display(),
+            SOCKET_PATH_LIMIT - 1
+        ));
+    }
+
+    Ok(())
+}
 
 impl Locations {
     /// Check the run directory before anything binds a socket under it.
     /// It must be absolute, since the workers and the edge bind their
     /// sockets by the paths they are given wherever they run, and short
-    /// enough to leave a worker's socket path within the platform's
-    /// limit, which it otherwise exceeds only once a release starts.
+    /// enough that the longest socket path under it is within the
+    /// platform's limit. No path under it carries a name, so a directory
+    /// that passes here never fails later for what a release is called.
     pub fn check_run_dir(&self) -> Result<(), String> {
         let run = &self.run.path;
 
@@ -150,20 +262,7 @@ impl Locations {
             ));
         }
 
-        let length = run.as_os_str().len();
-        let room = SOCKET_PATH_LIMIT.saturating_sub(length + SOCKET_PATH_OVERHEAD + 1);
-
-        if room < SHORTEST_NAME_ROOM {
-            return Err(format!(
-                "the run directory {} is {length} bytes long, which leaves {room} bytes for an \
-                 application's name in its workers' socket paths, limited to \
-                 {SOCKET_PATH_LIMIT} bytes on this platform; give --run-dir or MURU_RUN_DIR a \
-                 shorter path",
-                run.display()
-            ));
-        }
-
-        Ok(())
+        check_socket_room(run)
     }
 
     /// Resolve every location for the given options and environment.
@@ -316,9 +415,48 @@ impl Locations {
         self.logs.path.join("edge.log")
     }
 
+    /// The runtime files: every regular file the running daemon keeps,
+    /// in `run` under the state directory, never in the runtime location
+    /// (issue 948).
+    pub fn files(&self) -> PathBuf {
+        self.state.path.join(FILES_DIR)
+    }
+
     /// The daemon's pid file, for a background daemon.
     pub fn pid_file(&self) -> PathBuf {
-        self.run.path.join("daemon.pid")
+        self.files().join("daemon.pid")
+    }
+
+    /// The record of the running edge, which a restarted daemon re-adopts
+    /// it from.
+    pub fn edge_record(&self) -> PathBuf {
+        self.files().join("edge.toml")
+    }
+
+    /// The directory of the edge's sockets.
+    pub fn edge_sockets(&self) -> PathBuf {
+        self.run.path.join(EDGE_DIR)
+    }
+
+    /// The directory of the edge's own files: the rate limits' buckets.
+    pub fn edge_files(&self) -> PathBuf {
+        self.files().join("edge")
+    }
+
+    /// The sockets of the host of release number `number`.
+    pub fn host_sockets(&self, number: u64) -> PathBuf {
+        host_dir(&self.run.path, number)
+    }
+
+    /// The files of the host of release number `number`: its record, its
+    /// relay's, and the secrets delivered as files.
+    pub fn host_files(&self, number: u64) -> PathBuf {
+        host_dir(&self.files(), number)
+    }
+
+    /// Both directories of the host of release number `number`.
+    pub fn host_dirs(&self, number: u64) -> HostDirs {
+        HostDirs::numbered(&self.run.path, &self.files(), number)
     }
 
     /// The access log the edge writes, as JSON lines.
@@ -492,17 +630,54 @@ pub fn user_state() -> PathBuf {
         })
 }
 
-/// The default runtime location for whoever runs: the system one for
-/// root, the user's otherwise, whatever an option or variable says. The
-/// instance registry lives there (section 13.8).
-pub fn default_runtime() -> PathBuf {
-    default_run(if is_root() { Mode::System } else { Mode::User })
+/// Whether the caller is root, whose instances are the system's.
+pub fn caller_is_root() -> bool {
+    is_root()
+}
+
+/// The state location of the account that runs, which depends on
+/// nothing but who the user is: the home directory is the password
+/// database's and not `HOME`, and no option, `MURU_STATE_DIR` or
+/// `XDG_STATE_HOME` moves it. The user's instance registry is there
+/// (section 13.8, issue 948), so that every process of the user finds
+/// the same one, whatever environment it was started with. None for a
+/// user with no account or no home directory, as a container given an
+/// arbitrary user ID has.
+pub fn account_state() -> Option<PathBuf> {
+    // SAFETY: getuid has no preconditions and cannot fail.
+
+    let uid = unsafe { libc::getuid() };
+    let home = crate::host::Identity::account_home(uid).filter(|home| home.is_dir())?;
+    Some(account_state_in(&home))
+}
+
+/// Where the account with the home directory `home` keeps its state, as
+/// [`account_state`] gives the caller's.
+pub fn account_state_in(home: &std::path::Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/muru")
+    } else {
+        home.join(".local/state/muru")
+    }
+}
+
+/// The user's default runtime location, whatever an option or variable
+/// says: where the registry of a user with no home directory is.
+pub fn default_user_runtime() -> PathBuf {
+    default_run(Mode::User)
+}
+
+/// Where each development run keeps its runtime files, one directory a
+/// run: `run` under the user state location.
+pub fn user_run_files() -> PathBuf {
+    user_state().join(FILES_DIR)
 }
 
 fn default_run(mode: Mode) -> PathBuf {
     match mode {
         Mode::System => PathBuf::from("/run/muru"),
-        // Short, for the 104-byte limit on socket paths.
+        // Short, for the 104-byte limit on socket paths. Only sockets go
+        // here: macOS deletes regular files in /tmp by age.
         Mode::User if cfg!(target_os = "macos") => {
             // SAFETY: getuid has no preconditions and cannot fail.
 
@@ -557,6 +732,65 @@ mod tests {
             PathBuf::from("/tmp/run/admin.sock")
         );
         assert_eq!(locations.cache.rule, "default");
+    }
+
+    #[test]
+    fn sockets_are_in_the_run_directory_and_every_file_in_the_state_directory() {
+        let locations = Locations::resolve(&Options {
+            state_dir: Some(PathBuf::from("/srv/state")),
+            run_dir: Some(PathBuf::from("/tmp/run")),
+            ..Options::default()
+        });
+
+        assert_eq!(locations.host_sockets(142), PathBuf::from("/tmp/run/h/142"));
+        assert_eq!(locations.edge_sockets(), PathBuf::from("/tmp/run/e"));
+
+        for file in [
+            locations.pid_file(),
+            locations.edge_record(),
+            locations.edge_files(),
+            locations.host_files(142),
+        ] {
+            assert!(file.starts_with("/srv/state/run"), "{}", file.display());
+        }
+
+        assert_eq!(
+            locations.host_files(142),
+            PathBuf::from("/srv/state/run/h/142")
+        );
+    }
+
+    #[test]
+    fn the_longest_socket_path_does_not_depend_on_any_name() {
+        // The longest socket of a host, and of an edge and a managed
+        // server, against the overhead the check allows for.
+
+        let host = host_dir(std::path::Path::new(""), 99_999);
+
+        for socket in [
+            "worker-99-99-g99.sock",
+            "worker-99-g99.sock",
+            "control.sock",
+            "relay.sock",
+            "output.sock",
+            "server-99.sock",
+            "relay-99.sock",
+        ] {
+            let length = host.join(socket).as_os_str().len();
+            assert!(length <= SOCKET_PATH_OVERHEAD, "{socket}: {length}");
+        }
+
+        assert_eq!(SOCKET_PATH_OVERHEAD, 30);
+        assert!("/e/edge-999-listener.sock".len() <= SOCKET_PATH_OVERHEAD);
+
+        // A directory is accepted exactly while the longest path fits.
+
+        let limit = SOCKET_PATH_LIMIT - 1;
+        let fits = format!("/{}", "d".repeat(limit - SOCKET_PATH_OVERHEAD - 1));
+        let over = format!("{fits}d");
+        assert!(check_socket_room(std::path::Path::new(&fits)).is_ok());
+        let refused = check_socket_room(std::path::Path::new(&over)).unwrap_err();
+        assert!(refused.contains("shorter path"), "{refused}");
     }
 
     #[test]

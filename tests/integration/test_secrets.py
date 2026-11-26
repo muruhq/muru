@@ -131,7 +131,8 @@ def test_secrets_are_resolved_from_every_kind_of_store_and_never_shown(tmp_path:
         assert content == "value-for-shop/api-key"
         assert Path(command_file) != file_path
         assert not Path(command_file).exists()
-        assert not (daemon.run_dir / "apps" / "plain" / "r1" / "commands").exists()
+        commands = daemon.files_dir / "c"
+        assert not commands.exists() or list(commands.iterdir()) == []
         assert file_path.exists()
 
         # What the daemon records, exports and prints names the store and

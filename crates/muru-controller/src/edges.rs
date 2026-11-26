@@ -49,6 +49,10 @@ pub struct EdgeSpec {
     pub access_log: Option<PathBuf>,
     /// Where upload routes store files (section 4.11).
     pub spool: PathBuf,
+    /// The file of the rate limits' shared buckets (section 4.15), in
+    /// the edge's own directory of the runtime files, which every
+    /// generation of the edge maps.
+    pub buckets: PathBuf,
     /// Whom the edge runs as, when the daemon is root (ADR 0026): the
     /// service user, never root.
     pub identity: Option<crate::host::Identity>,
@@ -79,12 +83,6 @@ const LISTENER_FD: i32 = 3;
 
 /// How many listeners an edge can be handed.
 const MAX_LISTENERS: usize = 16;
-
-/// The directory under the runtime directory that holds the edges'
-/// sockets: the edge's own, so that it can bind them as the service user.
-pub fn directory(run_dir: &Path) -> PathBuf {
-    run_dir.join("edge")
-}
 
 /// The file of the rate limits' shared buckets in the edges' directory,
 /// named for its layout.
@@ -131,6 +129,7 @@ impl EdgeProcess {
         log: PathBuf,
         access_log: Option<PathBuf>,
         spool: PathBuf,
+        buckets: PathBuf,
         identity: Option<crate::host::Identity>,
         scope: String,
     ) -> anyhow::Result<Self> {
@@ -174,6 +173,7 @@ impl EdgeProcess {
                 log,
                 access_log,
                 spool,
+                buckets,
                 identity,
                 scope,
             },
@@ -220,20 +220,15 @@ impl EdgeProcess {
         self.spec.generation
     }
 
-    /// Move the spec's sockets to the next generation, into the edges'
-    /// directory: an edge adopted from a daemon that kept its sockets in
-    /// the runtime directory itself moves there with its replacement.
+    /// Move the spec's sockets to the next generation, in the edge's
+    /// directory.
     fn next_generation(&mut self) {
-        let mut directory = self
+        let directory = self
             .spec
             .control
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default();
-
-        if directory.file_name().is_none_or(|name| name != "edge") {
-            directory = self::directory(&directory);
-        }
 
         self.spec.generation += 1;
         let (control, listener_socket) = socket_paths(&directory, self.spec.generation);
@@ -620,9 +615,14 @@ async fn finish(mut process: Process, control: PathBuf, listener_socket: PathBuf
 /// its log.
 fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
     // The edge binds its sockets in a directory of its own, which belongs
-    // to the user it runs as.
+    // to the user it runs as, and keeps its buckets in another, among the
+    // runtime files. Both are made each time, since the sockets' one may
+    // have been removed while it was empty.
 
-    if let Some(directory) = spec.control.parent() {
+    for directory in [spec.control.parent(), spec.buckets.parent()]
+        .into_iter()
+        .flatten()
+    {
         std::fs::create_dir_all(directory)
             .with_context(|| format!("creating {}", directory.display()))?;
 
@@ -664,15 +664,11 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         .arg(&spec.scope)
         .envs(crate::instance::variables());
 
-    // Section 4.15: the rate limits' buckets, in the edges' directory,
-    // which every generation of the edge maps, so a replacement draws
-    // from the buckets of the edge it replaces.
+    // Section 4.15: the rate limits' buckets, which every generation of
+    // the edge maps, so a replacement draws from the buckets of the edge
+    // it replaces.
 
-    if let Some(directory) = spec.control.parent() {
-        command
-            .arg("--rate-buckets")
-            .arg(directory.join(BUCKETS_FILE));
-    }
+    command.arg("--rate-buckets").arg(&spec.buckets);
 
     if let Some(path) = &spec.access_log {
         command.arg("--access-log").arg(path);

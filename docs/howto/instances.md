@@ -2,7 +2,9 @@
 
 Every Muru instance on a machine, a daemon, a development run with
 `muructl run` or a `muructl serve`, registers itself when it starts, in
-a registry of your own in your runtime directory. `muructl instance list`
+a registry of your own, `registry` in the state location under your home
+directory (`~/Library/Application Support/muru` on macOS,
+`~/.local/state/muru` on Linux). `muructl instance list`
 reads it, so you can see what runs, where each instance listens and where
 it was started from, and what was left behind when one did not stop
 cleanly.
@@ -65,7 +67,8 @@ also lists every user's instances.
 with its `state`, its `location`, `local`, and for an instance that can
 be reached its `selector`, the value the NAME column shows.
 
-The list is the same whatever run directory an instance was given, so
+The list is the same whatever run directory, state directory or `HOME`
+an instance was given, so
 the development runs a test session starts under its own `MURU_RUN_DIR`
 are listed, though commands run outside the session never reach them.
 `muructl status` with nothing listening where it looked says how many

@@ -31,7 +31,7 @@ readiness = { path = '/healthz', timeout = '60s' }
 | `profile` | required | `gunicorn`, `uvicorn`, `granian`, `mod_wsgi-express`, `uwsgi` or `generic`; fixes how the server binds and how it is stopped |
 | `command` | required | the server's command line; a bare name is found on `PATH`, a relative path with a directory in it is taken from `cwd` |
 | `cwd` | `source` | the directory the command runs in; one of the two is required |
-| `bind` | `unix` | `unix`, a socket per instance under the release's run directory, or `port`, a free loopback port per instance |
+| `bind` | `unix` | `unix`, a socket per instance in the release's socket directory, or `port`, a free loopback port per instance |
 | `instances` | `1` | how many instances of the command run, each with its own address |
 | `readiness` | none | `path` is probed with a GET every 100 ms until it answers 2xx or 3xx; without it any HTTP response makes the instance ready. `timeout` (default `60s`) is how long the instances get |
 | `stop_signal` | the profile's | the signal that stops an instance gracefully: `TERM`, `INT`, `QUIT`, `HUP`, `USR1`, `USR2` or `WINCH`; required by `generic` |
@@ -55,8 +55,9 @@ the rest) do not apply to a managed server and are refused.
 
 ## Binding
 
-Each instance gets an address of its own: a Unix socket under the
-release's run directory, or a loopback port. The command says where the
+Each instance gets an address of its own: a Unix socket in the release's
+socket directory, which is named by the release's number (`h/7` in the
+daemon's run directory for the release numbered 7), or a loopback port. The command says where the
 server takes it:
 
 - `{bind}` is replaced by the address in the server's own form: for
@@ -207,8 +208,8 @@ it was read in front, and a tag naming the instance, by its
 error and `muru.instance[0].stdout:` for standard output.
 
 ```
-2026-11-02T05:42:22.840Z muru.instance[0]: [2026-11-02 05:42:22 +0000] [48213] [INFO] Listening at: unix:/run/muru/apps/shop/r4/r1/server-0.sock
-2026-11-02T05:42:22.851Z muru.instance[1]: [2026-11-02 05:42:22 +0000] [48214] [INFO] Listening at: unix:/run/muru/apps/shop/r4/r1/server-1.sock
+2026-11-02T05:42:22.840Z muru.instance[0]: [2026-11-02 05:42:22 +0000] [48213] [INFO] Listening at: unix:/run/muru/h/7/server-0.sock
+2026-11-02T05:42:22.851Z muru.instance[1]: [2026-11-02 05:42:22 +0000] [48214] [INFO] Listening at: unix:/run/muru/h/7/server-1.sock
 ```
 
 The relays hold, cut and drop lines under the `[logs]` settings, and open
@@ -222,7 +223,7 @@ with a new relay, as one that exits is.
 
 A daemon that stops without `--shutdown`, or upgrades itself, leaves
 the instances and their relays running, and the next daemon takes them
-over from the record in the release's run directory, one instance at a
+over from the record the daemon keeps in its state directory, one instance at a
 time. An instance that is still running is taken over as it is, with
 its relay. An instance that was waiting to be started again when the
 daemon stopped is started again within a second at the same address,
@@ -257,8 +258,8 @@ waits to be started again), `address` and `started_unix_ms`:
 
 ```
 command      .venv/bin/gunicorn shop.wsgi:application
-instance 0   pid 48213, unix:/run/muru/apps/shop/r4/r1/server-0.sock
-instance 1   pid 48214, unix:/run/muru/apps/shop/r4/r1/server-1.sock
+instance 0   pid 48213, unix:/run/muru/h/7/server-0.sock
+instance 1   pid 48214, unix:/run/muru/h/7/server-1.sock
 ```
 
 ## Cutting over

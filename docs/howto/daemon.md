@@ -139,6 +139,7 @@ entrypoint and sizes, and its worker groups and mounts:
 ```
 release      shop@r3
 state        ready, serving
+number       3
 source       /srv/shop
 python       /srv/shop/.venv/bin/python
 entrypoint   shop.wsgi:application, WSGI (detected)
@@ -996,13 +997,13 @@ bytecode.
 
 ## Where things live
 
-The daemon keeps its state store, run directory and logs in the user
+The daemon keeps its state, its sockets and its logs in the user
 locations for the platform, or the system locations with `--system`:
 
 | What | Linux, user | macOS, user | System |
 | --- | --- | --- | --- |
-| State store | `~/.local/state/muru` | `~/Library/Application Support/muru` | `/var/lib/muru` |
-| Admin socket and run directories | `$XDG_RUNTIME_DIR/muru` | `/tmp/muru-UID` | `/run/muru` |
+| State directory: the state store and every file the daemon keeps | `~/.local/state/muru` | `~/Library/Application Support/muru` | `/var/lib/muru` |
+| Run directory: sockets only | `$XDG_RUNTIME_DIR/muru`, or `/tmp/muru-UID` when that is not set | `/tmp/muru-UID` | `/run/muru` |
 | Logs | `~/.local/state/muru/logs` | `~/Library/Logs/muru` | `/var/log/muru` |
 | Configuration file | `~/.config/muru/muru.toml` | `~/Library/Application Support/muru/muru.toml` | `/etc/muru/muru.toml` |
 
@@ -1017,12 +1018,68 @@ commands, `muructl up` and `muructl mcp serve --up`, so one set of
 flags starts, stops and reloads a daemon. So does `muructl secret`,
 which reads the daemon's file. Every other command only talks to a
 running daemon, and takes `--socket`, `--run-dir` and `--system` to find
-it. The run
-directory must be an absolute path, and a Unix socket path is limited to
-104 bytes on macOS and 108 on Linux, so a run directory too deep to leave
-room for the workers' sockets, which sit about 35 bytes plus the
-application's name below it, is refused at start with a message saying
-so.
+it.
+
+### Sockets and files
+
+The run directory holds sockets and nothing else. It is a short path
+because a Unix socket's path is limited to 103 bytes on macOS and 107 on
+Linux, and on macOS that means a directory under `/tmp`, where the
+system deletes files that have not been touched for three days. So every
+file the running daemon keeps is in `run` under the state directory,
+which nothing cleans. With a release whose number is 142:
+
+```
+/tmp/muru-501/                           the run directory
+├── admin.sock                           the admin API, which muructl talks to
+├── e/
+│   ├── edge-1.sock                      the daemon's connection to the edge
+│   └── edge-1-listener.sock             the edge hands its listeners back to a new daemon
+└── h/
+    └── 142/                             one release's host
+        ├── control.sock                 the daemon's connection to the host
+        ├── relay.sock                   the daemon's connection to the host's log relay
+        ├── output.sock                  the workers' output, to the relay
+        ├── worker-0.sock                requests to a worker of the default group
+        └── worker-1-0.sock              requests to a worker of the first named group
+```
+
+```
+~/Library/Application Support/muru/      the state directory
+├── muru.sqlite                          the state store
+├── daemon.lock                          held while the daemon runs
+├── registry/                            the instances running on this machine
+└── run/                                 what the running daemon keeps
+    ├── daemon.pid
+    ├── edge.toml                        the edge, for the next daemon to take over
+    ├── edge/rate-buckets-v1             the rate limits' counts
+    └── h/142/                           one release's host
+        ├── host.toml                    the host, for the next daemon to take over
+        ├── relay.toml                   its log relay
+        └── secrets/                     secrets delivered as files
+```
+
+A host's directory is named by its release's number, which `muructl
+release show` prints as `number`, and a named group's sockets by the
+group's place among the named groups, so no socket's path carries an
+application's name, a release's ID or a group's name. The longest path
+is 30 bytes below the run directory, whatever anything is called. The
+run directory must be an absolute path, and one too long to leave those
+30 bytes is refused at start:
+
+```console
+$ muructl daemon start --run-dir /srv/a/very/long/path/that/goes/on/for/eighty/bytes/and/then/some/more
+muru: error: the run directory /srv/a/very/long/path/that/goes/on/for/eighty/bytes/and/then/some/more is 79 bytes long, and a worker's socket path under it can be 109 bytes, past the 103 this platform allows; give --run-dir or MURU_RUN_DIR a shorter path
+```
+
+The registry of running instances is always in the state location of
+your account, under your home directory, whatever `--state-dir`,
+`MURU_STATE_DIR` or `HOME` says, so every command finds the same one;
+the system daemon's is `/run/muru/registry`, which every user can read.
+
+A daemon started over files from before a reboot removes the ones with
+nothing behind them: the run directory is emptied at boot and the state
+directory is not.
 
 The configuration file is optional. Its `[[listener]]` entries name the
 addresses to serve, each with `tls = true` when the edge terminates TLS
@@ -1053,7 +1110,8 @@ of Muru's that holds it, as a reload that adds a listener does too.
 Without either, the error is the operating system's own.
 
 A daemon owns its state directory and its run directory for as long as
-it runs, through a lock on `daemon.lock` in each. A second daemon given
+it runs, through a lock on `daemon.lock` in the state directory and a
+lock on the run directory itself. A second daemon given
 either of them, by the same flags or by different ones that share a
 directory, is refused before it touches anything, naming the daemon that
 has it:
@@ -1067,7 +1125,7 @@ muru: error: another daemon (pid 4242) is using the run directory /run/muru; its
 process however it ends, so a daemon that was killed leaves nothing in
 the way of the next.
 
-The daemon writes its pid to `daemon.pid` in the runtime directory and
+The daemon writes its pid to `run/daemon.pid` in the state directory and
 removes the file when it exits. `muructl up` does the same and is harmless when one already runs. `muructl daemon
 status` and `muructl status` show the daemon, its edge process, its
 listener, its admin socket, its configuration file and its state, run,
@@ -1294,12 +1352,11 @@ webhooks; the [events guide](events.md) has the details.
 `muructl daemon stop` detaches: the daemon exits, and the edge and every
 host keep serving exactly as they were. The next `muructl daemon start`
 (or `up`, or a service manager restarting the unit) finds them through
-the records in the runtime directory, takes them over, and carries on,
+the records in `run` under the state directory, takes them over, and carries on,
 so a daemon restart or upgrade never costs a request. `muructl daemon
 stop --shutdown` drains every release, stops the hosts and the edge, and
 then exits, for taking a node out of service. It leaves no records
-behind in the runtime directory, and the next daemon starts the current
-releases afresh.
+behind, and the next daemon starts the current releases afresh.
 
 A host whose daemon is gone keeps its workers; a host that dies takes
 its workers with it, and the next daemon starts its release again. A
@@ -1385,8 +1442,8 @@ Two directories outlive the container:
 - the log directory, so that the logs can be read after the container
   has gone and collected while it runs.
 
-The run directory and `/tmp` hold only what the running processes need,
-and can be memory-backed.
+The run directory holds only sockets, and with `/tmp` can be
+memory-backed.
 
 ### Logs
 

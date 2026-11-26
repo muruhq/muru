@@ -1292,6 +1292,7 @@ message Release {
   Detour detour = 39;               // a detour's run and traffic, for kind detour
   map<string, string> metadata = 40; // what its deploy recorded of where its code came from
   string notice = 41;               // on a deploy's answer: what its caller should be told, as that applied files declare the application and do not have this release (issue 933)
+  uint64 number = 42;               // its number among every release the daemon has held, which names its host's directories (issue 948); 0 for a detour
 }
 
 // A gate a release passed: a run of a command at a point in its life.

@@ -78,6 +78,22 @@ def test_socket_paths_carry_the_generation_of_a_replacement(tmp_path: Path) -> N
     assert instance.socket_path(0) == str(tmp_path / "worker-0.sock")
 
 
+def test_a_named_groups_sockets_carry_its_place_and_never_its_name(tmp_path: Path) -> None:
+    # No socket's path grows with a name (design specification section
+    # 13.8): the first named group is 1, the second 2.
+
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    groups = [host.Group("api", 2, 1, 1, 1), host.Group("a-long-name-for-a-group", 1, 1, 1, 1)]
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1, groups=groups)
+
+    assert instance.socket_path(0) == str(tmp_path / "worker-0.sock")
+    assert instance.socket_path(2) == str(tmp_path / "worker-1-1.sock")
+    assert instance.socket_path(3) == str(tmp_path / "worker-2-0.sock")
+    instance.generation[3] = 4
+    assert instance.socket_path(3) == str(tmp_path / "worker-2-0-g4.sock")
+    assert instance.files_dir == str(tmp_path)
+
+
 def test_a_group_recycles_by_its_own_settings_else_the_releases(tmp_path: Path) -> None:
     release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
     name, recycle = host.parse_group_recycle("api=5,off")

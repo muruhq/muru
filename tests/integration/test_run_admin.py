@@ -764,14 +764,24 @@ def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
         assert server.wait_for_log(f"dashboard on http://127.0.0.1:{port}/")
         assert 'href="workers?release=plain-wsgi@r1"' in read("/fragment/overview")
 
-        # Issue 764: the run's process id is printed, and written beside
-        # its admin socket.
+        # Issue 764: the run's process id is printed, and written among
+        # the run's files, in a directory named as the one of its sockets
+        # is, under the state location: the run directory holds sockets
+        # and nothing else (issue 948).
 
         written = re.search(r"pid (\d+), written to (\S+)", server.log())
         assert written, server.log()
         assert int(written.group(1)) == server.process.pid
         assert Path(written.group(2)).read_text() == f"{server.process.pid}\n"
-        assert Path(written.group(2)).parent == server.admin_socket().parent
+        files = Path(written.group(2)).parent
+        sockets = server.admin_socket().parent
+        assert files.name == sockets.name and files.parent.name == "run"
+        assert files != sockets
+        assert (sockets / "h" / "1" / "worker-0.sock").is_socket()
+        assert (files / "h" / "1" / "relay.toml").is_file()
+        assert [
+            path for path in sockets.rglob("*") if not path.is_socket() and not path.is_dir()
+        ] == []
         page = read("/workers?release=plain-wsgi@r1")
         assert "<title>Muru: plain-wsgi@r1 workers</title>" in page
         assert '<a href="./">run</a>' in page

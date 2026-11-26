@@ -186,7 +186,7 @@ def test_a_failed_start_with_nothing_serving_leaves_no_edge(tmp_path: Path, know
 
     if known:
         assert "nothing was serving, so its edge is not started" in said, said
-        assert not (run_dir / "edge.toml").exists()
+        assert not (tmp_path / "state" / "run" / "edge.toml").exists()
     else:
         assert "nothing was serving, so its edge stops with it" in said, said
 
