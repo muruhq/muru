@@ -519,78 +519,22 @@ pub fn plan(
 ) -> Plan {
     let mut plan = Plan::default();
 
-    // Listeners and limits are node settings, read from the daemon's own
-    // file at start-up (section 10.3).
+    // ADR 0079: the daemon's own tables are no part of what an apply
+    // changes, and one in an applied file is refused, where some were
+    // skipped with a warning and others without a word.
 
-    if !document.listener.is_empty() {
-        plan.warnings.push(
-            "[[listener]] entries belong in the daemon configuration file and were not applied"
-                .to_owned(),
-        );
-    }
-
-    if document.limits.is_some() {
-        plan.warnings.push(
-            "the [limits] table belongs in the daemon configuration file and was not applied"
-                .to_owned(),
-        );
-    }
-
-    if document.proxy.is_some() {
-        plan.warnings.push(
-            "the [proxy] table belongs in the daemon configuration file and was not applied"
-                .to_owned(),
-        );
-    }
-
-    if document.metrics.is_some() {
-        plan.warnings.push(
-            "the [metrics] table belongs in the daemon configuration file and was not applied"
-                .to_owned(),
-        );
-    }
-
-    if document.events.is_some() {
-        plan.warnings.push(
-            "the [events] table belongs in the daemon configuration file and was not applied"
-                .to_owned(),
-        );
-    }
-
-    if document.dashboard.is_some() {
-        plan.warnings.push(
-            "the [dashboard] table belongs in the daemon configuration file and was not applied"
-                .to_owned(),
-        );
-    }
-
-    if document.logging.is_some() {
-        plan.warnings.push(
-            "the node-wide [logging] table belongs in the daemon configuration file and was not \
-             applied; an application's or a release's own logging table is"
-                .to_owned(),
-        );
-    }
-
-    if document.overlay_webhook.is_some() {
-        plan.warnings.push(
-            "the [overlay_webhook] table belongs in the daemon configuration file and was not applied"
-                .to_owned(),
-        );
-    }
-
-    if !document.error_pages.is_empty() || document.error_override.is_some() {
-        plan.warnings.push(
-            "the node-wide [error_pages] and [error_override] tables belong in the daemon \
-             configuration file and were not applied"
-                .to_owned(),
-        );
+    for table in document.daemon_tables() {
+        plan.errors.push(format!(
+            "{table} is part of the daemon's own configuration, which muructl apply does not \
+             change: put it in the daemon's configuration file and run muructl daemon reload"
+        ));
     }
 
     // Sections 4.14 and 4.15: the document's classes and limits come
     // first, so what follows may name them.
 
     plan_clients(store, document, defined, prune, &mut plan);
+    let file_conditions = &defined.conditions;
     let defined = &defined.with_applied(store, document, prune);
 
     let mut promotions = Vec::new();
@@ -647,7 +591,7 @@ pub fn plan(
     plan_upstreams(store, document, &mut plan);
     plan_routes(store, document, defined, &mut plan);
     plan_overlays(store, document, defined, prune, &mut plan);
-    plan_conditions(store, document, &mut plan);
+    plan_conditions(store, document, file_conditions, &mut plan);
     plan.changes.extend(promotions);
     plan_budget(document, defined, &mut plan);
 
@@ -2138,11 +2082,27 @@ fn stored_routes_named(
 
 /// Section 9.10 (issue 123): the named conditions a document declares,
 /// each checked, with a warning for one with no hysteresis.
-fn plan_conditions(store: &Store, document: &Document, plan: &mut Plan) {
+fn plan_conditions(
+    store: &Store,
+    document: &Document,
+    file: &BTreeMap<String, muru_config::Condition>,
+    plan: &mut Plan,
+) {
     let stored: BTreeMap<String, muru_config::Condition> =
         store.conditions().unwrap_or_default().into_iter().collect();
 
     for (name, condition) in &document.condition {
+        // ADR 0079: a name the daemon's file defines is the node's, as
+        // for a client class and a rate limit, where an applied
+        // condition of that name was left out with a line in the log.
+
+        if file.contains_key(name) {
+            plan.errors.push(format!(
+                "condition {name}: the daemon configuration file defines it"
+            ));
+            continue;
+        }
+
         match muru_config::condition::check(name, condition) {
             Ok(warnings) => plan.warnings.extend(warnings),
             Err(error) => {
@@ -8974,11 +8934,20 @@ mod tests {
             &Defined::default(),
             &crate::provision::Provisioning::off(),
         );
-        assert_eq!(plan.errors.len(), 3, "{:?}", plan.errors);
-        assert!(plan.errors[0].contains("\"Shop\" is not a valid application name"));
-        assert!(plan.errors[1].contains("shop@r1 has no source directory"));
-        assert!(plan.errors[2].contains("is not a directory"));
-        assert_eq!(plan.warnings.len(), 1);
+
+        // A table of the daemon's own configuration is an error too
+        // (issue 862), where it was a warning.
+
+        assert_eq!(plan.errors.len(), 4, "{:?}", plan.errors);
+        assert_eq!(
+            plan.errors[0],
+            "[[listener]] is part of the daemon's own configuration, which muructl apply does \
+             not change: put it in the daemon's configuration file and run muructl daemon reload"
+        );
+        assert!(plan.errors[1].contains("\"Shop\" is not a valid application name"));
+        assert!(plan.errors[2].contains("shop@r1 has no source directory"));
+        assert!(plan.errors[3].contains("is not a directory"));
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
         assert_eq!(plan.changes.len(), 1, "the app is still created");
     }
 

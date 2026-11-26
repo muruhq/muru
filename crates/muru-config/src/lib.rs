@@ -5944,6 +5944,84 @@ impl Document {
         toml::from_str(text).map_err(|error| error.to_string())
     }
 
+    /// The tables of the daemon's own configuration this document holds,
+    /// as a message names them: `[limits]`, `[[listener]]`. An applied
+    /// file may hold none (ADR 0079).
+    pub fn daemon_tables(&self) -> Vec<&'static str> {
+        // Destructured in full, so that a table added to the document is
+        // given to one file or the other here, or this does not compile.
+
+        let Self {
+            daemon,
+            tools,
+            listener,
+            limits,
+            proxy,
+            compression,
+            error_pages,
+            error_override,
+            secrets,
+            logs,
+            logging,
+            shutdown,
+            metrics,
+            events,
+            dashboard,
+            overlay_webhook,
+            host: _,
+            client_class: _,
+            rate_limit: _,
+            overlay: _,
+            condition: _,
+            route: _,
+            upstream: _,
+            app: _,
+        } = self;
+
+        [
+            ("[daemon]", daemon.is_some()),
+            ("[tools]", tools.is_some()),
+            ("[[listener]]", !listener.is_empty()),
+            ("[limits]", limits.is_some()),
+            ("[proxy]", proxy.is_some()),
+            ("[compression]", compression.is_some()),
+            ("[error_pages]", !error_pages.is_empty()),
+            ("[error_override]", error_override.is_some()),
+            ("[secrets]", secrets.is_some()),
+            ("[logs]", logs.is_some()),
+            ("[logging]", logging.is_some()),
+            ("[shutdown]", shutdown.is_some()),
+            ("[metrics]", metrics.is_some()),
+            ("[events]", events.is_some()),
+            ("[dashboard]", dashboard.is_some()),
+            ("[overlay_webhook]", overlay_webhook.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(table, present)| present.then_some(table))
+        .collect()
+    }
+
+    /// The tables this document holds that say what the daemon serves,
+    /// as a message names them: `[app.shop]`, `[[route]]`. The daemon's
+    /// own file may hold none (ADR 0079).
+    pub fn deployment_tables(&self) -> Vec<String> {
+        let mut tables = Vec::new();
+        tables.extend(self.app.keys().map(|name| format!("[app.{name}]")));
+        tables.extend(self.host.keys().map(|name| format!("[host.{name}]")));
+
+        if !self.route.is_empty() {
+            tables.push("[[route]]".to_owned());
+        }
+
+        tables.extend(
+            self.upstream
+                .keys()
+                .map(|name| format!("[upstream.{name}]")),
+        );
+        tables.extend(self.overlay.keys().map(|name| format!("[overlay.{name}]")));
+        tables
+    }
+
     /// Fold another document into this one: its listeners and routes are
     /// appended, its limits replace these when given, and its hosts,
     /// applications and releases are added. A host or a release declared
@@ -7044,7 +7122,8 @@ fn with_daemon_hint(message: String, text: &str) -> String {
     };
 
     let project = schema::top_level_keys(schema::File::Project);
-    let daemon = schema::top_level_keys(schema::File::Daemon);
+    let mut daemon = schema::top_level_keys(schema::File::Daemon);
+    daemon.extend(schema::top_level_keys(schema::File::Deployment));
 
     match table
         .keys()

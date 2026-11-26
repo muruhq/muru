@@ -20,7 +20,7 @@ import tomllib
 from pathlib import Path
 
 from support import server as support
-from support.daemon import FACTORY, SHOP, Daemon
+from support.daemon import FACTORY, SHOP, Daemon, start_daemon
 from support.daemon import daemon as daemon_fixture
 
 daemon = daemon_fixture
@@ -659,12 +659,42 @@ def test_a_directory_of_files_with_relative_sources(daemon: Daemon, tmp_path: Pa
     assert exported["app"]["shop"]["release"]["r1"]["source"] == SHOP_SOURCE
     assert "factory" not in exported["app"]
 
-    # Listeners and limits in an applied file are reported, not applied.
+    # Issue 862: a table of the daemon's own configuration in an applied
+    # file is refused, where some were skipped with a warning and others
+    # without a word.
 
-    (config / "40-node.toml").write_text("[[listener]]\naddress = '127.0.0.1:9999'\n")
-    warned = apply(daemon, config)
-    assert warned.returncode == 0, warned.stdout + warned.stderr
-    assert "warning: [[listener]] entries belong in the daemon configuration file" in warned.stdout
+    (config / "40-node.toml").write_text(
+        "[[listener]]\naddress = '127.0.0.1:9999'\n\n[shutdown]\nbudget = '5s'\n"
+    )
+    refused = apply(daemon, config)
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    said = refused.stdout + refused.stderr
+
+    for table in ("[[listener]]", "[shutdown]"):
+        assert (
+            f"{table} is part of the daemon's own configuration, which muructl apply does not "
+            "change: put it in the daemon's configuration file and run muructl daemon reload"
+        ) in said, said
+
+
+def test_the_daemons_file_takes_nothing_the_daemon_serves(tmp_path: Path) -> None:
+    # Issue 862: an application's table in the daemon's own file was read
+    # and ignored. A reload with one is refused and changes nothing.
+
+    running = start_daemon(tmp_path, listeners=[(support.free_port(), False)])
+
+    try:
+        file = tmp_path / "muru.toml"
+        file.write_text(file.read_text() + "\n[app.shop]\ndata_dir = '/srv/shop'\n")
+        refused = running.muructl("daemon", "reload", check=False)
+        assert refused.returncode != 0
+        assert (
+            "[app.shop] says what the daemon serves, which is not part of the daemon's own "
+            "configuration: give it to muructl apply -f"
+        ) in refused.stderr, refused.stderr
+        assert running.muructl("status").returncode == 0
+    finally:
+        running.stop()
 
 
 def test_recycling_and_timeouts_round_trip_through_export(daemon: Daemon, tmp_path: Path) -> None:

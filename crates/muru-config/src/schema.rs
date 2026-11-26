@@ -28,8 +28,10 @@ const SCHEMA_BASE: &str = "https://docs.muruhq.dev/en/latest/schema";
 /// A configuration file with a schema and a reference page of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum File {
-    /// The daemon's configuration file and the files `muructl apply` reads.
+    /// The daemon's own configuration file.
     Daemon,
+    /// The files `muructl apply` reads, which say what the daemon serves.
+    Deployment,
     /// The `[tool.muru]` table of a pyproject.toml, or a muru.toml.
     Project,
     /// muru.local.toml, a developer's own settings for `muructl run`.
@@ -38,13 +40,14 @@ pub enum File {
 
 impl File {
     /// Every file, in the order the reference lists them.
-    pub const ALL: [File; 3] = [File::Daemon, File::Project, File::Local];
+    pub const ALL: [File; 4] = [File::Daemon, File::Deployment, File::Project, File::Local];
 
     /// The name of the file's schema and page: `daemon` gives
     /// daemon.schema.json and daemon.md.
     pub fn name(self) -> &'static str {
         match self {
             File::Daemon => "daemon",
+            File::Deployment => "deployment",
             File::Project => "project",
             File::Local => "local",
         }
@@ -52,7 +55,8 @@ impl File {
 
     fn title(self) -> &'static str {
         match self {
-            File::Daemon => "The daemon's configuration and applied files",
+            File::Daemon => "The daemon's configuration",
+            File::Deployment => "Applied files",
             File::Project => "The project's [tool.muru] table",
             File::Local => "muru.local.toml",
         }
@@ -62,30 +66,38 @@ impl File {
     fn root(self) -> &'static str {
         match self {
             File::Project => "tool.muru",
-            File::Daemon | File::Local => "",
+            File::Daemon | File::Deployment | File::Local => "",
         }
     }
 
     fn introduction(self) -> &'static str {
         match self {
             File::Daemon => {
-                "The keys of the daemon's configuration file, `muru.toml` in its \
-                 configuration directory, and of the files `muructl apply` reads, which \
-                 share one format. A file in this format kept beside a project's code is \
+                "The keys of the daemon's own configuration file, `muru.toml` in its \
+                 configuration directory, which say how the daemon runs: its listeners, \
+                 limits, the proxy, compression, secret stores, logs, shutdown, metrics, \
+                 events, the dashboard and the overlay webhook. It is read when the \
+                 daemon starts and on `muructl daemon reload`. What the daemon serves is \
+                 not in this file: an application, a host, a route, an upstream or an \
+                 overlay here is refused, with a message that says to give it to \
+                 `muructl apply`. Client classes, rate limits and conditions defined \
+                 here are the node's: every applied file may use them, and none may \
+                 define one of the same name. The client classes' list files are taken \
+                 from this file's directory, and every other path is absolute."
+            }
+            File::Deployment => {
+                "The keys of the files `muructl apply` reads, which say what the daemon \
+                 serves: applications and their releases, hosts, routes, upstreams and \
+                 overlays, with the client classes, rate limits and conditions that \
+                 belong to them. A file of this kind kept beside a project's code is \
                  named `muru.daemon.toml`, since `muru.toml` there is the project's \
-                 settings, which have other keys. Listeners, limits, the proxy, compression, secret \
-                 stores, logs, shutdown, metrics, events, the dashboard and the overlay \
-                 webhook belong to the daemon's own file; an apply leaves them out, with \
-                 a warning. Applications, their releases, hosts, routes, upstreams, \
-                 overlays, conditions, client classes and rate limits may be in either, \
-                 and an applied file may not redefine a client class or rate limit the \
-                 daemon's own file defines. \
-                 A relative path in a file `muructl apply` reads is taken from that \
-                 file's directory, except a release's own static directories and \
-                 error pages, which are taken from its source directory; apply sends \
-                 the daemon the absolute paths. In the daemon's own file, the client \
-                 classes' list files are taken from its directory, and every other \
-                 path is absolute."
+                 settings, which have other keys. A table of the daemon's own \
+                 configuration here, such as `[[listener]]` or `[limits]`, is refused. \
+                 A client class, rate limit or condition may not have the name of one \
+                 the daemon's own file defines. A relative path is taken from the \
+                 file's directory, except a release's own static directories and error \
+                 pages, which are taken from its source directory; apply sends the \
+                 daemon the absolute paths."
             }
             File::Project => {
                 "The keys an application ships with: the `[tool.muru]` table of its \
@@ -149,17 +161,95 @@ struct LocalBuild {
     when: Option<BuildWhen>,
 }
 
+/// The top-level keys of a document that say what the daemon serves, and
+/// belong to applied files alone (ADR 0079). Every other key but the
+/// shared ones is the daemon's own.
+pub const DEPLOYMENT_TABLES: [&str; 5] = ["app", "host", "route", "upstream", "overlay"];
+
+/// The top-level keys both files take: the daemon's file defines them
+/// for the node, and an applied file for what it declares.
+pub const SHARED_TABLES: [&str; 3] = ["client_class", "rate_limit", "condition"];
+
+/// Keep the top-level properties `keep` accepts, and of the definitions
+/// only those the kept properties still reach.
+fn keep_top_level(schema: &mut Value, keep: &dyn Fn(&str) -> bool) {
+    let Value::Object(object) = schema else {
+        return;
+    };
+
+    if let Some(Value::Object(properties)) = object.get_mut("properties") {
+        properties.retain(|key, _| keep(key));
+    }
+
+    // Follow the references from what is left, definition by definition.
+
+    let mut reached = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    collect_references(object.get("properties"), &mut queue);
+
+    while let Some(name) = queue.pop_front() {
+        if !reached.insert(name.clone()) {
+            continue;
+        }
+
+        collect_references(
+            object
+                .get("$defs")
+                .and_then(|definitions| definitions.get(&name)),
+            &mut queue,
+        );
+    }
+
+    if let Some(Value::Object(definitions)) = object.get_mut("$defs") {
+        definitions.retain(|name, _| reached.contains(name));
+    }
+}
+
+/// The definitions a part of a schema refers to, by name.
+fn collect_references(value: Option<&Value>, found: &mut VecDeque<String>) {
+    match value {
+        Some(Value::Object(object)) => {
+            for (key, value) in object {
+                match (key.as_str(), value) {
+                    ("$ref", Value::String(reference)) => {
+                        found.extend(reference.strip_prefix("#/$defs/").map(str::to_owned));
+                    }
+                    _ => collect_references(Some(value), found),
+                }
+            }
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                collect_references(Some(item), found);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The file's JSON Schema, with descriptions for users.
 pub fn json_schema(file: File) -> Value {
     let generator = schemars::generate::SchemaSettings::draft2020_12().into_generator();
 
     let schema = match file {
-        File::Daemon => generator.into_root_schema_for::<Document>(),
+        File::Daemon | File::Deployment => generator.into_root_schema_for::<Document>(),
         File::Project => generator.into_root_schema_for::<ToolMuru>(),
         File::Local => generator.into_root_schema_for::<LocalFile>(),
     };
 
     let mut value = schema.to_value();
+
+    // The daemon's file and applied files are parsed as one document, and
+    // each takes its own tables of it (ADR 0079).
+
+    match file {
+        File::Daemon => keep_top_level(&mut value, &|key| !DEPLOYMENT_TABLES.contains(&key)),
+        File::Deployment => keep_top_level(&mut value, &|key| {
+            DEPLOYMENT_TABLES.contains(&key) || SHARED_TABLES.contains(&key)
+        }),
+        File::Project | File::Local => {}
+    }
+
     drop_null(&mut value);
     clean_descriptions(&mut value);
 

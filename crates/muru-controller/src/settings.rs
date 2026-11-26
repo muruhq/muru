@@ -123,6 +123,18 @@ impl NodeSettings {
             Err(error) => return Err(format!("reading {}: {error}", path.display())),
         };
 
+        // ADR 0079: what the daemon serves is no part of its own file. A
+        // table of that kind here was read and then ignored without a
+        // word (issue 862).
+
+        if let Some(table) = document.deployment_tables().first() {
+            return Err(format!(
+                "{}: {table} says what the daemon serves, which is not part of the daemon's own \
+                 configuration: give it to muructl apply -f",
+                path.display()
+            ));
+        }
+
         Self::from_document(&document, path, secrets_dir, overrides)
     }
 
@@ -674,6 +686,47 @@ mod tests {
             Path::new("/var/lib/muru/secrets"),
             &Overrides::default(),
         )
+    }
+
+    #[test]
+    fn the_daemons_file_holds_nothing_the_daemon_serves() {
+        // Issue 862: an application, a host, a route, an upstream or an
+        // overlay in the file was read and then ignored without a word.
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("muru.toml");
+        let read = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            NodeSettings::read(&path, directory.path(), &Overrides::default())
+        };
+
+        for (text, table) in [
+            ("[app.shop]\ndata_dir = '/srv/shop'\n", "[app.shop]"),
+            ("[host.shop]\nnames = ['shop.test']\n", "[host.shop]"),
+            ("[[route]]\nhost = 'shop'\napp = 'shop'\n", "[[route]]"),
+            (
+                "[upstream.legacy]\naddresses = ['127.0.0.1:9000']\n",
+                "[upstream.legacy]",
+            ),
+        ] {
+            let Err(error) = read(text) else {
+                panic!("{table} is refused");
+            };
+
+            assert_eq!(
+                error,
+                format!(
+                    "{}: {table} says what the daemon serves, which is not part of the daemon's \
+                     own configuration: give it to muructl apply -f",
+                    path.display()
+                )
+            );
+        }
+
+        // The node's own classes, limits and conditions stay.
+
+        let kept = read("[condition.busy]\nwhen = \"queue_depth{app='shop'} > 5\"\n");
+        assert!(kept.is_ok(), "{:?}", kept.err());
     }
 
     #[test]

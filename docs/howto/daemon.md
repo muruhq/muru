@@ -487,9 +487,15 @@ immutable: a declared
 release whose settings differ from the recorded ones is an error, and
 the file is applied only when it has no errors at all. Unknown keys,
 invalid names, a missing source directory and a source without an
-entrypoint are errors too. `[[listener]]` entries and the `[limits]`
-table belong in the daemon's own configuration file; in an applied file
-they are reported as warnings and not applied.
+entrypoint are errors too. So is a table of the daemon's own
+configuration, such as `[[listener]]` or `[limits]`: an apply changes
+what the daemon serves and never the daemon's own settings, which are
+in its [configuration file](#reloading-the-configuration). In turn the
+daemon's file holds no application, host, route, upstream or overlay,
+and a daemon does not start or reload with one in it. A client class,
+rate limit or condition may be in either: one the daemon's file defines
+is the node's, and an applied file that defines the same name is
+refused.
 
 The apply happens in two steps. First it creates the applications and
 starts the releases it adds, held, with traffic left where it is and

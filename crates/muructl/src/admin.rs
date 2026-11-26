@@ -9126,6 +9126,28 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
         let mut parsed = muru_config::Document::parse(&text)
             .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
 
+        // The daemon's own tables are no part of what an apply changes
+        // (issue 862). They are refused here, by file, since folding the
+        // files into one document keeps only some of them for the daemon
+        // to refuse.
+
+        let daemons = parsed.daemon_tables();
+
+        if !daemons.is_empty() {
+            let lines: Vec<String> = daemons
+                .iter()
+                .map(|table| {
+                    format!(
+                        "{}: {table} is part of the daemon's own configuration, which muructl \
+                         apply does not change: put it in the daemon's configuration file and \
+                         run muructl daemon reload",
+                        file.display()
+                    )
+                })
+                .collect();
+            anyhow::bail!("{}", lines.join("\n"));
+        }
+
         // Paths are resolved here, where the file is, since the daemon
         // may run elsewhere. The file's directory is made absolute first,
         // so that a file named by a relative path gives absolute paths
