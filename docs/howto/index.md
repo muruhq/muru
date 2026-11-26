@@ -29,6 +29,8 @@ Recipes for specific tasks, assuming you already know the basics. The
 ## Deploying
 
 - [The daemon](daemon.md): starting it and deploying applications.
+- [Commands and files](commands-and-files.md): running a node by
+  command, from files kept in version control, or both.
 - [Running under systemd](systemd.md): the daemon as a system service.
 - [Per-application users](users.md): the edge and each application as a
   user of its own.
@@ -159,6 +161,7 @@ mounts
 handoff
 grpc
 daemon
+commands-and-files
 systemd
 users
 secrets
