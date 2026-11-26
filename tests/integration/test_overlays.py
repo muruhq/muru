@@ -54,8 +54,14 @@ class Site:
 
     def apply(self, overlays: str, check: bool = True, prune: bool = False, route: str = "") -> str:
         config = self.base / "site.toml"
+
+        # The first apply adds both releases, so it says which serves;
+        # later ones leave traffic to the overlays and the commands.
+
+        serving = "" if self.daemon.releases("clients") else "[app.clients]\nserving = 'r2'\n\n"
         config.write_text(
-            f"""[app.clients.release.r1]
+            serving
+            + f"""[app.clients.release.r1]
 source = '{self.project}'
 python = '{sys.executable}'
 processes = 1

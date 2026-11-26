@@ -61,7 +61,7 @@ it out.
 | `access_log` | changes | `muructl logging access` | `mode`, `app`, `paths`, `for`, `reset` |
 | `reopen_logs` | changes | `muructl logs reopen` | `workers` |
 | `prune_releases` | changes | `muructl release prune`, refused unless `yes` is true or `dry_run` asked for | `app`, `keep`, `force`, `keep_logs`, `dry_run`, `yes` |
-| `remove_release` | changes | `muructl release remove`, refused unless `yes` is true or `dry_run` asked for | `release` (app@release), `keep_logs`, `dry_run`, `yes` |
+| `remove_release` | changes | `muructl release remove`, refused unless `yes` is true or `dry_run` asked for | `release` (app@release), `keep_logs`, `force`, `dry_run`, `yes` |
 | `remove_app` | changes | `muructl app remove`, refused unless `yes` is true or `dry_run` asked for | `app`, `dry_run`, `yes` |
 | `prune_cache` | changes | `muructl cache prune`, refused unless `yes` is true or `dry_run` asked for | `area`, `version`, `tag`, `dry_run`, `yes` |
 | `clear_cache` | changes | `muructl cache clear`, refused unless `yes` is true or `dry_run` asked for | `area`, `certs`, `dry_run`, `yes` |

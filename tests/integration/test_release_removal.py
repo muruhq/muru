@@ -196,7 +196,7 @@ def test_app_remove_drains_and_goes_only_once_no_route_sends_traffic(tmp_path: P
     daemon = start_daemon(tmp_path, listeners=[(support.free_port(), False)])
 
     def site(routed: bool) -> Path:
-        document = "".join(
+        document = "[app.shop]\nserving = 'r2'\n\n" + "".join(
             f"[app.shop.release.{release}]\nsource = '{SHOP}'\npython = '{sys.executable}'\n\n"
             for release in ("r1", "r2")
         )

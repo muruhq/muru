@@ -7935,8 +7935,8 @@ pub enum ReleaseCommand {
 
     /// Remove one release: its record, environment, bytecode and logs.
     /// Refused for the serving or rollback release, a running one or one
-    /// a route or rollout uses. Asks first; without a terminal it needs
-    /// --yes.
+    /// a route or rollout uses, and for one applied files declare unless
+    /// --force. Asks first; without a terminal it needs --yes.
     Remove(Box<ReleaseRemoveArgs>),
 
     /// Wait until a release reaches a state.
@@ -8004,6 +8004,11 @@ pub struct ReleaseRemoveArgs {
     /// Leave its log and log archives.
     #[arg(long)]
     keep_logs: bool,
+
+    /// Remove it although applied files declare it; the next apply of
+    /// those files creates it again.
+    #[arg(long)]
+    force: bool,
 
     /// Only say what would be removed.
     #[arg(long)]
@@ -8122,6 +8127,7 @@ pub async fn release_remove(args: ReleaseRemoveArgs) -> anyhow::Result<()> {
         release: id.to_owned(),
         keep_logs: args.keep_logs,
         dry_run: true,
+        force: args.force,
     };
 
     let plan = client

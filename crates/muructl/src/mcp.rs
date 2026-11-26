@@ -1831,11 +1831,12 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "remove_release",
-            description: "Remove one release, as app@release, with its environment, bytecode and logs. Refused for the serving or rollback release, a running one or one a route or rollout uses. dry_run says what would go; anything else is refused unless yes is true.",
+            description: "Remove one release, as app@release, with its environment, bytecode and logs. Refused for the serving or rollback release, a running one or one a route or rollout uses, and for one applied files declare unless force is true. dry_run says what would go; anything else is refused unless yes is true.",
             changes: true,
             properties: json!({
                 "release": {"type": "string", "description": "The release, as app@release"},
                 "keep_logs": {"type": "boolean", "description": "Leave its log and archives"},
+                "force": {"type": "boolean", "description": "Remove it although applied files declare it; the next apply of those files creates it again"},
                 "dry_run": {"type": "boolean"},
                 "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
             }),
@@ -1851,6 +1852,7 @@ fn specs() -> Vec<Spec> {
 
                 for (key, name) in [
                     ("keep_logs", "--keep-logs"),
+                    ("force", "--force"),
                     ("dry_run", "--dry-run"),
                     ("yes", "--yes"),
                 ] {

@@ -57,7 +57,7 @@ An application's table and its releases.
 | `processes` | integer | the source's, else 1 | Worker processes for every release, over the source's. |
 | `release` | table of tables, {ref}`[app.NAME.release.ID] <config-daemon-app-name-release-id>` |  | Releases by identifier. |
 | `schedule` | array of tables, {ref}`[[app.NAME.schedule]] <config-daemon-app-name-schedule>` |  | Scheduled capacity. |
-| `serving` | string | the last release in id order an apply adds, else the one that serves | The release that serves the application's traffic, a declared one or one the daemon has. The other releases an apply adds are started held, and naming a release the daemon has promotes it. |
+| `serving` | string | the one release an apply adds, else the one that serves | The release that serves the application's traffic, a declared one or one the daemon has. The other releases an apply adds are started held, and naming a release the daemon has promotes it. An apply that adds more than one release of the application needs it. |
 | `slow` | string | the `[logs]` table's | How slow one of the application's requests is to be written under `access_log = "errors"`. |
 | `sync_threads` | integer | the source's, else 8 | Threads for synchronous code called from an ASGI application, for every release, over the source's. |
 | `threads` | integer | the source's, else 4 | Application threads per worker for every release, over the source's. |

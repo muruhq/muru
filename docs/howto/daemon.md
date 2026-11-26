@@ -475,14 +475,15 @@ changes a default.
 ### What an apply does
 
 An apply creates the applications the files name, deploys each declared
-release the daemon does not have (the last of an application's in id
-order to serve, unless the application's [`serving`
-key](#which-release-serves) names another, and the others held when a
-route names them, else left stopped), creates or updates the hosts and
-routes, and leaves anything already recorded as declared alone. Id order
-puts ids of the form `rN` first, by number, so `r10` comes after `r9`,
-and every other id after them, by name: files adding `r9` and
-`2026-11-06` serve `2026-11-06`. Releases are immutable: a declared
+release the daemon does not have, creates or updates the hosts and
+routes, and leaves anything already recorded as declared alone. A
+release the apply adds serves when it is the only one it adds for its
+application, or the one the application's [`serving`
+key](#which-release-serves) names; the others are held when a route
+names them, else left stopped. An apply that adds more than one release
+of an application needs the key, and is refused without it, naming the
+releases: the order of their ids decides nothing. Releases are
+immutable: a declared
 release whose settings differ from the recorded ones is an error, and
 the file is applied only when it has no errors at all. Unknown keys,
 invalid names, a missing source directory and a source without an
@@ -650,9 +651,10 @@ muru: shop@r1 stays warm for 1800s with 1 worker to a group, when shop@r2 takes 
 ```
 
 The key names a declared release or one the daemon already has; naming
-neither is an error. Without the key, the last release the apply adds,
-in id order, serves, and the others it adds are held or left stopped
-as above. `--hold` with a key that would move traffic is an error,
+neither is an error. Without the key, a release serves when it is the
+only one the apply adds for the application, and an apply that adds
+several is refused until the key says which serves, or `--hold` holds
+them all. `--hold` with a key that would move traffic is an error,
 since the flag leaves traffic where it is.
 
 While a [rollout](rollouts.md) is under way, the rollout moves the

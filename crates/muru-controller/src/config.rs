@@ -220,7 +220,7 @@ pub enum Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Added {
     /// It takes the application's traffic: `serving` names it, or it is
-    /// the last added in id order.
+    /// the one release the apply adds.
     Serving,
     /// Started with traffic left where it is: `--hold`, or a route's
     /// traffic or an overlay in the same files names it.
@@ -930,15 +930,28 @@ fn plan_app(
     deploys.sort_by_key(|(id, _)| release_order(id));
 
     // Section 10.4: the release that serves, which `serving` names, else
-    // the last in id order the apply adds, unless `--hold` holds them all.
-    // The other releases the apply adds are held, and a release the
-    // daemon has that `serving` names is promoted.
+    // the one release the apply adds, unless `--hold` holds them all. An
+    // apply that adds several needs the key (ADR 0082): the order of ids
+    // decides nothing, since an id such as a commit has none, and a
+    // release removed while its file stayed was added again and given
+    // the traffic in place of a newer one (issue 926). The other releases
+    // the apply adds are held, and a release the daemon has that
+    // `serving` names is promoted.
 
     let current = stored.and_then(|stored| stored.current);
     let added: Vec<String> = deploys.iter().map(|(id, _)| id.clone()).collect();
 
     let (serving, moves) = match &app.serving {
         None if applying.hold => (current.clone(), false),
+        None if added.len() > 1 => {
+            plan.errors.push(format!(
+                "{name}: the files add {} releases ({}) and do not say which serves; name one \
+                 with the application's serving key, or hold them all with --hold",
+                added.len(),
+                added.join(", ")
+            ));
+            return None;
+        }
         None => (
             added.last().cloned().or_else(|| current.clone()),
             !added.is_empty(),
@@ -8140,19 +8153,31 @@ mod tests {
             .collect();
         assert_eq!(deploys, vec![("deploy", "shop@r2".to_owned(), "held")]);
 
-        // Without the key the last release added in id order serves
-        // (issue #447), and --hold starts every one held.
+        // Without the key the one release an apply adds serves, and an
+        // apply that adds several is refused (issue 926): the order of
+        // ids no longer picks one. --hold starts every one held.
+
+        let one = plan_with(
+            &store,
+            &shop_releases(&source, &["r1", "r2"], ""),
+            false,
+            false,
+        );
+        assert_eq!(
+            steps(&one),
+            vec![("deploy", "shop@r2".to_owned(), "serving")]
+        );
+        assert!(one.changes[0].detail.starts_with("serving: "));
 
         let document = shop_releases(&source, &["r1", "r3", "r2"], "");
-        let added = plan_with(&store, &document, false, false);
+        let several = plan_with(&store, &document, false, false);
         assert_eq!(
-            steps(&added),
-            vec![
-                ("deploy", "shop@r2".to_owned(), "stopped"),
-                ("deploy", "shop@r3".to_owned(), "serving"),
+            several.errors,
+            [
+                "shop: the files add 2 releases (r2, r3) and do not say which serves; name one \
+                 with the application's serving key, or hold them all with --hold"
             ]
         );
-        assert!(added.changes[1].detail.starts_with("serving: "));
         let all_held = plan_with(&store, &document, false, true);
         assert!(
             steps(&all_held)

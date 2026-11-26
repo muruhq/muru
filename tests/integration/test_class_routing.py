@@ -61,7 +61,10 @@ threads = 2
 """
     config = base / "site.toml"
     config.write_text(
-        f"""[app.site.release.r1]
+        f"""[app.site]
+serving = 'r2'
+
+[app.site.release.r1]
 {release}
 [app.site.release.r1.groups.crawlers]
 match = {{ client_class = ['ai-crawler'] }}

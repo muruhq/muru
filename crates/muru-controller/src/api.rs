@@ -1245,6 +1245,19 @@ impl Admin for Service {
             )));
         }
 
+        // Issue 926: a release applied files declare stays unless forced,
+        // as prune leaves one. Removed with its file left in place, it was
+        // created again by the next apply and given the traffic.
+
+        if candidate.declared && !request.force {
+            return Err(Status::failed_precondition(format!(
+                "{}@{} cannot be removed: {}",
+                app.name,
+                candidate.id,
+                removal::Keep::Declared.describe()
+            )));
+        }
+
         let planned = vec![Planned {
             app: app.name.clone(),
             id: candidate.id.clone(),

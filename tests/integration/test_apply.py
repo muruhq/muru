@@ -223,6 +223,64 @@ def test_how_the_releases_an_apply_adds_are_deployed(daemon: Daemon, tmp_path: P
     assert daemon.releases("shop")[0]["release"] == "shop@r3"
 
 
+def test_an_apply_that_adds_several_releases_says_which_serves(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    # Issue 926: the order of ids no longer picks the release that serves.
+    # One release added takes the traffic; several need the serving key.
+
+    config = tmp_path / "shop.toml"
+    config.write_text(release("shop", "2026-11-03"))
+    assert apply(daemon, config).returncode == 0
+    assert daemon.releases("shop")[0]["serving"] == "yes"
+
+    several = release("shop", "2026-11-03") + release("shop", "2026-11-01", threads=1)
+    several += release("shop", "2026-11-02", threads=2)
+    config.write_text(several)
+    refused = apply(daemon, config)
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert (
+        "shop: the files add 2 releases (2026-11-01, 2026-11-02) and do not say which serves; "
+        "name one with the application's serving key, or hold them all with --hold"
+    ) in refused.stdout + refused.stderr
+
+    config.write_text("[app.shop]\nserving = '2026-11-03'\n\n" + several)
+    applied = apply(daemon, config)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert {row["release"]: row["serving"] for row in daemon.releases("shop")} == {
+        "shop@2026-11-03": "yes",
+        "shop@2026-11-02": "",
+        "shop@2026-11-01": "",
+    }
+
+    # A release the files declare is not removed by name, as prune leaves
+    # one: removed with its file left in place, it came back at the next
+    # apply and took the traffic.
+
+    kept = daemon.muructl("release", "remove", "shop@2026-11-01", "--yes", check=False)
+    assert kept.returncode != 0
+    assert (
+        "muru: error: shop@2026-11-01 cannot be removed: applied files declare it, so the next "
+        "apply creates it again: take it out of the files and apply them with --prune, or "
+        "--force takes it"
+    ) in kept.stderr, kept.stderr
+
+    forced = daemon.muructl("release", "remove", "shop@2026-11-01", "--yes", "--force")
+    assert forced.returncode == 0, forced.stderr
+    assert len(daemon.releases("shop")) == 2
+
+    # The files still declare it, so the next apply records it again, and
+    # the key keeps the traffic where it is.
+
+    again = apply(daemon, config)
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert {row["release"]: row["serving"] for row in daemon.releases("shop")} == {
+        "shop@2026-11-03": "yes",
+        "shop@2026-11-02": "",
+        "shop@2026-11-01": "",
+    }
+
+
 def test_serving_stages_a_release_and_promotes_it(daemon: Daemon, tmp_path: Path) -> None:
     # Issue #420: a release declared beside the one serves, with a split
     # giving it 0%, is started held and takes no request without the
@@ -321,6 +379,7 @@ def test_a_release_that_does_not_start_leaves_nothing_changed(
     assert apply(daemon, config).returncode == 0
     config.write_text(
         ROUTED
+        + "[app.shop]\nserving = 'r3'\n\n"
         + release("other", "r1")
         + release("shop", "r1")
         + release("shop", "r2", threads=2)
@@ -456,7 +515,9 @@ def test_an_apply_whose_client_goes_away_is_still_undone(daemon: Daemon, tmp_pat
 
 def test_prune_removes_what_the_files_no_longer_contain(daemon: Daemon, tmp_path: Path) -> None:
     config = tmp_path / "shop.toml"
-    config.write_text(release("shop", "r1") + release("shop", "r2"))
+    config.write_text(
+        "[app.shop]\nserving = 'r2'\n\n" + release("shop", "r1") + release("shop", "r2")
+    )
     apply(daemon, config)
 
     # Without --prune, a release missing from the file is left alone.

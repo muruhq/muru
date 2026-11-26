@@ -999,6 +999,7 @@ message RemoveReleaseRequest {
   string release = 2;
   bool keep_logs = 3;               // leave its log and archives
   bool dry_run = 4;                 // only say what it would free
+  bool force = 5;                   // take it although applied files declare it (issue 926)
 }
 
 // A release a removal took, or would take.

@@ -5589,11 +5589,10 @@ pub struct App {
     /// The release that serves the application's traffic, a declared one
     /// or one the daemon has (section 10.4). The other releases an apply
     /// adds are started held, and naming a release the daemon has
-    /// promotes it.
+    /// promotes it. An apply that adds more than one release of the
+    /// application needs it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend(
-        "x-default" = "the last release in id order an apply adds, else the one that serves"
-    ))]
+    #[schemars(extend("x-default" = "the one release an apply adds, else the one that serves"))]
     pub serving: Option<String>,
     /// Scheduled capacity (section 7.5).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
