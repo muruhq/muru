@@ -548,6 +548,7 @@ impl Installation {
             app: String::new(),
             effective: true,
             resolve_rollouts: false,
+            ..pb::ExportConfigRequest::default()
         }))
         .await?;
         let wanted: Vec<String> = releases.iter().map(ReleaseFacts::name).collect();

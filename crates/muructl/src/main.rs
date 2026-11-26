@@ -1483,11 +1483,24 @@ fn main() -> anyhow::Result<()> {
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
         Command::Deployment { command } => match command {
             admin::DeploymentCommand::Export {
+                name,
+                dir,
                 app,
+                as_deployment,
                 resolve_rollouts,
                 json,
                 socket,
-            } => runtime.block_on(admin::config_export(app, resolve_rollouts, json, socket)),
+            } => runtime.block_on(admin::config_export(
+                admin::Exporting {
+                    name,
+                    dir,
+                    app,
+                    as_deployment,
+                    resolve_rollouts,
+                    json,
+                },
+                socket,
+            )),
             admin::DeploymentCommand::Show {
                 app,
                 effective,

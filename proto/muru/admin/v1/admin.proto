@@ -1511,6 +1511,8 @@ message ExportConfigRequest {
   string app = 1;                   // one application, else all
   bool effective = 3;               // routes as the active overlays leave them
   bool resolve_rollouts = 4;        // each rollout under way as where it stands
+  string deployment = 5;            // only what this deployment owns, with its deployment key (issue 937)
+  string as_deployment = 6;         // write this deployment key at the top, for an application moving out of default
 }
 
 message ExportConfigResponse {

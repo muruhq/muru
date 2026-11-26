@@ -244,6 +244,36 @@ pub fn fold(documents: Vec<Document>) -> Result<Declared, String> {
     Ok(declared)
 }
 
+/// Keep of an exported document only what the deployment `name` owns, and
+/// give it the deployment's key; `default` is written without one, so a
+/// node that names no deployment exports as it always did.
+pub fn keep(document: &mut Document, owners: &Owners, name: &str) {
+    let ours = |kind: Kind, key: &str| {
+        owners
+            .get(&(kind, key.to_owned()))
+            .map_or(DEFAULT, String::as_str)
+            == name
+    };
+
+    document.app.retain(|key, _| ours(Kind::App, key));
+    document.host.retain(|key, _| ours(Kind::Host, key));
+    document
+        .route
+        .retain(|route| ours(Kind::Route, &route_key(&route.host, &route.key())));
+    document.upstream.retain(|key, _| ours(Kind::Upstream, key));
+    document.overlay.retain(|key, _| ours(Kind::Overlay, key));
+    document
+        .client_class
+        .retain(|class| ours(Kind::ClientClass, &class.name));
+    document
+        .rate_limit
+        .retain(|key, _| ours(Kind::RateLimit, key));
+    document
+        .condition
+        .retain(|key, _| ours(Kind::Condition, key));
+    document.deployment = (name != DEFAULT).then(|| name.to_owned());
+}
+
 /// The objects the store holds, by kind and name.
 pub fn stored_objects(store: &Store) -> BTreeSet<(Kind, String)> {
     let mut found = BTreeSet::new();

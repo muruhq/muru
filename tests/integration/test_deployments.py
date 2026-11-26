@@ -171,3 +171,57 @@ def test_render_writes_the_deployment_and_a_daemons_file_takes_none(
     assert daemon.muructl("apply", "-f", str(file)).returncode == 0
     listed = json.loads(daemon.muructl("deployment", "list", "--json").stdout)
     assert {entry["name"] for entry in listed["deployments"]} == {"default", "shop"}
+
+
+def test_export_writes_a_deployment_to_a_file(daemon: Daemon, tmp_path: Path) -> None:
+    # Issue 937: one file carries one deployment key, so a daemon with
+    # several deployments is exported one at a time, or into a directory.
+
+    files = tmp_path / "deploy.d"
+    files.mkdir()
+    (files / "shop.toml").write_text(SHOP_FILE)
+    (files / "api.toml").write_text(API_FILE)
+
+    def export(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return daemon.muructl("deployment", "export", *arguments, check=False)
+
+    # With no deployment named there is one file to write, as before.
+
+    daemon.deploy("landing", SHOP)
+    whole = tomllib.loads(export().stdout)
+    assert "deployment" not in whole and list(whole["app"]) == ["landing"], whole
+
+    assert daemon.muructl("apply", "-f", str(files)).returncode == 0
+    unnamed = export()
+    assert unnamed.returncode != 0
+    assert (
+        "this daemon has the deployments api, default, shop; name one, as in muructl deployment "
+        "export api, or write a file for each with --dir DIR"
+    ) in unnamed.stderr, unnamed.stderr
+
+    shop = tomllib.loads(export("shop").stdout)
+    assert shop["deployment"] == "shop" and list(shop["app"]) == ["shop"], shop
+    assert list(shop["host"]) == ["shop"] and [route["app"] for route in shop["route"]] == ["shop"]
+    assert "deployment" not in tomllib.loads(export("default").stdout)
+    assert export("nowhere").returncode != 0
+
+    # A directory holds a file for each, and applies back unchanged.
+
+    out = tmp_path / "exported"
+    written = export("--dir", str(out))
+    assert written.returncode == 0, said(written)
+    assert sorted(path.name for path in out.iterdir()) == ["api.toml", "default.toml", "shop.toml"]
+    back = daemon.muructl("apply", "-f", str(out), "--prune=all", "--dry-run", check=False)
+    assert back.returncode == 0 and "no changes" in back.stdout, said(back)
+
+    again = export("--dir", str(out))
+    assert again.returncode != 0 and "is not empty" in again.stderr, again.stderr
+
+    # One application, written as a deployment of its own, moves out of
+    # default when the file is applied.
+
+    moving = tmp_path / "landing.toml"
+    moving.write_text(export("--app", "landing", "--as", "site").stdout)
+    assert tomllib.loads(moving.read_text())["deployment"] == "site"
+    moved = daemon.muructl("apply", "-f", str(moving))
+    assert "app landing moves from the deployment default to site" in said(moved), said(moved)

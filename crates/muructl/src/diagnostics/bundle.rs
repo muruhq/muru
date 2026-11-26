@@ -582,6 +582,7 @@ impl<W: Write> Bundle<'_, W> {
             app: self.target.app.clone(),
             effective: true,
             resolve_rollouts: false,
+            ..pb::ExportConfigRequest::default()
         }))
         .await?;
         let mut text = String::new();

@@ -3337,6 +3337,33 @@ impl Admin for Service {
             config::resolve_rollouts(&self.handle.store, &mut document).map_err(internal)?;
         }
 
+        // ADR 0080: one deployment's own objects, with its key, which is
+        // a file that applies back as that deployment.
+
+        if !request.deployment.is_empty() {
+            if !crate::deployments::list(&self.handle.store).contains_key(&request.deployment) {
+                return Err(Status::not_found(format!(
+                    "there is no deployment {}",
+                    request.deployment
+                )));
+            }
+
+            let owners = crate::deployments::stored(&self.handle.store);
+            crate::deployments::keep(&mut document, &owners, &request.deployment);
+        }
+
+        if !request.as_deployment.is_empty() {
+            if !crate::model::valid_name(&request.as_deployment) {
+                return Err(Status::invalid_argument(format!(
+                    "{:?} is not a valid deployment name: lowercase letters, digits and \
+                     hyphens, up to 63 characters",
+                    request.as_deployment
+                )));
+            }
+
+            document.deployment = Some(request.as_deployment.clone());
+        }
+
         let (attributions, layers) = if request.effective {
             let attributions =
                 config::make_effective(&self.handle.store, &mut document, app).map_err(internal)?;

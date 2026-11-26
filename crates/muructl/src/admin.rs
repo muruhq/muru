@@ -9069,9 +9069,27 @@ pub enum DeploymentCommand {
 
     /// Write desired state as a file that applies back without changes.
     Export {
-        /// One application rather than all.
+        /// The deployment to write, with its deployment key at the top.
+        /// With none, a daemon whose files name no deployment writes
+        /// everything, as default.
+        #[arg(conflicts_with_all = ["dir", "app"])]
+        name: Option<String>,
+
+        /// Write a file for each deployment into this directory, which
+        /// must be empty: NAME.toml, which muructl apply -f DIR applies
+        /// back without changes.
+        #[arg(long, value_name = "DIR", conflicts_with = "app")]
+        dir: Option<PathBuf>,
+
+        /// One application, with the routes that reach it and their
+        /// hosts, whichever deployment each is in.
         #[arg(long, value_name = "NAME")]
         app: Option<String>,
+
+        /// With --app: write this deployment's name at the top, for a
+        /// file that moves the application out of default.
+        #[arg(long = "as", value_name = "DEPLOYMENT", requires = "app")]
+        as_deployment: Option<String>,
 
         /// Write each rollout under way as where it stands: its candidate
         /// declared, and the application's routes splitting traffic at
@@ -9126,39 +9144,122 @@ pub enum DeploymentCommand {
 }
 
 /// Export desired state, with a header naming where it came from.
-pub async fn config_export(
-    app: Option<String>,
-    resolve_rollouts: bool,
-    json: bool,
-    socket: SocketArgs,
-) -> anyhow::Result<()> {
+/// What `deployment export` writes.
+pub struct Exporting {
+    /// One deployment.
+    pub name: Option<String>,
+    /// A file for each deployment, into this directory.
+    pub dir: Option<PathBuf>,
+    /// One application.
+    pub app: Option<String>,
+    /// The deployment key to write with `app`.
+    pub as_deployment: Option<String>,
+    /// Each rollout under way as where it stands.
+    pub resolve_rollouts: bool,
+    /// JSON rather than TOML.
+    pub json: bool,
+}
+
+/// Write desired state as files that apply back without changes: one
+/// deployment, one application, or with `dir` a file for each deployment.
+pub async fn config_export(exporting: Exporting, socket: SocketArgs) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.endpoint()?).await?;
-    let export = client
-        .export_config(pb::ExportConfigRequest {
-            app: app.unwrap_or_default(),
-            effective: false,
-            resolve_rollouts,
-        })
+    let named: Vec<String> = client
+        .list_deployments(pb::ListDeploymentsRequest {})
         .await
         .map_err(explain)?
-        .into_inner();
+        .into_inner()
+        .deployments
+        .into_iter()
+        .filter(|deployment| {
+            deployment.name != muru_controller::deployments::DEFAULT
+                || !deployment.apps.is_empty()
+                || deployment.hosts + deployment.routes + deployment.others > 0
+        })
+        .map(|deployment| deployment.name)
+        .collect();
+    let several = named
+        .iter()
+        .any(|name| name != muru_controller::deployments::DEFAULT);
 
-    if json {
-        let document =
-            muru_config::Document::parse(&export.document).map_err(anyhow::Error::msg)?;
-        println!("{}", serde_json::to_string_pretty(&document)?);
+    // One file cannot say which deployment each of its tables belongs
+    // to, so a daemon with named deployments is exported one at a time,
+    // or into a directory.
+
+    if exporting.name.is_none() && exporting.dir.is_none() && exporting.app.is_none() && several {
+        anyhow::bail!(
+            "this daemon has the deployments {}; name one, as in muructl deployment export {}, \
+             or write a file for each with --dir DIR",
+            named.join(", "),
+            named[0]
+        );
+    }
+
+    let extension = if exporting.json { "json" } else { "toml" };
+    let mut fetch = async |deployment: Option<&str>| -> anyhow::Result<String> {
+        let export = client
+            .export_config(pb::ExportConfigRequest {
+                app: exporting.app.clone().unwrap_or_default(),
+                effective: false,
+                resolve_rollouts: exporting.resolve_rollouts,
+                deployment: deployment.unwrap_or_default().to_owned(),
+                as_deployment: exporting.as_deployment.clone().unwrap_or_default(),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner();
+
+        if exporting.json {
+            let document =
+                muru_config::Document::parse(&export.document).map_err(anyhow::Error::msg)?;
+            return Ok(serde_json::to_string_pretty(&document)? + "\n");
+        }
+
+        Ok(format!(
+            "# Muru desired state: muructl {} on {}, {}, state version {}.\n\
+             # Applying this file to the daemon it came from changes nothing.\n\n{}",
+            export.version,
+            export.node,
+            format_time(export.time_unix_ms),
+            export.state_version,
+            export.document
+        ))
+    };
+
+    let Some(dir) = &exporting.dir else {
+        print!("{}", fetch(exporting.name.as_deref()).await?);
+        return Ok(());
+    };
+
+    // A file left from a deployment since removed would be applied back
+    // with the rest, so the directory starts empty.
+
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+
+    if std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .next()
+        .is_some()
+    {
+        anyhow::bail!(
+            "{} is not empty; a file there from a deployment since removed would be applied \
+             back with the rest, so give an empty directory",
+            dir.display()
+        );
+    }
+
+    if named.is_empty() {
+        println!("muru: there is nothing to export");
         return Ok(());
     }
 
-    println!(
-        "# Muru desired state: muructl {} on {}, {}, state version {}.\n\
-         # Applying this file to the daemon it came from changes nothing.\n",
-        export.version,
-        export.node,
-        format_time(export.time_unix_ms),
-        export.state_version
-    );
-    print!("{}", export.document);
+    for name in &named {
+        let path = dir.join(format!("{name}.{extension}"));
+        std::fs::write(&path, fetch(Some(name)).await?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("{}", path.display());
+    }
+
     Ok(())
 }
 
@@ -9176,6 +9277,7 @@ pub async fn config_show(
             app: app.unwrap_or_default(),
             effective,
             resolve_rollouts: false,
+            ..pb::ExportConfigRequest::default()
         })
         .await
         .map_err(explain)?

@@ -785,6 +785,38 @@ refused as a prune is while another deployment names something of it.
 `muructl deployment remove default` removes what `default` holds and
 leaves it in place, empty. Application data directories are kept.
 
+`muructl deployment export` follows the same division. A file carries
+one `deployment` key, so a daemon with named deployments is exported
+one at a time, or into a directory:
+
+```console
+$ muructl deployment export shop > shop.toml
+$ muructl deployment export --dir backup/
+backup/api.toml
+backup/default.toml
+backup/shop.toml
+$ muructl apply -f backup/ --dry-run
+muru: no changes (7 objects as declared)
+```
+
+`export NAME` writes what that deployment owns, with its key at the
+top; `default` is written without one. `--dir DIR` writes a file for
+each deployment into an empty directory, which applies back without
+changes. With no name and no directory, a daemon whose files name no
+deployment writes everything, and one with named deployments says to
+name one. `--app APP` writes one application with the routes that reach
+it and their hosts, and `--as NAME` puts `deployment = "NAME"` at the
+top, for moving an application made by command into files:
+
+```console
+$ muructl deployment export --app landing --as site > site.toml
+$ muructl apply -f site.toml
+muru: app landing moves from the deployment default to site
+```
+
+Client classes, rate limits and conditions the daemon's own file
+defines are not written: they are the node's, and stay in that file.
+
 What you would remove together belongs together. A host that
 separately released applications share goes in a deployment of its
 own, and each application's deployment holds its routes on that host.
