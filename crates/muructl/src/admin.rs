@@ -1237,6 +1237,19 @@ pub struct DaemonRunArgs {
     #[arg(long)]
     timestamps: bool,
 
+    /// Apply these files once the daemon is up, as muructl apply -f
+    /// does, and report ready only when they are applied: a file, or a
+    /// directory whose .toml files are applied together; repeatable. They
+    /// are applied at every start, and to a daemon that is already
+    /// running. A start whose files cannot be applied fails, leaving
+    /// what was serving as it was.
+    #[arg(long, value_name = "FILE or DIR")]
+    apply: Vec<PathBuf>,
+
+    /// With --apply: also remove what the files do not contain.
+    #[arg(long, requires = "apply")]
+    prune: bool,
+
     /// Set by a daemon that re-executed itself for an upgrade: the
     /// version it ran before.
     #[arg(long, hide = true, value_name = "VERSION")]
@@ -1358,8 +1371,34 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         upgraded_from: args.upgraded_from.clone(),
         rename_check: rename_check(),
         ownership,
+        start_apply: start_apply(&args),
     })
     .await
+}
+
+/// The files `--apply` names, read here as muructl apply reads them, so
+/// that their paths are taken from where each file is. Files that cannot
+/// be read as one configuration are carried as the reason, which the
+/// daemon reports once it has restored what its store holds.
+fn start_apply(args: &DaemonRunArgs) -> Option<muru_controller::daemon::StartApply> {
+    if args.apply.is_empty() {
+        return None;
+    }
+
+    let paths: Vec<String> = args
+        .apply
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    let document = load_documents(&args.apply)
+        .and_then(|document| document.to_toml().context("writing the configuration"))
+        .map_err(|error| format!("{error:#}"));
+
+    Some(muru_controller::daemon::StartApply {
+        paths: paths.join(" and "),
+        document,
+        prune: args.prune,
+    })
 }
 
 /// How often the daemon checks for a renamed log file: every five
@@ -1393,7 +1432,11 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
 
         if Path::new(&status.state_dir) == locations.state.path {
             println!("muru: the daemon is already running (pid {})", status.pid);
-            return Ok(());
+
+            // The files are applied to it all the same: the command means
+            // running, and serving these files (ADR 0081).
+
+            return apply_to_running(&args, &socket);
         }
 
         anyhow::bail!(
@@ -1440,6 +1483,19 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         command.arg("--user").arg(user);
     }
 
+    // The daemon reads the files itself, so their paths are made whole
+    // here, where a relative one means something.
+
+    for path in &args.apply {
+        command
+            .arg("--apply")
+            .arg(std::path::absolute(path).unwrap_or_else(|_| path.clone()));
+    }
+
+    if args.prune {
+        command.arg("--prune");
+    }
+
     command.args(args.locations.as_arguments());
     command
         .stdin(std::process::Stdio::null())
@@ -1471,12 +1527,33 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
             && let Ok(status) = client.get_status(pb::GetStatusRequest {}).await
         {
             let status = status.into_inner();
+
+            // With files to apply, started means applied: the daemon is
+            // ready only then, and one whose files cannot be applied
+            // exits, with why in its log.
+
+            if !args.apply.is_empty() {
+                await_start_apply(&socket, &mut child, &locations, written_before).await?;
+            }
+
             println!(
                 "muru: daemon started (pid {}), serving on {}, log {}",
                 status.pid,
                 status.listeners.join(" and "),
                 locations.daemon_log().display()
             );
+
+            if !args.apply.is_empty() {
+                let written = daemon_log_since(&locations.daemon_log(), written_before);
+
+                if let Some(line) = written
+                    .lines()
+                    .rfind(|line| line.contains("start apply of "))
+                {
+                    println!("muru: {}", after_stamp(line));
+                }
+            }
+
             return Ok(());
         }
 
@@ -1494,6 +1571,17 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
                 anyhow::bail!("{}", refusal.1);
             }
 
+            // A start whose files could not be applied says that, and no
+            // more of the log.
+
+            if let Some(failed) = written
+                .lines()
+                .rfind(|line| line.contains("start apply of ") && line.contains(" failed: "))
+                .and_then(|line| line.split_once("error: "))
+            {
+                anyhow::bail!("{}", failed.1.trim_end_matches(" (subject=daemon)"));
+            }
+
             anyhow::bail!("the daemon exited before it answered ({exited}); {written}");
         }
 
@@ -1504,6 +1592,85 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         "the daemon did not answer within 30 seconds; see {}",
         locations.daemon_log().display()
     )
+}
+
+/// A daemon's log line without the time and the `muru:` in front of it.
+fn after_stamp(line: &str) -> &str {
+    line.split_once("muru: ").map_or(line, |(_, rest)| rest)
+}
+
+/// Wait for a daemon started with `--apply` to finish applying: until it
+/// answers that it has started up, or exits, when what its log says of
+/// the apply is the error.
+async fn await_start_apply(
+    socket: &Path,
+    child: &mut std::process::Child,
+    locations: &Locations,
+    written_before: u64,
+) -> anyhow::Result<()> {
+    loop {
+        if let Some(exited) = child.try_wait().context("waiting for the daemon")? {
+            let written = daemon_log_since(&locations.daemon_log(), written_before);
+            let why = written
+                .lines()
+                .rfind(|line| line.contains("start apply of ") && line.contains(" failed: "))
+                .and_then(|line| line.split_once("error: "))
+                .map(|(_, why)| why.trim_end_matches(" (subject=daemon)"));
+
+            match why {
+                Some(why) => anyhow::bail!("{why}"),
+                None => anyhow::bail!("the daemon exited while applying ({exited}); {written}"),
+            }
+        }
+
+        // The daemon may be gone between one look and the next, so each
+        // look connects again.
+
+        let started = match client::connect(&client::Endpoint::unix(socket)).await {
+            Ok(mut client) => client
+                .probe(pb::ProbeRequest {
+                    probe: "startup".to_owned(),
+                    ..pb::ProbeRequest::default()
+                })
+                .await
+                .map(|answer| answer.into_inner().ok)
+                .unwrap_or(false),
+            Err(_) => false,
+        };
+
+        if started {
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Apply the `--apply` files of a start to the daemon that already
+/// runs, by running muructl apply against it, and fail as it fails.
+fn apply_to_running(args: &DaemonRunArgs, socket: &Path) -> anyhow::Result<()> {
+    if args.apply.is_empty() {
+        return Ok(());
+    }
+
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command.arg("apply").arg("--socket").arg(socket);
+
+    for path in &args.apply {
+        command.arg("-f").arg(path);
+    }
+
+    if args.prune {
+        command.arg("--prune");
+    }
+
+    let status = command.status().context("running muructl apply")?;
+
+    if !status.success() {
+        anyhow::bail!("the files were not applied; the daemon runs on as it was");
+    }
+
+    Ok(())
 }
 
 /// Refuse to start a named instance with no configuration file, naming

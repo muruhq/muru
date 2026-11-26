@@ -735,6 +735,51 @@ muru: plan (nothing changed)
   set-settings    shop                     processes; removes env.STRIPE_KEY
 ```
 
+### Applying files when the daemon starts
+
+`--apply` on `muructl daemon start`, `muructl daemon run` and `muructl
+up` applies files once the daemon is up, as `muructl apply -f` does, so
+one command brings up a daemon that serves:
+
+```console
+$ muructl daemon start --apply deploy.d/
+muru: daemon started (pid 4301), serving on http://127.0.0.1:8080, log /home/me/.local/state/muru/log/daemon.log
+muru: start apply of /home/me/deploy.d: 2 changes applied
+```
+
+It takes a file or a directory and may be given more than once.
+`--prune` beside it also removes what the files do not contain, as on
+`muructl apply`.
+
+- **Ready means applied.** The command returns, and the daemon answers
+  its [probes](#probes) and tells a service manager that it is ready,
+  once the files are applied.
+- **Every start applies them**, and so does a start that finds the
+  daemon already running, which then says so and applies the files to
+  it. The same line can be run every time.
+- **With nothing running**, as after a reboot, the daemon first starts
+  what it had, then applies the files. Its events say what the apply
+  will change before either happens.
+- **A start whose files cannot be applied fails.** Nothing is changed,
+  the daemon exits with the reason, and whatever was serving is left
+  serving for the next daemon to take over, as after `muructl daemon
+  stop`. A daemon that was already running stays running.
+- **An upgrade does not apply again.** `muructl daemon upgrade` starts
+  the daemon with its own arguments and leaves the files alone.
+
+```console
+$ muructl daemon start --apply deploy.d/
+muru: error: start apply of /home/me/deploy.d failed: /home/me/deploy.d/shop.toml: TOML parse error at line 19, column 9: invalid type: integer `7`, expected a sequence; the daemon exits, and what was serving is left serving
+```
+
+A restart applies whatever the files say at that moment, an edit
+nobody has applied yet among it, and puts back what a command changed
+where the files state otherwise. On a machine that is changed by hand,
+leave `--apply` off the service's command line and run `muructl apply`
+yourself. To keep a daemon running on what it had when files are bad,
+do the same: start it without `--apply`, and apply as a step of its
+own.
+
 ## Building the environment on the node
 
 A source with a `uv.lock` and no `.venv` gets an environment of its own,

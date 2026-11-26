@@ -249,6 +249,124 @@ pub struct Config {
     /// The locks on the state and run directories, taken before anything
     /// else and held for the life of the process (issue 804).
     pub ownership: crate::ownership::Ownership,
+    /// The files to apply once the daemon is up (`--apply`, ADR 0081), or
+    /// none.
+    pub start_apply: Option<StartApply>,
+}
+
+/// The files a start applies (section 13.13): what `muructl apply -f`
+/// would send for them, read before the daemon starts.
+#[derive(Debug, Clone)]
+pub struct StartApply {
+    /// The paths, as the messages name them.
+    pub paths: String,
+    /// The files as one document, or why they could not be read as one.
+    pub document: Result<String, String>,
+    /// Also remove what the files do not contain.
+    pub prune: bool,
+}
+
+/// An error on one line, for an event and a log line: a TOML parse
+/// error's excerpt of the file, with its line numbers and its caret, is
+/// left out, and what it says before and after is kept.
+fn on_one_line(error: &str) -> String {
+    error
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            let excerpt = line.starts_with('|')
+                || line.starts_with('^')
+                || line
+                    .split_once(" |")
+                    .is_some_and(|(number, _)| number.chars().all(|c| c.is_ascii_digit()));
+            !line.is_empty() && !excerpt
+        })
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+impl StartApply {
+    /// What the apply will do, planned against the store before anything
+    /// is restored, as the pending event says it; and whether it can be
+    /// applied at all.
+    fn pending(
+        &self,
+        store: &Store,
+        defined: &crate::config::Defined,
+        provisioning: &crate::provision::Provisioning,
+    ) -> (bool, String) {
+        let document = match self
+            .document
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|text| muru_config::Document::parse(text))
+        {
+            Ok(document) => document,
+            Err(error) => return (false, format!("cannot be applied: {}", on_one_line(&error))),
+        };
+
+        let plan = crate::config::plan(store, &document, self.prune, false, defined, provisioning);
+
+        if !plan.errors.is_empty() {
+            return (
+                false,
+                format!("cannot be applied: {}", plan.errors.join("; ")),
+            );
+        }
+
+        if plan.changes.is_empty() {
+            return (true, "nothing to change".to_owned());
+        }
+
+        let changes: Vec<String> = plan
+            .changes
+            .iter()
+            .map(|change| format!("{} {}", change.action.name(), change.subject()))
+            .collect();
+        (true, changes.join(", "))
+    }
+
+    /// Apply the files to the daemon at `socket`, as `muructl apply`
+    /// does, and say what came of it: the summary of a success, or the
+    /// report of a failure.
+    async fn run(self, socket: PathBuf) -> Result<String, String> {
+        let document = self.document.map_err(|error| on_one_line(&error))?;
+        let mut client = crate::client::connect(&crate::client::Endpoint::unix(&socket))
+            .await
+            .map_err(|error| error.to_string())?;
+        let report = client
+            .apply_config(muru_proto::admin::v1::ApplyConfigRequest {
+                document,
+                prune: self.prune,
+                ..muru_proto::admin::v1::ApplyConfigRequest::default()
+            })
+            .await
+            .map_err(|status| status.message().to_owned())?
+            .into_inner();
+
+        let failed: Vec<String> = report
+            .changes
+            .iter()
+            .filter(|change| change.outcome.starts_with("failed"))
+            .map(|change| format!("{} {}", change.subject, change.outcome))
+            .collect();
+        let mut errors = report.errors.clone();
+        errors.extend(failed);
+
+        if !report.snapshot_error.is_empty() {
+            errors.push(report.snapshot_error.clone());
+        }
+
+        if !errors.is_empty() {
+            return Err(format!("nothing applied: {}", errors.join("; ")));
+        }
+
+        Ok(if report.changes.is_empty() {
+            "nothing to change".to_owned()
+        } else {
+            format!("{} changes applied", report.changes.len())
+        })
+    }
 }
 
 /// How often the daemon checks whether a log file was renamed away
@@ -2527,6 +2645,40 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }
     }
 
+    // ADR 0081: the files a start applies are planned against the store
+    // before anything is restored, and what is pending is said first, so
+    // the log shows why a release starts only to be replaced, or that the
+    // files cannot be applied and the daemon will exit once what the
+    // store holds is back.
+
+    let start_apply = config
+        .start_apply
+        .filter(|_| config.upgraded_from.is_none());
+
+    if let Some(apply) = &start_apply {
+        let defined = daemon
+            .info
+            .defined
+            .read()
+            .expect("defined names poisoned")
+            .clone();
+        let (possible, what) = apply.pending(&daemon.store, &defined, &daemon.info.provisioning);
+        daemon.events.emit(
+            "config.apply_pending",
+            "config",
+            if possible { "notice" } else { "error" },
+            &format!(
+                "start apply of {}: {what}; {}",
+                apply.paths,
+                if possible {
+                    "applied once what the store holds is restored"
+                } else {
+                    "what the store holds is restored before the daemon exits"
+                }
+            ),
+        );
+    }
+
     daemon.restore().await;
     daemon.reconcile_traffic().await;
     daemon.run_at_boot().await;
@@ -2576,11 +2728,32 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let (wake_sender, mut wakes) = mpsc::channel(64);
     daemon.edge.watch_wakes(wake_sender);
 
-    crate::notify::ready(&format!("serving on {serving_on}"));
-    daemon
-        .info
-        .started
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    // ADR 0081: readiness waits for the files a start applies. They are
+    // applied through the daemon's own admin API once the loop below is
+    // carrying out commands, as muructl apply would apply them.
+
+    let (applied_tx, mut applied) = oneshot::channel::<Result<String, String>>();
+    let mut applying = start_apply.is_some();
+    let apply_paths = start_apply
+        .as_ref()
+        .map(|apply| apply.paths.clone())
+        .unwrap_or_default();
+
+    match start_apply {
+        Some(apply) => {
+            let socket = daemon.locations.admin_socket();
+            tokio::spawn(async move {
+                let _ = applied_tx.send(apply.run(socket).await);
+            });
+        }
+        None => {
+            crate::notify::ready(&format!("serving on {serving_on}"));
+            daemon
+                .info
+                .started
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 
     // Commands are carried out one at a time; a host dying in between is
     // noticed by the next pass. SIGTERM and SIGINT detach, as a service
@@ -2648,6 +2821,33 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             },
             Some(wake) = wakes.recv() => {
                 daemon.wake(wake).await;
+            }
+            result = &mut applied, if applying => {
+                applying = false;
+
+                match result.unwrap_or_else(|_| Err("the apply did not finish".to_owned())) {
+                    Ok(what) => {
+                        tracing::info!("start apply of {apply_paths}: {what}");
+                        crate::notify::ready(&format!("serving on {serving_on}"));
+                        daemon
+                            .info
+                            .started
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        // A failed start apply fails the start: the daemon
+                        // exits, leaving what serves detached for the next
+                        // daemon, as muructl daemon stop leaves it.
+
+                        let message = format!(
+                            "start apply of {apply_paths} failed: {error}; the daemon exits, and \
+                             what was serving is left serving"
+                        );
+                        daemon.events.emit("daemon.start_failed", "daemon", "error", &message);
+                        drain_on_exit = false;
+                        break Err(anyhow::anyhow!(message));
+                    }
+                }
             }
             served = &mut api => {
                 break served.map_err(anyhow::Error::from).and_then(|result| result);
