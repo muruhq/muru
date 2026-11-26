@@ -1184,6 +1184,14 @@ pub enum DaemonCommand {
         output: JsonArgs,
     },
 
+    /// Put the instance back to nothing, with everything of it stopped:
+    /// remove its state store and what its releases left (environments,
+    /// bytecode, static directories, the upload spool), after listing
+    /// what goes and what stays and asking. The configuration file is
+    /// kept, and so are application data and logs unless --data and
+    /// --logs. Refused while a daemon, an edge or a host of it runs.
+    Reset(Box<crate::daemon_reset::ResetArgs>),
+
     /// The daemon's own configuration file: where it is, what it holds,
     /// whether the daemon would take it, and changes that are checked,
     /// written and reloaded. What the daemon serves is not in it: that

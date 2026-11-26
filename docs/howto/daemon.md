@@ -1384,6 +1384,47 @@ daemon takes. A flag such as `--listen` holds over the file until the
 daemon is started without it, and a change to a key such a flag stands
 over is written with a warning saying so.
 
+## Starting again from nothing
+
+`muructl daemon reset` puts a daemon back to nothing. It removes the
+state store, with every application, release, host and route in it, and
+what the releases left: the environments built for them, their bytecode
+and static directories and the upload spool. It works on the files
+alone, so it needs no daemon, and it helps with a state store a daemon
+can no longer read.
+
+It runs only when nothing of the daemon is running. Stop everything
+first:
+
+```console
+$ muructl daemon stop --shutdown
+$ muructl daemon reset
+muru: this removes the state of the daemon at /home/me/.local/state/muru:
+  remove  /home/me/.local/state/muru/muru.sqlite  the state store: 3 applications, 7 releases, 2 hosts and 5 routes 212.0KB
+  remove  /home/me/.local/state/muru/envs  the environments built for releases 1.2GB
+  keep    /home/me/.local/state/muru/data  the applications' data (--data removes it)
+  keep    /home/me/.local/state/muru/logs  the logs (--logs removes them)
+  keep    /home/me/.config/muru/muru.toml  the daemon's configuration file
+Remove? [y/N]
+```
+
+While a daemon answers, or its edge and hosts still serve after a
+`muructl daemon stop` that left them, nothing is removed, and the
+command names what runs and exits 1.
+
+- `--dry-run` prints the list and stops, exiting 0 when a reset would
+  go ahead.
+- `--yes` goes ahead without asking. Without it and without a terminal,
+  the list is printed and nothing is removed.
+- `--json` prints the list as JSON: `allowed`, `running`, `remove` and
+  `keep`.
+- `--data` removes the applications' data directories under the state
+  directory as well, and `--logs` the log files.
+
+The daemon's configuration file, its file secret stores and the
+instance's identity are always kept. The next `muructl daemon start`
+finds nothing to serve.
+
 ## Reloading the configuration
 
 `muructl daemon reload`, or SIGHUP, reads the daemon's configuration

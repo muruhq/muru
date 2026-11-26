@@ -10,6 +10,7 @@
 mod admin;
 mod browser;
 mod daemon_config;
+mod daemon_reset;
 mod dashboard;
 mod detour;
 mod devcert;
@@ -1322,6 +1323,9 @@ fn main() -> anyhow::Result<()> {
                     output,
                 },
         } => exit_with(runtime, admin::daemon_status(socket, files, output.json)),
+        Command::Daemon {
+            command: admin::DaemonCommand::Reset(args),
+        } => exit_with(runtime, async move { daemon_reset::reset(*args) }),
         Command::Daemon { command } => runtime.block_on(async move {
             match command {
                 admin::DaemonCommand::Run(args) => admin::daemon_run(args).await,
@@ -1344,6 +1348,9 @@ fn main() -> anyhow::Result<()> {
                     unreachable!("daemon status is matched on its own")
                 }
                 admin::DaemonCommand::Config { command } => daemon_config::run(command).await,
+                admin::DaemonCommand::Reset(_) => {
+                    unreachable!("daemon reset is matched on its own")
+                }
             }
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
