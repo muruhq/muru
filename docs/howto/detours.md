@@ -24,7 +24,9 @@ true` in the `[daemon]` table of its configuration file:
 detours = true
 ```
 
-The setting is read when the daemon starts. A system daemon refuses it,
+The setting is read when the daemon starts, so `muructl daemon config
+set daemon.detours true --restart` turns detours on for a daemon that
+is running. A system daemon refuses it,
 and refuses a detour with a message saying why: its edge serves real
 traffic, and a detour would send that traffic to a process owned by
 whoever ran the command.

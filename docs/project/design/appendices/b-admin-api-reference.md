@@ -82,6 +82,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | ApplicationUrls | GET /v1/apps/{app}:urls | every URL the application can be reached at, best first, worked out from the routing: each route to it, on each virtual host the route belongs to, under each of the host's names but wildcards, on each listener the host uses; the default route (shortest path) first, a canonical name before the others, HTTPS before HTTP, ties by the listeners' and hosts' order; each with its scheme, name, port, path, route, host, listener, bound address, whether the name is canonical and how it was chosen (issue 815). A development run answers that it needs the daemon, since its URLs come from its registry record |
 | ReloadDaemonConfig | POST /v1/daemon:reload | re-read the daemon configuration |
 | UpgradeDaemon | POST /v1/daemon:upgrade | re-exec and replace edges |
+| RestartDaemon | POST /v1/daemon:restart | re-exec from the running binary, edges kept |
 | Backup, Restore | POST /v1/daemon:backup, :restore | state store |
 | ActivateOverlay, EndOverlay, PromoteOverlay | POST /v1/overlays/{overlay}:activate, :end, :promote | overlay control |
 | PreviewOverlay | GET /v1/overlays/{overlay}:preview | effective changes if activated |

@@ -28,6 +28,7 @@ Commands that act on a running system use the admin API (Appendix B). A command 
 | Daemon | muructl daemon config path, show, check [FILE], edit, set KEY VALUE, unset KEY, replace FILE | The daemon's own configuration file: where it is, what it holds (--full for every setting with where it came from), whether the daemon would take it, and changes that are checked, written and reloaded. Flags: --check, --no-reload | 10.3 |
 | Daemon | muructl daemon reset | Remove an instance's state with everything stopped, after listing what goes and asking. Flags: --dry-run, --json, --data, --logs, --yes | 13.13 |
 | Daemon | muructl daemon upgrade | Re-exec from the installed binary and replace edges | 13.4 |
+| Daemon | muructl daemon restart | Re-exec from the running binary, so that settings read at start take effect; also --restart on muructl daemon config edit, set, unset and replace | 13.4 |
 | Daemon | muructl daemon backup, restore | Save or load the state store | 13.5 |
 | Daemon | muructl up | Ensure a daemon is running for the current user or project; muructl daemon start under another name, --apply included | 13.2, 13.13 |
 | Agents | muructl mcp serve | Serve the daemon's operations to a coding agent over MCP on standard input and output; each tool runs the matching command with --json. Flags: --up, --read-only, --allow TOOL,..., and the socket and location flags | 10.11 |

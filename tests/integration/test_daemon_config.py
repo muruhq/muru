@@ -4,6 +4,7 @@ written and then given to the running daemon by a reload."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -46,6 +47,24 @@ def test_the_daemons_file_is_changed_checked_and_reloaded(tmp_path: Path) -> Non
             "[daemon] detours changed and is read at start, so the daemon keeps what it started "
             "with until it is restarted"
         ) in late.stdout, late.stdout
+
+        # With --json each says what it did (issue 941), the settings
+        # that wait for a restart among it.
+
+        shown = json.loads(config("show", "--json").stdout)
+        assert shown["path"] == str(file) and shown["present"] is True, shown
+        assert "detours = true" in shown["document"], shown
+        assert json.loads(config("check", "--json").stdout)["valid"] is True
+
+        told = json.loads(config("set", "limits.max_body_size", "60MB", "--json").stdout)
+        assert told["written"] is True and told["restarted"] is False, told
+        assert told["stale"] == ["[daemon] detours"], told
+        assert "changed [limits]" in told["reload"], told
+
+        refused = config("set", "limits.max_body_size", "lots", "--json")
+        assert refused.returncode != 0
+        assert "is not a size" in json.loads(refused.stdout)["error"], refused.stdout
+        assert config("set", "limits.max_body_size", "50MB").returncode == 0
 
         # A mistake is refused and nothing is written, by set, by replace
         # and by check of a file that is elsewhere.

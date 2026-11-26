@@ -15,7 +15,7 @@ use muru_controller::settings::{NodeSettings, Overrides};
 use muru_proto::admin::v1 as pb;
 use serde_json::Value;
 
-use crate::admin::{DaemonFileArgs, SocketArgs};
+use crate::admin::{DaemonFileArgs, JsonArgs, SocketArgs};
 
 /// The subcommands of `muructl daemon config`.
 #[derive(Subcommand)]
@@ -35,6 +35,9 @@ pub enum DaemonConfigCommand {
         full: bool,
 
         #[command(flatten)]
+        output: JsonArgs,
+
+        #[command(flatten)]
         place: Where,
     },
 
@@ -44,6 +47,9 @@ pub enum DaemonConfigCommand {
     Check {
         /// The file to check (default: the daemon's own).
         file: Option<PathBuf>,
+
+        #[command(flatten)]
+        output: JsonArgs,
 
         #[command(flatten)]
         place: Where,
@@ -69,10 +75,14 @@ pub enum DaemonConfigCommand {
 
         /// The value: a TOML value such as true, 4 or ["a", "b"], and
         /// anything else as a string.
+        #[arg(allow_hyphen_values = true)]
         value: String,
 
         #[command(flatten)]
         how: How,
+
+        #[command(flatten)]
+        output: JsonArgs,
 
         #[command(flatten)]
         place: Where,
@@ -85,6 +95,9 @@ pub enum DaemonConfigCommand {
 
         #[command(flatten)]
         how: How,
+
+        #[command(flatten)]
+        output: JsonArgs,
 
         #[command(flatten)]
         place: Where,
@@ -127,13 +140,25 @@ pub struct How {
     /// start reads it.
     #[arg(long)]
     no_reload: bool,
+
+    /// Restart the daemon as muructl daemon restart does, when the
+    /// change leaves a setting read only at start different from what
+    /// the daemon started with.
+    #[arg(long, conflicts_with_all = ["check", "no_reload"])]
+    restart: bool,
 }
+
+/// How long a restart asked for with --restart may take.
+const RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The daemon's file, and the daemon when one runs.
 struct Target {
     path: PathBuf,
     secrets: PathBuf,
     running: Option<(client::Endpoint, pb::Status)>,
+    /// The daemon's admin socket and its log, for a restart.
+    socket: PathBuf,
+    log: PathBuf,
 }
 
 impl Target {
@@ -181,12 +206,15 @@ fn checked(text: &str, path: &Path, secrets: &Path) -> anyhow::Result<()> {
 async fn target(place: &Where) -> anyhow::Result<Target> {
     let socket = place.socket.socket()?;
     let locations = crate::admin::daemon_locations(&place.socket, &place.files);
+    let log = place.socket.daemon_log(&place.files);
 
     if socket == locations.admin_socket() && crate::admin::no_daemon(&place.socket, &socket) {
         return Ok(Target {
             path: locations.config.path.clone(),
             secrets: locations.state.path.join("secrets"),
             running: None,
+            socket,
+            log,
         });
     }
 
@@ -209,6 +237,8 @@ async fn target(place: &Where) -> anyhow::Result<Target> {
         path: PathBuf::from(&status.config),
         secrets: Path::new(&status.state_dir).join("secrets"),
         running: Some((endpoint, status)),
+        socket,
+        log,
     })
 }
 
@@ -226,23 +256,37 @@ pub async fn run(command: DaemonConfigCommand) -> anyhow::Result<()> {
             println!("{}{present}", target.path.display());
             Ok(())
         }
-        DaemonConfigCommand::Show { full, place } => show(&target(&place).await?, full),
-        DaemonConfigCommand::Check { file, place } => check(&target(&place).await?, file),
+        DaemonConfigCommand::Show {
+            full,
+            output,
+            place,
+        } => show(&target(&place).await?, full, output.json),
+        DaemonConfigCommand::Check {
+            file,
+            output,
+            place,
+        } => check(&target(&place).await?, file, output.json),
         DaemonConfigCommand::Edit { how, place } => edit(&target(&place).await?, &how).await,
         DaemonConfigCommand::Set {
             key,
             value,
             how,
+            output,
             place,
         } => {
             let target = target(&place).await?;
             let text = set(&target.text()?, &key, Some(&value))?;
-            install(&target, &text, &how).await
+            install(&target, &text, &how, output.json).await
         }
-        DaemonConfigCommand::Unset { key, how, place } => {
+        DaemonConfigCommand::Unset {
+            key,
+            how,
+            output,
+            place,
+        } => {
             let target = target(&place).await?;
             let text = set(&target.text()?, &key, None)?;
-            install(&target, &text, &how).await
+            install(&target, &text, &how, output.json).await
         }
         DaemonConfigCommand::Replace { file, how, place } => {
             let target = target(&place).await?;
@@ -258,14 +302,28 @@ pub async fn run(command: DaemonConfigCommand) -> anyhow::Result<()> {
                     .with_context(|| format!("reading {}", file.display()))?
             };
 
-            install(&target, &text, &how).await
+            install(&target, &text, &how, false).await
         }
     }
 }
 
 /// Print the file, or with `full` every setting with where it came from.
-fn show(target: &Target, full: bool) -> anyhow::Result<()> {
+fn show(target: &Target, full: bool, json: bool) -> anyhow::Result<()> {
     let text = target.text()?;
+
+    if json {
+        let document = if full {
+            full_form(&text, &target.path, target.start_flags())?
+        } else {
+            text
+        };
+
+        return crate::admin::print_answer(&serde_json::json!({
+            "path": target.path,
+            "present": target.path.exists(),
+            "document": document,
+        }));
+    }
 
     if full {
         print!("{}", full_form(&text, &target.path, target.start_flags())?);
@@ -284,11 +342,19 @@ fn show(target: &Target, full: bool) -> anyhow::Result<()> {
 }
 
 /// Check the daemon's file, or one named, where it lies.
-fn check(target: &Target, file: Option<PathBuf>) -> anyhow::Result<()> {
+fn check(target: &Target, file: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
+    let valid = |path: &Path| {
+        if json {
+            return crate::admin::print_answer(&serde_json::json!({"path": path, "valid": true}));
+        }
+
+        println!("muru: {} is valid", path.display());
+        Ok(())
+    };
+
     let Some(file) = file else {
         target.check(&target.text()?)?;
-        println!("muru: {} is valid", target.path.display());
-        return Ok(());
+        return valid(&target.path);
     };
 
     // A file named is checked where it is: would a daemon started with
@@ -299,8 +365,7 @@ fn check(target: &Target, file: Option<PathBuf>) -> anyhow::Result<()> {
         std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
     let path = std::fs::canonicalize(&file).unwrap_or(file);
     checked(&text, &path, &target.secrets)?;
-    println!("muru: {} is valid", path.display());
-    Ok(())
+    valid(&path)
 }
 
 /// The file's text with one key set, or taken out when `value` is none,
@@ -438,7 +503,7 @@ async fn edit(target: &Target, how: &How) -> anyhow::Result<()> {
                     );
                 }
 
-                return install(target, &after, how).await;
+                return install(target, &after, how, false).await;
             }
             Err(error) => {
                 eprintln!("muru: {error:#}");
@@ -461,13 +526,84 @@ async fn edit(target: &Target, how: &How) -> anyhow::Result<()> {
 }
 
 /// Check a new text for the file, write it and have the daemon take it.
-async fn install(target: &Target, text: &str, how: &How) -> anyhow::Result<()> {
+async fn install(target: &Target, text: &str, how: &How, json: bool) -> anyhow::Result<()> {
+    let mut done = Installed {
+        path: target.path.clone(),
+        ..Installed::default()
+    };
+    let outcome = carry_out(target, text, how, json, &mut done).await;
+
+    // With --json what was done is said once, whole, even when a later
+    // step failed after the file was written.
+
+    if json && (outcome.is_ok() || done.written) {
+        if let Err(error) = &outcome {
+            done.error = Some(format!("{error:#}"));
+        }
+
+        crate::admin::print_answer(&done)?;
+
+        if outcome.is_err() {
+            std::process::exit(1);
+        }
+
+        return Ok(());
+    }
+
+    outcome
+}
+
+/// What a change to the file came to, as --json prints it.
+#[derive(Default, serde::Serialize)]
+struct Installed {
+    /// The daemon's file.
+    path: PathBuf,
+    /// Whether the file was written.
+    written: bool,
+    /// What happened in place of a reload, or before one: nothing
+    /// changed, nothing was written, or no daemon runs.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    note: String,
+    /// What the reload said.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    reload: String,
+    /// The settings read at start that differ from what the daemon
+    /// started with.
+    stale: Vec<String>,
+    /// Whether the daemon was restarted.
+    restarted: bool,
+    /// Keys the change touched that a start flag stands over.
+    warnings: Vec<String>,
+    /// Why a step after the write failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl Installed {
+    /// Say something in place of a reload.
+    fn note(&mut self, json: bool, note: &str) {
+        if !json {
+            println!("muru: {note}");
+        }
+
+        note.clone_into(&mut self.note);
+    }
+}
+
+/// The steps of a change, each said as it happens unless `json`.
+async fn carry_out(
+    target: &Target,
+    text: &str,
+    how: &How,
+    json: bool,
+    done: &mut Installed,
+) -> anyhow::Result<()> {
     target.check(text)?;
 
     if how.check {
-        println!(
-            "muru: valid as {}; nothing was written",
-            target.path.display()
+        done.note(
+            json,
+            &format!("valid as {}; nothing was written", target.path.display()),
         );
         return Ok(());
     }
@@ -475,16 +611,24 @@ async fn install(target: &Target, text: &str, how: &How) -> anyhow::Result<()> {
     let before = target.text()?;
 
     if before == text && target.path.exists() {
-        println!("muru: no changes");
+        done.note(json, "no changes");
         return Ok(());
     }
 
     refuse_unwritable(&target.path)?;
     write_whole(&target.path, text)?;
-    println!("muru: wrote {}", target.path.display());
+    done.written = true;
+
+    if !json {
+        println!("muru: wrote {}", target.path.display());
+    }
 
     for warning in overridden(&before, text, target.start_flags()) {
-        eprintln!("muru: warning: {warning}");
+        if !json {
+            eprintln!("muru: warning: {warning}");
+        }
+
+        done.warnings.push(warning);
     }
 
     if how.no_reload {
@@ -492,7 +636,10 @@ async fn install(target: &Target, text: &str, how: &How) -> anyhow::Result<()> {
     }
 
     let Some((endpoint, _)) = &target.running else {
-        println!("muru: the daemon is not running; it reads the file when it starts");
+        done.note(
+            json,
+            "the daemon is not running; it reads the file when it starts",
+        );
         return Ok(());
     };
 
@@ -502,7 +649,28 @@ async fn install(target: &Target, text: &str, how: &How) -> anyhow::Result<()> {
         .await
         .map_err(|status| anyhow::anyhow!("{}", status.message()))?
         .into_inner();
-    println!("muru: {}", response.message);
+
+    if !json {
+        println!("muru: {}", response.message);
+    }
+
+    done.reload = response.message;
+    done.stale = response.stale;
+
+    if !how.restart {
+        return Ok(());
+    }
+
+    if done.stale.is_empty() {
+        if !json {
+            println!("muru: no setting read at start changed, so the daemon is not restarted");
+        }
+
+        return Ok(());
+    }
+
+    crate::admin::restart_at(&target.socket, &target.log, RESTART_TIMEOUT, json).await?;
+    done.restarted = true;
     Ok(())
 }
 

@@ -72,7 +72,8 @@ is put back to nothing.
   The other start flags are still not looked at.
 
 - **`muructl daemon upgrade` does not apply again.** It re-executes the
-  daemon with its own arguments, and an upgrade should not deploy.
+  daemon with its own arguments, and an upgrade should not deploy. The
+  same holds for `muructl daemon restart` (issue 940).
 
 - **A failed start apply fails the start.** Nothing changes unless the
   whole plan is valid, a prune's removals included. Additions come

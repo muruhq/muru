@@ -934,8 +934,9 @@ the daemon serves at each start.
   running: the daemon exits before it listens when the files cannot be
   read, and stops its edge when a release they declare does not start.
   A daemon that was already running stays running.
-- **An upgrade does not apply again.** `muructl daemon upgrade` starts
-  the daemon with its own arguments and leaves the files alone.
+- **An upgrade or a restart does not apply again.** `muructl daemon
+  upgrade` and `muructl daemon restart` start the daemon with its own
+  arguments and leave the files alone.
 
 ```console
 $ muructl daemon start --apply deploy.d/
@@ -1599,8 +1600,18 @@ muru: wrote /home/me/.config/muru/muru.toml
 muru: reloaded /home/me/.config/muru/muru.toml: ...; [daemon] detours changed and is read at start, so the daemon keeps what it started with until it is restarted; ...
 ```
 
-`muructl daemon stop` and `muructl daemon start` restart the daemon
-with its hosts and its edge serving throughout.
+`--restart` then [restarts the daemon](#restarting-the-daemon) in
+place, with its hosts and its edge serving throughout. It restarts only
+when the file leaves a setting read at start different from what the
+daemon started with, and says so when it does not:
+
+```console
+$ muructl daemon config set daemon.detours true --restart
+muru: wrote /home/me/.config/muru/muru.toml
+muru: reloaded /home/me/.config/muru/muru.toml: ...; [daemon] detours changed and is read at start, so the daemon keeps what it started with until it is restarted; ...
+muru: daemon (pid 4120) re-executing from /usr/bin/muructl
+muru: daemon restarted (pid 4120)
+```
 
 `edit` opens the file in `$VISUAL`, else `$EDITOR`, else `vi`, starting
 from a short commented file when there is none. It checks what was
@@ -1635,8 +1646,9 @@ $ ./make-config | muructl daemon config replace -
 ```
 
 `set`, `unset`, `edit` and `replace` take `--check`, which checks the
-result and writes nothing, and `--no-reload`, which writes the file and
-leaves the daemon as it is. With no daemon running they write the file
+result and writes nothing, `--no-reload`, which writes the file and
+leaves the daemon as it is, and `--restart`. `show`, `check`, `set` and
+`unset` take `--json`. With no daemon running they write the file
 and say that the daemon reads it when it starts. A file this user may
 not write, as a system daemon's is to anyone but root, is refused
 before anything is edited, with the way to run the command with the
@@ -1748,9 +1760,9 @@ The rest of the file is read when the daemon starts: the `[metrics]`
 table, the `[dashboard]` table's `listen` address, the
 `[overlay_webhook]` table and the `[daemon]` table's `user` and
 `detours`. A change to
-those takes effect after `muructl daemon stop` and `muructl daemon
-start` (`systemctl restart muru` under systemd), which detaches from the
-hosts and the edge and takes them back, so it costs no request. A daemon
+those takes effect when the daemon is restarted, as [the next
+section](#restarting-the-daemon) describes, which costs no request. A
+daemon
 started with `--listen`, `--metrics`, `--dashboard` or `--user` keeps
 those over the file's settings on every reload.
 
@@ -1758,3 +1770,34 @@ The command prints what changed and what was done about it, what is
 unchanged and what is read at start, and the `config.reloaded` event
 records the same. A file the daemon cannot parse, or a table it refuses,
 leaves everything as it was and the command fails saying why.
+
+## Restarting the daemon
+
+`muructl daemon restart` starts the daemon again in place, so that it
+reads its configuration file afresh, the settings read only at start
+among them:
+
+```console
+$ muructl daemon restart
+muru: daemon (pid 4120) re-executing from /usr/bin/muructl
+muru: daemon restarted (pid 4120)
+```
+
+The daemon detaches from its hosts and its edge, which keep serving,
+re-executes itself from the `muructl` it runs, with the arguments it was
+started with, and takes them back. No request is lost. The process
+keeps its pid, so a service manager that started the daemon sees a
+reload, not an exit, and `systemctl status` shows the same main
+process. The command returns when the daemon is ready again, within
+`--timeout` (120 s by default), and the `daemon.restarted` event
+records it.
+
+- **The files of `--apply` are not applied again.** A restart reads the
+  daemon's own file, and leaves what the daemon serves as it is.
+- **A newer `muructl` is not taken.** When the installed `muructl` is
+  of another version than the daemon runs, the restart is refused, and
+  [`muructl daemon upgrade`](upgrading.md) is the command: it also
+  replaces the edge.
+- **A file with a mistake is refused.** The daemon reads its file
+  before it re-executes, and one it would not take leaves the daemon
+  running as it is, with the command saying what is wrong.

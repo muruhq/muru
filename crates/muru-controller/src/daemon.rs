@@ -238,11 +238,14 @@ pub struct Config {
     /// The executable to spawn edges from, normally the daemon's own.
     pub executable: PathBuf,
     /// The arguments to re-execute the daemon with on an upgrade (section
-    /// 13.4): its own, with the flag that names the version it ran before.
-    pub upgrade_arguments: Vec<std::ffi::OsString>,
+    /// 13.4) or a restart: its own, without the flags that say it
+    /// re-executed, which are added then.
+    pub reexec_arguments: Vec<std::ffi::OsString>,
     /// The version this daemon ran before it re-executed itself for an
     /// upgrade, or none when it started afresh.
     pub upgraded_from: Option<String>,
+    /// Whether this daemon re-executed itself for a restart (issue 940).
+    pub restarted: bool,
     /// How often the log files are checked for a rename, when
     /// `reopen_on_rename` is on: `RENAME_CHECK` but in tests.
     pub rename_check: Duration,
@@ -401,6 +404,23 @@ pub struct CertificateChanges {
     pub refused: Option<String>,
 }
 
+/// What a reload did (section 13.3).
+#[derive(Debug, Clone)]
+pub struct Reloaded {
+    /// The report, as one sentence.
+    pub message: String,
+    /// The settings read at start that differ from what the daemon
+    /// started with, which a restart applies (issue 940).
+    pub stale: Vec<String>,
+}
+
+/// The flag a daemon re-executes itself with for an upgrade, followed by
+/// the version it ran before.
+pub const UPGRADED_FROM_FLAG: &str = "--upgraded-from";
+
+/// The flag a daemon re-executes itself with for a restart.
+pub const RESTARTED_FLAG: &str = "--restarted";
+
 /// An upgrade the daemon is about to carry out (section 13.4).
 #[derive(Debug, Clone)]
 pub struct Upgrade {
@@ -408,6 +428,9 @@ pub struct Upgrade {
     pub executable: PathBuf,
     /// The version that binary reports.
     pub version: String,
+    /// Whether this is a restart (issue 940): the same version again,
+    /// with the edge left as it is.
+    pub restart: bool,
 }
 
 /// What to do with an active rollout (section 9.3).
@@ -673,7 +696,7 @@ pub enum Command {
     /// (section 13.3).
     Reload {
         /// Answered with what was reloaded, or why it was refused.
-        done: oneshot::Sender<Result<String, String>>,
+        done: oneshot::Sender<Result<Reloaded, String>>,
     },
     /// Reopen every log file after an external rotation (section 11.3):
     /// the daemon's own, the edge's access log and each host's, and with
@@ -718,6 +741,13 @@ pub enum Command {
     /// Re-execute the daemon from the installed binary and replace the
     /// edge (section 13.4).
     Upgrade {
+        /// Answered with what is about to happen, before the daemon
+        /// re-executes, or why it will not.
+        done: oneshot::Sender<Result<Upgrade, String>>,
+    },
+    /// Re-execute the daemon from the binary it runs, so that it reads
+    /// its configuration file afresh (issue 940).
+    Restart {
         /// Answered with what is about to happen, before the daemon
         /// re-executes, or why it will not.
         done: oneshot::Sender<Result<Upgrade, String>>,
@@ -2350,7 +2380,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     if let Some(apply) = config
         .start_apply
         .as_ref()
-        .filter(|_| booted && config.upgraded_from.is_none())
+        .filter(|_| booted && config.upgraded_from.is_none() && !config.restarted)
         && !store.apps()?.iter().any(|app| app.current.is_some())
         && let (false, what) = apply.pending(&store, &defined, &provisioning)
     {
@@ -2577,6 +2607,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 std::process::id()
             ),
         ),
+        None if config.restarted => events.emit(
+            "daemon.restarted",
+            "daemon",
+            "info",
+            &format!(
+                "re-executed from {}, pid {}; serving on {serving_on}",
+                config.executable.display(),
+                std::process::id()
+            ),
+        ),
         None => events.emit(
             "daemon.started",
             "daemon",
@@ -2697,7 +2737,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let start_apply = config
         .start_apply
-        .filter(|_| config.upgraded_from.is_none());
+        .filter(|_| config.upgraded_from.is_none() && !config.restarted);
 
     if let Some(apply) = &start_apply {
         let defined = daemon
@@ -2860,6 +2900,17 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                         let _ = done.send(Err(error));
                     }
                 },
+                Some(Command::Restart { done }) => match daemon.prepare_restart().await {
+                    Ok(restart) => {
+                        let _ = done.send(Ok(restart.clone()));
+                        upgrade_to = Some(restart);
+                        drain_on_exit = false;
+                        break Ok(());
+                    }
+                    Err(error) => {
+                        let _ = done.send(Err(error));
+                    }
+                },
                 Some(command) => daemon.carry_out(command).await,
                 None => break Ok(()),
             },
@@ -2965,8 +3016,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // the same way and then re-executes itself, so the next daemon is
     // this process with the installed binary's image.
 
-    if upgrade_to.is_some() {
-        crate::notify::notify("RELOADING=1\nSTATUS=upgrading");
+    if let Some(upgrade) = &upgrade_to {
+        crate::notify::notify(if upgrade.restart {
+            "RELOADING=1\nSTATUS=restarting"
+        } else {
+            "RELOADING=1\nSTATUS=upgrading"
+        });
     } else {
         crate::notify::stopping();
     }
@@ -3131,7 +3186,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         // The locks on the directories are kept through the exec, so
         // there is no moment when another daemon could take them.
 
-        let mut arguments = config.upgrade_arguments.clone();
+        let mut arguments = config.reexec_arguments.clone();
+
+        if upgrade.restart {
+            arguments.push(RESTARTED_FLAG.into());
+        } else {
+            arguments.push(UPGRADED_FROM_FLAG.into());
+            arguments.push(env!("CARGO_PKG_VERSION").into());
+        }
+
         let held = config.ownership.keep_across_exec();
 
         if !held.is_empty() {
@@ -3537,6 +3600,25 @@ async fn prepare_upgrade() -> Result<Upgrade, String> {
     Ok(Upgrade {
         executable,
         version,
+        restart: false,
+    })
+}
+
+/// The restart that re-executing from `found` would be for a daemon of
+/// version `running`, or why it would not be one.
+fn restart_of(found: Upgrade, running: &str) -> Result<Upgrade, String> {
+    if found.version != running {
+        return Err(format!(
+            "{} is version {}, and the daemon runs version {running}, so a restart would \
+             upgrade it: use muructl daemon upgrade",
+            found.executable.display(),
+            found.version
+        ));
+    }
+
+    Ok(Upgrade {
+        restart: true,
+        ..found
     })
 }
 
@@ -4382,7 +4464,23 @@ impl Daemon {
     /// and stopped, and the rest are swapped in place. The file is
     /// checked whole and the new listeners bound before anything is
     /// applied, so a mistake applies nothing.
-    async fn reload(&mut self) -> Result<String, String> {
+    /// Issue 940: a restart re-executes from the binary the daemon runs.
+    /// An installed binary of another version would make it an upgrade,
+    /// which replaces the edge as well, so that is refused and left to
+    /// the command that says so. The file is read first as the new image
+    /// will read it, since one it refused would leave no daemon.
+    async fn prepare_restart(&self) -> Result<Upgrade, String> {
+        crate::settings::NodeSettings::read(
+            &self.locations.config.path,
+            &self.locations.state.path.join("secrets"),
+            &self.overrides,
+        )
+        .map_err(|error| format!("the daemon is not restarted: {error}"))?;
+        let found = prepare_upgrade().await?;
+        restart_of(found, env!("CARGO_PKG_VERSION"))
+    }
+
+    async fn reload(&mut self) -> Result<Reloaded, String> {
         let path = self.locations.config.path.clone();
         let settings = crate::settings::NodeSettings::read(
             &path,
@@ -4661,7 +4759,8 @@ impl Daemon {
             if report.is_ok() { "info" } else { "warning" },
             &report.message(),
         );
-        report.outcome()
+        let stale = report.waiting();
+        report.outcome().map(|message| Reloaded { message, stale })
     }
 
     /// Section 4.2: read the certificate and key files of the applied
@@ -7073,7 +7172,7 @@ impl Daemon {
             Command::CloseDetour { serial, reason } => {
                 self.close_detour(serial, &reason).await;
             }
-            Command::Shutdown { .. } | Command::Upgrade { .. } => {}
+            Command::Shutdown { .. } | Command::Upgrade { .. } | Command::Restart { .. } => {}
         }
     }
 
@@ -14350,6 +14449,25 @@ fn step_message(steps: &[RolloutStep], step: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restart_is_refused_when_it_would_be_an_upgrade() {
+        // Issue 940: the same version again is a restart, and another
+        // version is left to muructl daemon upgrade.
+
+        let found = |version: &str| Upgrade {
+            executable: PathBuf::from("/usr/bin/muructl"),
+            version: version.to_owned(),
+            restart: false,
+        };
+
+        assert!(restart_of(found("1.2.0"), "1.2.0").unwrap().restart);
+        assert_eq!(
+            restart_of(found("1.3.0"), "1.2.0").unwrap_err(),
+            "/usr/bin/muructl is version 1.3.0, and the daemon runs version 1.2.0, so a \
+             restart would upgrade it: use muructl daemon upgrade"
+        );
+    }
 
     #[test]
     fn a_record_names_a_process_by_its_path_or_its_title() {
