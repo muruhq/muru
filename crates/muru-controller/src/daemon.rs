@@ -2330,6 +2330,45 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let booted = adopted.is_none();
     let wanted_listeners = settings.listeners.clone();
     let read_at_start = settings.at_start();
+    let provisioning =
+        crate::provision::Provisioning::for_daemon(&settings.tools, &locations.state.path);
+    let defined = crate::config::Defined {
+        budget: crate::budget::View {
+            budget: settings.budget,
+            ..crate::budget::View::default()
+        },
+        conditions: settings.conditions.clone(),
+        ..client_rules.defined()
+    };
+
+    // Issue 945: files that cannot be applied are known before anything
+    // is started. With no edge left running and nothing in the store
+    // serving there is nothing to restore first, so the start fails here,
+    // before a listener is bound: an edge with nothing behind it would
+    // only hold the address and answer errors.
+
+    if let Some(apply) = config
+        .start_apply
+        .as_ref()
+        .filter(|_| booted && config.upgraded_from.is_none())
+        && !store.apps()?.iter().any(|app| app.current.is_some())
+        && let (false, what) = apply.pending(&store, &defined, &provisioning)
+    {
+        events.emit(
+            "config.apply_pending",
+            "config",
+            "error",
+            &format!("start apply of {}: {what}", apply.paths),
+        );
+        let message = format!(
+            "start apply of {} failed: {}; the daemon exits, and nothing was serving, so its \
+             edge is not started",
+            apply.paths,
+            what.strip_prefix("cannot be applied: ").unwrap_or(&what)
+        );
+        events.emit("daemon.start_failed", "daemon", "error", &message);
+        anyhow::bail!(message);
+    }
 
     let edge = match adopted {
         Some(edge) => {
@@ -2369,8 +2408,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // Section 8.4: uv as found and how it is run, said once at start.
 
-    let provisioning =
-        crate::provision::Provisioning::for_daemon(&settings.tools, &locations.state.path);
     tracing::info!("{}", provisioning.describe_uv());
     write_edge_record(&locations.run.path, &edge);
 
@@ -2399,14 +2436,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         metrics,
         dashboard,
         dashboard_sessions: dashboard_sessions.clone(),
-        defined: std::sync::RwLock::new(crate::config::Defined {
-            budget: crate::budget::View {
-                budget: settings.budget,
-                ..crate::budget::View::default()
-            },
-            conditions: settings.conditions.clone(),
-            ..client_rules.defined()
-        }),
+        defined: std::sync::RwLock::new(defined),
         python_logging: std::sync::RwLock::new(settings.python_logging.clone()),
         interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
@@ -2851,14 +2881,28 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                     Err(error) => {
                         // A failed start apply fails the start: the daemon
                         // exits, leaving what serves detached for the next
-                        // daemon, as muructl daemon stop leaves it.
+                        // daemon, as muructl daemon stop leaves it. With
+                        // nothing serving there is nothing to leave, and
+                        // an edge left behind would hold the address and
+                        // answer every request with an error, so
+                        // everything stops.
 
+                        let serving = daemon
+                            .store
+                            .apps()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|app| app.current.is_some());
                         let message = format!(
-                            "start apply of {apply_paths} failed: {error}; the daemon exits, and \
-                             what was serving is left serving"
+                            "start apply of {apply_paths} failed: {error}; the daemon exits, and {}",
+                            if serving {
+                                "what was serving is left serving"
+                            } else {
+                                "nothing was serving, so its edge stops with it"
+                            }
                         );
                         daemon.events.emit("daemon.start_failed", "daemon", "error", &message);
-                        drain_on_exit = false;
+                        drain_on_exit = !serving;
                         break Err(anyhow::anyhow!(message));
                     }
                 }

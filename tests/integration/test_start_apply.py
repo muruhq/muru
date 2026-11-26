@@ -4,6 +4,7 @@ waiting for them and a failed apply failing the start."""
 
 from __future__ import annotations
 
+import socket
 import subprocess
 import sys
 import time
@@ -130,6 +131,87 @@ def test_a_start_applies_its_files_and_fails_when_it_cannot(tmp_path: Path) -> N
     finally:
         if daemon.process.poll() is None:
             daemon.stop()
+
+
+@pytest.mark.parametrize("known", [True, False], ids=["bad-file", "release-never-starts"])
+def test_a_failed_start_with_nothing_serving_leaves_no_edge(tmp_path: Path, known: bool) -> None:
+    # Issue 945: with an empty store there is nothing to leave serving,
+    # and an edge left behind would hold the address and answer errors.
+    # Files that cannot be applied are known before an edge is started,
+    # and a release that does not start is known only after.
+
+    files = tmp_path / "deploy.d"
+    files.mkdir()
+
+    if known:
+        (files / "shop.toml").write_text("[host.shop]\nnames = 7\n")
+    else:
+        broken = tmp_path / "broken"
+        broken.mkdir()
+        (broken / "app.py").write_text("raise RuntimeError('this release never starts')\n")
+        (files / "shop.toml").write_text(
+            f"[app.shop.release.r1]\nsource = '{broken}'\n"
+            f"entrypoint = 'app:application'\npython = '{sys.executable}'\n"
+        )
+
+    port = support.free_port()
+    run_dir = support.short_dir("muru-run-")
+    (tmp_path / "muru.toml").write_text(f"[[listener]]\naddress = '127.0.0.1:{port}'\n")
+    muructl = support.muructl_path()
+    assert muructl is not None
+    where = [
+        "--state-dir",
+        str(tmp_path / "state"),
+        "--run-dir",
+        str(run_dir),
+        "--log-dir",
+        str(tmp_path / "logs"),
+        "--cache-dir",
+        str(tmp_path / "cache"),
+        "--config",
+        str(tmp_path / "muru.toml"),
+    ]
+
+    failed = subprocess.run(
+        [str(muructl), "daemon", "run", *where, "--apply", str(files)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+        env=inherited(),
+    )
+    assert failed.returncode != 0, failed.stdout + failed.stderr
+    said = failed.stdout + failed.stderr
+    assert f"start apply of {files} failed: " in said, said
+
+    if known:
+        assert "nothing was serving, so its edge is not started" in said, said
+        assert not (run_dir / "edge.toml").exists()
+    else:
+        assert "nothing was serving, so its edge stops with it" in said, said
+
+    # Nothing of the instance runs, so the address is free and a reset
+    # would be allowed.
+
+    def listening() -> bool:
+        with socket.socket() as probe:
+            return probe.connect_ex(("127.0.0.1", port)) == 0
+
+    deadline = time.monotonic() + 20
+
+    while listening() and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+    assert not listening()
+    reset = subprocess.run(
+        [str(muructl), "daemon", "reset", *where, "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+        env=inherited(),
+    )
+    assert reset.returncode == 0, reset.stdout + reset.stderr
 
 
 @pytest.mark.parametrize("flag", ["--prune"])

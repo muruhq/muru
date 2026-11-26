@@ -884,7 +884,10 @@ the daemon serves at each start.
 - **A start whose files cannot be applied fails.** Nothing is changed,
   the daemon exits with the reason, and whatever was serving is left
   serving for the next daemon to take over, as after `muructl daemon
-  stop`. A daemon that was already running stays running.
+  stop`. With nothing serving, as on a first start, nothing is left
+  running: the daemon exits before it listens when the files cannot be
+  read, and stops its edge when a release they declare does not start.
+  A daemon that was already running stays running.
 - **An upgrade does not apply again.** `muructl daemon upgrade` starts
   the daemon with its own arguments and leaves the files alone.
 

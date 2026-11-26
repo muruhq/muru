@@ -79,12 +79,19 @@ is put back to nothing.
   first and removals last, only once the releases the apply adds serve,
   as with any apply. The daemon exits non-zero with the apply's report:
   `muructl daemon start` and `muructl up` print it and fail, and
-  `muructl daemon run` logs it and exits. The exit is a detach, as
-  `muructl daemon stop` is: an edge and hosts that were running stay up
-  for the next daemon to adopt. The first proposal, that the daemon
-  stays up on what the store held, was dropped because `daemon run` has
-  no separate command to fail, so the failure would be known only from
-  the log.
+  `muructl daemon run` logs it and exits. When an application has a
+  serving release the exit is a detach, as `muructl daemon stop` is: the
+  edge and the hosts stay up for the next daemon to adopt. With nothing
+  serving, as on a first start, there is nothing to protect and no edge
+  is left: one would hold the address, answer every request with an
+  error, and keep `muructl daemon reset` from running. Files that
+  cannot be read or planned are known before anything is started, so
+  the daemon then exits without binding a listener; a failure known
+  only later, a release that does not start, shuts the edge down with
+  the daemon. The first proposal,
+  that the daemon stays up on what the store held, was dropped because
+  `daemon run` has no separate command to fail, so the failure would be
+  known only from the log.
 
   When the daemon was already running, a failed apply leaves it running
   and the command exits non-zero, as a failed `muructl apply` does.
