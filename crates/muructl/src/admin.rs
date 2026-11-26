@@ -5070,6 +5070,10 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
         return Ok(0);
     }
 
+    if !release.notice.is_empty() {
+        eprintln!("muru: warning: {}", release.notice);
+    }
+
     if args.no_wait {
         println!(
             "muru: release {}@{} recorded ({})",

@@ -189,7 +189,7 @@ the overlay ends the routes are as they would have been without it,
 including any change made to them in the meantime. Two overlays may not
 set the same field unless they have different priorities, and then the
 higher one's value stands while both are active; capacity is the
-exception, where the highest floor and ceiling apply. `muructl config
+exception, where the highest floor and ceiling apply. `muructl deployment
 show --effective` shows the configuration with the active overlays
 applied and says which overlay set what.
 

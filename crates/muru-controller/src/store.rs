@@ -327,7 +327,8 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                 user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings FROM apps ORDER BY name",
+                 user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings, \
+                 serving_origin FROM apps ORDER BY name",
             )?;
             let rows = statement.query_map([], app_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -341,7 +342,8 @@ impl Store {
             connection
                 .query_row(
                     "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                     user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings FROM apps WHERE name = ?1",
+                     user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings, \
+                     serving_origin FROM apps WHERE name = ?1",
                     [name],
                     app_from_row,
                 )
@@ -491,6 +493,16 @@ impl Store {
         previous: Option<&str>,
     ) -> Result<(), StoreError> {
         self.with(|connection| Writes { connection }.set_app_releases(name, current, previous))
+    }
+
+    /// Record that applied files or a rollback set the serving release
+    /// just written.
+    pub fn set_serving_origin(
+        &self,
+        name: &str,
+        how: crate::model::ServingSetBy,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| Writes { connection }.set_serving_origin(name, how))
     }
 
     /// Releases of one application, or of every application, newest first.
@@ -1603,6 +1615,9 @@ fn app_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<App> {
         name: row.get(0)?,
         current: row.get(1)?,
         previous: row.get(2)?,
+        serving_origin: row
+            .get::<_, Option<String>>(14)?
+            .and_then(|text| crate::model::ServingOrigin::decode(&text)),
         created_unix_ms: row.get::<_, i64>(3)? as u64,
         resource_version: row.get::<_, i64>(4)? as u64,
         user: row.get(5)?,
@@ -1642,6 +1657,7 @@ fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
             ("media_dir", "TEXT"),
             ("uploads_dir", "TEXT"),
             ("settings", "TEXT"),
+            ("serving_origin", "TEXT"),
         ],
     )?;
     add_columns(
@@ -1784,10 +1800,32 @@ impl Writes<'_> {
         current: Option<&str>,
         previous: Option<&str>,
     ) -> Result<(), StoreError> {
+        // How the serving release was set is said after, by an apply or
+        // a rollback. Anything else leaves none, which reads as a
+        // command having set it.
+
         self.connection.execute(
-            "UPDATE apps SET current_release = ?2, previous_release = ?3, \
+            "UPDATE apps SET current_release = ?2, previous_release = ?3, serving_origin = NULL, \
                  resource_version = resource_version + 1 WHERE name = ?1",
             params![name, current, previous],
+        )?;
+        Ok(())
+    }
+
+    /// Record that applied files or a rollback set the serving release
+    /// just written (ADR 0082).
+    pub fn set_serving_origin(
+        &self,
+        name: &str,
+        how: crate::model::ServingSetBy,
+    ) -> Result<(), StoreError> {
+        let origin = crate::model::ServingOrigin {
+            how,
+            at_unix_ms: now_unix_ms(),
+        };
+        self.connection.execute(
+            "UPDATE apps SET serving_origin = ?2 WHERE name = ?1",
+            params![name, origin.encode()],
         )?;
         Ok(())
     }

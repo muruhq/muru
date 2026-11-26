@@ -1281,6 +1281,7 @@ message Release {
   string traffic = 38;              // its shares of the routes that split traffic, where they differ from what serving implies (issue 759)
   Detour detour = 39;               // a detour's run and traffic, for kind detour
   map<string, string> metadata = 40; // what its deploy recorded of where its code came from
+  string notice = 41;               // on a deploy's answer: what its caller should be told, as that applied files declare the application and do not have this release (issue 933)
 }
 
 // A gate a release passed: a run of a command at a point in its life.

@@ -12007,6 +12007,19 @@ impl Daemon {
         self.store
             .set_app_releases(app, Some(&previous), current.as_deref())
             .map_err(|error| error.to_string())?;
+
+        // ADR 0082: an apply reads this, and does not put back in traffic
+        // the release a rollback took out of it.
+
+        if let Some(from) = &current {
+            self.store
+                .set_serving_origin(
+                    app,
+                    crate::model::ServingSetBy::Rollback { from: from.clone() },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
         self.events.emit(
             "app.rolled-back",
             app,

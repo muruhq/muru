@@ -361,7 +361,7 @@ with the same keys: `env`, `processes`, `threads`, `sync_threads`,
 `concurrency`, `max_requests`, `max_lifetime`, a `timeouts` table of the
 host's timeouts and a `memory` table. The file states them in full, as
 it states the application's user, so applying a file whose application
-has none removes those `muructl app set` gave, and `muructl config
+has none removes those `muructl app set` gave, and `muructl deployment
 export` writes them, so settings made at a terminal can be kept in a
 file:
 
@@ -572,7 +572,10 @@ would take over from one that serves, it says how long that one stays
 warm. `--prune` also removes the routes, hosts, releases and
 applications the files do not contain: the routes and hosts with the
 rest of the files, and the releases and applications after the edge has
-the snapshot, a running release draining and stopping first. The release
+the snapshot, a running release draining and stopping first. A release
+the files do not declare is left for a later `--prune` while it is the
+one a rollback restores, the plan saying so, as `muructl release prune`
+leaves it. The release
 that serves each application after the apply must be declared, or the
 apply is refused, since `--prune` would remove it, and so must every
 release a route the files keep names in its traffic, and every
@@ -683,6 +686,54 @@ naming its candidate is an error too, since the apply would promote it
 past its gates: name another release, or promote it by hand with
 `muructl rollout bluegreen`, after which the files and the daemon
 agree.
+
+The same holds after `muructl rollback`. The files still name the
+release the rollback took out of traffic, and an apply does not put it
+back on its own:
+
+```console
+$ muructl rollback shop
+$ muructl apply -f config/
+muru: nothing applied; the configuration has errors:
+  shop: serving names r2, which muructl rollback took out of traffic at 2026-11-06T14:02:11.000Z; name another release with serving, or promote it again with muructl rollout bluegreen shop@r2
+```
+
+Any other move of traffic away from a release a command made serving
+is allowed, and the plan says that it is one:
+
+```console
+$ muructl apply -f config/ --dry-run
+muru: plan (nothing changed)
+  promote         shop@r1                  serving in place of shop@r2
+warning: shop@r2 was made serving by a command, not by applied files; this apply moves the application's traffic to shop@r1
+```
+
+### Files and commands on one application
+
+An application that applied files declare gets its releases and its
+settings from the files, and one that no file declares gets them from
+`muructl deploy` and `muructl app set`. Hosts and routes are declared
+in files either way, and a route may name an application no file
+declares.
+
+`muructl deploy` on an application the files declare is for an
+emergency. It works, and says that the files do not have the release:
+
+```console
+$ muructl deploy shop /srv/shop/hotfix
+muru: release shop@r5 is ready and serving
+muru: warning: shop is declared in applied files, which do not have shop@r5: the next apply moves traffic back when the files name the release that serves, and an apply with --prune removes r5 once it neither serves nor is the release a rollback restores. Add it to the files to keep it; muructl deployment export writes it
+```
+
+A setting `muructl app set` gives such an application lasts until the
+next apply, since a file states the application's table in full, and
+the plan names each setting an apply removes:
+
+```console
+$ muructl apply -f config/ --dry-run
+muru: plan (nothing changed)
+  set-settings    shop                     processes; removes env.STRIPE_KEY
+```
 
 ## Building the environment on the node
 

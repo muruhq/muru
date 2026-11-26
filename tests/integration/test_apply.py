@@ -315,6 +315,80 @@ def test_an_apply_that_adds_several_releases_says_which_serves(
     }
 
 
+def test_files_and_commands_on_one_application(daemon: Daemon, tmp_path: Path) -> None:
+    # Issue 933. The files declare r1 and r2 and name r2 as serving.
+
+    config = tmp_path / "shop.toml"
+    declared = release("shop", "r1") + release("shop", "r2", threads=2)
+    config.write_text("[app.shop]\nserving = 'r1'\n\n" + declared)
+    assert apply(daemon, config).returncode == 0
+    names_r2 = "[app.shop]\nserving = 'r2'\n\n" + declared
+    config.write_text(names_r2)
+    assert apply(daemon, config).returncode == 0
+    assert daemon.releases("shop")[0] == {"release": "shop@r2", "state": "ready", "serving": "yes"}
+
+    # A rollback by command takes r2 out of traffic. The files still name
+    # it, and an apply does not put it back on its own.
+
+    daemon.muructl("rollback", "shop")
+    refused = apply(daemon, config)
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    said = refused.stdout + refused.stderr
+    assert "shop: serving names r2, which muructl rollback took out of traffic at " in said, said
+    assert "promote it again with muructl rollout bluegreen shop@r2" in said, said
+    serving = {row["release"]: row["serving"] for row in daemon.releases("shop")}
+    assert serving == {"shop@r1": "yes", "shop@r2": ""}, serving
+
+    # Promoted again by command, the files and the daemon agree.
+
+    daemon.muructl("rollout", "bluegreen", "shop@r2")
+    daemon.wait_for_state("shop@r2", "ready")
+    agreed = apply(daemon, config)
+    assert agreed.returncode == 0 and "no changes" in agreed.stdout, agreed.stdout + agreed.stderr
+
+    # Files that name r1 move traffic back, and say a command chose r2.
+
+    config.write_text("[app.shop]\nserving = 'r1'\n\n" + declared)
+    reverted = apply(daemon, config, "--dry-run")
+    assert (
+        "shop@r2 was made serving by a command, not by applied files; this apply moves the "
+        "application's traffic to shop@r1"
+    ) in reverted.stdout + reverted.stderr, reverted.stdout + reverted.stderr
+    config.write_text(names_r2)
+
+    # A setting given by command and not in the files is removed by the
+    # next apply, and the plan names it.
+
+    daemon.muructl("app", "set", "shop", "--env", "STRIPE_KEY=sk_test", "--processes", "2")
+    planned = apply(daemon, config, "--dry-run")
+    assert "removes processes, env.STRIPE_KEY" in planned.stdout, planned.stdout
+
+    # A deploy on an application the files declare works, and warns that
+    # the files do not have the release.
+
+    hotfix = daemon.muructl(
+        "deploy", "shop", str(SHOP), "--python", sys.executable, "--release", "hotfix"
+    )
+    assert "release shop@hotfix is ready and serving" in hotfix.stdout, hotfix.stdout
+    assert (
+        "muru: warning: shop is declared in applied files, which do not have shop@hotfix: "
+    ) in hotfix.stderr, hotfix.stderr
+
+    # The files name r2, so the next apply moves traffic back to it. With
+    # --prune the hotfix, now the release a rollback restores, stays, and
+    # r1, which is neither, goes once the files drop it.
+
+    config.write_text("[app.shop]\nserving = 'r2'\n\n" + release("shop", "r2", threads=2))
+    pruned = apply(daemon, config, "--prune")
+    assert pruned.returncode == 0, pruned.stdout + pruned.stderr
+    assert (
+        "shop@hotfix is not declared and stays for now: it serves, or a rollback restores it"
+    ) in pruned.stdout + pruned.stderr, pruned.stdout + pruned.stderr
+    left = {row["release"]: row["serving"] for row in daemon.releases("shop")}
+    assert left == {"shop@hotfix": "", "shop@r2": "yes"}, left
+    assert daemon.muructl("rollback", "shop").returncode == 0
+
+
 def test_serving_stages_a_release_and_promotes_it(daemon: Daemon, tmp_path: Path) -> None:
     # Issue #420: a release declared beside the one serves, with a split
     # giving it 0%, is started held and takes no request without the

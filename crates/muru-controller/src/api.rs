@@ -751,8 +751,39 @@ impl Admin for Service {
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::invalid_argument)?;
 
+        // ADR 0082: an application applied files declare gets its
+        // releases from them. A deploy on it works, for an emergency,
+        // and its caller is told what the files will do with the release.
+
+        let declared = !self
+            .handle
+            .store
+            .declared_releases(&request.app)
+            .unwrap_or_default()
+            .is_empty();
+        let noticed = |release: Release| {
+            let notice = if declared {
+                format!(
+                    "{app} is declared in applied files, which do not have {app}@{id}: the next \
+                     apply moves traffic back when the files name the release that serves, and \
+                     an apply with --prune removes {id} once it neither serves nor is the \
+                     release a rollback restores. Add it to the files to keep it; muructl \
+                     deployment export writes it",
+                    app = release.app,
+                    id = release.id
+                )
+            } else {
+                String::new()
+            };
+
+            pb::Release {
+                notice,
+                ..release_message(release, &self.handle)
+            }
+        };
+
         if !request.wait {
-            return Ok(Response::new(release_message(created, &self.handle)));
+            return Ok(Response::new(noticed(created)));
         }
 
         let release = done_rx
@@ -760,7 +791,7 @@ impl Admin for Service {
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
         await_host_report(&self.handle, &release).await;
-        Ok(Response::new(release_message(release, &self.handle)))
+        Ok(Response::new(noticed(release)))
     }
 
     async fn plan_deploy(
@@ -3208,7 +3239,7 @@ impl Admin for Service {
             .read()
             .expect("defined names poisoned")
             .clone();
-        let plan = config::plan(
+        let mut plan = config::plan(
             &self.handle.store,
             &document,
             true,
@@ -3216,6 +3247,12 @@ impl Admin for Service {
             &defined,
             &self.handle.info.provisioning,
         );
+
+        // A diff says what the daemon holds that the files do not, the
+        // releases a prune would leave for later among them.
+
+        let deferred = std::mem::take(&mut plan.deferred);
+        plan.changes.extend(deferred);
         Ok(Response::new(report_message(&plan)))
     }
 
@@ -4600,6 +4637,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         traffic: String::new(),
         detour: None,
         metadata: release.spec.metadata.clone(),
+        notice: String::new(),
         app: release.app,
         id: release.id,
         state: release.state.as_str().to_owned(),

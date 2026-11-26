@@ -386,6 +386,11 @@ pub struct Plan {
     /// The releases the document declares, by application, which `release
     /// prune` leaves unless forced (section 9.1).
     pub declared: Vec<(String, Vec<String>)>,
+    /// The removals a prune leaves for later: a release the files do not
+    /// declare that serves or that a rollback restores (ADR 0082). An
+    /// apply does not carry them out, and a diff shows them, since the
+    /// daemon holds what the files do not.
+    pub deferred: Vec<Change>,
 }
 
 /// The refusal for making `app` serve while other applications do and no
@@ -807,11 +812,30 @@ fn plan_app(
     {
         let keys: Vec<String> = settings.lines().into_iter().map(|(key, _)| key).collect();
 
+        // ADR 0082: a file states the table in full, so a setting the
+        // application has and the files do not is removed, and the plan
+        // names it: muructl app set may have given it.
+
+        let removed: Vec<String> = stored
+            .as_ref()
+            .map(|stored| stored.settings.lines())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, _)| key)
+            .filter(|key| !keys.contains(key))
+            .collect();
+
+        let removes = if removed.is_empty() {
+            String::new()
+        } else {
+            format!("; removes {}", removed.join(", "))
+        };
+
         plan.changes.push(Change {
             detail: if keys.is_empty() {
-                "no settings of its own".to_owned()
+                format!("no settings of its own{removes}")
             } else {
-                keys.join(", ")
+                format!("{}{removes}", keys.join(", "))
             },
             action: Action::SetAppSettings {
                 app: name.to_owned(),
@@ -882,6 +906,9 @@ fn plan_app(
     // the apply adds are held, and a release the daemon has that
     // `serving` names is promoted.
 
+    let origin = stored
+        .as_ref()
+        .and_then(|stored| stored.serving_origin.clone());
     let current = stored.and_then(|stored| stored.current);
     let added: Vec<String> = deploys.iter().map(|(id, _)| id.clone()).collect();
 
@@ -913,6 +940,48 @@ fn plan_app(
             }
         }
     };
+
+    // ADR 0082: an apply does not undo a rollback on its own. The files
+    // still name the release a rollback took out of traffic, and applying
+    // them, at a restart as much as by hand, would put it back.
+
+    if moves
+        && let Some(serving) = &serving
+        && let Some(crate::model::ServingOrigin {
+            how: crate::model::ServingSetBy::Rollback { from },
+            at_unix_ms,
+        }) = &origin
+        && from == serving
+    {
+        plan.errors.push(format!(
+            "{name}: serving names {serving}, which muructl rollback took out of traffic at {}; \
+             name another release with serving, or promote it again with muructl rollout \
+             bluegreen {name}@{serving}",
+            crate::sinks::rfc3339(*at_unix_ms)
+        ));
+        return None;
+    }
+
+    // Any other move of traffic away from a release that applied files
+    // did not make serving is allowed, and said: a command chose that
+    // release, and this apply chooses another.
+
+    if moves
+        && let (Some(serving), Some(current)) = (&serving, &current)
+        && serving != current
+        && !matches!(
+            origin,
+            Some(crate::model::ServingOrigin {
+                how: crate::model::ServingSetBy::Apply,
+                ..
+            })
+        )
+    {
+        plan.warnings.push(format!(
+            "{name}@{current} was made serving by a command, not by applied files; this apply \
+             moves the application's traffic to {name}@{serving}"
+        ));
+    }
 
     // Section 10.4: `--prune` removes what the files do not declare, so
     // the release that serves must be one of theirs.
@@ -2746,6 +2815,30 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         for release in releases {
             let kept = declared.is_some_and(|table| table.release.contains_key(&release.id));
 
+            // ADR 0082: a release a rollback restores stays, as prune and
+            // remove leave it, and so does the one that serves now when
+            // this apply moves traffic away from it, which makes it the
+            // rollback release. A later prune takes it once it is neither.
+
+            if !kept
+                && declared.is_some()
+                && [&app.current, &app.previous].contains(&&Some(release.id.clone()))
+            {
+                plan.warnings.push(format!(
+                    "{}@{} is not declared and stays for now: it serves, or a rollback restores \
+                     it, and a later --prune removes it once neither holds",
+                    app.name, release.id
+                ));
+                plan.deferred.push(Change {
+                    action: Action::RemoveRelease {
+                        app: app.name.clone(),
+                        id: release.id.clone(),
+                    },
+                    detail: format!("{} and not declared", release.state),
+                });
+                continue;
+            }
+
             if !kept {
                 // A route the files keep must not lose a release its
                 // traffic names.
@@ -3019,6 +3112,7 @@ fn write(
                 .find(|(serving, release, _)| serving == app && release == id)
                 .and_then(|(_, _, previous)| previous.as_deref());
             writes.set_app_releases(app, Some(id), previous)?;
+            writes.set_serving_origin(app, crate::model::ServingSetBy::Apply)?;
             "serving"
         }
     };
@@ -7647,7 +7741,14 @@ mod tests {
         let changes = planned(&without).changes;
         assert_eq!(changes.len(), 1, "{changes:?}");
         assert_eq!(changes[0].action.name(), "set-settings");
-        assert_eq!(changes[0].detail, "no settings of its own");
+
+        // The plan names what it takes away (ADR 0082), which muructl app
+        // set may have given.
+
+        assert_eq!(
+            changes[0].detail,
+            "no settings of its own; removes threads, env.DATABASE_URL"
+        );
 
         let mut zero = document;
         zero.app.get_mut("shop").unwrap().processes = Some(0);
@@ -8509,7 +8610,9 @@ mod tests {
             assert!(plan_with(&store, &document, false, false).errors.is_empty());
         }
 
-        // Naming the declared release promotes it before r1 is removed.
+        // Naming the declared release promotes it, and r1, which the
+        // promotion makes the release a rollback restores, stays for a
+        // later prune (ADR 0082), where it was removed with its rollback.
 
         let moved = plan_with(
             &store,
@@ -8518,11 +8621,98 @@ mod tests {
             false,
         );
         assert!(moved.errors.is_empty(), "{:?}", moved.errors);
+        assert_eq!(steps(&moved), vec![("promote", "shop@r2".to_owned(), "")]);
+        assert!(
+            moved.warnings.iter().any(|warning| warning
+                == "shop@r1 is not declared and stays for now: it serves, or a rollback restores \
+                    it, and a later --prune removes it once neither holds"),
+            "{:?}",
+            moved.warnings
+        );
+    }
+
+    #[test]
+    fn an_apply_does_not_undo_a_rollback_and_says_when_it_reverts_a_command() {
+        // ADR 0082. r2 serves by an apply; a rollback by command takes it
+        // out of traffic, and the files still name it.
+
+        let source = source_dir();
+        let store = store_with_two(&source);
+        store
+            .set_app_releases("shop", Some("r2"), Some("r1"))
+            .unwrap();
+        store
+            .set_serving_origin("shop", crate::model::ServingSetBy::Apply)
+            .unwrap();
+        let names_r2 = shop_releases(&source, &["r1", "r2"], "serving = 'r2'");
+        assert!(
+            plan_with(&store, &names_r2, false, false)
+                .changes
+                .is_empty()
+        );
+
+        store
+            .set_app_releases("shop", Some("r1"), Some("r2"))
+            .unwrap();
+        store
+            .set_serving_origin(
+                "shop",
+                crate::model::ServingSetBy::Rollback {
+                    from: "r2".to_owned(),
+                },
+            )
+            .unwrap();
+        let refused = plan_with(&store, &names_r2, false, false);
+        assert_eq!(refused.errors.len(), 1, "{:?}", refused.errors);
+        assert!(
+            refused.errors[0].starts_with(
+                "shop: serving names r2, which muructl rollback took out of traffic at "
+            ),
+            "{}",
+            refused.errors[0]
+        );
+        assert!(
+            refused.errors[0].ends_with(
+                "name another release with serving, or promote it again with muructl rollout \
+                 bluegreen shop@r2"
+            ),
+            "{}",
+            refused.errors[0]
+        );
+
+        // The files naming the release that serves now agree with the
+        // rollback, and plan nothing.
+
+        let names_r1 = shop_releases(&source, &["r1", "r2"], "serving = 'r1'");
+        let agreed = plan_with(&store, &names_r1, false, false);
+        assert!(
+            agreed.errors.is_empty() && agreed.changes.is_empty(),
+            "{agreed:?}"
+        );
+
+        // Promoted again by command, r2 serves with no origin recorded,
+        // and the files that name it agree. Files that name r1 then move
+        // traffic back, and say that a command had chosen r2.
+
+        store
+            .set_app_releases("shop", Some("r2"), Some("r1"))
+            .unwrap();
+        assert!(
+            plan_with(&store, &names_r2, false, false)
+                .changes
+                .is_empty()
+        );
+
+        let reverted = plan_with(&store, &names_r1, false, false);
         assert_eq!(
-            steps(&moved),
-            vec![
-                ("promote", "shop@r2".to_owned(), ""),
-                ("remove-release", "shop@r1".to_owned(), ""),
+            steps(&reverted),
+            vec![("promote", "shop@r1".to_owned(), "")]
+        );
+        assert_eq!(
+            reverted.warnings,
+            [
+                "shop@r2 was made serving by a command, not by applied files; this apply moves \
+                 the application's traffic to shop@r1"
             ]
         );
     }
