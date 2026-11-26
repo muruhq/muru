@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -32,16 +31,32 @@ def write_module(directory: Path, name: str, body: str) -> None:
 
 
 def test_thread_count_sees_a_new_thread() -> None:
-    before = preload.thread_count()
-    release = threading.Event()
-    thread = threading.Thread(target=release.wait)
-    thread.start()
+    # The counts are taken in a fresh interpreter. In this one a thread an
+    # earlier test joined may still be leaving the operating system's
+    # count, which a join does not wait for (issue 947).
 
-    try:
-        assert preload.thread_count() == before + 1
-    finally:
-        release.set()
-        thread.join()
+    script = """
+import threading
+
+from muru import preload
+
+before = preload.thread_count()
+release = threading.Event()
+thread = threading.Thread(target=release.wait)
+thread.start()
+
+try:
+    after = preload.thread_count()
+finally:
+    release.set()
+    thread.join()
+
+assert after == before + 1, (before, after)
+"""
+    counted = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False, timeout=60
+    )
+    assert counted.returncode == 0, counted.stderr
 
 
 def test_child_pids_sees_a_child_process() -> None:
