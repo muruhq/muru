@@ -3627,7 +3627,7 @@ fn group_prefixes(paths: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The keys a Python logging table sets, as `config show --effective`
+/// The keys a Python logging table sets, as `deployment show --effective`
 /// names them (`logging.python.level`, `logging.python.loggers.NAME`,
 /// `logging.python.warnings.N`), in the order of `PythonLogging::layered`,
 /// each with whether `over` sets it rather than `under`. Warnings are
@@ -3674,7 +3674,7 @@ pub fn logging_keys(
     keys
 }
 
-/// A Python logging key's value as `config show --effective` writes it,
+/// A Python logging key's value as `deployment show --effective` writes it,
 /// for a key `logging_keys` names.
 fn logging_value(logging: &muru_config::PythonLogging, key: &str) -> String {
     let key = key.strip_prefix("logging.python.").unwrap_or(key);
@@ -3711,7 +3711,7 @@ fn own_logging_key(key: &str, before: usize) -> String {
 /// Section 11.4: the Python logging defaults each release of an exported
 /// document starts its host with, the daemon's `[logging.python]` under
 /// the release's own, a line a key with the layer it comes from, for
-/// `config show --effective`.
+/// `deployment show --effective`.
 pub fn logging_layers(
     store: &Store,
     document: &Document,
@@ -5208,7 +5208,7 @@ fn resolve_layers(
     )
 }
 
-/// Section 3.3: a release's settings as `config show --effective`
+/// Section 3.3: a release's settings as `deployment show --effective`
 /// shows them beside their layers, by key.
 pub fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
     let optional = |value: Option<u64>, format: fn(u64) -> String| {
@@ -5288,7 +5288,7 @@ pub fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
 
 /// Section 3.3: each setting of the releases an exported document
 /// declares, with the layer it came from, one line a setting, for
-/// `config show --effective`.
+/// `deployment show --effective`.
 pub fn release_layers(store: &Store, document: &Document) -> Result<Vec<String>, StoreError> {
     let mut lines = Vec::new();
 
@@ -5340,7 +5340,7 @@ pub(crate) fn served_settings(limits: &crate::model::ServedLimits) -> Vec<(Strin
 
 /// Section 4.6: the limits on a request that the releases an exported
 /// document declares set, with those of their worker groups and mounts,
-/// one line a limit, for `config show --effective`.
+/// one line a limit, for `deployment show --effective`.
 pub fn served_layers(store: &Store, document: &Document) -> Result<Vec<String>, StoreError> {
     let mut lines = Vec::new();
 
@@ -5391,7 +5391,7 @@ fn with_served(
 }
 
 /// Section 4.6: the limits of each route an exported document declares,
-/// with the level each came from, one line a limit, for `config show
+/// with the level each came from, one line a limit, for `deployment show
 /// --effective`: the route, the serving release of the application it
 /// routes to, its virtual host, the daemon's `[limits]` table or the
 /// default. A worker group or a mount of the release may set its own for

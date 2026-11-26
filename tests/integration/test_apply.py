@@ -3,8 +3,8 @@
 `muructl apply -f` deploys the releases a file declares, changes nothing
 when applied again, plans without acting under --dry-run, prunes what the
 file no longer contains, and refuses a file with errors without applying
-any of it. `config export` writes desired state as a file that applies
-back without changes, and `config diff` reports drift either way.
+any of it. `deployment export` writes desired state as a file that applies
+back without changes, and `deployment diff` reports drift either way.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def apply(daemon: Daemon, path: Path, *arguments: str) -> subprocess.CompletedPr
     return daemon.muructl("apply", "-f", str(path), *arguments, check=False)
 
 
-def test_a_daemon_format_file_beside_the_code_is_named_muru_daemon_toml(
+def test_a_daemon_format_file_beside_the_code_is_named_muru_deploy_toml(
     daemon: Daemon, tmp_path: Path
 ) -> None:
     # The coding agents guide's example: a file for muructl apply kept
@@ -74,9 +74,9 @@ def test_a_daemon_format_file_beside_the_code_is_named_muru_daemon_toml(
         "[tool.muru]\nentrypoint = 'app:application'\nthreads = 3\n"
     )
     declared = f"[app.shop.release.r1]\nsource = '.'\npython = '{sys.executable}'\nprocesses = 1\n"
-    (project / "muru.daemon.toml").write_text(declared)
+    (project / "muru.deploy.toml").write_text(declared)
 
-    applied = apply(daemon, project / "muru.daemon.toml")
+    applied = apply(daemon, project / "muru.deploy.toml")
     assert applied.returncode == 0, applied.stdout + applied.stderr
     daemon.wait_for_routing("shop")
     shown = daemon.muructl("release", "show", "shop@r1").stdout
@@ -92,8 +92,42 @@ def test_a_daemon_format_file_beside_the_code_is_named_muru_daemon_toml(
     refused = apply(daemon, other / "muru.toml")
     output = refused.stdout + refused.stderr
     assert refused.returncode != 0
-    assert "`app` is a key of the daemon's format, and this file is read as the project's" in output
-    assert "named muru.daemon.toml" in output, output
+    assert "`app` is a key of a file for muructl apply, and this file is read as" in output
+    assert "named muru.deploy.toml" in output, output
+
+    # Issue 931: the project's directory is not a directory of files to
+    # apply, and is refused by what it is, where it failed on the first
+    # key of the project's pyproject.toml.
+
+    whole = apply(daemon, project)
+    assert whole.returncode != 0
+    assert (
+        f"muru: error: {project} is a project (it has a pyproject.toml), not a directory of "
+        f"files to apply; name the file, as in muructl apply -f {project / 'muru.deploy.toml'}"
+    ) in whole.stderr, whole.stderr
+
+    # -f may be given more than once, the files applied as one: the
+    # release in one file and its host and route in another.
+
+    routed = tmp_path / "routed.toml"
+    routed.write_text(ROUTED)
+    both = daemon.muructl(
+        "apply",
+        "-f",
+        str(project / "muru.deploy.toml"),
+        "-f",
+        str(routed),
+        "--dry-run",
+        check=False,
+    )
+    assert both.returncode == 2, both.stdout + both.stderr
+    assert "host shop" in both.stdout and "1 object as declared" in both.stdout, both.stdout
+
+    # The group that reads what the daemon serves is muructl deployment.
+
+    assert "[app.shop.release.r1]" in daemon.muructl("deployment", "export").stdout
+    gone = daemon.muructl("config", "export", check=False)
+    assert gone.returncode != 0 and "unrecognized subcommand" in gone.stderr, gone.stderr
 
 
 def test_an_interpreter_relative_to_the_file_is_resolved_there(
@@ -331,7 +365,7 @@ def test_serving_stages_a_release_and_promotes_it(daemon: Daemon, tmp_path: Path
     # Issue #440: the export writes r2 as well, since the split names it,
     # so it applies back without a change.
 
-    staged_export = daemon.muructl("config", "export").stdout
+    staged_export = daemon.muructl("deployment", "export").stdout
     assert list(tomllib.loads(staged_export)["app"]["shop"]["release"]) == ["r1", "r2"]
     exported = tmp_path / "export.toml"
     exported.write_text(staged_export)
@@ -353,7 +387,7 @@ def test_serving_stages_a_release_and_promotes_it(daemon: Daemon, tmp_path: Path
     assert promoted.returncode == 0, promoted.stdout + promoted.stderr
     assert "promote         shop@r2                  ready and serving" in promoted.stdout
     assert json.loads(daemon.request("/", host="shop.test").body)["release"] == "r2"
-    exported = tomllib.loads(daemon.muructl("config", "export").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "export").stdout)
     assert exported["app"]["shop"]["serving"] == "r2"
 
     # Naming the stopped r3 starts and promotes it.
@@ -397,7 +431,7 @@ def test_a_release_that_does_not_start_leaves_nothing_changed(
     assert set(outcomes.values()) == {"not applied"}, refused.stdout
     assert {"other", "other@r1", "shop@r2", "host shop", "route shop /"} <= set(outcomes)
 
-    exported = tomllib.loads(daemon.muructl("config", "export").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "export").stdout)
     assert list(exported["app"]) == ["shop"], exported
     assert list(exported["app"]["shop"]["release"]) == ["r1"], exported
     assert "host" not in exported and "route" not in exported, exported
@@ -561,7 +595,7 @@ def test_prune_removes_what_the_files_no_longer_contain(daemon: Daemon, tmp_path
 def test_export_applies_back_without_changes(daemon: Daemon, tmp_path: Path) -> None:
     daemon.deploy("shop", SHOP)
 
-    exported = daemon.muructl("config", "export").stdout
+    exported = daemon.muructl("deployment", "export").stdout
     assert exported.startswith("# Muru desired state: muructl ")
     document = tomllib.loads(exported)
     r1 = document["app"]["shop"]["release"]["r1"]
@@ -574,15 +608,15 @@ def test_export_applies_back_without_changes(daemon: Daemon, tmp_path: Path) -> 
     config = tmp_path / "export.toml"
     config.write_text(exported)
     assert apply(daemon, config).stdout.strip() == "muru: no changes (1 object as declared)"
-    assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0
+    assert daemon.muructl("deployment", "diff", "-f", str(config), check=False).returncode == 0
 
     # Only the serving release is written, and --json writes the same
     # document as JSON.
 
     daemon.deploy("shop", SHOP, "--threads", "1")
-    current = tomllib.loads(daemon.muructl("config", "export").stdout)
+    current = tomllib.loads(daemon.muructl("deployment", "export").stdout)
     assert list(current["app"]["shop"]["release"]) == ["r2"]
-    as_json = json.loads(daemon.muructl("config", "export", "--json").stdout)
+    as_json = json.loads(daemon.muructl("deployment", "export", "--json").stdout)
     assert as_json["app"]["shop"]["release"]["r2"]["threads"] == 1
 
 
@@ -596,7 +630,7 @@ def test_diff_reports_drift_in_both_directions(daemon: Daemon, tmp_path: Path) -
 
     daemon.deploy("shop", SHOP)
     config.write_text(release("shop", "r1") + release("shop", "r3"))
-    diff = daemon.muructl("config", "diff", "-f", str(config), check=False)
+    diff = daemon.muructl("deployment", "diff", "-f", str(config), check=False)
     assert diff.returncode == 2, diff.stdout + diff.stderr
     actions = [line.split()[:2] for line in diff.stdout.splitlines()[1:3]]
     assert actions == [["deploy", "shop@r3"], ["remove-release", "shop@r2"]]
@@ -655,7 +689,7 @@ def test_a_directory_of_files_with_relative_sources(daemon: Daemon, tmp_path: Pa
     assert applied.returncode == 0, applied.stdout + applied.stderr
     assert sorted(row["release"] for row in daemon.releases()) == ["factory@r1", "shop@r1"]
     assert all(row["state"] == "ready" for row in daemon.releases())
-    exported = tomllib.loads(daemon.muructl("config", "export", "--app", "shop").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "export", "--app", "shop").stdout)
     assert exported["app"]["shop"]["release"]["r1"]["source"] == SHOP_SOURCE
     assert "factory" not in exported["app"]
 
@@ -706,13 +740,13 @@ def test_recycling_and_timeouts_round_trip_through_export(daemon: Daemon, tmp_pa
     applied = apply(daemon, config)
     assert applied.returncode == 0, applied.stdout + applied.stderr
 
-    exported = tomllib.loads(daemon.muructl("config", "export").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "export").stdout)
     written = exported["app"]["shop"]["release"]["r1"]
     assert written["max_requests"] == 250
     assert written["max_lifetime"] == "3600s"
     assert written["timeouts"]["soft_timeout"] == "20s"
     assert written["timeouts"]["hard_timeout"] == "30s"
-    assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0
+    assert daemon.muructl("deployment", "diff", "-f", str(config), check=False).returncode == 0
 
     # A declared release that differs on these is immutable like any other.
 
@@ -732,7 +766,7 @@ def test_a_memory_table_round_trips_through_export(daemon: Daemon, tmp_path: Pat
     applied = apply(daemon, config)
     assert applied.returncode == 0, applied.stdout + applied.stderr
 
-    exported = tomllib.loads(daemon.muructl("config", "export").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "export").stdout)
     memory = exported["app"]["shop"]["release"]["r1"]["memory"]
     assert memory == {
         "measure": "rss",
@@ -742,7 +776,7 @@ def test_a_memory_table_round_trips_through_export(daemon: Daemon, tmp_path: Pat
         "hard_limit": "1GB",
         "check_interval": "5s",
     }
-    assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0
+    assert daemon.muructl("deployment", "diff", "-f", str(config), check=False).returncode == 0
 
 
 def test_relative_paths_are_taken_from_the_file(daemon: Daemon) -> None:
@@ -798,7 +832,7 @@ routes.files.target = {{ static = 'snapshot' }}
 
     # The exported configuration carries the resolved paths.
 
-    exported = daemon.muructl("config", "export").stdout
+    exported = daemon.muructl("deployment", "export").stdout
 
     for path in ("static", "snapshot", "reports", "pages/route-404.html", "pages/host-404.html"):
         assert str(site / path) in exported, (path, exported)
@@ -837,7 +871,7 @@ sendfile_roots = ['reports']
         check=False,
     )
     assert applied.returncode == 0, applied.stdout + applied.stderr
-    exported = daemon.muructl("config", "export").stdout
+    exported = daemon.muructl("deployment", "export").stdout
     assert str(site / "reports") in exported, exported
 
 

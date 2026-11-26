@@ -519,7 +519,7 @@ impl Installation {
     }
 
     /// The effective settings of the releases named, each with where it
-    /// came from, as `muructl config show --effective` reports them.
+    /// came from, as `muructl deployment show --effective` reports them.
     pub async fn settings(&mut self, releases: &[ReleaseFacts]) -> Result<Vec<Setting>, String> {
         let read = self.store.as_ref().ok().map(|store| {
             let mut settings = Vec::new();

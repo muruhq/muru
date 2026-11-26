@@ -1,6 +1,7 @@
 //! `muructl render` (design specification section 10.4): the release a
 //! command line describes, written as the table that declares it in the
-//! daemon's format, for `muructl apply` or a record kept beside the code.
+//! form applied files have, for `muructl apply` or a record kept beside the
+//! code.
 //! Nothing is asked of a daemon, and nothing is changed.
 
 use std::collections::BTreeMap;
@@ -157,9 +158,9 @@ fn header(
     full: bool,
     named: bool,
 ) -> String {
-    let name = muru_config::DAEMON_FILE;
+    let name = muru_config::DEPLOY_FILE;
     let mut out = format!(
-        "# The release this command line describes, in the daemon's format.\n\
+        "# The release this command line describes, as a table for muructl apply.\n\
          # Save it as {name} and give it to the daemon with:\n\
          #   muructl apply -f {name}\n"
     );

@@ -209,7 +209,7 @@ Everything the daemon was told is in its state store, and it can write
 it out as a file:
 
 ```
-muructl config export
+muructl deployment export
 ```
 
 ```toml

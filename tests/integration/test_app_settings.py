@@ -52,7 +52,7 @@ def test_a_setting_on_the_application_reaches_every_later_release(tmp_path: Path
         # The export writes them on the application's table, and unset
         # takes one away.
 
-        exported = tomllib.loads(daemon.muructl("config", "export").stdout)
+        exported = tomllib.loads(daemon.muructl("deployment", "export").stdout)
         assert exported["app"]["shop"]["threads"] == 3, exported
         assert exported["app"]["shop"]["env"] == {"DATABASE_URL": "postgres://db/shop"}
 
@@ -94,7 +94,7 @@ def test_an_applied_file_sets_the_applications_settings(tmp_path: Path) -> None:
         # The export writes what the file declared, so it applies back
         # without a change.
 
-        exported = tomllib.loads(daemon.muructl("config", "export").stdout)["app"]["shop"]
+        exported = tomllib.loads(daemon.muructl("deployment", "export").stdout)["app"]["shop"]
         assert exported["processes"] == 3 and exported["max_lifetime"] == "3600s", exported
         assert exported["env"] == {"DATABASE_URL": "postgres://db/shop"}, exported
         assert exported["timeouts"] == {"hard_timeout": "40s"}, exported

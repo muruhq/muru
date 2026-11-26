@@ -90,7 +90,7 @@ impl File {
                  serves: applications and their releases, hosts, routes, upstreams and \
                  overlays, with the client classes, rate limits and conditions that \
                  belong to them. A file of this kind kept beside a project's code is \
-                 named `muru.daemon.toml`, since `muru.toml` there is the project's \
+                 named `muru.deploy.toml`, since `muru.toml` there is the project's \
                  settings, which have other keys. A table of the daemon's own \
                  configuration here, such as `[[listener]]` or `[limits]`, is refused. \
                  A client class, rate limit or condition may not have the name of one \

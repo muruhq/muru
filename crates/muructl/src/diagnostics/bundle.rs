@@ -353,7 +353,7 @@ impl<W: Write> Bundle<'_, W> {
     /// `config/`: the configuration in force on the system. With the
     /// state store in reach, every release's effective settings and its
     /// specification, the whole effective configuration and what is in
-    /// force outside it; without, what `muructl config show --effective`
+    /// force outside it; without, what `muructl deployment show --effective`
     /// prints. Beside them the daemon's own file, what only the running
     /// daemon knows, and every change the window's events record.
     ///
@@ -569,7 +569,7 @@ impl<W: Write> Bundle<'_, W> {
         Ok(Some(changes > 0))
     }
 
-    /// The effective configuration as `muructl config show --effective`
+    /// The effective configuration as `muructl deployment show --effective`
     /// prints it, asked of what runs: what each overlay sets, each
     /// release's settings with where each came from, then the document,
     /// its variables masked as a worker's environment is.

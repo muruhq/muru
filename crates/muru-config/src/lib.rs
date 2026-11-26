@@ -5844,7 +5844,7 @@ pub struct Metrics {
 }
 
 /// A declarative configuration file as `muructl apply` reads it and
-/// `muructl config export` writes it (section 10.4): listeners and limits,
+/// `muructl deployment export` writes it (section 10.4): listeners and limits,
 /// which belong to the daemon's own file, and applications with their
 /// releases.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -7109,12 +7109,14 @@ pub fn load_project(dir: &Path) -> Result<Option<(PathBuf, ToolMuru)>, ProjectEr
     Ok(None)
 }
 
-/// The name by convention of a file in the daemon's format that is kept
-/// beside a project's code, where `muru.toml` is the project's settings.
-pub const DAEMON_FILE: &str = "muru.daemon.toml";
+/// The name by convention of a file for `muructl apply` that is kept
+/// beside a project's code, where `muru.toml` is the project's settings
+/// (ADR 0079, in place of the muru.deploy.toml of ADR 0051: the file
+/// holds releases, not the daemon's settings).
+pub const DEPLOY_FILE: &str = "muru.deploy.toml";
 
 /// A refusal of a project's settings file, with what the file is taken
-/// for when the key refused belongs to the daemon's format: an applied
+/// for when the key refused belongs to a file for apply: an applied
 /// file saved as muru.toml beside the code is the usual cause.
 fn with_daemon_hint(message: String, text: &str) -> String {
     let Ok(table) = text.parse::<toml::Table>() else {
@@ -7130,9 +7132,9 @@ fn with_daemon_hint(message: String, text: &str) -> String {
         .find(|key| daemon.contains(*key) && !project.contains(*key))
     {
         Some(key) => format!(
-            "{message}\n`{key}` is a key of the daemon's format, and this file is read as the \
-             project's settings; a file in the daemon's format beside the code is named \
-             {DAEMON_FILE}"
+            "{message}\n`{key}` is a key of a file for muructl apply, and this file is read as \
+             the project's settings; a file for muructl apply beside the code is named \
+             {DEPLOY_FILE}"
         ),
         None => message,
     }
@@ -9024,8 +9026,9 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(error.contains("unknown field `app`"), "{error}");
         assert!(
             error.contains(
-                "`app` is a key of the daemon's format, and this file is read as the project's \
-                 settings; a file in the daemon's format beside the code is named muru.daemon.toml"
+                "`app` is a key of a file for muructl apply, and this file is read as the \
+                 project's settings; a file for muructl apply beside the code is named \
+                 muru.deploy.toml"
             ),
             "{error}"
         );
@@ -9034,13 +9037,13 @@ traffic = { classes = { ai-crawler = 'r1' } }"
 
         std::fs::write(dir.join("muru.toml"), "entrypont = 'a:b'\n").unwrap();
         let error = load_project(&dir).unwrap_err().to_string();
-        assert!(!error.contains("daemon's format"), "{error}");
+        assert!(!error.contains("for muructl apply"), "{error}");
 
         // A key both formats have, wrongly typed, is the project's own.
 
         std::fs::write(dir.join("muru.toml"), "error_pages = 3\n").unwrap();
         let error = load_project(&dir).unwrap_err().to_string();
-        assert!(!error.contains("daemon's format"), "{error}");
+        assert!(!error.contains("for muructl apply"), "{error}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

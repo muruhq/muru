@@ -2,7 +2,7 @@
 //! sections 10.4, 13.2 and 13.3, appendix A): `daemon run`, `daemon
 //! start`, `daemon stop`, `daemon status`, `up`, `deploy`, `app list`,
 //! `release list`, `release wait`, `rollback`, `drain`, `status`,
-//! `events`, `logs`, `logs reopen`, `apply`, `config export` and `config
+//! `events`, `logs`, `logs reopen`, `apply`, `deployment export` and `config
 //! diff`.
 
 use std::net::SocketAddr;
@@ -8738,9 +8738,15 @@ pub async fn drain(release: String, socket: SocketArgs, json: bool) -> anyhow::R
 /// What `apply` takes.
 #[derive(Args)]
 pub struct ApplyArgs {
-    /// The file to apply, or a directory whose .toml files are applied together.
-    #[arg(short = 'f', long = "file", value_name = "FILE or DIR")]
-    file: PathBuf,
+    /// A file to apply, or a directory whose .toml files are applied
+    /// together. Given more than once, the files are applied as one.
+    #[arg(
+        short = 'f',
+        long = "file",
+        value_name = "FILE or DIR",
+        required = true
+    )]
+    file: Vec<PathBuf>,
 
     /// Report what would change and change nothing.
     #[arg(long)]
@@ -8816,7 +8822,7 @@ pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
 
 /// The configuration subcommands.
 #[derive(Subcommand)]
-pub enum ConfigCommand {
+pub enum DeploymentCommand {
     /// Write desired state as a file that applies back without changes.
     Export {
         /// One application rather than all.
@@ -8856,9 +8862,15 @@ pub enum ConfigCommand {
 
     /// Compare a file, or a directory of files, with desired state.
     Diff {
-        /// The file, or a directory whose .toml files are read together.
-        #[arg(short = 'f', long = "file", value_name = "FILE or DIR")]
-        file: PathBuf,
+        /// A file, or a directory whose .toml files are read together.
+        /// Given more than once, the files are read as one.
+        #[arg(
+            short = 'f',
+            long = "file",
+            value_name = "FILE or DIR",
+            required = true
+        )]
+        file: Vec<PathBuf>,
 
         /// Print the report as JSON.
         #[arg(long)]
@@ -8970,7 +8982,11 @@ pub async fn config_show(
 
 /// Compare a file with desired state. The exit code is 0 when they
 /// match, 2 when they differ and 1 for errors.
-pub async fn config_diff(file: PathBuf, json: bool, socket: SocketArgs) -> anyhow::Result<i32> {
+pub async fn config_diff(
+    file: Vec<PathBuf>,
+    json: bool,
+    socket: SocketArgs,
+) -> anyhow::Result<i32> {
     let document = load_documents(&file)?;
     let mut client = client::connect(&socket.endpoint()?).await?;
     let report = client
@@ -9094,28 +9110,54 @@ fn resolve_route_overlay(route: &mut muru_config::RouteOverlay, absolute: &dyn F
     }
 }
 
-fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
+/// The files `-f` names, read as one document: each file as it is, and
+/// of a directory its .toml files in name order.
+fn load_documents(paths: &[PathBuf]) -> anyhow::Result<muru_config::Document> {
     let mut files = Vec::new();
 
-    if path.is_dir() {
+    for path in paths {
+        if !path.is_dir() {
+            files.push(path.clone());
+            continue;
+        }
+
+        // A project's directory is not a directory of files to apply:
+        // its pyproject.toml or muru.toml holds the project's settings,
+        // and failed here on its first key (issue 931).
+
+        if let Some(project) = ["pyproject.toml", "muru.toml"]
+            .iter()
+            .find(|name| path.join(name).is_file())
+        {
+            anyhow::bail!(
+                "{} is a project (it has a {project}), not a directory of files to apply; name \
+                 the file, as in muructl apply -f {}",
+                path.display(),
+                path.join(muru_config::DEPLOY_FILE).display()
+            );
+        }
+
+        let mut found = Vec::new();
+
         for entry in
             std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?
         {
             let entry = entry?.path();
+
             if entry
                 .extension()
                 .is_some_and(|extension| extension == "toml")
             {
-                files.push(entry);
+                found.push(entry);
             }
         }
-        files.sort();
 
-        if files.is_empty() {
+        if found.is_empty() {
             anyhow::bail!("{} holds no .toml files", path.display());
         }
-    } else {
-        files.push(path.to_path_buf());
+
+        found.sort();
+        files.extend(found);
     }
 
     let mut document = muru_config::Document::default();

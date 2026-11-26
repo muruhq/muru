@@ -975,7 +975,7 @@ run = ['python', 'manage.py', 'migrate']
             ]
         );
 
-        // Every setting `config show --effective` lists is written or
+        // Every setting `deployment show --effective` lists is written or
         // named as unset.
 
         let spec = config::resolve_spec(

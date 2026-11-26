@@ -244,6 +244,6 @@ deferred too.
 
 `muructl run --print-config` shows `tracing` and the entrypoint's
 `tracing_middleware`. Under the daemon, `muru._tracing` is the first of a
-release's instrumentation modules, and `muructl config export` shows it
+release's instrumentation modules, and `muructl deployment export` shows it
 with the configuration file and the entry points it wraps in its
 settings.

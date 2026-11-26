@@ -288,7 +288,7 @@ def test_static_routes_under_the_daemon_with_cache_headers_and_an_app_fallback(
 
         # The export round-trips the static route.
 
-        exported = daemon.muructl("config", "export").stdout
+        exported = daemon.muructl("deployment", "export").stdout
         assert f"static = '{STATIC}'" in exported or f'static = "{STATIC}"' in exported
         assert "immutable = true" in exported
 
@@ -386,7 +386,7 @@ def test_an_applications_own_directories_under_run_and_deploy(tmp_path: Path) ->
         daemon.deploy("files", project)
         assert daemon.get("/assets/site.css").status == 200
         assert daemon.get("/fixture/fox.txt").status == 404, "the flag's entry is not carried"
-        exported = daemon.muructl("config", "show", "files").stdout
+        exported = daemon.muructl("deployment", "show", "files").stdout
         assert "[[app.files.release.r2.static]]" in exported
         assert str(STATIC) not in exported, exported
         assert 'dir = "source:assets"' in exported, exported
@@ -400,7 +400,7 @@ def test_an_applications_own_directories_under_run_and_deploy(tmp_path: Path) ->
         (bare / "pyproject.toml").write_text("[tool.muru]\nentrypoint = 'app:application'\n")
         daemon.deploy("files", bare)
         assert daemon.get("/assets/site.css").body != b"body { color: red }\n"
-        assert "static" not in daemon.muructl("config", "show", "files").stdout
+        assert "static" not in daemon.muructl("deployment", "show", "files").stdout
 
         refused = daemon.muructl(
             "deploy", "files", str(project), "--static", "/gone/=nowhere", check=False

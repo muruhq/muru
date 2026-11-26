@@ -403,7 +403,7 @@ hold starts the release without moving traffic.
 release; drain takes a release out of traffic and stops it.
 - rollout canary shifts traffic to a release step by step, each step judged \
 by gates against the release that serves.
-- apply makes a declarative file (muru.daemon.toml) the desired state; deploy adds \
+- apply makes a declarative file (muru.deploy.toml) the desired state; deploy adds \
 one release. apply with hold starts the releases it adds without moving \
 traffic. The muructl render command writes such a file for a release from \
 a source directory and deploy's settings, without the daemon.
@@ -1115,8 +1115,8 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
-            name: "config",
-            description: "The desired state as TOML (show, with effective for what active overlays change), or compare a file or directory of TOML files with it (diff).",
+            name: "deployment",
+            description: "What the daemon serves, its desired state, as TOML (show, with effective for what active overlays change), or compare a file or directory of TOML files with it (diff).",
             changes: false,
             properties: json!({
                 "action": {"type": "string", "enum": ["show", "diff"]},
@@ -1127,7 +1127,7 @@ fn specs() -> Vec<Spec> {
             required: &["action"],
             command: |arguments| match needed(arguments, "action")?.as_str() {
                 "show" => {
-                    let mut command = words(&["config", "show"]);
+                    let mut command = words(&["deployment", "show"]);
                     command.extend(text(arguments, "app"));
 
                     if flag(arguments, "effective") {
@@ -1137,11 +1137,11 @@ fn specs() -> Vec<Spec> {
                     Ok(command)
                 }
                 "diff" => Ok([
-                    words(&["config", "diff", "--file"]),
+                    words(&["deployment", "diff", "--file"]),
                     vec![needed(arguments, "file")?],
                 ]
                 .concat()),
-                other => Err(format!("no config action {other}")),
+                other => Err(format!("no deployment action {other}")),
             },
         },
         Spec {

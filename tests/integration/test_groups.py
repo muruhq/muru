@@ -256,7 +256,7 @@ memory = {{ hard_limit = "1GB" }}
 
     import tomllib
 
-    exported = tomllib.loads(daemon.muructl("config", "export", "--app", "shop").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "export", "--app", "shop").stdout)
     groups = exported["app"]["shop"]["release"]["r1"]["groups"]
     assert groups == {
         "hot": {
@@ -318,7 +318,7 @@ def test_an_optional_group_that_cannot_start_leaves_the_release_ready(daemon: Da
 
     import tomllib
 
-    exported = tomllib.loads(daemon.muructl("config", "export", "--app", "grouped").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "export", "--app", "grouped").stdout)
     assert exported["app"]["grouped"]["release"]["r1"]["groups"]["batch"]["optional"] is True
 
 

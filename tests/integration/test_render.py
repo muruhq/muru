@@ -74,9 +74,9 @@ def test_a_command_line_is_written_as_the_release_it_describes(tmp_path: Path) -
     assert completed.returncode == 0, completed.stderr
     printed = completed.stdout
     assert printed.startswith(
-        "# The release this command line describes, in the daemon's format.\n"
-        "# Save it as muru.daemon.toml and give it to the daemon with:\n"
-        "#   muructl apply -f muru.daemon.toml\n"
+        "# The release this command line describes, as a table for muructl apply.\n"
+        "# Save it as muru.deploy.toml and give it to the daemon with:\n"
+        "#   muructl apply -f muru.deploy.toml\n"
     ), printed
     assert f"[tool.muru] in {SHOP.resolve() / 'pyproject.toml'}" in printed
     assert "name this one with --release" not in printed
@@ -227,7 +227,7 @@ def test_a_rendered_release_is_applied_held_and_a_deploy_is_planned(
     # A rendered release applied with --hold starts beside the one that
     # serves, and the plan and the report both say it is held.
 
-    config = tmp_path / "muru.daemon.toml"
+    config = tmp_path / "muru.deploy.toml"
     flags = ["--threads", "1", "--max-requests", "500"]
     config.write_text(render("shop", str(SHOP), "--release", "next", *flags, *python).stdout)
     planned = daemon.muructl("apply", "-f", str(config), "--hold", "--dry-run", check=False)

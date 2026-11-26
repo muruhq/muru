@@ -223,7 +223,7 @@ trigger = {{ schedule = {{ start = '{at(3)}', end = '{at(7)}' }} }}
 
 def test_config_show_effective_attributes_values_to_overlays(site: Site) -> None:
     site.apply(OVERLAYS, prune=True)
-    shown = site.daemon.muructl("config", "show", "--effective").stdout
+    shown = site.daemon.muructl("deployment", "show", "--effective").stdout
     assert "No active overlay" in shown
 
     # Each serving release's settings say which layer they came from.
@@ -233,7 +233,7 @@ def test_config_show_effective_attributes_values_to_overlays(site: Site) -> None
     assert "#   clients@r2: threads = 4 (default)" in shown
 
     site.overlay("activate", "read-only")
-    shown = site.daemon.muructl("config", "show", "--effective").stdout
+    shown = site.daemon.muructl("deployment", "show", "--effective").stdout
     assert "#   route root: mode = read-only (overlay read-only)" in shown
     assert "#   route root: methods.deny = POST, PUT (overlay read-only)" in shown
     effective = tomllib.loads(shown)
@@ -242,9 +242,11 @@ def test_config_show_effective_attributes_values_to_overlays(site: Site) -> None
 
     # The base is unchanged.
 
-    base = tomllib.loads(site.daemon.muructl("config", "show").stdout)
+    base = tomllib.loads(site.daemon.muructl("deployment", "show").stdout)
     assert "mode" not in base["route"][0]
-    assert "route root" in site.daemon.muructl("config", "show", "clients", "--effective").stdout
+    assert (
+        "route root" in site.daemon.muructl("deployment", "show", "clients", "--effective").stdout
+    )
     site.overlay("end", "read-only")
 
 
@@ -261,7 +263,7 @@ routes.root.error_pages = { '503:maintenance' = { template = '<p>Upgrading, back
     site.overlay("activate", "upgrade")
     assert eventually(lambda: site.request().status == 503)
     assert site.request().body == b"<p>Upgrading, back soon</p>"
-    shown = site.daemon.muructl("config", "show", "--effective").stdout
+    shown = site.daemon.muructl("deployment", "show", "--effective").stdout
     assert "route root: error_pages.503:maintenance = a template (overlay upgrade)" in shown
 
     site.overlay("end", "upgrade")
@@ -394,7 +396,7 @@ apps.clients = { mode = 'backup', deny = ['POST'], answer = 'method_not_allowed'
     assert refused.status == 405
     assert (
         "app clients: mode = backup (overlay backup)"
-        in site.daemon.muructl("config", "show", "--effective").stdout
+        in site.daemon.muructl("deployment", "show", "--effective").stdout
     )
 
     site.overlay("end", "backup")
@@ -510,7 +512,7 @@ def test_promotion_makes_an_overlay_the_base(site: Site) -> None:
     assert site.seen()["mode"] == "read-only"
     assert "promoted" in site.overlay("list")
 
-    exported = site.daemon.muructl("config", "export").stdout
+    exported = site.daemon.muructl("deployment", "export").stdout
     assert 'mode = "read-only"' in exported
     assert "overlay.promoted" in site.daemon.events()
 
@@ -568,7 +570,7 @@ def test_promoting_a_pin_makes_the_release_serve(site: Site) -> None:
     # The route has no pin of its own, so the files, which name no
     # serving release, keep the promotion when applied again.
 
-    exported = tomllib.loads(site.daemon.muructl("config", "export").stdout)
+    exported = tomllib.loads(site.daemon.muructl("deployment", "export").stdout)
     assert [route.get("traffic") for route in exported["route"]] == [None]
     site.apply(OVERLAYS)
     assert site.seen()["release"] == "r1"

@@ -210,7 +210,7 @@ shop@r6                  retained            1 (2x8)          9b01c33d7a2e+   21
 (`from /srv/shop, commit 4f2a9c1e0b3d of main`), the dashboard's
 releases table shows the commit, linked to `url`, with the ref and the
 description, and `--json` gives the map as `metadata`. A release
-declared in a file takes it as a `metadata` table, and `config export`
+declared in a file takes it as a `metadata` table, and `deployment export`
 writes it there:
 
 ```toml
@@ -267,7 +267,7 @@ muructl app show shop
 
 The same settings go on an application's table in a file given to
 `muructl apply` (see [declaring applications in
-files](#declaring-applications-in-files)), and `muructl config export`
+files](#declaring-applications-in-files)), and `muructl deployment export`
 writes them there.
 
 ### What a release's environment holds
@@ -328,8 +328,8 @@ threads = 8
 muructl apply -f shop.toml
 muructl apply -f config/ --dry-run
 muructl apply -f config/ --prune
-muructl config export > config/shop.toml
-muructl config diff -f config/
+muructl deployment export > config/shop.toml
+muructl deployment diff -f config/
 ```
 
 Each `[app.NAME.release.ID]` table needs a `source`; a relative path is
@@ -346,7 +346,11 @@ those of the
 table leaves out comes from the application's settings, then the
 source's `[tool.muru]` table and then the defaults, exactly as a deploy
 resolves them. A directory applies every `.toml` file in it, in name
-order, as one configuration. Releases of one application add up across
+order, as one configuration, and `-f` may be given more than once, the
+files and directories named applied as one. A project's own directory
+is not such a directory: its `pyproject.toml` holds the project's
+settings, so name the file in it, as in `muructl apply -f
+muru.deploy.toml`. Releases of one application add up across
 the files, and so do routes; a release, a host or an upstream declared
 in two files is refused, and so is an application whose own settings
 two files set: the keys of its `[app.NAME]` table go in one file.
@@ -377,13 +381,13 @@ So a release's table needs only its `source` when the project's own
 file says the rest:
 
 ```toml
-# muru.daemon.toml, beside the project's pyproject.toml
+# muru.deploy.toml, beside the project's pyproject.toml
 [app.shop.release.r1]
 source = "."
 ```
 
 A file kept beside a project's code like this is named
-`muru.daemon.toml`. `muru.toml` there is the project's settings file,
+`muru.deploy.toml`. `muru.toml` there is the project's settings file,
 which has other keys, and a file in this format saved under that name is
 refused as one. Anywhere else, the file's name is yours to choose.
 
@@ -395,9 +399,9 @@ settings `muructl deploy` takes for a release, and prints the table:
 
 ```text
 $ muructl render shop /srv/shop --release 2026-11-06 --processes 4
-# The release this command line describes, in the daemon's format.
-# Save it as muru.daemon.toml and give it to the daemon with:
-#   muructl apply -f muru.daemon.toml
+# The release this command line describes, as a table for muructl apply.
+# Save it as muru.deploy.toml and give it to the daemon with:
+#   muructl apply -f muru.deploy.toml
 # Settings come from the flags, then the source's own settings, then the
 # defaults. The source's settings are [tool.muru] in /srv/shop/pyproject.toml.
 # A setting left at its default is not written; --full writes those too.
@@ -413,8 +417,8 @@ DJANGO_SETTINGS_MODULE = "shop.settings.production"
 ```
 
 ```
-muructl render shop /srv/shop --release 2026-11-06 > muru.daemon.toml
-muructl apply -f muru.daemon.toml
+muructl render shop /srv/shop --release 2026-11-06 > muru.deploy.toml
+muructl apply -f muru.deploy.toml
 ```
 
 The command asks nothing of a daemon and changes nothing, so it runs
@@ -426,7 +430,7 @@ directory it can read.
   is written as `r1`.
 - **The source** is written as the command line gives it. A relative
   path stays relative, and `muructl apply` takes it from the file's
-  directory, so `muructl render shop . > muru.daemon.toml` beside the
+  directory, so `muructl render shop . > muru.deploy.toml` beside the
   code applies from there. With no source the current directory is
   written as its full path.
 - **The settings** come from the flags, then the source's settings,
@@ -537,7 +541,7 @@ on `muructl deploy`:
 | `--retain-workers N` | The workers each group of that release keeps meanwhile |
 
 ```
-muructl apply -f muru.daemon.toml --hold
+muructl apply -f muru.deploy.toml --hold
 muructl rollout bluegreen shop@2026-11-06
 ```
 
@@ -576,7 +580,7 @@ snapshot the edge did not take, which the report names: the changes
 were made, and the edge serves what it had until a later snapshot
 reaches it.
 
-`muructl config export` writes desired state as a file of this form, with
+`muructl deployment export` writes desired state as a file of this form, with
 a header naming the daemon's version, the node, the time and the state
 version. It writes the release that serves each application, every key
 spelled out, and the application's `serving` key naming it, and the
@@ -589,18 +593,18 @@ their hosts, and `--json` the same document as JSON. A [rollout](rollouts.md) un
 with `--resolve-rollouts` it is written as where it stands, the
 candidate declared beside the serving release and the application's
 routes splitting traffic between them at the candidate's current share.
-`muructl config diff -f FILE` compares a file with desired state in
+`muructl deployment diff -f FILE` compares a file with desired state in
 both directions, listing what the file would add and what the daemon
 holds that the file does not, with exit code 2 when they differ.
 
-`muructl config show [APP] --effective` writes the same document headed
+`muructl deployment show [APP] --effective` writes the same document headed
 by each serving release's settings and where each came from: the
 release table of an applied file or the deploy's flags, the
 application's settings, the source's `[tool.muru]` table, the source's
 `.venv` for the interpreter, or the default:
 
 ```console
-$ muructl config show shop --effective
+$ muructl deployment show shop --effective
 # Muru effective state: muructl 0.1.0 on web1, 2026-11-02T02:10:00Z, state version 812.
 # No active overlay changes this configuration.
 

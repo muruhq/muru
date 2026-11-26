@@ -2156,7 +2156,7 @@ impl Admin for Service {
         list_routes(pb::ListRoutesRequest) -> pb::ListRoutesResponse, "muructl route";
         list_upstreams(pb::ListUpstreamsRequest) -> pb::ListUpstreamsResponse, "muructl upstream";
         apply_config(pb::ApplyConfigRequest) -> pb::ConfigReport, "muructl apply";
-        diff_config(pb::DiffConfigRequest) -> pb::ConfigReport, "muructl config diff";
+        diff_config(pb::DiffConfigRequest) -> pb::ConfigReport, "muructl deployment diff";
         reload_config(pb::ReloadConfigRequest) -> pb::ReloadConfigResponse, "muructl daemon reload";
         upgrade_daemon(pb::UpgradeDaemonRequest) -> pb::UpgradeDaemonResponse, "muructl daemon upgrade";
         list_overlays(pb::ListOverlaysRequest) -> pb::ListOverlaysResponse, "muructl overlay";

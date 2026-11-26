@@ -271,7 +271,7 @@ def test_a_policy_is_validated_when_declared(daemon: Daemon, tmp_path: Path) -> 
         "mode = 'target'\nmax_workers = 6\nslot_utilization = 0.8\nqueue_wait_p95 = '50ms'",
     )
     assert daemon.muructl("apply", "-f", str(config)).returncode == 0
-    exported = daemon.muructl("config", "export").stdout
+    exported = daemon.muructl("deployment", "export").stdout
     assert "[app.shop.release.r1.scaling]" in exported, exported
     assert 'mode = "target"' in exported and "slot_utilization = 0.8" in exported, exported
     assert 'queue_wait_p95 = "50ms"' in exported, exported

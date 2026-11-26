@@ -524,7 +524,7 @@ app = 'legacy'
     daemon.muructl("apply", "-f", str(config))
     assert report(daemon, host="legacy.test")["env"]["LEGACY_SETTING"] == "declared"
 
-    exported = daemon.muructl("config", "export").stdout
+    exported = daemon.muructl("deployment", "export").stdout
     assert "kind = 'http'" in exported.replace('"', "'")
     assert "profile = 'generic'" in exported.replace('"', "'")
     assert "stop_signal = 'TERM'" in exported.replace('"', "'")

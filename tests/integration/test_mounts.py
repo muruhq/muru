@@ -187,7 +187,7 @@ interface = "asgi"
     scope = json.loads(daemon.request("/asgi/info").body)["scope"]
     assert (scope["root_path"], scope["path"]) == ("/asgi", "/asgi/info")
 
-    exported = tomllib.loads(daemon.muructl("config", "export", "--app", "echo").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "export", "--app", "echo").stdout)
     assert exported["app"]["echo"]["release"]["r1"]["mounts"] == {
         "asgi": {"path": "/asgi", "entrypoint": "plain_asgi:application", "interface": "asgi"}
     }
@@ -268,7 +268,7 @@ entrypoint = "plain_wsgi:application"
     applied = daemon.muructl("apply", "-f", str(config))
     assert "ready and serving" in applied.stdout, applied.stdout
     assert daemon.request("/other/info").status == 200
-    exported = tomllib.loads(daemon.muructl("config", "export", "--app", "echo").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "export", "--app", "echo").stdout)
     assert exported["app"]["echo"]["release"]["r1"]["groups"]["hot"]["mounts"] == ["other"]
 
 

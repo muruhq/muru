@@ -2,7 +2,7 @@
 
 # Applied files
 
-The keys of the files `muructl apply` reads, which say what the daemon serves: applications and their releases, hosts, routes, upstreams and overlays, with the client classes, rate limits and conditions that belong to them. A file of this kind kept beside a project's code is named `muru.daemon.toml`, since `muru.toml` there is the project's settings, which have other keys. A table of the daemon's own configuration here, such as `[[listener]]` or `[limits]`, is refused. A client class, rate limit or condition may not have the name of one the daemon's own file defines. A relative path is taken from the file's directory, except a release's own static directories and error pages, which are taken from its source directory; apply sends the daemon the absolute paths.
+The keys of the files `muructl apply` reads, which say what the daemon serves: applications and their releases, hosts, routes, upstreams and overlays, with the client classes, rate limits and conditions that belong to them. A file of this kind kept beside a project's code is named `muru.deploy.toml`, since `muru.toml` there is the project's settings, which have other keys. A table of the daemon's own configuration here, such as `[[listener]]` or `[limits]`, is refused. A client class, rate limit or condition may not have the name of one the daemon's own file defines. A relative path is taken from the file's directory, except a release's own static directories and error pages, which are taken from its source directory; apply sends the daemon the absolute paths.
 
 The JSON Schema of the same keys, for an editor that checks TOML against one, is `https://docs.muruhq.dev/en/latest/schema/deployment.schema.json`.
 

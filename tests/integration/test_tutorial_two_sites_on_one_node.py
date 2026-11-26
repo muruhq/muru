@@ -140,7 +140,7 @@ def test_the_two_sites_tutorial(tmp_path: Path) -> None:
         hosts = daemon.muructl("host", "list").stdout
         assert "shop             yes      all        shop.localhost" in hosts
         assert "upstream notes" in daemon.muructl("route", "list").stdout
-        exported = daemon.muructl("config", "export").stdout
+        exported = daemon.muructl("deployment", "export").stdout
         assert "[upstream.notes]" in exported and "[host.blog]" in exported
     finally:
         if notes.poll() is None:

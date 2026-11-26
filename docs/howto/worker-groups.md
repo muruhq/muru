@@ -201,7 +201,7 @@ takes them from the release's `groups` tables when present. A release is
 ready when every worker of every required group listens, and `muructl
 events` counts the workers listening. Groups are part of the release, so a declared release
 whose groups differ from what is recorded is refused like any other
-changed setting; `muructl config export` writes each group with every size
+changed setting; `muructl deployment export` writes each group with every size
 spelled out, and a restarted daemon takes every group's workers back.
 `muructl release show` lists a release's groups with their paths and
 sizes.

@@ -117,7 +117,7 @@ def test_a_deployed_release_uses_the_project_settings(daemon: Daemon) -> None:
 
     # The settings are part of the release, so an export carries them.
 
-    exported = daemon.muructl("config", "export", "--app", "logger").stdout
+    exported = daemon.muructl("deployment", "export", "--app", "logger").stdout
     assert "logging.python" in exported, exported
     assert 'level = "INFO"' in exported, exported
     assert 'noisy = "ERROR"' in exported, exported
@@ -150,7 +150,7 @@ def test_the_daemons_defaults_lie_under_the_applications(tmp_path: Path) -> None
 
         assert server.request("/warn").status == 500
 
-        shown = server.muructl("config", "show", "logger", "--effective").stdout
+        shown = server.muructl("deployment", "show", "logger", "--effective").stdout
 
         for line in [
             "logger@r1: logging.python.level = INFO ([tool.muru])",

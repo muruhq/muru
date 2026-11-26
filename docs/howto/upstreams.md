@@ -199,7 +199,7 @@ served as it is.
 
 `muructl upstream list` shows each upstream's protocol, TLS, addresses,
 probe path and trust; `muructl route list` names upstream targets,
-fallbacks and handlers. `muructl config export` writes the tables back.
+fallbacks and handlers. `muructl deployment export` writes the tables back.
 The access log records a request to an upstream under the upstream's
 name as its application, `upstream` as its group and the address that
 answered as its mount.

@@ -65,7 +65,7 @@ the developer deploy it the same way (see
 [declaring applications in files](daemon.md#declaring-applications-in-files)):
 
 ```toml
-# muru.daemon.toml
+# muru.deploy.toml
 [app.shop.release.r1]
 source = "."
 entrypoint = "shop.wsgi:application"
@@ -74,10 +74,10 @@ processes = 2
 threads = 4
 ```
 
-The file is named `muru.daemon.toml` because `muru.toml` beside the code
+The file is named `muru.deploy.toml` because `muru.toml` beside the code
 is the project's own settings file. What the table leaves out comes from
 that file, or from `[tool.muru]` in `pyproject.toml`. `muructl render
-shop . > muru.daemon.toml` writes the file from those settings.
+shop . > muru.deploy.toml` writes the file from those settings.
 
 Then the agent, through the tools:
 

@@ -2886,7 +2886,7 @@
   "$id": "https://docs.muruhq.dev/en/latest/schema/deployment.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "A declarative configuration file as `muructl apply` reads it and `muructl config export` writes it: listeners and limits, which belong to the daemon's own file, and applications with their releases.",
+  "description": "A declarative configuration file as `muructl apply` reads it and `muructl deployment export` writes it: listeners and limits, which belong to the daemon's own file, and applications with their releases.",
   "properties": {
     "app": {
       "additionalProperties": {

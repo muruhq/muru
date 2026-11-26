@@ -383,7 +383,7 @@ def test_export_round_trips_hosts_and_routes_and_prune_removes_them(
     config = hosts_file(tmp_path, cert, key)
     assert apply(daemon, config).returncode == 0
 
-    exported = daemon.muructl("config", "export").stdout
+    exported = daemon.muructl("deployment", "export").stdout
     document = tomllib.loads(exported)
     assert sorted(document["host"]) == ["echo", "other", "shop"]
     assert document["host"]["echo"]["tls"]["certificate"] == str(cert)
@@ -394,7 +394,7 @@ def test_export_round_trips_hosts_and_routes_and_prune_removes_them(
 
     # One application's export carries only its routes and their hosts.
 
-    only_shop = tomllib.loads(daemon.muructl("config", "export", "--app", "shop").stdout)
+    only_shop = tomllib.loads(daemon.muructl("deployment", "export", "--app", "shop").stdout)
     assert list(only_shop["host"]) == ["shop"]
     assert [route["app"] for route in only_shop["route"]] == ["shop"]
 

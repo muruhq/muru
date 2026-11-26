@@ -114,7 +114,7 @@ max_body_size = "1MB"
 
     # The effective configuration says where each limit comes from.
 
-    effective = daemon.muructl("config", "show", "--effective").stdout
+    effective = daemon.muructl("deployment", "show", "--effective").stdout
 
     for line in [
         "echo@r1: max_body_size = 2KB (the release)",
@@ -130,7 +130,7 @@ max_body_size = "1MB"
 
     # The export writes the keys back, and the same file changes nothing.
 
-    exported = daemon.muructl("config", "export").stdout
+    exported = daemon.muructl("deployment", "export").stdout
     assert 'max_body_size = "2KB"' in exported and 'request_deadline = "1s"' in exported
     again = apply(daemon, config)
     assert again.returncode == 0, again.stdout + again.stderr

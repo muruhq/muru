@@ -197,7 +197,7 @@ routes.root.client_routes = {{ ai-crawler = {{ target = {{ static = '{archive}' 
         daemon.muructl("overlay", "activate", "crawler-surge")
         assert eventually(lambda: crawled() == b"archived\n")
         assert seen(daemon, "/")["release"] == "r2"
-        shown = daemon.muructl("config", "show", "--effective").stdout
+        shown = daemon.muructl("deployment", "show", "--effective").stdout
         assert (
             f"route root: client_routes.ai-crawler = static {archive} (overlay crawler-surge)"
             in shown

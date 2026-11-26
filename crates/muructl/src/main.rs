@@ -247,13 +247,16 @@ enum Command {
         output: admin::JsonArgs,
     },
 
-    /// Apply declarative configuration from a file or a directory of files.
+    /// Apply files that say what the daemon serves: applications, their
+    /// releases, hosts, routes, upstreams and overlays. It never changes
+    /// the daemon's own settings.
     Apply(Box<admin::ApplyArgs>),
 
-    /// Export, compare or inspect declarative configuration.
-    Config {
+    /// What the daemon serves, as applied files state it: export it,
+    /// show it or compare files with it.
+    Deployment {
         #[command(subcommand)]
-        command: admin::ConfigCommand,
+        command: admin::DeploymentCommand,
     },
 
     /// Manage the file secret stores.
@@ -1469,20 +1472,20 @@ fn main() -> anyhow::Result<()> {
             shown
         }),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
-        Command::Config { command } => match command {
-            admin::ConfigCommand::Export {
+        Command::Deployment { command } => match command {
+            admin::DeploymentCommand::Export {
                 app,
                 resolve_rollouts,
                 json,
                 socket,
             } => runtime.block_on(admin::config_export(app, resolve_rollouts, json, socket)),
-            admin::ConfigCommand::Show {
+            admin::DeploymentCommand::Show {
                 app,
                 effective,
                 socket,
                 output,
             } => runtime.block_on(admin::config_show(app, effective, socket, output.json)),
-            admin::ConfigCommand::Diff { file, json, socket } => {
+            admin::DeploymentCommand::Diff { file, json, socket } => {
                 exit_with(runtime, admin::config_diff(file, json, socket))
             }
         },

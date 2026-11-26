@@ -177,7 +177,7 @@ workers for looking at. It is kept beside the retained release a rollback
 goes to, so a failed canary does not cost the instant rollback.
 
 While a rollout runs, its share is live state the daemon changes. It is
-not part of the configuration `muructl config export` writes, and while
+not part of the configuration `muructl deployment export` writes, and while
 an overlay pins or splits the route's traffic, the rollout waits.
 
 ## How overlays layer
@@ -199,13 +199,13 @@ a rollout under way holds its step. Rolling back is never frozen.
 
 ## Declared and live state
 
-What `muructl apply` reads and `muructl config export` writes is the
+What `muructl apply` reads and `muructl deployment export` writes is the
 declared state: applications, their releases, routes with their traffic
 policies, client classes and overlays. A rollout's current share, a pin
 set with `muructl scale`, and a temporary floor or cap from `scale --min`
 or `scale --cap` are
 live state, kept by the daemon and left out of the export, so applying
-a file does not undo a rollout in progress. `config export
+a file does not undo a rollout in progress. `deployment export
 --resolve-rollouts` writes a rollout as it stands, as a candidate
 declared beside the serving release with the routes splitting between
 them, for a file in version control.
