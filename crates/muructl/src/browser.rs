@@ -260,37 +260,43 @@ mod tests {
         ));
     }
 
+    /// Write an executable script through a child shell, so that no
+    /// descriptor of the test process is ever open on it for writing. The
+    /// tests run on parallel threads, and a fork on one copies every open
+    /// descriptor into its child until that child execs, which makes
+    /// executing a script this process wrote fail with `ETXTBSY` on Linux
+    /// (issue 946).
+    fn write_script(path: &Path, text: &str) {
+        let written = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s' \"$2\" > \"$1\" && /bin/chmod 755 \"$1\"",
+                "sh",
+            ])
+            .arg(path)
+            .arg(text)
+            .status()
+            .expect("the shell runs");
+
+        assert!(written.success(), "writing {}", path.display());
+    }
+
     #[test]
     fn a_launcher_is_given_the_url_as_an_argument() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let script = directory.path().join("browser");
         let written = directory.path().join("opened");
-        std::fs::write(
+        write_script(
             &script,
-            format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", written.display()),
-        )
-        .expect("written");
-
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
+            &format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", written.display()),
+        );
 
         let url = "http://localhost:8000/a?b=c&d='e'";
         launch(&script, &[], url).expect("launched");
         assert_eq!(std::fs::read_to_string(&written).expect("read"), url);
 
         let failing = directory.path().join("failing");
-        std::fs::write(&failing, "#!/bin/sh\nexit 3\n").expect("written");
-
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-
-            std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
+        write_script(&failing, "#!/bin/sh\nexit 3\n");
 
         assert!(launch(&failing, &[], url).is_err());
     }

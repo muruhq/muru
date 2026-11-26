@@ -65,7 +65,7 @@ The limits are those of the route the client's request matched: an
 [internal redirect](internal-redirects.md) to another route keeps them.
 `header_read_timeout` is read before the request names its host, so it
 is set for the node, or for a
-[listener](connections.md#a-listeners-own-limits). `muructl config show --effective` lists each
+[listener](connections.md#a-listeners-own-limits). `muructl deployment show --effective` lists each
 route's timeouts with where each came from.
 
 ## With the application
@@ -108,7 +108,7 @@ Here a request under `/reports/` has 300 seconds wherever it is routed
 from, unless its route sets a deadline of its own, and a host's
 `request_deadline` applies only to applications that set none. So an
 application says what its own paths need, a host gives a site its
-defaults, and a route has the last word. `muructl config show
+defaults, and a route has the last word. `muructl deployment show
 --effective` lists what each release, group and mount sets beside the
 routes:
 

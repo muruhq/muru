@@ -238,18 +238,18 @@ def test_an_export_can_resolve_a_rollout_where_it_stands(daemon: Daemon, tmp_pat
 
     # The plain export has the serving release alone and no split.
 
-    plain = tomllib.loads(daemon.muructl("config", "export").stdout)
+    plain = tomllib.loads(daemon.muructl("deployment", "export").stdout)
     assert list(plain["app"]["shop"]["release"]) == ["r1"]
     assert "traffic" not in plain["route"][0]
 
-    resolved = tomllib.loads(daemon.muructl("config", "export", "--resolve-rollouts").stdout)
+    resolved = tomllib.loads(daemon.muructl("deployment", "export", "--resolve-rollouts").stdout)
     assert sorted(resolved["app"]["shop"]["release"]) == ["r1", "r2"]
     assert resolved["route"][0]["traffic"]["split"] == {"r1": 70, "r2": 30}
 
     # Applied back, the split holds the same share once the rollout ends.
 
     exported = tmp_path / "resolved.toml"
-    exported.write_text(daemon.muructl("config", "export", "--resolve-rollouts").stdout)
+    exported.write_text(daemon.muructl("deployment", "export", "--resolve-rollouts").stdout)
     daemon.muructl("rollout", "abort", "shop")
     daemon.muructl("apply", "-f", str(exported))
     seen = releases_seen(daemon, 60, "resolved")

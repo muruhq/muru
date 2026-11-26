@@ -154,7 +154,7 @@ strip_prefix = "/app"
 segments long, and `muructl apply` refuses anything else:
 
 ```console
-$ muructl apply -f muru.daemon.toml
+$ muructl apply -f muru.deploy.toml
 muru: plan
   route site /sub/path/api: strip_prefix /sub/pa is not a leading part of its path on segment boundaries
 ```
@@ -297,7 +297,7 @@ route replaces both. Here every request for `api.example.com` may carry
 seconds and keeps the host's 2 second queue timeout. A key the host
 leaves out is the daemon's own: its `[limits]` and `[logs]` tables, or
 the default. `muructl host list` shows what each host sets, and
-`muructl config show --effective` lists every route's limits with the
+`muructl deployment show --effective` lists every route's limits with the
 level each came from:
 
 ```
@@ -341,10 +341,10 @@ retired name redirects to wherever the canonical name is served.
 muructl apply -f config/
 muructl host list
 muructl route list
-muructl config export
+muructl deployment export
 ```
 
-`host list` and `route list` show what is applied. `config export`
+`host list` and `route list` show what is applied. `deployment export`
 writes the hosts and routes with the applications, and `--app NAME`
 writes only the routes to that application and their hosts. `apply
 --prune` removes hosts and routes the files no longer declare, routes

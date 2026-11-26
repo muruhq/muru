@@ -43,7 +43,7 @@ A condition's name is lowercase letters, digits and hyphens. A name the
 daemon's file declares stays the file's: an applied condition with the
 same name is left out, with a warning in the daemon's log. `muructl
 apply` refuses a condition that does not read, naming the condition and
-the term, and `muructl config export` writes the applied ones back.
+the term, and `muructl deployment export` writes the applied ones back.
 
 ## The expression
 

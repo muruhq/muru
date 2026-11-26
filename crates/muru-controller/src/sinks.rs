@@ -174,7 +174,7 @@ pub fn source() -> String {
     }
 }
 
-fn rfc3339(unix_ms: u64) -> String {
+pub(crate) fn rfc3339(unix_ms: u64) -> String {
     let time = std::time::UNIX_EPOCH + Duration::from_millis(unix_ms);
     let (date, hours, minutes, seconds, millis) = muru_edge::access::civil(time);
     format!("{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")

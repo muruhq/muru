@@ -159,7 +159,7 @@ and target modes need `max_workers`; `min_workers` defaults to 1, and 0
 [scales the group to zero](#scale-to-zero) when idle; `processes` must
 not be over `max_workers` and is raised to `min_workers` when below it.
 In static mode the table takes no other key, so a key that does nothing
-is never written by mistake. `muructl config export` writes the resolved
+is never written by mistake. `muructl deployment export` writes the resolved
 policy with every key.
 
 ## Scheduled capacity
@@ -231,7 +231,7 @@ $ muructl scale shop --group reports --min 2 --max 4 --until 2026-11-02T18:00 --
 This makes a temporary overlay, `shop:scale` or `shop:scale:reports`,
 which the next such command for the group replaces, `muructl overlay end`
 ends early, and which is forgotten once it ends. `muructl apply` leaves it
-alone and `muructl config export` does not write it.
+alone and `muructl deployment export` does not write it.
 
 ## Capacity on a condition
 

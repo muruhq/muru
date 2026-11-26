@@ -210,7 +210,7 @@ shop@r6                  retained            1 (2x8)          9b01c33d7a2e+   21
 (`from /srv/shop, commit 4f2a9c1e0b3d of main`), the dashboard's
 releases table shows the commit, linked to `url`, with the ref and the
 description, and `--json` gives the map as `metadata`. A release
-declared in a file takes it as a `metadata` table, and `config export`
+declared in a file takes it as a `metadata` table, and `deployment export`
 writes it there:
 
 ```toml
@@ -267,7 +267,7 @@ muructl app show shop
 
 The same settings go on an application's table in a file given to
 `muructl apply` (see [declaring applications in
-files](#declaring-applications-in-files)), and `muructl config export`
+files](#declaring-applications-in-files)), and `muructl deployment export`
 writes them there.
 
 ### What a release's environment holds
@@ -328,8 +328,8 @@ threads = 8
 muructl apply -f shop.toml
 muructl apply -f config/ --dry-run
 muructl apply -f config/ --prune
-muructl config export > config/shop.toml
-muructl config diff -f config/
+muructl deployment export > config/shop.toml
+muructl deployment diff -f config/
 ```
 
 Each `[app.NAME.release.ID]` table needs a `source`; a relative path is
@@ -346,7 +346,14 @@ those of the
 table leaves out comes from the application's settings, then the
 source's `[tool.muru]` table and then the defaults, exactly as a deploy
 resolves them. A directory applies every `.toml` file in it, in name
-order, as one configuration.
+order, as one configuration, and `-f` may be given more than once, the
+files and directories named applied as one. A project's own directory
+is not such a directory: its `pyproject.toml` holds the project's
+settings, so name the file in it, as in `muructl apply -f
+muru.deploy.toml`. Releases of one application add up across
+the files, and so do routes; a release, a host or an upstream declared
+in two files is refused, and so is an application whose own settings
+two files set: the keys of its `[app.NAME]` table go in one file.
 
 The application's own table holds the [settings on the
 application](#settings-on-the-application) that `muructl app set` sets,
@@ -354,7 +361,7 @@ with the same keys: `env`, `processes`, `threads`, `sync_threads`,
 `concurrency`, `max_requests`, `max_lifetime`, a `timeouts` table of the
 host's timeouts and a `memory` table. The file states them in full, as
 it states the application's user, so applying a file whose application
-has none removes those `muructl app set` gave, and `muructl config
+has none removes those `muructl app set` gave, and `muructl deployment
 export` writes them, so settings made at a terminal can be kept in a
 file:
 
@@ -374,13 +381,13 @@ So a release's table needs only its `source` when the project's own
 file says the rest:
 
 ```toml
-# muru.daemon.toml, beside the project's pyproject.toml
+# muru.deploy.toml, beside the project's pyproject.toml
 [app.shop.release.r1]
 source = "."
 ```
 
 A file kept beside a project's code like this is named
-`muru.daemon.toml`. `muru.toml` there is the project's settings file,
+`muru.deploy.toml`. `muru.toml` there is the project's settings file,
 which has other keys, and a file in this format saved under that name is
 refused as one. Anywhere else, the file's name is yours to choose.
 
@@ -392,9 +399,9 @@ settings `muructl deploy` takes for a release, and prints the table:
 
 ```text
 $ muructl render shop /srv/shop --release 2026-11-06 --processes 4
-# The release this command line describes, in the daemon's format.
-# Save it as muru.daemon.toml and give it to the daemon with:
-#   muructl apply -f muru.daemon.toml
+# The release this command line describes, as a table for muructl apply.
+# Save it as muru.deploy.toml and give it to the daemon with:
+#   muructl apply -f muru.deploy.toml
 # Settings come from the flags, then the source's own settings, then the
 # defaults. The source's settings are [tool.muru] in /srv/shop/pyproject.toml.
 # A setting left at its default is not written; --full writes those too.
@@ -410,8 +417,8 @@ DJANGO_SETTINGS_MODULE = "shop.settings.production"
 ```
 
 ```
-muructl render shop /srv/shop --release 2026-11-06 > muru.daemon.toml
-muructl apply -f muru.daemon.toml
+muructl render shop /srv/shop --release 2026-11-06 > muru.deploy.toml
+muructl apply -f muru.deploy.toml
 ```
 
 The command asks nothing of a daemon and changes nothing, so it runs
@@ -419,12 +426,12 @@ where no daemon does, such as a job that writes the file for a later
 step to commit. It reads the source's settings, so the source is a
 directory it can read.
 
-- **The release id** is the one `--release` names. With none the table
-  is written as `r1`.
+- **The release id** is the one `--release` names, which is required:
+  an id of your choosing, such as a date or a commit.
 - **The source** is written as the command line gives it. A relative
   path stays relative, and `muructl apply` takes it from the file's
-  directory, so `muructl render shop . > muru.daemon.toml` beside the
-  code applies from there. With no source the current directory is
+  directory, so `muructl render shop . --release 2026-11-06 >
+  muru.deploy.toml` beside the code applies from there. With no source the current directory is
   written as its full path.
 - **The settings** come from the flags, then the source's settings,
   then the defaults. Nothing comes from a release or the settings the
@@ -438,6 +445,10 @@ directory it can read.
   built by the daemon when the file is applied.
 - **Secrets** are written as the references `--secret` gives. No secret
   store is read.
+- **Where the code came from** is written as a deploy records it: a
+  `metadata` table with the commit and ref of the git checkout the
+  source is in, and what `--metadata KEY=VALUE` gives over them.
+  `--no-git-metadata` fills nothing from git.
 
 A command line that a deploy would refuse is refused with the same
 message, and nothing is printed. `--json` writes the document as JSON.
@@ -472,20 +483,27 @@ changes a default.
 ### What an apply does
 
 An apply creates the applications the files name, deploys each declared
-release the daemon does not have (the last of an application's in id
-order to serve, unless the application's [`serving`
-key](#which-release-serves) names another, and the others held when a
-route names them, else left stopped), creates or updates the hosts and
-routes, and leaves anything already recorded as declared alone. Id order
-puts ids of the form `rN` first, by number, so `r10` comes after `r9`,
-and every other id after them, by name: files adding `r9` and
-`2026-11-06` serve `2026-11-06`. Releases are immutable: a declared
+release the daemon does not have, creates or updates the hosts and
+routes, and leaves anything already recorded as declared alone. A
+release the apply adds serves when it is the only one it adds for its
+application, or the one the application's [`serving`
+key](#which-release-serves) names; the others are held when a route
+names them, else left stopped. An apply that adds more than one release
+of an application needs the key, and is refused without it, naming the
+releases: the order of their ids decides nothing. Releases are
+immutable: a declared
 release whose settings differ from the recorded ones is an error, and
 the file is applied only when it has no errors at all. Unknown keys,
 invalid names, a missing source directory and a source without an
-entrypoint are errors too. `[[listener]]` entries and the `[limits]`
-table belong in the daemon's own configuration file; in an applied file
-they are reported as warnings and not applied.
+entrypoint are errors too. So is a table of the daemon's own
+configuration, such as `[[listener]]` or `[limits]`: an apply changes
+what the daemon serves and never the daemon's own settings, which are
+in its [configuration file](#reloading-the-configuration). In turn the
+daemon's file holds no application, host, route, upstream or overlay,
+and a daemon does not start or reload with one in it. A client class,
+rate limit or condition may be in either: one the daemon's file defines
+is the node's, and an applied file that defines the same name is
+refused.
 
 The apply happens in two steps. First it creates the applications and
 starts the releases it adds, held, with traffic left where it is and
@@ -527,7 +545,7 @@ on `muructl deploy`:
 | `--retain-workers N` | The workers each group of that release keeps meanwhile |
 
 ```
-muructl apply -f muru.daemon.toml --hold
+muructl apply -f muru.deploy.toml --hold
 muructl rollout bluegreen shop@2026-11-06
 ```
 
@@ -552,13 +570,18 @@ them, else stopped.
 `--dry-run` prints the plan and changes nothing. For each release that
 would take over from one that serves, it says how long that one stays
 warm. `--prune` also removes the routes, hosts, releases and
-applications the files do not contain: the routes and hosts with the
+applications the files do not contain, of the
+[deployments](#deployments) they name: the routes and hosts with the
 rest of the files, and the releases and applications after the edge has
-the snapshot, a running release draining and stopping first. The release
+the snapshot, a running release draining and stopping first. A release
+the files do not declare is left for a later `--prune` while it is the
+one a rollback restores, the plan saying so, as `muructl release prune`
+leaves it. The release
 that serves each application after the apply must be declared, or the
-apply is refused, since `--prune` would remove it, and so must every
-release a route the files keep names in its traffic, and every
-application such a route sends requests to. `--json` writes the report
+apply is refused, since `--prune` would remove it, and so must
+everything else the files name that it would remove: an application or
+a host a route is for, a release in a route's traffic, a rate limit on
+a host. `--json` writes the report
 as JSON. The exit code is 0 when there is nothing to do or everything
 applied, 2 for a dry run with changes planned, and 1 for errors, for a
 release that did not start, for a change that failed, and for a
@@ -566,7 +589,7 @@ snapshot the edge did not take, which the report names: the changes
 were made, and the edge serves what it had until a later snapshot
 reaches it.
 
-`muructl config export` writes desired state as a file of this form, with
+`muructl deployment export` writes desired state as a file of this form, with
 a header naming the daemon's version, the node, the time and the state
 version. It writes the release that serves each application, every key
 spelled out, and the application's `serving` key naming it, and the
@@ -579,18 +602,19 @@ their hosts, and `--json` the same document as JSON. A [rollout](rollouts.md) un
 with `--resolve-rollouts` it is written as where it stands, the
 candidate declared beside the serving release and the application's
 routes splitting traffic between them at the candidate's current share.
-`muructl config diff -f FILE` compares a file with desired state in
+`muructl deployment diff -f FILE` compares a file with desired state in
 both directions, listing what the file would add and what the daemon
 holds that the file does not, with exit code 2 when they differ.
 
-`muructl config show [APP] --effective` writes the same document headed
+`muructl deployment show --effective`, with `--app APP` for one
+application, writes the same document headed
 by each serving release's settings and where each came from: the
 release table of an applied file or the deploy's flags, the
 application's settings, the source's `[tool.muru]` table, the source's
 `.venv` for the interpreter, or the default:
 
 ```console
-$ muructl config show shop --effective
+$ muructl deployment show --app shop --effective
 # Muru effective state: muructl 0.1.0 on web1, 2026-11-02T02:10:00Z, state version 812.
 # No active overlay changes this configuration.
 
@@ -647,9 +671,10 @@ muru: shop@r1 stays warm for 1800s with 1 worker to a group, when shop@r2 takes 
 ```
 
 The key names a declared release or one the daemon already has; naming
-neither is an error. Without the key, the last release the apply adds,
-in id order, serves, and the others it adds are held or left stopped
-as above. `--hold` with a key that would move traffic is an error,
+neither is an error. Without the key, a release serves when it is the
+only one the apply adds for the application, and an apply that adds
+several is refused until the key says which serves, or `--hold` holds
+them all. `--hold` with a key that would move traffic is an error,
 since the flag leaves traffic where it is.
 
 While a [rollout](rollouts.md) is under way, the rollout moves the
@@ -664,6 +689,266 @@ naming its candidate is an error too, since the apply would promote it
 past its gates: name another release, or promote it by hand with
 `muructl rollout bluegreen`, after which the files and the daemon
 agree.
+
+The same holds after `muructl rollback`. The files still name the
+release the rollback took out of traffic, and an apply does not put it
+back on its own:
+
+```console
+$ muructl rollback shop
+$ muructl apply -f config/
+muru: nothing applied; the configuration has errors:
+  shop: serving names r2, which muructl rollback took out of traffic at 2026-11-06T14:02:11.000Z; name another release with serving, or promote it again with muructl rollout bluegreen shop@r2
+```
+
+Any other move of traffic away from a release a command made serving
+is allowed, and the plan says that it is one:
+
+```console
+$ muructl apply -f config/ --dry-run
+muru: plan (nothing changed)
+  promote         shop@r1                  serving in place of shop@r2
+warning: shop@r2 was made serving by a command, not by applied files; this apply moves the application's traffic to shop@r1
+```
+
+### Deployments
+
+A node that serves unrelated things can keep each as a deployment of
+its own: a named set of applications, hosts, routes and the rest that
+is applied, pruned and removed together. A `deployment` key at the top
+of a file names the one its tables belong to:
+
+```toml
+deployment = "shop"
+
+[app.shop.release.r1]
+source = "/srv/shop"
+
+[host.shop]
+names = ["shop.example.com"]
+
+[[route]]
+host = "shop"
+app = "shop"
+```
+
+Files with the same name are one deployment, and one apply may carry
+several: the files given are read a deployment at a time, and applied
+together. Files with no key belong to the deployment named `default`,
+and so does what commands make, so a node with one set of files, or
+none, names nothing.
+
+```console
+$ muructl deployment list
+NAME                     APPS                             HOSTS ROUTES  OTHER
+api                      api                                  0      1      0
+default                  landing                              0      0      0
+shop                     shop                                 1      1      0
+```
+
+Once a deployment is named, `muructl app list`, `host list`, `route
+list`, `upstream list` and `overlay list` say whose each object is, and
+`--deployment NAME` on any of them lists one deployment's:
+
+```console
+$ muructl app list
+APP                  DEPLOYMENT       CURRENT      PREVIOUS     USER
+api                  api              r1           -            -
+landing              default          r1           -            -
+shop                 shop             r1           -            -
+$ muructl route list --deployment api
+HOST             PATH                     DEPLOYMENT       TARGET
+shop             /api                     api              api
+```
+
+`muructl deployment show NAME` prints one deployment as its files would
+state it, with its `deployment` key at the top.
+
+- **Names are shared across the node.** A route in one deployment may
+  send requests to an application in another, and may be on a host
+  another declares. A deployment groups objects and is no part of their
+  names, so two deployments cannot each have an upstream named
+  `legacy`. Where several deployments define things of the same kind,
+  start each name with its deployment's: `backends-legacy`,
+  `backends-partner`.
+- **Only its owner changes an object.** An apply that declares an
+  object another named deployment owns is refused, naming that
+  deployment.
+- **A named deployment takes an object from `default` by declaring
+  it**, which is how an application made by command moves to files.
+  The apply says `app landing moves from the deployment default to
+  site`.
+- **`--prune` reaches only the deployments the files name.** It removes
+  what they own and the files no longer declare, and leaves every other
+  deployment alone. `--prune=all` reaches every deployment, `default`
+  among them, so the files are the whole of what the daemon serves: a
+  deployment they do not mention is removed, and so is an application
+  made by command.
+- **Nothing is removed while another deployment names it.** A prune
+  that would remove something an object of another deployment names is
+  refused, naming both. That holds for everything one object names in
+  another: a route its host, its application or upstream, its client
+  classes, its rate limits and the releases in its traffic; a host its
+  rate limits; a rate limit and a worker group their client classes; an
+  overlay its condition, its applications, its routes and what it
+  changes them to. Take the reference out first, or apply both
+  deployments together.
+
+  ```console
+  $ muructl apply -f shop.toml --prune
+  muru: nothing applied; the configuration has errors:
+    rate_limit steady is not removed: host api of deployment api names it; take that out first, or apply both deployments together
+  ```
+
+`muructl deployment remove NAME` removes a deployment as a unit. It
+lists what goes, asks, drains what the deployment runs, and removes its
+applications with their releases, its hosts, routes and the rest:
+
+```console
+$ muructl deployment remove shop
+muru: plan (nothing changed)
+  remove-route    route shop /             not declared
+  remove-host     host shop                not declared
+  remove-release  shop@r1                  ready and not declared
+  remove-app      shop                     not declared
+Remove the deployment shop? [y/N]
+```
+
+`--dry-run` only lists, and `--yes` goes ahead without asking. It is
+refused as a prune is while another deployment names something of it.
+`muructl deployment remove default` removes what `default` holds and
+leaves it in place, empty.
+
+Application data directories are kept. `--data` removes them with their
+applications, and the list says each with what it holds before it asks:
+
+```console
+$ muructl deployment remove api --data
+muru: plan (nothing changed)
+  remove-route    route shop /api          not declared
+  remove-release  api@r1                   ready and not declared
+  remove-app      api                      not declared, with its data directory /var/lib/muru/data/api (296.0KB)
+Remove the deployment api? [y/N]
+```
+
+`muructl deployment export` follows the same division. A file carries
+one `deployment` key, so a daemon with named deployments is exported
+one at a time, or into a directory:
+
+```console
+$ muructl deployment export shop > shop.toml
+$ muructl deployment export --dir backup/
+backup/api.toml
+backup/default.toml
+backup/shop.toml
+$ muructl apply -f backup/ --dry-run
+muru: no changes (7 objects as declared)
+```
+
+`export NAME` writes what that deployment owns, with its key at the
+top; `default` is written without one. `--dir DIR` writes a file for
+each deployment into an empty directory, which applies back without
+changes. With no name and no directory, a daemon whose files name no
+deployment writes everything, and one with named deployments says to
+name one. `--app APP` writes one application with the routes that reach
+it and their hosts, and `--as NAME` puts `deployment = "NAME"` at the
+top, for moving an application made by command into files:
+
+```console
+$ muructl deployment export --app landing --as site > site.toml
+$ muructl apply -f site.toml
+muru: app landing moves from the deployment default to site
+```
+
+Client classes, rate limits and conditions the daemon's own file
+defines are not written: they are the node's, and stay in that file.
+
+What you would remove together belongs together. A host that
+separately released applications share goes in a deployment of its
+own, and each application's deployment holds its routes on that host.
+
+### Files and commands on one application
+
+An application that applied files declare gets its releases and its
+settings from the files, and one that no file declares gets them from
+`muructl deploy` and `muructl app set`. Hosts and routes are declared
+in files either way, and a route may name an application no file
+declares.
+
+`muructl app set` and `muructl app unset` are refused on an application
+a named deployment owns, since that deployment's files state its
+settings: change `[app.NAME]` there and apply, or give the value to one
+release with `muructl deploy`. In `default` they work, and say when
+applied files wrote the settings last, since their next apply removes
+what they do not carry.
+
+`muructl deploy` on an application the files declare is for an
+emergency. It works, and says that the files do not have the release:
+
+```console
+$ muructl deploy shop /srv/shop/hotfix
+muru: release shop@r5 is ready and serving
+muru: warning: shop is declared in applied files, which do not have shop@r5: the next apply moves traffic back when the files name the release that serves, and an apply with --prune removes r5 once it neither serves nor is the release a rollback restores. Add it to the files to keep it; muructl deployment export writes it
+```
+
+A setting `muructl app set` gives such an application lasts until the
+next apply, since a file states the application's table in full, and
+the plan names each setting an apply removes:
+
+```console
+$ muructl apply -f config/ --dry-run
+muru: plan (nothing changed)
+  set-settings    shop                     processes; removes env.STRIPE_KEY
+```
+
+### Applying files when the daemon starts
+
+`--apply` on `muructl daemon start`, `muructl daemon run` and `muructl
+up` applies files once the daemon is up, as `muructl apply -f` does, so
+one command brings up a daemon that serves:
+
+```console
+$ muructl daemon start --apply deploy.d/
+muru: daemon started (pid 4301), serving on http://127.0.0.1:8080, log /home/me/.local/state/muru/log/daemon.log
+muru: start apply of /home/me/deploy.d: 2 changes applied
+```
+
+It takes a file or a directory and may be given more than once.
+`--prune` beside it also removes what the files do not contain, as on
+`muructl apply`, and `--prune=all` makes the files the whole of what
+the daemon serves at each start.
+
+- **Ready means applied.** The command returns, and the daemon answers
+  its [probes](#probes) and tells a service manager that it is ready,
+  once the files are applied.
+- **Every start applies them**, and so does a start that finds the
+  daemon already running, which then says so and applies the files to
+  it. The same line can be run every time.
+- **With nothing running**, as after a reboot, the daemon first starts
+  what it had, then applies the files. Its events say what the apply
+  will change before either happens.
+- **A start whose files cannot be applied fails.** Nothing is changed,
+  the daemon exits with the reason, and whatever was serving is left
+  serving for the next daemon to take over, as after `muructl daemon
+  stop`. With nothing serving, as on a first start, nothing is left
+  running: the daemon exits before it listens when the files cannot be
+  read, and stops its edge when a release they declare does not start.
+  A daemon that was already running stays running.
+- **An upgrade does not apply again.** `muructl daemon upgrade` starts
+  the daemon with its own arguments and leaves the files alone.
+
+```console
+$ muructl daemon start --apply deploy.d/
+muru: error: start apply of /home/me/deploy.d failed: /home/me/deploy.d/shop.toml: TOML parse error at line 19, column 9: invalid type: integer `7`, expected a sequence; the daemon exits, and what was serving is left serving
+```
+
+A restart applies whatever the files say at that moment, an edit
+nobody has applied yet among it, and puts back what a command changed
+where the files state otherwise. On a machine that is changed by hand,
+leave `--apply` off the service's command line and run `muructl apply`
+yourself. To keep a daemon running on what it had when files are bad,
+do the same: start it without `--apply`, and apply as a step of its
+own.
 
 ## Building the environment on the node
 
@@ -1272,6 +1557,139 @@ keeping its process id and its children, and replaces the edge without
 refusing a connection. Releases keep the runtime library they started
 with until a new release replaces them. [Upgrading Muru](upgrading.md)
 covers the command, development runs, the daemon and releases.
+
+## The daemon's configuration file
+
+The daemon reads one file of its own, which says how it runs: its
+listeners, limits, logs, metrics and the rest. It need not exist;
+without it the daemon serves HTTP on 127.0.0.1:8080 with the defaults.
+What the daemon serves is not in it: an application, a host or a route
+there is refused, and goes in a file for [`muructl
+apply`](#declaring-applications-in-files).
+
+`muructl daemon config` finds the file, shows it, checks it and changes
+it. A running daemon says which file it reads; with none running it is
+the file a daemon started with the same options would read.
+
+```console
+$ muructl daemon config path
+/home/me/.config/muru/muru.toml (not present)
+```
+
+`set` changes one key by its dotted path. It checks the result as the
+daemon would, writes the file whole, keeping its comments and layout,
+and has the running daemon reload:
+
+```console
+$ muructl daemon config set limits.max_body_size 50MB
+muru: wrote /home/me/.config/muru/muru.toml
+muru: reloaded /home/me/.config/muru/muru.toml: changed [limits] (the edge has it); ...
+```
+
+A value that is TOML, such as `true`, `4` or `["a", "b"]`, is taken as
+it is, and anything else as a string. `unset` takes a key out. A key in
+a list of entries, such as a `[[listener]]`, is changed with `edit`.
+
+A few settings are read only when the daemon starts. The file is
+written, and the reload says the daemon keeps what it started with:
+
+```console
+$ muructl daemon config set daemon.detours true
+muru: wrote /home/me/.config/muru/muru.toml
+muru: reloaded /home/me/.config/muru/muru.toml: ...; [daemon] detours changed and is read at start, so the daemon keeps what it started with until it is restarted; ...
+```
+
+`muructl daemon stop` and `muructl daemon start` restart the daemon
+with its hosts and its edge serving throughout.
+
+`edit` opens the file in `$VISUAL`, else `$EDITOR`, else `vi`, starting
+from a short commented file when there is none. It checks what was
+saved before it writes anything, and a file with a mistake is never
+written:
+
+```console
+$ muructl daemon config edit
+muru: /home/me/.config/muru/muru.toml: "50 megs" is not a size such as 10MB or 512KB
+Edit again? [Y/n]
+```
+
+The file is an ordinary file, and can be changed by other means: an
+editor of your own, a checkout, configuration management. `check` says
+whether the daemon would take it, and `muructl daemon reload` applies
+it:
+
+```console
+$ muructl daemon config check
+muru: /home/me/.config/muru/muru.toml is valid
+$ muructl daemon reload
+```
+
+`check FILE` checks a file that is somewhere else, its relative paths
+taken from its own directory, as a daemon started with `--config FILE`
+would read it. `replace FILE` installs a whole file as the daemon's,
+checked in the daemon's place, written and reloaded, and takes `-` for
+standard input, for a script that generates the file:
+
+```console
+$ ./make-config | muructl daemon config replace -
+```
+
+`set`, `unset`, `edit` and `replace` take `--check`, which checks the
+result and writes nothing, and `--no-reload`, which writes the file and
+leaves the daemon as it is. With no daemon running they write the file
+and say that the daemon reads it when it starts. A file this user may
+not write, as a system daemon's is to anyone but root, is refused
+before anything is edited, with the way to run the command with the
+rights to.
+
+`show` prints the file as it is written. `show --full` prints every
+setting of its plain tables: what the file sets, marked so, and as
+comments the default of every other key, with the flags the daemon was
+started with that stand over the file. The result is itself a file the
+daemon takes. A flag such as `--listen` holds over the file until the
+daemon is started without it, and a change to a key such a flag stands
+over is written with a warning saying so.
+
+## Starting again from nothing
+
+`muructl daemon reset` puts a daemon back to nothing. It removes the
+state store, with every application, release, host and route in it, and
+what the releases left: the environments built for them, their bytecode
+and static directories and the upload spool. It works on the files
+alone, so it needs no daemon, and it helps with a state store a daemon
+can no longer read.
+
+It runs only when nothing of the daemon is running. Stop everything
+first:
+
+```console
+$ muructl daemon stop --shutdown
+$ muructl daemon reset
+muru: this removes the state of the daemon at /home/me/.local/state/muru:
+  remove  /home/me/.local/state/muru/muru.sqlite  the state store: 3 applications, 7 releases, 2 hosts and 5 routes 212.0KB
+  remove  /home/me/.local/state/muru/envs  the environments built for releases 1.2GB
+  keep    /home/me/.local/state/muru/data  the applications' data (--data removes it)
+  keep    /home/me/.local/state/muru/logs  the logs (--logs removes them)
+  keep    /home/me/.config/muru/muru.toml  the daemon's configuration file
+Remove? [y/N]
+```
+
+While a daemon answers, or its edge and hosts still serve after a
+`muructl daemon stop` that left them, nothing is removed, and the
+command names what runs and exits 1.
+
+- `--dry-run` prints the list and stops, exiting 0 when a reset would
+  go ahead.
+- `--yes` goes ahead without asking. Without it and without a terminal,
+  the list is printed and nothing is removed.
+- `--json` prints the list as JSON: `allowed`, `running`, `remove` and
+  `keep`.
+- `--data` removes the applications' data directories under the state
+  directory as well, and `--logs` the log files.
+
+The daemon's configuration file, its file secret stores and the
+instance's identity are always kept. The next `muructl daemon start`
+finds nothing to serve.
 
 ## Reloading the configuration
 

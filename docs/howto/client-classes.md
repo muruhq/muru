@@ -244,7 +244,7 @@ one route or on every route of an application.
 gives the edge changed classes and limits without a restart.
 
 Classes and limits in applied files reach the edge when they are
-applied, and `muructl config export` writes them out. An applied class's
+applied, and `muructl deployment export` writes them out. An applied class's
 rule keeps its place among the applied rules when it changes, and a new
 one goes after them; with `--prune` they take the file's order, and
 those the file leaves out are removed. A name the daemon's file defines

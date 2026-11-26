@@ -120,6 +120,6 @@ is trusted.
 `muructl daemon reload` applies a changed `[proxy]` table and a changed
 `proxy` table of a listener to the requests that arrive from then on.
 
-A `[proxy]` table in a file given to `muructl apply` is reported and not
-applied; it belongs in the daemon's own file, and a daemon whose table
-does not parse refuses to start and says which entry is wrong.
+A `[proxy]` table in a file given to `muructl apply` is refused; it
+belongs in the daemon's own file, and a daemon whose table does not
+parse refuses to start and says which entry is wrong.

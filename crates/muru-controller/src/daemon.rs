@@ -249,6 +249,138 @@ pub struct Config {
     /// The locks on the state and run directories, taken before anything
     /// else and held for the life of the process (issue 804).
     pub ownership: crate::ownership::Ownership,
+    /// The files to apply once the daemon is up (`--apply`, ADR 0081), or
+    /// none.
+    pub start_apply: Option<StartApply>,
+}
+
+/// The files a start applies (section 13.13): what `muructl apply -f`
+/// would send for them, read before the daemon starts.
+#[derive(Debug, Clone)]
+pub struct StartApply {
+    /// The paths, as the messages name them.
+    pub paths: String,
+    /// The files, a deployment to a document, or why they could not be
+    /// read.
+    pub documents: Result<Vec<String>, String>,
+    /// How far the apply's removals reach.
+    pub prune: crate::deployments::Prune,
+}
+
+/// An error on one line, for an event and a log line: a TOML parse
+/// error's excerpt of the file, with its line numbers and its caret, is
+/// left out, and what it says before and after is kept.
+fn on_one_line(error: &str) -> String {
+    error
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            let excerpt = line.starts_with('|')
+                || line.starts_with('^')
+                || line
+                    .split_once(" |")
+                    .is_some_and(|(number, _)| number.chars().all(|c| c.is_ascii_digit()));
+            !line.is_empty() && !excerpt
+        })
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+impl StartApply {
+    /// What the apply will do, planned against the store before anything
+    /// is restored, as the pending event says it; and whether it can be
+    /// applied at all.
+    fn pending(
+        &self,
+        store: &Store,
+        defined: &crate::config::Defined,
+        provisioning: &crate::provision::Provisioning,
+    ) -> (bool, String) {
+        let declared = match self
+            .documents
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|texts| {
+                let parsed = texts
+                    .iter()
+                    .map(|text| muru_config::Document::parse(text))
+                    .collect::<Result<Vec<_>, _>>()?;
+                crate::deployments::fold(parsed)
+            }) {
+            Ok(declared) => declared,
+            Err(error) => return (false, format!("cannot be applied: {}", on_one_line(&error))),
+        };
+
+        let plan = crate::config::plan_declared(
+            store,
+            &declared,
+            self.prune,
+            false,
+            defined,
+            provisioning,
+        );
+
+        if !plan.errors.is_empty() {
+            return (
+                false,
+                format!("cannot be applied: {}", plan.errors.join("; ")),
+            );
+        }
+
+        if plan.changes.is_empty() {
+            return (true, "nothing to change".to_owned());
+        }
+
+        let changes: Vec<String> = plan
+            .changes
+            .iter()
+            .map(|change| format!("{} {}", change.action.name(), change.subject()))
+            .collect();
+        (true, changes.join(", "))
+    }
+
+    /// Apply the files to the daemon at `socket`, as `muructl apply`
+    /// does, and say what came of it: the summary of a success, or the
+    /// report of a failure.
+    async fn run(self, socket: PathBuf) -> Result<String, String> {
+        let documents = self.documents.map_err(|error| on_one_line(&error))?;
+        let mut client = crate::client::connect(&crate::client::Endpoint::unix(&socket))
+            .await
+            .map_err(|error| error.to_string())?;
+        let report = client
+            .apply_config(muru_proto::admin::v1::ApplyConfigRequest {
+                documents,
+                prune: self.prune.any(),
+                prune_all: self.prune == crate::deployments::Prune::All,
+                ..muru_proto::admin::v1::ApplyConfigRequest::default()
+            })
+            .await
+            .map_err(|status| status.message().to_owned())?
+            .into_inner();
+
+        let failed: Vec<String> = report
+            .changes
+            .iter()
+            .filter(|change| change.outcome.starts_with("failed"))
+            .map(|change| format!("{} {}", change.subject, change.outcome))
+            .collect();
+        let mut errors = report.errors.clone();
+        errors.extend(failed);
+
+        if !report.snapshot_error.is_empty() {
+            errors.push(report.snapshot_error.clone());
+        }
+
+        if !errors.is_empty() {
+            return Err(format!("nothing applied: {}", errors.join("; ")));
+        }
+
+        Ok(if report.changes.is_empty() {
+            "nothing to change".to_owned()
+        } else {
+            format!("{} changes applied", report.changes.len())
+        })
+    }
 }
 
 /// How often the daemon checks whether a log file was renamed away
@@ -1018,6 +1150,8 @@ pub struct Info {
     pub instance_id: crate::registry::InstanceId,
     /// Section 9.13: the open detours, as the daemon last published them.
     pub detours: std::sync::Mutex<Vec<muru_proto::admin::v1::Detour>>,
+    /// The flags the daemon was started with that stand over its file.
+    pub start_flags: Vec<String>,
 }
 
 /// What runs for one release now, for the API.
@@ -1975,6 +2109,9 @@ struct Daemon {
     access_overrides: Vec<muru_edge::access::Override>,
     /// The command line's settings, laid over the file on every reload.
     overrides: crate::settings::Overrides,
+    /// The settings read only at start, as this daemon started with
+    /// them, which a reload compares the file's with.
+    read_at_start: Vec<(&'static str, String)>,
     /// The event sinks delivering (section 11.5), reconciled on reload.
     sinks: crate::sinks::Sinks,
     /// Section 4.2: each TLS host's last good certificate chain and key
@@ -2046,6 +2183,15 @@ struct Daemon {
     /// previous one to take over: its first start, after a reboot or
     /// after a shutdown. Commands with `at_boot` run then.
     booted: bool,
+}
+
+/// The listeners as a start says them: each as a URL, joined with `and`.
+fn serving_on_text(listeners: &[(SocketAddr, bool)]) -> String {
+    listeners
+        .iter()
+        .map(|(address, tls)| format!("{}://{address}", if *tls { "https" } else { "http" }))
+        .collect::<Vec<_>>()
+        .join(" and ")
 }
 
 /// Run the daemon until it is told to stop: bind the edge, serve the admin
@@ -2182,6 +2328,47 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     };
 
     let booted = adopted.is_none();
+    let wanted_listeners = settings.listeners.clone();
+    let read_at_start = settings.at_start();
+    let provisioning =
+        crate::provision::Provisioning::for_daemon(&settings.tools, &locations.state.path);
+    let defined = crate::config::Defined {
+        budget: crate::budget::View {
+            budget: settings.budget,
+            ..crate::budget::View::default()
+        },
+        conditions: settings.conditions.clone(),
+        ..client_rules.defined()
+    };
+
+    // Issue 945: files that cannot be applied are known before anything
+    // is started. With no edge left running and nothing in the store
+    // serving there is nothing to restore first, so the start fails here,
+    // before a listener is bound: an edge with nothing behind it would
+    // only hold the address and answer errors.
+
+    if let Some(apply) = config
+        .start_apply
+        .as_ref()
+        .filter(|_| booted && config.upgraded_from.is_none())
+        && !store.apps()?.iter().any(|app| app.current.is_some())
+        && let (false, what) = apply.pending(&store, &defined, &provisioning)
+    {
+        events.emit(
+            "config.apply_pending",
+            "config",
+            "error",
+            &format!("start apply of {}: {what}", apply.paths),
+        );
+        let message = format!(
+            "start apply of {} failed: {}; the daemon exits, and nothing was serving, so its \
+             edge is not started",
+            apply.paths,
+            what.strip_prefix("cannot be applied: ").unwrap_or(&what)
+        );
+        events.emit("daemon.start_failed", "daemon", "error", &message);
+        anyhow::bail!(message);
+    }
 
     let edge = match adopted {
         Some(edge) => {
@@ -2221,8 +2408,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // Section 8.4: uv as found and how it is run, said once at start.
 
-    let provisioning =
-        crate::provision::Provisioning::for_daemon(&settings.tools, &locations.state.path);
     tracing::info!("{}", provisioning.describe_uv());
     write_edge_record(&locations.run.path, &edge);
 
@@ -2251,14 +2436,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         metrics,
         dashboard,
         dashboard_sessions: dashboard_sessions.clone(),
-        defined: std::sync::RwLock::new(crate::config::Defined {
-            budget: crate::budget::View {
-                budget: settings.budget,
-                ..crate::budget::View::default()
-            },
-            conditions: settings.conditions.clone(),
-            ..client_rules.defined()
-        }),
+        defined: std::sync::RwLock::new(defined),
         python_logging: std::sync::RwLock::new(settings.python_logging.clone()),
         interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
@@ -2276,6 +2454,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         cgroup_limits: std::sync::Mutex::new(None),
         instance_id,
         detours: std::sync::Mutex::new(Vec::new()),
+        start_flags: config.overrides.flags(),
     });
     let underway = crate::commands::Underway::default();
     let runs = crate::runs::Runs::new(
@@ -2384,11 +2563,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     };
 
     let mut api = tokio::spawn(api);
-    let serving_on = listeners
-        .iter()
-        .map(|(address, tls)| format!("{}://{address}", if *tls { "https" } else { "http" }))
-        .collect::<Vec<_>>()
-        .join(" and ");
+    let serving_on = serving_on_text(&listeners);
 
     match &config.upgraded_from {
         Some(before) => events.emit(
@@ -2469,6 +2644,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         access_log: settings.access_log.clone(),
         access_overrides: Vec::new(),
         overrides: config.overrides,
+        read_at_start,
         sinks,
         certificates: HashMap::new(),
         budget_table: settings.budget,
@@ -2513,6 +2689,40 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }
     }
 
+    // ADR 0081: the files a start applies are planned against the store
+    // before anything is restored, and what is pending is said first, so
+    // the log shows why a release starts only to be replaced, or that the
+    // files cannot be applied and the daemon will exit once what the
+    // store holds is back.
+
+    let start_apply = config
+        .start_apply
+        .filter(|_| config.upgraded_from.is_none());
+
+    if let Some(apply) = &start_apply {
+        let defined = daemon
+            .info
+            .defined
+            .read()
+            .expect("defined names poisoned")
+            .clone();
+        let (possible, what) = apply.pending(&daemon.store, &defined, &daemon.info.provisioning);
+        daemon.events.emit(
+            "config.apply_pending",
+            "config",
+            if possible { "notice" } else { "error" },
+            &format!(
+                "start apply of {}: {what}; {}",
+                apply.paths,
+                if possible {
+                    "applied once what the store holds is restored"
+                } else {
+                    "what the store holds is restored before the daemon exits"
+                }
+            ),
+        );
+    }
+
     daemon.restore().await;
     daemon.reconcile_traffic().await;
     daemon.run_at_boot().await;
@@ -2524,13 +2734,37 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         tracing::warn!(%error, "pushing the first snapshot failed");
     }
 
+    // Issue 930: a start and a reload read the file the same way. An
+    // edge re-adopted after a detach has the listeners it was started
+    // with, so a file that now names others takes a new edge, as a reload
+    // gives it, where the old listeners served until the next reload.
+
+    let relisten = if daemon.booted {
+        None
+    } else {
+        daemon
+            .bind_listeners(&wanted_listeners)
+            .map_err(anyhow::Error::msg)?
+    };
+
     // Section 13.4: an upgraded daemon replaces the edge with one from
     // its own image once the hosts are re-adopted and the snapshot is
     // whole again.
 
-    if config.upgraded_from.is_some() {
-        let _ = daemon.replace_edge(None, "the same listeners").await;
+    match relisten {
+        Some((listeners, what)) => {
+            daemon
+                .replace_edge(Some(listeners), &what)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+        None if config.upgraded_from.is_some() => {
+            let _ = daemon.replace_edge(None, "the same listeners").await;
+        }
+        None => {}
     }
+
+    let serving_on = serving_on_text(&daemon.edge.listeners());
 
     // Section 7.4: the edge says when a request waits for a group with
     // no workers.
@@ -2538,11 +2772,32 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let (wake_sender, mut wakes) = mpsc::channel(64);
     daemon.edge.watch_wakes(wake_sender);
 
-    crate::notify::ready(&format!("serving on {serving_on}"));
-    daemon
-        .info
-        .started
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    // ADR 0081: readiness waits for the files a start applies. They are
+    // applied through the daemon's own admin API once the loop below is
+    // carrying out commands, as muructl apply would apply them.
+
+    let (applied_tx, mut applied) = oneshot::channel::<Result<String, String>>();
+    let mut applying = start_apply.is_some();
+    let apply_paths = start_apply
+        .as_ref()
+        .map(|apply| apply.paths.clone())
+        .unwrap_or_default();
+
+    match start_apply {
+        Some(apply) => {
+            let socket = daemon.locations.admin_socket();
+            tokio::spawn(async move {
+                let _ = applied_tx.send(apply.run(socket).await);
+            });
+        }
+        None => {
+            crate::notify::ready(&format!("serving on {serving_on}"));
+            daemon
+                .info
+                .started
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 
     // Commands are carried out one at a time; a host dying in between is
     // noticed by the next pass. SIGTERM and SIGINT detach, as a service
@@ -2610,6 +2865,47 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             },
             Some(wake) = wakes.recv() => {
                 daemon.wake(wake).await;
+            }
+            result = &mut applied, if applying => {
+                applying = false;
+
+                match result.unwrap_or_else(|_| Err("the apply did not finish".to_owned())) {
+                    Ok(what) => {
+                        tracing::info!("start apply of {apply_paths}: {what}");
+                        crate::notify::ready(&format!("serving on {serving_on}"));
+                        daemon
+                            .info
+                            .started
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        // A failed start apply fails the start: the daemon
+                        // exits, leaving what serves detached for the next
+                        // daemon, as muructl daemon stop leaves it. With
+                        // nothing serving there is nothing to leave, and
+                        // an edge left behind would hold the address and
+                        // answer every request with an error, so
+                        // everything stops.
+
+                        let serving = daemon
+                            .store
+                            .apps()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|app| app.current.is_some());
+                        let message = format!(
+                            "start apply of {apply_paths} failed: {error}; the daemon exits, and {}",
+                            if serving {
+                                "what was serving is left serving"
+                            } else {
+                                "nothing was serving, so its edge stops with it"
+                            }
+                        );
+                        daemon.events.emit("daemon.start_failed", "daemon", "error", &message);
+                        drain_on_exit = !serving;
+                        break Err(anyhow::anyhow!(message));
+                    }
+                }
             }
             served = &mut api => {
                 break served.map_err(anyhow::Error::from).and_then(|result| result);
@@ -4096,6 +4392,15 @@ impl Daemon {
         let clients = settings.client_rules.policies(&self.store)?;
         let listeners = self.bind_listeners(&settings.listeners)?;
         let mut report = crate::reload::Report::new(&path);
+
+        // Issue 894: what is read only at start and now differs from what
+        // this daemon started with, which a restart applies.
+
+        for ((setting, started), (_, now)) in self.read_at_start.iter().zip(settings.at_start()) {
+            if *started != now {
+                report.stale(setting);
+            }
+        }
 
         // Section 4.4: the tables the edge takes from each snapshot, and
         // the limits with them (section 4.6).
@@ -11960,6 +12265,19 @@ impl Daemon {
         self.store
             .set_app_releases(app, Some(&previous), current.as_deref())
             .map_err(|error| error.to_string())?;
+
+        // ADR 0082: an apply reads this, and does not put back in traffic
+        // the release a rollback took out of it.
+
+        if let Some(from) = &current {
+            self.store
+                .set_serving_origin(
+                    app,
+                    crate::model::ServingSetBy::Rollback { from: from.clone() },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
         self.events.emit(
             "app.rolled-back",
             app,

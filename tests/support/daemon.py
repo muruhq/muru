@@ -80,8 +80,11 @@ class Daemon:
         stdin: str | None = None,
         cwd: Path | None = None,
         git_metadata: bool = False,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run a muructl command against this daemon, with `stdin` as its input, in `cwd`.
+
+        `env` is added to the environment the command runs with.
 
         Commands that work from the daemon's files rather than its socket
         (the secret commands) get the daemon's locations instead. A deploy
@@ -130,6 +133,7 @@ class Daemon:
                 timeout=180,
                 input=stdin,
                 cwd=cwd,
+                env={**os.environ, **env} if env else None,
             )
         except subprocess.TimeoutExpired as error:
             self.timeline.append(f"{stamp(began)} muructl {' '.join(arguments)}: hung")

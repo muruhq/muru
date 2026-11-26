@@ -220,7 +220,7 @@ pub enum Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Added {
     /// It takes the application's traffic: `serving` names it, or it is
-    /// the last added in id order.
+    /// the one release the apply adds.
     Serving,
     /// Started with traffic left where it is: `--hold`, or a route's
     /// traffic or an overlay in the same files names it.
@@ -386,6 +386,17 @@ pub struct Plan {
     /// The releases the document declares, by application, which `release
     /// prune` leaves unless forced (section 9.1).
     pub declared: Vec<(String, Vec<String>)>,
+    /// The deployment of each object the files declare (ADR 0080), which
+    /// is recorded once the apply has been carried out.
+    pub owners: crate::deployments::Owners,
+    /// What the apply does besides its changes, said in its report: an
+    /// object that moves from `default` to a named deployment.
+    pub notes: Vec<String>,
+    /// The removals a prune leaves for later: a release the files do not
+    /// declare that serves or that a rollback restores (ADR 0082). An
+    /// apply does not carry them out, and a diff shows them, since the
+    /// daemon holds what the files do not.
+    pub deferred: Vec<Change>,
 }
 
 /// The refusal for making `app` serve while other applications do and no
@@ -517,81 +528,101 @@ pub fn plan(
     defined: &Defined,
     provisioning: &crate::provision::Provisioning,
 ) -> Plan {
-    let mut plan = Plan::default();
+    let declared = match crate::deployments::fold(vec![document.clone()]) {
+        Ok(declared) => declared,
+        Err(error) => {
+            return Plan {
+                errors: vec![error],
+                ..Plan::default()
+            };
+        }
+    };
 
-    // Listeners and limits are node settings, read from the daemon's own
-    // file at start-up (section 10.3).
+    let prune = if prune {
+        crate::deployments::Prune::Files
+    } else {
+        crate::deployments::Prune::No
+    };
 
-    if !document.listener.is_empty() {
-        plan.warnings.push(
-            "[[listener]] entries belong in the daemon configuration file and were not applied"
-                .to_owned(),
-        );
+    plan_declared(store, &declared, prune, hold, defined, provisioning)
+}
+
+/// Compare what the files of an apply declare with desired state, as
+/// [`plan`] does for one document, with each object's deployment and a
+/// prune that reaches the deployments the files name, or all of them
+/// (ADR 0080).
+pub fn plan_declared(
+    store: &Store,
+    declared: &crate::deployments::Declared,
+    prune: crate::deployments::Prune,
+    hold: bool,
+    defined: &Defined,
+    provisioning: &crate::provision::Provisioning,
+) -> Plan {
+    let document = &declared.document;
+    let mut plan = Plan {
+        owners: declared.owners.clone(),
+        ..Plan::default()
+    };
+
+    // ADR 0080: only its owner changes an object. One another named
+    // deployment owns is refused, and one of `default`'s that a named
+    // deployment declares moves to it, which is how a node run by command
+    // moves to files.
+
+    let owned = crate::deployments::stored(store);
+    let there = crate::deployments::stored_objects(store);
+
+    for ((kind, key), owner) in &declared.owners {
+        match owned.get(&(*kind, key.clone())) {
+            Some(other) if other != owner => plan.errors.push(format!(
+                "{} {key} belongs to the deployment {other}, and an apply of the deployment \
+                 {owner} does not change it",
+                kind.as_str()
+            )),
+            None if owner != crate::deployments::DEFAULT
+                && there.contains(&(*kind, key.clone())) =>
+            {
+                plan.notes.push(format!(
+                    "{} {key} moves from the deployment default to {owner}",
+                    kind.as_str()
+                ));
+            }
+            _ => {}
+        }
     }
 
-    if document.limits.is_some() {
-        plan.warnings.push(
-            "the [limits] table belongs in the daemon configuration file and was not applied"
-                .to_owned(),
-        );
-    }
+    // ADR 0079: the daemon's own tables are no part of what an apply
+    // changes, and one in an applied file is refused, where some were
+    // skipped with a warning and others without a word.
 
-    if document.proxy.is_some() {
-        plan.warnings.push(
-            "the [proxy] table belongs in the daemon configuration file and was not applied"
-                .to_owned(),
-        );
-    }
-
-    if document.metrics.is_some() {
-        plan.warnings.push(
-            "the [metrics] table belongs in the daemon configuration file and was not applied"
-                .to_owned(),
-        );
-    }
-
-    if document.events.is_some() {
-        plan.warnings.push(
-            "the [events] table belongs in the daemon configuration file and was not applied"
-                .to_owned(),
-        );
-    }
-
-    if document.dashboard.is_some() {
-        plan.warnings.push(
-            "the [dashboard] table belongs in the daemon configuration file and was not applied"
-                .to_owned(),
-        );
-    }
-
-    if document.logging.is_some() {
-        plan.warnings.push(
-            "the node-wide [logging] table belongs in the daemon configuration file and was not \
-             applied; an application's or a release's own logging table is"
-                .to_owned(),
-        );
-    }
-
-    if document.overlay_webhook.is_some() {
-        plan.warnings.push(
-            "the [overlay_webhook] table belongs in the daemon configuration file and was not applied"
-                .to_owned(),
-        );
-    }
-
-    if !document.error_pages.is_empty() || document.error_override.is_some() {
-        plan.warnings.push(
-            "the node-wide [error_pages] and [error_override] tables belong in the daemon \
-             configuration file and were not applied"
-                .to_owned(),
-        );
+    for table in document.daemon_tables() {
+        plan.errors.push(format!(
+            "{table} is part of the daemon's own configuration, which muructl apply does not \
+             change: put it in the daemon's configuration file and run muructl daemon reload"
+        ));
     }
 
     // Sections 4.14 and 4.15: the document's classes and limits come
     // first, so what follows may name them.
 
-    plan_clients(store, document, defined, prune, &mut plan);
-    let defined = &defined.with_applied(store, document, prune);
+    plan_clients(store, document, defined, prune.any(), &mut plan);
+    let file_conditions = &defined.conditions;
+
+    // What a prune reaches of the store, by its owner: what the
+    // deployments the files name own, or with `all` everything. What it
+    // does not reach stays, and may be named.
+
+    let reach = |kind: crate::deployments::Kind, key: &str| {
+        prune == crate::deployments::Prune::All
+            || declared.named.contains(
+                owned
+                    .get(&(kind, key.to_owned()))
+                    .map_or(crate::deployments::DEFAULT, String::as_str),
+            )
+    };
+    let stays = |kind: crate::deployments::Kind, key: &str| !prune.any() || !reach(kind, key);
+    let defined = &defined.with_applied(store, document, &stays);
 
     let mut promotions = Vec::new();
     let route_apps: BTreeMap<String, String> = document
@@ -614,7 +645,10 @@ pub fn plan(
     for (name, app) in &document.app {
         plan.declared
             .push((name.clone(), app.release.keys().cloned().collect()));
-        let applying = Applying { prune, hold };
+        let applying = Applying {
+            prune: prune.any(),
+            hold,
+        };
         promotions.extend(plan_app(
             store,
             name,
@@ -646,14 +680,20 @@ pub fn plan(
     plan_hosts(store, document, &defined.rate_limits, &mut plan);
     plan_upstreams(store, document, &mut plan);
     plan_routes(store, document, defined, &mut plan);
-    plan_overlays(store, document, defined, prune, &mut plan);
-    plan_conditions(store, document, &mut plan);
+    plan_overlays(store, document, defined, prune.any(), &mut plan);
+    plan_conditions(store, document, file_conditions, &mut plan);
     plan.changes.extend(promotions);
     plan_budget(document, defined, &mut plan);
 
-    if prune {
-        plan_removals(store, document, &mut plan);
+    if prune.any() {
+        plan_removals(store, document, &reach, &mut plan);
     }
+
+    // ADR 0080: nothing that stays may name something this apply
+    // removes, in the files or in another deployment.
+
+    let dangling = crate::references::left_naming_removed(store, declared, &plan);
+    plan.errors.extend(dangling);
 
     if let Some(refusal) = apply_no_host_refusal(store, &plan.changes) {
         plan.errors.push(refusal);
@@ -863,11 +903,30 @@ fn plan_app(
     {
         let keys: Vec<String> = settings.lines().into_iter().map(|(key, _)| key).collect();
 
+        // ADR 0082: a file states the table in full, so a setting the
+        // application has and the files do not is removed, and the plan
+        // names it: muructl app set may have given it.
+
+        let removed: Vec<String> = stored
+            .as_ref()
+            .map(|stored| stored.settings.lines())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, _)| key)
+            .filter(|key| !keys.contains(key))
+            .collect();
+
+        let removes = if removed.is_empty() {
+            String::new()
+        } else {
+            format!("; removes {}", removed.join(", "))
+        };
+
         plan.changes.push(Change {
             detail: if keys.is_empty() {
-                "no settings of its own".to_owned()
+                format!("no settings of its own{removes}")
             } else {
-                keys.join(", ")
+                format!("{}{removes}", keys.join(", "))
             },
             action: Action::SetAppSettings {
                 app: name.to_owned(),
@@ -930,15 +989,31 @@ fn plan_app(
     deploys.sort_by_key(|(id, _)| release_order(id));
 
     // Section 10.4: the release that serves, which `serving` names, else
-    // the last in id order the apply adds, unless `--hold` holds them all.
-    // The other releases the apply adds are held, and a release the
-    // daemon has that `serving` names is promoted.
+    // the one release the apply adds, unless `--hold` holds them all. An
+    // apply that adds several needs the key (ADR 0082): the order of ids
+    // decides nothing, since an id such as a commit has none, and a
+    // release removed while its file stayed was added again and given
+    // the traffic in place of a newer one (issue 926). The other releases
+    // the apply adds are held, and a release the daemon has that
+    // `serving` names is promoted.
 
+    let origin = stored
+        .as_ref()
+        .and_then(|stored| stored.serving_origin.clone());
     let current = stored.and_then(|stored| stored.current);
     let added: Vec<String> = deploys.iter().map(|(id, _)| id.clone()).collect();
 
     let (serving, moves) = match &app.serving {
         None if applying.hold => (current.clone(), false),
+        None if added.len() > 1 => {
+            plan.errors.push(format!(
+                "{name}: the files add {} releases ({}) and do not say which serves; name one \
+                 with the application's serving key, or hold them all with --hold",
+                added.len(),
+                added.join(", ")
+            ));
+            return None;
+        }
         None => (
             added.last().cloned().or_else(|| current.clone()),
             !added.is_empty(),
@@ -956,6 +1031,48 @@ fn plan_app(
             }
         }
     };
+
+    // ADR 0082: an apply does not undo a rollback on its own. The files
+    // still name the release a rollback took out of traffic, and applying
+    // them, at a restart as much as by hand, would put it back.
+
+    if moves
+        && let Some(serving) = &serving
+        && let Some(crate::model::ServingOrigin {
+            how: crate::model::ServingSetBy::Rollback { from },
+            at_unix_ms,
+        }) = &origin
+        && from == serving
+    {
+        plan.errors.push(format!(
+            "{name}: serving names {serving}, which muructl rollback took out of traffic at {}; \
+             name another release with serving, or promote it again with muructl rollout \
+             bluegreen {name}@{serving}",
+            crate::sinks::rfc3339(*at_unix_ms)
+        ));
+        return None;
+    }
+
+    // Any other move of traffic away from a release that applied files
+    // did not make serving is allowed, and said: a command chose that
+    // release, and this apply chooses another.
+
+    if moves
+        && let (Some(serving), Some(current)) = (&serving, &current)
+        && serving != current
+        && !matches!(
+            origin,
+            Some(crate::model::ServingOrigin {
+                how: crate::model::ServingSetBy::Apply,
+                ..
+            })
+        )
+    {
+        plan.warnings.push(format!(
+            "{name}@{current} was made serving by a command, not by applied files; this apply \
+             moves the application's traffic to {name}@{serving}"
+        ));
+    }
 
     // Section 10.4: `--prune` removes what the files do not declare, so
     // the release that serves must be one of theirs.
@@ -1109,7 +1226,14 @@ pub struct Defined {
 impl Defined {
     /// These names with the classes and limits of applied files: those
     /// `document` declares and, without `prune`, those recorded.
-    fn with_applied(&self, store: &Store, document: &Document, prune: bool) -> Defined {
+    fn with_applied(
+        &self,
+        store: &Store,
+        document: &Document,
+        stays: &dyn Fn(crate::deployments::Kind, &str) -> bool,
+    ) -> Defined {
+        use crate::deployments::Kind;
+
         let mut all = self.clone();
         all.client_classes
             .extend(document.client_class.iter().map(|class| class.name.clone()));
@@ -1121,26 +1245,32 @@ impl Defined {
                 .or_insert_with(|| condition.clone());
         }
 
-        if !prune {
-            for (name, condition) in store.conditions().unwrap_or_default() {
+        // What is recorded and stays through this apply may be named
+        // too: everything without a prune, and with one what it does not
+        // reach, which is another deployment's (ADR 0080).
+
+        for (name, condition) in store.conditions().unwrap_or_default() {
+            if stays(Kind::Condition, &name) {
                 all.conditions.entry(name).or_insert(condition);
             }
-
-            all.client_classes.extend(
-                store
-                    .client_classes()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(_, class)| class.name),
-            );
-            all.rate_limits.extend(
-                store
-                    .rate_limits()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(name, _)| name),
-            );
         }
+
+        all.client_classes.extend(
+            store
+                .client_classes()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, class)| class.name)
+                .filter(|name| stays(Kind::ClientClass, name)),
+        );
+        all.rate_limits.extend(
+            store
+                .rate_limits()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| stays(Kind::RateLimit, name)),
+        );
 
         all
     }
@@ -2125,11 +2255,27 @@ fn stored_routes_named(
 
 /// Section 9.10 (issue 123): the named conditions a document declares,
 /// each checked, with a warning for one with no hysteresis.
-fn plan_conditions(store: &Store, document: &Document, plan: &mut Plan) {
+fn plan_conditions(
+    store: &Store,
+    document: &Document,
+    file: &BTreeMap<String, muru_config::Condition>,
+    plan: &mut Plan,
+) {
     let stored: BTreeMap<String, muru_config::Condition> =
         store.conditions().unwrap_or_default().into_iter().collect();
 
     for (name, condition) in &document.condition {
+        // ADR 0079: a name the daemon's file defines is the node's, as
+        // for a client class and a rate limit, where an applied
+        // condition of that name was left out with a line in the log.
+
+        if file.contains_key(name) {
+            plan.errors.push(format!(
+                "condition {name}: the daemon configuration file defines it"
+            ));
+            continue;
+        }
+
         match muru_config::condition::check(name, condition) {
             Ok(warnings) => plan.warnings.extend(warnings),
             Err(error) => {
@@ -2677,16 +2823,29 @@ pub fn describe_traffic(traffic: Option<&muru_config::Traffic>) -> String {
 }
 
 /// With prune, routes, hosts, releases and applications in desired state
-/// that the document does not declare go, in that order. A release or an
-/// application a route the document keeps still names is refused.
-fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
+/// that the document does not declare go, in that order. Whether anything
+/// that stays still names one of them is checked once the plan is whole
+/// (`references::left_naming_removed`).
+fn plan_removals(
+    store: &Store,
+    document: &Document,
+    reach: &dyn Fn(crate::deployments::Kind, &str) -> bool,
+    plan: &mut Plan,
+) {
+    use crate::deployments::Kind;
+
     for route in store.routes().unwrap_or_default() {
         let declared = document
             .route
             .iter()
             .any(|candidate| candidate.host == route.host && candidate.key() == route.key());
 
-        if !declared {
+        if !declared
+            && reach(
+                Kind::Route,
+                &crate::deployments::route_key(&route.host, &route.key()),
+            )
+        {
             plan.changes.push(Change {
                 action: Action::RemoveRoute {
                     path: route.key(),
@@ -2698,7 +2857,7 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
     }
 
     for (name, _) in store.hosts().unwrap_or_default() {
-        if !document.host.contains_key(&name) {
+        if !document.host.contains_key(&name) && reach(Kind::Host, &name) {
             plan.changes.push(Change {
                 action: Action::RemoveHost { name },
                 detail: "not declared".to_owned(),
@@ -2711,6 +2870,7 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
             .client_class
             .iter()
             .any(|declared| declared.name == class.name)
+            && reach(Kind::ClientClass, &class.name)
         {
             plan.changes.push(Change {
                 action: Action::RemoveClientClass { name: class.name },
@@ -2720,7 +2880,7 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
     }
 
     for (name, _) in store.rate_limits().unwrap_or_default() {
-        if !document.rate_limit.contains_key(&name) {
+        if !document.rate_limit.contains_key(&name) && reach(Kind::RateLimit, &name) {
             plan.changes.push(Change {
                 action: Action::RemoveRateLimit { name },
                 detail: "not declared".to_owned(),
@@ -2729,7 +2889,7 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
     }
 
     for (name, _) in store.upstreams().unwrap_or_default() {
-        if !document.upstream.contains_key(&name) {
+        if !document.upstream.contains_key(&name) && reach(Kind::Upstream, &name) {
             plan.changes.push(Change {
                 action: Action::RemoveUpstream { name },
                 detail: "not declared".to_owned(),
@@ -2738,7 +2898,7 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
     }
 
     for (name, _) in store.conditions().unwrap_or_default() {
-        if !document.condition.contains_key(&name) {
+        if !document.condition.contains_key(&name) && reach(Kind::Condition, &name) {
             plan.changes.push(Change {
                 action: Action::RemoveCondition { name },
                 detail: "not declared".to_owned(),
@@ -2752,6 +2912,7 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         if !document.overlay.contains_key(&name)
             && !schedules.contains_key(&name)
             && !crate::overlays::is_temporary(&name)
+            && reach(Kind::Overlay, &name)
         {
             plan.changes.push(Change {
                 action: Action::RemoveOverlay { name },
@@ -2765,7 +2926,15 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
     };
 
     for app in apps {
+        // An application the prune does not reach is another
+        // deployment's, releases and all.
+
+        if !reach(Kind::App, &app.name) {
+            continue;
+        }
+
         let declared = document.app.get(&app.name);
+
         let Ok(releases) = store.releases(Some(&app.name)) else {
             continue;
         };
@@ -2773,24 +2942,31 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         for release in releases {
             let kept = declared.is_some_and(|table| table.release.contains_key(&release.id));
 
+            // ADR 0082: a release a rollback restores stays, as prune and
+            // remove leave it, and so does the one that serves now when
+            // this apply moves traffic away from it, which makes it the
+            // rollback release. A later prune takes it once it is neither.
+
+            if !kept
+                && declared.is_some()
+                && [&app.current, &app.previous].contains(&&Some(release.id.clone()))
+            {
+                plan.warnings.push(format!(
+                    "{}@{} is not declared and stays for now: it serves, or a rollback restores \
+                     it, and a later --prune removes it once neither holds",
+                    app.name, release.id
+                ));
+                plan.deferred.push(Change {
+                    action: Action::RemoveRelease {
+                        app: app.name.clone(),
+                        id: release.id.clone(),
+                    },
+                    detail: format!("{} and not declared", release.state),
+                });
+                continue;
+            }
+
             if !kept {
-                // A route the files keep must not lose a release its
-                // traffic names.
-
-                let named = (app.name.clone(), release.id.clone());
-
-                for route in document
-                    .route
-                    .iter()
-                    .filter(|route| traffic_releases(route).contains(&named))
-                {
-                    plan.errors.push(format!(
-                        "route {} {}: traffic names {}@{}, which the files do not declare, so \
-                         --prune would remove it; declare it, or take it out of the route's traffic",
-                        route.host, route.path, app.name, release.id
-                    ));
-                }
-
                 plan.changes.push(Change {
                     action: Action::RemoveRelease {
                         app: app.name.clone(),
@@ -2802,24 +2978,6 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         }
 
         if declared.is_none() {
-            // Nor an application it sends requests to.
-
-            let routed = |route: &&RouteTable| {
-                route.app == app.name
-                    || route
-                        .fallback
-                        .as_ref()
-                        .is_some_and(|fallback| fallback.app.as_deref() == Some(app.name.as_str()))
-            };
-
-            for route in document.route.iter().filter(routed) {
-                plan.errors.push(format!(
-                    "route {} {}: names application {}, which the files do not declare, so \
-                     --prune would remove it; declare it, or take the route out",
-                    route.host, route.path, app.name
-                ));
-            }
-
             plan.changes.push(Change {
                 action: Action::RemoveApp {
                     app: app.name.clone(),
@@ -2986,7 +3144,8 @@ fn write(
             writes.set_app_access_log(app, access_log).map(|()| "set")?
         }
         Action::SetAppSettings { app, settings } => {
-            writes.set_app_settings(app, settings).map(|()| "set")?
+            writes.set_app_settings(app, settings)?;
+            writes.mark_settings_applied(app).map(|()| "set")?
         }
         Action::PutHost { name, host, new } => writes.put_host(name, host).map(|()| made(*new))?,
         Action::RemoveHost { name } => writes.delete_host(name).map(|()| "removed")?,
@@ -3046,6 +3205,7 @@ fn write(
                 .find(|(serving, release, _)| serving == app && release == id)
                 .and_then(|(_, _, previous)| previous.as_deref());
             writes.set_app_releases(app, Some(id), previous)?;
+            writes.set_serving_origin(app, crate::model::ServingSetBy::Apply)?;
             "serving"
         }
     };
@@ -3654,7 +3814,7 @@ fn group_prefixes(paths: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The keys a Python logging table sets, as `config show --effective`
+/// The keys a Python logging table sets, as `deployment show --effective`
 /// names them (`logging.python.level`, `logging.python.loggers.NAME`,
 /// `logging.python.warnings.N`), in the order of `PythonLogging::layered`,
 /// each with whether `over` sets it rather than `under`. Warnings are
@@ -3701,7 +3861,7 @@ pub fn logging_keys(
     keys
 }
 
-/// A Python logging key's value as `config show --effective` writes it,
+/// A Python logging key's value as `deployment show --effective` writes it,
 /// for a key `logging_keys` names.
 fn logging_value(logging: &muru_config::PythonLogging, key: &str) -> String {
     let key = key.strip_prefix("logging.python.").unwrap_or(key);
@@ -3738,7 +3898,7 @@ fn own_logging_key(key: &str, before: usize) -> String {
 /// Section 11.4: the Python logging defaults each release of an exported
 /// document starts its host with, the daemon's `[logging.python]` under
 /// the release's own, a line a key with the layer it comes from, for
-/// `config show --effective`.
+/// `deployment show --effective`.
 pub fn logging_layers(
     store: &Store,
     document: &Document,
@@ -5235,7 +5395,7 @@ fn resolve_layers(
     )
 }
 
-/// Section 3.3: a release's settings as `config show --effective`
+/// Section 3.3: a release's settings as `deployment show --effective`
 /// shows them beside their layers, by key.
 pub fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
     let optional = |value: Option<u64>, format: fn(u64) -> String| {
@@ -5315,7 +5475,7 @@ pub fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
 
 /// Section 3.3: each setting of the releases an exported document
 /// declares, with the layer it came from, one line a setting, for
-/// `config show --effective`.
+/// `deployment show --effective`.
 pub fn release_layers(store: &Store, document: &Document) -> Result<Vec<String>, StoreError> {
     let mut lines = Vec::new();
 
@@ -5367,7 +5527,7 @@ pub(crate) fn served_settings(limits: &crate::model::ServedLimits) -> Vec<(Strin
 
 /// Section 4.6: the limits on a request that the releases an exported
 /// document declares set, with those of their worker groups and mounts,
-/// one line a limit, for `config show --effective`.
+/// one line a limit, for `deployment show --effective`.
 pub fn served_layers(store: &Store, document: &Document) -> Result<Vec<String>, StoreError> {
     let mut lines = Vec::new();
 
@@ -5418,7 +5578,7 @@ fn with_served(
 }
 
 /// Section 4.6: the limits of each route an exported document declares,
-/// with the level each came from, one line a limit, for `config show
+/// with the level each came from, one line a limit, for `deployment show
 /// --effective`: the route, the serving release of the application it
 /// routes to, its virtual host, the daemon's `[limits]` table or the
 /// default. A worker group or a mount of the release may set its own for
@@ -7674,7 +7834,14 @@ mod tests {
         let changes = planned(&without).changes;
         assert_eq!(changes.len(), 1, "{changes:?}");
         assert_eq!(changes[0].action.name(), "set-settings");
-        assert_eq!(changes[0].detail, "no settings of its own");
+
+        // The plan names what it takes away (ADR 0082), which muructl app
+        // set may have given.
+
+        assert_eq!(
+            changes[0].detail,
+            "no settings of its own; removes threads, env.DATABASE_URL"
+        );
 
         let mut zero = document;
         zero.app.get_mut("shop").unwrap().processes = Some(0);
@@ -8140,19 +8307,31 @@ mod tests {
             .collect();
         assert_eq!(deploys, vec![("deploy", "shop@r2".to_owned(), "held")]);
 
-        // Without the key the last release added in id order serves
-        // (issue #447), and --hold starts every one held.
+        // Without the key the one release an apply adds serves, and an
+        // apply that adds several is refused (issue 926): the order of
+        // ids no longer picks one. --hold starts every one held.
+
+        let one = plan_with(
+            &store,
+            &shop_releases(&source, &["r1", "r2"], ""),
+            false,
+            false,
+        );
+        assert_eq!(
+            steps(&one),
+            vec![("deploy", "shop@r2".to_owned(), "serving")]
+        );
+        assert!(one.changes[0].detail.starts_with("serving: "));
 
         let document = shop_releases(&source, &["r1", "r3", "r2"], "");
-        let added = plan_with(&store, &document, false, false);
+        let several = plan_with(&store, &document, false, false);
         assert_eq!(
-            steps(&added),
-            vec![
-                ("deploy", "shop@r2".to_owned(), "stopped"),
-                ("deploy", "shop@r3".to_owned(), "serving"),
+            several.errors,
+            [
+                "shop: the files add 2 releases (r2, r3) and do not say which serves; name one \
+                 with the application's serving key, or hold them all with --hold"
             ]
         );
-        assert!(added.changes[1].detail.starts_with("serving: "));
         let all_held = plan_with(&store, &document, false, true);
         assert!(
             steps(&all_held)
@@ -8524,7 +8703,9 @@ mod tests {
             assert!(plan_with(&store, &document, false, false).errors.is_empty());
         }
 
-        // Naming the declared release promotes it before r1 is removed.
+        // Naming the declared release promotes it, and r1, which the
+        // promotion makes the release a rollback restores, stays for a
+        // later prune (ADR 0082), where it was removed with its rollback.
 
         let moved = plan_with(
             &store,
@@ -8533,11 +8714,98 @@ mod tests {
             false,
         );
         assert!(moved.errors.is_empty(), "{:?}", moved.errors);
+        assert_eq!(steps(&moved), vec![("promote", "shop@r2".to_owned(), "")]);
+        assert!(
+            moved.warnings.iter().any(|warning| warning
+                == "shop@r1 is not declared and stays for now: it serves, or a rollback restores \
+                    it, and a later --prune removes it once neither holds"),
+            "{:?}",
+            moved.warnings
+        );
+    }
+
+    #[test]
+    fn an_apply_does_not_undo_a_rollback_and_says_when_it_reverts_a_command() {
+        // ADR 0082. r2 serves by an apply; a rollback by command takes it
+        // out of traffic, and the files still name it.
+
+        let source = source_dir();
+        let store = store_with_two(&source);
+        store
+            .set_app_releases("shop", Some("r2"), Some("r1"))
+            .unwrap();
+        store
+            .set_serving_origin("shop", crate::model::ServingSetBy::Apply)
+            .unwrap();
+        let names_r2 = shop_releases(&source, &["r1", "r2"], "serving = 'r2'");
+        assert!(
+            plan_with(&store, &names_r2, false, false)
+                .changes
+                .is_empty()
+        );
+
+        store
+            .set_app_releases("shop", Some("r1"), Some("r2"))
+            .unwrap();
+        store
+            .set_serving_origin(
+                "shop",
+                crate::model::ServingSetBy::Rollback {
+                    from: "r2".to_owned(),
+                },
+            )
+            .unwrap();
+        let refused = plan_with(&store, &names_r2, false, false);
+        assert_eq!(refused.errors.len(), 1, "{:?}", refused.errors);
+        assert!(
+            refused.errors[0].starts_with(
+                "shop: serving names r2, which muructl rollback took out of traffic at "
+            ),
+            "{}",
+            refused.errors[0]
+        );
+        assert!(
+            refused.errors[0].ends_with(
+                "name another release with serving, or promote it again with muructl rollout \
+                 bluegreen shop@r2"
+            ),
+            "{}",
+            refused.errors[0]
+        );
+
+        // The files naming the release that serves now agree with the
+        // rollback, and plan nothing.
+
+        let names_r1 = shop_releases(&source, &["r1", "r2"], "serving = 'r1'");
+        let agreed = plan_with(&store, &names_r1, false, false);
+        assert!(
+            agreed.errors.is_empty() && agreed.changes.is_empty(),
+            "{agreed:?}"
+        );
+
+        // Promoted again by command, r2 serves with no origin recorded,
+        // and the files that name it agree. Files that name r1 then move
+        // traffic back, and say that a command had chosen r2.
+
+        store
+            .set_app_releases("shop", Some("r2"), Some("r1"))
+            .unwrap();
+        assert!(
+            plan_with(&store, &names_r2, false, false)
+                .changes
+                .is_empty()
+        );
+
+        let reverted = plan_with(&store, &names_r1, false, false);
         assert_eq!(
-            steps(&moved),
-            vec![
-                ("promote", "shop@r2".to_owned(), ""),
-                ("remove-release", "shop@r1".to_owned(), ""),
+            steps(&reverted),
+            vec![("promote", "shop@r1".to_owned(), "")]
+        );
+        assert_eq!(
+            reverted.warnings,
+            [
+                "shop@r2 was made serving by a command, not by applied files; this apply moves \
+                 the application's traffic to shop@r1"
             ]
         );
     }
@@ -8604,8 +8872,8 @@ mod tests {
         assert_eq!(
             refused.errors,
             vec![
-                "route shop /: traffic names shop@r2, which the files do not declare, so --prune \
-                 would remove it; declare it, or take it out of the route's traffic"
+                "route shop /: names release shop@r2, which the files do not declare, so --prune \
+                 would remove it; declare it, or take the name out"
             ]
         );
         assert!(
@@ -8623,7 +8891,7 @@ mod tests {
         let orphaned = plan_with(&store, &with(&["r1", "r2"], blog), true, false);
         assert_eq!(orphaned.errors.len(), 1, "{:?}", orphaned.errors);
         assert!(
-            orphaned.errors[0].starts_with("route shop /blog: names application blog"),
+            orphaned.errors[0].starts_with("route shop /blog: names app blog"),
             "{}",
             orphaned.errors[0]
         );
@@ -8949,11 +9217,20 @@ mod tests {
             &Defined::default(),
             &crate::provision::Provisioning::off(),
         );
-        assert_eq!(plan.errors.len(), 3, "{:?}", plan.errors);
-        assert!(plan.errors[0].contains("\"Shop\" is not a valid application name"));
-        assert!(plan.errors[1].contains("shop@r1 has no source directory"));
-        assert!(plan.errors[2].contains("is not a directory"));
-        assert_eq!(plan.warnings.len(), 1);
+
+        // A table of the daemon's own configuration is an error too
+        // (issue 862), where it was a warning.
+
+        assert_eq!(plan.errors.len(), 4, "{:?}", plan.errors);
+        assert_eq!(
+            plan.errors[0],
+            "[[listener]] is part of the daemon's own configuration, which muructl apply does \
+             not change: put it in the daemon's configuration file and run muructl daemon reload"
+        );
+        assert!(plan.errors[1].contains("\"Shop\" is not a valid application name"));
+        assert!(plan.errors[2].contains("shop@r1 has no source directory"));
+        assert!(plan.errors[3].contains("is not a directory"));
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
         assert_eq!(plan.changes.len(), 1, "the app is still created");
     }
 

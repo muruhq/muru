@@ -65,7 +65,7 @@ def test_read_commands_print_the_api_answers(daemon: Daemon) -> None:
     assert answer(daemon, "rollout", "status")["rollouts"] == []
     assert answer(daemon, "scale", "status", "shop")["app"] == "shop"
     assert answer(daemon, "websockets")["open"] == 0
-    assert "[app.shop.release.r1]" in answer(daemon, "config", "show")["document"]
+    assert "[app.shop.release.r1]" in answer(daemon, "deployment", "show")["document"]
 
     # Events and metrics: an event's type keeps its proto name, and each
     # sample carries the type its family declares.

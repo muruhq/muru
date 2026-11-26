@@ -137,7 +137,7 @@ def test_secrets_are_resolved_from_every_kind_of_store_and_never_shown(tmp_path:
         # What the daemon records, exports and prints names the store and
         # key, never the value.
 
-        exported = daemon.muructl("config", "export").stdout
+        exported = daemon.muructl("deployment", "export").stdout
         assert "store = 'local'" in exported or 'store = "local"' in exported
         assert "key = 'db-password'" in exported or 'key = "db-password"' in exported
         assert "as = 'file'" in exported or 'as = "file"' in exported
@@ -217,7 +217,7 @@ def test_declared_releases_carry_env_tables_and_unknown_stores_are_refused(
         assert env_of(daemon, "MODE")["value"] == "declared"
         assert env_of(daemon, "GREETING")["value"] == "hello"
         assert env_of(daemon, "NOTE")["content"] == "hello"
-        assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0
+        assert daemon.muructl("deployment", "diff", "-f", str(config), check=False).returncode == 0
 
         config.write_text(
             "[app.plain.release.r2]\n"

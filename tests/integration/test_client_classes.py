@@ -361,7 +361,7 @@ rate_limits = ['applied-limit']
     assert site.request("/applied/", bot).status == 200
     assert site.request("/applied/", bot).status == 429
 
-    exported = site.daemon.muructl("config", "export").stdout
+    exported = site.daemon.muructl("deployment", "export").stdout
     assert 'name = "applied"' in exported and "[rate_limit.applied-limit]" in exported
 
     # A name the daemon's file defines is refused.
@@ -378,7 +378,7 @@ rate_limits = ['applied-limit']
     )
     applied = site.daemon.muructl("apply", "-f", str(tables))
     assert "create-client-class" in applied.stdout, applied.stdout
-    assert str(listed) in site.daemon.muructl("config", "export").stdout
+    assert str(listed) in site.daemon.muructl("deployment", "export").stdout
 
     # Pruned, they are gone.
 

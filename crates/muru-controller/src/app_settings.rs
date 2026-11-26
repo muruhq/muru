@@ -231,6 +231,7 @@ impl AppSettings {
             memory_reclaim_first: self.memory_reclaim_first,
             memory_hard_limit: self.memory_hard_limit,
             memory_check_interval_ms: self.memory_check_interval_ms,
+            notice: String::new(),
         }
     }
 

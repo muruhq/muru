@@ -403,7 +403,7 @@ hold starts the release without moving traffic.
 release; drain takes a release out of traffic and stops it.
 - rollout canary shifts traffic to a release step by step, each step judged \
 by gates against the release that serves.
-- apply makes a declarative file (muru.daemon.toml) the desired state; deploy adds \
+- apply makes a declarative file (muru.deploy.toml) the desired state; deploy adds \
 one release. apply with hold starts the releases it adds without moving \
 traffic. The muructl render command writes such a file for a release from \
 a source directory and deploy's settings, without the daemon.
@@ -1115,11 +1115,12 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
-            name: "config",
-            description: "The desired state as TOML (show, with effective for what active overlays change), or compare a file or directory of TOML files with it (diff).",
+            name: "deployment",
+            description: "What the daemon serves, its desired state, as TOML (show, with effective for what active overlays change), or compare a file or directory of TOML files with it (diff).",
             changes: false,
             properties: json!({
                 "action": {"type": "string", "enum": ["show", "diff"]},
+                "deployment": {"type": "string", "description": "For show: one deployment only, as its files would state it"},
                 "app": {"type": "string", "description": "For show: one application only"},
                 "effective": {"type": "boolean", "description": "For show: as the active overlays leave it"},
                 "file": {"type": "string", "description": "For diff: the file or directory"},
@@ -1127,8 +1128,12 @@ fn specs() -> Vec<Spec> {
             required: &["action"],
             command: |arguments| match needed(arguments, "action")?.as_str() {
                 "show" => {
-                    let mut command = words(&["config", "show"]);
-                    command.extend(text(arguments, "app"));
+                    let mut command = words(&["deployment", "show"]);
+                    command.extend(text(arguments, "deployment"));
+
+                    if let Some(app) = text(arguments, "app") {
+                        command.extend(["--app".to_owned(), app]);
+                    }
 
                     if flag(arguments, "effective") {
                         command.push("--effective".to_owned());
@@ -1137,11 +1142,11 @@ fn specs() -> Vec<Spec> {
                     Ok(command)
                 }
                 "diff" => Ok([
-                    words(&["config", "diff", "--file"]),
+                    words(&["deployment", "diff", "--file"]),
                     vec![needed(arguments, "file")?],
                 ]
                 .concat()),
-                other => Err(format!("no config action {other}")),
+                other => Err(format!("no deployment action {other}")),
             },
         },
         Spec {
@@ -1831,11 +1836,12 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "remove_release",
-            description: "Remove one release, as app@release, with its environment, bytecode and logs. Refused for the serving or rollback release, a running one or one a route or rollout uses. dry_run says what would go; anything else is refused unless yes is true.",
+            description: "Remove one release, as app@release, with its environment, bytecode and logs. Refused for the serving or rollback release, a running one or one a route or rollout uses, and for one applied files declare unless force is true. dry_run says what would go; anything else is refused unless yes is true.",
             changes: true,
             properties: json!({
                 "release": {"type": "string", "description": "The release, as app@release"},
                 "keep_logs": {"type": "boolean", "description": "Leave its log and archives"},
+                "force": {"type": "boolean", "description": "Remove it although applied files declare it; the next apply of those files creates it again"},
                 "dry_run": {"type": "boolean"},
                 "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
             }),
@@ -1851,6 +1857,7 @@ fn specs() -> Vec<Spec> {
 
                 for (key, name) in [
                     ("keep_logs", "--keep-logs"),
+                    ("force", "--force"),
                     ("dry_run", "--dry-run"),
                     ("yes", "--yes"),
                 ] {

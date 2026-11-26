@@ -633,7 +633,7 @@ def test_bundle_of_a_development_run_and_of_a_serve(tmp_path: Path) -> None:
         assert b"muru_requests_total" in found["figures/metrics.txt"]
         assert not any(path.startswith("figures/scaling/") for path in found)
 
-        # A run has no state store: its settings are what config show
+        # A run has no state store: its settings are what deployment show
         # --effective prints, and it has no daemon's file.
 
         effective = found["config/effective.toml"].decode()

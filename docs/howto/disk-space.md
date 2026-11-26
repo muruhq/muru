@@ -64,7 +64,8 @@ Past that point a failed release is removed whatever N is, so a run of
 failed deploys does not push out good releases.
 
 A release that applied files declare stays unless `--force` is given,
-since the next `muructl apply` would create it again.
+since the next `muructl apply` would create it again. To remove one for
+good, take it out of the files and apply them with `--prune`.
 
 With the release go its environment, its bytecode, its static directory
 and its log and log archives. `--keep-logs` leaves the log and archives.
@@ -89,6 +90,13 @@ refused:
 ```console
 $ muructl release remove shop@r5
 muru: error: shop@r5 cannot be removed: it serves the application's traffic
+```
+
+So is a release that applied files declare, unless `--force` is given:
+
+```console
+$ muructl release remove shop@r3
+muru: error: shop@r3 cannot be removed: applied files declare it, so the next apply creates it again: take it out of the files and apply them with --prune, or --force takes it
 ```
 
 ## Removing an application

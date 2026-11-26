@@ -44,7 +44,7 @@ impl Settings {
             .collect()
     }
 
-    /// Each setting as a line of `muructl config show --effective`, which
+    /// Each setting as a line of `muructl deployment show --effective`, which
     /// reads `SCOPE: KEY = VALUE (SOURCE)`, with those of the command's
     /// table under its name, as `run.port`.
     pub fn layers(&self, scope: &str) -> Vec<String> {

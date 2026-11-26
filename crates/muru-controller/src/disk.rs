@@ -103,6 +103,19 @@ impl Measure {
     }
 }
 
+/// A byte count for a reader, in the units sizes are given in.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
+
+    for (scale, unit) in UNITS {
+        if bytes >= scale {
+            return format!("{:.1}{unit}", bytes as f64 / scale as f64);
+        }
+    }
+
+    format!("{bytes}B")
+}
+
 /// What one path takes.
 pub fn measure(path: &Path) -> io::Result<DiskUse> {
     std::fs::symlink_metadata(path)?;

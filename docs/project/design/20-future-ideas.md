@@ -83,3 +83,7 @@ Serving the ASGI HTTP trailers extension on ordinary responses: `http.response.s
 ## 20.14 Access log format templates
 
 A format for the access log written as a template of named fields, for an analyser or a pipeline that reads neither JSON nor the combined format (section 11.2). It needs a syntax for the fields, escaping rules for each value, and a decision on whether `muructl logs --access` can still read what it writes; the two named formats cover Muru's own tools and the common analysers meanwhile.
+
+## 20.15 Values from outside in applied files
+
+Applied files are applied as written (section 10.3, ADR 0079). Ideas for a value that comes from outside them, kept in issue 939: a `dotenv` secret store or an `--env-file` on muructl app set and muructl deploy, `pass_env` for one application where it is node-wide, and `${VAR}` interpolation with an export `--param`, which the specification once named and which was never built. A value a platform injects is reached today through an `env` secret store (section 10.8).

@@ -102,6 +102,9 @@ service Admin {
   // one with desired state, or export desired state as one.
   rpc ApplyConfig(ApplyConfigRequest) returns (ConfigReport);
   rpc DiffConfig(DiffConfigRequest) returns (ConfigReport);
+  // The deployments, each with what it holds (issue 936). default is
+  // always among them.
+  rpc ListDeployments(ListDeploymentsRequest) returns (ListDeploymentsResponse);
   rpc ExportConfig(ExportConfigRequest) returns (ExportConfigResponse);
 
   // Logs: a release's output or the access log,
@@ -446,6 +449,7 @@ message Status {
   string instance_id = 24;          // the instance's ID, 32 hex digits, as its registry entry has it, so a client can check it reached the instance it meant
   string hostname = 25;             // the machine's hostname
   string name = 26;                 // the instance's name: user, system or a named instance's; empty for a run, a serve or a daemon whose locations were given by flags
+  repeated string start_flags = 27; // the flags the daemon was started with that stand over its configuration file: --listen, --metrics, --dashboard, --user (issue 894)
 }
 
 message ListWebSocketsRequest {
@@ -759,6 +763,7 @@ message App {
   int32 priority = 10;              // the node's budget admits higher priorities' scale-ups first
   string maintenance_overlay = 11;  // the active overlay whose maintenance setting is in force, if one is (issue 757)
   AppSettings settings = 12;        // the release settings every release deployed from now takes (issue 899)
+  string deployment = 13;           // the deployment that owns it (issue 943)
 }
 
 // An application's own release settings (issue 899): what every release
@@ -787,6 +792,7 @@ message AppSettings {
   optional bool memory_reclaim_first = 19;
   optional uint64 memory_hard_limit = 20;    // bytes
   optional uint64 memory_check_interval_ms = 21;
+  string notice = 22;                        // on a change's answer: what its caller should be told, as that applied files last wrote these settings (issue 936)
 }
 
 // Set some of an application's settings and remove others. The settings
@@ -999,6 +1005,7 @@ message RemoveReleaseRequest {
   string release = 2;
   bool keep_logs = 3;               // leave its log and archives
   bool dry_run = 4;                 // only say what it would free
+  bool force = 5;                   // take it although applied files declare it (issue 926)
 }
 
 // A release a removal took, or would take.
@@ -1279,6 +1286,7 @@ message Release {
   string traffic = 38;              // its shares of the routes that split traffic, where they differ from what serving implies (issue 759)
   Detour detour = 39;               // a detour's run and traffic, for kind detour
   map<string, string> metadata = 40; // what its deploy recorded of where its code came from
+  string notice = 41;               // on a deploy's answer: what its caller should be told, as that applied files declare the application and do not have this release (issue 933)
 }
 
 // A gate a release passed: a run of a command at a point in its life.
@@ -1416,6 +1424,7 @@ message OverlayInfo {
   uint64 starts_unix_ms = 8;        // when its schedule's window begins, if that is to come; 0 otherwise
   string condition = 9;             // the named condition it follows, if any
   string condition_state = 10;      // that condition's state: firing, resolved or unknown
+  string deployment = 11;           // the deployment that owns it; none for one a detour or a command made for a time (issue 943)
 }
 
 message ControlOverlayRequest {
@@ -1458,10 +1467,29 @@ message ApplyConfigRequest {
   bool no_wait = 6;                 // return once those releases are recorded, without waiting for them to serve
   optional uint64 retain_ms = 7;    // how long a release the apply replaces stays warm; 30 minutes when absent
   optional uint32 retain_workers = 8; // the workers each of its groups keeps meanwhile; when absent 1, or 0 for a group whose min_workers is 0
+  repeated string documents = 9;    // the files a deployment to a document, each with its deployment key, in place of document (issue 936)
+  bool prune_all = 10;              // with prune: reach every deployment, those the documents do not name among them
+  bool remove_data = 11;            // also remove the data directory of each application the apply removes (issue 943)
+}
+
+message ListDeploymentsRequest {}
+
+// A named set of objects applied, pruned and removed together.
+message Deployment {
+  string name = 1;
+  repeated string apps = 2;         // the applications it owns
+  uint32 hosts = 3;
+  uint32 routes = 4;
+  uint32 others = 5;                // its upstreams, overlays, client classes, rate limits and conditions
+}
+
+message ListDeploymentsResponse {
+  repeated Deployment deployments = 1;
 }
 
 message DiffConfigRequest {
   string document = 1;
+  repeated string documents = 2;    // a deployment to a document, in place of document
 }
 
 // What an apply would do, or did. With errors nothing is applied.
@@ -1486,6 +1514,8 @@ message ExportConfigRequest {
   string app = 1;                   // one application, else all
   bool effective = 3;               // routes as the active overlays leave them
   bool resolve_rollouts = 4;        // each rollout under way as where it stands
+  string deployment = 5;            // only what this deployment owns, with its deployment key (issue 937)
+  string as_deployment = 6;         // write this deployment key at the top, for an application moving out of default
 }
 
 message ExportConfigResponse {
@@ -1525,6 +1555,7 @@ message Host {
   string access_log_format = 18;      // how the host's access records are written, when it says: json or combined
   string access_log_file = 19;        // the file in the log directory that takes the host's access records, when it names one
   string access_log_query = 20;       // what the host's access records keep of the query string, when it says: keep, mask or drop
+  string deployment = 21;             // the deployment that owns it (issue 943)
 }
 
 message ListRoutesRequest {}
@@ -1556,6 +1587,7 @@ message Route {
   string request_headers = 20;      // what the route removes from and sets on requests, as one phrase
   string response_headers = 21;     // what the route removes from, sets on and adds to responses, as one phrase
   string strip_prefix = 22;         // the leading part of the path the application lives under, as configured; none when empty
+  string deployment = 23;           // the deployment that owns it (issue 943)
 }
 
 message ListUpstreamsRequest {}
@@ -1572,6 +1604,7 @@ message Upstream {
   bool tls = 4;
   string health_path = 5;           // the path probed, when one is
   bool trust_muru_headers = 6;
+  string deployment = 7;            // the deployment that owns it (issue 943)
 }
 
 // One release's share of a route's requests, in percent.

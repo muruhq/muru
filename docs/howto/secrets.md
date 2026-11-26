@@ -78,7 +78,7 @@ key, and never the value.
 
 Values are held only as long as needed and never written to the state
 store, exports, events, logs or dry-run output, nor passed on a command
-line. `muructl config export` and `config diff` show the store and key;
+line. `muructl deployment export` and `deployment diff` show the store and key;
 `muructl secret list` shows names only. A development run (`muructl
 run`) takes plain `[tool.muru.env]` values and refuses secret references,
 since only the daemon has the stores.

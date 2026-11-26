@@ -78,7 +78,7 @@ fn release_facts(release: &Release, serving: bool) -> ReleaseFacts {
 
 /// The effective settings of one release with the layer each came from
 /// (section 3.3), and the limits it, its worker groups and its mounts set
-/// on the requests they serve (section 4.6): what `muructl config show
+/// on the requests they serve (section 4.6): what `muructl deployment show
 /// --effective` lists for it. A managed HTTP server has none of the
 /// worker settings, and a release made before layers were recorded has
 /// no source to give.
@@ -216,7 +216,7 @@ pub fn in_force(store: &Store) -> Result<serde_json::Value, StoreError> {
     }))
 }
 
-/// The effective configuration as `muructl config show --effective`
+/// The effective configuration as `muructl deployment show --effective`
 /// writes it: desired state as the active overlays leave it, as TOML,
 /// headed by what each overlay sets that is in force. For `app` alone
 /// when one is given. The variables a release's table writes with their

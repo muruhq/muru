@@ -1630,6 +1630,10 @@ pub struct App {
     pub current: Option<String>,
     /// The release a rollback restores, if any.
     pub previous: Option<String>,
+    /// How the serving release was last set, when applied files or a
+    /// rollback set it; none when a deploy, a rollout or another command
+    /// did (ADR 0082).
+    pub serving_origin: Option<ServingOrigin>,
     /// When it was created, Unix milliseconds.
     pub created_unix_ms: u64,
     /// For optimistic concurrency.
@@ -1656,6 +1660,59 @@ pub struct App {
     /// The release settings every release deployed from now takes
     /// (issue 899).
     pub settings: crate::app_settings::AppSettings,
+}
+
+/// How an application's serving release came to serve, which an apply
+/// reads before it moves traffic (ADR 0082): an apply does not undo a
+/// rollback on its own, and says when it moves traffic away from a
+/// release a command made serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingOrigin {
+    /// What set it.
+    pub how: ServingSetBy,
+    /// When, Unix milliseconds.
+    pub at_unix_ms: u64,
+}
+
+/// What set an application's serving release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServingSetBy {
+    /// Applied files.
+    Apply,
+    /// `muructl rollback`, away from the release named.
+    Rollback {
+        /// The release that served before, which the rollback took out
+        /// of traffic.
+        from: String,
+    },
+}
+
+impl ServingOrigin {
+    /// The origin as the store keeps it.
+    pub fn encode(&self) -> String {
+        match &self.how {
+            ServingSetBy::Apply => format!("apply {}", self.at_unix_ms),
+            ServingSetBy::Rollback { from } => format!("rollback {} {from}", self.at_unix_ms),
+        }
+    }
+
+    /// The origin the store kept, none for one this version does not
+    /// know.
+    pub fn decode(text: &str) -> Option<Self> {
+        let mut parts = text.splitn(3, ' ');
+        let how = parts.next()?;
+        let at_unix_ms = parts.next()?.parse().ok()?;
+
+        let how = match (how, parts.next()) {
+            ("apply", None) => ServingSetBy::Apply,
+            ("rollback", Some(from)) => ServingSetBy::Rollback {
+                from: from.to_owned(),
+            },
+            _ => return None,
+        };
+
+        Some(Self { how, at_unix_ms })
+    }
 }
 
 impl App {

@@ -68,7 +68,8 @@ impl Keep {
             Keep::InUse(state) => format!("it is {state}"),
             Keep::Referenced => "a route's traffic or a rollout under way uses it".to_owned(),
             Keep::Declared => {
-                "applied files declare it, so the next apply creates it again; --force takes it"
+                "applied files declare it, so the next apply creates it again: take it out of \
+                 the files and apply them with --prune, or --force takes it"
                     .to_owned()
             }
             Keep::WithinKeep => "it is among the newest kept".to_owned(),

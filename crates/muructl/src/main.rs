@@ -9,6 +9,8 @@
 
 mod admin;
 mod browser;
+mod daemon_config;
+mod daemon_reset;
 mod dashboard;
 mod detour;
 mod devcert;
@@ -247,13 +249,16 @@ enum Command {
         output: admin::JsonArgs,
     },
 
-    /// Apply declarative configuration from a file or a directory of files.
+    /// Apply files that say what the daemon serves: applications, their
+    /// releases, hosts, routes, upstreams and overlays. It never changes
+    /// the daemon's own settings.
     Apply(Box<admin::ApplyArgs>),
 
-    /// Export, compare or inspect declarative configuration.
-    Config {
+    /// What the daemon serves, as applied files state it: export it,
+    /// show it or compare files with it.
+    Deployment {
         #[command(subcommand)]
-        command: admin::ConfigCommand,
+        command: admin::DeploymentCommand,
     },
 
     /// Manage the file secret stores.
@@ -1318,6 +1323,9 @@ fn main() -> anyhow::Result<()> {
                     output,
                 },
         } => exit_with(runtime, admin::daemon_status(socket, files, output.json)),
+        Command::Daemon {
+            command: admin::DaemonCommand::Reset(args),
+        } => exit_with(runtime, async move { daemon_reset::reset(*args) }),
         Command::Daemon { command } => runtime.block_on(async move {
             match command {
                 admin::DaemonCommand::Run(args) => admin::daemon_run(args).await,
@@ -1338,6 +1346,10 @@ fn main() -> anyhow::Result<()> {
                 } => admin::daemon_upgrade(socket, files, timeout).await,
                 admin::DaemonCommand::Status { .. } => {
                     unreachable!("daemon status is matched on its own")
+                }
+                admin::DaemonCommand::Config { command } => daemon_config::run(command).await,
+                admin::DaemonCommand::Reset(_) => {
+                    unreachable!("daemon reset is matched on its own")
                 }
             }
         }),
@@ -1361,12 +1373,14 @@ fn main() -> anyhow::Result<()> {
         Command::Secret { command } => runtime.block_on(admin::secret(command)),
         Command::Logging { command } => runtime.block_on(admin::logging(command)),
         Command::Deploy(args) => exit_with(runtime, admin::deploy(*args)),
-        Command::Render(args) => render::render(*args),
+        Command::Render(args) => runtime.block_on(render::render(*args)),
         Command::App { command } => runtime.block_on(async move {
             match command {
-                admin::AppCommand::List { socket, output } => {
-                    admin::app_list(socket, output.json).await
-                }
+                admin::AppCommand::List {
+                    deployment,
+                    socket,
+                    output,
+                } => admin::app_list(socket, output.json, deployment).await,
                 admin::AppCommand::Remove(args) => admin::app_remove(*args).await,
                 admin::AppCommand::Set(args) => admin::app_set(*args).await,
                 admin::AppCommand::Unset(args) => admin::app_unset(*args).await,
@@ -1407,14 +1421,29 @@ fn main() -> anyhow::Result<()> {
             }
         }),
         Command::Host {
-            command: admin::HostCommand::List { socket, output },
-        } => runtime.block_on(admin::host_list(socket, output.json)),
+            command:
+                admin::HostCommand::List {
+                    deployment,
+                    socket,
+                    output,
+                },
+        } => runtime.block_on(admin::host_list(socket, output.json, deployment)),
         Command::Route {
-            command: admin::RouteCommand::List { socket, output },
-        } => runtime.block_on(admin::route_list(socket, output.json)),
+            command:
+                admin::RouteCommand::List {
+                    deployment,
+                    socket,
+                    output,
+                },
+        } => runtime.block_on(admin::route_list(socket, output.json, deployment)),
         Command::Upstream {
-            command: admin::UpstreamCommand::List { socket, output },
-        } => runtime.block_on(admin::upstream_list(socket, output.json)),
+            command:
+                admin::UpstreamCommand::List {
+                    deployment,
+                    socket,
+                    output,
+                },
+        } => runtime.block_on(admin::upstream_list(socket, output.json, deployment)),
         Command::Rollback {
             app,
             socket,
@@ -1469,22 +1498,55 @@ fn main() -> anyhow::Result<()> {
             shown
         }),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
-        Command::Config { command } => match command {
-            admin::ConfigCommand::Export {
+        Command::Deployment { command } => match command {
+            admin::DeploymentCommand::Export {
+                name,
+                dir,
                 app,
+                as_deployment,
                 resolve_rollouts,
                 json,
                 socket,
-            } => runtime.block_on(admin::config_export(app, resolve_rollouts, json, socket)),
-            admin::ConfigCommand::Show {
+            } => runtime.block_on(admin::config_export(
+                admin::Exporting {
+                    name,
+                    dir,
+                    app,
+                    as_deployment,
+                    resolve_rollouts,
+                    json,
+                },
+                socket,
+            )),
+            admin::DeploymentCommand::Show {
+                name,
                 app,
                 effective,
                 socket,
                 output,
-            } => runtime.block_on(admin::config_show(app, effective, socket, output.json)),
-            admin::ConfigCommand::Diff { file, json, socket } => {
+            } => runtime.block_on(admin::config_show(
+                name,
+                app,
+                effective,
+                socket,
+                output.json,
+            )),
+            admin::DeploymentCommand::Diff { file, json, socket } => {
                 exit_with(runtime, admin::config_diff(file, json, socket))
             }
+            admin::DeploymentCommand::List { socket, output } => {
+                runtime.block_on(admin::deployment_list(socket, output.json))
+            }
+            admin::DeploymentCommand::Remove {
+                name,
+                data,
+                dry_run,
+                yes,
+                socket,
+            } => exit_with(
+                runtime,
+                admin::deployment_remove(name, data, dry_run, yes, socket),
+            ),
         },
         Command::Events {
             follow,

@@ -734,5 +734,5 @@ def test_listings_and_apply_checks(site: Fixture, tmp_path: Path) -> None:
 
     # Export writes the upstreams back.
 
-    exported = site.daemon.muructl("config", "export").stdout
+    exported = site.daemon.muructl("deployment", "export").stdout
     assert "[upstream.legacy]" in exported and "[upstream.inner-h2]" in exported

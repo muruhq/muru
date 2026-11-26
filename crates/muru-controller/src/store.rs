@@ -175,6 +175,12 @@ CREATE TABLE IF NOT EXISTS import_reports (
     report TEXT NOT NULL,
     PRIMARY KEY (app, release)
 );
+CREATE TABLE IF NOT EXISTS ownership (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    deployment TEXT NOT NULL,
+    PRIMARY KEY (kind, key)
+);
 CREATE TABLE IF NOT EXISTS log_periods (
     path TEXT PRIMARY KEY,
     period TEXT NOT NULL
@@ -327,7 +333,8 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                 user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings FROM apps ORDER BY name",
+                 user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings, \
+                 serving_origin FROM apps ORDER BY name",
             )?;
             let rows = statement.query_map([], app_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -341,7 +348,8 @@ impl Store {
             connection
                 .query_row(
                     "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                     user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings FROM apps WHERE name = ?1",
+                     user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings, \
+                     serving_origin FROM apps WHERE name = ?1",
                     [name],
                     app_from_row,
                 )
@@ -436,6 +444,27 @@ impl Store {
         self.with(|connection| Writes { connection }.set_app_settings(name, settings))
     }
 
+    /// Whether applied files last wrote the application's settings, and
+    /// with `forget` no longer: a command is about to write them.
+    pub fn settings_applied(&self, name: &str, forget: bool) -> Result<bool, StoreError> {
+        self.with(|connection| {
+            let applied: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM ownership WHERE kind = 'settings' AND key = ?1",
+                [name],
+                |row| row.get(0),
+            )?;
+
+            if forget {
+                connection.execute(
+                    "DELETE FROM ownership WHERE kind = 'settings' AND key = ?1",
+                    [name],
+                )?;
+            }
+
+            Ok(applied > 0)
+        })
+    }
+
     /// Change the application's own release settings in one step under
     /// the store's lock, creating the application when it does not exist:
     /// `change` is given the settings as they are, and what it leaves is
@@ -491,6 +520,16 @@ impl Store {
         previous: Option<&str>,
     ) -> Result<(), StoreError> {
         self.with(|connection| Writes { connection }.set_app_releases(name, current, previous))
+    }
+
+    /// Record that applied files or a rollback set the serving release
+    /// just written.
+    pub fn set_serving_origin(
+        &self,
+        name: &str,
+        how: crate::model::ServingSetBy,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| Writes { connection }.set_serving_origin(name, how))
     }
 
     /// Releases of one application, or of every application, newest first.
@@ -616,6 +655,60 @@ impl Store {
             let rows = statement.query_map([app], |row| row.get::<_, String>(0))?;
             rows.collect::<Result<BTreeSet<_>, _>>()
                 .map_err(StoreError::from)
+        })
+    }
+
+    /// The named deployment recorded for each object (ADR 0080), by kind
+    /// and name. An object with no record belongs to `default`, and a
+    /// record may outlive its object, which the caller passes over.
+    pub fn ownership(&self) -> Result<crate::deployments::Owners, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT kind, key, deployment FROM ownership")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut owners = crate::deployments::Owners::new();
+
+            for row in rows {
+                let (kind, key, deployment) = row?;
+
+                if let Some(kind) = crate::deployments::Kind::parse(&kind) {
+                    owners.insert((kind, key), deployment);
+                }
+            }
+
+            Ok(owners)
+        })
+    }
+
+    /// Record who owns the objects an apply declared: a named deployment
+    /// for each of its own, and no record for one that is `default`'s.
+    pub fn set_owners(&self, owners: &crate::deployments::Owners) -> Result<(), StoreError> {
+        self.with(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+
+            for ((kind, key), deployment) in owners {
+                if deployment == crate::deployments::DEFAULT {
+                    transaction.execute(
+                        "DELETE FROM ownership WHERE kind = ?1 AND key = ?2",
+                        params![kind.as_str(), key],
+                    )?;
+                } else {
+                    transaction.execute(
+                        "INSERT INTO ownership (kind, key, deployment) VALUES (?1, ?2, ?3) \
+                         ON CONFLICT(kind, key) DO UPDATE SET deployment = excluded.deployment",
+                        params![kind.as_str(), key, deployment],
+                    )?;
+                }
+            }
+
+            transaction.commit()?;
+            Ok(())
         })
     }
 
@@ -1603,6 +1696,9 @@ fn app_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<App> {
         name: row.get(0)?,
         current: row.get(1)?,
         previous: row.get(2)?,
+        serving_origin: row
+            .get::<_, Option<String>>(14)?
+            .and_then(|text| crate::model::ServingOrigin::decode(&text)),
         created_unix_ms: row.get::<_, i64>(3)? as u64,
         resource_version: row.get::<_, i64>(4)? as u64,
         user: row.get(5)?,
@@ -1642,6 +1738,7 @@ fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
             ("media_dir", "TEXT"),
             ("uploads_dir", "TEXT"),
             ("settings", "TEXT"),
+            ("serving_origin", "TEXT"),
         ],
     )?;
     add_columns(
@@ -1784,10 +1881,44 @@ impl Writes<'_> {
         current: Option<&str>,
         previous: Option<&str>,
     ) -> Result<(), StoreError> {
+        // How the serving release was set is said after, by an apply or
+        // a rollback. Anything else leaves none, which reads as a
+        // command having set it.
+
         self.connection.execute(
-            "UPDATE apps SET current_release = ?2, previous_release = ?3, \
+            "UPDATE apps SET current_release = ?2, previous_release = ?3, serving_origin = NULL, \
                  resource_version = resource_version + 1 WHERE name = ?1",
             params![name, current, previous],
+        )?;
+        Ok(())
+    }
+
+    /// Remember that applied files wrote the application's settings:
+    /// muructl app set then says that their next apply takes its change
+    /// away (ADR 0080).
+    pub fn mark_settings_applied(&self, name: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO ownership (kind, key, deployment) VALUES ('settings', ?1, 'apply') \
+             ON CONFLICT(kind, key) DO NOTHING",
+            params![name],
+        )?;
+        Ok(())
+    }
+
+    /// Record that applied files or a rollback set the serving release
+    /// just written (ADR 0082).
+    pub fn set_serving_origin(
+        &self,
+        name: &str,
+        how: crate::model::ServingSetBy,
+    ) -> Result<(), StoreError> {
+        let origin = crate::model::ServingOrigin {
+            how,
+            at_unix_ms: now_unix_ms(),
+        };
+        self.connection.execute(
+            "UPDATE apps SET serving_origin = ?2 WHERE name = ?1",
+            params![name, origin.encode()],
         )?;
         Ok(())
     }

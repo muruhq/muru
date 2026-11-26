@@ -207,7 +207,7 @@ scale_in = 'hold'
 """
     config = shop(tmp_path, nightly)
     daemon.muructl("apply", "-f", str(config))
-    exported = daemon.muructl("config", "export").stdout
+    exported = daemon.muructl("deployment", "export").stdout
     assert "[[app.shop.schedule]]" in exported
     assert 'cron = "0 2 * * *"' in exported
     assert 'warm_up = "15m"' in exported

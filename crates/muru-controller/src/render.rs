@@ -5,7 +5,7 @@
 //! is at hand.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use muru_config::{Release as ReleaseTable, ToolMuru};
 use muru_proto::admin::v1 as pb;
@@ -184,6 +184,20 @@ pub fn render(request: &pb::DeployRequest, source: &str, full: bool) -> Result<R
     })
 }
 
+/// An interpreter the source's settings name, as an applied file names
+/// it: a relative path, which the settings take from the source, is put
+/// under the source as the table writes it. A version request and a bare
+/// name, which are not paths, and an absolute path stay as they are.
+fn under_source(source: &str, python: &str) -> String {
+    let path = Path::new(python);
+
+    if path.is_absolute() || path.components().count() < 2 {
+        return python.to_owned();
+    }
+
+    Path::new(source).join(path).display().to_string()
+}
+
 /// A release of native workers: each setting from the request, else the
 /// source's table, else with `full` the default.
 fn workers(
@@ -218,7 +232,16 @@ fn workers(
         (None, None)
     };
 
-    let python = writer.given("python", text(&request.python), table.python);
+    // Issue 927: a relative interpreter in the source's settings is taken
+    // from the source, and one in an applied file from the file's
+    // directory, so it is written under the source as the table names it
+    // and means the same wherever the file is kept.
+
+    let python = writer.given(
+        "python",
+        text(&request.python),
+        table.python.map(|python| under_source(source, &python)),
+    );
 
     if python.is_none() {
         writer.unset.push("python");
@@ -796,6 +819,39 @@ run = ['python', 'manage.py', 'migrate']
     }
 
     #[test]
+    fn a_relative_interpreter_of_the_source_is_written_under_the_source() {
+        // Issue 927: written as the settings have it, an applied file
+        // took it from its own directory.
+
+        let directory =
+            project("[tool.muru]\nentrypoint = 'a:b'\npython = '../.venv/bin/python'\n");
+        let request = request(directory.path());
+
+        for (written, expected) in [
+            ("/srv/shop", "/srv/shop/../.venv/bin/python"),
+            ("shop", "shop/../.venv/bin/python"),
+        ] {
+            let rendered = render(&request, written, false).unwrap();
+            assert_eq!(rendered.table.python.as_deref(), Some(expected));
+        }
+
+        // A version request, an absolute path and one a flag gives stay.
+
+        assert_eq!(under_source("/srv/shop", "3.13"), "3.13");
+        assert_eq!(
+            under_source("/srv/shop", "/usr/bin/python3"),
+            "/usr/bin/python3"
+        );
+
+        let flagged = pb::DeployRequest {
+            python: ".venv/bin/python".to_owned(),
+            ..request
+        };
+        let rendered = render(&flagged, "/srv/shop", false).unwrap();
+        assert_eq!(rendered.table.python.as_deref(), Some(".venv/bin/python"));
+    }
+
+    #[test]
     fn the_flags_come_before_the_settings_and_the_defaults_are_left_out() {
         let directory = project(SETTINGS);
         let rendered = render(&flags(directory.path()), "releases/42", false).unwrap();
@@ -919,7 +975,7 @@ run = ['python', 'manage.py', 'migrate']
             ]
         );
 
-        // Every setting `config show --effective` lists is written or
+        // Every setting `deployment show --effective` lists is written or
         // named as unset.
 
         let spec = config::resolve_spec(

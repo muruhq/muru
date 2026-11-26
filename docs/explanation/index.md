@@ -8,6 +8,7 @@ detail, for contributors.
 :maxdepth: 1
 
 architecture
+configuration
 releases-and-traffic
 worker-protocol
 process-models

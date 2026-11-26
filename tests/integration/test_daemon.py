@@ -791,11 +791,11 @@ def test_a_deploy_takes_nothing_from_the_release_before(daemon: Daemon) -> None:
         "shop", SHOP, "--timeout", "soft=3s", "--memory", "soft_limit=800MB", "--env", "DEBUG=1"
     )
     daemon.deploy("shop", SHOP)
-    shown = daemon.muructl("config", "show", "shop", "--effective").stdout
+    shown = daemon.muructl("deployment", "show", "--app", "shop", "--effective").stdout
     assert "#   shop@r2: timeouts.soft_timeout = off (default)" in shown
     assert "#   shop@r2: memory.soft_limit = off (default)" in shown
     assert "#   shop@r2: threads = 3 ([tool.muru])" in shown
-    exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "show", "--app", "shop").stdout)
     assert "env" not in exported["app"]["shop"]["release"]["r2"]
 
 
@@ -850,7 +850,7 @@ def test_a_deploy_records_where_its_code_came_from(daemon: Daemon, tmp_path: Pat
 
     # The export writes it, and a limit refuses a deploy before it is sent.
 
-    exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "show", "--app", "shop").stdout)
     assert exported["app"]["shop"]["release"]["r2"]["metadata"]["dirty"] == "true"
     refused = daemon.muructl(
         "deploy", "shop", str(source), "--metadata", "url=ftp://example.com", check=False

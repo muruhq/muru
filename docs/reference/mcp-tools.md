@@ -34,7 +34,7 @@ it out.
 | `debug` | reads | `muructl debug status`, `stacks`, `tasks`, `memory` or `inspect`, never with `--env`; or `debug request`, a development run's record of one request | `what` (status, stacks, tasks, memory, inspect, request), `target`, `worker`, `request_id` (for request) |
 | `imports` | reads | `muructl debug imports`: the import report of a release's load, with its advice and the modules the workers loaded since the fork | `target`, `worker`, `load_target` (as `--target`), `top`, `min_ms`, `package`, `module`, `all` (as `--all`) |
 | `scale_status` | reads | `muructl scale status` | `target` |
-| `config` | reads | `muructl config show` or `config diff` | `action` (show, diff), `app`, `effective`, `file` |
+| `deployment` | reads | `muructl deployment show` or `deployment diff` | `action` (show, diff), `deployment`, `app`, `effective`, `file` |
 | `metrics` | reads | `muructl metrics`, the samples kept to those whose name starts with `prefix` | `prefix` |
 | `websockets` | reads | `muructl websockets` | `app`, `list` |
 | `requests` | reads | `muructl requests` | `app`, `list` |
@@ -61,7 +61,7 @@ it out.
 | `access_log` | changes | `muructl logging access` | `mode`, `app`, `paths`, `for`, `reset` |
 | `reopen_logs` | changes | `muructl logs reopen` | `workers` |
 | `prune_releases` | changes | `muructl release prune`, refused unless `yes` is true or `dry_run` asked for | `app`, `keep`, `force`, `keep_logs`, `dry_run`, `yes` |
-| `remove_release` | changes | `muructl release remove`, refused unless `yes` is true or `dry_run` asked for | `release` (app@release), `keep_logs`, `dry_run`, `yes` |
+| `remove_release` | changes | `muructl release remove`, refused unless `yes` is true or `dry_run` asked for | `release` (app@release), `keep_logs`, `force`, `dry_run`, `yes` |
 | `remove_app` | changes | `muructl app remove`, refused unless `yes` is true or `dry_run` asked for | `app`, `dry_run`, `yes` |
 | `prune_cache` | changes | `muructl cache prune`, refused unless `yes` is true or `dry_run` asked for | `area`, `version`, `tag`, `dry_run`, `yes` |
 | `clear_cache` | changes | `muructl cache clear`, refused unless `yes` is true or `dry_run` asked for | `area`, `certs`, `dry_run`, `yes` |
