@@ -6261,8 +6261,11 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
 
     match args.processes {
         Some(count) => println!(
-            "muru: {}@{} {} pinned to {count} workers",
-            status.app, status.release, args.group
+            "muru: {}@{} {} pinned to {}",
+            status.app,
+            status.release,
+            args.group,
+            counted(count, "worker", "workers")
         ),
         None => println!(
             "muru: {}@{} {} unpinned; the autoscaler decides again",

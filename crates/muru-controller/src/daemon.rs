@@ -12357,7 +12357,10 @@ impl Daemon {
                 "scaling.decision",
                 &subject,
                 "notice",
-                &format!("{group}: pinned to {count} workers by an operator"),
+                &format!(
+                    "{group}: pinned to {count} {} by an operator",
+                    if count == 1 { "worker" } else { "workers" }
+                ),
             );
             self.ask_scale(app, id, group, count);
         }
