@@ -331,6 +331,33 @@ def test_recycling_under_the_daemon_moves_traffic_with_no_request_failed(
         second.stop(shutdown=True)
 
 
+def test_recycling_with_the_daemon_stopped_fails_no_request(tmp_path: Path) -> None:
+    """Issue 986: workers replaced under load with no daemon to tell the
+    edge, which goes on sending to the worker that is leaving."""
+
+    first = start_daemon(tmp_path)
+
+    try:
+        assert (
+            first.deploy("shop", SHOP, "--processes", "2", "--max-requests", "300")
+            == "muru: release shop@r1 is ready and serving"
+        )
+        assert "detached" in first.muructl("daemon", "stop").stdout
+        first.process.wait(timeout=30)
+        log = first.base / "logs" / "apps" / "shop" / "r1.log"
+
+        with Load(first.port, path="/info") as load:
+            wait_for(
+                lambda: log.read_text(errors="replace").count("worker.recycled: ") >= 6,
+                timeout=60,
+            )
+            time.sleep(0.3)
+
+        load.check("recycling with the daemon stopped")
+    finally:
+        start_daemon(tmp_path, run_dir=first.run_dir, port=first.port).stop(shutdown=True)
+
+
 def test_events_of_a_recycle_begun_while_the_daemon_is_stopped_are_recorded_with_their_times(
     tmp_path: Path,
 ) -> None:

@@ -129,9 +129,10 @@ stop a second later, so workers are replaced with no daemon as they are
 with one. A worker that crashes meanwhile is started again and reached
 the same way. The daemon that takes the host over asks it for its
 workers' sockets, gives them to the edge, and the host removes the
-second names. One request can be lost in each such replacement: a
-request the edge sends the old worker, over a connection it already had
-to it, at the moment that worker is told to stop is answered 502.
+second names. A request the edge sends the old worker, over a connection
+it already had to it, at the moment that worker is told to stop is not
+started by the worker, which says so, and the edge sends it to the new
+worker.
 
 A worker whose request runs past the [hard timeout](timeouts.md) takes
 the same path, except that it leaves routing before its replacement is
