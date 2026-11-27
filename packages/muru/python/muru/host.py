@@ -2614,11 +2614,18 @@ class Host:
         self.send_imports()
 
         # Section 10.14: a supervisor that connects while every worker is
-        # being restarted is told how far that has got.
+        # being restarted is told how far that has got, and one that
+        # connects while none is under way is told that (issue 983): its
+        # last word from this host may be of a restart that has since
+        # finished, which the connection it had did not live to say.
 
         if self.restart is not None:
             self.restart.told = None
             self.tell_restart()
+        else:
+            self.send_to_supervisor(
+                {"type": "restart", "total": 0, "left": 0, "started_unix_ms": 0, "group": ""}
+            )
 
         if self.loaded is not None:
             self.send_to_supervisor(
@@ -3105,7 +3112,7 @@ class Host:
                 with contextlib.suppress(OSError):
                     os.unlink(alias)
 
-    def alias_routes(self) -> None:
+    def alias_routes(self, unanswered: bool = False) -> None:
         """Make each worker in routing reachable at the path the edge has for it.
 
         Issue 981: with no supervisor connected nobody tells the edge a
@@ -3117,9 +3124,17 @@ class Host:
         finishes what it has. The supervisor that connects next is told
         the sockets' own paths, and the second names go once it has
         acknowledged them.
+
+        `unanswered` says a supervisor is connected and has not
+        acknowledged an announcement in the time it is given (issue 983),
+        which is treated the same: the second name does no harm if the
+        edge was told after all, since the socket keeps its own.
         """
 
-        if self.supervisor is not None or self.tcp_base_port is not None or self.stopping:
+        if self.tcp_base_port is not None or self.stopping:
+            return
+
+        if self.supervisor is not None and not unanswered:
             return
 
         for index, path in self.routed.items():
@@ -3153,10 +3168,14 @@ class Host:
                 continue
 
             if self.aliases.get(index) != (alias, path):
+                why = (
+                    "no supervisor is connected to give it"
+                    if self.supervisor is None
+                    else "the supervisor has not said the edge has"
+                )
                 log(
                     f"worker {self.worker_name(index)} is reached by the edge at "
-                    f"{os.path.basename(alias)}: no supervisor is connected to give it "
-                    f"{os.path.basename(path)}"
+                    f"{os.path.basename(alias)}: {why} {os.path.basename(path)}"
                 )
 
             self.aliases[index] = (alias, path)
@@ -5370,6 +5389,14 @@ class Host:
                 replacement.index
             )
             waited = now >= (replacement.announced_at or now) + ACK_TIMEOUT_SECONDS
+
+            # Issue 983: a supervisor that has not answered in that time
+            # may not have told the edge, which then still has the old
+            # worker's path, so the new worker is made reachable there as
+            # it is with no supervisor connected.
+
+            if waited and not acknowledged:
+                self.alias_routes(unanswered=True)
 
             if acknowledged or waited:
                 replacement.terminate_at = now + ROUTE_SETTLE_SECONDS

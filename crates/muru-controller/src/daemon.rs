@@ -766,6 +766,19 @@ pub enum Command {
         /// The connection, for acknowledgements.
         control: HostControl,
     },
+    /// A host's control connection ended (issue 983). Answered with
+    /// whether the release still runs under that host, in which case
+    /// the connection is made again.
+    HostDetached {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The pid of the host the connection was to.
+        pid: Option<u32>,
+        /// Whether to connect again.
+        again: oneshot::Sender<bool>,
+    },
     /// A host said something over its control connection.
     HostMessage {
         /// The application.
@@ -7221,7 +7234,34 @@ impl Daemon {
             Command::HostAttached { app, id, control } => {
                 if let Some(running) = self.running.get_mut(&(app, id)) {
                     running.control = Some(control);
+
+                    // Issue 983: on a connection made again the host is
+                    // told its allowances again, which it may not have
+                    // heard. It says itself how far a restart has got,
+                    // or that none is under way.
+
+                    running.surge_told = None;
                 }
+            }
+            Command::HostDetached {
+                app,
+                id,
+                pid,
+                again,
+            } => {
+                let same = self.running.get_mut(&(app, id)).is_some_and(|running| {
+                    let same = running
+                        .backend
+                        .host()
+                        .is_some_and(|host| pid.is_some() && host.pid() == pid);
+
+                    if same {
+                        running.control = None;
+                    }
+
+                    same
+                });
+                let _ = again.send(same);
             }
             Command::HostMessage { app, id, message } => {
                 self.host_message(&app, &id, message).await;
@@ -13291,38 +13331,20 @@ impl Daemon {
             return;
         };
 
-        let path = host.control_path();
-        let commands = self.commands.clone();
-        let (app, id) = (app.to_owned(), id.to_owned());
-
-        tokio::spawn(async move {
-            let (control, messages) = match HostControl::connect(&path).await {
-                Ok(connected) => connected,
-                Err(error) => {
-                    tracing::info!(%error, "release {app}@{id}: no host control connection");
-                    return;
-                }
-            };
-
-            if commands
-                .send(Command::HostAttached {
-                    app: app.clone(),
-                    id: id.clone(),
-                    control,
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-
-            forward_host_messages(&commands, &app, &id, Vec::new(), messages).await;
-        });
+        tokio::spawn(keep_control(
+            self.commands.clone(),
+            app.to_owned(),
+            id.to_owned(),
+            host.pid(),
+            host.control_path(),
+            None,
+        ));
     }
 
     /// Feed what a host says on a control connection already made into
     /// the daemon's inbox, `sent` first: what it said before the
-    /// connection was handed over.
+    /// connection was handed over. The connection is made again if it
+    /// ends, as one the daemon made itself is.
     fn forward_control(
         &self,
         app: &str,
@@ -13330,12 +13352,22 @@ impl Daemon {
         sent: Vec<HostMessage>,
         messages: mpsc::Receiver<HostMessage>,
     ) {
-        let commands = self.commands.clone();
-        let (app, id) = (app.to_owned(), id.to_owned());
+        let Some(host) = self
+            .running
+            .get(&(app.to_owned(), id.to_owned()))
+            .and_then(|running| running.backend.host())
+        else {
+            return;
+        };
 
-        tokio::spawn(async move {
-            forward_host_messages(&commands, &app, &id, sent, messages).await;
-        });
+        tokio::spawn(keep_control(
+            self.commands.clone(),
+            app.to_owned(),
+            id.to_owned(),
+            host.pid(),
+            host.control_path(),
+            Some((sent, messages)),
+        ));
     }
 
     /// Act on what a host said: new worker sockets go into the record
@@ -14606,15 +14638,112 @@ fn size_scalers(
     }
 }
 
+/// How long the daemon waits before it tries a host's control socket
+/// again, when the host is still there and a connection could not be made.
+const CONTROL_RETRY: Duration = Duration::from_secs(1);
+
+/// Keep a control connection to a release's host for as long as the
+/// release runs under it (section 5.9, issue 983): connect, hand the
+/// connection to the daemon, feed what the host says into the daemon's
+/// inbox, and when the connection ends ask the daemon whether the host
+/// is still the release's, connecting again if so. A host closes the
+/// connection when a send to its supervisor fails or does not complete,
+/// which a daemon that was stalled causes; the host sends its state and
+/// the events it held to whoever connects next. `made` is a connection
+/// already up, with what the host has said on it so far.
+async fn keep_control(
+    commands: mpsc::Sender<Command>,
+    app: String,
+    id: String,
+    pid: Option<u32>,
+    path: PathBuf,
+    made: Option<(Vec<HostMessage>, mpsc::Receiver<HostMessage>)>,
+) {
+    let mut made = made;
+    let mut again = false;
+
+    loop {
+        let connected = match made.take() {
+            Some(made) => Some(made),
+            None => match HostControl::connect(&path).await {
+                Ok((control, messages)) => {
+                    let attached = commands
+                        .send(Command::HostAttached {
+                            app: app.clone(),
+                            id: id.clone(),
+                            control,
+                        })
+                        .await;
+
+                    if attached.is_err() {
+                        return;
+                    }
+
+                    if again {
+                        tracing::info!(
+                            "release {app}@{id}: the host control connection ended and was made again"
+                        );
+                    }
+
+                    Some((Vec::new(), messages))
+                }
+                // A host that has just exited closes its connection a
+                // moment before the daemon knows it has gone, so only a
+                // first connection that fails is worth a line.
+                Err(error) if again => {
+                    tracing::debug!(%error, "release {app}@{id}: no host control connection");
+                    None
+                }
+                Err(error) => {
+                    tracing::info!(%error, "release {app}@{id}: no host control connection");
+                    None
+                }
+            },
+        };
+
+        let failed = connected.is_none();
+
+        if let Some((sent, messages)) = connected
+            && !forward_host_messages(&commands, &app, &id, sent, messages).await
+        {
+            return;
+        }
+
+        // The connection ended, or none could be made. The daemon says
+        // whether the release still runs under this host.
+
+        let (answer, answered) = oneshot::channel();
+        let asked = commands
+            .send(Command::HostDetached {
+                app: app.clone(),
+                id: id.clone(),
+                pid,
+                again: answer,
+            })
+            .await;
+
+        if asked.is_err() || !answered.await.unwrap_or(false) {
+            return;
+        }
+
+        again = true;
+
+        if failed {
+            tokio::time::sleep(CONTROL_RETRY).await;
+        }
+    }
+}
+
 /// Pass a host's messages to the daemon's inbox, those already taken
-/// from the connection first, until the connection or the daemon ends.
+/// from the connection first, until the connection ends. Returns whether
+/// the daemon is still there to take them.
 async fn forward_host_messages(
     commands: &mpsc::Sender<Command>,
     app: &str,
     id: &str,
     sent: Vec<HostMessage>,
     mut messages: mpsc::Receiver<HostMessage>,
-) {
+) -> bool {
     for message in sent {
         let forwarded = commands
             .send(Command::HostMessage {
@@ -14625,7 +14754,7 @@ async fn forward_host_messages(
             .await;
 
         if forwarded.is_err() {
-            return;
+            return false;
         }
     }
 
@@ -14639,9 +14768,11 @@ async fn forward_host_messages(
             .await;
 
         if forwarded.is_err() {
-            break;
+            return false;
         }
     }
+
+    true
 }
 
 /// Section 7.4: the scaling state of each group of a release that is
@@ -15163,5 +15294,71 @@ mod tests {
             crate::scaling::worker_size(Interface::Grpc, 4, 8, 1000),
             (1000.0, 9)
         );
+    }
+
+    // Issue 983: a control connection that ends is made again for as
+    // long as the daemon says the release runs under the host.
+
+    #[tokio::test]
+    async fn a_control_connection_that_ends_is_made_again_while_the_host_is_the_releases() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (commands, mut inbox) = mpsc::channel(8);
+        let kept = tokio::spawn(keep_control(
+            commands,
+            "shop".to_owned(),
+            "r1".to_owned(),
+            Some(7),
+            path.clone(),
+            None,
+        ));
+
+        // The host says one thing and closes, as it does when a send to
+        // its supervisor fails.
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream
+            .write_all(b"{\"type\":\"restart\",\"total\":0,\"left\":0}\n")
+            .await
+            .unwrap();
+        drop(stream);
+        assert!(matches!(
+            inbox.recv().await,
+            Some(Command::HostAttached { .. })
+        ));
+        assert!(matches!(
+            inbox.recv().await,
+            Some(Command::HostMessage {
+                message: HostMessage::Restart { left: 0, .. },
+                ..
+            })
+        ));
+
+        let Some(Command::HostDetached { pid, again, .. }) = inbox.recv().await else {
+            panic!("the end of the connection was not reported");
+        };
+
+        assert_eq!(pid, Some(7));
+        again.send(true).unwrap();
+
+        // It connects again, and stops once the release is no longer
+        // the host's.
+
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(matches!(
+            inbox.recv().await,
+            Some(Command::HostAttached { .. })
+        ));
+        drop(stream);
+
+        let Some(Command::HostDetached { again, .. }) = inbox.recv().await else {
+            panic!("the end of the second connection was not reported");
+        };
+
+        again.send(false).unwrap();
+        kept.await.unwrap();
     }
 }

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import time
 from collections.abc import Callable
 
@@ -161,3 +162,34 @@ def test_all_restarts_every_worker_in_turn_by_one_call(daemon: Daemon) -> None:
     ]:
         refused = daemon.muructl(*arguments, check=False)
         assert refused.returncode != 0 and expected in refused.stderr, refused.stderr
+
+
+def test_a_control_connection_that_ends_is_made_again(daemon: Daemon) -> None:
+    """Issue 983: the daemon connects again to a host that closed its
+    control connection, and is the host's supervisor as before."""
+
+    before = deploy_shop(daemon)
+
+    # A host has one supervisor, so another connection to its control
+    # socket has it close the daemon's, as it does when a send to a
+    # daemon that has stalled does not complete.
+
+    other = socket.socket(socket.AF_UNIX)
+    other.connect(str(daemon.host_sockets("shop@r1") / "control.sock"))
+    daemon.wait_for_log("release shop@r1: the host control connection ended and was made again")
+    other.close()
+
+    # The daemon hears the host again: a restart of every worker is
+    # carried out and waited for, its events arrive, and the edge is
+    # given the new workers' sockets.
+
+    output = daemon.muructl("restart", "shop", "--all").stdout
+    assert output.splitlines()[-1] == "muru: the restart of shop@r1 has finished", output
+    after = workers(daemon)
+    assert after[0] != before[0] and after[1] != before[1], (before, after)
+    events = daemon.muructl("events").stdout
+    assert events.count("worker.restarted") == 2, events
+    assert "restart  " not in daemon.muructl("release", "show", "shop@r1").stdout
+
+    for _ in range(8):
+        assert daemon.get("/").status == 200

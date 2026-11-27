@@ -118,7 +118,8 @@ host sends the old worker SIGTERM. The old worker stops accepting,
 finishes the requests it holds and exits; requests still being dispatched
 to it over the edge's existing connections complete normally. If the
 supervisor does not answer within five seconds, the old worker is told to
-stop regardless.
+stop regardless, and the new worker is first made reachable at the path
+the edge has, as it is with no daemon (below).
 
 While the daemon is stopped, restarting or being upgraded, nobody can
 give the edge a new socket, and it goes on connecting to the paths it

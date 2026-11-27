@@ -1677,3 +1677,80 @@ def test_a_replaced_workers_socket_file_is_removed_once_it_has_exited(
     exits(monkeypatch, (states[1].pid, 0))
     instance.reap()
     assert sorted(os.listdir()) == ["w0-g1.sock", "w1.sock"]
+
+
+# Issue 983: a supervisor that connects is told where a restart stands,
+# and one that does not answer is treated as one that is not there.
+
+
+def test_a_supervisor_that_connects_is_told_no_restart_is_under_way() -> None:
+    with tempfile.TemporaryDirectory(prefix="muru-", dir="/tmp") as directory:
+        instance = unsupervised_host(Path(directory))
+        instance.control_listener = listener(os.path.join(directory, "control.sock"))
+        supervisor = socket.socket(socket.AF_UNIX)
+        supervisor.connect(os.path.join(directory, "control.sock"))
+        instance.accept_supervisor()
+        assert [message["type"] for message in received(supervisor)] == ["workers", "restart"]
+
+        # A second connection takes the first one's place, and is told
+        # the same: the first may have been left believing in a restart
+        # that has finished since.
+
+        again = socket.socket(socket.AF_UNIX)
+        again.connect(os.path.join(directory, "control.sock"))
+        instance.accept_supervisor()
+        assert received(again)[1] == {
+            "type": "restart",
+            "total": 0,
+            "left": 0,
+            "started_unix_ms": 0,
+            "group": "",
+        }
+        assert supervisor.recv(1) == b""
+
+        for held in (supervisor, again, instance.control_listener):
+            held.close()
+
+        instance.drop_supervisor()
+
+
+def test_a_replacement_nobody_acknowledges_takes_the_path_the_edge_has(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="muru-", dir="/tmp") as directory:
+        instance = unsupervised_host(Path(directory))
+        first = os.path.join(directory, "worker-0.sock")
+        second = os.path.join(directory, "worker-0-g1.sock")
+        old = listener(first)
+        instance.routed[0] = first
+        supervisor = connect(instance)
+        instance.send_workers()
+        acknowledge(instance, supervisor)
+
+        # The supervisor stays connected and says nothing of the next
+        # announcement: when its time is up the old worker is told to
+        # stop, and the edge's path reaches the new one first.
+
+        monkeypatch.setattr(os, "kill", lambda _pid, _signal: None)
+        new = listener(second)
+        instance.routed[0] = second
+        replacement = host.Replacement(0, 4000, "served 10 requests", "worker.recycled")
+        replacement.announced = instance.announce()
+        replacement.announced_at = time.monotonic()
+        instance.advance(replacement, time.monotonic())
+        assert replacement.terminate_at is None and not reached(first, new)
+
+        instance.advance(replacement, time.monotonic() + host.ACK_TIMEOUT_SECONDS)
+        assert replacement.terminate_at is not None
+        assert reached(first, new) and reached(second, new)
+
+        # An acknowledgement that comes after all takes the second name
+        # away: the edge has the socket's own.
+
+        acknowledge(instance, supervisor)
+        assert os.listdir(directory) == ["worker-0-g1.sock"]
+
+        for held in (old, new, supervisor):
+            held.close()
+
+        instance.drop_supervisor()
