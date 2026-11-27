@@ -145,6 +145,23 @@ def test_tools_run_the_commands_they_name(daemon: Daemon) -> None:
         assert any(row["pid"] == daemon.process.pid for row in listed["instances"]), listed
         assert "orphans" in listed
 
+        # Issue 950: doctor checks the daemon the server reaches, found
+        # from its socket's directory, and a failed check is an answer.
+
+        assert tools["doctor"]["annotations"]["readOnlyHint"] is True
+        failed, text = client.call("doctor")
+        assert not failed, text
+        found = json.loads(text)
+        admin = str(daemon.run_dir / "admin.sock")
+        assert any(socket["path"] == admin for socket in found["sockets"]), found
+        assert {"registry", "edge", "versions"} <= {check["check"] for check in found["checks"]}
+
+        failed, text = client.call("doctor", part="store")
+        assert not failed and json.loads(text)["tables"]["releases"] == 1, text
+
+        failed, text = client.call("doctor", part="timeline", limit=5)
+        assert not failed and len(json.loads(text)["timeline"]) == 5, text
+
 
 def test_a_failing_command_is_a_tool_error_with_its_sentence(daemon: Daemon) -> None:
     with session(daemon) as (client, _):

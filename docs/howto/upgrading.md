@@ -66,6 +66,22 @@ The daemon checks that the installed binary runs before it commits, and
 the `daemon.upgraded` and `edge.replaced` events record what happened.
 `muructl status` shows the daemon's version afterwards.
 
+A daemon of a version before 0.1.0a37 is not upgraded in place. Those
+versions kept the daemon's lock and its records of the edge and the
+releases in the run directory, and later ones keep them in the state
+directory, so the new version could not take the edge and the releases
+over. The command refuses and changes nothing:
+
+```console
+$ muructl daemon upgrade
+muru: error: the daemon (pid 4120, version 0.1.0-alpha.36) keeps its runtime files in its run directory /run/muru, and this version of Muru keeps them in the state directory, so it cannot take over that daemon's edge and releases and does not upgrade it in place; stop it and its releases with muructl daemon stop --shutdown, then start it again with muructl daemon start
+```
+
+Stopping with `--shutdown` drains and stops every release, so requests
+are refused until the new daemon has started them again. A daemon
+started in a run directory where such a version left an edge or releases
+running refuses to start and says the same.
+
 A system daemon is upgraded the same way:
 
 ```

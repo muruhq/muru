@@ -797,6 +797,7 @@ Everything is under one directory named as the file is.
 | `host/APP@RELEASE/packages.txt` | The distributions installed in the release's environment, each with its version |
 | `host/APP@RELEASE/uv.lock` and the like | The lock files of the release's source that are there: `uv.lock`, `pylock.toml`, `requirements.txt`, `poetry.lock`, `pdm.lock` and `Pipfile.lock` |
 | `host/APP@RELEASE/inspect.json` | What the release's workers have loaded: the interpreter and its build, `sys.path`, the modules with their versions, the threads and descriptors, and the environment as [`muructl debug inspect --json`](#inspect) gives it |
+| `doctor/report.json`, `doctor/store.json` | What [`muructl doctor`](doctor.md) finds of the daemon's installation as the bundle is made: every socket and file with its owner and condition and the checks of one part against another, and the checks of the state store. `muructl doctor --bundle FILE` prints them |
 | `failures/events.jsonl` | Every event Muru still keeps that records something going wrong, from before the window too: a request past its soft timeout or its deadline, a worker killed for a timeout or for memory, recycled, stalled or gone, a release that failed |
 
 With a target, the releases, events and output of other applications

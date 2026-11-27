@@ -126,11 +126,24 @@ fn plan(locations: &Locations, data: bool, logs: bool) -> (Vec<Item>, Vec<Item>)
     }
 
     // Nothing runs, so what the run directory holds is left over: the
-    // records and sockets of an edge and hosts that are gone.
+    // sockets of an edge and hosts that are gone.
 
     if let Ok(entries) = std::fs::read_dir(&locations.run.path) {
         for entry in entries.flatten() {
             remove.push(item(entry.path(), "left in the run directory"));
+        }
+    }
+
+    // Their records are among the runtime files, in the state directory.
+    // The default daemon's are beside the files of the user's
+    // development runs, each in a directory named `run-` and its ID,
+    // which are those runs' and stay.
+
+    if let Ok(entries) = std::fs::read_dir(locations.files()) {
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("run-") {
+                remove.push(item(entry.path(), "left among the runtime files"));
+            }
         }
     }
 

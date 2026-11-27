@@ -494,6 +494,122 @@ pub fn left_naming_removed(store: &Store, declared: &Declared, plan: &Plan) -> V
     reasons
 }
 
+/// What the objects a store holds name that the store does not hold:
+/// one line for each, such as a route whose application was removed. A
+/// store that an apply or a command left whole has none, so each is a
+/// fault of Muru's own, which `muructl doctor store` reports.
+pub fn dangling(store: &Store) -> Result<Vec<String>, crate::store::StoreError> {
+    let mut held: BTreeSet<Target> = BTreeSet::new();
+    let apps = store.apps()?;
+    let releases = store.releases(None)?;
+    let routes = store.routes()?;
+
+    held.extend(apps.iter().map(|app| object(Kind::App, &app.name)));
+    held.extend(
+        releases
+            .iter()
+            .map(|release| Target::Release(release.app.clone(), release.id.clone())),
+    );
+    held.extend(
+        routes
+            .iter()
+            .filter_map(|route| route.name.clone())
+            .map(Target::NamedRoute),
+    );
+
+    for (name, _) in store.hosts()? {
+        held.insert(object(Kind::Host, &name));
+    }
+
+    for (name, _) in store.upstreams()? {
+        held.insert(object(Kind::Upstream, &name));
+    }
+
+    for (_, class) in store.client_classes()? {
+        held.insert(object(Kind::ClientClass, &class.name));
+    }
+
+    for (name, _) in store.rate_limits()? {
+        held.insert(object(Kind::RateLimit, &name));
+    }
+
+    for (name, _) in store.conditions()? {
+        held.insert(object(Kind::Condition, &name));
+    }
+
+    // What each object names, by how a message says the object.
+
+    let mut naming: Vec<(String, Vec<Target>)> = Vec::new();
+    let route_apps: BTreeMap<String, String> = routes
+        .iter()
+        .filter_map(|route| route.name.clone().map(|name| (name, route.app.clone())))
+        .collect();
+
+    for route in &routes {
+        naming.push((
+            format!("route {} {}", route.host, route.key()),
+            self::route(route),
+        ));
+    }
+
+    for (name, table) in store.hosts()? {
+        naming.push((format!("host {name}"), host(&table)));
+    }
+
+    for (name, table) in store.rate_limits()? {
+        naming.push((format!("rate_limit {name}"), rate_limit(&table)));
+    }
+
+    for (name, table) in store.overlays()? {
+        naming.push((format!("overlay {name}"), overlay(&table, &route_apps)));
+    }
+
+    for release in &releases {
+        for group in &release.spec.groups {
+            naming.push((
+                format!(
+                    "{}@{}: worker group {}",
+                    release.app, release.id, group.name
+                ),
+                self::group(&group.client_class, &group.host),
+            ));
+        }
+    }
+
+    // A rollout under way names its two releases; one that has ended is
+    // history, and its releases may since have been removed.
+
+    for app in &apps {
+        if let Some(rollout) = store.active_rollout(&app.name)? {
+            naming.push((
+                format!("rollout {} of {}", rollout.id, rollout.app),
+                vec![
+                    Target::Release(rollout.app.clone(), rollout.candidate.clone()),
+                    Target::Release(rollout.app.clone(), rollout.baseline.clone()),
+                ],
+            ));
+        }
+    }
+
+    let mut found = Vec::new();
+
+    for (what, names) in naming {
+        let missing: BTreeSet<&Target> = names
+            .iter()
+            .filter(|target| !held.contains(target))
+            .collect();
+
+        for target in missing {
+            found.push(format!(
+                "{what} names {}, which the store does not hold",
+                target.describe()
+            ));
+        }
+    }
+
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

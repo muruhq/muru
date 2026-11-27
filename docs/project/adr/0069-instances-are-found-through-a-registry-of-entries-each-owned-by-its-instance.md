@@ -93,3 +93,7 @@ never takes a half-made entry for a stale one.
 Section 13.8 of the specification ("The instance registry", "Finding a
 running instance"), issue 805, and the tracking issue 813. Issue 814
 describes the remote instances this structure leaves room for.
+
+[ADR 0083](0083-the-runtime-location-holds-sockets-and-nothing-else.md)
+supersedes where the registry is: it moved from the user's runtime
+location to the account's state location. The rest of this record stands.

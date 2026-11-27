@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS releases (
     resource_version INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (app, id)
 );
+CREATE TABLE IF NOT EXISTS release_numbers (last INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS hosts (
     name TEXT PRIMARY KEY,
     spec TEXT NOT NULL,
@@ -196,7 +197,7 @@ CREATE TABLE IF NOT EXISTS log_files_seen (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// The store.
 pub struct Store {
@@ -212,6 +213,7 @@ impl Store {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.execute_batch(SCHEMA)?;
         add_identity_columns(&connection)?;
+        number_releases(&connection)?;
 
         // Version 1 had applications, releases and events; version 2
         // added hosts and routes and version 3 the event sink cursors,
@@ -237,7 +239,9 @@ impl Store {
         // overlays by their conditions (issue 689), version 20 the import
         // report of each release's load (issue 741), and version 21 where
         // the application's data directory and its parts are (issue 849),
-        // added to an older table here.
+        // added to an older table here, and version 22 the number of each
+        // release (issue 948), given here to the releases of an older
+        // store.
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -291,11 +295,189 @@ impl Store {
         })
     }
 
+    /// What SQLite's own check of the database finds (issue 950): no
+    /// lines for a sound one, else what it says is wrong.
+    pub fn integrity(&self) -> Result<Vec<String>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare("PRAGMA integrity_check")?;
+            let lines = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(lines.into_iter().filter(|line| line != "ok").collect())
+        })
+    }
+
+    /// The rows that name a row their foreign key does not find, each as
+    /// its table and row id.
+    pub fn foreign_key_faults(&self) -> Result<Vec<String>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+            let rows = statement.query_map([], |row| {
+                let table: String = row.get(0)?;
+                let rowid: Option<i64> = row.get(1)?;
+                let parent: String = row.get(2)?;
+                Ok(match rowid {
+                    Some(rowid) => format!("{table} row {rowid} names no row of {parent}"),
+                    None => format!("a row of {table} names no row of {parent}"),
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// The schema version the store records, or none when it records
+    /// none, as a file that is not a store does not.
+    pub fn schema_version(&self) -> Result<Option<i64>, StoreError> {
+        self.with(|connection| {
+            connection
+                .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
+                .optional()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Each table with how many rows it holds, by name.
+    pub fn table_counts(&self) -> Result<Vec<(String, u64)>, StoreError> {
+        self.with(|connection| {
+            let names: Vec<String> = {
+                let mut statement = connection.prepare(
+                    "SELECT name FROM sqlite_schema WHERE type = 'table' \
+                     AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                )?;
+                let rows = statement.query_map([], |row| row.get(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            let mut counts = Vec::new();
+
+            for name in names {
+                let quoted = name.replace('"', "\"\"");
+                let count: i64 = connection.query_row(
+                    &format!("SELECT COUNT(*) FROM \"{quoted}\""),
+                    [],
+                    |row| row.get(0),
+                )?;
+                counts.push((name, count as u64));
+            }
+
+            Ok(counts)
+        })
+    }
+
+    /// The schema as the SQL that would make it, one statement to a
+    /// paragraph, tables before indexes.
+    pub fn schema_sql(&self) -> Result<String, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
+                 ORDER BY type = 'table' DESC, name",
+            )?;
+            let statements = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(statements
+                .iter()
+                .map(|sql| format!("{sql};\n"))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        })
+    }
+
+    /// Write a copy of the store to `path`, which must not exist: one
+    /// consistent database with no log beside it, taken in one read
+    /// while a daemon goes on using the store.
+    pub fn copy_to(&self, path: &Path) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
+            Ok(())
+        })
+    }
+
+    /// What the store holds that breaks a rule of Muru's own, each rule
+    /// by its name with the rows that break it; a rule nothing breaks
+    /// has none. The rules are those the daemon keeps whenever it
+    /// writes, so a break is a fault and never a state a command left.
+    pub fn rule_breaks(&self) -> Result<Vec<(&'static str, Vec<String>)>, StoreError> {
+        const RULES: [(&str, &str); 6] = [
+            (
+                "each release belongs to an application",
+                "SELECT 'release ' || app || '@' || id || ' has no application' FROM releases \
+                 WHERE app NOT IN (SELECT name FROM apps)",
+            ),
+            (
+                "each application's serving and previous release exist",
+                "SELECT 'application ' || name || ' serves ' || current_release || \
+                 ', which is no release' FROM apps WHERE current_release IS NOT NULL \
+                 AND NOT EXISTS (SELECT 1 FROM releases WHERE app = name AND id = current_release) \
+                 UNION ALL \
+                 SELECT 'application ' || name || ' would roll back to ' || previous_release || \
+                 ', which is no release' FROM apps WHERE previous_release IS NOT NULL \
+                 AND NOT EXISTS (SELECT 1 FROM releases WHERE app = name AND id = previous_release)",
+            ),
+            (
+                "scale pins, gates and import reports belong to a release",
+                "SELECT 'a scale pin names ' || app || '@' || release FROM scale_pins s \
+                 WHERE NOT EXISTS (SELECT 1 FROM releases r WHERE r.app = s.app AND r.id = s.release) \
+                 UNION ALL \
+                 SELECT 'a passed gate names ' || app || '@' || release FROM gates g \
+                 WHERE NOT EXISTS (SELECT 1 FROM releases r WHERE r.app = g.app AND r.id = g.release) \
+                 UNION ALL \
+                 SELECT 'an import report names ' || app || '@' || release FROM import_reports i \
+                 WHERE NOT EXISTS (SELECT 1 FROM releases r WHERE r.app = i.app AND r.id = i.release)",
+            ),
+            (
+                "rollouts, runs and maintenance belong to an application",
+                "SELECT 'rollout ' || id || ' names application ' || app FROM rollouts \
+                 WHERE app NOT IN (SELECT name FROM apps) \
+                 UNION ALL \
+                 SELECT 'run ' || id || ' names application ' || app FROM runs \
+                 WHERE app NOT IN (SELECT name FROM apps) \
+                 UNION ALL \
+                 SELECT 'maintenance names application ' || app FROM maintenance \
+                 WHERE app NOT IN (SELECT name FROM apps)",
+            ),
+            (
+                "each release has a number of its own, none past the count",
+                "SELECT 'release ' || app || '@' || id || ' has no number' FROM releases \
+                 WHERE number IS NULL \
+                 UNION ALL \
+                 SELECT 'the number ' || number || ' names ' || COUNT(*) || ' releases' \
+                 FROM releases WHERE number IS NOT NULL GROUP BY number HAVING COUNT(*) > 1 \
+                 UNION ALL \
+                 SELECT 'release ' || app || '@' || id || ' has the number ' || number || \
+                 ', past the count ' || (SELECT COALESCE(MAX(last), 0) FROM release_numbers) \
+                 FROM releases \
+                 WHERE number > (SELECT COALESCE(MAX(last), 0) FROM release_numbers)",
+            ),
+            (
+                "event sequence numbers have no gaps",
+                "SELECT 'the events run from ' || MIN(sequence) || ' to ' || MAX(sequence) || \
+                 ' and there are ' || COUNT(*) FROM events \
+                 HAVING COUNT(*) > 0 AND MAX(sequence) - MIN(sequence) + 1 <> COUNT(*)",
+            ),
+        ];
+
+        self.with(|connection| {
+            let mut found = Vec::new();
+
+            for (rule, query) in RULES {
+                let mut statement = connection.prepare(query)?;
+                let breaks = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                found.push((rule, breaks));
+            }
+
+            Ok(found)
+        })
+    }
+
     /// An in-memory store, for tests and for development runs.
     pub fn in_memory() -> Result<Self, StoreError> {
         let connection = Connection::open_in_memory()?;
         connection.execute_batch(SCHEMA)?;
         add_identity_columns(&connection)?;
+        number_releases(&connection)?;
         connection.execute("INSERT INTO schema (version) VALUES (?1)", [SCHEMA_VERSION])?;
 
         Ok(Self {
@@ -536,7 +718,7 @@ impl Store {
     pub fn releases(&self, app: Option<&str>) -> Result<Vec<Release>, StoreError> {
         self.with(|connection| {
             let mut statement = connection.prepare(
-                "SELECT app, id, spec, state, message, created_unix_ms, resource_version \
+                "SELECT app, id, spec, state, message, created_unix_ms, resource_version, number \
                  FROM releases WHERE (?1 IS NULL OR app = ?1) ORDER BY created_unix_ms DESC, id DESC",
             )?;
             let rows = statement.query_map([app], release_from_row)?;
@@ -549,7 +731,7 @@ impl Store {
         self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT app, id, spec, state, message, created_unix_ms, resource_version \
+                    "SELECT app, id, spec, state, message, created_unix_ms, resource_version, number \
                      FROM releases WHERE app = ?1 AND id = ?2",
                     [app, id],
                     release_from_row,
@@ -569,9 +751,21 @@ impl Store {
         let encoded =
             toml::to_string(spec).map_err(|error| StoreError::Decode(error.to_string()))?;
         self.with(|connection| {
+            // The release's number (section 13.8, issue 948): the next of
+            // a count that only goes up, so a number never names two
+            // releases of a store, whatever was removed in between.
+
+            connection.execute("UPDATE release_numbers SET last = last + 1", [])?;
             connection.execute(
-                "INSERT INTO releases (app, id, spec, state, created_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![app, id, encoded, ReleaseState::Pending.as_str(), now_unix_ms() as i64],
+                "INSERT INTO releases (app, id, spec, state, created_unix_ms, number) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, (SELECT last FROM release_numbers))",
+                params![
+                    app,
+                    id,
+                    encoded,
+                    ReleaseState::Pending.as_str(),
+                    now_unix_ms() as i64
+                ],
             )?;
             Ok(())
         })?;
@@ -1744,8 +1938,46 @@ fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
     add_columns(
         connection,
         "releases",
-        &[("declared", "INTEGER NOT NULL DEFAULT 0")],
+        &[
+            ("declared", "INTEGER NOT NULL DEFAULT 0"),
+            ("number", "INTEGER"),
+        ],
     )
+}
+
+/// Give every release a number (version 22, issue 948): the count the
+/// numbers come from is started where the highest number is, and the
+/// releases of an older store, which have none, are numbered oldest
+/// first. A number names the release's host directory (section 13.8),
+/// which is why it is short and never an application's name or an ID.
+fn number_releases(connection: &Connection) -> Result<(), StoreError> {
+    let counted: i64 =
+        connection.query_row("SELECT COUNT(*) FROM release_numbers", [], |row| row.get(0))?;
+
+    if counted == 0 {
+        connection.execute(
+            "INSERT INTO release_numbers (last) SELECT COALESCE(MAX(number), 0) FROM releases",
+            [],
+        )?;
+    }
+
+    let unnumbered: Vec<i64> = {
+        let mut statement = connection.prepare(
+            "SELECT rowid FROM releases WHERE number IS NULL ORDER BY created_unix_ms, rowid",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+
+    for row in unnumbered {
+        connection.execute("UPDATE release_numbers SET last = last + 1", [])?;
+        connection.execute(
+            "UPDATE releases SET number = (SELECT last FROM release_numbers) WHERE rowid = ?1",
+            [row],
+        )?;
+    }
+
+    Ok(())
 }
 
 /// The columns a run is read from, in `run_from_row`'s order.
@@ -2111,6 +2343,7 @@ fn release_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Release> {
         message: row.get(4)?,
         created_unix_ms: row.get::<_, i64>(5)? as u64,
         resource_version: row.get::<_, i64>(6)? as u64,
+        number: row.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
     })
 }
 
@@ -2192,6 +2425,166 @@ pub(crate) mod tests {
         );
         assert_eq!(store.app("shop").unwrap().current.as_deref(), Some("r1"));
         assert!(store.release("shop", "r9").is_err());
+    }
+
+    #[test]
+    fn a_sound_store_breaks_no_rule_and_a_broken_one_says_which() {
+        let store = Store::in_memory().unwrap();
+        store.ensure_app("shop").unwrap();
+        store.create_release("shop", "r1", &spec()).unwrap();
+        store.set_app_releases("shop", Some("r1"), None).unwrap();
+        store
+            .append_event("release.ready", "shop@r1", "info", "ready")
+            .unwrap();
+        store
+            .append_event("release.ready", "shop@r1", "info", "again")
+            .unwrap();
+
+        assert!(store.integrity().unwrap().is_empty());
+        assert!(store.foreign_key_faults().unwrap().is_empty());
+        assert_eq!(store.schema_version().unwrap(), Some(SCHEMA_VERSION));
+        assert!(
+            store
+                .rule_breaks()
+                .unwrap()
+                .iter()
+                .all(|(_, breaks)| breaks.is_empty())
+        );
+
+        let counts = store.table_counts().unwrap();
+        assert!(counts.contains(&("releases".to_owned(), 1)), "{counts:?}");
+        assert!(counts.contains(&("events".to_owned(), 2)), "{counts:?}");
+        assert!(
+            store
+                .schema_sql()
+                .unwrap()
+                .contains("CREATE TABLE releases (")
+        );
+
+        // A serving release that is gone, a release with no application
+        // and a gap in the events are each a break of their own rule.
+
+        store
+            .with(|connection| {
+                connection.pragma_update(None, "foreign_keys", "OFF")?;
+                connection.execute("UPDATE apps SET current_release = 'r9'", [])?;
+                connection.execute(
+                    "INSERT INTO releases (app, id, spec, state, created_unix_ms, number) \
+                     VALUES ('gone', 'r1', '', 'stopped', 1, 1)",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO events (sequence, time_unix_ms, type, subject, level, message) \
+                     VALUES (9, 1, 'a', 'b', 'info', 'c')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let breaks: Vec<String> = store
+            .rule_breaks()
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, breaks)| breaks)
+            .collect();
+        assert_eq!(
+            breaks,
+            [
+                "release gone@r1 has no application",
+                "application shop serves r9, which is no release",
+                "the number 1 names 2 releases",
+                "the events run from 1 to 9 and there are 3",
+            ]
+        );
+        assert_eq!(
+            store.foreign_key_faults().unwrap(),
+            ["releases row 2 names no row of apps"]
+        );
+    }
+
+    #[test]
+    fn a_copy_of_a_store_is_a_whole_store_and_the_original_is_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("muru.sqlite");
+
+        {
+            let store = Store::open(&path).unwrap();
+            store.ensure_app("shop").unwrap();
+            store.create_release("shop", "r1", &spec()).unwrap();
+        }
+
+        let before = std::fs::read(&path).unwrap();
+        let copy = directory.path().join("copy.sqlite");
+        Store::open_read_only(&path)
+            .unwrap()
+            .copy_to(&copy)
+            .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let copied = Store::open_read_only(&copy).unwrap();
+        assert_eq!(copied.release("shop", "r1").unwrap().number, 1);
+        assert!(copied.integrity().unwrap().is_empty());
+
+        // A copy never replaces a file that is there.
+
+        assert!(
+            Store::open_read_only(&path)
+                .unwrap()
+                .copy_to(&copy)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_release_has_a_number_that_is_never_given_twice() {
+        let store = Store::in_memory().unwrap();
+        store.ensure_app("shop").unwrap();
+        store.ensure_app("blog").unwrap();
+
+        let first = store.create_release("shop", "r1", &spec()).unwrap();
+        let second = store.create_release("blog", "r1", &spec()).unwrap();
+        assert_eq!((first.number, second.number), (1, 2));
+
+        // The highest number is not given again once its release is gone.
+
+        store.delete_release("blog", "r1").unwrap();
+        let third = store.create_release("blog", "r2", &spec()).unwrap();
+        assert_eq!(third.number, 3);
+        assert_eq!(store.releases(None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_releases_of_an_older_store_are_numbered_oldest_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("muru.sqlite");
+
+        {
+            let store = Store::open(&path).unwrap();
+            store.ensure_app("shop").unwrap();
+            store.create_release("shop", "r1", &spec()).unwrap();
+            store.create_release("shop", "r2", &spec()).unwrap();
+
+            store
+                .with(|connection| {
+                    connection.execute("UPDATE releases SET number = NULL", [])?;
+                    connection.execute("DELETE FROM release_numbers", [])?;
+                    connection.execute(
+                        "UPDATE releases SET created_unix_ms = 5 WHERE id = 'r2'",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.release("shop", "r2").unwrap().number, 1);
+        assert_eq!(store.release("shop", "r1").unwrap().number, 2);
+        assert_eq!(
+            store.create_release("shop", "r3", &spec()).unwrap().number,
+            3
+        );
     }
 
     #[test]

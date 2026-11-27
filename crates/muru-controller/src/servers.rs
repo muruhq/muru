@@ -16,6 +16,7 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::Instant;
 
 use crate::host::Identity;
+use crate::locations::HostDirs;
 use crate::model::HttpServerSpec;
 use crate::supervisor::{self, EventNames, InstanceSpec, Report, RestartPolicy, Supervisor};
 
@@ -180,7 +181,7 @@ pub struct Servers {
     readiness_timeout: Duration,
     /// Each instance's starting mark, in the supervisor's order.
     starting: Vec<Starting>,
-    run_dir: PathBuf,
+    dirs: HostDirs,
     /// Each instance's address, in the supervisor's order.
     binds: Vec<Bind>,
     supervisor: Supervisor,
@@ -191,8 +192,8 @@ pub struct Servers {
 }
 
 impl Servers {
-    /// Start every instance under the run directory, each with its own
-    /// address, running `spec.command` in `cwd` with `env`, as
+    /// Start every instance in `dirs`, its sockets in one directory and
+    /// its files in the other (section 13.8), each with its own address, running `spec.command` in `cwd` with `env`, as
     /// `identity` when one is set, its output going to `log` through a
     /// relay of its own with `relays`, or appended by the instance itself
     /// without. When an instance cannot be started, those started before
@@ -200,7 +201,7 @@ impl Servers {
     #[allow(clippy::too_many_arguments)]
     pub async fn start(
         spec: &HttpServerSpec,
-        run_dir: &Path,
+        dirs: &HostDirs,
         cwd: &Path,
         env: Vec<(String, String)>,
         identity: Option<Identity>,
@@ -208,16 +209,21 @@ impl Servers {
         relays: Option<Relays>,
         grace: Duration,
     ) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(run_dir)
-            .with_context(|| format!("creating {}", run_dir.display()))?;
-        let binds = allocate(spec.bind, run_dir, spec.instances.max(1))?;
+        dirs.create().with_context(|| {
+            format!(
+                "creating {} and {}",
+                dirs.sockets.display(),
+                dirs.files.display()
+            )
+        })?;
+        let binds = allocate(spec.bind, &dirs.sockets, spec.instances.max(1))?;
         let instances = (0..)
             .zip(&binds)
             .map(|(index, bind)| instance_spec(spec, index, bind))
             .collect();
         let dropped = Arc::new(AtomicU64::new(0));
         let started = Supervisor::start(
-            process_spec(spec, cwd, env, identity, log, run_dir, relays, &dropped),
+            process_spec(spec, cwd, env, identity, log, dirs, relays, &dropped),
             RestartPolicy::default(),
             instances,
             grace,
@@ -227,7 +233,7 @@ impl Servers {
         let supervisor = match started {
             Ok(supervisor) => supervisor,
             Err(error) => {
-                let _ = std::fs::remove_dir_all(run_dir);
+                dirs.remove();
                 return Err(error);
             }
         };
@@ -236,7 +242,7 @@ impl Servers {
             readiness_path: spec.readiness_path.clone(),
             readiness_timeout: readiness_timeout(spec),
             starting: binds.iter().map(|_| Starting::default()).collect(),
-            run_dir: run_dir.to_path_buf(),
+            dirs: dirs.clone(),
             binds,
             supervisor,
             dropped,
@@ -263,7 +269,7 @@ impl Servers {
     #[allow(clippy::too_many_arguments)]
     pub async fn adopt(
         spec: &HttpServerSpec,
-        run_dir: &Path,
+        dirs: &HostDirs,
         cwd: &Path,
         env: Vec<(String, String)>,
         identity: Option<Identity>,
@@ -311,7 +317,7 @@ impl Servers {
 
         let dropped = Arc::new(AtomicU64::new(0));
         let supervisor = Supervisor::adopt(
-            process_spec(spec, cwd, env, identity, log, run_dir, relays, &dropped),
+            process_spec(spec, cwd, env, identity, log, dirs, relays, &dropped),
             RestartPolicy::default(),
             instances,
             &processes,
@@ -329,7 +335,7 @@ impl Servers {
             readiness_path: spec.readiness_path.clone(),
             readiness_timeout: readiness_timeout(spec),
             starting,
-            run_dir: run_dir.to_path_buf(),
+            dirs: dirs.clone(),
             binds,
             supervisor,
             dropped,
@@ -582,6 +588,11 @@ impl Servers {
         }
     }
 
+    /// The directories the instances' sockets and files are in.
+    pub fn dirs(&self) -> &HostDirs {
+        &self.dirs
+    }
+
     /// Stop every instance: the graceful signal, then SIGKILL for one
     /// still there after `grace`, and the sockets and run directory
     /// removed.
@@ -593,7 +604,7 @@ impl Servers {
     /// `kill_at`.
     pub async fn stop_until(self, kill_at: std::time::Instant) {
         self.supervisor.stop_until(Instant::from_std(kill_at)).await;
-        let _ = std::fs::remove_dir_all(&self.run_dir);
+        self.dirs.remove();
     }
 
     /// Leave the instances running and forget them, for a daemon that
@@ -659,7 +670,7 @@ fn process_spec(
     env: Vec<(String, String)>,
     identity: Option<Identity>,
     log: &Path,
-    run_dir: &Path,
+    dirs: &HostDirs,
     relays: Option<Relays>,
     dropped: &Arc<AtomicU64>,
 ) -> supervisor::Spec {
@@ -670,7 +681,7 @@ fn process_spec(
         log: log.to_path_buf(),
         relay: relays.map(|relays| supervisor::RelaySpec {
             executable: relays.executable,
-            run_dir: run_dir.to_path_buf(),
+            dirs: dirs.clone(),
             settings: relays.settings,
             release: relays.release,
             kind: "instance",
@@ -1087,7 +1098,7 @@ mod tests {
             };
             let servers = Servers::adopt(
                 &spec,
-                dir.path(),
+                &HostDirs::together(dir.path()),
                 dir.path(),
                 Vec::new(),
                 None,

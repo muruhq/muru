@@ -66,6 +66,29 @@ class Daemon:
     log_path: Path
     listeners: list[tuple[int, bool]]
 
+    @property
+    def files_dir(self) -> Path:
+        """The daemon's runtime files: every regular file it keeps while
+        it runs, in `run` under its state directory (section 13.8)."""
+
+        return self.base / "state" / "run"
+
+    def release_number(self, release: str) -> int:
+        """The number of `app@release`, which names its host's directories."""
+
+        shown = json.loads(self.muructl("release", "show", release, "--json").stdout)
+        return int(shown["number"])
+
+    def host_sockets(self, release: str) -> Path:
+        """The directory of the sockets of the host of `app@release`."""
+
+        return self.run_dir / "h" / str(self.release_number(release))
+
+    def host_files(self, release: str) -> Path:
+        """The directory of the files of the host of `app@release`."""
+
+        return self.files_dir / "h" / str(self.release_number(release))
+
     # What a failing test's report shows (issue 734): each command and
     # request with when it began and how long it took, and the daemon's
     # state as it was stopped while an exception was on its way out.

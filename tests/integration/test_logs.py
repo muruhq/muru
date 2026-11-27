@@ -300,7 +300,7 @@ def test_sigusr1_reopens_the_daemons_own_log(tmp_path: Path) -> None:
     )
     assert "daemon started" in started.stdout
     daemon_log = base / "logs" / "daemon.log"
-    pid = int((run_dir / "daemon.pid").read_text())
+    pid = int((base / "state" / "run" / "daemon.pid").read_text())
 
     try:
         wait_for(daemon_log.exists)

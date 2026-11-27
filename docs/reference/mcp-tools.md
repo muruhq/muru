@@ -19,6 +19,7 @@ it out.
 | `status` | reads | `muructl status` | none |
 | `processes` | reads | `muructl status --processes` | `app` (an application, or `app@release`), `all` |
 | `instances` | reads | `muructl instance list`, on this machine rather than the instance the server reaches | `orphans`, `label` |
+| `doctor` | reads | `muructl doctor`, `doctor store` or `doctor timeline`, on the files of the daemon the server reaches: Muru itself checked, with nothing changed | `part` (installation, store, timeline), `limit` |
 | `urls` | reads | `muructl open --list`: every URL the application can be reached at, best first, opening nothing | `app` |
 | `list` | reads | `muructl app list`, `release list`, `host list`, `route list`, `upstream list`, `rollout status` or `overlay list` | `what` (apps, releases, hosts, routes, upstreams, rollouts, overlays), `app` |
 | `release` | reads | `muructl release show` | `release` (app@release) |

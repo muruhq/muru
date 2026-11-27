@@ -299,6 +299,19 @@ pub fn registries(all_users: bool) -> anyhow::Result<Vec<PathBuf>> {
             anyhow::bail!("--all-users reads other users' registries, which needs root");
         }
 
+        // Each account's, under its home directory.
+
+        for home in muru_controller::host::Identity::account_homes() {
+            let path = muru_controller::locations::account_state_in(&home).join("registry");
+
+            if path.is_dir() && !found.contains(&path) {
+                found.push(path);
+            }
+        }
+
+        // And those of users with no home directory, which are in the
+        // runtime location.
+
         let pattern: (&str, &str) = if cfg!(target_os = "linux") {
             ("/run/user", "muru/registry")
         } else {
@@ -1141,6 +1154,8 @@ pub struct Removing {
     registry: PathBuf,
     #[serde(skip)]
     run_dir: Option<PathBuf>,
+    #[serde(skip)]
+    files_dir: Option<PathBuf>,
 }
 
 /// Something prune leaves, and why.
@@ -1206,6 +1221,9 @@ pub async fn plan(args: &PruneArgs) -> anyhow::Result<Plan> {
             registry: path,
             run_dir: matches!(row.record.kind, Kind::Run | Kind::Detour)
                 .then(|| row.record.run_dir.clone()),
+            files_dir: matches!(row.record.kind, Kind::Run | Kind::Detour)
+                .then(|| row.record.files_dir.clone())
+                .flatten(),
         };
 
         match row.state {
@@ -1391,12 +1409,19 @@ fn remove(plan: &mut Plan) {
 
         match registry::remove_stale(&removing.registry, id) {
             Ok(true) => {
-                if let Some(run_dir) = &removing.run_dir
-                    && run_dir
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().starts_with("run-"))
+                // A run's own directories: its sockets', and its files'.
+
+                for directory in [&removing.run_dir, &removing.files_dir]
+                    .into_iter()
+                    .flatten()
                 {
-                    let _ = std::fs::remove_dir_all(run_dir);
+                    let named_for_a_run = directory
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with("run-"));
+
+                    if named_for_a_run {
+                        let _ = std::fs::remove_dir_all(directory);
+                    }
                 }
 
                 removed.push(removing);

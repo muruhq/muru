@@ -521,6 +521,7 @@ message EdgeStatus {
   string listen = 2;                    // the first listener
   uint64 snapshot_version = 3;
   repeated Listener listeners = 4;
+  string version = 5;                  // the version of Muru the edge runs (issue 950)
 }
 
 message Listener {

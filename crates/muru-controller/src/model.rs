@@ -1619,6 +1619,11 @@ pub struct Release {
     pub created_unix_ms: u64,
     /// For optimistic concurrency.
     pub resource_version: u64,
+    /// Its number among every release this store has held, from 1, never
+    /// given twice: it names the directories of the release's host
+    /// (section 13.8), so no socket path carries an application's name
+    /// or a release's ID.
+    pub number: u64,
 }
 
 /// An application: a name and which of its releases serves.

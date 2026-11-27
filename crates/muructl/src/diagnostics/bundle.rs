@@ -298,6 +298,7 @@ impl<W: Write> Bundle<'_, W> {
         self.figures().await?;
         self.host().await?;
         self.failures()?;
+        self.doctor().await?;
         self.asked_for().await?;
 
         // What was noted while reaching the installation and collecting
@@ -319,6 +320,42 @@ impl<W: Write> Bundle<'_, W> {
             archive: self.archive,
             configuration_changed,
         })
+    }
+
+    /// What `muructl doctor` finds of a daemon's installation now (issue
+    /// 950): its sockets and files with their owners and conditions and
+    /// the checks of one part against another, and the checks of the
+    /// state store. `muructl doctor --bundle` prints them elsewhere. The
+    /// store itself is never taken, since it holds the releases'
+    /// environment values, which a bundle does not.
+    async fn doctor(&mut self) -> io::Result<()> {
+        let Some(mut locations) = self.installation.locations().cloned() else {
+            return Ok(());
+        };
+
+        // The daemon in reach says where its sockets are, which the
+        // locations of its files do not.
+
+        if let Some(status) = self.installation.status() {
+            locations.run = muru_controller::locations::Location {
+                path: PathBuf::from(&status.run_dir),
+                rule: "daemon",
+            };
+        }
+
+        let store = locations.state_store();
+
+        if self.asks(crate::doctor::BUNDLE_REPORT) {
+            let report = crate::doctor::examine(locations).await;
+            self.put(crate::doctor::BUNDLE_REPORT, Ok(report))?;
+        }
+
+        let checked = match store.is_file() {
+            true => crate::doctor::examine_store(&store).map_err(|error| format!("{error:#}")),
+            false => Err(format!("there is no state store at {}", store.display())),
+        };
+
+        self.put(crate::doctor::BUNDLE_STORE, checked)
     }
 
     /// Add a part as text, or record why there is none.

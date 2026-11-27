@@ -233,8 +233,9 @@ pub fn release_logs(locations: &Locations, app: &str, id: &str) -> Vec<PathBuf> 
 }
 
 /// Everything of a release's that goes with it: its environment, bytecode,
-/// static directory, run directory and, unless `keep_logs`, its log and
-/// archives. Its source directory is never among them: Muru points at it
+/// static directory and, unless `keep_logs`, its log and archives. Its
+/// host's directories are not among them: they went when the host
+/// stopped, and a release still running is never removed. Its source directory is never among them: Muru points at it
 /// and does not own it. Nor is the application's data directory, which
 /// every release shares (issue 849).
 pub fn release_paths(locations: &Locations, app: &str, id: &str, keep_logs: bool) -> Vec<PathBuf> {
@@ -243,7 +244,6 @@ pub fn release_paths(locations: &Locations, app: &str, id: &str, keep_logs: bool
         Provisioning::environment_dir(state, app, id),
         Provisioning::pycache_dir(state, app, id),
         crate::places::static_dir(state, app, id),
-        locations.run.path.join("apps").join(app).join(id),
     ];
 
     if !keep_logs {
@@ -512,7 +512,6 @@ mod tests {
         write(root.join("state/pycache/shop/r1/module.pyc"));
         write(root.join("state/static/shop/r1/admin/base.css"));
         write(root.join("state/data/shop/db.sqlite3"));
-        write(root.join("run/apps/shop/r1/host.toml"));
         write(root.join("logs/apps/shop/r1.log"));
         write(root.join("logs/apps/shop/r1.log.20260101-000000.zst"));
         write(root.join("logs/apps/shop/r12.log"));
@@ -529,7 +528,6 @@ mod tests {
             root.join("state/data/shop/db.sqlite3").exists(),
             "the data directory is the application's"
         );
-        assert!(!root.join("run/apps/shop/r1").exists());
         assert!(root.join("logs/apps/shop/r1.log").exists());
         assert!(root.join("state/envs/other/r1/lib/module.py").exists());
 

@@ -39,7 +39,7 @@ instance holds, so two instances never clash once both run.
 | --- | --- | --- | --- |
 | Configuration | `~/.config/muru/instances/NAME/muru.toml` | `~/Library/Application Support/muru/instances/NAME/muru.toml` | `/etc/muru/instances/NAME/muru.toml` |
 | State | `~/.local/state/muru/instances/NAME` | `~/Library/Application Support/muru/instances/NAME/state` | `/var/lib/muru/instances/NAME` |
-| Admin socket and run directories | `$XDG_RUNTIME_DIR/muru/instances/NAME` | `/tmp/muru-UID/instances/NAME` | `/run/muru/instances/NAME` |
+| Run directory: sockets only | `$XDG_RUNTIME_DIR/muru/instances/NAME` | `/tmp/muru-UID/instances/NAME` | `/run/muru/instances/NAME` |
 | Logs | `~/.local/state/muru/logs/instances/NAME` | `~/Library/Logs/muru/instances/NAME` | `/var/log/muru/instances/NAME` |
 | Cache | `~/.cache/muru` | `~/Library/Caches/muru` | `/var/cache/muru` |
 

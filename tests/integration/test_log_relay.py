@@ -65,10 +65,11 @@ def wait_for(predicate: Callable[[], bool], timeout: float = 20.0) -> None:
         time.sleep(0.05)
 
 
-def relay_pid(run_dir: Path) -> int:
-    """The pid in the release's relay record, or 0 while it is not there."""
+def relay_pid(files_dir: Path) -> int:
+    """The pid in the relay record of the first release's host, among the
+    daemon's runtime files, or 0 while it is not there."""
 
-    record = run_dir / "apps" / "shop" / "r1" / "r1" / "relay.toml"
+    record = files_dir / "h" / "1" / "relay.toml"
 
     try:
         return int(record.read_text().split("=")[1])
@@ -83,25 +84,25 @@ def test_a_relay_is_replaced_adopted_and_drains_at_stop(tmp_path: Path) -> None:
         daemon.deploy("shop", SHOP)
         assert daemon.request("/first").status == 200
         wait_for(lambda: "shop: served /first" in daemon.muructl("logs", "shop").stdout)
-        first = relay_pid(daemon.run_dir)
+        first = relay_pid(daemon.files_dir)
         assert first
 
         # A relay that dies is replaced, and is given the same pipes: the
         # workers' output goes on reaching the log.
 
         os.kill(first, signal.SIGKILL)
-        wait_for(lambda: relay_pid(daemon.run_dir) not in (0, first))
+        wait_for(lambda: relay_pid(daemon.files_dir) not in (0, first))
         assert "output.relay_restarting" in daemon.events()
         assert daemon.request("/second").status == 200
         wait_for(lambda: "shop: served /second" in daemon.muructl("logs", "shop").stdout)
 
         # A daemon that restarts adopts the relay with its host.
 
-        second = relay_pid(daemon.run_dir)
+        second = relay_pid(daemon.files_dir)
         daemon.stop(shutdown=False)
         assert daemon.request("/detached").status == 200
         daemon = start_daemon(tmp_path, run_dir=daemon.run_dir, port=daemon.port)
-        assert relay_pid(daemon.run_dir) == second
+        assert relay_pid(daemon.files_dir) == second
         wait_for(lambda: "shop: served /detached" in daemon.muructl("logs", "shop").stdout)
     finally:
         daemon.stop()
@@ -124,7 +125,9 @@ def test_a_relay_is_replaced_under_single(tmp_path: Path) -> None:
     try:
         assert server.get("/first").status == 200
         assert server.wait_for_log("echo /first"), server.log()
-        record = server.admin_socket().parent / "r1" / "relay.toml"
+        written = re.search(r"pid \d+, written to (\S+)", server.log())
+        assert written, server.log()
+        record = Path(written.group(1)).parent / "h" / "1" / "relay.toml"
         first = int(record.read_text().split("=")[1])
 
         os.kill(first, signal.SIGKILL)

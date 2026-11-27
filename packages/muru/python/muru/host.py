@@ -352,7 +352,7 @@ def untag_host_streams() -> None:
         sys.stderr = sys.stderr.stream
 
 
-# The file a host held before its fork writes in its run directory, which
+# The file a host held before its fork writes among its files, which
 # tells the daemon its before_fork gates may run (issue 266).
 
 GATES_FILE = "gates"
@@ -361,7 +361,7 @@ GATES_FILE = "gates"
 def hold_for_gates(run_dir: str) -> bool:
     """Wait, once preloaded, for the daemon to run the release's gates.
 
-    The host says it is ready by writing the file `gates` in its run
+    The host says it is ready by writing the file `gates` in its files
     directory, whole, and then reads a line from standard input: `fork`
     goes on to fork the workers, and anything else, or the end of the
     stream because the daemon went away, stops the host.
@@ -1344,6 +1344,7 @@ class Host:
         handoff: str | None = None,
         cgroup: str | None = None,
         sendfile: list[tuple[str, list[str], str | None, dict[str, int]]] | None = None,
+        files_dir: str | None = None,
     ) -> None:
         self.release = release
         self.mounts = mounts or []
@@ -1355,6 +1356,11 @@ class Host:
 
         self.sendfile = sendfile or []
         self.socket_dir = socket_dir
+
+        # The host's regular files are kept apart from its sockets, which
+        # are in a short location where files may be deleted by age.
+
+        self.files_dir = files_dir or socket_dir
         self.tcp_base_port = tcp_base_port
         self.detach = detach
         self.threads = threads
@@ -1622,10 +1628,11 @@ class Host:
     def socket_path(self, index: int) -> str:
         """Return the Unix socket path, or the TCP address, a worker listens on.
 
-        A named group's sockets carry its name, so the daemon can tell
-        them apart; the default group's are numbered plainly. A
-        replacement's socket carries its generation, so it never collides
-        with the socket of the worker it replaces.
+        A named group's sockets carry its place among the named groups,
+        from 1, and never its name, so that no socket's path grows with a
+        name; the default group's are numbered plainly. A replacement's
+        socket carries its generation, so it never collides with the
+        socket of the worker it replaces.
         """
 
         if self.tcp_base_port is not None:
@@ -1637,7 +1644,8 @@ class Host:
         if group.name == "default":
             return os.path.join(self.socket_dir, f"worker-{within}{suffix}.sock")
 
-        return os.path.join(self.socket_dir, f"worker-{group.name}-{within}{suffix}.sock")
+        place = next(at for at, known in enumerate(self.groups) if known.name == group.name)
+        return os.path.join(self.socket_dir, f"worker-{place}-{within}{suffix}.sock")
 
     def spawn(self, index: int, replacing: bool = False) -> int:
         """Fork one worker and return its pid. The child never returns.
@@ -4895,7 +4903,7 @@ class Host:
         budget = self.stop_budget()
 
         try:
-            with open(os.path.join(self.socket_dir, STOP_BY_FILE)) as stop_by:
+            with open(os.path.join(self.files_dir, STOP_BY_FILE)) as stop_by:
                 left = int(stop_by.read()) / 1000 - time.time()
         except (OSError, ValueError):
             return budget
@@ -5250,6 +5258,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--release", default=None, help="the release's id for muru.context(); dev otherwise"
     )
     parser.add_argument("--socket-dir", required=True, help="directory for the worker sockets")
+    parser.add_argument(
+        "--files-dir",
+        default=None,
+        help="directory for the host's regular files; the socket directory otherwise",
+    )
     parser.add_argument("--processes", type=int, default=1, help="worker processes to fork")
     parser.add_argument(
         "--interface",
@@ -5609,7 +5622,7 @@ def imports_report() -> str | None:
 
 
 def carry_imports(run_dir: str) -> None:
-    """Leave the load's import report in the run directory, for the host started again."""
+    """Leave the load's import report among the host's files, for the host started again."""
 
     report = imports_report()
 
@@ -5626,7 +5639,7 @@ def carry_imports(run_dir: str) -> None:
 
 
 def carried_imports(run_dir: str) -> str | None:
-    """Take the import report a host that fell back left in the run directory, if any."""
+    """Take the import report a host that fell back left among its files, if any."""
 
     path = os.path.join(run_dir, IMPORTS_FILE)
 
@@ -5885,10 +5898,10 @@ def _main(argv: list[str] | None) -> int:
             instruments.finished(context, _instrumentation.FALLBACK)
             flush_streams()
 
-            # Section 6.18: the load's import report waits in the run
-            # directory for the host started again, which sends it.
+            # Section 6.18: the load's import report waits among the
+            # host's files for the host started again, which sends it.
 
-            carry_imports(args.socket_dir)
+            carry_imports(args.files_dir or args.socket_dir)
 
             # The instrumentation list goes back in the environment, so
             # the host started again gives it to each worker.
@@ -5921,14 +5934,14 @@ def _main(argv: list[str] | None) -> int:
     # Section 9.12 (issue 266): the daemon runs the release's before_fork
     # gates now, with the application imported and nothing forked.
 
-    if args.hold_before_fork and not hold_for_gates(args.socket_dir):
+    if args.hold_before_fork and not hold_for_gates(args.files_dir or args.socket_dir):
         return 1
 
     # A socket past the platform's path limit never binds, so the longest
-    # a default worker's socket can be is checked once here; a named
-    # group's sockets carry its name as well.
+    # a worker's socket can be is checked once here: a named group's,
+    # which carries the group's place and never its name.
 
-    longest = os.path.join(args.socket_dir, "worker-99-g99.sock")
+    longest = os.path.join(args.socket_dir, "worker-99-99-g99.sock")
 
     if len(longest.encode()) >= SOCKET_PATH_LIMIT:
         log(
@@ -5948,6 +5961,7 @@ def _main(argv: list[str] | None) -> int:
         sync_threads=args.sync_threads,
         concurrency=args.concurrency,
         detach=args.detach,
+        files_dir=args.files_dir,
         groups=[
             replace(
                 group,
@@ -5997,7 +6011,7 @@ def _main(argv: list[str] | None) -> int:
             "imports": imports_summary(),
         }
 
-    host.imports = imports_report() or carried_imports(args.socket_dir)
+    host.imports = imports_report() or carried_imports(args.files_dir or args.socket_dir)
 
     # Section 2.1: the host says which release it is; each worker it
     # forks says so too, with its group and index.

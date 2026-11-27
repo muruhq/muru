@@ -1619,7 +1619,8 @@ mod tests {
         let runs = crate::runs::Runs::new(
             store.clone(),
             crate::events::Events::new(store),
-            logs,
+            logs.clone(),
+            logs.join("sockets"),
             crate::runs::DEFAULT_KEEP,
         );
         Arc::new(runs.recorded(crate::runs::MANUAL, "you"))

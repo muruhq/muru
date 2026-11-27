@@ -16,6 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
+use crate::locations::HostDirs;
 use crate::logs::Logs;
 
 /// What a host says over its control connection (section 5.9).
@@ -840,9 +841,9 @@ fn sendfile_argument(spec: &HostSpec) -> String {
 impl HostSpec {
     /// The release as app@release, as the host names itself: the
     /// application's name, else the top-level module of its entrypoint,
-    /// and the release's id, else the name of its run directory (`r1`,
-    /// `r2` in development).
-    pub fn label(&self, run_dir: &Path) -> String {
+    /// and the release's id, else `r` and the number of the host among
+    /// those its starter has started (`r1`, `r2` in development).
+    pub fn label(&self, release: u32) -> String {
         let name = self.name.clone().unwrap_or_else(|| {
             let module = self.app.split(':').next().unwrap_or_default();
             let top = module.split('.').next().unwrap_or_default();
@@ -854,12 +855,10 @@ impl HostSpec {
             }
         });
 
-        let release = self.release.clone().unwrap_or_else(|| {
-            run_dir
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        });
+        let release = self
+            .release
+            .clone()
+            .unwrap_or_else(|| format!("r{release}"));
 
         format!("{name}@{release}")
     }
@@ -968,6 +967,68 @@ impl Identity {
             .collect()
     }
 
+    /// The home directory the password database gives the user `uid`,
+    /// whatever `HOME` says.
+    pub fn account_home(uid: u32) -> Option<PathBuf> {
+        let identity = Self {
+            uid,
+            gid: 0,
+            umask: None,
+        };
+
+        identity
+            .account()
+            .into_iter()
+            .find(|(variable, _)| variable == "HOME")
+            .map(|(_, home)| PathBuf::from(home))
+    }
+
+    /// The home directory of every account the password database lists,
+    /// for a command that reads what each user keeps under theirs.
+    pub fn account_homes() -> Vec<PathBuf> {
+        static LISTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        // getpwent keeps its place in storage the whole process shares,
+        // so one listing is made at a time.
+
+        let _one_at_a_time = LISTING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut homes = Vec::new();
+
+        // SAFETY: setpwent, getpwent and endpwent take no arguments; the
+        // lock above keeps this the only walk of the database, and each
+        // entry's strings are copied before the next call replaces them.
+
+        unsafe {
+            libc::setpwent();
+
+            loop {
+                let entry = libc::getpwent();
+
+                if entry.is_null() {
+                    break;
+                }
+
+                let home = (*entry).pw_dir;
+
+                if !home.is_null() {
+                    let home = std::ffi::CStr::from_ptr(home).to_string_lossy();
+
+                    if !home.is_empty() {
+                        homes.push(PathBuf::from(home.into_owned()));
+                    }
+                }
+            }
+
+            libc::endpwent();
+        }
+
+        homes.sort();
+        homes.dedup();
+        homes
+    }
+
     /// Whether this process may switch to another user.
     pub fn can_switch() -> bool {
         // SAFETY: geteuid has no preconditions.
@@ -1060,7 +1121,7 @@ pub struct HostProcess {
     pub group_sockets: Vec<(String, Vec<PathBuf>)>,
     /// The groups the release is ready without (ADR 0033).
     optional: Vec<String>,
-    run_dir: PathBuf,
+    dirs: HostDirs,
     /// The release number within this run, from 1.
     pub release: u32,
     /// The tasks relaying its log relay's output to this process's
@@ -1088,20 +1149,26 @@ enum Process {
 }
 
 impl HostProcess {
-    /// Start the host for release number `release` under the run directory,
-    /// with a log relay beside it (section 11.3). Without `detach_to` what
+    /// Start the host for release number `release` in `dirs`, its sockets
+    /// in one directory and its files in the other (section 13.8), with a
+    /// log relay beside it (section 11.3). Without `detach_to` what
     /// the relay writes comes to this process's own streams and is kept in
     /// `logs` for the dashboard; `watcher` hears what the relay reports.
     pub fn start(
         spec: &HostSpec,
-        run_dir: &Path,
+        dirs: &HostDirs,
         release: u32,
         logs: &Logs,
         watcher: RelayWatcher,
     ) -> anyhow::Result<Self> {
-        let run_dir = run_dir.join(format!("r{release}"));
-        std::fs::create_dir_all(&run_dir)
-            .with_context(|| format!("creating {}", run_dir.display()))?;
+        let dirs = dirs.clone();
+        dirs.create().with_context(|| {
+            format!(
+                "creating {} and {}",
+                dirs.sockets.display(),
+                dirs.files.display()
+            )
+        })?;
         let mut command = Command::new(&spec.python);
         command
             .arg("-m")
@@ -1109,7 +1176,9 @@ impl HostProcess {
             .arg("--app")
             .arg(&spec.app)
             .arg("--socket-dir")
-            .arg(&run_dir)
+            .arg(&dirs.sockets)
+            .arg("--files-dir")
+            .arg(&dirs.files)
             .args(
                 spec.name
                     .iter()
@@ -1173,7 +1242,7 @@ impl HostProcess {
             );
             command
                 .arg("--output-socket")
-                .arg(run_dir.join(crate::relay::OUTPUT_SOCKET))
+                .arg(dirs.sockets.join(crate::relay::OUTPUT_SOCKET))
                 .arg("--output-fd")
                 .arg(crate::relay::HOST_OUTPUT_FD.to_string());
         }
@@ -1372,7 +1441,7 @@ impl HostProcess {
 
         command
             .arg("--control")
-            .arg(run_dir.join("control.sock"))
+            .arg(dirs.sockets.join("control.sock"))
             .arg("--hard-drain-grace")
             .arg(spec.hard_drain_grace.as_secs_f64().to_string())
             .arg("--shutdown-timeout")
@@ -1523,7 +1592,7 @@ impl HostProcess {
 
         // The relay first, so that the host's first line has a reader.
 
-        let launch = RelayLaunch::new(spec, &run_dir)?;
+        let launch = RelayLaunch::new(spec, &dirs, release)?;
         let relays: SharedRelays = Arc::default();
         let first = launch
             .spawn(Some(output_read.as_raw_fd()), logs, &relays)
@@ -1552,12 +1621,15 @@ impl HostProcess {
         );
 
         // Sockets are numbered across every group in the order the host
-        // forks them: the default group first, then each named group.
+        // forks them: the default group first, then each named group. A
+        // named group's sockets carry its place among the named groups,
+        // from 1, and never its name, so that no socket's path grows
+        // with a name (section 13.8).
 
-        let socket = |group: Option<&str>, index: usize, position: usize| match base_port {
+        let socket = |group: Option<usize>, index: usize, position: usize| match base_port {
             None => match group {
-                None => run_dir.join(format!("worker-{index}.sock")),
-                Some(name) => run_dir.join(format!("worker-{name}-{index}.sock")),
+                None => dirs.sockets.join(format!("worker-{index}.sock")),
+                Some(group) => dirs.sockets.join(format!("worker-{group}-{index}.sock")),
             },
             Some(base) => {
                 let port = base.wrapping_add(u16::try_from(position).unwrap_or(0));
@@ -1569,11 +1641,11 @@ impl HostProcess {
             .collect();
         let mut group_sockets = Vec::new();
 
-        for group in &spec.groups {
+        for (place, group) in spec.groups.iter().enumerate() {
             let mut these = Vec::new();
 
             for index in 0..group.processes {
-                let path = socket(Some(&group.name), index, sockets.len());
+                let path = socket(Some(place + 1), index, sockets.len());
                 sockets.push(path.clone());
                 these.push(path);
             }
@@ -1592,7 +1664,7 @@ impl HostProcess {
                 .filter(|group| group.optional)
                 .map(|group| group.name.clone())
                 .collect(),
-            run_dir,
+            dirs,
             release,
             relays,
             relay,
@@ -1610,7 +1682,7 @@ impl HostProcess {
         sockets: Vec<PathBuf>,
         group_sockets: Vec<(String, Vec<PathBuf>)>,
         optional: Vec<String>,
-        run_dir: PathBuf,
+        dirs: HostDirs,
         release: u32,
         launch: RelayLaunch,
         relay_pid: Option<u32>,
@@ -1632,7 +1704,7 @@ impl HostProcess {
             sockets,
             group_sockets,
             optional,
-            run_dir,
+            dirs,
             release,
             relays,
             relay,
@@ -1715,24 +1787,24 @@ impl HostProcess {
         unsafe { libc::kill(pid as libc::pid_t, signal) == 0 }
     }
 
-    /// The release run directory.
-    pub fn run_dir(&self) -> &Path {
-        &self.run_dir
+    /// The host's directories.
+    pub fn dirs(&self) -> &HostDirs {
+        &self.dirs
     }
 
     /// Where the host serves its control connection (section 5.9): the
     /// worker sockets as they change, and events about its workers.
     pub fn control_path(&self) -> PathBuf {
-        self.run_dir.join("control.sock")
+        self.dirs.sockets.join("control.sock")
     }
 
     /// Wait for a host started with `hold_before_fork` to have preloaded
     /// and to wait for its gates, which it says by writing the file
-    /// `gates` in its run directory; or for it to exit first, or the time
+    /// `gates` among its files; or for it to exit first, or the time
     /// to be up.
     pub async fn wait_held(&mut self, timeout: Duration) -> anyhow::Result<()> {
         let started = Instant::now();
-        let held = self.run_dir.join("gates");
+        let held = self.dirs.files.join("gates");
 
         loop {
             if held.is_file() {
@@ -1890,7 +1962,7 @@ impl HostProcess {
         self.relay.finish().await;
         relayed_to_the_end(&self.relays).await;
 
-        let _ = std::fs::remove_dir_all(&self.run_dir);
+        self.dirs.remove();
     }
 
     /// Write when the workers must be gone where the host looks for it, by
@@ -1899,7 +1971,7 @@ impl HostProcess {
     /// own budget and is killed at the shutdown's deadline.
     fn tell_stop_by(&self, workers_by: Instant) {
         let at = SystemTime::now() + workers_by.saturating_duration_since(Instant::now());
-        let path = self.run_dir.join(STOP_BY_FILE);
+        let path = self.dirs.files.join(STOP_BY_FILE);
         let Ok(since_epoch) = at.duration_since(SystemTime::UNIX_EPOCH) else {
             return;
         };
@@ -1934,7 +2006,7 @@ impl HostProcess {
             return true;
         }
 
-        let control = self.run_dir.join(crate::relay::CONTROL_SOCKET);
+        let control = self.dirs.sockets.join(crate::relay::CONTROL_SOCKET);
 
         let flushed = tokio::time::timeout(OUTPUT_FLUSH, async {
             // What the relay could not flush is still read here.
@@ -2660,8 +2732,8 @@ pub type RelayWatcher = Arc<dyn Fn(RelayNews) + Send + Sync>;
 pub struct RelayLaunch {
     /// The executable, this program.
     executable: PathBuf,
-    /// The directory the host's and relay's sockets are in.
-    run_dir: PathBuf,
+    /// The directories the host's and relay's sockets and files are in.
+    dirs: HostDirs,
     /// The release log, or none to write to this process.
     log_file: Option<PathBuf>,
     settings: RelaySettings,
@@ -2674,13 +2746,13 @@ pub struct RelayLaunch {
 
 impl RelayLaunch {
     /// How to start the relay of a host started with `spec`.
-    fn new(spec: &HostSpec, run_dir: &Path) -> anyhow::Result<Self> {
+    fn new(spec: &HostSpec, dirs: &HostDirs, release: u32) -> anyhow::Result<Self> {
         let launch = Self::for_release(
-            run_dir.to_owned(),
+            dirs.clone(),
             spec.detach_to.clone(),
             spec.relay,
             spec.identity,
-            spec.label(run_dir),
+            spec.label(release),
         )?;
 
         Ok(Self {
@@ -2689,10 +2761,10 @@ impl RelayLaunch {
         })
     }
 
-    /// How to start the relay of a release whose sockets are in
-    /// `run_dir`, writing `log_file` or else to this process.
+    /// How to start the relay of a release whose sockets and files are
+    /// in `dirs`, writing `log_file` or else to this process.
     pub fn for_release(
-        run_dir: PathBuf,
+        dirs: HostDirs,
         log_file: Option<PathBuf>,
         settings: RelaySettings,
         identity: Option<Identity>,
@@ -2701,7 +2773,7 @@ impl RelayLaunch {
         Ok(Self {
             executable: crate::daemon::running_executable()
                 .context("finding the executable to start the relay from")?,
-            run_dir,
+            dirs,
             log_file,
             settings,
             identity,
@@ -2711,11 +2783,11 @@ impl RelayLaunch {
     }
 
     fn output_socket(&self) -> PathBuf {
-        self.run_dir.join(crate::relay::OUTPUT_SOCKET)
+        self.dirs.sockets.join(crate::relay::OUTPUT_SOCKET)
     }
 
     fn control_socket(&self) -> PathBuf {
-        self.run_dir.join(crate::relay::CONTROL_SOCKET)
+        self.dirs.sockets.join(crate::relay::CONTROL_SOCKET)
     }
 
     /// Start a relay, handing it the read end of the host's output when
@@ -2794,7 +2866,7 @@ impl RelayLaunch {
     /// record is written whole, as the relay writes its own, since a
     /// daemon may read it while a replacement relay is recorded.
     fn record(&self, pid: u32) {
-        let path = self.run_dir.join(crate::relay::RECORD);
+        let path = self.dirs.files.join(crate::relay::RECORD);
 
         if let Err(error) = muru_common::files::write_whole(&path, format!("pid = {pid}\n")) {
             tracing::warn!(%error, "could not record the release's log relay");

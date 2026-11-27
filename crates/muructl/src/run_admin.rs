@@ -1017,6 +1017,10 @@ pub struct Registration {
     /// The run's own directory, or none for `muructl serve`, whose socket
     /// sits in the container's run directory.
     directory: Option<PathBuf>,
+    /// The run's own directory of regular files, under the user state
+    /// location; none for `muructl serve`, and for a run that could not
+    /// register, which keeps them with its sockets.
+    files: Option<PathBuf>,
     /// The admin socket.
     pub socket: PathBuf,
     /// The registry entry, when it could be written.
@@ -1095,6 +1099,18 @@ impl Registration {
 
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
 
+        // Section 13.8 (issue 948): the run's directory under the run
+        // directory holds its sockets alone. Its regular files, its pid
+        // file and what its hosts keep, are in a directory of the same
+        // name under the user state location, which nothing deletes by
+        // age. That one is made once the entry is published, so that a
+        // directory there always has a live entry naming it, and the
+        // ones dead runs left are removed first.
+
+        let files =
+            muru_controller::locations::user_run_files().join(format!("run-{}", id.short()));
+        sweep_run_files();
+
         let socket = directory.join("admin.sock");
         let mut record = muru_controller::registry::Record::new(
             id,
@@ -1102,6 +1118,7 @@ impl Registration {
             muru_controller::client::Endpoint::unix(&socket),
             directory.clone(),
         );
+        record.files_dir = Some(files.clone());
         record.app = Some(app.to_owned());
         record.project = Some(project.to_path_buf());
         record.started_from = std::env::current_dir()
@@ -1110,11 +1127,24 @@ impl Registration {
         record.listeners = listeners;
         record.names = names.to_vec();
 
+        // A run that could not register has no entry to say its files
+        // are a live run's, so it keeps them with its sockets.
+
+        let entry = publish(record);
+        let files = entry.is_some().then_some(files);
+
+        if let Some(files) = &files {
+            std::fs::create_dir_all(files)
+                .with_context(|| format!("creating {}", files.display()))?;
+            std::fs::set_permissions(files, std::fs::Permissions::from_mode(0o700))?;
+        }
+
         Ok(Self {
             id,
             directory: Some(directory),
+            files,
             socket,
-            entry: publish(record),
+            entry,
         })
     }
 
@@ -1171,15 +1201,22 @@ impl Registration {
         Ok(Self {
             id,
             directory: None,
+            files: None,
             socket: socket.to_path_buf(),
             entry: publish(record),
         })
     }
 
-    /// The run's own directory, where its releases' run directories go;
+    /// The run's own directory, where its sockets and its hosts' go;
     /// none for `muructl serve`.
     pub fn directory(&self) -> Option<&Path> {
         self.directory.as_deref()
+    }
+
+    /// The run's own directory of regular files, where its hosts' go;
+    /// none for `muructl serve`.
+    pub fn files(&self) -> Option<&Path> {
+        self.files.as_deref()
     }
 
     /// The run's registry record as last written, when it has one.
@@ -1196,11 +1233,11 @@ impl Registration {
             .map_or_else(|| self.id.short(), |entry| entry.record().tag())
     }
 
-    /// Write the run's process id to `pid` in its directory, as a script
+    /// Write the run's process id to `pid` among its files, as a script
     /// reads it to stop the run (issue 764); the file's path, or none
     /// for `muructl serve` or when it could not be written.
     pub fn write_pid(&self, pid: u32) -> Option<PathBuf> {
-        let path = self.directory.as_ref()?.join("pid");
+        let path = self.files.as_ref()?.join("pid");
         muru_common::files::write_whole(&path, format!("{pid}\n")).ok()?;
         Some(path)
     }
@@ -1258,6 +1295,10 @@ impl Drop for Registration {
     fn drop(&mut self) {
         drop(self.entry.take());
 
+        if let Some(files) = &self.files {
+            let _ = std::fs::remove_dir_all(files);
+        }
+
         match &self.directory {
             Some(directory) => {
                 let _ = std::fs::remove_dir_all(directory);
@@ -1266,6 +1307,32 @@ impl Drop for Registration {
                 let _ = std::fs::remove_file(&self.socket);
                 let _ = std::fs::remove_file(self.socket.with_file_name("serve.json"));
             }
+        }
+    }
+}
+
+/// Remove the directories of regular files that runs which are gone left
+/// under the user state location: each `run-ID` there that no live entry
+/// of the registry names. A run killed outright removes nothing, and
+/// nothing else cleans the state location.
+pub fn sweep_run_files() {
+    let base = muru_controller::locations::user_run_files();
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return;
+    };
+
+    let live: Vec<PathBuf> =
+        muru_controller::registry::live(&muru_controller::registry::user_registry())
+            .into_iter()
+            .filter_map(|record| record.files_dir)
+            .collect();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ours = entry.file_name().to_string_lossy().starts_with("run-");
+
+        if ours && !live.contains(&path) {
+            let _ = std::fs::remove_dir_all(path);
         }
     }
 }
@@ -1511,6 +1578,7 @@ impl Admin for Service {
             started_unix_ms: state.started_unix_ms,
             app_count: 1,
             release_count: 1,
+            snapshot_version: 0,
             edge_pid: std::process::id(),
             metrics: state
                 .dashboard

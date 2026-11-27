@@ -23,7 +23,7 @@ use crate::edges::{EdgeProcess, EdgeSpec};
 use crate::events::Events;
 use crate::host::{HostControl, HostMessage, WorkerReply};
 use crate::host::{HostProcess, HostSpec};
-use crate::locations::Locations;
+use crate::locations::{HostDirs, Locations};
 use crate::logs::Logs;
 use crate::model::{
     AccessLogSpec, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutState,
@@ -1122,6 +1122,8 @@ pub struct Info {
     pub started_unix_ms: u64,
     /// The edge process's pid, for status.
     pub edge_pid: std::sync::atomic::AtomicU32,
+    /// The version of the snapshot the edge was last given.
+    pub snapshot_version: Arc<std::sync::atomic::AtomicU64>,
     /// Where the Prometheus exposition is served, or nowhere.
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard is served, or nowhere.
@@ -1350,10 +1352,10 @@ impl Backend {
     }
 
     /// The record a previous daemon reads to take the release over.
-    fn record_path(&self, run_dir: &Path) -> PathBuf {
+    fn record_path(&self, files: &Path) -> PathBuf {
         match self {
-            Self::Host(_) | Self::Dormant => run_dir.join("host.toml"),
-            Self::Servers(_) => run_dir.join("servers.toml"),
+            Self::Host(_) | Self::Dormant => files.join(HOST_RECORD),
+            Self::Servers(_) => files.join(SERVERS_RECORD),
         }
     }
 
@@ -1590,7 +1592,7 @@ struct StartPrep {
     release: Release,
     env: Vec<(String, String)>,
     identity: Option<crate::host::Identity>,
-    run_dir: PathBuf,
+    dirs: HostDirs,
     started: Instant,
     /// Once built: the runtime library the host was started with.
     library: Option<muru_provision::Provided>,
@@ -1615,10 +1617,9 @@ struct Starting {
 struct Stop {
     /// When the stop's task gives up waiting for the processes.
     until: Instant,
-    /// The release's run directory and the record in it, removed once it
-    /// has stopped.
-    run_dir: PathBuf,
-    record: PathBuf,
+    /// The directories of the release's host, removed once it has
+    /// stopped.
+    dirs: HostDirs,
     /// What follows the stop, carried out when it has ended.
     waiters: Vec<AfterStop>,
 }
@@ -2233,6 +2234,25 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .check_run_dir()
         .map_err(|error| anyhow::anyhow!(error))?;
 
+    // Section 13.8 (issue 948): an edge and hosts recorded in the run
+    // directory are an earlier version's, which this one cannot take
+    // over. Starting beside them would leave them running unseen and
+    // fail on the listener they hold, so the start says what to do.
+
+    let run = &config.locations.run.path;
+
+    if crate::locations::earlier_daemon_left(run) {
+        anyhow::bail!(
+            "the run directory {} holds the records of an edge or releases that an earlier \
+             version of Muru started, and this version keeps those records in the state \
+             directory, so it cannot take them over; start the daemon with the version that \
+             started them and stop it with muructl daemon stop --shutdown, or stop its \
+             processes (muructl instance list --orphans lists them) and remove edge.toml and \
+             apps from the directory",
+            run.display()
+        );
+    }
+
     // Section 9.13: a system daemon's edge serves real traffic, which a
     // detour would send to a process owned by whoever opened it.
 
@@ -2257,9 +2277,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let sinks = std::mem::take(&mut settings.sinks);
     let locations = config.locations;
 
-    for location in [&locations.state, &locations.run, &locations.logs] {
-        std::fs::create_dir_all(&location.path)
-            .with_context(|| format!("creating {}", location.path.display()))?;
+    for path in [
+        locations.state.path.clone(),
+        locations.run.path.clone(),
+        locations.logs.path.clone(),
+        locations.files(),
+    ] {
+        std::fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
     }
 
     // Section 13.8: the daemon registers in the instance registry, under
@@ -2333,7 +2357,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     prepare_spool(&spool, service)
         .with_context(|| format!("preparing the upload spool {}", spool.display()))?;
 
-    let adopted = match read_record::<EdgeRecord>(&locations.run.path.join("edge.toml")) {
+    let buckets = locations.edge_files().join(crate::edges::BUCKETS_FILE);
+
+    let adopted = match read_record::<EdgeRecord>(&locations.edge_record()) {
         Some(record) => EdgeProcess::adopt(
             record.pid,
             config.executable.clone(),
@@ -2348,6 +2374,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             edge_log.clone(),
             config.access_log.clone(),
             spool.clone(),
+            buckets.clone(),
             service,
             locations.scope(),
         )
@@ -2417,7 +2444,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             }
 
             let (control, listener_socket) =
-                crate::edges::socket_paths(&crate::edges::directory(&locations.run.path), 1);
+                crate::edges::socket_paths(&locations.edge_sockets(), 1);
             EdgeProcess::spawn(EdgeSpec {
                 executable: config.executable.clone(),
                 listeners,
@@ -2427,6 +2454,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 log: edge_log,
                 access_log: config.access_log,
                 spool,
+                buckets,
                 identity: service,
                 scope: locations.scope(),
             })
@@ -2439,7 +2467,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Section 8.4: uv as found and how it is run, said once at start.
 
     tracing::info!("{}", provisioning.describe_uv());
-    write_edge_record(&locations.run.path, &edge);
+    write_edge_record(&locations, &edge);
 
     if let Some(entry) = &registered {
         entry.update(|record| {
@@ -2463,6 +2491,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         limits: std::sync::RwLock::new(settings.limits.clone()),
         started_unix_ms: crate::model::now_unix_ms(),
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
+        snapshot_version: edge.sent_version(),
         metrics,
         dashboard,
         dashboard_sessions: dashboard_sessions.clone(),
@@ -2491,6 +2520,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         Arc::clone(&store),
         events.clone(),
         locations.logs.path.clone(),
+        locations.run.path.join(COMMANDS_DIR),
         settings.keep_command_runs,
     );
     let handle = Handle {
@@ -3266,6 +3296,7 @@ fn daemon_record(
     record.name = locations.instance_name();
     record.scope = locations.mode_word().to_owned();
     record.state_dir = Some(locations.state.path.clone());
+    record.files_dir = Some(locations.files());
     record.config = Some(locations.config.path.clone());
     record.log_dir = Some(locations.logs.path.clone());
     record.dashboard = dashboard.map(|address| format!("http://{address}/"));
@@ -3355,24 +3386,51 @@ fn remove_pid_file(locations: &Locations) {
 /// record the next daemon would adopt it by, and the rate limits' shared
 /// buckets, with the edges' directory when that leaves it empty.
 fn forget_edge(locations: &Locations) {
-    let run_dir = &locations.run.path;
-    let edges = crate::edges::directory(run_dir);
-    let _ = std::fs::remove_file(run_dir.join("edge.toml"));
-    let _ = std::fs::remove_file(edges.join(crate::edges::BUCKETS_FILE));
-    let _ = std::fs::remove_dir(edges);
+    let files = locations.edge_files();
+    let _ = std::fs::remove_file(locations.edge_record());
+    let _ = std::fs::remove_file(files.join(crate::edges::BUCKETS_FILE));
+    let _ = std::fs::remove_dir(files);
+    let _ = std::fs::remove_dir(locations.edge_sockets());
 }
 
-/// Remove a release's record, its host's secret files and the
-/// directories that leaves empty: the release's own and then its
-/// application's.
-fn forget_release_dir(run_dir: &Path, record: &Path) {
-    let _ = std::fs::remove_file(record);
-    let _ = std::fs::remove_dir_all(run_dir.join("secrets"));
+/// The record of a release's host among its files, which the next
+/// daemon re-adopts it from.
+pub const HOST_RECORD: &str = "host.toml";
 
-    if std::fs::remove_dir(run_dir).is_ok()
-        && let Some(app_dir) = run_dir.parent()
-    {
-        let _ = std::fs::remove_dir(app_dir);
+/// The record of a managed server release's instances, as the host's.
+pub const SERVERS_RECORD: &str = "servers.toml";
+
+/// The directory of a host's secrets delivered as files, among its files.
+const SECRETS_DIR: &str = "secrets";
+
+/// The directories, in the runtime location and in the runtime files,
+/// that hold one directory per detached command run.
+pub const COMMANDS_DIR: &str = "c";
+
+/// Remove what a stopped release's host kept: its sockets, its record,
+/// its secret files and whatever else is in its two directories.
+fn forget_release_dir(dirs: &HostDirs) {
+    dirs.remove();
+}
+
+/// Section 13.8 (issue 948): the runtime files outlive what the runtime
+/// location holds, since a reboot empties the one and not the other. Once
+/// the releases still running have been taken over, a host's files with
+/// no host behind them are stale and are removed, with the sockets of the
+/// same number. `kept` are the numbers of the releases this daemon runs.
+fn remove_stale_hosts(locations: &Locations, kept: &BTreeSet<u64>) {
+    for base in [locations.files(), locations.run.path.clone()] {
+        let Ok(entries) = std::fs::read_dir(base.join(crate::locations::HOSTS_DIR)) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let number = entry.file_name().to_string_lossy().parse::<u64>().ok();
+
+            if number.is_some_and(|number| !kept.contains(&number)) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
     }
 }
 
@@ -3506,9 +3564,9 @@ fn share_sockets(
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o2750))
 }
 
-fn write_edge_record(run_dir: &Path, edge: &EdgeProcess) {
+fn write_edge_record(locations: &Locations, edge: &EdgeProcess) {
     write_record(
-        &run_dir.join("edge.toml"),
+        &locations.edge_record(),
         &EdgeRecord {
             pid: edge.pid().unwrap_or(0),
             control: edge.control().to_path_buf(),
@@ -4010,12 +4068,23 @@ fn command_mentions(pid: u32, path: &Path, title: &str) -> bool {
 fn names(command: &str, path: &Path, title: &str) -> bool {
     let command = command.trim();
 
-    command.contains(&path.display().to_string())
+    mentions(command, &path.display().to_string())
         || command == title
         || command
             .strip_prefix(title)
             .and_then(|rest| rest.strip_prefix(" ("))
             .is_some_and(|tag| tag.ends_with(')') && !tag.contains(' '))
+}
+
+/// Whether `command` has `path` as a whole path or the start of one: a
+/// host's directory is named by a number, and `h/14` is not `h/142`.
+fn mentions(command: &str, path: &str) -> bool {
+    command.match_indices(path).any(|(at, _)| {
+        command[at + path.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| next == '/' || next.is_whitespace())
+    })
 }
 
 impl Daemon {
@@ -6230,6 +6299,21 @@ impl Daemon {
             }
         };
 
+        // Section 13.8 (issue 948): what a host left among the runtime
+        // files outlives a reboot, which empties the runtime location.
+        // Only a release the store says was running can have a host to
+        // take over, so every other host's directories are stale.
+
+        let may_run: BTreeSet<u64> = self
+            .store
+            .releases(None)
+            .unwrap_or_default()
+            .iter()
+            .filter(|release| release.state.is_running())
+            .map(|release| release.number)
+            .collect();
+        remove_stale_hosts(&self.locations, &may_run);
+
         for app in apps {
             // A release in a running state is taken over when its host is
             // still there and listening; otherwise it is gone with the
@@ -6240,6 +6324,13 @@ impl Daemon {
                     if self.adopt_host(&release.app, &release.id).await {
                         continue;
                     }
+
+                    // Its record names no host that is there, so its
+                    // files are stale. Its sockets are left: a process
+                    // that could not be taken over may still hold them.
+
+                    let stale = self.locations.host_files(release.number);
+                    let _ = std::fs::remove_dir_all(stale);
 
                     let _ = self.store.set_release_state(
                         &release.app,
@@ -6276,18 +6367,18 @@ impl Daemon {
     /// Take over a release's host, or a managed server's instances, from
     /// its record, if it is still there.
     async fn adopt_host(&mut self, app: &str, id: &str) -> bool {
-        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+        let dirs = self.host_dirs(app, id);
 
-        if let Some(record) = read_record::<ServersRecord>(&run_dir.join("servers.toml")) {
-            return self.adopt_servers(app, id, &run_dir, &record).await;
+        if let Some(record) = read_record::<ServersRecord>(&dirs.files.join(SERVERS_RECORD)) {
+            return self.adopt_servers(app, id, &dirs, &record).await;
         }
 
-        let Some(record) = read_record::<HostRecord>(&run_dir.join("host.toml")) else {
+        let Some(record) = read_record::<HostRecord>(&dirs.files.join(HOST_RECORD)) else {
             tracing::info!("release {app}@{id} could not be re-adopted: no readable host record");
             return false;
         };
 
-        if !command_mentions(record.pid, &run_dir, &format!("muru host {app}@{id}")) {
+        if !command_mentions(record.pid, &dirs.sockets, &format!("muru host {app}@{id}")) {
             tracing::info!(
                 pid = record.pid,
                 "release {app}@{id} could not be re-adopted: no process of its host has the pid"
@@ -6320,9 +6411,8 @@ impl Daemon {
             }
         };
 
-        let host_dir = run_dir.join("r1");
         let launch = match crate::host::RelayLaunch::for_release(
-            host_dir.clone(),
+            dirs.clone(),
             Some(self.host_log(app, id)),
             self.relay_settings,
             identity,
@@ -6334,16 +6424,16 @@ impl Daemon {
                 return false;
             }
         };
-        let relay_pid = read_record::<RelayRecord>(&host_dir.join(crate::relay::RECORD))
+        let relay_pid = read_record::<RelayRecord>(&dirs.files.join(crate::relay::RECORD))
             .map(|record| record.pid)
-            .filter(|pid| command_mentions(*pid, &host_dir, &format!("muru relay {subject}")));
+            .filter(|pid| command_mentions(*pid, &dirs.sockets, &format!("muru relay {subject}")));
         let watcher = self.relay_watcher(&subject);
         let adopted = HostProcess::adopt(
             record.pid,
             record.sockets.clone(),
             group_sockets,
             optional,
-            host_dir,
+            dirs,
             1,
             launch,
             relay_pid,
@@ -6431,7 +6521,7 @@ impl Daemon {
         &mut self,
         app: &str,
         id: &str,
-        run_dir: &Path,
+        dirs: &HostDirs,
         record: &ServersRecord,
     ) -> bool {
         let Ok(release) = self.store.release(app, id) else {
@@ -6451,14 +6541,19 @@ impl Daemon {
             }
         };
 
-        let env =
-            match resolve_env(&self.secrets, &release.spec.env, &run_dir.join("secrets")).await {
-                Ok(env) => env,
-                Err(error) => {
-                    tracing::info!(%error, "release {subject} could not be re-adopted");
-                    return false;
-                }
-            };
+        let env = match resolve_env(
+            &self.secrets,
+            &release.spec.env,
+            &dirs.files.join(SECRETS_DIR),
+        )
+        .await
+        {
+            Ok(env) => env,
+            Err(error) => {
+                tracing::info!(%error, "release {subject} could not be re-adopted");
+                return false;
+            }
+        };
         let env = self.server_environment(env, app, id, &release.spec, identity);
 
         let relays = match self.server_relays(&subject) {
@@ -6471,7 +6566,7 @@ impl Daemon {
 
         let adopted = Servers::adopt(
             &http,
-            &run_dir.join("r1"),
+            dirs,
             &release.spec.source,
             env,
             identity,
@@ -7501,16 +7596,22 @@ impl Daemon {
         // A command's secret files are its own, so that its end removes
         // them without touching those of a host still running.
 
-        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+        let dirs = self.host_dirs(app, id);
         let identity = self.resolve_identity(app, &subject)?;
 
         // Its name is this daemon's start and a count, so that a detached
-        // run's, which outlives the daemon, is never another run's.
+        // run's, which outlives the daemon, is never another run's. The
+        // directory is among the runtime files and apart from the
+        // release's host's, which is removed when the host stops; a
+        // detached run's relay binds its socket in the directory of the
+        // same name in the runtime location (section 13.8).
 
         let run = COMMAND_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let secrets = run_dir
-            .join("commands")
-            .join(format!("{}-{run}", self.info.started_unix_ms));
+        let secrets = self
+            .locations
+            .files()
+            .join(COMMANDS_DIR)
+            .join(crate::runs::directory_name(self.info.started_unix_ms, run));
 
         let env = match resolve_env(&self.secrets, &spec.env, &secrets).await {
             Ok(env) => env,
@@ -7521,7 +7622,7 @@ impl Daemon {
         };
 
         if let Some(identity) = identity {
-            self.own_release_dirs(identity, &run_dir, app, id)?;
+            self.own_release_dirs(identity, &dirs, app, id)?;
             own_secret_files(identity, &secrets)?;
         }
 
@@ -7664,7 +7765,7 @@ impl Daemon {
             },
         );
         let spec = &release.spec;
-        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+        let dirs = self.locations.host_dirs(release.number);
 
         let identity = match self.resolve_identity(app, &subject) {
             Ok(identity) => identity,
@@ -7679,7 +7780,7 @@ impl Daemon {
         // Section 10.8: secrets are resolved now, for this start, and
         // delivered as variables or as files only the host can read.
 
-        let env = match resolve_env(&self.secrets, &spec.env, &run_dir.join("secrets")).await {
+        let env = match resolve_env(&self.secrets, &spec.env, &dirs.files.join(SECRETS_DIR)).await {
             Ok(env) => env,
             Err(message) => {
                 self.set_state(&release, ReleaseState::Failed, &message);
@@ -7696,7 +7797,7 @@ impl Daemon {
         // read its secrets and reopen its log.
 
         if let Some(identity) = identity
-            && let Err(message) = self.own_release_dirs(identity, &run_dir, app, id)
+            && let Err(message) = self.own_release_dirs(identity, &dirs, app, id)
         {
             self.set_state(&release, ReleaseState::Failed, &message);
             self.events
@@ -7724,7 +7825,7 @@ impl Daemon {
             let env = self.server_environment(env, app, id, spec, identity);
 
             return self
-                .start_servers(app, id, &release, &http, env, identity, &run_dir, started)
+                .start_servers(app, id, &release, &http, env, identity, &dirs, started)
                 .map(|()| false);
         }
 
@@ -7772,7 +7873,7 @@ impl Daemon {
                     release,
                     env,
                     identity,
-                    run_dir,
+                    dirs,
                     started,
                     library: None,
                 }),
@@ -7808,7 +7909,7 @@ impl Daemon {
             release,
             env,
             identity,
-            run_dir,
+            dirs,
             started,
             ..
         } = prep;
@@ -7972,7 +8073,7 @@ impl Daemon {
 
         let watcher = self.relay_watcher(&subject);
 
-        let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs, watcher) {
+        let mut host = match HostProcess::start(&host_spec, &dirs, 1, &self.logs, watcher) {
             Ok(host) => host,
             Err(error) => {
                 let message = format!("the host could not be started: {error:#}");
@@ -8026,7 +8127,7 @@ impl Daemon {
                     release: release.clone(),
                     env: Vec::new(),
                     identity,
-                    run_dir,
+                    dirs,
                     started,
                     library: Some(library),
                 });
@@ -8073,7 +8174,7 @@ impl Daemon {
 
         let StartPrep {
             release,
-            run_dir,
+            dirs,
             started,
             library,
             ..
@@ -8125,7 +8226,7 @@ impl Daemon {
             })
             .collect();
         write_record(
-            &run_dir.join("host.toml"),
+            &dirs.files.join(HOST_RECORD),
             &HostRecord {
                 pid: host.pid().unwrap_or(0),
                 sockets: host.sockets.clone(),
@@ -8253,14 +8354,14 @@ impl Daemon {
     fn own_release_dirs(
         &self,
         identity: crate::host::Identity,
-        run_dir: &Path,
+        dirs: &HostDirs,
         app: &str,
         id: &str,
     ) -> Result<(), String> {
         let owned = [
-            run_dir.to_path_buf(),
-            run_dir.join("r1"),
-            run_dir.join("secrets"),
+            dirs.sockets.clone(),
+            dirs.files.clone(),
+            dirs.files.join(SECRETS_DIR),
         ];
 
         for path in &owned {
@@ -8269,7 +8370,7 @@ impl Daemon {
 
         let mut paths: Vec<PathBuf> = owned.to_vec();
 
-        if let Ok(entries) = std::fs::read_dir(run_dir.join("secrets")) {
+        if let Ok(entries) = std::fs::read_dir(dirs.files.join(SECRETS_DIR)) {
             paths.extend(entries.flatten().map(|entry| entry.path()));
         }
 
@@ -8290,7 +8391,7 @@ impl Daemon {
         }
 
         if let Some(service) = self.service {
-            share_sockets(&run_dir.join("r1"), identity, service).map_err(|error| {
+            share_sockets(&dirs.sockets, identity, service).map_err(|error| {
                 format!("sharing the socket directory with the edge failed: {error}")
             })?;
         }
@@ -8309,7 +8410,7 @@ impl Daemon {
         http: &crate::model::HttpServerSpec,
         env: Vec<(String, String)>,
         identity: Option<crate::host::Identity>,
-        run_dir: &Path,
+        dirs: &HostDirs,
         started: Instant,
     ) -> Result<(), String> {
         let subject = format!("{app}@{id}");
@@ -8323,8 +8424,7 @@ impl Daemon {
         let context = self.context();
         let commands = self.commands.clone();
         let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
-        let (task_release, task_http, task_dir) =
-            (release.clone(), http.clone(), run_dir.to_path_buf());
+        let (task_release, task_http, task_dir) = (release.clone(), http.clone(), dirs.clone());
         let key = (app.to_owned(), id.to_owned());
 
         tokio::spawn(async move {
@@ -8334,7 +8434,7 @@ impl Daemon {
             let outcome = async {
                 let spawned = Servers::start(
                     &task_http,
-                    &task_dir.join("r1"),
+                    &task_dir,
                     &release.spec.source,
                     env,
                     identity,
@@ -8396,7 +8496,7 @@ impl Daemon {
                     release: release.clone(),
                     env: Vec::new(),
                     identity,
-                    run_dir: run_dir.to_path_buf(),
+                    dirs: dirs.clone(),
                     started,
                     library: None,
                 }),
@@ -8423,7 +8523,7 @@ impl Daemon {
 
         let StartPrep {
             release,
-            run_dir,
+            dirs,
             started,
             ..
         } = prep;
@@ -8435,7 +8535,7 @@ impl Daemon {
             .map(crate::model::HttpServerSpec::describe)
             .unwrap_or_default();
 
-        write_record(&run_dir.join("servers.toml"), &servers.record());
+        write_record(&dirs.files.join(SERVERS_RECORD), &servers.record());
         self.running.insert(
             (app.to_owned(), id.to_owned()),
             Running {
@@ -9565,8 +9665,7 @@ impl Daemon {
                 "stopping the host"
             },
         );
-        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
-        let record = running.backend.record_path(&run_dir);
+        let dirs = self.locations.host_dirs(release.number);
         let grace = release.spec.timeouts.stop_budget();
         let wait = stop_wait(grace);
         let backend = running.backend;
@@ -9596,8 +9695,7 @@ impl Daemon {
             (app.to_owned(), id.to_owned()),
             Stop {
                 until: Instant::now() + wait,
-                run_dir,
-                record,
+                dirs,
                 waiters: Vec::new(),
             },
         );
@@ -9612,7 +9710,7 @@ impl Daemon {
             return;
         };
 
-        forget_release_dir(&stop.run_dir, &stop.record);
+        forget_release_dir(&stop.dirs);
         let _ = self.store.remove_scale_pins(app, id, None);
 
         if let Ok(release) = self.store.release(app, id) {
@@ -11073,8 +11171,8 @@ impl Daemon {
         };
 
         let backend = std::mem::replace(&mut running.backend, Backend::Dormant);
-        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
-        let record = backend.record_path(&run_dir);
+        let dirs = self.host_dirs(app, id);
+        let record = backend.record_path(&dirs.files);
         let grace = self
             .store
             .release(app, id)
@@ -11097,7 +11195,7 @@ impl Daemon {
         // files again.
 
         let _ = std::fs::remove_file(record);
-        let _ = std::fs::remove_dir_all(run_dir.join("secrets"));
+        let _ = std::fs::remove_dir_all(dirs.files.join(SECRETS_DIR));
         running.control = None;
         running.status.clear();
         running.signals_from = None;
@@ -12656,14 +12754,10 @@ impl Daemon {
                 marks_changed |= servers.starting() != marked;
 
                 if !changes.is_empty() {
-                    let run_dir = self
-                        .locations
-                        .run
-                        .path
-                        .join("apps")
-                        .join(&key.0)
-                        .join(&key.1);
-                    write_record(&run_dir.join("servers.toml"), &servers.record());
+                    write_record(
+                        &servers.dirs().files.join(SERVERS_RECORD),
+                        &servers.record(),
+                    );
                 }
 
                 reports.extend(changes.into_iter().map(|report| (key.clone(), report)));
@@ -12900,7 +12994,7 @@ impl Daemon {
                     self.edge.pid().unwrap_or(0),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                write_edge_record(&self.locations.run.path, &self.edge);
+                write_edge_record(&self.locations, &self.edge);
                 self.events.emit(
                     "edge.restarted",
                     "edge",
@@ -13004,14 +13098,14 @@ impl Daemon {
                     size_scalers(&mut running.scalers, &release.spec, interface);
                 }
 
-                let Some((record, pid)) = running.backend.host().map(|host| {
-                    (
-                        host.run_dir().join("..").join("host.toml"),
-                        host.pid().unwrap_or(0),
-                    )
-                }) else {
+                let Some((record, pid)) = running
+                    .backend
+                    .host()
+                    .map(|host| (host.dirs().files.join(HOST_RECORD), host.pid().unwrap_or(0)))
+                else {
                     return;
                 };
+
                 let before: BTreeSet<PathBuf> = running.routed_sockets().into_iter().collect();
                 running.sockets = sockets;
 
@@ -13258,7 +13352,7 @@ impl Daemon {
                     .edge_pid
                     .store(pid, std::sync::atomic::Ordering::Relaxed);
                 *self.info.listeners.write().expect("listeners poisoned") = self.edge.listeners();
-                write_edge_record(&self.locations.run.path, &self.edge);
+                write_edge_record(&self.locations, &self.edge);
                 self.events.emit(
                     "edge.replaced",
                     "edge",
@@ -13358,14 +13452,13 @@ impl Daemon {
                 .map(|release| release.spec.timeouts.stop_budget())
                 .unwrap_or(DRAIN_TIMEOUT);
             let kill_at = deadline.min(Instant::now() + budget + crate::host::STOP_MARGIN);
-            let run_dir = self.locations.run.path.join("apps").join(&app).join(&id);
-            let record = running.backend.record_path(&run_dir);
+            let dirs = self.host_dirs(&app, &id);
             stopping.push(async move {
                 running
                     .backend
                     .stop_until(kill_at, crate::shutdown::workers_deadline(deadline))
                     .await;
-                forget_release_dir(&run_dir, &record);
+                forget_release_dir(&dirs);
                 release
             });
         }
@@ -13378,7 +13471,19 @@ impl Daemon {
             self.set_state(&release, ReleaseState::Stopped, "the daemon stopped");
         }
 
-        let _ = std::fs::remove_dir(self.locations.run.path.join("apps"));
+        for base in [self.locations.run.path.clone(), self.locations.files()] {
+            let _ = std::fs::remove_dir(base.join(crate::locations::HOSTS_DIR));
+        }
+    }
+
+    /// The directories of a release's host (section 13.8), named by the
+    /// release's number in the store.
+    fn host_dirs(&self, app: &str, id: &str) -> HostDirs {
+        let number = self
+            .store
+            .release(app, id)
+            .map_or(0, |release| release.number);
+        self.locations.host_dirs(number)
     }
 
     /// Where a release's host writes its output, its directory created.
@@ -14471,10 +14576,20 @@ mod tests {
 
     #[test]
     fn a_record_names_a_process_by_its_path_or_its_title() {
-        let run_dir = Path::new("/run/muru/apps/shop/r42");
+        let run_dir = Path::new("/run/muru/h/14");
 
         assert!(super::names(
-            "python -m muru.host --socket-dir /run/muru/apps/shop/r42/r1",
+            "python -m muru.host --socket-dir /run/muru/h/14 --files-dir /var/lib/muru/run/h/14",
+            run_dir,
+            "muru host shop@r42"
+        ));
+        assert!(super::names(
+            "muructl relay run --control /run/muru/h/14/relay.sock",
+            run_dir,
+            "muru relay shop@r42"
+        ));
+        assert!(!super::names(
+            "python -m muru.host --socket-dir /run/muru/h/142",
             run_dir,
             "muru host shop@r42"
         ));
