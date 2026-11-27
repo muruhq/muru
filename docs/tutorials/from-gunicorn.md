@@ -99,6 +99,7 @@ muructl deploy legacy . --entrypoint legacy:app --hold
 
 ```
 muru: release legacy@r2 is ready and held: not serving
+muru: muructl preview legacy@r2 opens a preview of it
 ```
 
 `r2` runs `legacy.py` unchanged, in the project's virtualenv, on Muru's
@@ -123,11 +124,12 @@ muructl rollout canary legacy@r2 --steps 10,50 --hold 30s
 `r2` takes 10% of the requests, judged against gunicorn on its error
 rate over the same seconds, and the loop starts to show
 `Hello from Muru` among the `Hello from gunicorn/26.2.0` lines. While it
-runs, either release can be asked for by name:
+runs, either release can be asked for with its preview header, which
+`muructl preview --header` prints:
 
 ```
-curl -H 'Muru-Preview: r2' http://127.0.0.1:8080/
-curl -H 'Muru-Preview: r1' http://127.0.0.1:8080/
+curl -H "$(muructl preview legacy@r2 --header)" http://127.0.0.1:8080/
+curl -H "$(muructl preview legacy@r1 --header)" http://127.0.0.1:8080/
 ```
 
 Follow it to the end:

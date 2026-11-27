@@ -460,38 +460,6 @@ impl Shared {
     }
 }
 
-/// Remove the preview header, and the preview cookie from the Cookie
-/// headers, leaving the request's other cookies as they were.
-fn without_preview(headers: &mut HeaderMap) {
-    headers.remove(crate::routing::PREVIEW_HEADER);
-
-    let cookies: Vec<String> = headers
-        .get_all(http::header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(';')
-                .map(str::trim)
-                .filter(|pair| {
-                    pair.split_once('=')
-                        .is_none_or(|(name, _)| name.trim() != crate::routing::PREVIEW_COOKIE)
-                })
-                .collect::<Vec<_>>()
-                .join("; ")
-        })
-        .filter(|value| !value.is_empty())
-        .collect();
-
-    headers.remove(http::header::COOKIE);
-
-    for value in cookies {
-        if let Ok(value) = HeaderValue::from_str(&value) {
-            headers.append(http::header::COOKIE, value);
-        }
-    }
-}
-
 /// Whether the client said it takes trailers, as a gRPC client does.
 fn wants_trailers(headers: &HeaderMap) -> bool {
     headers
@@ -1267,14 +1235,6 @@ pub async fn handle(
     let host = requested_host(parts, context);
     let mut headers = outgoing_headers(parts, context, &host, upgrade.is_some());
 
-    // Section 4.21: the preview that chose the detour is the daemon's,
-    // and carries its secret, so neither the run's edge nor the
-    // application sees it.
-
-    if shared.detour {
-        without_preview(&mut headers);
-    }
-
     // Section 4.21: the run is told how the request reached it, whether
     // by its preview, and under which path its route lies. The client's
     // own header went with the other X-Muru headers.
@@ -1740,8 +1700,9 @@ fn requested_host(parts: &http::request::Parts, context: &Context<'_>) -> String
 }
 
 /// The request headers as the upstream gets them: the client's, less
-/// hop-by-hop ones, names with underscores and X-Muru headers, with the
-/// forwarding headers and the request identifier added.
+/// hop-by-hop ones, names with underscores, X-Muru headers and the
+/// preview header and cookie, which carry a release's secret (section
+/// 4.22), with the forwarding headers and the request identifier added.
 fn outgoing_headers(
     parts: &http::request::Parts,
     context: &Context<'_>,
@@ -1758,10 +1719,22 @@ fn outgoing_headers(
         if (crate::is_hop_by_hop(text, &named) && !kept_for_upgrade)
             || text.contains('_')
             || text.starts_with("x-muru-")
+            || crate::preview::is_header(text)
             || name == HOST
             || name == CONTENT_LENGTH
             || name == EXPECT
         {
+            continue;
+        }
+
+        if name == http::header::COOKIE {
+            let kept = crate::preview::cookies_without(value.as_bytes())
+                .and_then(|kept| HeaderValue::from_bytes(&kept).ok());
+
+            if let Some(kept) = kept {
+                headers.append(name.clone(), kept);
+            }
+
             continue;
         }
 
@@ -2255,30 +2228,6 @@ mod tests {
 
         second.end_relays();
         assert!(*relaying.borrow());
-    }
-
-    #[test]
-    fn a_detour_gets_no_preview_header_or_cookie_and_keeps_the_other_cookies() {
-        let mut headers = HeaderMap::new();
-        headers.insert("muru-preview", HeaderValue::from_static("dev-7f3a.0f"));
-        headers.append(
-            http::header::COOKIE,
-            HeaderValue::from_static("session=abc; muru_preview=dev-7f3a.0f; theme=dark"),
-        );
-        headers.append(
-            http::header::COOKIE,
-            HeaderValue::from_static("muru_preview=dev-7f3a.0f"),
-        );
-
-        without_preview(&mut headers);
-
-        assert!(!headers.contains_key("muru-preview"));
-        let cookies: Vec<&str> = headers
-            .get_all(http::header::COOKIE)
-            .iter()
-            .map(|value| value.to_str().unwrap())
-            .collect();
-        assert_eq!(cookies, ["session=abc; theme=dark"]);
     }
 
     #[test]

@@ -24,6 +24,7 @@ mod log_format;
 mod mcp;
 mod open;
 mod places;
+mod preview;
 mod print_config;
 mod processes;
 mod project_commands;
@@ -271,6 +272,11 @@ enum Command {
     /// Open the project's application, an application on a daemon, or an
     /// instance's dashboard in the browser on this machine.
     Open(Box<open::OpenArgs>),
+
+    /// Preview a release before it takes traffic: open a one-time entry
+    /// link to it in the browser, print the link, or print the
+    /// Muru-Preview header that reaches it.
+    Preview(Box<preview::PreviewArgs>),
 
     /// Look into a release's workers (status, stacks, tasks, inspect),
     /// and collect diagnostics: a report for a bug report, a bundle of
@@ -1138,7 +1144,7 @@ fn running(command: &Command) -> admin::Running {
             daemon_only: args.app().is_some(),
             ..admin::Running::default()
         },
-        Command::Detour { .. } => admin::Running {
+        Command::Detour { .. } | Command::Preview(_) => admin::Running {
             daemon_only: true,
             ..admin::Running::default()
         },
@@ -1314,7 +1320,6 @@ fn main() -> anyhow::Result<()> {
         Command::Detour { command } => match command {
             detour::DetourCommand::Run(args) => runtime.block_on(detour::run(*args)),
             detour::DetourCommand::Traffic(args) => runtime.block_on(detour::traffic(args)),
-            detour::DetourCommand::Preview(args) => runtime.block_on(detour::preview(args)),
             detour::DetourCommand::List(args) => runtime.block_on(detour::list(args)),
         },
         Command::Serve(args) => runtime.block_on(serve::serve(*args)),
@@ -1368,6 +1373,7 @@ fn main() -> anyhow::Result<()> {
         Command::Up(args) => runtime.block_on(admin::up(args)),
         Command::Debug { command } => runtime.block_on(admin::debug(command)),
         Command::Open(args) => runtime.block_on(open::open(*args)),
+        Command::Preview(args) => runtime.block_on(preview::preview(*args)),
         Command::Doctor(args) => exit_with(runtime, doctor::doctor(*args)),
         Command::Instance { command } => match command {
             instances::InstanceCommand::List(args) => exit_with(runtime, instances::list(args)),
@@ -4918,7 +4924,7 @@ async fn run_with(
             "traffic: {}{}",
             detour::takes(&traffic, &mode.app, &paths),
             if traffic == "preview" {
-                "; muructl detour preview gives an entry link"
+                "; muructl preview gives an entry link"
             } else {
                 ""
             }

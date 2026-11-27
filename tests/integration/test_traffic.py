@@ -105,12 +105,12 @@ sticky_grace = "2s"
     # The sticky cookie holds whatever the bucket says, and a preview pins
     # a release for the request alone.
 
+    r1, r2 = daemon.preview("shop@r1"), daemon.preview("shop@r2")
+
     for n in range(20):
         assert served_by(daemon, Cookie=f"muru_id=client-{n}; muru_release=r1")[0] == "r1"
-        assert served_by(daemon, Cookie=f"muru_id=client-{n}; muru_preview=r2")[0] == "r2"
-        assert (
-            served_by(daemon, **{"Muru-Preview": "r1", "Cookie": f"muru_id=client-{n}"})[0] == "r1"
-        )
+        assert served_by(daemon, Cookie=f"muru_id=client-{n}; muru_preview={r2}")[0] == "r2"
+        assert served_by(daemon, **{"Muru-Preview": r1, "Cookie": f"muru_id=client-{n}"})[0] == "r1"
 
     # At 0% a release takes only previews and sticky clients.
 
@@ -126,8 +126,8 @@ sticky_grace = "2s"
     )
     assert all(served_by(daemon, Cookie=f"muru_id=fresh-{n}")[0] == "r2" for n in range(50))
     assert served_by(daemon, Cookie="muru_release=r1")[0] == "r1"
-    assert served_by(daemon, **{"Muru-Preview": "r1"})[0] == "r1"
-    named = daemon.request("/", host="shop.test", headers={"Muru-Preview": "r1"})
+    assert served_by(daemon, **{"Muru-Preview": r1})[0] == "r1"
+    named = daemon.request("/", host="shop.test", headers={"Muru-Preview": r1})
     assert named.header_values("Muru-Preview") == []
     unknown = daemon.request("/", host="shop.test", headers={"Muru-Preview": "r9"})
     assert json.loads(unknown.body)["release"] in ("r1", "r2")
@@ -150,6 +150,180 @@ sticky_grace = "2s"
 
     assert states(daemon) == {"shop@r1": "retained", "shop@r2": "ready"}
     assert served_by(daemon, Cookie="muru_release=r1")[0] == "r2"
+
+
+def test_a_sticky_cookie_reaches_only_what_the_policy_names(daemon: Daemon, tmp_path: Path) -> None:
+    # Issue 955: a held release takes no traffic, and naming it in the
+    # sticky cookie does not reach it until the policy gives it a share.
+
+    daemon.deploy("shop", SHOP)
+    daemon.deploy("shop", SHOP, "--hold")
+    assert states(daemon) == {"shop@r1": "ready", "shop@r2": "ready"}
+
+    applied = daemon.muructl(
+        "apply", "-f", str(policy_file(tmp_path, "[route.traffic]\nsticky = true\n"))
+    )
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert served_by(daemon, Cookie="muru_release=r2")[0] == "r1"
+    assert served_by(daemon, Cookie="muru_release=r1")[0] == "r1"
+
+    applied = daemon.muructl(
+        "apply",
+        "-f",
+        str(policy_file(tmp_path, "[route.traffic]\nsplit = { r2 = 0 }\nsticky = true\n")),
+    )
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert served_by(daemon, Cookie="muru_release=r2")[0] == "r2"
+    assert served_by(daemon)[0] == "r1"
+
+
+def answered(daemon: Daemon, path: str = "/", **headers: str) -> tuple[object, ...]:
+    """What a client can tell from a response: the release that served it,
+    whether its preview was ignored, and the cookies set."""
+
+    response = daemon.request(path, host="shop.test", headers=headers)
+    assert response.status == 200, response.body
+    return (
+        json.loads(response.body)["release"],
+        response.header_values("Muru-Preview"),
+        response.header_values("Set-Cookie"),
+    )
+
+
+def test_a_preview_needs_the_releases_secret(daemon: Daemon, tmp_path: Path) -> None:
+    # Issue 928: r2 is held, and nothing but its ID and its preview secret
+    # together reaches it.
+
+    # With --open-preview the held release is opened in the browser as it
+    # is deployed, which $BROWSER names here, by an entry link.
+
+    opened = tmp_path / "opened"
+    launcher = tmp_path / "browser"
+    launcher.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{opened}'\n")
+    launcher.chmod(0o755)
+    daemon.deploy("shop", SHOP)
+    held = daemon.muructl(
+        "deploy", "shop", str(SHOP), "--hold", "--open-preview", env={"BROWSER": str(launcher)}
+    )
+    assert held.stdout.startswith("muru: release shop@r2 is ready and held: not serving\n")
+    assert "in preview of shop@r2" in held.stdout + held.stderr, held.stderr
+    deadline = time.monotonic() + 20
+
+    while not opened.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    first = opened.read_text().split()[0].split(f":{daemon.port}", 1)[1]
+    entered = daemon.request(first)
+    assert (entered.header("set-cookie") or "").startswith("muru_preview=r2."), entered.headers
+    assert "muructl preview shop@r2 previews it" in daemon.muructl("release", "list").stdout
+    applied = daemon.muructl("apply", "-f", str(policy_file(tmp_path, "")))
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+
+    # The application alone means its one held release.
+
+    value = daemon.preview("shop")
+    release, _, secret = value.rpartition(".")
+    assert release == "r2" and len(secret) == 32 and int(secret, 16) >= 0
+    assert daemon.preview("shop@r2") == value, "the secret is kept"
+    other = daemon.preview("shop@r1").rpartition(".")[2]
+    assert other != secret
+
+    # The header and the cookie preview it, the serving release too, and
+    # the application sees neither, with its other cookies as they were.
+
+    assert answered(daemon, **{"Muru-Preview": value}) == ("r2", [], [])
+    assert answered(daemon, Cookie=f"muru_preview={value}") == ("r2", [], [])
+    assert answered(daemon, **daemon.preview_header("shop@r1")) == ("r1", [], [])
+    seen = daemon.request(
+        "/preview-seen",
+        host="shop.test",
+        headers={"Muru-Preview": value, "Cookie": f"a=b; muru_preview={value}; c=d"},
+    )
+    assert json.loads(seen.body) == {"release": "r2", "header": None, "cookie": "a=b; c=d"}
+
+    # Every miss is one answer: a bare ID, a wrong secret, another
+    # release's secret, a release that does not exist with and without a
+    # secret. Nothing says whether the release exists.
+
+    misses = ["r2", f"r2.{secret[:-1]}0", f"r2.{secret[:-1]}1", f"r2.{other}", "r9", f"r9.{secret}"]
+    by_header = {miss: answered(daemon, **{"Muru-Preview": miss}) for miss in misses}
+    assert all(got == ("r1", ["ignored"], []) for got in by_header.values()), by_header
+    by_cookie = {miss: answered(daemon, Cookie=f"muru_preview={miss}") for miss in misses}
+    expired = "muru_preview=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+    assert all(got == ("r1", ["ignored"], [expired]) for got in by_cookie.values()), by_cookie
+
+    # An entry link works once and sets the cookie; a link is refused a
+    # life of more than an hour, and one past its time enters nothing.
+
+    def entry(*arguments: str) -> str:
+        link = daemon.muructl("preview", "shop@r2", "--print", *arguments).stdout.strip()
+        assert link.startswith(f"http://shop.test:{daemon.port}/_muru/preview/"), link
+        return link.split(f":{daemon.port}", 1)[1]
+
+    link = entry("--any-name")
+    entered = daemon.request(link, host="shop.test")
+    assert entered.status == 303 and entered.header("location") == "/"
+    assert (entered.header("set-cookie") or "").split(";")[0] == f"muru_preview={value}"
+    again = daemon.request(link, host="shop.test")
+    assert again.status == 404 and b"muructl preview gives a new one" in again.body
+
+    asked = daemon.muructl("preview", "shop@r2", "--valid-for", "10m", "--any-name", "--json")
+    assert json.loads(asked.stdout)["valid_for_ms"] == 600_000
+    refused = daemon.muructl("preview", "shop@r2", "--valid-for", "2h", check=False)
+    assert refused.returncode != 0 and "lasts at most an hour" in refused.stderr, refused.stderr
+    brief = entry("--any-name", "--valid-for", "1s")
+    time.sleep(1.2)
+    assert daemon.request(brief, host="shop.test").status == 404
+
+    # A new secret: what was given out before previews nothing, a link
+    # made before sets the new cookie, and the event says nothing secret.
+
+    earlier = entry("--any-name")
+    renewed = daemon.muructl("preview", "shop@r2", "--new-secret", "--header")
+    assert "shop@r2 has a new preview secret" in renewed.stderr
+    fresh = renewed.stdout.strip().removeprefix("Muru-Preview: ")
+    assert fresh.startswith("r2.") and fresh != value
+    assert answered(daemon, **{"Muru-Preview": value}) == ("r1", ["ignored"], [])
+    assert answered(daemon, **{"Muru-Preview": fresh}) == ("r2", [], [])
+    entered = daemon.request(earlier, host="shop.test")
+    assert (entered.header("set-cookie") or "").split(";")[0] == f"muru_preview={fresh}"
+    assert "release.preview_secret_changed" in daemon.events()
+
+    # A second held release says how to preview it, and makes the
+    # application alone ambiguous: the refusal names both.
+
+    third = daemon.muructl("deploy", "shop", str(SHOP), "--hold")
+    assert third.stdout.strip() == "muru: release shop@r3 is ready and held: not serving"
+    assert third.stderr.strip() == "muru: muructl preview shop@r3 opens a preview of it"
+    refused = daemon.muructl("preview", "shop", "--header", check=False)
+    assert refused.returncode != 0, refused.stdout
+    assert "shop has 2 held releases" in refused.stderr, refused.stderr
+    assert "shop@r2, shop@r3" in refused.stderr, refused.stderr
+
+    # A release that takes no requests is not previewed, and an unknown
+    # one is refused.
+
+    for target, why in (("shop@r9", "there is no release shop@r9"), ("nothing", "no application")):
+        refused = daemon.muructl("preview", target, "--header", check=False)
+        assert refused.returncode != 0 and why in refused.stderr, refused.stderr
+
+    # None of the secrets is in what the daemon shows or writes: the
+    # listings and their JSON, the events and the logs.
+
+    shown = [
+        daemon.muructl("release", "list", "--json").stdout,
+        daemon.muructl("release", "show", "shop@r2", "--json").stdout,
+        daemon.muructl("release", "show", "shop@r2").stdout,
+        daemon.muructl("events", "--json").stdout,
+        daemon.muructl("status").stdout,
+        daemon.log(),
+    ]
+    written = [path.read_bytes() for path in (tmp_path / "logs").rglob("*") if path.is_file()]
+    assert written, "the daemon wrote no logs"
+
+    for given in (secret, other, fresh.rpartition(".")[2]):
+        assert not any(given in text for text in shown), given
+        assert not any(given.encode() in content for content in written), given
 
 
 def test_header_and_client_keys_and_invalid_policies(daemon: Daemon, tmp_path: Path) -> None:

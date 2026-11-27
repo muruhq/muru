@@ -4879,9 +4879,14 @@ pub struct DeployArgs {
     no_wait: bool,
 
     /// Start the release but leave traffic where it is, for a preview
-    /// with the Muru-Preview header or a rollout.
+    /// with muructl preview or a rollout.
     #[arg(long)]
     hold: bool,
+
+    /// With --hold, open an entry link to the release's preview in the
+    /// browser once it is ready.
+    #[arg(long, requires = "hold", conflicts_with_all = ["no_wait", "dry_run"])]
+    open_preview: bool,
 
     /// Deploy although an overlay freezes the application's deploys;
     /// recorded as an event.
@@ -5351,7 +5356,8 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
     ))
     .map_err(anyhow::Error::msg)?;
 
-    let mut client = client::connect(&args.socket.endpoint()?).await?;
+    let endpoint = args.socket.endpoint()?;
+    let mut client = client::connect(&endpoint).await?;
     let python = args
         .settings
         .python
@@ -5421,6 +5427,25 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
                 .map(|origin| format!(", {origin}"))
                 .unwrap_or_default()
         );
+    }
+
+    // A held release is there to be tried: say how, and with
+    // --open-preview do it. The preview's secret is never printed here.
+
+    if args.hold && !args.no_wait && !release.serving {
+        let name = format!("{}@{}", release.app, release.id);
+
+        if !args.open_preview {
+            eprintln!("muru: muructl preview {name} opens a preview of it");
+        } else if let Err(error) =
+            crate::preview::open_for(&endpoint, &release.app, &release.id, None, false).await
+        {
+            eprintln!("muru: no preview link: {error:#}; muructl preview {name} gives one");
+        } else {
+            // The browser is given a moment to start before muructl exits.
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     Ok(0)
@@ -9254,7 +9279,7 @@ pub struct ApplyArgs {
     override_freeze: bool,
 
     /// Start the releases the apply adds but leave traffic where it is,
-    /// for a preview with the Muru-Preview header or a rollout; refused
+    /// for a preview with muructl preview or a rollout; refused
     /// when an application's serving key would move its traffic.
     #[arg(long)]
     hold: bool,
@@ -9311,7 +9336,12 @@ pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
         print_answer(&report)?;
     } else {
         print_report(&report, args.dry_run);
+
+        if args.hold && !args.dry_run && !args.no_wait {
+            eprintln!("muru: muructl preview APP@RELEASE opens a preview of a held release");
+        }
     }
+
     Ok(exit_code(&report, args.dry_run))
 }
 

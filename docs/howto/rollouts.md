@@ -14,14 +14,28 @@ application serving (see [virtual hosts](virtual-hosts.md)).
 ```console
 $ muructl deploy shop /srv/shop --hold
 muru: release shop@r2 is ready and held: not serving
+muru: muructl preview shop@r2 opens a preview of it
 ```
 
 With `--hold` the release is started and left running without traffic.
-It can be checked through a preview, with the `Muru-Preview: r2` header
-or a `muru_preview=r2` cookie, which routes a request to it whatever the
-traffic policy says (see [traffic between releases](traffic.md)). A held
-release stays until a rollout or a promotion takes it, or `muructl drain`
-stops it.
+It is checked through a preview, which routes a request to it whatever
+the traffic policy says:
+
+```console
+$ muructl preview shop@r2
+muru: opened https://shop.example.com/ in preview of shop@r2
+$ curl -H "$(muructl preview shop@r2 --header)" https://shop.example.com/
+```
+
+`muructl preview` opens a one-time entry link in the browser, which
+gives it the preview cookie, and `--header` prints the `Muru-Preview`
+header for curl or a test client. Both carry the release's preview
+secret, so the release's ID alone reaches nothing (see [traffic between
+releases](traffic.md#previews)). `muructl deploy --hold --open-preview`
+opens the link as soon as the release is ready.
+
+A held release stays until a rollout or a promotion takes it, or
+`muructl drain` stops it.
 
 ## Blue/green
 
@@ -106,7 +120,8 @@ had over the step rolls the candidate back.
 
 A probe is a URL the daemon requests through the edge every 5 seconds
 while the rollout runs, once from the candidate and once from the
-baseline, each by preview with the `Muru-Preview` header. A probe passes
+baseline, each as a preview of that release, which the daemon sends
+with the release's preview secret. A probe passes
 with a 2xx or 3xx answer within 5 seconds. Like a crash, a failed probe
 counts at once: one more failure on the candidate than on the baseline
 over the step rolls it back, so a health check failing on both

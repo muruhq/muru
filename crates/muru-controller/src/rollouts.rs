@@ -309,10 +309,11 @@ pub fn check_probe(url: &str) -> Result<(), String> {
     }
 }
 
-/// Request a probe URL from one release by preview: a 2xx or 3xx answer
+/// Request a probe URL from one release by preview, the release's
+/// preview value, `RELEASE.SECRET` (section 4.22): a 2xx or 3xx answer
 /// within the timeout passes, and anything else says how it failed.
-pub async fn probe(client: &ProbeClient, url: &str, release: &str) -> Result<(), String> {
-    probe_host(client, url, None, release).await
+pub async fn probe(client: &ProbeClient, url: &str, preview: &str) -> Result<(), String> {
+    probe_host(client, url, None, preview).await
 }
 
 /// `probe`, with the Host header given rather than the URL's, for a probe
@@ -321,7 +322,7 @@ pub async fn probe_host(
     client: &ProbeClient,
     url: &str,
     host: Option<&str>,
-    release: &str,
+    preview: &str,
 ) -> Result<(), String> {
     let mut request = http::Request::get(url);
 
@@ -330,7 +331,7 @@ pub async fn probe_host(
     }
 
     let request = request
-        .header(muru_edge::routing::PREVIEW_HEADER, release)
+        .header(muru_edge::routing::PREVIEW_HEADER, preview)
         .header(http::header::USER_AGENT, "muru-probe")
         .body(Empty::new())
         .map_err(|error| format!("{url}: {error}"))?;

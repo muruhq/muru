@@ -190,7 +190,9 @@ blog|r1|ready
 
 The copy is one consistent database, taken while the daemon goes on
 using the store, with no write-ahead log beside it. It is never written
-over a file that exists.
+over a file that exists. It leaves out the releases' [preview
+secrets](traffic.md#the-preview-secret), and a daemon started on a copy
+gives each release a new one.
 
 ## What happened last
 

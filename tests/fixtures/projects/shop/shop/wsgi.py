@@ -234,6 +234,22 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
 
     print(f"shop: served {environ['PATH_INFO']}")
 
+    # Section 4.22: what the application sees of a preview, which is
+    # nothing: the edge takes the header and the cookie off.
+
+    if environ["PATH_INFO"] == "/preview-seen":
+        body = json.dumps(
+            {
+                "release": context().release,
+                "header": environ.get("HTTP_MURU_PREVIEW"),
+                "cookie": environ.get("HTTP_COOKIE"),
+            }
+        ).encode()
+        start_response(
+            "200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+        )
+        return [body]
+
     if environ["PATH_INFO"].endswith("/error"):
         raise RuntimeError("deliberate failure")
 

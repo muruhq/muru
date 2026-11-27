@@ -208,7 +208,7 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
 
         assert not served(daemon)["instance"].startswith("detour:")
         assert not served(daemon, **{"Muru-Preview": release})["instance"].startswith("detour:")
-        header = daemon.muructl("detour", "preview", "--header", cwd=project).stdout.strip()
+        header = daemon.muructl("preview", "--header", cwd=project).stdout.strip()
         name, value = header.split(": ", 1)
         assert name == "Muru-Preview" and value.startswith(f"{release}.")
         preview = {"Muru-Preview": value}
@@ -216,7 +216,7 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         # A one-time entry link sets the preview cookie and leads to the
         # application, once.
 
-        link = daemon.muructl("detour", "preview", "--print", cwd=project).stdout.strip()
+        link = daemon.muructl("preview", "--print", cwd=project).stdout.strip()
         entry = urllib.parse.urlsplit(link).path
         assert entry.startswith("/_muru/preview/")
         entered = daemon.request(entry)
@@ -465,10 +465,10 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         # A preview link is for a name that reaches this machine, or the
         # name asked for.
 
-        link = daemon.muructl("detour", "preview", "--print", cwd=project).stdout.strip()
+        link = daemon.muructl("preview", "--print", cwd=project).stdout.strip()
         assert urllib.parse.urlsplit(link).hostname in ("localhost", "files.localhost"), link
         link = daemon.muructl(
-            "detour", "preview", "--print", "--name", "bob.wild.test", "--any-name", cwd=project
+            "preview", "--print", "--name", "bob.wild.test", "--any-name", cwd=project
         ).stdout.strip()
         assert link.startswith(f"http://bob.wild.test:{port}/_muru/preview/"), link
 
@@ -531,7 +531,7 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
             detour.log()
         )
         assert "--mounts release" in detour.log()
-        bare_value = daemon.muructl("detour", "preview", "--header", cwd=bare).stdout
+        bare_value = daemon.muructl("preview", "--header", cwd=bare).stdout
         bare_preview = dict([bare_value.strip().split(": ", 1)])
         own = served(daemon, "/ws/x", **bare_preview)
         assert own["instance"].startswith("detour:")
@@ -542,7 +542,7 @@ def test_a_detour_is_previewed_served_through_and_closed(tmp_path: Path) -> None
         detour.wait_for_log("on detour detoured@")
         assert "serving the mounts of the serving release detoured@" in detour.log()
         assert "warning: the serving release" not in detour.log()
-        bare_value = daemon.muructl("detour", "preview", "--header", cwd=bare).stdout
+        bare_value = daemon.muructl("preview", "--header", cwd=bare).stdout
         bare_preview = dict([bare_value.strip().split(": ", 1)])
 
         with websockets.connect(

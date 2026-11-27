@@ -550,8 +550,9 @@ muructl apply -f muru.deploy.toml --hold
 muructl rollout bluegreen shop@2026-11-06
 ```
 
-A held release takes no traffic and is reached with the `Muru-Preview`
-header, until a [rollout](rollouts.md) or a promotion moves traffic to
+A held release takes no traffic and is reached through a
+[preview](traffic.md#previews), as `muructl preview APP@RELEASE` opens
+one, until a [rollout](rollouts.md) or a promotion moves traffic to
 it. `--hold` holds every release the apply adds, in every application,
 and the plan and the report say `held` of each:
 
@@ -648,7 +649,7 @@ Applied while r1 serves, this records r2 and leaves it stopped, since
 nothing serves it or names it. A route whose traffic split or client
 classes in the same files name r2, even at 0%, starts it held instead:
 it does not take the application's traffic, and serves only that share
-and requests that name it with the `Muru-Preview` header. So does an
+and [previews](traffic.md#previews) of it. So does an
 [overlay](overlays.md) in the same files that pins r2, splits to it or
 waits for it with `release_ready`, so that the overlay can activate. A
 stopped release is started by a rollout, a promotion or a split that

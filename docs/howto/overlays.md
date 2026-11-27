@@ -313,7 +313,8 @@ cleared`, and `muructl overlay list` shows a skip with no end as
 
 `preconditions.probe` is a path that release must answer with a 2xx or
 3xx response as well, asked through the edge as a preview of the release,
-at the host of the first route the overlay changes:
+which the daemon sends with the release's preview secret, at the host of
+the first route the overlay changes:
 
 ```toml
 preconditions = { release_ready = 'r43', probe = '/healthz' }

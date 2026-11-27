@@ -108,7 +108,7 @@ def test_the_first_canary_tutorial(tmp_path: Path) -> None:
                 "20",
                 "--approve-each-step",
             )
-            preview = daemon.request("/", headers={"Muru-Preview": "r5"})
+            preview = daemon.request("/", headers=daemon.preview_header("hello@r5"))
             assert preview.body == b"Howdy from hello@r5\n"
 
             deadline = time.monotonic() + 30

@@ -97,9 +97,11 @@ to the application's serving release. A route with one decides in this
 order, and the first that applies wins:
 
 1. **A preview.** A `Muru-Preview` header or `muru_preview` cookie
-   naming a release the edge has for the application sends the request
-   there. This is how a held release, or one with a share of 0, is
-   checked before clients reach it.
+   carrying a release's ID and its preview secret sends the request to
+   that release, when the edge has it for the application. This is how a
+   held release, or one with a share of 0, is checked before clients
+   reach it. The secret is what `muructl preview` gives out, so a
+   release's ID alone previews nothing.
 
 2. **A client class.** When the request's [client
    class](../howto/client-classes.md) is given a release in the policy's
@@ -107,7 +109,8 @@ order, and the first that applies wins:
    class.
 
 3. **A sticky cookie.** With `sticky = true`, a `muru_release` cookie
-   naming a release the route still has sends the client back to it.
+   naming the serving release, a release the policy names or one in its
+   sticky grace sends the client back to it.
 
 4. **The split.** The client's key, the anonymous id cookie the edge
    issues unless the policy names a header, a cookie or the client's
