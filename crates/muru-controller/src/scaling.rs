@@ -653,6 +653,24 @@ impl Scaler {
         self.last = Some((now, "unpinned".to_owned()));
     }
 
+    /// Issue 964: keep the group at the count its release started with,
+    /// which it stays at while the release takes no traffic. A pin
+    /// stands over it. Returns whether the count wanted changed.
+    pub fn hold_at(&mut self, count: u32, now: Instant) -> bool {
+        if self.pinned.is_some() || self.desired == count {
+            return false;
+        }
+
+        self.desired = count;
+        self.out_since = None;
+        self.requested_at = None;
+        self.last = Some((
+            now,
+            format!("held at its initial count of {count}: the release takes no traffic"),
+        ));
+        true
+    }
+
     /// Section 7.5: the floor, ceiling and scale-in hold that schedules
     /// and overlays set now, or none.
     pub fn set_capacity(&mut self, capacity: Option<Capacity>) {
@@ -1386,6 +1404,10 @@ pub struct GroupScaling {
     /// The group's `max_surge` (section 7.8): the most its surge
     /// allowance can be.
     pub max_surge: u32,
+    /// The count the group started with, when its release was deployed
+    /// with one below its `processes` (issue 964): the count it keeps
+    /// while the release takes no traffic.
+    pub initial: Option<u32>,
 }
 
 /// What one second's observation of a group comes to.
@@ -1427,6 +1449,7 @@ impl GroupScaling {
             hard_limit: None,
             denied: None,
             max_surge: muru_config::DEFAULT_MAX_SURGE,
+            initial: None,
         }
     }
 
@@ -1996,6 +2019,52 @@ mod tests {
 
         group.scaler.unpin(group.start + MINUTE);
         group.run(MINUTE, MINUTE, |_| 8.0);
+        assert!(!group.outs().is_empty());
+    }
+
+    // Issue 964: a group kept at the count its release started with.
+
+    #[test]
+    fn a_group_is_held_at_its_initial_count_under_a_pin_and_grows_once_released() {
+        let fixed = ScalingSpec {
+            max_workers: 4,
+            scale_out_window_ms: 1000,
+            ..ScalingSpec::default()
+        };
+        assert!(fixed.is_static());
+        let mut group = Group::new(fixed, 1, 1.0);
+        let start = group.start;
+
+        // Held, the count wanted is the initial one and nothing is
+        // decided; holding it again changes nothing.
+
+        assert!(!group.scaler.hold_at(1, start));
+        assert_eq!(group.scaler.desired(), 1);
+
+        // A pin stands over the hold, and the count comes back to the
+        // initial one when the pin is lifted.
+
+        group.scaler.pin(3, start);
+        assert!(!group.scaler.hold_at(1, start));
+        assert_eq!(group.scaler.desired(), 3);
+        group.scaler.unpin(start);
+        assert!(group.scaler.hold_at(1, start));
+        assert_eq!(group.scaler.desired(), 1);
+        assert!(
+            group
+                .scaler
+                .status(start)
+                .last
+                .is_some_and(|(_, what)| what.contains("held at its initial count of 1"))
+        );
+
+        // No longer held, the group is brought to the count it is
+        // declared with as a group under its static count is, which the
+        // budget admits as a scale-up.
+
+        group.ready = 1;
+        group.run(Duration::ZERO, MINUTE, |_| 0.0);
+        assert_eq!(group.scaler.desired(), 4);
         assert!(!group.outs().is_empty());
     }
 

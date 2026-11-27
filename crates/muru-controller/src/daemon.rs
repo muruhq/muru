@@ -9,7 +9,7 @@
 //! previous release, drains and events. Re-adoption of hosts across daemon
 //! restarts, retention of drained releases and the rest of phase 2 follow.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,8 +26,8 @@ use crate::host::{HostProcess, HostSpec};
 use crate::locations::{HostDirs, Locations};
 use crate::logs::Logs;
 use crate::model::{
-    AccessLogSpec, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutState,
-    RolloutStep, now_unix_ms, valid_name,
+    AccessLogSpec, GroupSpec, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates,
+    RolloutState, RolloutStep, now_unix_ms, valid_name,
 };
 use crate::rollouts::{Counters, Verdict, judge};
 use crate::scaling::{Decision, ScaleStatus};
@@ -8133,7 +8133,7 @@ impl Daemon {
             factory: spec.factory,
             reflection: spec.reflection,
             handoff: spec.handoff,
-            processes: spec.processes as usize,
+            processes: spec.starting_processes() as usize,
             threads: spec.threads as usize,
             sync_threads: spec.sync_threads as usize,
             concurrency: spec.concurrency as usize,
@@ -8184,7 +8184,7 @@ impl Daemon {
                 .iter()
                 .map(|group| crate::host::HostGroup {
                     name: group.name.clone(),
-                    processes: group.processes as usize,
+                    processes: group.starting_processes() as usize,
                     threads: group.threads as usize,
                     sync_threads: group.sync_threads as usize,
                     concurrency: group.concurrency as usize,
@@ -8370,7 +8370,7 @@ impl Daemon {
                 host.group_sockets
                     .iter()
                     .find(|(name, _)| name == &group.name)
-                    .is_some_and(|(_, sockets)| sockets.len() < group.processes as usize)
+                    .is_some_and(|(_, sockets)| sockets.len() < group.starting_processes() as usize)
             })
             .map(|group| format!("group {}", group.name))
             .collect();
@@ -11069,6 +11069,7 @@ impl Daemon {
             .collect();
         let mut asks = Vec::new();
         let mut reasons: HashMap<(String, String, String), (u32, String)> = HashMap::new();
+        let small = self.starting_small();
 
         for ((app, id), running) in &mut self.running {
             // A retained release is at its warm floor (section 9.1), not
@@ -11079,8 +11080,18 @@ impl Daemon {
             }
 
             let subject = format!("{app}@{id}");
+            let held_small = small.contains(&(app.clone(), id.clone()));
 
             for index in 0..running.scalers.len() {
+                // Issue 964: a release that takes no traffic keeps each
+                // group at the count it started with, whatever its
+                // count or policy says, until it is pinned or serves.
+
+                if held_small && let Some(initial) = running.scalers[index].initial {
+                    running.scalers[index].scaler.hold_at(initial, now);
+                    continue;
+                }
+
                 let cost = running.worker_cost(&running.scalers[index], fallback);
                 let name = running.scalers[index].name.clone();
                 let Some(sockets) = running.group_sockets(&name) else {
@@ -11198,6 +11209,38 @@ impl Daemon {
             .write()
             .expect("defined names poisoned")
             .budget = view;
+    }
+
+    /// Issue 964: the running releases deployed with an initial count
+    /// that take no share of their application's traffic, whose groups
+    /// stay at that count. Empty, without reading the routes, when no
+    /// release was started small.
+    fn starting_small(&self) -> HashSet<(String, String)> {
+        let started: Vec<&(String, String)> = self
+            .running
+            .iter()
+            .filter(|(_, running)| running.retained_until.is_none())
+            .filter(|(_, running)| running.scalers.iter().any(|group| group.initial.is_some()))
+            .map(|(key, _)| key)
+            .collect();
+
+        if started.is_empty() {
+            return HashSet::new();
+        }
+
+        let routes = self.effective().0;
+        let rollouts = self.store.rollouts(None).unwrap_or_default();
+
+        started
+            .into_iter()
+            .filter(|(app, id)| {
+                self.running
+                    .get(&(app.clone(), id.clone()))
+                    .is_some_and(|running| running.held)
+                    || self.traffic_share(app, id, &routes, &rollouts) == 0
+            })
+            .cloned()
+            .collect()
     }
 
     /// Section 7.5: each window of a schedule or overlay that raises a
@@ -11559,12 +11602,12 @@ impl Daemon {
             return;
         }
 
-        let starting = release.spec.processes
+        let starting = release.spec.starting_processes()
             + release
                 .spec
                 .groups
                 .iter()
-                .map(|group| group.processes)
+                .map(GroupSpec::starting_processes)
                 .sum::<u32>();
         let used = self.budget_usage();
         let mut message = "a request is waiting: starting its host again".to_owned();
@@ -14804,7 +14847,9 @@ fn scalers_for(
         let current = groups
             .iter()
             .find(|record| record.name == group.name)
-            .map_or(group.processes as usize, |record| record.sockets.len());
+            .map_or(group.starting_processes() as usize, |record| {
+                record.sockets.len()
+            });
         scalers.push(GroupScaling::new(
             &group.name,
             group.scaling.clone(),
@@ -14819,6 +14864,7 @@ fn scalers_for(
 
     for scaling in &mut scalers {
         scaling.max_surge = spec.group_swap(&scaling.name).0;
+        scaling.initial = spec.group_initial(&scaling.name);
         scaling.hard_limit = spec
             .groups
             .iter()

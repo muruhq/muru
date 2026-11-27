@@ -460,6 +460,18 @@ pub struct GroupSpec {
     /// are swapped; the release's when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_unavailable: Option<u32>,
+    /// The workers the group starts with and keeps while the release
+    /// takes no traffic, when that is fewer than `processes` (issue 964).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_processes: Option<u32>,
+}
+
+impl GroupSpec {
+    /// The workers the group's host forks at start: its initial count,
+    /// or its `processes`.
+    pub fn starting_processes(&self) -> u32 {
+        self.initial_processes.unwrap_or(self.processes)
+    }
 }
 
 /// A worker group's own timeouts (section 7.1): the ones a group may
@@ -611,6 +623,12 @@ pub struct ReleaseSpec {
     /// are swapped.
     #[serde(default)]
     pub max_unavailable: u32,
+    /// The workers the default group starts with and keeps while the
+    /// release takes no traffic, when that is fewer than `processes`
+    /// (issue 964). `processes` stays the count the release is declared
+    /// with, which it takes once it serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_processes: Option<u32>,
     /// The timeouts the host enforces on its workers (section 7.6).
     #[serde(default)]
     pub timeouts: WorkerTimeouts,
@@ -715,15 +733,36 @@ impl ReleaseSpec {
         }
     }
 
+    /// The workers the default group's host forks at start: the
+    /// release's initial count, or its `processes` (issue 964).
+    pub fn starting_processes(&self) -> u32 {
+        self.initial_processes.unwrap_or(self.processes)
+    }
+
+    /// The initial count of a group, the default group under its name:
+    /// the workers it keeps while the release takes no traffic. None for
+    /// a group that starts at its `processes`, and for one the release
+    /// does not have.
+    pub fn group_initial(&self, group: &str) -> Option<u32> {
+        if group == muru_edge::routing::DEFAULT_GROUP {
+            return self.initial_processes;
+        }
+
+        self.groups
+            .iter()
+            .find(|known| known.name == group)
+            .and_then(|known| known.initial_processes)
+    }
+
     /// The instrumentation list the host is given (sections 6.15, 6.17
     /// and 6.18): the module that defers imports and records the import
     /// report first when either key is on, then the release's own list.
     pub fn host_instrumentation(&self) -> Vec<muru_config::Instrumentation> {
-        let workers = self.processes as usize
+        let workers = self.starting_processes() as usize
             + self
                 .groups
                 .iter()
-                .map(|group| group.processes as usize)
+                .map(|group| group.starting_processes() as usize)
                 .sum::<usize>();
 
         muru_config::lazy_imports_entry(

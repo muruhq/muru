@@ -5213,8 +5213,10 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                 max_unavailable: group.max_unavailable.unwrap_or(max_unavailable),
                 surge_allowance: live.surge.get(&group.name).map(|surge| surge.allowance),
                 surge_short: surge_short(live.surge.get(&group.name)),
+                initial_processes: group.initial_processes,
             })
             .collect(),
+        initial_processes: release.spec.initial_processes,
         detected_interface,
         websockets,
     }

@@ -35,7 +35,10 @@ releases](traffic.md#previews)). `muructl deploy --hold --open-preview`
 opens the link as soon as the release is ready.
 
 A held release stays until a rollout or a promotion takes it, or
-`muructl drain` stops it.
+`muructl drain` stops it. On a node whose
+[budget](scaling.md#releases-and-the-budget) has no room for it at full
+size, `--initial-processes N` starts it with fewer workers, which it
+keeps until it takes traffic.
 
 ## Blue/green
 

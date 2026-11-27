@@ -439,7 +439,7 @@ impl View {
         let soft_limit = spec.memory.soft_limit;
         let groups = std::iter::once((
             muru_edge::routing::DEFAULT_GROUP,
-            spec.processes,
+            spec.starting_processes(),
             spec.memory.hard_limit,
         ))
         .chain(spec.groups.iter().map(|group| {
@@ -447,7 +447,7 @@ impl View {
                 .memory
                 .as_ref()
                 .map_or(spec.memory.hard_limit, |memory| memory.hard_limit);
-            (group.name.as_str(), group.processes, hard)
+            (group.name.as_str(), group.starting_processes(), hard)
         }));
         let mut total = 0;
         let mut each = None;
@@ -550,6 +550,36 @@ mod tests {
         let unmeasured = |hard, soft| view.cost("shop", "reports", hard, soft).memory;
         assert_eq!(unmeasured(None, Some(80 * MB)), Some(80 * MB));
         assert_eq!(unmeasured(None, None), Some(50 * MB));
+    }
+
+    // Issue 964: a release deployed with an initial count is checked at
+    // it, where it was checked at the count it is declared with.
+
+    #[test]
+    fn a_release_is_checked_at_the_count_it_starts_with() {
+        let view = View {
+            budget: Budget {
+                memory: Some(1000 * MB),
+                ..Budget::default()
+            },
+            used: Usage {
+                memory: 600 * MB,
+                ..Usage::default()
+            },
+            fallback: Some(200 * MB),
+            ..View::default()
+        };
+        let mut spec = crate::store::tests::spec();
+        spec.processes = 4;
+
+        // Four workers and a host, each at the node's mean.
+
+        assert_eq!(view.release_memory("shop", &spec), Some(1000 * MB));
+        assert!(view.release_fits("shop", &spec, 0).is_err());
+
+        spec.initial_processes = Some(1);
+        assert_eq!(view.release_memory("shop", &spec), Some(400 * MB));
+        assert_eq!(view.release_fits("shop", &spec, 0), Ok(()));
     }
 
     fn ask(key: &str, priority: i32, from: u32, to: u32, memory: u64) -> Ask<String> {
