@@ -11685,6 +11685,7 @@ impl Daemon {
             used,
             fallback,
             sources: self.budget_sources(),
+            memory_from_cgroup: self.budget_table.memory.is_none(),
             ..crate::budget::View::default()
         };
 

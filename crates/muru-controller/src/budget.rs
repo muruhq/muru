@@ -392,6 +392,9 @@ pub struct View {
     /// Where the limits the daemon file leaves out come from, such as
     /// ` (memory from memory.max 2.0GB less 205MB of headroom)`, or empty.
     pub sources: String,
+    /// Whether the memory limit is the daemon's cgroup's, the daemon's
+    /// file setting none (issue 961).
+    pub memory_from_cgroup: bool,
 }
 
 impl View {

@@ -402,7 +402,9 @@ a container or under a systemd unit with `MemoryMax=` or `CPUQuota=`:
 `memory` to `memory.max` less a headroom of 10% (at least 128MB), and
 `cpu` to the quota of `cpu.max`. These are read at each decision, so a
 resize of the container applies to the next one, and a value in the
-file wins. `muructl daemon reload` picks up a change to the file. A
+file wins. A node with no memory limit from either has no memory
+budget at all, which [`muructl doctor`](doctor.md#a-node-with-no-memory-limit)
+warns of. `muructl daemon reload` picks up a change to the file. A
 worker counts at its group's `memory.hard_limit` when one is set, else
 at what its group's workers measure, its proportional set size and the
 CPU it uses, and before any has reported at the group's

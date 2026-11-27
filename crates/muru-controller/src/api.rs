@@ -449,17 +449,29 @@ impl Admin for Service {
         let info = &self.handle.info;
         let apps = self.handle.store.apps().map_err(internal)?;
         let releases = self.handle.store.releases(None).map_err(internal)?;
-        let budget = {
+        let (budget, budget_memory, budget_memory_from) = {
             let view = &info.defined.read().expect("defined names poisoned").budget;
 
-            if view.budget.is_set() {
+            let described = if view.budget.is_set() {
                 format!("{}{}", view.budget.describe(&view.used), view.sources)
             } else {
                 String::new()
-            }
+            };
+
+            // Issue 961: whether the node has a memory limit, and whose.
+
+            let from = match (view.budget.memory, view.memory_from_cgroup) {
+                (None, _) => "",
+                (Some(_), true) => "cgroup",
+                (Some(_), false) => "file",
+            };
+
+            (described, view.budget.memory, from.to_owned())
         };
 
         Ok(Response::new(pb::Status {
+            budget_memory,
+            budget_memory_from,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             pid: std::process::id(),
             instance_id: info.instance_id.to_string(),

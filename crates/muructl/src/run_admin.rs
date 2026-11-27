@@ -1619,6 +1619,8 @@ impl Admin for Service {
     ) -> Result<Response<pb::Status>, Status> {
         let state = &self.state;
         Ok(Response::new(pb::Status {
+            budget_memory: None,
+            budget_memory_from: String::new(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             pid: std::process::id(),
             instance_id: state.instance_id.clone(),
