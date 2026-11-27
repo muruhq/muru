@@ -1356,7 +1356,11 @@ webhooks; the [events guide](events.md) has the details.
 host keep serving exactly as they were. The next `muructl daemon start`
 (or `up`, or a service manager restarting the unit) finds them through
 the records in `run` under the state directory, takes them over, and carries on,
-so a daemon restart or upgrade never costs a request. `muructl daemon
+so a daemon restart or upgrade never costs a request. The events a host
+raises with no daemon, a worker replaced or exited among them, it holds
+and sends to the daemon that takes it over, which records each with the
+time it happened; the [events guide](events.md) has the details.
+`muructl daemon
 stop --shutdown` drains every release, stops the hosts and the edge, and
 then exits, for taking a node out of service. It leaves no records
 behind, and the next daemon starts the current releases afresh.

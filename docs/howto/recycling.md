@@ -207,8 +207,9 @@ The release's host takes the turns, not the command. The command
 waits until every worker has been replaced, for up to ten minutes, and
 `--no-wait` returns once the workers are marked. Either way the restart
 carries on if the command is interrupted and while the daemon is
-stopped or being upgraded. `muructl release show` says how far it has
-got:
+stopped or being upgraded, and the [events](events.md) of that time are
+recorded, each with the time it happened, when the daemon is back.
+`muructl release show` says how far it has got:
 
 ```
 restart      3 of 4 workers still to be replaced, each in its turn; muructl restart --cancel leaves them

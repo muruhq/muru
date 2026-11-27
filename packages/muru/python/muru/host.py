@@ -461,6 +461,11 @@ def resolve_app(
 
 UNNAMED_EVENTS = frozenset({"worker.started", "worker.ready"})
 
+# Section 11.5: how many events a host holds while no supervisor is
+# connected, for the next one. Past it the oldest held goes.
+
+HELD_EVENTS = 256
+
 
 def run_exit_callbacks() -> None:
     """Run the callbacks registered with ``atexit`` in this worker, on this thread.
@@ -1620,6 +1625,13 @@ class Host:
         self.loaded: dict[str, Any] | None = None
         self.loaded_sent = False
 
+        # Section 11.5: the events raised with no supervisor connected,
+        # each with the time it happened, for the next one, and how many
+        # were dropped for want of room since the last was told.
+
+        self.held_events: deque[dict[str, Any]] = deque()
+        self.events_dropped = 0
+
         # Section 6.7: the interfaces the workers settled themselves, by
         # mount, for an application imported in each worker or made by a
         # factory there, which the host never loads.
@@ -2601,6 +2613,75 @@ class Host:
             )
             self.loaded_sent = True
 
+        self.send_held_events()
+
+    def hold_event(self, event: dict[str, Any]) -> None:
+        """Keep an event for the next supervisor, with the time it happened.
+
+        Only events are held: the workers, the load, the import report and
+        the progress of a restart are state, which a supervisor is sent
+        whole when it connects. At most `HELD_EVENTS` are held, the oldest
+        going first, each without its evidence, which belongs to request
+        records only a supervisor that was connected keeps. A host with no
+        control socket has no supervisor to come and holds nothing.
+        """
+
+        if self.control_listener is None:
+            return
+
+        held = {key: value for key, value in event.items() if key != "evidence"}
+        held["time_unix_ms"] = int(time.time() * 1000)
+
+        if len(self.held_events) >= HELD_EVENTS:
+            self.held_events.popleft()
+
+            if self.events_dropped == 0:
+                log(
+                    f"more than {HELD_EVENTS} events are held with nothing connected to "
+                    "record them: the oldest are dropped from here on"
+                )
+
+            self.events_dropped += 1
+
+        self.held_events.append(held)
+
+    def send_held_events(self) -> None:
+        """Send a supervisor that has connected the events held for it, oldest first.
+
+        An event saying how many were dropped goes ahead of them, since
+        the ones dropped were the oldest. What a failed send leaves stays
+        held for the next supervisor.
+        """
+
+        dropped = self.events_dropped
+
+        if dropped:
+            sent = self.send_to_supervisor(
+                {
+                    "type": "event",
+                    "kind": "host.events_dropped",
+                    "level": "warning",
+                    "message": (
+                        f"{dropped} event{'' if dropped == 1 else 's'} raised while nothing "
+                        f"was connected to record them {'was' if dropped == 1 else 'were'} "
+                        f"dropped, the oldest: {HELD_EVENTS} are held at most, and the "
+                        "release's log has a line for each"
+                    ),
+                    "dropped": dropped,
+                }
+            )
+
+            if not sent:
+                return
+
+            self.events_dropped = 0
+
+        while self.held_events:
+            if not self.send_to_supervisor(self.held_events[0]):
+                return
+
+            self.held_events.popleft()
+
     def send_imports(self) -> None:
         """Send the load's import report to the supervisor, in parts, if there is one."""
 
@@ -2851,11 +2932,15 @@ class Host:
             elif message.get("type") == "request":
                 self.take_request(message)
 
-    def send_to_supervisor(self, message: dict[str, Any]) -> None:
-        """Send one message as a JSON line, dropping the connection if that fails."""
+    def send_to_supervisor(self, message: dict[str, Any]) -> bool:
+        """Send one message as a JSON line, dropping the connection if that fails.
+
+        Returns whether it was sent: not when no supervisor is connected,
+        and not when the send failed.
+        """
 
         if self.supervisor is None:
-            return
+            return False
 
         # Blocking for the send, with a bound, so an answer larger than
         # the socket's buffer (an inspect of many modules) gets through.
@@ -2865,9 +2950,10 @@ class Host:
             self.supervisor.sendall(json.dumps(message).encode() + b"\n")
         except OSError:
             self.drop_supervisor()
-            return
+            return False
 
         self.supervisor.setblocking(False)
+        return True
 
     def workers_message(self) -> dict[str, Any]:
         """Build the announcement of the sockets the edge should route to, by group."""
@@ -2980,6 +3066,8 @@ class Host:
         kind, except for the start-up lines every worker has. `evidence`
         names the requests the event is about, with the stacks of the
         threads serving them, for a development run's records (issue 706).
+        An event raised with no supervisor connected, or whose send
+        failed, is held for the next one (section 11.5).
         """
 
         log(message if kind in UNNAMED_EVENTS else f"{kind}: {message}")
@@ -2994,7 +3082,8 @@ class Host:
         if evidence is not None:
             event["evidence"] = evidence
 
-        self.send_to_supervisor(event)
+        if not self.send_to_supervisor(event):
+            self.hold_event(event)
 
     # Section 11.7: the supervisor's questions, answered by the host or
     # passed to the workers.

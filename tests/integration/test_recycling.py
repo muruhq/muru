@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from support import server as support
@@ -281,4 +282,77 @@ def test_recycling_under_the_daemon_moves_traffic_with_no_request_failed(
     finally:
         if second is None:
             second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+        second.stop(shutdown=True)
+
+
+def test_events_of_a_recycle_begun_while_the_daemon_is_stopped_are_recorded_with_their_times(
+    tmp_path: Path,
+) -> None:
+    first = start_daemon(tmp_path)
+    second: Daemon | None = None
+
+    try:
+        assert (
+            first.deploy("shop", SHOP, "--processes", "1", "--max-requests", "50")
+            == "muru: release shop@r1 is ready and serving"
+        )
+        assert "detached" in first.muructl("daemon", "stop").stdout
+        first.process.wait(timeout=30)
+        stopped = int(time.time() * 1000)
+
+        # The edge and the host serve on with no daemon, and the fiftieth
+        # request has the host start a replacement for its worker, which
+        # it can tell nobody; its log has the line of each event.
+
+        for _ in range(55):
+            assert first.get("/info").status == 200
+
+        log = first.base / "logs" / "apps" / "shop" / "r1.log"
+        wait_for(lambda: log.read_text(errors="replace").count(") is ready\n") == 2)
+        started = int(time.time() * 1000)
+        second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+
+        # The daemon that takes the host over is sent what it held: the
+        # replacement's start and its being ready, each recorded after the
+        # daemon's own start with the time it happened, before it.
+
+        def recorded() -> list[dict[str, Any]]:
+            events = json.loads(second.muructl("events", "--json").stdout)["events"]
+            return [event for event in events if int(event["sequence"]) > restarted]
+
+        restarted = 0
+        restarted = max(
+            int(event["sequence"]) for event in recorded() if event["type"] == "daemon.started"
+        )
+        wait_for(lambda: any(event["type"] == "worker.recycled" for event in recorded()))
+        workers = [event for event in recorded() if event["type"].startswith("worker.")]
+        assert [(event["type"], event["subject"]) for event in workers] == [
+            ("worker.started", "shop@r1"),
+            ("worker.ready", "shop@r1"),
+            ("worker.recycled", "shop@r1"),
+        ], recorded()
+        times = [int(event["time_unix_ms"]) for event in workers]
+        assert stopped <= times[0] <= times[1] <= started, (stopped, times, started)
+
+        # The swap ends once the daemon has the edge route to the new
+        # worker, so its event arrives as it happens.
+
+        assert times[2] >= started, (times, started)
+        assert "max_requests 50" in workers[2]["message"], workers[2]
+
+        # It is counted as one that arrived as it happened is.
+
+        labels = 'app="shop",release="r1",group="default"'
+        assert re.search(
+            rf'muru_worker_recycles_total\{{{re.escape(labels)},reason="max_requests"\}} 1\n',
+            second.muructl("metrics").stdout,
+        )
+
+        # Told of the new worker, the edge routes to it.
+
+        wait_for(lambda: second.get("/info").status == 200)
+    finally:
+        if second is None:
+            second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+
         second.stop(shutdown=True)

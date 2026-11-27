@@ -240,6 +240,12 @@ decisions above.
   refused: the call says "every worker started before now", which
   holds either way.
 
+- **The events of a restart outlast a daemon that is away.** The host
+  holds the events it raises with no supervisor connected, 256 at most,
+  and sends them to the next with the times they happened (issue 965,
+  section 11.5). The wait of `RestartRelease` reads the release's
+  record, which the host's progress message keeps, and not the events.
+
 - **`muructl restart --all` waits by default,** as it did, and
   `--no-wait` returns once the workers are marked.
 

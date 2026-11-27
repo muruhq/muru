@@ -5575,16 +5575,18 @@ async fn run_with(
                             }
                         }
                     }
-                    muru_controller::host::HostMessage::Event { kind, level, message, group, reason, evidence } => {
+                    muru_controller::host::HostMessage::Event { kind, level, message, group, reason, evidence, time_unix_ms } => {
                         // The host has logged the event, and its line is
                         // the one the terminal shows; the run counts it
                         // and keeps it for muructl events, and its
                         // evidence goes to the records of the requests it
-                        // names (issue 706).
+                        // names (issue 706). One the host held while
+                        // nothing was connected carries the time it
+                        // happened.
 
                         let release = format!("r{}", current.release);
                         run_admin::count_worker_event(&label, &release, &kind, &group, &reason);
-                        run_events.record(&kind, &format!("{label}@{release}"), &level, &message);
+                        run_events.record_at(&kind, &format!("{label}@{release}"), &level, &message, time_unix_ms);
 
                         if let (Some(mut evidence), Some(recorder)) = (evidence, &recorder) {
                             if KILLS.contains(&kind.as_str()) {

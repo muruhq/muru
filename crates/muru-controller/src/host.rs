@@ -79,6 +79,10 @@ pub enum HostMessage {
         /// the requests it names (issue 706), which only a development
         /// run keeps.
         evidence: Option<muru_edge::recorder::Evidence>,
+        /// When it happened, in Unix milliseconds, for an event the host
+        /// held while no supervisor was connected (section 11.5); none
+        /// for one sent as it happened.
+        time_unix_ms: Option<u64>,
     },
     /// Evidence for request records that is no event of its own (issue
     /// 706): that a request past its deadline has since ended.
@@ -406,6 +410,7 @@ impl HostMessage {
                 group: value["group"].as_str().unwrap_or_default().to_owned(),
                 reason: value["reason"].as_str().unwrap_or_default().to_owned(),
                 evidence: value.get("evidence").map(|_| evidence(&value)),
+                time_unix_ms: value["time_unix_ms"].as_u64(),
             }),
             "capture" => Some(Self::Capture(evidence(&value))),
             "loaded" => Some(Self::Loaded {
@@ -3370,7 +3375,24 @@ mod tests {
         let plain = HostMessage::parse(r#"{"type":"event","kind":"worker.exited","message":"x"}"#);
         assert!(matches!(
             plain,
-            Some(HostMessage::Event { evidence: None, .. })
+            Some(HostMessage::Event {
+                evidence: None,
+                time_unix_ms: None,
+                ..
+            })
+        ));
+
+        // Section 11.5: an event the host held carries when it happened.
+
+        let held = HostMessage::parse(
+            r#"{"type":"event","kind":"worker.recycled","message":"x","time_unix_ms":1700000000000}"#,
+        );
+        assert!(matches!(
+            held,
+            Some(HostMessage::Event {
+                time_unix_ms: Some(1_700_000_000_000),
+                ..
+            })
         ));
 
         let ended = HostMessage::parse(

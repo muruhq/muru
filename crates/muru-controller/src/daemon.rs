@@ -13532,6 +13532,7 @@ impl Daemon {
                 message,
                 group,
                 reason,
+                time_unix_ms,
                 ..
             } => {
                 let level = match level.as_str() {
@@ -13577,8 +13578,11 @@ impl Daemon {
                         .or_default() += 1;
                 }
 
+                // Section 11.5: an event the host held while no daemon
+                // was connected is recorded with the time it happened.
+
                 self.events
-                    .emit(&kind, &format!("{app}@{id}"), level, &message);
+                    .emit_at(&kind, &format!("{app}@{id}"), level, &message, time_unix_ms);
             }
         }
     }

@@ -166,6 +166,25 @@ impl RunEvents {
 
     /// Record an event and tell the watchers.
     pub fn record(&self, kind: &str, subject: &str, level: &str, message: &str) {
+        self.record_at(kind, subject, level, message, None);
+    }
+
+    /// Record an event that happened at `time_unix_ms`, or now when none
+    /// is given, and tell the watchers: an event a host held while
+    /// nothing was connected carries the time it was raised. A time
+    /// ahead of the clock is taken as now.
+    pub fn record_at(
+        &self,
+        kind: &str,
+        subject: &str,
+        level: &str,
+        message: &str,
+        time_unix_ms: Option<u64>,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+
         let level = match level {
             "error" | "warning" | "notice" => level,
             _ => "info",
@@ -176,9 +195,7 @@ impl RunEvents {
             kept.0 += 1;
             let event = pb::Event {
                 sequence: kept.0,
-                time_unix_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |since| since.as_millis() as u64),
+                time_unix_ms: time_unix_ms.map_or(now, |happened| happened.min(now)),
                 r#type: kind.to_owned(),
                 subject: subject.to_owned(),
                 level: level.to_owned(),
@@ -2385,5 +2402,33 @@ mod tests {
             [259, 260]
         );
         assert_eq!(events.after(0, 3).len(), 3);
+    }
+
+    #[test]
+    fn an_event_a_host_held_keeps_the_time_it_happened() {
+        let events = RunEvents::default();
+        events.record_at(
+            "worker.recycled",
+            "shop@r1",
+            "info",
+            "held",
+            Some(1_700_000_000_000),
+        );
+        events.record_at(
+            "worker.recycled",
+            "shop@r1",
+            "info",
+            "ahead",
+            Some(u64::MAX / 2),
+        );
+        events.record("worker.recycled", "shop@r1", "info", "now");
+
+        let kept = events.after(0, 10);
+        assert_eq!(kept[0].time_unix_ms, 1_700_000_000_000);
+        assert!(kept[1].time_unix_ms <= kept[2].time_unix_ms);
+        assert_eq!(
+            kept.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
     }
 }

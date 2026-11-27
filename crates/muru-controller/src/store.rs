@@ -1540,7 +1540,24 @@ impl Store {
         level: &'static str,
         message: &str,
     ) -> Result<Event, StoreError> {
-        let time_unix_ms = now_unix_ms();
+        self.append_event_at(kind, subject, level, message, None)
+    }
+
+    /// Append an event that happened at `happened_unix_ms`, or now when
+    /// none is given, and return it with its sequence number, which is
+    /// the next whatever its time: an event recorded late sits in the
+    /// order it was recorded in with the time it happened (section 11.5).
+    /// A time ahead of the clock is taken as now.
+    pub fn append_event_at(
+        &self,
+        kind: &str,
+        subject: &str,
+        level: &'static str,
+        message: &str,
+        happened_unix_ms: Option<u64>,
+    ) -> Result<Event, StoreError> {
+        let now = now_unix_ms();
+        let time_unix_ms = happened_unix_ms.map_or(now, |happened| happened.min(now));
         self.with(|connection| {
             connection.execute(
                 "INSERT INTO events (time_unix_ms, type, subject, level, message) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -3034,6 +3051,47 @@ pub(crate) mod tests {
         store.set_sink_cursor("ops", event.sequence).unwrap();
         store.set_sink_cursor("ops", event.sequence + 1).unwrap();
         assert_eq!(store.sink_cursor("ops").unwrap(), Some(event.sequence + 1));
+    }
+
+    #[test]
+    fn an_event_recorded_late_keeps_the_time_it_happened_and_takes_the_next_sequence() {
+        let store = Store::in_memory().unwrap();
+        let first = store
+            .append_event("daemon.started", "daemon", "info", "up")
+            .unwrap();
+        let held = store
+            .append_event_at(
+                "worker.recycled",
+                "shop@r1",
+                "info",
+                "held",
+                Some(1_700_000_000_000),
+            )
+            .unwrap();
+        assert_eq!(held.sequence, first.sequence + 1);
+        assert_eq!(held.time_unix_ms, 1_700_000_000_000);
+
+        // A time ahead of the clock is taken as now.
+
+        let ahead = store
+            .append_event_at(
+                "worker.recycled",
+                "shop@r1",
+                "info",
+                "ahead",
+                Some(u64::MAX / 2),
+            )
+            .unwrap();
+        assert!(ahead.time_unix_ms >= first.time_unix_ms);
+        assert!(ahead.time_unix_ms <= now_unix_ms());
+
+        let times: Vec<u64> = store
+            .events_after(first.sequence, 10)
+            .unwrap()
+            .iter()
+            .map(|event| event.time_unix_ms)
+            .collect();
+        assert_eq!(times, [held.time_unix_ms, ahead.time_unix_ms]);
     }
 
     #[test]

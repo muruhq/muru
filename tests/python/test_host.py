@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import signal
 import socket
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -1349,3 +1351,170 @@ def test_a_restart_of_one_group_marks_only_its_workers(
     instance.restart.told = None
     instance.tell_restart()
     assert sent[-1]["type"] == "restart" and (sent[-1]["total"], sent[-1]["left"]) == (1, 1)
+
+
+# Section 11.5: events raised with no supervisor connected are held.
+
+
+def unsupervised_host(tmp_path: Path) -> host.Host:
+    """A host with a control socket and no supervisor connected to it."""
+
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1)
+    instance.control_listener = object()  # type: ignore[assignment]
+    return instance
+
+
+def connect(instance: host.Host) -> socket.socket:
+    """Stand a supervisor's connection in, and return the supervisor's end."""
+
+    ours, theirs = socket.socketpair()
+    instance.supervisor = ours
+    return theirs
+
+
+def received(connection: socket.socket) -> list[dict[str, Any]]:
+    """Read every line the host has sent on a connection."""
+
+    connection.setblocking(False)
+    data = b""
+
+    while True:
+        try:
+            chunk = connection.recv(65536)
+        except BlockingIOError:
+            break
+
+        if not chunk:
+            break
+
+        data += chunk
+
+    return [json.loads(line) for line in data.splitlines()]
+
+
+def test_events_raised_with_no_supervisor_are_held_and_sent_with_their_times(
+    tmp_path: Path,
+) -> None:
+    instance = unsupervised_host(tmp_path)
+    before = int(time.time() * 1000)
+
+    instance.emit("worker.recycled", "info", "one", group="default", reason="max_requests")
+    instance.emit(
+        "worker.timeout_killed",
+        "warning",
+        "two",
+        group="default",
+        reason="hard_timeout",
+        evidence={"worker": "0", "pid": 1, "requests": ["r-1"], "threads": []},
+    )
+    instance.emit("restart.finished", "notice", "three")
+
+    # State is not held: a supervisor is sent it whole when it connects.
+
+    instance.announce()
+    after = int(time.time() * 1000)
+    assert [event["kind"] for event in instance.held_events] == [
+        "worker.recycled",
+        "worker.timeout_killed",
+        "restart.finished",
+    ]
+
+    # A supervisor that connects is sent them oldest first, each with the
+    # time it happened and none with its evidence.
+
+    supervisor = connect(instance)
+    instance.send_held_events()
+    events = received(supervisor)
+    assert [(event["type"], event["kind"], event["message"]) for event in events] == [
+        ("event", "worker.recycled", "one"),
+        ("event", "worker.timeout_killed", "two"),
+        ("event", "restart.finished", "three"),
+    ]
+    assert (events[0]["group"], events[0]["reason"]) == ("default", "max_requests")
+    assert all(before <= event["time_unix_ms"] <= after for event in events)
+    assert all("evidence" not in event for event in events)
+    assert not instance.held_events
+
+    # With one connected, an event is sent as it happens, with no time of
+    # its own, and nothing is held.
+
+    instance.emit("worker.recycled", "info", "four")
+    assert received(supervisor) == [
+        {"type": "event", "kind": "worker.recycled", "level": "info", "message": "four"}
+    ]
+    assert not instance.held_events
+
+    # One whose send fails is held for the next supervisor.
+
+    supervisor.close()
+    instance.emit("worker.exited", "error", "five")
+    assert instance.supervisor is None
+    assert [event["message"] for event in instance.held_events] == ["five"]
+
+    later = connect(instance)
+    instance.send_held_events()
+    assert [event["message"] for event in received(later)] == ["five"]
+
+
+def test_past_the_bound_the_oldest_held_events_go_and_the_supervisor_is_told(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    instance = unsupervised_host(tmp_path)
+
+    for number in range(host.HELD_EVENTS + 3):
+        instance.emit("worker.recycled", "info", f"event {number}")
+
+    assert len(instance.held_events) == host.HELD_EVENTS
+    assert instance.events_dropped == 3
+
+    # The log says so once, when the first is dropped.
+
+    said = "events are held with nothing connected to record them: the oldest are dropped"
+    assert capfd.readouterr().err.count(said) == 1
+
+    # The supervisor hears how many were dropped ahead of the ones kept.
+
+    # They are more than a socket's buffer takes, so the supervisor reads
+    # as the host sends, as a real one does.
+
+    supervisor = connect(instance)
+    events: list[dict[str, Any]] = []
+
+    def read() -> None:
+        lines = supervisor.makefile("rb")
+
+        while len(events) < host.HELD_EVENTS + 1:
+            events.append(json.loads(lines.readline()))
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    instance.send_held_events()
+    reader.join(timeout=10)
+    assert len(events) == host.HELD_EVENTS + 1
+    assert (events[0]["kind"], events[0]["level"], events[0]["dropped"]) == (
+        "host.events_dropped",
+        "warning",
+        3,
+    )
+    assert events[0]["message"] == (
+        "3 events raised while nothing was connected to record them were dropped, the "
+        f"oldest: {host.HELD_EVENTS} are held at most, and the release's log has a line for each"
+    )
+    assert events[1]["message"] == "event 3"
+    assert events[-1]["message"] == f"event {host.HELD_EVENTS + 2}"
+    assert instance.events_dropped == 0
+
+    # The next supervisor is not told again.
+
+    instance.emit("worker.recycled", "info", "sent")
+    instance.send_held_events()
+    assert [event["kind"] for event in received(supervisor)] == ["worker.recycled"]
+
+
+def test_a_host_with_no_control_socket_holds_no_events(tmp_path: Path) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1)
+
+    instance.emit("worker.recycled", "info", "nobody is coming")
+    assert not instance.held_events
