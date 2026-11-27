@@ -4263,6 +4263,16 @@ fn resolve_settings(
             max_lifetime_ms,
             max_surge: group.max_surge,
             max_unavailable: group.max_unavailable,
+            initial_processes: initial_count(
+                request
+                    .group_initial_processes
+                    .get(name)
+                    .copied()
+                    .map(Initial::Own)
+                    .or(request.initial_processes.map(Initial::Releases)),
+                group_processes,
+                &format!("the worker group {name}"),
+            )?,
         });
     }
 
@@ -4655,6 +4665,25 @@ fn resolve_settings(
 
     muru_config::check_handoff(handoff, Some(interface))?;
 
+    // Issue 964: the count each group starts with, where the request
+    // gives one below the count it is declared with.
+
+    if let Some(unknown) = request
+        .group_initial_processes
+        .keys()
+        .find(|name| !resolved_groups.iter().any(|group| &group.name == *name))
+    {
+        return Err(format!(
+            "initial processes are given for the worker group {unknown}, which the release does not have"
+        ));
+    }
+
+    let initial_processes = initial_count(
+        request.initial_processes.map(Initial::Own),
+        processes,
+        "the release",
+    )?;
+
     Ok(ReleaseSpec {
         metadata: BTreeMap::new(),
         limits: crate::model::ServedLimits::from_settings(&served),
@@ -4663,6 +4692,7 @@ fn resolve_settings(
         interface,
         python,
         processes,
+        initial_processes,
         threads,
         sync_threads,
         concurrency,
@@ -6102,6 +6132,16 @@ fn resolve_http_spec(
         return Err("shutdown_timeout must be longer than nothing".to_owned());
     }
 
+    // Issue 964: a managed server's instances are not scaled, so there
+    // is no count for one to grow to from a smaller start.
+
+    if request.initial_processes.is_some() || !request.group_initial_processes.is_empty() {
+        return Err(
+            "initial processes are for a release of workers; a managed HTTP server's instances are not scaled"
+                .to_owned(),
+        );
+    }
+
     let (env, env_layers) = resolve_env_specs(&BTreeMap::new(), "", &request.env)?;
     let (error_pages, error_override, maintenance) =
         resolve_error_tables(tables, &BTreeMap::new(), None, None, &source)?;
@@ -6119,6 +6159,7 @@ fn resolve_http_spec(
         interface: muru_config::Interface::Auto,
         python: PathBuf::new(),
         processes: 0,
+        initial_processes: None,
         threads: 0,
         sync_threads: 0,
         concurrency: 0,
@@ -6234,6 +6275,43 @@ fn check_idle_host<'a>(
     }
 
     Ok(())
+}
+
+/// An initial count as a deploy gives it (issue 964): a group's own, or
+/// the release's, which a named group takes when it is given none.
+#[derive(Debug, Clone, Copy)]
+enum Initial {
+    /// Given for this group, or for the release and its default group.
+    Own(u32),
+    /// The release's, taken by a named group.
+    Releases(u32),
+}
+
+/// The count a group starts with, of the `processes` it is declared
+/// with: none when no initial count is given or it is the declared one.
+/// A group's own count over its `processes` is refused; the release's,
+/// which every named group without one takes, is no more than the
+/// group's `processes` there.
+fn initial_count(
+    given: Option<Initial>,
+    processes: u32,
+    what: &str,
+) -> Result<Option<u32>, String> {
+    let count = match given {
+        None => return Ok(None),
+        Some(Initial::Own(0) | Initial::Releases(0)) => {
+            return Err("initial processes must be at least 1".to_owned());
+        }
+        Some(Initial::Own(count)) if count > processes => {
+            return Err(format!(
+                "{count} initial processes are more than the {processes} {what} is declared with"
+            ));
+        }
+        Some(Initial::Own(count)) => count,
+        Some(Initial::Releases(count)) => count.min(processes),
+    };
+
+    Ok((count < processes).then_some(count))
 }
 
 /// Section 7.2 and 7.4: a scaling table resolved against the defaults of
@@ -6497,6 +6575,8 @@ pub(crate) fn env_spec_from_table(
 /// A declared release as the deploy request it stands for.
 fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequest {
     pb::DeployRequest {
+        initial_processes: None,
+        group_initial_processes: BTreeMap::new(),
         metadata: table.metadata.clone(),
         app: app.to_owned(),
         source: source.to_owned(),
@@ -7622,6 +7702,107 @@ mod tests {
         dir
     }
 
+    // Issue 964: the count a release starts with, apart from the count
+    // it is declared with.
+
+    #[test]
+    fn a_release_takes_an_initial_count_below_its_processes_for_each_group() {
+        let source = source_dir();
+        let groups: BTreeMap<String, GroupTable> = [
+            (
+                "jobs".to_owned(),
+                GroupTable {
+                    paths: vec!["/jobs".to_owned()],
+                    processes: Some(2),
+                    ..GroupTable::default()
+                },
+            ),
+            (
+                "reports".to_owned(),
+                GroupTable {
+                    paths: vec!["/reports".to_owned()],
+                    ..GroupTable::default()
+                },
+            ),
+        ]
+        .into();
+        let resolve = |initial: Option<u32>, own: &[(&str, u32)]| {
+            let request = pb::DeployRequest {
+                app: "shop".to_owned(),
+                source: source.display().to_string(),
+                entrypoint: "shop.wsgi:application".to_owned(),
+                python: "/usr/bin/python3".to_owned(),
+                processes: Some(4),
+                initial_processes: initial,
+                group_initial_processes: own
+                    .iter()
+                    .map(|(name, count)| ((*name).to_owned(), *count))
+                    .collect(),
+                ..Default::default()
+            };
+            let tables = Tables {
+                groups: Some(&groups),
+                ..Tables::default()
+            };
+            resolve_spec(&request, &tables, &crate::provision::Provisioning::off())
+        };
+        let counts = |spec: &ReleaseSpec| {
+            (
+                spec.initial_processes,
+                spec.group_initial("jobs"),
+                spec.group_initial("reports"),
+            )
+        };
+
+        // Without one, every group starts at the count it is declared
+        // with, and the release's is every group's, no more than its own.
+
+        let spec = resolve(None, &[]).unwrap();
+        assert_eq!(counts(&spec), (None, None, None));
+        assert_eq!((spec.processes, spec.starting_processes()), (4, 4));
+
+        let spec = resolve(Some(1), &[]).unwrap();
+        assert_eq!(counts(&spec), (Some(1), Some(1), Some(1)));
+        assert_eq!((spec.processes, spec.starting_processes()), (4, 1));
+        assert_eq!(spec.group_initial("default"), Some(1));
+        assert_eq!(spec.groups[0].starting_processes(), 1);
+
+        let spec = resolve(Some(3), &[]).unwrap();
+        assert_eq!(counts(&spec), (Some(3), None, Some(3)));
+
+        // A group's own stands over the release's, and the count a
+        // group is declared with is no initial count.
+
+        let spec = resolve(Some(2), &[("reports", 1), ("jobs", 2)]).unwrap();
+        assert_eq!(counts(&spec), (Some(2), None, Some(1)));
+        assert_eq!(resolve(Some(4), &[]).unwrap().initial_processes, None);
+
+        // One over the declared count, none at all and a group the
+        // release does not have are refused.
+
+        for (initial, own, expected) in [
+            (
+                Some(5),
+                vec![],
+                "5 initial processes are more than the 4 the release is declared with",
+            ),
+            (
+                None,
+                vec![("jobs", 3)],
+                "more than the 2 the worker group jobs is declared with",
+            ),
+            (Some(0), vec![], "initial processes must be at least 1"),
+            (
+                None,
+                vec![("nosuch", 1)],
+                "the worker group nosuch, which the release does not have",
+            ),
+        ] {
+            let refused = resolve(initial, &own).unwrap_err();
+            assert!(refused.contains(expected), "{refused}");
+        }
+    }
+
     #[test]
     fn a_release_takes_its_swap_settings_from_the_request_and_refuses_both_zero() {
         let source = source_dir();
@@ -8670,6 +8851,7 @@ mod tests {
             message: message.to_owned(),
             created_unix_ms: id.parse().unwrap_or(0),
             updated_unix_ms: 0,
+            shared: None,
         }
     }
 

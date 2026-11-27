@@ -10,6 +10,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -1518,3 +1519,238 @@ def test_a_host_with_no_control_socket_holds_no_events(tmp_path: Path) -> None:
 
     instance.emit("worker.recycled", "info", "nobody is coming")
     assert not instance.held_events
+
+
+# Issue 981: with no supervisor connected, a worker that enters routing
+# is reachable at the path the edge has.
+
+
+def listener(path: str) -> socket.socket:
+    """A Unix socket listening at a path, as a worker's is."""
+
+    listening = socket.socket(socket.AF_UNIX)
+    listening.bind(path)
+    listening.listen(4)
+    listening.setblocking(False)
+    return listening
+
+
+def reached(path: str, listening: socket.socket) -> bool:
+    """Say whether a connection to the path arrives at this listener."""
+
+    client = socket.socket(socket.AF_UNIX)
+
+    try:
+        client.connect(path)
+    except OSError:
+        return False
+    finally:
+        client.close()
+
+    try:
+        accepted, _ = listening.accept()
+    except BlockingIOError:
+        return False
+
+    accepted.close()
+    return True
+
+
+def acknowledge(instance: host.Host, supervisor: socket.socket) -> None:
+    """Have the supervisor acknowledge the host's latest announcement."""
+
+    assert instance.supervisor is not None
+    instance.supervisor.setblocking(False)
+    supervisor.sendall(
+        json.dumps({"type": "applied", "version": instance.version}).encode() + b"\n"
+    )
+    instance.read_supervisor()
+
+
+def test_a_worker_that_enters_routing_with_no_supervisor_takes_the_path_the_edge_has() -> None:
+    # A directory of its own with a short name: a Unix socket's path is
+    # limited to about a hundred characters.
+
+    with tempfile.TemporaryDirectory(prefix="muru-", dir="/tmp") as directory:
+        instance = unsupervised_host(Path(directory))
+        first = os.path.join(directory, "worker-0.sock")
+        second = os.path.join(directory, "worker-0-g1.sock")
+        old = listener(first)
+        instance.routed[0] = first
+
+        # The supervisor acknowledges the first socket, so the edge has it.
+
+        supervisor = connect(instance)
+        instance.send_workers()
+        acknowledge(instance, supervisor)
+        assert instance.edge_routes == {0: first}
+        assert not instance.edge_reaches(0)
+
+        # It goes away, and a replacement becomes ready on a socket of
+        # its own, which nobody can tell the edge of: the edge's path
+        # reaches the new worker, and the old one's socket stays open.
+
+        supervisor.close()
+        instance.drop_supervisor()
+        new = listener(second)
+        instance.routed[0] = second
+        instance.alias_routes()
+        assert reached(first, new) and not reached(first, old)
+        assert reached(second, new)
+        assert instance.edge_reaches(0)
+        assert sorted(os.listdir(directory)) == ["worker-0-g1.sock", "worker-0.sock"]
+
+        # A worker that crashed is started again on the path it had,
+        # which is a new socket: the edge's path follows it.
+
+        new.close()
+        os.unlink(second)
+        again = listener(second)
+        assert not reached(first, again)
+        instance.alias_routes()
+        assert reached(first, again)
+
+        # The next supervisor is told the socket's own path, and the
+        # second name goes once it has acknowledged it.
+
+        later = connect(instance)
+        instance.version += 1
+        instance.send_workers()
+        assert received(later)[-1]["sockets"] == [second]
+        assert os.path.exists(first)
+        acknowledge(instance, later)
+        assert instance.edge_routes == {0: second}
+        assert not instance.aliases
+        assert os.listdir(directory) == ["worker-0-g1.sock"]
+
+        for held in (old, again, later):
+            held.close()
+
+        instance.drop_supervisor()
+
+
+def test_an_announcement_never_acknowledged_is_not_what_the_edge_has(tmp_path: Path) -> None:
+    instance = unsupervised_host(tmp_path)
+    instance.routed[0] = "worker-0.sock"
+    supervisor = connect(instance)
+    instance.send_workers()
+    acknowledge(instance, supervisor)
+
+    # The supervisor goes before it acknowledges the next announcement,
+    # so the edge is taken to have the sockets of the last it did.
+
+    instance.routed[0] = "worker-0-g1.sock"
+    instance.announce()
+    assert instance.announcements == {1: {0: "worker-0-g1.sock"}}
+    supervisor.close()
+    instance.drop_supervisor()
+    assert instance.edge_routes == {0: "worker-0.sock"}
+    assert not instance.announcements
+
+
+# Issue 987: a worker's socket file goes when the worker has.
+
+
+def test_a_replaced_workers_socket_file_is_removed_once_it_has_exited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, _sent, forks = swapping_host(tmp_path, monkeypatch)
+    monkeypatch.chdir(tmp_path)
+
+    for name in ("w0.sock", "w1.sock", "w0-g1.sock"):
+        Path(name).touch()
+
+    # The old worker's file stays while it finishes what it holds, and
+    # goes when it is reaped; the others are untouched.
+
+    instance.swap(states[0], "served 10 requests", "worker.recycled", "max_requests")
+    ready(instance, forks[0][1])
+    assert sorted(os.listdir()) == ["w0-g1.sock", "w0.sock", "w1.sock"]
+    exits(monkeypatch, (states[0].pid, 0))
+    instance.reap()
+    assert sorted(os.listdir()) == ["w0-g1.sock", "w1.sock"]
+
+    # A path that is the second name of another worker's socket, which
+    # the edge connects to with no supervisor, is left.
+
+    instance.aliases[1] = ("w1.sock", "w1-g1.sock")
+    exits(monkeypatch, (states[1].pid, 0))
+    instance.reap()
+    assert sorted(os.listdir()) == ["w0-g1.sock", "w1.sock"]
+
+
+# Issue 983: a supervisor that connects is told where a restart stands,
+# and one that does not answer is treated as one that is not there.
+
+
+def test_a_supervisor_that_connects_is_told_no_restart_is_under_way() -> None:
+    with tempfile.TemporaryDirectory(prefix="muru-", dir="/tmp") as directory:
+        instance = unsupervised_host(Path(directory))
+        instance.control_listener = listener(os.path.join(directory, "control.sock"))
+        supervisor = socket.socket(socket.AF_UNIX)
+        supervisor.connect(os.path.join(directory, "control.sock"))
+        instance.accept_supervisor()
+        assert [message["type"] for message in received(supervisor)] == ["workers", "restart"]
+
+        # A second connection takes the first one's place, and is told
+        # the same: the first may have been left believing in a restart
+        # that has finished since.
+
+        again = socket.socket(socket.AF_UNIX)
+        again.connect(os.path.join(directory, "control.sock"))
+        instance.accept_supervisor()
+        assert received(again)[1] == {
+            "type": "restart",
+            "total": 0,
+            "left": 0,
+            "started_unix_ms": 0,
+            "group": "",
+        }
+        assert supervisor.recv(1) == b""
+
+        for held in (supervisor, again, instance.control_listener):
+            held.close()
+
+        instance.drop_supervisor()
+
+
+def test_a_replacement_nobody_acknowledges_takes_the_path_the_edge_has(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="muru-", dir="/tmp") as directory:
+        instance = unsupervised_host(Path(directory))
+        first = os.path.join(directory, "worker-0.sock")
+        second = os.path.join(directory, "worker-0-g1.sock")
+        old = listener(first)
+        instance.routed[0] = first
+        supervisor = connect(instance)
+        instance.send_workers()
+        acknowledge(instance, supervisor)
+
+        # The supervisor stays connected and says nothing of the next
+        # announcement: when its time is up the old worker is told to
+        # stop, and the edge's path reaches the new one first.
+
+        monkeypatch.setattr(os, "kill", lambda _pid, _signal: None)
+        new = listener(second)
+        instance.routed[0] = second
+        replacement = host.Replacement(0, 4000, "served 10 requests", "worker.recycled")
+        replacement.announced = instance.announce()
+        replacement.announced_at = time.monotonic()
+        instance.advance(replacement, time.monotonic())
+        assert replacement.terminate_at is None and not reached(first, new)
+
+        instance.advance(replacement, time.monotonic() + host.ACK_TIMEOUT_SECONDS)
+        assert replacement.terminate_at is not None
+        assert reached(first, new) and reached(second, new)
+
+        # An acknowledgement that comes after all takes the second name
+        # away: the edge has the socket's own.
+
+        acknowledge(instance, supervisor)
+        assert os.listdir(directory) == ["worker-0-g1.sock"]
+
+        for held in (old, new, supervisor):
+            held.close()
+
+        instance.drop_supervisor()

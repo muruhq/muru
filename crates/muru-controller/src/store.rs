@@ -2489,6 +2489,7 @@ pub(crate) mod tests {
             interface: Interface::Auto,
             python: PathBuf::from("/srv/shop/.venv/bin/python"),
             processes: 2,
+            initial_processes: None,
             threads: 4,
             sync_threads: 8,
             concurrency: 1000,

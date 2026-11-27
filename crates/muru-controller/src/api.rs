@@ -2888,6 +2888,20 @@ impl Admin for Service {
                 100
             },
         };
+
+        // Section 9.16: whether the two releases share the baseline's
+        // worker count.
+
+        let shared = match request.capacity.as_str() {
+            "" | "own" => false,
+            "shared" => true,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "capacity {other:?} is not own or shared"
+                )));
+            }
+        };
+
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
             .commands
@@ -2897,6 +2911,7 @@ impl Admin for Service {
                 steps,
                 gates,
                 approve_each_step: request.approve_each_step,
+                shared,
                 done: done_tx,
             })
             .await
@@ -4803,7 +4818,33 @@ fn rollout_message(rollout: &Rollout) -> pb::Rollout {
         probes: rollout.gates.probes.clone(),
         min_requests: rollout.gates.min_requests,
         approve_each_step: rollout.approve_each_step,
+        capacity: if rollout.shared.is_some() {
+            "shared"
+        } else {
+            "own"
+        }
+        .to_owned(),
+        totals: shared_counts(rollout, |shared| &shared.totals),
+        baseline_workers: shared_counts(rollout, |shared| &shared.baseline),
+        candidate_workers: shared_counts(rollout, |shared| &shared.candidate),
+        sizing: rollout
+            .shared
+            .as_ref()
+            .is_some_and(|shared| shared.sizing || shared.finishing),
     }
+}
+
+/// One of the maps of a rollout that shares capacity, by group; empty
+/// for a rollout that does not.
+fn shared_counts(
+    rollout: &Rollout,
+    of: impl Fn(&crate::model::SharedCapacity) -> &BTreeMap<String, u32>,
+) -> BTreeMap<String, u32> {
+    rollout
+        .shared
+        .as_ref()
+        .map(|shared| of(shared).clone())
+        .unwrap_or_default()
 }
 
 /// Section 8.7: the variables a planned release would get, by name and
@@ -5213,8 +5254,10 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                 max_unavailable: group.max_unavailable.unwrap_or(max_unavailable),
                 surge_allowance: live.surge.get(&group.name).map(|surge| surge.allowance),
                 surge_short: surge_short(live.surge.get(&group.name)),
+                initial_processes: group.initial_processes,
             })
             .collect(),
+        initial_processes: release.spec.initial_processes,
         detected_interface,
         websockets,
     }

@@ -1356,7 +1356,13 @@ webhooks; the [events guide](events.md) has the details.
 host keep serving exactly as they were. The next `muructl daemon start`
 (or `up`, or a service manager restarting the unit) finds them through
 the records in `run` under the state directory, takes them over, and carries on,
-so a daemon restart or upgrade never costs a request. The events a host
+so a daemon restart or upgrade never costs a request. A host goes on
+[replacing its workers](recycling.md#what-happens) with no daemon, so
+the daemon that takes it over asks it which sockets its workers listen
+on now. A host that hears nothing from a daemon for long enough, one
+that is stalled say, closes its connection to it; the daemon connects
+again when it can, and is sent the host's state and the events the host
+held meanwhile. The events a host
 raises with no daemon, a worker replaced or exited among them, it holds
 and sends to the daemon that takes it over, which records each with the
 time it happened; the [events guide](events.md) has the details.

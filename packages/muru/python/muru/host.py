@@ -1614,6 +1614,19 @@ class Host:
         self.version = 0
         self.acked = 0
 
+        # Issue 981: the sockets the edge routes by, as far as the host
+        # knows: those of the last announcement a supervisor acknowledged,
+        # by worker index, with the announcements sent and not yet
+        # acknowledged, by version. With no supervisor connected nobody
+        # can give the edge a new socket, so a worker that enters routing
+        # then is made reachable at the path the edge has, by a second
+        # name for its socket: the path the edge has, by worker index,
+        # with the socket it names now.
+
+        self.edge_routes: dict[int, str] = {}
+        self.announcements: dict[int, dict[int, str]] = {}
+        self.aliases: dict[int, tuple[str, str]] = {}
+
         # Section 6.18: the load's import report, sent to each supervisor
         # that connects.
 
@@ -2597,15 +2610,22 @@ class Host:
         self.supervisor = connection
         self.supervisor_buffer = b""
         self.selector.register(connection, selectors.EVENT_READ)
-        self.send_to_supervisor(self.workers_message())
+        self.send_workers()
         self.send_imports()
 
         # Section 10.14: a supervisor that connects while every worker is
-        # being restarted is told how far that has got.
+        # being restarted is told how far that has got, and one that
+        # connects while none is under way is told that (issue 983): its
+        # last word from this host may be of a restart that has since
+        # finished, which the connection it had did not live to say.
 
         if self.restart is not None:
             self.restart.told = None
             self.tell_restart()
+        else:
+            self.send_to_supervisor(
+                {"type": "restart", "total": 0, "left": 0, "started_unix_ms": 0, "group": ""}
+            )
 
         if self.loaded is not None:
             self.send_to_supervisor(
@@ -2714,6 +2734,12 @@ class Host:
 
         self.supervisor.close()
         self.supervisor = None
+
+        # Issue 981: what was announced and not acknowledged may never
+        # have reached the edge, and nobody is left to tell it.
+
+        self.announcements.clear()
+        self.alias_routes()
 
     def close_control(self) -> None:
         """Close the control sockets, in a worker after fork."""
@@ -2929,6 +2955,7 @@ class Host:
 
             if message.get("type") == "applied":
                 self.acked = max(self.acked, int(message.get("version", 0)))
+                self.edge_applied()
             elif message.get("type") == "request":
                 self.take_request(message)
 
@@ -3045,8 +3072,131 @@ class Host:
         """Tell the supervisor the worker sockets changed; return the version."""
 
         self.version += 1
-        self.send_to_supervisor(self.workers_message())
+        self.send_workers()
         return self.version
+
+    def send_workers(self) -> None:
+        """Send the supervisor the worker sockets, and keep what it was told until it answers."""
+
+        if self.send_to_supervisor(self.workers_message()):
+            self.announcements[self.version] = {
+                index: path for index, path in self.routed.items() if path is not None
+            }
+
+    def edge_applied(self) -> None:
+        """Take the edge to route by the newest announcement acknowledged.
+
+        Issue 981: a second name made for a worker's socket while no
+        supervisor was connected goes once the edge has the socket's own.
+        """
+
+        known = [version for version in self.announcements if version <= self.acked]
+
+        if not known:
+            return
+
+        self.edge_routes = self.announcements[max(known)]
+
+        for version in known:
+            del self.announcements[version]
+
+        live = {state.path for state in self.states.values()}
+
+        for index, (alias, _path) in list(self.aliases.items()):
+            if self.edge_routes.get(index) == alias:
+                continue
+
+            del self.aliases[index]
+
+            if alias not in live:
+                with contextlib.suppress(OSError):
+                    os.unlink(alias)
+
+    def alias_routes(self, unanswered: bool = False) -> None:
+        """Make each worker in routing reachable at the path the edge has for it.
+
+        Issue 981: with no supervisor connected nobody tells the edge a
+        new socket, and it goes on connecting to the paths of the last
+        snapshot it was given. A worker that entered routing on another
+        socket has that socket given the edge's path as a second name (a
+        hard link, moved into place in one step), so the edge reaches it
+        and the worker before it, which still holds its own socket open,
+        finishes what it has. The supervisor that connects next is told
+        the sockets' own paths, and the second names go once it has
+        acknowledged them.
+
+        `unanswered` says a supervisor is connected and has not
+        acknowledged an announcement in the time it is given (issue 983),
+        which is treated the same: the second name does no harm if the
+        edge was told after all, since the socket keeps its own.
+        """
+
+        if self.tcp_base_port is not None or self.stopping:
+            return
+
+        if self.supervisor is not None and not unanswered:
+            return
+
+        for index, path in self.routed.items():
+            alias = self.edge_routes.get(index)
+
+            if path is None or alias is None or alias == path:
+                continue
+
+            # A rename onto another name of the same file does nothing
+            # and leaves both, so a path that names the socket already is
+            # left alone.
+
+            with contextlib.suppress(OSError):
+                if os.path.samefile(path, alias):
+                    self.aliases[index] = (alias, path)
+                    continue
+
+            partial = f"{alias}.alias"
+
+            try:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(partial)
+
+                os.link(path, partial)
+                os.rename(partial, alias)
+            except OSError as error:
+                log(
+                    f"worker {self.worker_name(index)}: its socket could not be given "
+                    f"the path the edge routes by: {error}"
+                )
+                continue
+
+            if self.aliases.get(index) != (alias, path):
+                why = (
+                    "no supervisor is connected to give it"
+                    if self.supervisor is None
+                    else "the supervisor has not said the edge has"
+                )
+                log(
+                    f"worker {self.worker_name(index)} is reached by the edge at "
+                    f"{os.path.basename(alias)}: {why} {os.path.basename(path)}"
+                )
+
+            self.aliases[index] = (alias, path)
+
+    def edge_reaches(self, index: int) -> bool:
+        """Say whether the edge reaches the worker in routing at an index with no supervisor.
+
+        True when no supervisor is connected and the path the edge has
+        names the worker's socket, its own or a second name for it.
+        """
+
+        if self.supervisor is not None:
+            return False
+
+        path = self.routed.get(index)
+        route = self.edge_routes.get(index)
+
+        if path is None or route is None:
+            return False
+
+        return route == path or self.aliases.get(index) == (route, path)
 
     def emit(
         self,
@@ -4184,6 +4334,13 @@ class Host:
 
             self.announce()
 
+        # Issue 981: with no supervisor, the edge is not told the socket,
+        # so the socket takes the path the edge has. A worker started
+        # again on the path it had has a new socket there, which the
+        # second name is moved to.
+
+        self.alias_routes()
+
     def check_requests(self, state: WorkerState) -> None:
         """Replace a worker that has served its share of requests."""
 
@@ -5228,8 +5385,18 @@ class Host:
         """
 
         if replacement.announced is not None and replacement.terminate_at is None:
-            acknowledged = self.acked >= replacement.announced
+            acknowledged = self.acked >= replacement.announced or self.edge_reaches(
+                replacement.index
+            )
             waited = now >= (replacement.announced_at or now) + ACK_TIMEOUT_SECONDS
+
+            # Issue 983: a supervisor that has not answered in that time
+            # may not have told the edge, which then still has the old
+            # worker's path, so the new worker is made reachable there as
+            # it is with no supervisor connected.
+
+            if waited and not acknowledged:
+                self.alias_routes(unanswered=True)
 
             if acknowledged or waited:
                 replacement.terminate_at = now + ROUTE_SETTLE_SECONDS
@@ -5297,7 +5464,11 @@ class Host:
                 continue
 
             spawned_at = self.spawned_at.pop(pid, 0.0)
-            self.states.pop(pid, None)
+            gone = self.states.pop(pid, None)
+
+            if gone is not None:
+                self.remove_socket(gone.path)
+
             self.worker_pipes_ended(pid)
             self.adopt_orphans(index, pid)
             if self.stopping:
@@ -5473,6 +5644,28 @@ class Host:
                 )
 
             self.restart_after[index] = time.monotonic() + RESTART_DELAY_SECONDS
+
+    def remove_socket(self, path: str) -> None:
+        """Remove the socket file of a worker that has exited (issue 987).
+
+        A worker never removes its own, and a replacement listens on a
+        path of the next generation, so the file of each worker replaced
+        would stay until the host stops. It is left when the path is in
+        use again: by a worker that listens on it, or as the second name
+        of another worker's socket, which the edge connects to.
+        """
+
+        if self.tcp_base_port is not None:
+            return
+
+        if any(state.path == path for state in self.states.values()):
+            return
+
+        if any(alias == path for alias, _path in self.aliases.values()):
+            return
+
+        with contextlib.suppress(OSError):
+            os.unlink(path)
 
     def took_oom_kill(self, status: int) -> bool:
         """Say whether a worker's exit is one of the kernel's kills for memory.
@@ -5707,6 +5900,7 @@ class Host:
         if self.tcp_base_port is None:
             paths = {self.socket_path(index) for index in range(self.worker_count)}
             paths.update(state.path for state in self.states.values())
+            paths.update(alias for alias, _path in self.aliases.values())
 
             for path in paths:
                 try:

@@ -4869,6 +4869,21 @@ pub struct ReleaseArgs {
     command: Vec<String>,
 }
 
+/// An `--initial-processes` value: a count for the release, or
+/// `GROUP=N` for one worker group.
+fn parse_initial_processes(text: &str) -> Result<(Option<String>, u32), String> {
+    let (group, count) = match text.split_once('=') {
+        Some((group, count)) if !group.is_empty() => (Some(group.to_owned()), count),
+        Some(_) => return Err("give N, or GROUP=N for one worker group".to_owned()),
+        None => (None, text),
+    };
+
+    match count.parse::<u32>() {
+        Ok(count) if count >= 1 => Ok((group, count)),
+        _ => Err(format!("{count:?} is not a count of at least 1")),
+    }
+}
+
 /// What `deploy` takes.
 #[derive(Args)]
 pub struct DeployArgs {
@@ -4915,6 +4930,14 @@ pub struct DeployArgs {
     /// min_workers is 0; 0 keeps the host alone).
     #[arg(long, value_name = "N")]
     retain_workers: Option<u32>,
+
+    /// The workers the release starts with, where that is fewer than
+    /// its processes: the count the node's budget checks the deploy at,
+    /// and the count the release keeps while it takes no traffic. Once
+    /// it serves it takes its processes, or what its scaling policy
+    /// says. GROUP=N gives one worker group's; repeatable.
+    #[arg(long = "initial-processes", value_name = "N|GROUP=N", value_parser = parse_initial_processes)]
+    initial_processes: Vec<(Option<String>, u32)>,
 
     /// Report what the deploy would do, with where each of the release's
     /// settings would come from, and change nothing.
@@ -5223,6 +5246,8 @@ impl ReleaseArgs {
     pub(crate) fn request(self, app: &str, source: &str, python: String) -> pb::DeployRequest {
         pb::DeployRequest {
             metadata: std::collections::BTreeMap::new(),
+            initial_processes: None,
+            group_initial_processes: std::collections::BTreeMap::new(),
             app: app.to_owned(),
             source: source.to_owned(),
             kind: self.server.map(|_| "http".to_owned()).unwrap_or_default(),
@@ -5387,6 +5412,17 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
         override_freeze: args.override_freeze,
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
         retain_workers: args.retain_workers,
+        initial_processes: args
+            .initial_processes
+            .iter()
+            .rev()
+            .find(|(group, _)| group.is_none())
+            .map(|(_, count)| *count),
+        group_initial_processes: args
+            .initial_processes
+            .iter()
+            .filter_map(|(group, count)| group.clone().map(|group| (group, *count)))
+            .collect(),
         ..args
             .settings
             .request(&args.app, &source.display().to_string(), python)
@@ -5627,6 +5663,14 @@ pub enum RolloutCommand {
         /// Wait for `rollout resume` before each step after the first.
         #[arg(long)]
         approve_each_step: bool,
+
+        /// How the two releases are sized: own, each at its own size
+        /// (the default), or shared, the two sharing the worker count
+        /// the baseline has when the rollout starts, each sized by its
+        /// share of the traffic, for a node with no room for two full
+        /// copies.
+        #[arg(long, value_name = "MODE", default_value = "own", value_parser = ["own", "shared"])]
+        capacity: String,
 
         /// Stay until the rollout is promoted or rolled back.
         #[arg(long)]
@@ -6261,8 +6305,11 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
 
     match args.processes {
         Some(count) => println!(
-            "muru: {}@{} {} pinned to {count} workers",
-            status.app, status.release, args.group
+            "muru: {}@{} {} pinned to {}",
+            status.app,
+            status.release,
+            args.group,
+            counted(count, "worker", "workers")
         ),
         None => println!(
             "muru: {}@{} {} unpinned; the autoscaler decides again",
@@ -6497,6 +6544,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             probes,
             min_requests,
             approve_each_step,
+            capacity,
             wait,
             override_freeze,
             socket,
@@ -6524,6 +6572,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                     min_requests,
                     approve_each_step,
                     override_freeze,
+                    capacity,
                 })
                 .await
                 .map_err(explain)?
@@ -9150,7 +9199,7 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
             release.threads,
             release.concurrency,
             release.sync_threads,
-        ),
+        ) + &initial_note(release.initial_processes),
     ));
 
     for group in &release.groups {
@@ -9180,7 +9229,7 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
                     group.threads,
                     group.concurrency,
                     group.sync_threads
-                ),
+                ) + &initial_note(group.initial_processes),
                 if group.optional { ", optional" } else { "" }
             ) + &if (group.max_surge, group.max_unavailable)
                 == (release.max_surge, release.max_unavailable)
@@ -9302,6 +9351,14 @@ struct Uses {
     threads: bool,
     /// The event loop, for ASGI and gRPC.
     event_loop: bool,
+}
+
+/// What `release show` adds to a group's size when the release was
+/// deployed with fewer workers to start with (issue 964).
+fn initial_note(initial: Option<u32>) -> String {
+    initial.map_or_else(String::new, |initial| {
+        format!("; {initial} to start with and while it takes no traffic")
+    })
 }
 
 /// A group's processes and what each takes at once: threads for WSGI,
@@ -13296,6 +13353,18 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_initial_count_is_the_releases_or_one_groups() {
+        use super::parse_initial_processes as parse;
+
+        assert_eq!(parse("2"), Ok((None, 2)));
+        assert_eq!(parse("jobs=1"), Ok((Some("jobs".to_owned()), 1)));
+
+        for refused in ["0", "jobs=0", "=1", "jobs=", "many"] {
+            assert!(parse(refused).is_err(), "{refused}");
+        }
+    }
+
     #[test]
     fn a_re_execution_drops_the_flags_of_the_one_before() {
         // Issue 940: a restart after an upgrade, or an upgrade after a

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import re
+import signal
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -256,6 +258,13 @@ def test_recycling_under_the_daemon_moves_traffic_with_no_request_failed(
 
         load.check("recycling under the daemon")
         assert json.loads(first.get("/info").body)["pid"] != pid
+
+        # A replaced worker's socket file goes with it (issue 987): the
+        # directory holds the worker that serves and at most the one
+        # being replaced, not one for each of the workers there have been.
+
+        sockets = first.host_sockets("shop@r1")
+        wait_for(lambda: len(list(sockets.glob("worker-*.sock"))) <= 2)
         assert first.releases("shop") == [
             {"release": "shop@r1", "state": "ready", "serving": "yes"}
         ]
@@ -296,24 +305,40 @@ def test_events_of_a_recycle_begun_while_the_daemon_is_stopped_are_recorded_with
             first.deploy("shop", SHOP, "--processes", "1", "--max-requests", "50")
             == "muru: release shop@r1 is ready and serving"
         )
+        sockets = first.host_sockets("shop@r1")
+        before = serving_pid(first)
         assert "detached" in first.muructl("daemon", "stop").stdout
         first.process.wait(timeout=30)
         stopped = int(time.time() * 1000)
 
         # The edge and the host serve on with no daemon, and the fiftieth
-        # request has the host start a replacement for its worker, which
-        # it can tell nobody; its log has the line of each event.
+        # request has the host replace its worker, which it can tell
+        # nobody: the swap runs to its end, and the edge, which still has
+        # the old worker's socket, reaches the new worker by that path
+        # (issue 981). Its log has the line of each event.
 
         for _ in range(55):
             assert first.get("/info").status == 200
 
         log = first.base / "logs" / "apps" / "shop" / "r1.log"
-        wait_for(lambda: log.read_text(errors="replace").count(") is ready\n") == 2)
+        wait_for(lambda: "worker.recycled: " in log.read_text(errors="replace"))
+        replacement = serving_pid(first)
+        assert replacement not in (None, before)
+        assert {"worker-0.sock", "worker-0-g1.sock"} <= {path.name for path in sockets.iterdir()}
+
+        # A worker that crashes is started again on the socket it had,
+        # and the edge reaches that one too.
+
+        assert replacement is not None
+        os.kill(replacement, signal.SIGKILL)
+        wait_for(lambda: log.read_text(errors="replace").count(") is ready\n") == 3)
+        wait_for(lambda: serving_pid(first) not in (None, before, replacement))
         started = int(time.time() * 1000)
         second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
 
-        # The daemon that takes the host over is sent what it held: the
-        # replacement's start and its being ready, each recorded after the
+        # The daemon that starts takes the host over, learning its
+        # sockets from the host itself, and is sent what it held: every
+        # event of the swap and of the crash, each recorded after the
         # daemon's own start with the time it happened, before it.
 
         def recorded() -> list[dict[str, Any]]:
@@ -324,33 +349,44 @@ def test_events_of_a_recycle_begun_while_the_daemon_is_stopped_are_recorded_with
         restarted = max(
             int(event["sequence"]) for event in recorded() if event["type"] == "daemon.started"
         )
-        wait_for(lambda: any(event["type"] == "worker.recycled" for event in recorded()))
+        wait_for(lambda: sum(event["type"] == "worker.ready" for event in recorded()) == 2)
+        assert [event["type"] for event in recorded() if event["type"].startswith("release.")] == [
+            "release.adopted"
+        ], recorded()
         workers = [event for event in recorded() if event["type"].startswith("worker.")]
         assert [(event["type"], event["subject"]) for event in workers] == [
             ("worker.started", "shop@r1"),
             ("worker.ready", "shop@r1"),
             ("worker.recycled", "shop@r1"),
+            ("worker.exited", "shop@r1"),
+            ("worker.started", "shop@r1"),
+            ("worker.ready", "shop@r1"),
         ], recorded()
         times = [int(event["time_unix_ms"]) for event in workers]
-        assert stopped <= times[0] <= times[1] <= started, (stopped, times, started)
-
-        # The swap ends once the daemon has the edge route to the new
-        # worker, so its event arrives as it happens.
-
-        assert times[2] >= started, (times, started)
+        assert times == sorted(times) and stopped <= times[0] and times[-1] <= started, (
+            stopped,
+            times,
+            started,
+        )
         assert "max_requests 50" in workers[2]["message"], workers[2]
 
-        # It is counted as one that arrived as it happened is.
+        # They are counted as ones that arrived as they happened are.
 
         labels = 'app="shop",release="r1",group="default"'
+        metrics = second.muructl("metrics").stdout
         assert re.search(
             rf'muru_worker_recycles_total\{{{re.escape(labels)},reason="max_requests"\}} 1\n',
-            second.muructl("metrics").stdout,
+            metrics,
+        )
+        assert re.search(
+            rf'muru_worker_exits_total\{{{re.escape(labels)},reason="crashed"\}} 1\n', metrics
         )
 
-        # Told of the new worker, the edge routes to it.
+        # Told of the worker's own socket, the edge routes to it, and the
+        # host takes away the path it had kept for the edge.
 
-        wait_for(lambda: second.get("/info").status == 200)
+        wait_for(lambda: not (sockets / "worker-0.sock").exists())
+        assert second.get("/info").status == 200
     finally:
         if second is None:
             second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)

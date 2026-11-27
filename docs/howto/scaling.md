@@ -509,6 +509,34 @@ first, until it is back under, and until then other releases' scale-out
 is refused. While the node is over its memory budget, retained releases
 are stopped, oldest first.
 
+A release can start with fewer workers than it is declared with:
+
+```console
+$ muructl deploy shop /srv/shop-2 --hold --initial-processes 1
+muru: release shop@r2 is ready and held: not serving
+```
+
+`--initial-processes N` is the count each worker group of the release
+starts with, and the count the deploy is checked against the budget at.
+`--initial-processes NAME=N` gives one [worker group](worker-groups.md)'s,
+over the release's; a group whose `processes` is lower than the
+release's count starts at its own. The count must be at least 1 and no
+more than the `processes` the group is declared with, which the release
+keeps as its own count: `muructl release show` gives both, as `4
+processes of 3 threads; 1 to start with and while it takes no traffic`.
+
+While the release takes no share of its application's traffic, each
+group stays at its initial count, whatever its `processes` or its
+scaling policy says. A [pin](#watching-and-overriding) moves a group
+meanwhile, and the group returns to its initial count when the pin is
+lifted. Once the release takes traffic, from a rollout's first step, a
+promotion or a deploy without `--hold`, each group is brought to its
+`processes`, or sized by its scaling policy from its `min_workers` up,
+and the workers that takes are admitted by the budget as any scale-out
+is. A release started again later, after a rollback to one that had
+stopped say, starts at its initial count again and grows the same way.
+The option is for a release of workers, and is refused with `--server`.
+
 When a new release at full size does not fit beside the one that
 serves, the application is upgraded a step at a time: see
 [upgrading in place on a host with limited memory](upgrading-in-place.md).

@@ -9,7 +9,7 @@
 //! previous release, drains and events. Re-adoption of hosts across daemon
 //! restarts, retention of drained releases and the rest of phase 2 follow.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,8 +26,8 @@ use crate::host::{HostProcess, HostSpec};
 use crate::locations::{HostDirs, Locations};
 use crate::logs::Logs;
 use crate::model::{
-    AccessLogSpec, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutState,
-    RolloutStep, now_unix_ms, valid_name,
+    AccessLogSpec, GroupSpec, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates,
+    RolloutState, RolloutStep, SharedCapacity, now_unix_ms, valid_name,
 };
 use crate::rollouts::{Counters, Verdict, judge};
 use crate::scaling::{Decision, ScaleStatus};
@@ -465,6 +465,13 @@ struct RolloutRun {
 /// over.
 const SIGNAL_WINDOW: Duration = Duration::from_secs(4);
 
+/// Section 9.16: how long a rollout that shares capacity waits for the
+/// workers its baseline gave up, when the baseline's own stop budget
+/// cannot be read, and how long past that budget it allows for the host
+/// to kill and reap them.
+const DRAIN_WAIT: Duration = Duration::from_secs(60);
+const DRAIN_MARGIN: Duration = Duration::from_secs(5);
+
 /// Section 7.9: how often a host is told its surge allowances again when
 /// they have not changed, in case a message was lost with a connection.
 const SURGE_RETELL: Duration = Duration::from_secs(30);
@@ -546,6 +553,9 @@ pub enum Command {
         gates: RolloutGates,
         /// Whether each step after the first waits for approval.
         approve_each_step: bool,
+        /// Whether the two releases share the baseline's worker count
+        /// (section 9.16).
+        shared: bool,
         /// Where the outcome goes.
         done: oneshot::Sender<Result<Rollout, String>>,
     },
@@ -765,6 +775,19 @@ pub enum Command {
         id: String,
         /// The connection, for acknowledgements.
         control: HostControl,
+    },
+    /// A host's control connection ended (issue 983). Answered with
+    /// whether the release still runs under that host, in which case
+    /// the connection is made again.
+    HostDetached {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The pid of the host the connection was to.
+        pid: Option<u32>,
+        /// Whether to connect again.
+        again: oneshot::Sender<bool>,
     },
     /// A host said something over its control connection.
     HostMessage {
@@ -1708,6 +1731,7 @@ enum AfterStart {
         steps: Vec<RolloutStep>,
         gates: RolloutGates,
         approve_each_step: bool,
+        shared: bool,
         done: oneshot::Sender<Result<Rollout, String>>,
     },
     /// A promotion: its before_promote gates, then the switch.
@@ -2227,6 +2251,11 @@ struct Daemon {
     probe_failures: ProbeFailures,
     /// When each application's rollout probes were last sent.
     probed: HashMap<String, Instant>,
+    /// Section 9.16: the workers a rollout's baseline gave up that a
+    /// step waits to see exit, by application and group: the count of
+    /// workers scaled in at which they have all gone, and when the wait
+    /// is over whatever has.
+    shared_drains: HashMap<(String, String), (u64, Instant)>,
     /// The client probes are sent with.
     probe_client: crate::rollouts::ProbeClient,
     /// The release each application's traffic goes to, as the edge has
@@ -2782,6 +2811,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         worker_faults: HashMap::new(),
         probe_failures: Arc::default(),
         probed: HashMap::new(),
+        shared_drains: HashMap::new(),
         probe_client: crate::rollouts::probe_client(),
         serving: HashMap::new(),
         no_host: BTreeSet::new(),
@@ -6462,6 +6492,40 @@ impl Daemon {
             return false;
         }
 
+        // Issue 981: the host says which sockets its workers listen on.
+        // It replaces workers and starts them again while no daemon is
+        // there, so the record, which the last daemon wrote, may name
+        // sockets of workers long gone.
+
+        let (control, messages, announced) = match HostControl::connect_announced(
+            &dirs.sockets.join("control.sock"),
+        )
+        .await
+        {
+            Ok(connected) => connected,
+            Err(error) => {
+                tracing::info!(error = %format!("{error:#}"), "release {app}@{id} could not be re-adopted");
+                return false;
+            }
+        };
+        let mut record = record;
+
+        for group in &mut record.groups {
+            group.sockets = announced
+                .groups
+                .iter()
+                .find(|(name, _)| *name == group.name)
+                .map(|(_, sockets)| sockets.clone())
+                .unwrap_or_default();
+        }
+
+        record.sockets = announced
+            .sockets
+            .iter()
+            .chain(record.groups.iter().flat_map(|group| &group.sockets))
+            .cloned()
+            .collect();
+
         let group_sockets = record
             .groups
             .iter()
@@ -6562,7 +6626,7 @@ impl Daemon {
                         inspected: false,
                         sticky_until: None,
                         held: false,
-                        control: None,
+                        control: Some(control),
                         status: Vec::new(),
                         load_ms: None,
                         memory_replacements: Vec::new(),
@@ -6579,7 +6643,13 @@ impl Daemon {
                         ready_at,
                     },
                 );
-                self.attach_control(app, id);
+
+                // What the host has said goes through the inbox with the
+                // rest, so its announcement is acknowledged only after
+                // the snapshot of the restored routing has gone to the
+                // edge: the host keeps the paths the edge had until then.
+
+                self.forward_control(app, id, announced.sent, messages);
                 self.events.emit(
                     "release.adopted",
                     &format!("{app}@{id}"),
@@ -6991,9 +7061,12 @@ impl Daemon {
                 steps,
                 gates,
                 approve_each_step,
+                shared,
                 done,
             } => {
-                let checked = self.check_rollout(&app, &release, &steps, &gates).await;
+                let checked = self
+                    .check_rollout(&app, &release, &steps, &gates, shared)
+                    .await;
 
                 match checked {
                     Ok(()) => {
@@ -7006,6 +7079,7 @@ impl Daemon {
                                 steps,
                                 gates,
                                 approve_each_step,
+                                shared,
                                 done,
                             },
                         )
@@ -7181,7 +7255,34 @@ impl Daemon {
             Command::HostAttached { app, id, control } => {
                 if let Some(running) = self.running.get_mut(&(app, id)) {
                     running.control = Some(control);
+
+                    // Issue 983: on a connection made again the host is
+                    // told its allowances again, which it may not have
+                    // heard. It says itself how far a restart has got,
+                    // or that none is under way.
+
+                    running.surge_told = None;
                 }
+            }
+            Command::HostDetached {
+                app,
+                id,
+                pid,
+                again,
+            } => {
+                let same = self.running.get_mut(&(app, id)).is_some_and(|running| {
+                    let same = running
+                        .backend
+                        .host()
+                        .is_some_and(|host| pid.is_some() && host.pid() == pid);
+
+                    if same {
+                        running.control = None;
+                    }
+
+                    same
+                });
+                let _ = again.send(same);
             }
             Command::HostMessage { app, id, message } => {
                 self.host_message(&app, &id, message).await;
@@ -8053,7 +8154,7 @@ impl Daemon {
             factory: spec.factory,
             reflection: spec.reflection,
             handoff: spec.handoff,
-            processes: spec.processes as usize,
+            processes: spec.starting_processes() as usize,
             threads: spec.threads as usize,
             sync_threads: spec.sync_threads as usize,
             concurrency: spec.concurrency as usize,
@@ -8104,7 +8205,7 @@ impl Daemon {
                 .iter()
                 .map(|group| crate::host::HostGroup {
                     name: group.name.clone(),
-                    processes: group.processes as usize,
+                    processes: group.starting_processes() as usize,
                     threads: group.threads as usize,
                     sync_threads: group.sync_threads as usize,
                     concurrency: group.concurrency as usize,
@@ -8290,7 +8391,7 @@ impl Daemon {
                 host.group_sockets
                     .iter()
                     .find(|(name, _)| name == &group.name)
-                    .is_some_and(|(_, sockets)| sockets.len() < group.processes as usize)
+                    .is_some_and(|(_, sockets)| sockets.len() < group.starting_processes() as usize)
             })
             .map(|group| format!("group {}", group.name))
             .collect();
@@ -8780,12 +8881,20 @@ impl Daemon {
                 steps,
                 gates,
                 approve_each_step,
+                shared,
                 done,
             } => {
                 let outcome = match started {
                     Ok(()) => {
-                        self.rollout_started(&app, &candidate, steps, gates, approve_each_step)
-                            .await
+                        self.rollout_started(
+                            &app,
+                            &candidate,
+                            steps,
+                            gates,
+                            approve_each_step,
+                            shared,
+                        )
+                        .await
                     }
                     Err(error) => Err(error),
                 };
@@ -9858,6 +9967,7 @@ impl Daemon {
         candidate: &str,
         steps: &[RolloutStep],
         gates: &RolloutGates,
+        shared: bool,
     ) -> Result<(), String> {
         let record = self.store.app(app).map_err(|error| error.to_string())?;
         let Some(baseline) = record.current.clone() else {
@@ -9868,9 +9978,28 @@ impl Daemon {
             return Err(format!("{app}@{candidate} already serves"));
         }
 
-        self.store
+        let release = self
+            .store
             .release(app, candidate)
             .map_err(|error| error.to_string())?;
+
+        // Section 9.16: a managed server's instances are not scaled, so
+        // a baseline of one cannot shrink and a candidate cannot grow.
+
+        if shared {
+            let serving = self
+                .store
+                .release(app, &baseline)
+                .map_err(|error| error.to_string())?;
+
+            for (id, spec) in [(&baseline, &serving.spec), (&release.id, &release.spec)] {
+                if spec.http.is_some() {
+                    return Err(format!(
+                        "{app}@{id} runs a managed HTTP server, whose instances are not scaled, so it cannot share capacity; a canary without --capacity shared runs it at its own size"
+                    ));
+                }
+            }
+        }
 
         if let Some(active) = self
             .store
@@ -9917,6 +10046,7 @@ impl Daemon {
         steps: Vec<RolloutStep>,
         gates: RolloutGates,
         approve_each_step: bool,
+        shared: bool,
     ) -> Result<Rollout, String> {
         let baseline = self
             .store
@@ -9924,6 +10054,7 @@ impl Daemon {
             .map_err(|error| error.to_string())?
             .current
             .ok_or_else(|| format!("{app} has no serving release to roll out against"))?;
+        let shared = shared.then(|| self.share_capacity(app, &baseline, candidate));
 
         if let Some(running) = self
             .running
@@ -9941,7 +10072,8 @@ impl Daemon {
                 .map_err(|error| error.to_string())?,
             candidate: candidate.to_owned(),
             baseline: baseline.clone(),
-            message: step_message(&steps, 0),
+            message: step_message(&steps, 0)
+                + &shared.as_ref().map_or_else(String::new, total_note),
             steps,
             gates,
             approve_each_step,
@@ -9950,6 +10082,7 @@ impl Daemon {
             step_started_unix_ms: now,
             created_unix_ms: now,
             updated_unix_ms: now,
+            shared,
         };
         self.store
             .put_rollout(&rollout)
@@ -9959,16 +10092,542 @@ impl Daemon {
             &format!("{app}@{candidate}"),
             "notice",
             &format!(
-                "rollout {} against {baseline}: {}",
+                "rollout {} against {baseline}: {}{}",
                 rollout.id,
-                describe_steps(&rollout.steps)
+                describe_steps(&rollout.steps),
+                rollout.shared.as_ref().map_or_else(String::new, total_note)
             ),
         );
+
+        // Section 9.16: the two releases are the rollout's to size from
+        // here, at the counts they have until the first step's workers
+        // are in place.
+
+        if let Some(shared) = &rollout.shared {
+            for (id, counts) in [
+                (&baseline, &shared.baseline),
+                (&rollout.candidate, &shared.candidate),
+            ] {
+                for (group, count) in counts {
+                    self.pin_for_rollout(app, id, group, *count);
+                }
+            }
+        }
+
         let pushed = self.push_snapshot().await;
         self.mark_ready(app, candidate, "");
         pushed?;
         self.begin_rollout_run(&rollout).await;
         Ok(rollout)
+    }
+
+    /// Section 9.16: the total a rollout's two releases share, the
+    /// baseline's worker count now in each of its groups, with the
+    /// counts both are at. A group with no workers, scaled to zero, is
+    /// left out, and so is one the candidate does not have on its side.
+    fn share_capacity(&self, app: &str, baseline: &str, candidate: &str) -> SharedCapacity {
+        let counts = |id: &str| -> BTreeMap<String, u32> {
+            self.running
+                .get(&(app.to_owned(), id.to_owned()))
+                .map(|running| {
+                    running
+                        .scalers
+                        .iter()
+                        .map(|group| {
+                            let ready = running
+                                .group_sockets(&group.name)
+                                .map_or(0, <[PathBuf]>::len)
+                                as u32;
+                            (group.name.clone(), ready.max(group.scaler.desired()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let totals: BTreeMap<String, u32> = counts(baseline)
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        let candidate = counts(candidate)
+            .into_iter()
+            .filter(|(group, _)| totals.contains_key(group))
+            .collect();
+
+        SharedCapacity {
+            baseline: totals.clone(),
+            totals,
+            candidate,
+            sizing: true,
+            finishing: false,
+        }
+    }
+
+    /// Section 9.16: pin a group of a release to the count a rollout
+    /// gives it, as an operator's pin does, so the autoscaler stands
+    /// aside and the count outlives the daemon. Returns the count the
+    /// group was being brought to, or none when the release does not
+    /// run or has no such group.
+    fn pin_for_rollout(&mut self, app: &str, id: &str, group: &str, count: u32) -> Option<u32> {
+        let now = Instant::now();
+        let scaling = self
+            .running
+            .get_mut(&(app.to_owned(), id.to_owned()))?
+            .scalers
+            .iter_mut()
+            .find(|scaling| scaling.name == group)?;
+        let before = scaling.scaler.desired();
+        scaling.scaler.pin(count, now);
+        scaling.requested = Some(count);
+
+        if let Err(error) = self.store.put_scale_pin(app, id, group, count) {
+            tracing::warn!(%error, "release {app}@{id}: a rollout's pin could not be kept");
+        }
+
+        self.ask_scale(app, id, group, count);
+        Some(before)
+    }
+
+    /// Section 9.16: lift the pins a rollout set on its two releases,
+    /// now that it has ended, so the release that serves is sized by
+    /// its own count or policy again.
+    fn release_rollout_pins(&mut self, rollout: &Rollout) {
+        let Some(shared) = &rollout.shared else {
+            return;
+        };
+
+        let now = Instant::now();
+
+        for id in [&rollout.baseline, &rollout.candidate] {
+            if let Some(running) = self.running.get_mut(&(rollout.app.clone(), id.clone())) {
+                for scaling in &mut running.scalers {
+                    if shared.totals.contains_key(&scaling.name)
+                        && scaling.scaler.pinned().is_some()
+                    {
+                        scaling.scaler.unpin(now);
+                    }
+                }
+            }
+
+            for group in shared.totals.keys() {
+                let _ = self.store.remove_scale_pins(&rollout.app, id, Some(group));
+            }
+        }
+
+        self.shared_drains.retain(|(app, _), _| app != &rollout.app);
+    }
+
+    /// Section 9.16: how many more workers of a group of a release fit
+    /// the node's budget, over what the releases hold without the room
+    /// held for swaps, which gives way to a rollout's workers as it
+    /// does to a pin; none when nothing limits them.
+    fn rollout_room(&self, app: &str, id: &str, group: &str) -> Option<u32> {
+        let budget = self.budget();
+
+        if !budget.is_set() {
+            return None;
+        }
+
+        let fallback = self.node_mean_pss();
+        let mut used = crate::budget::Usage::default();
+
+        for running in self.running.values() {
+            used.add_usage(&running.usage_with(fallback, false));
+        }
+
+        for starting in self.starting.values() {
+            used.memory += starting.reserved;
+        }
+
+        let running = self.running.get(&(app.to_owned(), id.to_owned()))?;
+        let scaling = running
+            .scalers
+            .iter()
+            .find(|scaling| scaling.name == group)?;
+        let cost = running.worker_cost(scaling, fallback);
+        crate::budget::room(&budget, &used, cost).map(|(fits, _)| fits)
+    }
+
+    /// Section 9.16: note that a rollout's baseline gave up `given`
+    /// workers of a group, which a step waits to see exit, for no longer
+    /// than their stop budget.
+    fn await_drain(&mut self, rollout: &Rollout, group: &str, given: u32) {
+        if given == 0 {
+            return;
+        }
+
+        let key = (rollout.app.clone(), rollout.baseline.clone());
+        let exited = self.scaled_in(&key, group);
+        let budget = self
+            .store
+            .release(&rollout.app, &rollout.baseline)
+            .map_or(DRAIN_WAIT, |release| release.spec.timeouts.stop_budget());
+        let entry = self
+            .shared_drains
+            .entry((rollout.app.clone(), group.to_owned()))
+            .or_insert((exited, Instant::now()));
+        entry.0 = entry.0.max(exited) + u64::from(given);
+        entry.1 = Instant::now() + budget + DRAIN_MARGIN;
+    }
+
+    /// The workers of a group of a release that have exited scaled in,
+    /// since the daemon began to hear from its host.
+    fn scaled_in(&self, key: &(String, String), group: &str) -> u64 {
+        self.running.get(key).map_or(0, |running| {
+            running
+                .exits
+                .get(&(group.to_owned(), "scaled_in".to_owned()))
+                .copied()
+                .unwrap_or(0)
+        })
+    }
+
+    /// Section 9.16: whether workers a rollout's baseline gave up in a
+    /// group are still exiting; with no group, in any.
+    fn draining_for(&mut self, rollout: &Rollout, group: Option<&str>) -> bool {
+        let key = (rollout.app.clone(), rollout.baseline.clone());
+        let now = Instant::now();
+        let waits: Vec<(String, u64, Instant)> = self
+            .shared_drains
+            .iter()
+            .filter(|((app, name), _)| {
+                app == &rollout.app && group.is_none_or(|group| group == name)
+            })
+            .map(|((_, name), (expected, until))| (name.clone(), *expected, *until))
+            .collect();
+        let mut draining = false;
+
+        for (name, expected, until) in waits {
+            if self.scaled_in(&key, &name) >= expected || now >= until {
+                self.shared_drains.remove(&(rollout.app.clone(), name));
+            } else {
+                draining = true;
+            }
+        }
+
+        draining
+    }
+
+    /// Section 9.16: move a rollout that shares capacity along while a
+    /// step's workers are being put in place, or the candidate grown to
+    /// the total ahead of its promotion. Each group is taken toward the
+    /// step's counts by `shared::plan`; once every group is there the
+    /// traffic moves and the baseline drains to its counts, or the
+    /// candidate is promoted. Returns whether the rollout was in such a
+    /// phase, in which case its gates are not judged this tick.
+    async fn size_rollout(&mut self, rollout: &mut Rollout) -> bool {
+        let Some(mut shared) = rollout.shared.clone() else {
+            return false;
+        };
+
+        if !shared.sizing && !shared.finishing {
+            return false;
+        }
+
+        let app = rollout.app.clone();
+        let subject = format!("{app}@{}", rollout.candidate);
+
+        let percent = if shared.finishing {
+            100
+        } else {
+            rollout
+                .steps
+                .get(rollout.step)
+                .map_or(100, |step| step.percent)
+        };
+        let swaps = self
+            .store
+            .release(&app, &rollout.baseline)
+            .map(|release| release.spec)
+            .ok();
+        let mut ready = true;
+        let mut waiting = None;
+        let mut short = Vec::new();
+
+        for (group, total) in shared.totals.clone() {
+            let Some(pinned) = shared.candidate.get(&group).copied() else {
+                continue;
+            };
+
+            let (baseline_target, candidate_target) = crate::shared::sizes(total, percent);
+            let candidate_key = (app.clone(), rollout.candidate.clone());
+
+            // The baseline keeps a worker while it takes any traffic,
+            // which it does until the promotion, and a scaled group of
+            // the candidate is never pinned over its ceiling.
+
+            let (candidate_ready, ceiling) =
+                self.running
+                    .get(&candidate_key)
+                    .map_or((0, None), |running| {
+                        let ready =
+                            running.group_sockets(&group).map_or(0, <[PathBuf]>::len) as u32;
+                        let ceiling = running
+                            .scalers
+                            .iter()
+                            .find(|scaling| scaling.name == group)
+                            .filter(|scaling| !scaling.scaler.spec().is_static())
+                            .map(|scaling| scaling.scaler.ceiling());
+                        (ready, ceiling)
+                    });
+            let state = crate::shared::Group {
+                baseline: shared.baseline.get(&group).copied().unwrap_or(total),
+                candidate: pinned,
+                baseline_target: baseline_target.max(1),
+                candidate_target: ceiling
+                    .map_or(candidate_target, |ceiling| candidate_target.min(ceiling)),
+                candidate_ready,
+                baseline_draining: self.draining_for(rollout, Some(&group)),
+                room: self.rollout_room(&app, &rollout.candidate, &group),
+                max_unavailable: swaps.as_ref().map_or(0, |spec| spec.group_swap(&group).1),
+            };
+
+            match crate::shared::plan(&state) {
+                crate::shared::Move::Trim(to) => {
+                    ready = false;
+                    self.pin_for_rollout(&app, &rollout.candidate, &group, to);
+                    shared.candidate.insert(group.clone(), to);
+                    self.events.emit(
+                        "rollout.capacity",
+                        &subject,
+                        "notice",
+                        &format!(
+                            "{} {group}: drained from {pinned} to {}, its share at {percent}%",
+                            rollout.candidate,
+                            workers(to)
+                        ),
+                    );
+                }
+                crate::shared::Move::Grow(to) => {
+                    ready = false;
+                    self.pin_for_rollout(&app, &rollout.candidate, &group, to);
+                    shared.candidate.insert(group.clone(), to);
+                    self.events.emit(
+                        "rollout.capacity",
+                        &subject,
+                        "notice",
+                        &format!(
+                            "{} {group}: grown from {pinned} to {}, {}",
+                            rollout.candidate,
+                            workers(to),
+                            match (to >= state.candidate_target, shared.finishing) {
+                                (true, true) =>
+                                    "the whole total, ahead of its promotion".to_owned(),
+                                (true, false) =>
+                                    format!("its share at {percent}%, ahead of the traffic"),
+                                (false, _) => format!(
+                                    "of the {} it is to have at {percent}%: what the node's budget has room for",
+                                    state.candidate_target
+                                ),
+                            }
+                        ),
+                    );
+                }
+                crate::shared::Move::Shrink(to) => {
+                    ready = false;
+                    self.pin_for_rollout(&app, &rollout.baseline, &group, to);
+                    shared.baseline.insert(group.clone(), to);
+                    self.await_drain(rollout, &group, state.baseline - to);
+                    self.events.emit(
+                        "rollout.capacity",
+                        &subject,
+                        "notice",
+                        &format!(
+                            "{} {group}: drained from {} to {}, ahead of the traffic: the node's budget has no room for the workers of {} until it has",
+                            rollout.baseline,
+                            state.baseline,
+                            workers(to),
+                            rollout.candidate
+                        ),
+                    );
+                }
+                crate::shared::Move::Starting => {
+                    ready = false;
+                    waiting.get_or_insert(format!(
+                        "waiting for the {} of {} ({group}) to be ready",
+                        workers(pinned),
+                        rollout.candidate
+                    ));
+                }
+                crate::shared::Move::Draining => {
+                    ready = false;
+                    waiting.get_or_insert(format!(
+                        "waiting for the workers {} gave up ({group}) to exit",
+                        rollout.baseline
+                    ));
+                }
+                crate::shared::Move::NoRoom => {
+                    ready = false;
+                    waiting.get_or_insert(format!(
+                        "waiting for room in the node's budget for the workers of {} ({group}): max_unavailable 0 lets {} give up none before its traffic moves",
+                        rollout.candidate, rollout.baseline
+                    ));
+                }
+                crate::shared::Move::Ready { short: true } => {
+                    short.push(format!(
+                        "{group} at {} of {}",
+                        pinned,
+                        workers(state.candidate_target)
+                    ));
+                }
+                crate::shared::Move::Ready { short: false } => {}
+            }
+        }
+
+        let now = now_unix_ms();
+
+        let phase = if shared.finishing {
+            "every step passed its gates".to_owned()
+        } else {
+            step_message(&rollout.steps, rollout.step)
+        };
+
+        if !ready {
+            let message = match waiting {
+                Some(waiting) => format!("{phase}: {waiting}"),
+                None => format!("{phase}{SIZING}"),
+            };
+
+            if rollout.message != message || rollout.shared.as_ref() != Some(&shared) {
+                rollout.message = message;
+                rollout.updated_unix_ms = now;
+                rollout.shared = Some(shared);
+                let _ = self.store.put_rollout(rollout);
+            }
+
+            return true;
+        }
+
+        if !short.is_empty() {
+            self.events.emit(
+                "rollout.capacity",
+                &subject,
+                "warning",
+                &format!(
+                    "{} goes on short of its share at {percent}%, the node's budget having no room: {}",
+                    rollout.candidate,
+                    short.join(", ")
+                ),
+            );
+        }
+
+        // Every group of the candidate has its workers, ready. Ahead of
+        // a promotion that is all: the promotion moves the traffic and
+        // retains the baseline.
+
+        if shared.finishing {
+            rollout.shared = Some(shared);
+            rollout.updated_unix_ms = now;
+            let _ = self.store.put_rollout(rollout);
+            self.promote_rollout(rollout.clone(), "every step passed its gates", None)
+                .await;
+            return true;
+        }
+
+        // The traffic moves, and then the baseline drains to its counts.
+
+        shared.sizing = false;
+        rollout.shared = Some(shared.clone());
+        rollout.step_started_unix_ms = now;
+        rollout.updated_unix_ms = now;
+        rollout.message = phase;
+        let _ = self.store.put_rollout(rollout);
+
+        if let Err(error) = self.push_snapshot().await {
+            tracing::error!(%error, "pushing the snapshot for a rollout step failed");
+        }
+
+        for (group, total) in &shared.totals {
+            let target = crate::shared::sizes(*total, percent).0.max(1);
+            let held = shared.baseline.get(group).copied().unwrap_or(*total);
+
+            if target >= held {
+                continue;
+            }
+
+            self.pin_for_rollout(&app, &rollout.baseline, group, target);
+            shared.baseline.insert(group.clone(), target);
+            self.await_drain(rollout, group, held - target);
+            self.events.emit(
+                "rollout.capacity",
+                &subject,
+                "notice",
+                &format!(
+                    "{} {group}: drained from {held} to {}, its share with {} at {percent}%",
+                    rollout.baseline,
+                    workers(target),
+                    rollout.candidate
+                ),
+            );
+        }
+
+        rollout.shared = Some(shared);
+        let _ = self.store.put_rollout(rollout);
+        self.begin_rollout_run(rollout).await;
+        true
+    }
+
+    /// Section 9.16: a rollback's first move, before the traffic goes
+    /// back: the baseline is grown toward the total, as far as the
+    /// budget has room, without waiting for the workers.
+    fn grow_baseline_back(&mut self, rollout: &mut Rollout) {
+        let Some(mut shared) = rollout.shared.clone() else {
+            return;
+        };
+
+        let subject = format!("{}@{}", rollout.app, rollout.candidate);
+
+        for (group, total) in shared.totals.clone() {
+            let held = shared.baseline.get(&group).copied().unwrap_or(total);
+
+            if held >= total {
+                continue;
+            }
+
+            let room = self.rollout_room(&rollout.app, &rollout.baseline, &group);
+            let to = room.map_or(total, |room| total.min(held.saturating_add(room)));
+
+            if to > held {
+                self.pin_for_rollout(&rollout.app, &rollout.baseline, &group, to);
+                shared.baseline.insert(group.clone(), to);
+                self.events.emit(
+                    "rollout.capacity",
+                    &subject,
+                    "notice",
+                    &format!(
+                        "{} {group}: grown back from {held} to {} of its {total}, before it takes the traffic again",
+                        rollout.baseline,
+                        workers(to)
+                    ),
+                );
+            }
+        }
+
+        rollout.shared = Some(shared);
+    }
+
+    /// Section 9.16: ahead of a promotion by hand, the candidate is
+    /// grown toward the total, as far as the budget has room, without
+    /// waiting for the workers.
+    fn grow_candidate_now(&mut self, rollout: &mut Rollout) {
+        let Some(mut shared) = rollout.shared.clone() else {
+            return;
+        };
+
+        for (group, total) in shared.totals.clone() {
+            let Some(held) = shared.candidate.get(&group).copied() else {
+                continue;
+            };
+
+            let room = self.rollout_room(&rollout.app, &rollout.candidate, &group);
+            let to = room.map_or(total, |room| total.min(held.saturating_add(room)));
+
+            if to > held {
+                self.pin_for_rollout(&rollout.app, &rollout.candidate, &group, to);
+                shared.candidate.insert(group, to);
+            }
+        }
+
+        rollout.shared = Some(shared);
     }
 
     /// Section 9.3: a release's counters for the gates, the edge's with
@@ -10122,6 +10781,7 @@ impl Daemon {
                 rollout.state = RolloutState::Running;
                 rollout.step_started_unix_ms = now_unix_ms();
                 rollout.message = step_message(&rollout.steps, rollout.step);
+                let sizing = rollout.shared.as_ref().is_some_and(|shared| shared.sizing);
 
                 if approved {
                     self.events.emit(
@@ -10130,6 +10790,11 @@ impl Daemon {
                         "notice",
                         &format!("approved: {}", rollout.message),
                     );
+
+                    if sizing {
+                        rollout.message.push_str(SIZING);
+                    }
+
                     self.store
                         .put_rollout(&rollout)
                         .map_err(|error| error.to_string())?;
@@ -10137,6 +10802,10 @@ impl Daemon {
                 } else {
                     self.events
                         .emit("rollout.resumed", &subject, "notice", &rollout.message);
+
+                    if sizing {
+                        rollout.message.push_str(SIZING);
+                    }
                 }
 
                 self.begin_rollout_run(&rollout).await;
@@ -10175,6 +10844,11 @@ impl Daemon {
         self.probed.remove(&rollout.app);
 
         let record = |rollout: &mut Rollout, store: &Store| -> Result<(), String> {
+            if let Some(shared) = &mut rollout.shared {
+                shared.sizing = false;
+                shared.finishing = false;
+            }
+
             rollout.state = state;
             rollout.message = message.to_owned();
             rollout.updated_unix_ms = now_unix_ms();
@@ -10188,6 +10862,11 @@ impl Daemon {
                 self.promote_rollout(rollout.clone(), message, None).await;
             }
             _ => {
+                // Section 9.16: the order of a step in reverse, with no
+                // waiting: the baseline grows back, takes the traffic,
+                // and the candidate drains.
+
+                self.grow_baseline_back(rollout);
                 record(rollout, &self.store)?;
                 self.push_snapshot().await?;
                 self.events.emit(
@@ -10207,6 +10886,8 @@ impl Daemon {
                     self.drain(&rollout.app, &rollout.candidate, Retention::inspection())
                         .await;
                 }
+
+                self.release_rollout_pins(rollout);
             }
         }
 
@@ -10397,6 +11078,11 @@ impl Daemon {
 
         let outcome = match promoted {
             Ok(_) => {
+                if let Some(shared) = &mut rollout.shared {
+                    shared.sizing = false;
+                    shared.finishing = false;
+                }
+
                 rollout.state = RolloutState::Promoted;
                 rollout.message = message.clone();
                 rollout.updated_unix_ms = now_unix_ms();
@@ -10413,6 +11099,11 @@ impl Daemon {
                             "notice",
                             &format!("rollout {}: {message}", rollout.id),
                         );
+
+                        // Section 9.16: the candidate serves, and is its
+                        // own count's or policy's to size from here.
+
+                        self.release_rollout_pins(&rollout);
                         Ok(rollout)
                     }
                     Err(error) => Err(error.to_string()),
@@ -10494,6 +11185,8 @@ impl Daemon {
         };
 
         let message = format!("promoted by hand at {}%", rollout.percent());
+        let mut rollout = rollout;
+        self.grow_candidate_now(&mut rollout);
         self.promote_rollout(rollout, &message, Some(done)).await;
     }
 
@@ -10710,6 +11403,14 @@ impl Daemon {
             let subject = format!("{app}@{}", rollout.candidate);
             let now = now_unix_ms();
 
+            // Section 9.16: while a step's workers are put in place the
+            // traffic has not moved, so there is nothing of the step to
+            // judge yet.
+
+            if self.size_rollout(&mut rollout).await {
+                continue;
+            }
+
             let run = match self.rollout_runs.get(&app) {
                 Some(run) if run.rollout == rollout.id && run.step == rollout.step => run.clone(),
                 _ => {
@@ -10784,7 +11485,39 @@ impl Daemon {
                 continue;
             }
 
+            // Section 9.16: a step is not finished until the workers
+            // the baseline gave up for it have exited, so that the next
+            // does not put the candidate's in beside them.
+
+            if rollout.shared.is_some() && self.draining_for(&rollout, None) {
+                let message = format!(
+                    "step {} at {percent}%: passed its gates; waiting for the workers {} gave up to exit",
+                    rollout.step + 1,
+                    rollout.baseline
+                );
+
+                if rollout.message != message {
+                    rollout.message = message;
+                    rollout.updated_unix_ms = now;
+                    let _ = self.store.put_rollout(&rollout);
+                }
+
+                continue;
+            }
+
             if rollout.step + 1 >= rollout.steps.len() {
+                // Sharing capacity, the candidate is grown to the whole
+                // total first, and promoted once those workers are ready.
+
+                if let Some(shared) = &mut rollout.shared {
+                    shared.finishing = true;
+                    rollout.updated_unix_ms = now;
+                    rollout.message = format!("every step passed its gates{SIZING}");
+                    let _ = self.store.put_rollout(&rollout);
+                    self.rollout_runs.remove(&app);
+                    continue;
+                }
+
                 self.promote_rollout(rollout, "every step passed its gates", None)
                     .await;
                 continue;
@@ -10794,6 +11527,15 @@ impl Daemon {
             rollout.step_started_unix_ms = now;
             rollout.updated_unix_ms = now;
             self.rollout_runs.remove(&app);
+
+            // Sharing capacity, the step's workers are put in place
+            // before its traffic moves: the step before's share stays in
+            // force until then, and `size_rollout` moves it.
+
+            let sizing = rollout.shared.as_mut().is_some_and(|shared| {
+                shared.sizing = true;
+                true
+            });
 
             if rollout.approve_each_step {
                 rollout.state = RolloutState::AwaitingApproval;
@@ -10808,9 +11550,16 @@ impl Daemon {
             }
 
             rollout.message = step_message(&rollout.steps, rollout.step);
-            let _ = self.store.put_rollout(&rollout);
             self.events
                 .emit("rollout.step", &subject, "notice", &rollout.message);
+
+            if sizing {
+                rollout.message.push_str(SIZING);
+                let _ = self.store.put_rollout(&rollout);
+                continue;
+            }
+
+            let _ = self.store.put_rollout(&rollout);
 
             if let Err(error) = self.push_snapshot().await {
                 tracing::error!(%error, "pushing the snapshot for a rollout step failed");
@@ -10989,6 +11738,7 @@ impl Daemon {
             .collect();
         let mut asks = Vec::new();
         let mut reasons: HashMap<(String, String, String), (u32, String)> = HashMap::new();
+        let small = self.starting_small();
 
         for ((app, id), running) in &mut self.running {
             // A retained release is at its warm floor (section 9.1), not
@@ -10999,8 +11749,18 @@ impl Daemon {
             }
 
             let subject = format!("{app}@{id}");
+            let held_small = small.contains(&(app.clone(), id.clone()));
 
             for index in 0..running.scalers.len() {
+                // Issue 964: a release that takes no traffic keeps each
+                // group at the count it started with, whatever its
+                // count or policy says, until it is pinned or serves.
+
+                if held_small && let Some(initial) = running.scalers[index].initial {
+                    running.scalers[index].scaler.hold_at(initial, now);
+                    continue;
+                }
+
                 let cost = running.worker_cost(&running.scalers[index], fallback);
                 let name = running.scalers[index].name.clone();
                 let Some(sockets) = running.group_sockets(&name) else {
@@ -11118,6 +11878,38 @@ impl Daemon {
             .write()
             .expect("defined names poisoned")
             .budget = view;
+    }
+
+    /// Issue 964: the running releases deployed with an initial count
+    /// that take no share of their application's traffic, whose groups
+    /// stay at that count. Empty, without reading the routes, when no
+    /// release was started small.
+    fn starting_small(&self) -> HashSet<(String, String)> {
+        let started: Vec<&(String, String)> = self
+            .running
+            .iter()
+            .filter(|(_, running)| running.retained_until.is_none())
+            .filter(|(_, running)| running.scalers.iter().any(|group| group.initial.is_some()))
+            .map(|(key, _)| key)
+            .collect();
+
+        if started.is_empty() {
+            return HashSet::new();
+        }
+
+        let routes = self.effective().0;
+        let rollouts = self.store.rollouts(None).unwrap_or_default();
+
+        started
+            .into_iter()
+            .filter(|(app, id)| {
+                self.running
+                    .get(&(app.clone(), id.clone()))
+                    .is_some_and(|running| running.held)
+                    || self.traffic_share(app, id, &routes, &rollouts) == 0
+            })
+            .cloned()
+            .collect()
     }
 
     /// Section 7.5: each window of a schedule or overlay that raises a
@@ -11479,12 +12271,12 @@ impl Daemon {
             return;
         }
 
-        let starting = release.spec.processes
+        let starting = release.spec.starting_processes()
             + release
                 .spec
                 .groups
                 .iter()
-                .map(|group| group.processes)
+                .map(GroupSpec::starting_processes)
                 .sum::<u32>();
         let used = self.budget_usage();
         let mut message = "a request is waiting: starting its host again".to_owned();
@@ -12213,6 +13005,19 @@ impl Daemon {
             return Err(starting_refusal(app, id));
         }
 
+        // Section 9.16: a rollout that shares capacity sizes its two
+        // releases with pins of its own.
+
+        if let Ok(Some(rollout)) = self.store.active_rollout(app)
+            && rollout.shared.is_some()
+            && (rollout.baseline == id || rollout.candidate == id)
+        {
+            return Err(format!(
+                "release {app}@{id} is sized by rollout {}, which shares capacity between its releases; muructl rollout abort {app} or promote {app} ends it",
+                rollout.id
+            ));
+        }
+
         let Some(running) = self.running.get_mut(&key) else {
             return Err(format!("release {app}@{id} is not running"));
         };
@@ -12277,7 +13082,10 @@ impl Daemon {
                 "scaling.decision",
                 &subject,
                 "notice",
-                &format!("{group}: pinned to {count} workers by an operator"),
+                &format!(
+                    "{group}: pinned to {count} {} by an operator",
+                    if count == 1 { "worker" } else { "workers" }
+                ),
             );
             self.ask_scale(app, id, group, count);
         }
@@ -13251,45 +14059,43 @@ impl Daemon {
             return;
         };
 
-        let path = host.control_path();
-        let commands = self.commands.clone();
-        let (app, id) = (app.to_owned(), id.to_owned());
+        tokio::spawn(keep_control(
+            self.commands.clone(),
+            app.to_owned(),
+            id.to_owned(),
+            host.pid(),
+            host.control_path(),
+            None,
+        ));
+    }
 
-        tokio::spawn(async move {
-            let (control, mut messages) = match HostControl::connect(&path).await {
-                Ok(connected) => connected,
-                Err(error) => {
-                    tracing::info!(%error, "release {app}@{id}: no host control connection");
-                    return;
-                }
-            };
+    /// Feed what a host says on a control connection already made into
+    /// the daemon's inbox, `sent` first: what it said before the
+    /// connection was handed over. The connection is made again if it
+    /// ends, as one the daemon made itself is.
+    fn forward_control(
+        &self,
+        app: &str,
+        id: &str,
+        sent: Vec<HostMessage>,
+        messages: mpsc::Receiver<HostMessage>,
+    ) {
+        let Some(host) = self
+            .running
+            .get(&(app.to_owned(), id.to_owned()))
+            .and_then(|running| running.backend.host())
+        else {
+            return;
+        };
 
-            if commands
-                .send(Command::HostAttached {
-                    app: app.clone(),
-                    id: id.clone(),
-                    control,
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-
-            while let Some(message) = messages.recv().await {
-                let sent = commands
-                    .send(Command::HostMessage {
-                        app: app.clone(),
-                        id: id.clone(),
-                        message,
-                    })
-                    .await;
-
-                if sent.is_err() {
-                    break;
-                }
-            }
-        });
+        tokio::spawn(keep_control(
+            self.commands.clone(),
+            app.to_owned(),
+            id.to_owned(),
+            host.pid(),
+            host.control_path(),
+            Some((sent, messages)),
+        ));
     }
 
     /// Act on what a host said: new worker sockets go into the record
@@ -14560,6 +15366,143 @@ fn size_scalers(
     }
 }
 
+/// How long the daemon waits before it tries a host's control socket
+/// again, when the host is still there and a connection could not be made.
+const CONTROL_RETRY: Duration = Duration::from_secs(1);
+
+/// Keep a control connection to a release's host for as long as the
+/// release runs under it (section 5.9, issue 983): connect, hand the
+/// connection to the daemon, feed what the host says into the daemon's
+/// inbox, and when the connection ends ask the daemon whether the host
+/// is still the release's, connecting again if so. A host closes the
+/// connection when a send to its supervisor fails or does not complete,
+/// which a daemon that was stalled causes; the host sends its state and
+/// the events it held to whoever connects next. `made` is a connection
+/// already up, with what the host has said on it so far.
+async fn keep_control(
+    commands: mpsc::Sender<Command>,
+    app: String,
+    id: String,
+    pid: Option<u32>,
+    path: PathBuf,
+    made: Option<(Vec<HostMessage>, mpsc::Receiver<HostMessage>)>,
+) {
+    let mut made = made;
+    let mut again = false;
+
+    loop {
+        let connected = match made.take() {
+            Some(made) => Some(made),
+            None => match HostControl::connect(&path).await {
+                Ok((control, messages)) => {
+                    let attached = commands
+                        .send(Command::HostAttached {
+                            app: app.clone(),
+                            id: id.clone(),
+                            control,
+                        })
+                        .await;
+
+                    if attached.is_err() {
+                        return;
+                    }
+
+                    if again {
+                        tracing::info!(
+                            "release {app}@{id}: the host control connection ended and was made again"
+                        );
+                    }
+
+                    Some((Vec::new(), messages))
+                }
+                // A host that has just exited closes its connection a
+                // moment before the daemon knows it has gone, so only a
+                // first connection that fails is worth a line.
+                Err(error) if again => {
+                    tracing::debug!(%error, "release {app}@{id}: no host control connection");
+                    None
+                }
+                Err(error) => {
+                    tracing::info!(%error, "release {app}@{id}: no host control connection");
+                    None
+                }
+            },
+        };
+
+        let failed = connected.is_none();
+
+        if let Some((sent, messages)) = connected
+            && !forward_host_messages(&commands, &app, &id, sent, messages).await
+        {
+            return;
+        }
+
+        // The connection ended, or none could be made. The daemon says
+        // whether the release still runs under this host.
+
+        let (answer, answered) = oneshot::channel();
+        let asked = commands
+            .send(Command::HostDetached {
+                app: app.clone(),
+                id: id.clone(),
+                pid,
+                again: answer,
+            })
+            .await;
+
+        if asked.is_err() || !answered.await.unwrap_or(false) {
+            return;
+        }
+
+        again = true;
+
+        if failed {
+            tokio::time::sleep(CONTROL_RETRY).await;
+        }
+    }
+}
+
+/// Pass a host's messages to the daemon's inbox, those already taken
+/// from the connection first, until the connection ends. Returns whether
+/// the daemon is still there to take them.
+async fn forward_host_messages(
+    commands: &mpsc::Sender<Command>,
+    app: &str,
+    id: &str,
+    sent: Vec<HostMessage>,
+    mut messages: mpsc::Receiver<HostMessage>,
+) -> bool {
+    for message in sent {
+        let forwarded = commands
+            .send(Command::HostMessage {
+                app: app.to_owned(),
+                id: id.to_owned(),
+                message,
+            })
+            .await;
+
+        if forwarded.is_err() {
+            return false;
+        }
+    }
+
+    while let Some(message) = messages.recv().await {
+        let forwarded = commands
+            .send(Command::HostMessage {
+                app: app.to_owned(),
+                id: id.to_owned(),
+                message,
+            })
+            .await;
+
+        if forwarded.is_err() {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Section 7.4: the scaling state of each group of a release that is
 /// starting or adopted, from its spec, the interface it runs as, the
 /// workers it has and the pins an operator left on it.
@@ -14586,7 +15529,9 @@ fn scalers_for(
         let current = groups
             .iter()
             .find(|record| record.name == group.name)
-            .map_or(group.processes as usize, |record| record.sockets.len());
+            .map_or(group.starting_processes() as usize, |record| {
+                record.sockets.len()
+            });
         scalers.push(GroupScaling::new(
             &group.name,
             group.scaling.clone(),
@@ -14601,6 +15546,7 @@ fn scalers_for(
 
     for scaling in &mut scalers {
         scaling.max_surge = spec.group_swap(&scaling.name).0;
+        scaling.initial = spec.group_initial(&scaling.name);
         scaling.hard_limit = spec
             .groups
             .iter()
@@ -14803,6 +15749,28 @@ fn describe_steps(steps: &[RolloutStep]) -> String {
 }
 
 /// What a rollout at this step is doing: "step 2 of 3: 50% for 2m".
+/// Section 9.16: what a rollout's message says after its step while the
+/// step's workers are being moved and its traffic has not.
+const SIZING: &str = ": putting its workers in place";
+
+/// Section 9.16: what a rollout that shares capacity adds to its first
+/// message: the total its two releases share, over every group.
+fn total_note(shared: &SharedCapacity) -> String {
+    format!(
+        ", on a shared total of {}",
+        workers(shared.totals.values().sum())
+    )
+}
+
+/// A count of workers, in words.
+fn workers(count: u32) -> String {
+    if count == 1 {
+        "1 worker".to_owned()
+    } else {
+        format!("{count} workers")
+    }
+}
+
 fn step_message(steps: &[RolloutStep], step: usize) -> String {
     match steps.get(step) {
         Some(current) => format!(
@@ -15079,5 +16047,71 @@ mod tests {
             crate::scaling::worker_size(Interface::Grpc, 4, 8, 1000),
             (1000.0, 9)
         );
+    }
+
+    // Issue 983: a control connection that ends is made again for as
+    // long as the daemon says the release runs under the host.
+
+    #[tokio::test]
+    async fn a_control_connection_that_ends_is_made_again_while_the_host_is_the_releases() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (commands, mut inbox) = mpsc::channel(8);
+        let kept = tokio::spawn(keep_control(
+            commands,
+            "shop".to_owned(),
+            "r1".to_owned(),
+            Some(7),
+            path.clone(),
+            None,
+        ));
+
+        // The host says one thing and closes, as it does when a send to
+        // its supervisor fails.
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream
+            .write_all(b"{\"type\":\"restart\",\"total\":0,\"left\":0}\n")
+            .await
+            .unwrap();
+        drop(stream);
+        assert!(matches!(
+            inbox.recv().await,
+            Some(Command::HostAttached { .. })
+        ));
+        assert!(matches!(
+            inbox.recv().await,
+            Some(Command::HostMessage {
+                message: HostMessage::Restart { left: 0, .. },
+                ..
+            })
+        ));
+
+        let Some(Command::HostDetached { pid, again, .. }) = inbox.recv().await else {
+            panic!("the end of the connection was not reported");
+        };
+
+        assert_eq!(pid, Some(7));
+        again.send(true).unwrap();
+
+        // It connects again, and stops once the release is no longer
+        // the host's.
+
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(matches!(
+            inbox.recv().await,
+            Some(Command::HostAttached { .. })
+        ));
+        drop(stream);
+
+        let Some(Command::HostDetached { again, .. }) = inbox.recv().await else {
+            panic!("the end of the second connection was not reported");
+        };
+
+        again.send(false).unwrap();
+        kept.await.unwrap();
     }
 }

@@ -118,7 +118,20 @@ host sends the old worker SIGTERM. The old worker stops accepting,
 finishes the requests it holds and exits; requests still being dispatched
 to it over the edge's existing connections complete normally. If the
 supervisor does not answer within five seconds, the old worker is told to
-stop regardless.
+stop regardless, and the new worker is first made reachable at the path
+the edge has, as it is with no daemon (below).
+
+While the daemon is stopped, restarting or being upgraded, nobody can
+give the edge a new socket, and it goes on connecting to the paths it
+has. The host then gives the new worker's socket the path the edge has
+for the old one, as a second name for it, and tells the old worker to
+stop a second later, so workers are replaced with no daemon as they are
+with one. A worker that crashes meanwhile is started again and reached
+the same way. The daemon that takes the host over asks it for its
+workers' sockets, gives them to the edge, and the host removes the
+second names. One request can be lost in each such replacement: a
+request the edge sends the old worker, over a connection it already had
+to it, at the moment that worker is told to stop is answered 502.
 
 A worker whose request runs past the [hard timeout](timeouts.md) takes
 the same path, except that it leaves routing before its replacement is

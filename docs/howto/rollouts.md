@@ -35,7 +35,10 @@ releases](traffic.md#previews)). `muructl deploy --hold --open-preview`
 opens the link as soon as the release is ready.
 
 A held release stays until a rollout or a promotion takes it, or
-`muructl drain` stops it.
+`muructl drain` stops it. On a node whose
+[budget](scaling.md#releases-and-the-budget) has no room for it at full
+size, `--initial-processes N` starts it with fewer workers, which it
+keeps until it takes traffic.
 
 ## Blue/green
 
@@ -81,6 +84,7 @@ rollout.
 | `--max-queue-wait` | none | The candidate's 95th percentile wait for a worker thread over the step |
 | `--probe` | none | A URL requested from the candidate and the baseline every 5 seconds; repeatable |
 | `--min-requests` | `100` | Requests the candidate must serve in a step before the gates judge |
+| `--capacity` | `own` | `own`: each release runs at its own size. `shared`: the two share the baseline's worker count, each sized by its share of the traffic |
 | `--approve-each-step` | off | Wait for `rollout resume` before each step after the first |
 
 ## Gates
@@ -135,6 +139,82 @@ $ muructl rollout canary shop@r2 --probe http://127.0.0.1:8080/health --probe ht
 Probe requests count as requests of their release, as any other request
 does.
 
+## Sharing capacity
+
+```console
+$ muructl rollout canary shop@r2 --steps 25,50,75 --capacity shared
+muru: rollout 1 of shop@r2 started against r1: step 1 of 3: 25% for 2m, on a shared total of 4 workers
+```
+
+With `--capacity shared` the baseline and the candidate share one total
+of workers, in proportion to each step's traffic, where a canary
+otherwise runs each release at its own size. It is for a node whose
+[budget](scaling.md#the-nodes-budget) has no room for two full copies of
+the application, and works the same on a node with no budget.
+
+**The total** is the number of workers the baseline has when the
+rollout starts, for each [worker group](worker-groups.md) by itself.
+At a step that gives the candidate a share of the traffic, the
+candidate has that share of the total, rounded down, and the baseline
+the rest. With a total of 4:
+
+| Share of the candidate | Baseline | Candidate |
+| --- | --- | --- |
+| 25% | 3 | 1 |
+| 50% | 2 | 2 |
+| 75% | 1 | 3 |
+| promoted | kept warm | 4 |
+
+**Each side keeps one worker** in each group while it takes any
+traffic, so a share too small to earn a whole worker still has one: a
+total of 4 at 10% runs 4 and 1, and a total of 2 runs 2 and 1 until the
+candidate's share reaches half. A group of one runs one worker of each
+release for the length of the rollout.
+
+**A step moves the workers before and after the traffic.** The
+candidate is grown to its count, and once those workers are ready the
+traffic moves; then the baseline is drained to its count. A candidate
+that has more workers than its share, having been deployed at its own
+size, is drained to its share first. The workers
+the candidate gains are checked against the node's budget, with the
+room held for [replacing workers](scaling.md#room-for-replacing-workers)
+giving way to them. When the budget has no room for them, the order is
+the other way: the baseline gives up workers first and the candidate
+gains them, as many at a time as the baseline group's
+[`max_unavailable`](recycling.md#how-many-at-once-and-in-which-order),
+and then the traffic moves. With `max_unavailable = 0`, which lets the
+baseline give up no worker ahead of its traffic, such a step waits for
+room and its message says so. When the baseline is down to its count
+and the budget still has no room for the candidate's, the candidate
+takes the step's traffic with the workers it has.
+
+**A step lasts until the baseline has drained.** The gates judge the
+step over its hold as they do in any canary, and the next step does not
+begin before the workers the baseline gave up have exited, or their
+[shutdown timeout](timeouts.md) has passed.
+
+**The last step passing** grows the candidate to the whole total, and
+once those workers are ready promotes it. **A rollback**, by a failing
+gate or `muructl rollout abort`, does not wait: the baseline is grown
+back as far as the budget lets it, takes all the traffic at once, and
+the candidate drains to the one worker it is kept with.
+
+The rollout sizes the two releases with pins of its own, so
+`muructl scale status` shows each group as pinned while it runs, and
+`muructl scale --processes` and `--unpin` are refused for the two
+releases until it ends. When it ends, either way, the pins are lifted
+and the release that serves is sized by its own count or scaling policy
+again: a candidate deployed with
+[`--initial-processes`](scaling.md#releases-and-the-budget) takes the
+count it is declared with. `muructl rollout promote` grows the
+candidate to the total as far as the budget lets it and promotes it at
+once, without waiting for those workers.
+
+Each move of workers is a `rollout.capacity` event. A release that runs
+a [managed HTTP server](managed-servers.md) is refused, as baseline or
+as candidate: its instances are not scaled. An ordinary canary still
+works for it.
+
 ## Controlling a rollout
 
 | Command | Effect |
@@ -155,8 +235,8 @@ resource to itself](exclusive-workers.md).
 
 A canary runs the candidate beside the baseline at whatever size each
 has. On a node whose budget cannot hold two full copies of the
-application, the releases are sized by hand at each approved step: see
-[upgrading in place on a host with limited memory](upgrading-in-place.md).
+application, `--capacity shared` has the two share one total of
+workers: see [sharing capacity](#sharing-capacity).
 
 A rollout is not part of the configuration `muructl deployment export`
 writes. `deployment export --resolve-rollouts` writes it as where it stands:
@@ -186,7 +266,8 @@ saying what was done and which overlay froze it.
 ## Events
 
 Every change is an event: `rollout.started`, `rollout.step` for each new
-step or one awaiting approval, `rollout.paused` and `rollout.resumed`,
+step or one awaiting approval, `rollout.capacity` for each move of
+workers when [capacity is shared](#sharing-capacity), `rollout.paused` and `rollout.resumed`,
 `rollout.gate_failed` with the gate and the numbers, `rollout.completed`
 when the candidate is promoted and `rollout.rolled_back` when it is taken
 out, by a gate or by hand.
