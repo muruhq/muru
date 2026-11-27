@@ -808,8 +808,9 @@ def test_the_daemons_file_takes_nothing_the_daemon_serves(tmp_path: Path) -> Non
 def test_recycling_and_timeouts_round_trip_through_export(daemon: Daemon, tmp_path: Path) -> None:
     config = tmp_path / "shop.toml"
     config.write_text(
-        release("shop", "r1", max_requests=250, max_lifetime="1h")
+        release("shop", "r1", max_requests=250, max_lifetime="1h", max_surge=0, max_unavailable=1)
         + "[app.shop.release.r1.timeouts]\nsoft_timeout = '20s'\nhard_timeout = '30s'\n"
+        + "\n[app.shop.release.r1.groups.hot]\npaths = ['/x']\nmax_surge = 2\n"
     )
     applied = apply(daemon, config)
     assert applied.returncode == 0, applied.stdout + applied.stderr
@@ -820,7 +821,17 @@ def test_recycling_and_timeouts_round_trip_through_export(daemon: Daemon, tmp_pa
     assert written["max_lifetime"] == "3600s"
     assert written["timeouts"]["soft_timeout"] == "20s"
     assert written["timeouts"]["hard_timeout"] == "30s"
+    assert (written["max_surge"], written["max_unavailable"]) == (0, 1)
+    assert written["groups"]["hot"]["max_surge"] == 2
+    assert "max_unavailable" not in written["groups"]["hot"]
     assert daemon.muructl("deployment", "diff", "-f", str(config), check=False).returncode == 0
+
+    # Section 7.8: a release's description gives the settings, and a
+    # group's own where they differ from the release's.
+
+    shown = daemon.muructl("release", "show", "shop@r1").stdout
+    assert "swaps        max_surge 0, max_unavailable 1 (the old worker stops first)" in shown
+    assert "max_surge 2, max_unavailable 1 (the new worker starts first)" in shown
 
     # A declared release that differs on these is immutable like any other.
 

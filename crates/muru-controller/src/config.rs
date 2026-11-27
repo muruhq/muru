@@ -4162,6 +4162,20 @@ fn resolve_settings(
     let groups = groups.unwrap_or(&table.groups);
     let mounts = mounts.unwrap_or(&table.mounts);
     check_groups_and_mounts(groups, mounts)?;
+
+    // Section 7.8: how far a group may move from its count while its
+    // workers are swapped.
+
+    let max_surge = request
+        .max_surge
+        .or(table.max_surge)
+        .unwrap_or(muru_config::DEFAULT_MAX_SURGE);
+    let max_unavailable = request
+        .max_unavailable
+        .or(table.max_unavailable)
+        .unwrap_or(muru_config::DEFAULT_MAX_UNAVAILABLE);
+    muru_config::check_swap(max_surge, max_unavailable)?;
+
     let mut resolved_groups = Vec::new();
 
     for (name, group) in groups {
@@ -4218,6 +4232,15 @@ fn resolve_settings(
         )
         .map_err(|error| format!("worker group {name}: {error}"))?;
 
+        // Section 7.8: the group's own swap settings over the release's,
+        // which must leave a way to swap a worker.
+
+        muru_config::check_swap(
+            group.max_surge.unwrap_or(max_surge),
+            group.max_unavailable.unwrap_or(max_unavailable),
+        )
+        .map_err(|error| format!("worker group {name}: {error}"))?;
+
         resolved_groups.push(GroupSpec {
             limits: crate::model::ServedLimits::from_settings(&served),
             name: name.clone(),
@@ -4238,6 +4261,8 @@ fn resolve_settings(
             memory: None,
             max_requests: group.max_requests,
             max_lifetime_ms,
+            max_surge: group.max_surge,
+            max_unavailable: group.max_unavailable,
         });
     }
 
@@ -4668,6 +4693,8 @@ fn resolve_settings(
         logging: python_logging,
         max_requests: request.max_requests.or(table.max_requests),
         max_lifetime_ms,
+        max_surge,
+        max_unavailable,
         timeouts,
         memory,
         env,
@@ -5259,6 +5286,22 @@ fn resolve_layers(
             ),
         ),
         (
+            "max_surge",
+            layer(
+                request.max_surge.is_some(),
+                table.max_surge.is_some(),
+                declared,
+            ),
+        ),
+        (
+            "max_unavailable",
+            layer(
+                request.max_unavailable.is_some(),
+                table.max_unavailable.is_some(),
+                declared,
+            ),
+        ),
+        (
             "timeouts.soft_timeout",
             layer(
                 request.soft_timeout_ms.is_some(),
@@ -5418,6 +5461,8 @@ pub fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
             optional(spec.max_requests, |value| value.to_string()),
         ),
         ("max_lifetime", optional(spec.max_lifetime_ms, format_ms)),
+        ("max_surge", spec.swap().0.to_string()),
+        ("max_unavailable", spec.swap().1.to_string()),
         (
             "timeouts.soft_timeout",
             optional(spec.timeouts.soft_timeout_ms, format_ms),
@@ -5986,6 +6031,8 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         logging: None,
         max_requests: request.max_requests,
         max_lifetime: request.max_lifetime_ms.map(format_ms),
+        max_surge: request.max_surge,
+        max_unavailable: request.max_unavailable,
         timeouts: timeouts_given.then(|| muru_config::Timeouts {
             soft_timeout: request.soft_timeout_ms.map(format_ms),
             hard_timeout: request.hard_timeout_ms.map(format_ms),
@@ -6099,6 +6146,8 @@ fn resolve_http_spec(
         logging: muru_config::PythonLogging::default(),
         max_requests: None,
         max_lifetime_ms: None,
+        max_surge: muru_config::DEFAULT_MAX_SURGE,
+        max_unavailable: muru_config::DEFAULT_MAX_UNAVAILABLE,
         timeouts: crate::model::WorkerTimeouts {
             shutdown_timeout_ms,
             exit_grace_ms: 0,
@@ -6537,6 +6586,8 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         hold: false,
         max_requests: table.max_requests,
         max_lifetime_ms: duration_field(table.max_lifetime.as_ref()),
+        max_surge: table.max_surge,
+        max_unavailable: table.max_unavailable,
         accel_redirect: table.accel_redirect,
         cgi_local_redirect: table.cgi_local_redirect,
         sendfile_roots: table.sendfile_roots.clone(),
@@ -6732,6 +6783,8 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         memory: group.memory.as_ref().map(crate::model::MemoryPolicy::table),
                         max_requests: group.max_requests,
                         max_lifetime: group.max_lifetime_ms.map(format_ms),
+                        max_surge: group.max_surge,
+                        max_unavailable: group.max_unavailable,
                     },
                 )
             })
@@ -6777,6 +6830,8 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         max_lifetime: spec
             .max_lifetime_ms
             .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
+        max_surge: Some(spec.max_surge),
+        max_unavailable: Some(spec.max_unavailable),
         max_body_size: spec.limits.max_body_size_text(),
         timeouts: with_served(
             (spec.timeouts != crate::model::WorkerTimeouts::default()).then(|| {
@@ -7104,6 +7159,16 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "max_lifetime",
         describe_ms(declared.max_lifetime_ms),
         describe_ms(recorded.max_lifetime_ms),
+    );
+    compare(
+        "max_surge",
+        declared.swap().0.to_string(),
+        recorded.swap().0.to_string(),
+    );
+    compare(
+        "max_unavailable",
+        declared.swap().1.to_string(),
+        recorded.swap().1.to_string(),
     );
     compare(
         "request limits",
@@ -7555,6 +7620,47 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("muru-config-plan-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_release_takes_its_swap_settings_from_the_request_and_refuses_both_zero() {
+        let source = source_dir();
+        let request = |max_surge, max_unavailable| pb::DeployRequest {
+            app: "shop".to_owned(),
+            source: source.display().to_string(),
+            entrypoint: "shop.wsgi:application".to_owned(),
+            python: "/usr/bin/python3".to_owned(),
+            max_surge,
+            max_unavailable,
+            ..Default::default()
+        };
+        let resolve = |max_surge, max_unavailable| {
+            resolve_spec(
+                &request(max_surge, max_unavailable),
+                &Tables::default(),
+                &crate::provision::Provisioning::off(),
+            )
+        };
+
+        // Section 7.8: the defaults are one over and none under.
+
+        let plain = resolve(None, None).unwrap();
+        assert_eq!(plain.swap(), (1, 0));
+        assert_eq!(plain.group_swap("default"), (1, 0));
+
+        let drain_first = resolve(Some(0), Some(1)).unwrap();
+        assert_eq!(drain_first.swap(), (0, 1));
+
+        // With both 0 no worker could be swapped, whichever way it is
+        // said.
+
+        for (max_surge, max_unavailable) in [(Some(0), None), (Some(0), Some(0))] {
+            let error = resolve(max_surge, max_unavailable).unwrap_err();
+            assert!(
+                error.starts_with("max_surge and max_unavailable are both 0"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

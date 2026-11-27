@@ -36,6 +36,8 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `max_body_size` | string | the host's, else `max_body_size` in `[limits]` | The largest body of a request the release serves, for example 50MB, which the edge enforces. |
 | `max_lifetime` | string |  | How long a worker lives before it is replaced. |
 | `max_requests` | integer |  | Requests a worker serves before it is replaced. |
+| `max_surge` | integer | `1` | How many workers a group may run over its count while workers are swapped: recycled, or restarted on request. A replacement is started before the old worker stops while the group is within it; with 0 the old worker stops first. |
+| `max_unavailable` | integer | `0` | How many workers a group may run under its count while workers are swapped. Both this and `max_surge` 0 is refused. |
 | `memory` | table, {ref}`[tool.muru.memory] <config-project-tool-muru-memory>` |  | The memory policy for the workers. |
 | `mounts` | table of tables, {ref}`[tool.muru.mounts.NAME] <config-project-tool-muru-mounts-name>` |  | Mounts by name. |
 | `preload` | string | `"auto"` | Whether the application is imported once, in the host, before the workers are forked from it. `auto`: Preload when the import check passes, otherwise import per worker. `true`: Preload, and fail the release when the import check does not pass. `false`: Import in every worker. |
@@ -167,6 +169,8 @@ A worker group, the `[app.NAME.release.ID.groups.NAME]` or `[tool.muru.groups.NA
 | `max_body_size` | string | the release's | The largest body of a request the group serves, for example 200MB, which the edge enforces. |
 | `max_lifetime` | string | the release's | How long a worker of the group lives before it is replaced, for example 1h, with jitter. |
 | `max_requests` | integer | the release's | Requests a worker of the group serves before it is replaced, with jitter. |
+| `max_surge` | integer | the release's | How many workers the group may run over its count while workers are swapped. |
+| `max_unavailable` | integer | the release's | How many workers the group may run under its count while workers are swapped. |
 | `memory` | table, {ref}`[tool.muru.memory] <config-project-tool-muru-memory>` |  | The group's own memory policy, each key the release's when absent. |
 | `mounts` | array of strings |  | The named mounts the group's workers serve, beside the default mount, which every worker serves; every mount when absent. The group's paths must lie within them. |
 | `optional` | boolean | `false` | Whether the release is ready without the group's workers: its requests wait until one listens. |
@@ -366,6 +370,8 @@ The `[tool.muru.serve]` table (`[serve]` in muru.toml, and in the file `muructl 
 | `max_lifetime` | string |  | How long a worker lives before it is replaced. |
 | `max_requests` | integer |  | Requests a worker serves before it is replaced. |
 | `max_requests_per_connection` | integer | `0` | Requests one connection may carry. |
+| `max_surge` | integer | `1` | How many workers a group may run over its count while workers are swapped. |
+| `max_unavailable` | integer | `0` | How many workers a group may run under its count while workers are swapped. |
 | `media_dir` | string | `"media"` | The media part, the one part ever served, a relative one taken from the data directory. |
 | `memory` | array of strings |  | The memory policy as KEY=VALUE. |
 | `min_ready` | integer | `1` | The workers ready in every worker group for `/readyz` to pass. |

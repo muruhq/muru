@@ -4892,7 +4892,17 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         String::new()
     };
 
+    // Section 7.8: a managed server's instances are not swapped.
+
+    let (max_surge, max_unavailable) = if release.spec.http.is_some() {
+        (0, 0)
+    } else {
+        release.spec.swap()
+    };
+
     pb::Release {
+        max_surge,
+        max_unavailable,
         traffic: String::new(),
         detour: None,
         metadata: release.spec.metadata.clone(),
@@ -5014,6 +5024,8 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                 hosts: group.host.clone(),
                 methods: group.method.clone(),
                 mounts: group.mounts.clone(),
+                max_surge: group.max_surge.unwrap_or(max_surge),
+                max_unavailable: group.max_unavailable.unwrap_or(max_unavailable),
             })
             .collect(),
         detected_interface,

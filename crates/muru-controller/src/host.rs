@@ -93,6 +93,9 @@ pub enum HostMessage {
         /// The workers being replaced for memory, which the memory guard
         /// counts as its one at a time (section 13.9, issue 662).
         memory_replacements: Vec<MemoryReplacement>,
+        /// The voluntary swaps waiting their turn, by group (section
+        /// 7.8).
+        swaps_waiting: std::collections::BTreeMap<String, u32>,
     },
     /// The workers' answers to a request (section 11.7).
     Response {
@@ -494,6 +497,17 @@ impl HostMessage {
                             .collect()
                     })
                     .unwrap_or_default(),
+                swaps_waiting: value["swaps_waiting"]
+                    .as_object()
+                    .map(|groups| {
+                        groups
+                            .iter()
+                            .map(|(group, count)| {
+                                (group.clone(), count.as_u64().unwrap_or(0) as u32)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             _ => None,
         }
@@ -739,6 +753,12 @@ pub struct HostSpec {
     pub max_requests: Option<u64>,
     /// How long a worker lives before it is replaced (section 7.7).
     pub max_lifetime: Option<Duration>,
+    /// How many workers a group may run over its count while workers are
+    /// swapped (section 7.8).
+    pub max_surge: u32,
+    /// How many workers a group may run under its count while workers
+    /// are swapped.
+    pub max_unavailable: u32,
     /// How long a request may run before it is interrupted (section
     /// 7.6); off when absent.
     pub soft_timeout: Option<Duration>,
@@ -1102,6 +1122,12 @@ pub struct HostGroup {
     /// How long a worker lives before it is replaced, resolved over the
     /// release's.
     pub max_lifetime: Option<Duration>,
+    /// How many workers the group may run over its count while workers
+    /// are swapped, resolved over the release's (section 7.8).
+    pub max_surge: u32,
+    /// How many workers the group may run under its count while workers
+    /// are swapped, resolved over the release's.
+    pub max_unavailable: u32,
     /// Whether the release is ready without the group's workers (ADR
     /// 0033).
     pub optional: bool,
@@ -1398,6 +1424,10 @@ impl HostProcess {
                     |lifetime| lifetime.as_secs_f64().to_string()
                 ),
             ));
+            command.arg("--group-swap").arg(format!(
+                "{}={},{}",
+                group.name, group.max_surge, group.max_unavailable
+            ));
         }
 
         if let Some(level) = spec.logging.level {
@@ -1454,6 +1484,12 @@ impl HostProcess {
             .arg(spec.loop_stall_timeout.as_secs_f64().to_string())
             .arg("--gil-stall-timeout")
             .arg(spec.gil_stall_timeout.as_secs_f64().to_string());
+
+        command
+            .arg("--max-surge")
+            .arg(spec.max_surge.to_string())
+            .arg("--max-unavailable")
+            .arg(spec.max_unavailable.to_string());
 
         if let Some(count) = spec.max_requests {
             command.arg("--max-requests").arg(count.to_string());
@@ -3197,6 +3233,28 @@ mod tests {
 
         assert_eq!(start_time(first.id()), None);
         assert_eq!(start_time(0), None);
+    }
+
+    #[test]
+    fn a_status_carries_the_swaps_waiting_in_each_group() {
+        let parsed = HostMessage::parse(
+            r#"{"type":"status","host":{},"workers":[],"memory_replacements":[],
+                "swaps_waiting":{"default":2,"reports":0}}"#,
+        );
+        let Some(HostMessage::Status { swaps_waiting, .. }) = parsed else {
+            panic!("not a status");
+        };
+
+        assert_eq!(swaps_waiting.get("default"), Some(&2));
+        assert_eq!(swaps_waiting.get("reports"), Some(&0));
+
+        // A host from before the queue says nothing of it.
+
+        let old = HostMessage::parse(r#"{"type":"status","host":{},"workers":[]}"#);
+        assert!(matches!(
+            old,
+            Some(HostMessage::Status { swaps_waiting, .. }) if swaps_waiting.is_empty()
+        ));
     }
 
     #[test]

@@ -361,6 +361,10 @@ def test_invalid_groups_are_refused(daemon: Daemon, tmp_path: Path) -> None:
             "[app.shop.release.r1.groups.hot]\npaths = ['/x']\nmax_lifetime = 'soon'\n",
             "worker group hot: max_lifetime:",
         ),
+        (
+            "[app.shop.release.r1.groups.hot]\npaths = ['/x']\nmax_surge = 0\n",
+            "worker group hot: max_surge and max_unavailable are both 0",
+        ),
     ]:
         config.write_text(
             f"[app.shop.release.r1]\nsource = '{SHOP}'\npython = '{sys.executable}'\n\n{table}"

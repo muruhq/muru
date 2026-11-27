@@ -2491,6 +2491,8 @@ pub(crate) mod tests {
             logging: Default::default(),
             max_requests: None,
             max_lifetime_ms: None,
+            max_surge: muru_config::DEFAULT_MAX_SURGE,
+            max_unavailable: muru_config::DEFAULT_MAX_UNAVAILABLE,
             timeouts: Default::default(),
             memory: Default::default(),
             env: Vec::new(),

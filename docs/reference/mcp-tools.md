@@ -45,7 +45,7 @@ it out.
 | `preview` | reads | `muructl preview --print`: a one-time entry link to the preview of a release, a detour or any release the daemon routes to, valid for a minute or for `valid_for`, for an address whose name reaches this machine, with the `Muru-Preview` header value, which holds the release's preview secret and is given when there is no link too, with why | `target` (`APP@RELEASE`, an application or a detour), `host`, `name`, `valid_for` |
 | `skill_status` | reads | `muructl mcp skill status` | none |
 | `docs` | reads | The user guide embedded in `muructl`: the list of pages, or one page's Markdown | `page` |
-| `set_app_settings` | changes | `muructl app set` | `app`, `env`, `secrets`, `processes`, `threads`, `sync_threads`, `concurrency`, `max_requests`, `max_lifetime`, `timeouts`, `memory`, `replace` |
+| `set_app_settings` | changes | `muructl app set` | `app`, `env`, `secrets`, `processes`, `threads`, `sync_threads`, `concurrency`, `max_requests`, `max_lifetime`, `max_surge`, `max_unavailable`, `timeouts`, `memory`, `replace` |
 | `unset_app_settings` | changes | `muructl app unset` | `app`, `keys`, `all` |
 | `deploy` | changes | `muructl deploy` | `app`, `source`, `entrypoint`, `python`, `hold`, `wait` (default true), `dry_run` |
 | `promote` | changes | `muructl rollout bluegreen` | `release` |

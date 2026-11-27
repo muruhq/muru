@@ -35,6 +35,71 @@ can set `max_requests` and `max_lifetime` of its own, so a group that
 leaks is replaced more often than the rest; a group that sets neither
 takes the release's.
 
+## How many at once, and in which order
+
+Two more settings say how far a group of workers may move from its
+count while its workers are replaced:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `max_surge` | 1 | workers the group may run over its count |
+| `max_unavailable` | 0 | workers the group may run under its count |
+
+With the defaults one worker of a group is replaced at a time, and its
+replacement is started before it stops, so the group runs one worker
+over its count for the length of each replacement and is never under
+it.
+
+```
+muructl deploy shop /srv/shop --max-surge 0 --max-unavailable 1
+```
+
+```toml
+[tool.muru]
+max_surge = 0
+max_unavailable = 1
+```
+
+With `max_surge = 0` the order is the other way round: the old worker
+leaves routing, finishes its requests and exits, and only then is its
+replacement started. The group is one worker under its count
+meanwhile, and never over it. This is the setting for a host with no
+memory to spare for an extra worker, and for an application whose
+worker needs a resource to itself. A group of
+one worker then has none for the moment of each replacement: its
+requests wait at the edge, and are answered once the new worker is
+ready, or with 503 at the [queue timeout](timeouts.md).
+
+Both settings 0 is refused, since no worker could then be replaced.
+Larger values replace more workers at once: `max_surge = 2` starts two
+replacements together, and `max_surge = 1` with `max_unavailable = 1`
+replaces one worker each way at the same time.
+
+A replacement that nothing is forcing waits its turn: a recycle for
+`max_requests`, `max_lifetime` or the [soft memory limit](memory.md),
+and a [restart of every worker](#restarting-a-worker-by-hand). Each
+group has a queue, taken in the order the workers came due. The next
+one starts as soon as the group is within `max_surge`, with its
+replacement started first, or else within `max_unavailable`, with the
+old worker stopped first, and otherwise waits. A worker counts as under
+the group's count whenever the edge is not routing to it, whatever the
+cause: one stopped ahead of its replacement, one that crashed and is
+starting again, one a scale-out has just started.
+
+A replacement that cannot wait does not: a worker past the
+[hard timeout](timeouts.md), one whose event loop or interpreter has
+stalled, one over its hard memory limit or chosen by the
+[memory guard](containers.md#the-memory-guard), and a restart of one
+worker by hand. It goes ahead whatever else is being replaced, and it
+keeps the order: its replacement is started at once when `max_surge`
+is 1 or more, and with `max_surge = 0` only after the old worker has
+exited.
+
+A worker group sets `max_surge` and `max_unavailable` of its own, and
+takes the release's where it sets neither. `muructl release show`
+prints them, and `muructl deploy --dry-run` lists them with where each
+came from.
+
 ## What happens
 
 Each worker reports to the host once a second: the requests it has
@@ -57,13 +122,23 @@ over its [memory limits](memory.md).
 
 Events record each replacement: `worker.started` and `worker.ready` for
 the new worker, then `worker.recycled` (or `worker.restarted`) with the
-reason once the old one has gone, under the release's subject. A
+reason once the old one has gone, under the release's subject. The
+message of a worker that was stopped first ends with `it stopped before
+its replacement started`. A replacement that has to wait its turn is a
+`worker.swap_waiting` event, once, saying what it waits for:
+
+```
+worker.swap_waiting  shop@r1  worker 1 (pid 65835) waits to be replaced (served 1030 requests (max_requests 1000)): max_surge 1 and max_unavailable 0 of the group default allow no more replacements until one under way ends
+```
+
+A
 `worker.timeout_killed` event comes when the host decides to replace the
 worker, with the replacement already forked, and the old worker's exit
 after its drain grace is a line in the log. A worker that exits on its
 own is `worker.exited`.
 The [metrics](metrics.md) count them too, as `muru_worker_recycles_total`
-by reason and `muru_worker_exits_total`. The daemon restarts a release
+by reason and `muru_worker_exits_total`, and `muru_worker_swaps_waiting`
+is the number of replacements waiting their turn in each group. The daemon restarts a release
 whose host dies, and a host that cannot start a replacement three times
 running keeps the old worker and stops trying.
 

@@ -148,6 +148,13 @@ LEAK_RECYCLES = 3
 
 MEMORY_CAUSES = ("memory", "container_memory")
 
+# Section 7.8: the two orders of a swap. Surge first forks the replacement
+# beside the old worker; drain first forks it once the old worker has
+# exited.
+
+SURGE_FIRST = "surge_first"
+DRAIN_FIRST = "drain_first"
+
 # Section 7.7 (issue 624): the score every worker raises its own
 # /proc/self/oom_score_adj to after the fork, so the kernel picks a worker,
 # which its host replaces, before a host, the edge or another service.
@@ -934,6 +941,12 @@ class Group:
     max_requests: int | None = None
     max_lifetime: float | None = None
 
+    # Section 7.8: how many workers the group may run over and under its
+    # count while workers are swapped; the release's when None.
+
+    max_surge: int | None = None
+    max_unavailable: int | None = None
+
     # ADR 0033: the release is ready without an optional group's workers,
     # which enter routing as each listens, and a worker of one that
     # cannot start is given up rather than stopping the host.
@@ -1135,6 +1148,27 @@ def parse_group_recycle(text: str) -> tuple[str, dict[str, float | None]]:
     return name, {"max_requests": requests, "max_lifetime": lifetime}
 
 
+def parse_group_swap(text: str) -> tuple[str, dict[str, int]]:
+    """Parse NAME=MAX_SURGE,MAX_UNAVAILABLE, two counts that are not both 0."""
+
+    form = "NAME=MAX_SURGE,MAX_UNAVAILABLE"
+    name, _, values = text.partition("=")
+    parts = values.split(",")
+
+    if not name or len(parts) != 2:
+        raise argparse.ArgumentTypeError(f"{text!r} is not {form}")
+
+    try:
+        surge, unavailable = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not {form}") from None
+
+    if surge < 0 or unavailable < 0 or surge + unavailable == 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not {form}")
+
+    return name, {"max_surge": surge, "max_unavailable": unavailable}
+
+
 @dataclass
 class MemoryPolicy:
     """The memory limits of section 7.7, in bytes and seconds."""
@@ -1218,6 +1252,11 @@ class WorkerState:
 
     stop_first_held: bool = False
 
+    # Section 7.8: whether a voluntary swap of this worker waits in its
+    # group's queue, so it joins once.
+
+    queued: bool = False
+
 
 @dataclass
 class PastDeadline:
@@ -1300,6 +1339,21 @@ class Replacement:
 
 
 @dataclass
+class Swap:
+    """A voluntary swap of a worker, waiting its turn in its group's queue (section 7.8)."""
+
+    index: int
+    pid: int
+    reason: str
+    kind: str
+    cause: str
+
+    # What the swap was last said to wait for, so it is said once.
+
+    waiting_for: str = ""
+
+
+@dataclass
 class Orphan:
     """A process a dead worker left behind, a child of the host now (section 6.10)."""
 
@@ -1345,6 +1399,8 @@ class Host:
         cgroup: str | None = None,
         sendfile: list[tuple[str, list[str], str | None, dict[str, int]]] | None = None,
         files_dir: str | None = None,
+        max_surge: int = 1,
+        max_unavailable: int = 0,
     ) -> None:
         self.release = release
         self.mounts = mounts or []
@@ -1368,6 +1424,8 @@ class Host:
         self.concurrency = concurrency
         self.max_requests = max_requests
         self.max_lifetime = max_lifetime
+        self.max_surge = max_surge
+        self.max_unavailable = max_unavailable
         self.soft_timeout = soft_timeout
         self.hard_timeout = hard_timeout
         self.hard_drain_grace = hard_drain_grace
@@ -1487,6 +1545,11 @@ class Host:
         self.routed: dict[int, str | None] = {}
         self.replacing: dict[int, Replacement] = {}
 
+        # Section 7.8: the voluntary swaps of each group waiting their
+        # turn, by the group's name, in the order they came.
+
+        self.swaps: dict[str, deque[Swap]] = {}
+
         # Section 7.4: indices forked by a scale-out and not yet ready, and
         # indices a scale-in emptied, to be used again by the next one.
 
@@ -1556,6 +1619,10 @@ class Host:
             memory=self.memory if group.memory is None else group.memory,
             max_requests=self.max_requests if group.max_requests is None else group.max_requests,
             max_lifetime=self.max_lifetime if group.max_lifetime is None else group.max_lifetime,
+            max_surge=self.max_surge if group.max_surge is None else group.max_surge,
+            max_unavailable=(
+                self.max_unavailable if group.max_unavailable is None else group.max_unavailable
+            ),
         )
 
     def group_of(self, index: int) -> Group:
@@ -3626,7 +3693,7 @@ class Host:
             self.signal(state.pid, signal.SIGUSR2)
             return
 
-        self.replace(
+        self.swap(
             state,
             f"{policy.measure} {format_size(value)} stayed over the soft limit of "
             f"{format_size(soft)} for {now - state.over_soft_since:.0f} s"
@@ -3691,6 +3758,9 @@ class Host:
                     for replacement in self.replacing.values()
                     if replacement.cause in MEMORY_CAUSES
                 ],
+                "swaps_waiting": {
+                    group.name: len(self.swaps.get(group.name, ())) for group in self.groups
+                },
             }
         )
 
@@ -3746,7 +3816,7 @@ class Host:
             state.recycle_after_requests is not None
             and state.requests >= state.recycle_after_requests
         ):
-            self.replace(
+            self.swap(
                 state,
                 f"served {state.requests} requests "
                 f"(max_requests {self.group_of(state.index).max_requests})",
@@ -3914,7 +3984,7 @@ class Host:
                     },
                 )
             elif state.recycle_at is not None and now >= state.recycle_at:
-                self.replace(
+                self.swap(
                     state,
                     f"lived {now - state.started_at:.0f} s (max_lifetime {group.max_lifetime:g} s)",
                     "worker.recycled",
@@ -3923,6 +3993,8 @@ class Host:
 
         for replacement in list(self.replacing.values()):
             self.advance(replacement, now)
+
+        self.run_swaps()
 
         # A profile sampled from outside is answered by its thread, so it is
         # looked at here as well as when its time is up.
@@ -3938,6 +4010,7 @@ class Host:
         cause: str = "",
         hard: bool = False,
         abandon: dict[str, str] | None = None,
+        order: str | None = None,
     ) -> bool:
         """Start replacing a worker with a fresh one on a new socket.
 
@@ -3948,6 +4021,12 @@ class Host:
         the stuck one, or all of them when the whole worker is stalled. A
         worker being debugged is pinned: the policy applies once the last
         session ends. Return whether a replacement was started.
+
+        `order` is the order the group's queue gave a voluntary swap
+        (section 7.8): SURGE_FIRST forks the replacement beside the old
+        worker, DRAIN_FIRST once the old worker has exited. Without it
+        the replacement is involuntary, held back by no queue or slot,
+        and its order follows the group's surge allowance.
         """
 
         if state.debug_sessions:
@@ -4002,15 +4081,28 @@ class Host:
         if self.start_failures.get(index, 0) >= MAX_START_FAILURES:
             return False
 
+        # Section 7.8: an involuntary replacement is surge first while its
+        # group has a surge allowance, and otherwise the old worker has
+        # exited before its successor is forked.
+
+        group = self.group_of(index)
+        allowance = self.surge_allowance(group)
+
+        if order is None:
+            order = SURGE_FIRST if allowance >= 1 else DRAIN_FIRST
+
         # Section 13.9: two large workers alive at once is what the kernel
         # would kill for, so with no room for a second this one leaves
         # routing and stops first, and reap() forks its successor. It does
         # not while it is the last of its group in routing and another of
         # the group is out of it, being replaced or starting (issue 662):
-        # its replacement waits until that one is back.
+        # its replacement waits until that one is back. A group with no
+        # surge allowance asked for the old worker to stop first, and has
+        # no such floor (section 7.8).
 
-        short = self.short_of_memory(state) if cause in MEMORY_CAUSES else None
-        away = self.away_from_group(index) if cause in MEMORY_CAUSES else None
+        memory = cause in MEMORY_CAUSES
+        short = self.short_of_memory(state) if memory else None
+        away = self.away_from_group(index) if memory and allowance >= 1 else None
 
         if short is not None and away is not None:
             if not state.stop_first_held:
@@ -4024,6 +4116,7 @@ class Host:
             return False
 
         state.replaced = True
+        state.queued = False
         self.generation[index] = self.generation.get(index, 0) + 1
         replacement = Replacement(index, state.pid, reason, kind, cause)
         self.replacing[index] = replacement
@@ -4074,12 +4167,192 @@ class Host:
             replacement.announced_at = time.monotonic()
             return True
 
+        # Section 7.8: drain first. The worker leaves routing, unless the
+        # hard path took it out already, and stops, after the hard drain
+        # grace on that path; reap() forks its successor.
+
+        if order == DRAIN_FIRST:
+            why = (
+                f"max_surge of the group {group.name} is 0"
+                if not group.max_surge
+                else f"the group {group.name} has no surge allowance"
+                if allowance < 1
+                else f"no surge slot of the group {group.name} is free"
+            )
+            log(
+                f"worker {self.worker_name(index)} (pid {state.pid}) "
+                f"stops before its replacement starts: {why}"
+            )
+            replacement.stop_first = True
+
+            if not hard:
+                self.routed[index] = None
+                replacement.announced = self.announce()
+                replacement.announced_at = time.monotonic()
+
+            if kind == "worker.timeout_killed":
+                self.report_timeout_kill(replacement)
+
+            return True
+
         replacement.new_pid = self.spawn(index, replacing=True)
 
         if kind == "worker.timeout_killed":
             self.report_timeout_kill(replacement)
 
         return True
+
+    # Section 7.8: the swaps of a group's workers, paced by its max_surge
+    # and max_unavailable.
+
+    def surge_allowance(self, group: Group) -> int:
+        """Return how many workers the group may run over its count during a swap."""
+
+        return group.max_surge or 0
+
+    def surge_in_use(self, group: Group) -> int:
+        """Return how many of the group's workers have a replacement alive beside them."""
+
+        return sum(
+            1
+            for replacement in self.replacing.values()
+            if self.group_of(replacement.index) is group
+            and not replacement.retire
+            and replacement.new_pid is not None
+        )
+
+    def in_routing(self, index: int) -> bool:
+        """Say whether a worker at the index is one the edge is told to route to."""
+
+        path = self.routed.get(index)
+        return path is not None and any(
+            state.index == index and state.path == path for state in self.states.values()
+        )
+
+    def unavailable_in_use(self, group: Group) -> int:
+        """Return how many workers of the group's count are out of routing.
+
+        Whatever took them out counts: a drain ahead of a replacement, a
+        replacement still starting, a crash to be started again and a
+        scale-out not yet ready.
+        """
+
+        return sum(1 for index in self.active_indices(group) if not self.in_routing(index))
+
+    def free_order(self, group: Group) -> str | None:
+        """Return the order the group's next voluntary swap takes, or None while it waits.
+
+        Surge first while a surge slot is free, else drain first while an
+        unavailable slot is free.
+        """
+
+        if self.surge_in_use(group) < self.surge_allowance(group):
+            return SURGE_FIRST
+
+        if self.unavailable_in_use(group) < (group.max_unavailable or 0):
+            return DRAIN_FIRST
+
+        return None
+
+    def swap(self, state: WorkerState, reason: str, kind: str, cause: str) -> None:
+        """Queue a voluntary swap of a worker, and start it when its turn has come.
+
+        Nothing is wrong with the worker yet (a recycle, a restart of
+        every worker on request), so it waits its turn in its group's
+        queue. A worker being debugged is pinned, and is asked again once
+        its last session ends.
+        """
+
+        if state.replaced or state.queued or state.index in self.replacing:
+            return
+
+        if state.debug_sessions:
+            return
+
+        # With no control socket, or a successor that keeps failing, there
+        # is nothing to wait for: replace() says why and declines.
+
+        if (
+            self.control_listener is None
+            or self.start_failures.get(state.index, 0) >= MAX_START_FAILURES
+        ):
+            self.replace(state, reason, kind, cause)
+            return
+
+        state.queued = True
+        queue = self.swaps.setdefault(self.group_of(state.index).name, deque())
+        queue.append(Swap(state.index, state.pid, reason, kind, cause))
+        self.run_swaps()
+
+    def run_swaps(self) -> None:
+        """Start the queued swaps whose turn has come, group by group, in order."""
+
+        for group in self.groups:
+            queue = self.swaps.get(group.name)
+
+            if not queue:
+                continue
+
+            for swap in list(queue):
+                state = self.states.get(swap.pid)
+
+                # A worker that went another way meanwhile (a crash, an
+                # involuntary replacement, a scale-in) leaves the queue.
+
+                if state is None or state.replaced or state.index in self.replacing:
+                    queue.remove(swap)
+
+                    if state is not None:
+                        state.queued = False
+
+                    continue
+
+                if state.debug_sessions:
+                    continue
+
+                order = self.free_order(group)
+
+                if order is None:
+                    self.note_waiting(swap, group)
+                    break
+
+                queue.remove(swap)
+                state.queued = False
+                self.replace(state, swap.reason, swap.kind, swap.cause, order=order)
+
+    def waiting_for(self, group: Group) -> tuple[str, str]:
+        """Return what a waiting swap of the group waits for, as one word and in words."""
+
+        if not group.max_surge:
+            return (
+                "unavailable",
+                f"max_unavailable {group.max_unavailable} of the group {group.name} "
+                "allows no more of its workers out of routing",
+            )
+
+        return (
+            "surge",
+            f"max_surge {group.max_surge} and max_unavailable {group.max_unavailable} of the "
+            f"group {group.name} allow no more replacements until one under way ends",
+        )
+
+    def note_waiting(self, swap: Swap, group: Group) -> None:
+        """Raise worker.swap_waiting for a swap that cannot start, once for what it waits for."""
+
+        word, words = self.waiting_for(group)
+
+        if swap.waiting_for == word:
+            return
+
+        swap.waiting_for = word
+        self.emit(
+            "worker.swap_waiting",
+            "info",
+            f"worker {self.worker_name(swap.index)} (pid {swap.pid}) waits to be replaced "
+            f"({swap.reason}): {words}",
+            group=group.name,
+            reason=word,
+        )
 
     def away_from_group(self, index: int) -> int | None:
         """Return another worker of the group out of routing, when it is the group's last in.
@@ -4144,17 +4417,27 @@ class Host:
         within the second capture_stacks allows it.
         """
 
-        if replacement.reported or replacement.new_pid is None or not replacement.captured:
+        if replacement.reported or not replacement.captured:
+            return
+
+        # Section 7.8: a worker that stops first has no successor yet, and
+        # the fault is still reported at the decision.
+
+        if replacement.new_pid is None and not replacement.stop_first:
             return
 
         replacement.reported = True
         capture = f"; {replacement.capture}" if replacement.capture else ""
+        successor = (
+            "is replaced once it has stopped"
+            if replacement.new_pid is None
+            else f"replaced by pid {replacement.new_pid}"
+        )
         self.emit(
             replacement.kind,
             "warning",
             f"worker {self.worker_name(replacement.index)} (pid {replacement.old_pid}) "
-            "replaced by pid "
-            f"{replacement.new_pid}: {replacement.reason}{capture}",
+            f"{successor}: {replacement.reason}{capture}",
             group=self.group_of(replacement.index).name,
             reason=replacement.cause,
             evidence=replacement.evidence,
@@ -4639,12 +4922,15 @@ class Host:
                     continue
 
                 capture = f"; {replacement.capture}" if replacement.capture else ""
+                order = (
+                    "; it stopped before its replacement started" if replacement.stop_first else ""
+                )
                 self.emit(
                     replacement.kind,
                     "info",
                     f"worker {self.worker_name(index)} (pid {pid}) "
                     f"replaced by pid {replacement.new_pid}: "
-                    f"{replacement.reason}{capture}",
+                    f"{replacement.reason}{capture}{order}",
                     group=self.group_of(index).name,
                     reason=replacement.cause,
                     evidence=replacement.evidence,
@@ -5483,6 +5769,28 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="replace a worker after this long, with jitter",
     )
     parser.add_argument(
+        "--max-surge",
+        type=int,
+        default=1,
+        metavar="N",
+        help="workers a group may run over its count while workers are swapped",
+    )
+    parser.add_argument(
+        "--max-unavailable",
+        type=int,
+        default=0,
+        metavar="N",
+        help="workers a group may run under its count while workers are swapped",
+    )
+    parser.add_argument(
+        "--group-swap",
+        action="append",
+        default=[],
+        type=parse_group_swap,
+        metavar="NAME=MAX_SURGE,MAX_UNAVAILABLE",
+        help="a named group's max_surge and max_unavailable; the release's without",
+    )
+    parser.add_argument(
         "--soft-timeout",
         type=float,
         default=None,
@@ -5952,6 +6260,15 @@ def _main(argv: list[str] | None) -> int:
         return 1
 
     os.makedirs(args.socket_dir, exist_ok=True)
+
+    if args.max_surge < 0 or args.max_unavailable < 0:
+        log("max_surge and max_unavailable must be at least 0")
+        return 1
+
+    if args.max_surge + args.max_unavailable == 0:
+        log("max_surge and max_unavailable are both 0, so no worker could be replaced")
+        return 1
+
     host = Host(
         release,
         args.socket_dir,
@@ -5968,6 +6285,7 @@ def _main(argv: list[str] | None) -> int:
                 **dict(args.group_timeouts).get(group.name, {}),
                 memory=dict(args.group_memory).get(group.name),
                 **dict(args.group_recycle).get(group.name, {}),
+                **dict(args.group_swap).get(group.name, {}),
                 optional=group.name in args.optional_group,
                 mounts=dict(args.group_mounts).get(group.name, ()),
             )
@@ -5979,6 +6297,8 @@ def _main(argv: list[str] | None) -> int:
         control=args.control,
         max_requests=args.max_requests,
         max_lifetime=args.max_lifetime,
+        max_surge=args.max_surge,
+        max_unavailable=args.max_unavailable,
         soft_timeout=args.soft_timeout,
         hard_timeout=args.hard_timeout,
         hard_drain_grace=args.hard_drain_grace,

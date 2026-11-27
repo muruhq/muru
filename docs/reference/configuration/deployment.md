@@ -36,6 +36,8 @@ An application's table and its releases.
 | `group` | string | the user's primary group | The group, else the user's primary group. |
 | `max_lifetime` | string | the source's, else never | How long a worker lives before it is replaced, for every release, over the source's. |
 | `max_requests` | integer | the source's, else never | Requests a worker serves before it is replaced, for every release, over the source's. |
+| `max_surge` | integer | the source's, else 1 | How many workers a group may run over its count while workers are swapped, for every release, over the source's. |
+| `max_unavailable` | integer | the source's, else 0 | How many workers a group may run under its count while workers are swapped, for every release, over the source's. |
 | `media_dir` | string | `"media"` | The media part, the one part ever served, a relative one taken from `data_dir`. |
 | `memory` | table, {ref}`[app.NAME.memory] <config-deployment-app-name-memory>` |  | The memory policy for every release, each key over the source's. |
 | `priority` | integer | `0` | Which applications' scale-ups the node's budget admits first, the highest first. |
@@ -126,6 +128,8 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `max_body_size` | string | the host's, else `max_body_size` in `[limits]` | The largest body of a request the release serves, for example 50MB, which the edge enforces. |
 | `max_lifetime` | string |  | How long a worker lives before it is replaced, for example 1h, with jitter; off when absent. |
 | `max_requests` | integer |  | Requests a worker serves before it is replaced, with jitter; off when absent. |
+| `max_surge` | integer | `1` | How many workers a group may run over its count while workers are swapped: recycled, or restarted on request. A replacement is started before the old worker stops while the group is within it; with 0 the old worker stops first. |
+| `max_unavailable` | integer | `0` | How many workers a group may run under its count while workers are swapped. Both this and `max_surge` 0 is refused. |
 | `memory` | table, {ref}`[app.NAME.memory] <config-deployment-app-name-memory>` |  | The memory policy for the workers. |
 | `metadata` | table of strings |  | What the deploy recorded about where the release's code came from: string keys to string values, `commit`, `ref`, `url`, `description` and `dirty` among them, which the release keeps and never gives the application. At most 32 keys. |
 | `mounts` | table of tables, {ref}`[app.NAME.release.ID.mounts.NAME] <config-deployment-app-name-release-id-mounts-name>` |  | Mounts by name. |
@@ -216,6 +220,8 @@ A worker group, the `[app.NAME.release.ID.groups.NAME]` or `[tool.muru.groups.NA
 | `max_body_size` | string | the release's | The largest body of a request the group serves, for example 200MB, which the edge enforces. |
 | `max_lifetime` | string | the release's | How long a worker of the group lives before it is replaced, for example 1h, with jitter. |
 | `max_requests` | integer | the release's | Requests a worker of the group serves before it is replaced, with jitter. |
+| `max_surge` | integer | the release's | How many workers the group may run over its count while workers are swapped. |
+| `max_unavailable` | integer | the release's | How many workers the group may run under its count while workers are swapped. |
 | `memory` | table, {ref}`[app.NAME.memory] <config-deployment-app-name-memory>` |  | The group's own memory policy, each key the release's when absent. |
 | `mounts` | array of strings |  | The named mounts the group's workers serve, beside the default mount, which every worker serves; every mount when absent. The group's paths must lie within them. |
 | `optional` | boolean | `false` | Whether the release is ready without the group's workers: its requests wait until one listens. |

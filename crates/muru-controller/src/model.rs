@@ -452,6 +452,14 @@ pub struct GroupSpec {
     /// milliseconds; the release's when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lifetime_ms: Option<u64>,
+    /// How many workers the group may run over its count while workers
+    /// are swapped; the release's when absent (section 7.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_surge: Option<u32>,
+    /// How many workers the group may run under its count while workers
+    /// are swapped; the release's when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_unavailable: Option<u32>,
 }
 
 /// A worker group's own timeouts (section 7.1): the ones a group may
@@ -594,6 +602,15 @@ pub struct ReleaseSpec {
     /// How long a worker lives before it is replaced, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lifetime_ms: Option<u64>,
+    /// How many workers a group may run over its count while workers are
+    /// swapped (section 7.8). A record from before the setting has the
+    /// default.
+    #[serde(default = "default_max_surge")]
+    pub max_surge: u32,
+    /// How many workers a group may run under its count while workers
+    /// are swapped.
+    #[serde(default)]
+    pub max_unavailable: u32,
     /// The timeouts the host enforces on its workers (section 7.6).
     #[serde(default)]
     pub timeouts: WorkerTimeouts,
@@ -674,7 +691,30 @@ pub fn created_from(spec: &ReleaseSpec) -> String {
     }
 }
 
+fn default_max_surge() -> u32 {
+    muru_config::DEFAULT_MAX_SURGE
+}
+
 impl ReleaseSpec {
+    /// The release's `max_surge` and `max_unavailable` (section 7.8).
+    pub fn swap(&self) -> (u32, u32) {
+        (self.max_surge, self.max_unavailable)
+    }
+
+    /// A group's `max_surge` and `max_unavailable`: its own, else the
+    /// release's. The default group has the release's.
+    pub fn group_swap(&self, group: &str) -> (u32, u32) {
+        let (max_surge, max_unavailable) = self.swap();
+
+        match self.groups.iter().find(|candidate| candidate.name == group) {
+            Some(group) => (
+                group.max_surge.unwrap_or(max_surge),
+                group.max_unavailable.unwrap_or(max_unavailable),
+            ),
+            None => (max_surge, max_unavailable),
+        }
+    }
+
     /// The instrumentation list the host is given (sections 6.15, 6.17
     /// and 6.18): the module that defers imports and records the import
     /// report first when either key is on, then the release's own list.

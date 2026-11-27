@@ -730,6 +730,18 @@ struct RunArgs {
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     max_lifetime: Option<Duration>,
 
+    /// Workers a group may run over its count while workers are swapped
+    /// (default 1): a replacement starts before the old worker stops
+    /// while the group is within it, and with 0 the old worker stops
+    /// first.
+    #[arg(long, value_name = "N")]
+    max_surge: Option<u32>,
+
+    /// Workers a group may run under its count while workers are
+    /// swapped (default 0).
+    #[arg(long, value_name = "N")]
+    max_unavailable: Option<u32>,
+
     /// A memory setting as KEY=VALUE: measure (uss, pss or rss),
     /// soft_limit (for example 800MB), soft_for (2m), reclaim_first
     /// (true), hard_limit (1200MB) or check_interval (5s). Repeatable.
@@ -2326,6 +2338,10 @@ struct Resolved {
     max_requests: Option<u64>,
     /// How long a worker lives before it is replaced (section 7.7).
     max_lifetime: Option<Duration>,
+    /// How many workers a group may run over and under its count while
+    /// workers are swapped (section 7.8).
+    max_surge: u32,
+    max_unavailable: u32,
     /// The host's timeouts from the table (section 7.6).
     timeouts: Option<muru_config::Timeouts>,
     /// The table's own limits on a request (section 4.6): its
@@ -2653,6 +2669,19 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         "[tool.muru] max_requests must be at least 1"
     );
 
+    // Section 7.8: the swap settings, which must leave a way to swap.
+
+    let max_surge = args
+        .max_surge
+        .or(table.max_surge)
+        .unwrap_or(muru_config::DEFAULT_MAX_SURGE);
+    let max_unavailable = args
+        .max_unavailable
+        .or(table.max_unavailable)
+        .unwrap_or(muru_config::DEFAULT_MAX_UNAVAILABLE);
+    muru_config::check_swap(max_surge, max_unavailable)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
     // Section 4.9: the file hint keys, the release's and each mount's
     // over them.
 
@@ -2803,6 +2832,8 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
             ),
             (None, None) => None,
         },
+        max_surge,
+        max_unavailable,
         timeouts: table.timeouts,
         memory: table.memory,
         env,
@@ -3719,6 +3750,12 @@ fn host_spec(
         .groups
         .iter()
         .map(|(name, group)| {
+            muru_config::check_swap(
+                group.max_surge.unwrap_or(resolved.max_surge),
+                group.max_unavailable.unwrap_or(resolved.max_unavailable),
+            )
+            .map_err(|error| anyhow::anyhow!("[tool.muru.groups.{name}] {error}"))?;
+
             Ok(muru_controller::host::HostGroup {
                 name: name.clone(),
                 processes: group.processes.unwrap_or(resolved.processes),
@@ -3747,6 +3784,8 @@ fn host_spec(
                     }
                     None => resolved.max_lifetime,
                 },
+                max_surge: group.max_surge.unwrap_or(resolved.max_surge),
+                max_unavailable: group.max_unavailable.unwrap_or(resolved.max_unavailable),
                 optional: group.optional.unwrap_or(false),
                 mounts: group.mounts.clone(),
             })
@@ -3840,6 +3879,8 @@ fn host_spec(
             .unwrap_or_default(),
         max_requests: resolved.max_requests,
         max_lifetime: resolved.max_lifetime,
+        max_surge: resolved.max_surge,
+        max_unavailable: resolved.max_unavailable,
         soft_timeout: timeouts.soft,
         hard_timeout: timeouts.hard,
         hard_drain_grace: timeouts.hard_drain_grace,
@@ -5570,8 +5611,9 @@ async fn run_with(
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);
                     }
-                    muru_controller::host::HostMessage::Status { workers, host_rss, memory_replacements } => {
+                    muru_controller::host::HostMessage::Status { workers, host_rss, memory_replacements, swaps_waiting } => {
                         run_admin::set_worker_modules(&label, &format!("r{}", current.release), &workers);
+                        run_admin::set_swaps_waiting(&label, &format!("r{}", current.release), swaps_waiting);
 
                         // The relay may have been started again since.
 

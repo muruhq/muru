@@ -371,6 +371,20 @@
           "type": "integer",
           "x-default": "the release's"
         },
+        "max_surge": {
+          "description": "How many workers the group may run over its count while workers are swapped.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "the release's"
+        },
+        "max_unavailable": {
+          "description": "How many workers the group may run under its count while workers are swapped.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "the release's"
+        },
         "memory": {
           "$ref": "#/$defs/Memory",
           "description": "The group's own memory policy, each key the release's when absent."
@@ -1214,6 +1228,20 @@
           "minimum": 0,
           "type": "integer"
         },
+        "max_surge": {
+          "default": 1,
+          "description": "How many workers a group may run over its count while workers are swapped.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_unavailable": {
+          "default": 0,
+          "description": "How many workers a group may run under its count while workers are swapped.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "media_dir": {
           "default": "media",
           "description": "The media part, the one part ever served, a relative one taken from the data directory.",
@@ -1604,6 +1632,20 @@
     "max_requests": {
       "description": "Requests a worker serves before it is replaced.",
       "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "max_surge": {
+      "default": 1,
+      "description": "How many workers a group may run over its count while workers are swapped: recycled, or restarted on request. A replacement is started before the old worker stops while the group is within it; with 0 the old worker stops first.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "max_unavailable": {
+      "default": 0,
+      "description": "How many workers a group may run under its count while workers are swapped. Both this and `max_surge` 0 is refused.",
+      "format": "uint32",
       "minimum": 0,
       "type": "integer"
     },

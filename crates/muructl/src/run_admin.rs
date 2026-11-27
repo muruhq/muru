@@ -834,6 +834,19 @@ pub fn set_release_load(app: &str, release: &str, ms: u64) {
         .insert((app.to_owned(), release.to_owned()), ms);
 }
 
+/// The voluntary swaps waiting their turn in each group of the release
+/// that runs, as its host last said (section 7.8).
+static SWAPS_WAITING: Mutex<BTreeMap<(String, String, String), u32>> = Mutex::new(BTreeMap::new());
+
+/// Note the swaps a release's host says are waiting, by group, in place
+/// of what any release's host said before.
+pub fn set_swaps_waiting(app: &str, release: &str, waiting: BTreeMap<String, u32>) {
+    *SWAPS_WAITING.lock().expect("swaps waiting poisoned") = waiting
+        .into_iter()
+        .map(|(group, count)| ((app.to_owned(), release.to_owned(), group), count))
+        .collect();
+}
+
 /// Note what a release's workers last reported of the modules they have
 /// loaded, in place of what the release's workers reported before.
 pub fn set_worker_modules(
@@ -884,6 +897,22 @@ fn load_samples() -> Vec<muru_edge::metrics::Sample> {
             *loaded,
             *us,
             *load_us,
+        ));
+    }
+
+    // Section 7.8: the swaps waiting their turn in each group.
+
+    let waiting = SWAPS_WAITING.lock().expect("swaps waiting poisoned");
+
+    for ((app, release, group), count) in waiting.iter() {
+        samples.push(muru_edge::metrics::Sample::new(
+            "muru_worker_swaps_waiting",
+            &[
+                ("app", app.as_str()),
+                ("release", release.as_str()),
+                ("group", group.as_str()),
+            ],
+            f64::from(*count),
         ));
     }
 

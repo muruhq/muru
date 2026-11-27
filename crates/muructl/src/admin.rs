@@ -4775,6 +4775,18 @@ pub struct ReleaseArgs {
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     pub(crate) max_lifetime: Option<Duration>,
 
+    /// Workers a group may run over its count while workers are swapped
+    /// (default 1): a replacement starts before the old worker stops
+    /// while the group is within it, and with 0 the old worker stops
+    /// first.
+    #[arg(long, value_name = "N")]
+    pub(crate) max_surge: Option<u32>,
+
+    /// Workers a group may run under its count while workers are
+    /// swapped (default 0).
+    #[arg(long, value_name = "N")]
+    pub(crate) max_unavailable: Option<u32>,
+
     /// A host timeout as NAME=DURATION: soft (interrupt a request that
     /// runs this long; off), hard (replace a worker whose request runs
     /// this long; off), hard_drain_grace (10s), shutdown (5s),
@@ -5265,6 +5277,8 @@ impl ReleaseArgs {
             max_lifetime_ms: self
                 .max_lifetime
                 .map(|lifetime| lifetime.as_millis() as u64),
+            max_surge: self.max_surge,
+            max_unavailable: self.max_unavailable,
             soft_timeout_ms: timeout_ms(&self.timeouts, "soft"),
             accel_redirect: None,
             cgi_local_redirect: None,
@@ -5961,7 +5975,13 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
             .unwrap_or_default();
         let how = if args.force { ", killed at once" } else { "" };
 
-        if !args.output.json {
+        // Section 7.8: a worker that stops first has no successor yet.
+
+        if !args.output.json && new_pid == 0 {
+            println!(
+                "muru: worker {name} (pid {pid}) is stopping, and is replaced once it has stopped{how}"
+            );
+        } else if !args.output.json {
             println!("muru: worker {name} (pid {pid}) is being replaced by pid {new_pid}{how}");
         }
 
@@ -6696,7 +6716,8 @@ pub enum AppCommand {
 
     /// Remove release settings from the application, by key: processes,
     /// threads, sync_threads, concurrency, max_requests, max_lifetime,
-    /// timeouts.KEY, memory.KEY, env.NAME, or env for every variable.
+    /// max_surge, max_unavailable, timeouts.KEY, memory.KEY, env.NAME,
+    /// or env for every variable.
     Unset(Box<AppUnsetArgs>),
 
     /// Show the release settings the application gives its releases.
@@ -6742,6 +6763,18 @@ pub struct AppSetArgs {
     /// Replace a worker after this long, for example 1h, with jitter.
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     max_lifetime: Option<Duration>,
+
+    /// Workers a group may run over its count while workers are swapped
+    /// (default 1): a replacement starts before the old worker stops
+    /// while the group is within it, and with 0 the old worker stops
+    /// first.
+    #[arg(long, value_name = "N")]
+    max_surge: Option<u32>,
+
+    /// Workers a group may run under its count while workers are
+    /// swapped (default 0).
+    #[arg(long, value_name = "N")]
+    max_unavailable: Option<u32>,
 
     /// A host timeout as NAME=DURATION, as deploy --timeout takes it:
     /// soft, hard, hard_drain_grace, shutdown, websocket_drain_grace,
@@ -6832,6 +6865,8 @@ impl AppSetArgs {
             max_lifetime_ms: self
                 .max_lifetime
                 .map(|lifetime| lifetime.as_millis() as u64),
+            max_surge: self.max_surge,
+            max_unavailable: self.max_unavailable,
             soft_timeout_ms: timeout("soft"),
             hard_timeout_ms: timeout("hard"),
             hard_drain_grace_ms: timeout("hard_drain_grace"),
@@ -8798,6 +8833,18 @@ fn workers_column(release: &pb::Release) -> String {
 }
 
 /// Show one release.
+/// A release's or a group's `max_surge` and `max_unavailable` in words,
+/// with the order its swaps take.
+fn swap_settings(max_surge: u32, max_unavailable: u32) -> String {
+    let order = if max_surge == 0 {
+        "the old worker stops first"
+    } else {
+        "the new worker starts first"
+    };
+
+    format!("max_surge {max_surge}, max_unavailable {max_unavailable} ({order})")
+}
+
 pub async fn release_show(release: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
     let mut client = client::connect(&socket.endpoint()?).await?;
@@ -9011,7 +9058,26 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
                     group.sync_threads
                 ),
                 if group.optional { ", optional" } else { "" }
-            ),
+            ) + &if (group.max_surge, group.max_unavailable)
+                == (release.max_surge, release.max_unavailable)
+            {
+                String::new()
+            } else {
+                format!(
+                    ", {}",
+                    swap_settings(group.max_surge, group.max_unavailable)
+                )
+            },
+        ));
+    }
+
+    // Section 7.8: how far a group may move from its count while its
+    // workers are swapped. A release of another kind has neither.
+
+    if release.max_surge + release.max_unavailable > 0 {
+        lines.push((
+            "swaps".to_owned(),
+            swap_settings(release.max_surge, release.max_unavailable),
         ));
     }
 

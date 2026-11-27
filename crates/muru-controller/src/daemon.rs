@@ -1444,6 +1444,9 @@ struct Running {
     /// The workers the host is replacing for memory, for the memory
     /// guard (section 13.9).
     memory_replacements: Vec<crate::host::MemoryReplacement>,
+    /// The voluntary swaps waiting their turn in the host, by group
+    /// (section 7.8).
+    swaps_waiting: BTreeMap<String, u32>,
     /// Section 11.1: workers the host replaced, by group and reason, and
     /// workers that exited, likewise, since the release started.
     recycles: BTreeMap<(String, String), u64>,
@@ -6256,6 +6259,20 @@ impl Daemon {
                 ));
             }
 
+            // Section 7.8: the swaps waiting their turn in each group.
+
+            for (group, waiting) in &running.swaps_waiting {
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_worker_swaps_waiting",
+                    &[
+                        ("app", app.as_str()),
+                        ("release", id.as_str()),
+                        ("group", group.as_str()),
+                    ],
+                    f64::from(*waiting),
+                ));
+            }
+
             // Sections 7.6 and 7.7: workers replaced and workers gone.
 
             for (name, counts) in [
@@ -6500,6 +6517,7 @@ impl Daemon {
                         status: Vec::new(),
                         load_ms: None,
                         memory_replacements: Vec::new(),
+                        swaps_waiting: BTreeMap::new(),
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
                         signals_from: None,
@@ -6608,6 +6626,7 @@ impl Daemon {
                         status: Vec::new(),
                         load_ms: None,
                         memory_replacements: Vec::new(),
+                        swaps_waiting: BTreeMap::new(),
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
                         signals_from: None,
@@ -8001,6 +8020,8 @@ impl Daemon {
                 .layered(&spec.logging),
             max_requests: spec.max_requests,
             max_lifetime: spec.max_lifetime_ms.map(Duration::from_millis),
+            max_surge: spec.swap().0,
+            max_unavailable: spec.swap().1,
             soft_timeout: spec.timeouts.soft_timeout_ms.map(Duration::from_millis),
             hard_timeout: spec.timeouts.hard_timeout_ms.map(Duration::from_millis),
             hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
@@ -8039,6 +8060,8 @@ impl Daemon {
                         .max_lifetime_ms
                         .or(spec.max_lifetime_ms)
                         .map(Duration::from_millis),
+                    max_surge: spec.group_swap(&group.name).0,
+                    max_unavailable: spec.group_swap(&group.name).1,
                     optional: group.optional,
                     mounts: group.mounts.clone(),
                 })
@@ -8270,6 +8293,7 @@ impl Daemon {
                 status: Vec::new(),
                 load_ms: None,
                 memory_replacements: Vec::new(),
+                swaps_waiting: BTreeMap::new(),
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
                 signals_from: None,
@@ -8563,6 +8587,7 @@ impl Daemon {
                 status: Vec::new(),
                 load_ms: None,
                 memory_replacements: Vec::new(),
+                swaps_waiting: BTreeMap::new(),
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
                 signals_from: None,
@@ -13201,6 +13226,7 @@ impl Daemon {
             HostMessage::Status {
                 workers,
                 memory_replacements,
+                swaps_waiting,
                 ..
             } => {
                 if let Some(running) = self.running.get_mut(&key) {
@@ -13257,6 +13283,7 @@ impl Daemon {
 
                     running.status = workers;
                     running.memory_replacements = memory_replacements;
+                    running.swaps_waiting = swaps_waiting;
                 }
             }
             HostMessage::Response { id, workers, error } => {

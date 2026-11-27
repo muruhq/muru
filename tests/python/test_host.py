@@ -921,3 +921,239 @@ def test_development_is_what_the_environment_says(monkeypatch: pytest.MonkeyPatc
     assert host.is_development()
     monkeypatch.setenv("MURU_DEVELOPMENT", "0")
     assert not host.is_development()
+
+
+# Section 7.8: swapping workers within max_surge and max_unavailable.
+
+
+def swapping_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workers: int = 2, **settings: int
+) -> tuple[host.Host, list[host.WorkerState], list[dict[str, Any]], list[tuple[int, int]]]:
+    """A host whose workers are ready and routed to, with forks, signals and exits stood in for.
+
+    It returns the host, its workers' states in index order, what it sent
+    its supervisor, and each fork as (index, pid). A forked worker has a
+    state as a real one has, and is ready once `ready()` says so.
+    """
+
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=workers, threads=1, **settings)
+    sent: list[dict[str, Any]] = []
+    forks: list[tuple[int, int]] = []
+    states = []
+
+    for index in range(workers):
+        state = host.WorkerState(index, 4000 + index, 0, f"w{index}.sock", time.monotonic(), -1)
+        state.ready = True
+        state.last_report_at = time.monotonic()
+        instance.states[state.pid] = state
+        instance.workers[state.pid] = index
+        instance.routed[index] = state.path
+        states.append(state)
+
+    def spawn(index: int, replacing: bool = False) -> int:
+        pid = 5000 + len(forks)
+        forks.append((index, pid))
+        generation = instance.generation.get(index, 0)
+        path = f"w{index}-g{generation}.sock"
+        fresh = host.WorkerState(index, pid, generation, path, time.monotonic(), -1)
+        fresh.last_report_at = time.monotonic()
+        instance.states[pid] = fresh
+        instance.workers[pid] = index
+
+        if not replacing:
+            instance.routed[index] = path
+
+        return pid
+
+    monkeypatch.setattr(_outside, "WHOLE", False)
+    monkeypatch.setattr(os, "kill", lambda _pid, _signal: None)
+    instance.control_listener = object()  # type: ignore[assignment]
+    instance.send_to_supervisor = sent.append  # type: ignore[method-assign]
+    instance.ask = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    instance.spawn = spawn  # type: ignore[method-assign]
+    instance.own_memory = lambda: {}  # type: ignore[method-assign]
+    return instance, states, sent, forks
+
+
+def ready(instance: host.Host, pid: int) -> None:
+    """Have the worker with this pid report for the first time."""
+
+    state = instance.states[pid]
+    state.ready = True
+    instance.worker_ready(state)
+
+
+def waiting(sent: list[dict[str, Any]]) -> list[tuple[object, object]]:
+    return [
+        (message["group"], message["reason"])
+        for message in sent
+        if message.get("kind") == "worker.swap_waiting"
+    ]
+
+
+def test_voluntary_swaps_of_a_group_take_turns_within_max_surge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, sent, forks = swapping_host(tmp_path, monkeypatch)
+
+    # Both workers are due at once. The first is replaced surge first: its
+    # successor is forked while it serves. The second waits for the slot.
+
+    instance.swap(states[0], "served 10 requests", "worker.recycled", "max_requests")
+    instance.swap(states[1], "served 11 requests", "worker.recycled", "max_requests")
+    instance.swap(states[1], "served 12 requests", "worker.recycled", "max_requests")
+    assert forks == [(0, 5000)]
+    assert instance.routed[0] == "w0.sock"
+    assert waiting(sent) == [("default", "surge")]
+    assert len(instance.swaps["default"]) == 1
+
+    instance.send_status()
+    assert sent[-1]["swaps_waiting"] == {"default": 1}
+
+    # Nothing changes until the old worker has gone, however often asked.
+
+    ready(instance, 5000)
+    instance.run_swaps()
+    assert forks == [(0, 5000)]
+    assert waiting(sent) == [("default", "surge")]
+
+    exits(monkeypatch, (4000, 0))
+    instance.reap()
+    instance.run_swaps()
+    assert forks == [(0, 5000), (1, 5001)]
+    assert not instance.swaps["default"]
+    recycled = [message for message in sent if message.get("kind") == "worker.recycled"]
+    assert recycled[0]["message"] == (
+        "worker 0 (pid 4000) replaced by pid 5000: served 10 requests"
+    )
+
+
+def test_a_group_with_no_surge_swaps_drain_first_within_max_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, sent, forks = swapping_host(
+        tmp_path, monkeypatch, max_surge=0, max_unavailable=1
+    )
+    instance.swap(states[0], "lived 60 s", "worker.recycled", "max_lifetime")
+    instance.swap(states[1], "lived 61 s", "worker.recycled", "max_lifetime")
+
+    # The first worker leaves routing and nothing is forked; the second
+    # waits, since one worker of the group is out of routing already.
+
+    assert forks == []
+    assert instance.routed[0] is None
+    assert instance.replacing[0].stop_first
+    assert waiting(sent) == [("default", "unavailable")]
+
+    # Its successor is forked once it has exited, and the second swap
+    # still waits until that successor is in routing.
+
+    exits(monkeypatch, (4000, 0))
+    instance.reap()
+    instance.run_swaps()
+    assert forks == [(0, 5000)]
+    assert instance.routed[1] == "w1.sock"
+    recycled = [message for message in sent if message.get("kind") == "worker.recycled"]
+    assert recycled[0]["message"] == (
+        "worker 0 (pid 4000) replaced by pid 5000: lived 60 s; "
+        "it stopped before its replacement started"
+    )
+
+    ready(instance, 5000)
+    instance.run_swaps()
+    assert instance.routed[1] is None
+    assert forks == [(0, 5000)]
+
+
+def test_a_group_of_one_with_no_surge_has_no_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, _sent, forks = swapping_host(
+        tmp_path, monkeypatch, workers=1, max_surge=0, max_unavailable=1
+    )
+    instance.swap(states[0], "lived 60 s", "worker.recycled", "max_lifetime")
+    assert instance.routed[0] is None
+    assert forks == []
+
+
+def test_an_involuntary_replacement_skips_the_queue_and_keeps_the_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With a surge allowance: a hard timeout is not held back by the swap
+    # under way, and its successor is forked at once.
+
+    instance, states, _sent, forks = swapping_host(tmp_path, monkeypatch)
+    instance.swap(states[0], "served 10 requests", "worker.recycled", "max_requests")
+    assert instance.replace(states[1], "ran too long", "worker.timeout_killed", "hard_timeout")
+    assert forks == [(0, 5000), (1, 5001)]
+
+    # With none: it is not held back by the worker already out of
+    # routing either, but its successor waits for it to exit, and the
+    # fault is reported at the decision all the same.
+
+    instance, states, sent, forks = swapping_host(
+        tmp_path / "none", monkeypatch, max_surge=0, max_unavailable=1
+    )
+    instance.swap(states[0], "served 10 requests", "worker.recycled", "max_requests")
+    assert instance.replace(states[1], "ran too long", "worker.timeout_killed", "hard_timeout")
+    assert forks == []
+    assert instance.routed == {0: None, 1: None}
+    replacement = instance.replacing[1]
+    assert replacement.stop_first and replacement.terminate_at is not None
+
+    replacement.captured = True
+    instance.report_timeout_kill(replacement)
+    killed = [message for message in sent if message.get("kind") == "worker.timeout_killed"]
+    assert (
+        killed[0]["message"] == "worker 1 (pid 4001) is replaced once it has stopped: ran too long"
+    )
+
+    exits(monkeypatch, (4001, 0))
+    instance.reap()
+    assert forks == [(1, 5000)]
+
+
+def test_a_queued_swap_is_dropped_when_its_worker_goes_another_way(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, _sent, forks = swapping_host(tmp_path, monkeypatch, workers=3)
+    instance.swap(states[0], "served 10 requests", "worker.recycled", "max_requests")
+    instance.swap(states[1], "served 11 requests", "worker.recycled", "max_requests")
+    instance.swap(states[2], "served 12 requests", "worker.recycled", "max_requests")
+
+    # The second worker is scaled in while it waits, and a worker being
+    # debugged is passed over and keeps its place.
+
+    instance.retire(states[1], "scaled in")
+    states[2].debug_sessions = 1
+    ready(instance, 5000)
+    exits(monkeypatch, (4000, 0))
+    instance.reap()
+    instance.run_swaps()
+    assert forks == [(0, 5000)]
+    assert [swap.pid for swap in instance.swaps["default"]] == [4002]
+
+    states[2].debug_sessions = 0
+    instance.run_swaps()
+    assert forks == [(0, 5000), (2, 5001)]
+
+
+def test_a_groups_swap_settings_are_its_own_or_the_releases(tmp_path: Path) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    reports = host.Group("reports", 1, 1, 1, 1, max_surge=0, max_unavailable=1)
+    plain = host.Group("plain", 1, 1, 1, 1)
+    instance = host.Host(
+        release, str(tmp_path), workers=1, threads=1, groups=[reports, plain], max_surge=2
+    )
+    settings = {group.name: (group.max_surge, group.max_unavailable) for group in instance.groups}
+    assert settings == {"default": (2, 0), "reports": (0, 1), "plain": (2, 0)}
+
+    assert host.parse_group_swap("reports=0,1") == (
+        "reports",
+        {"max_surge": 0, "max_unavailable": 1},
+    )
+
+    for refused in ("reports=0,0", "reports=1", "=1,0", "reports=-1,2", "reports=a,b"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            host.parse_group_swap(refused)

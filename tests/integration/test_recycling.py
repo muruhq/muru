@@ -82,6 +82,41 @@ def test_workers_are_replaced_after_max_requests_with_no_request_failed(
     assert recycled.get("/").status == 200
 
 
+def test_with_no_surge_a_worker_stops_before_its_replacement_starts() -> None:
+    """Section 7.8: with max_surge 0 and max_unavailable 1 the workers of
+    a group are swapped one at a time, each old worker gone before its
+    successor is forked, and the other worker serves meanwhile."""
+
+    server = support.start(
+        "plain_wsgi:application",
+        workers=2,
+        threads=2,
+        args=["--max-requests", "20", "--max-surge", "0", "--max-unavailable", "1"],
+    )
+
+    try:
+        with Load(server.port) as load:
+            wait_for(lambda: len(replacements(server.log())) >= 3)
+            time.sleep(0.5)
+
+        load.check("recycling with the old worker stopped first")
+        log = server.log()
+        lines = replacements(log)
+        assert all(line.endswith("it stopped before its replacement started") for line in lines)
+
+        # The host says the worker stops first, and forks its successor
+        # only after that worker's exit, which the replacement's line
+        # follows at once.
+
+        first = re.search(r"worker (\d) \(pid (\d+)\) replaced by pid (\d+)", lines[0])
+        assert first is not None
+        index, old, new = first.groups()
+        stops = log.index(f"worker {index} (pid {old}) stops before its replacement starts")
+        assert stops < log.index(f"worker {index} started as pid {new}")
+    finally:
+        server.stop()
+
+
 def test_workers_are_replaced_after_max_lifetime() -> None:
     server = support.start(
         "plain_wsgi:application", workers=1, threads=2, args=["--max-lifetime", "1s"]

@@ -46,6 +46,12 @@ pub struct AppSettings {
     /// How long a worker lives before it is replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lifetime_ms: Option<u64>,
+    /// Workers a group may run over its count while workers are swapped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_surge: Option<u32>,
+    /// Workers a group may run under its count while workers are swapped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_unavailable: Option<u32>,
     /// The host's timeouts, by the key of a `timeouts` table.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub timeouts_ms: BTreeMap<String, u64>,
@@ -83,13 +89,15 @@ pub const TIMEOUTS: [&str; 8] = [
 ];
 
 /// The keys `unset` takes besides `timeouts.KEY` and `env.NAME`.
-const SCALARS: [&str; 12] = [
+const SCALARS: [&str; 14] = [
     "processes",
     "threads",
     "sync_threads",
     "concurrency",
     "max_requests",
     "max_lifetime",
+    "max_surge",
+    "max_unavailable",
     "memory.measure",
     "memory.soft_limit",
     "memory.soft_for",
@@ -179,6 +187,8 @@ impl AppSettings {
             concurrency: message.concurrency,
             max_requests: message.max_requests,
             max_lifetime_ms: message.max_lifetime_ms,
+            max_surge: message.max_surge,
+            max_unavailable: message.max_unavailable,
             timeouts_ms,
             memory_measure,
             memory_soft_limit: message.memory_soft_limit,
@@ -214,6 +224,8 @@ impl AppSettings {
             concurrency: self.concurrency,
             max_requests: self.max_requests,
             max_lifetime_ms: self.max_lifetime_ms,
+            max_surge: self.max_surge,
+            max_unavailable: self.max_unavailable,
             soft_timeout_ms: timeout("soft_timeout"),
             hard_timeout_ms: timeout("hard_timeout"),
             hard_drain_grace_ms: timeout("hard_drain_grace"),
@@ -290,6 +302,8 @@ impl AppSettings {
             concurrency: count(table.concurrency, "concurrency")?,
             max_requests: table.max_requests,
             max_lifetime_ms: optional_ms(&table.max_lifetime, "max_lifetime")?,
+            max_surge: table.max_surge,
+            max_unavailable: table.max_unavailable,
             timeouts_ms,
             memory_measure: memory.measure,
             memory_soft_limit: optional_bytes(&memory.soft_limit, "memory.soft_limit")?,
@@ -314,6 +328,8 @@ impl AppSettings {
         table.concurrency = self.concurrency.map(|value| value as usize);
         table.max_requests = self.max_requests;
         table.max_lifetime = self.max_lifetime_ms.map(duration);
+        table.max_surge = self.max_surge;
+        table.max_unavailable = self.max_unavailable;
         table.timeouts = (!self.timeouts_ms.is_empty()).then(|| muru_config::HostTimeouts {
             soft_timeout: timeout("soft_timeout"),
             hard_timeout: timeout("hard_timeout"),
@@ -347,6 +363,13 @@ impl AppSettings {
             ("max_lifetime", self.max_lifetime_ms),
             ("memory.check_interval", self.memory_check_interval_ms),
         ];
+
+        // Section 7.8: with both set here, they must leave a way to swap
+        // a worker; one set alone is checked with the release it joins.
+
+        if let (Some(max_surge), Some(max_unavailable)) = (self.max_surge, self.max_unavailable) {
+            muru_config::check_swap(max_surge, max_unavailable)?;
+        }
 
         if let Some((key, _)) = zero.iter().find(|(_, value)| *value == Some(0)) {
             return Err(format!("{key} must be more than 0"));
@@ -385,6 +408,8 @@ impl AppSettings {
             concurrency: over.concurrency.or(self.concurrency),
             max_requests: over.max_requests.or(self.max_requests),
             max_lifetime_ms: over.max_lifetime_ms.or(self.max_lifetime_ms),
+            max_surge: over.max_surge.or(self.max_surge),
+            max_unavailable: over.max_unavailable.or(self.max_unavailable),
             timeouts_ms,
             memory_measure: over.memory_measure.or(self.memory_measure),
             memory_soft_limit: over.memory_soft_limit.or(self.memory_soft_limit),
@@ -432,6 +457,8 @@ impl AppSettings {
             "concurrency" => self.concurrency = None,
             "max_requests" => self.max_requests = None,
             "max_lifetime" => self.max_lifetime_ms = None,
+            "max_surge" => self.max_surge = None,
+            "max_unavailable" => self.max_unavailable = None,
             "memory.measure" => self.memory_measure = None,
             "memory.soft_limit" => self.memory_soft_limit = None,
             "memory.soft_for" => self.memory_soft_for_ms = None,
@@ -469,6 +496,11 @@ impl AppSettings {
                 self.max_requests.map(|value| value.to_string()),
             ),
             ("max_lifetime", self.max_lifetime_ms.map(duration)),
+            ("max_surge", self.max_surge.map(|value| value.to_string())),
+            (
+                "max_unavailable",
+                self.max_unavailable.map(|value| value.to_string()),
+            ),
         ]
         .into_iter()
         .filter_map(|(key, value)| Some((key.to_owned(), value?)))
@@ -549,6 +581,24 @@ impl AppSettings {
         if request.kind == "http" {
             return given;
         }
+
+        // Section 7.8: the swap settings, which are counts.
+
+        let mut fill_count = |slot: &mut Option<u32>, value: Option<u32>, key: &str| {
+            if slot.is_none()
+                && let Some(value) = value
+            {
+                *slot = Some(value);
+                given.push(key.to_owned());
+            }
+        };
+
+        fill_count(&mut request.max_surge, self.max_surge, "max_surge");
+        fill_count(
+            &mut request.max_unavailable,
+            self.max_unavailable,
+            "max_unavailable",
+        );
 
         let mut fill = |slot: &mut Option<u64>, value: Option<u64>, key: &str| {
             if slot.is_none()

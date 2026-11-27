@@ -480,6 +480,17 @@ pub fn run_settings(args: &crate::RunArgs, resolved: &crate::Resolved) -> Settin
         ));
     }
 
+    top.push(Row::new(
+        "max_surge",
+        resolved.max_surge,
+        app(args.max_surge.is_some(), "max_surge"),
+    ));
+    top.push(Row::new(
+        "max_unavailable",
+        resolved.max_unavailable,
+        app(args.max_unavailable.is_some(), "max_unavailable"),
+    ));
+
     let top: Vec<Row> = top.into_iter().flatten().collect();
     let (http, https) = crate::addresses(args, serving);
 
@@ -849,6 +860,13 @@ pub fn serve_settings(resolved: &crate::Resolved, serve: Serve) -> Settings {
             app("max_lifetime"),
         ));
     }
+
+    top.push(Row::new("max_surge", resolved.max_surge, app("max_surge")));
+    top.push(Row::new(
+        "max_unavailable",
+        resolved.max_unavailable,
+        app("max_unavailable"),
+    ));
 
     let top: Vec<Row> = top.into_iter().flatten().collect();
 
