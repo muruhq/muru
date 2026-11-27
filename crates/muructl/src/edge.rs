@@ -481,6 +481,7 @@ impl EdgeControl for Control {
             pid: std::process::id(),
             listen: self.listeners[0].0.to_string(),
             snapshot_version: self.version.load(Ordering::Relaxed),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
             listeners: self
                 .listeners
                 .iter()

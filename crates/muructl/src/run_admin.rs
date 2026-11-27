@@ -1578,6 +1578,7 @@ impl Admin for Service {
             started_unix_ms: state.started_unix_ms,
             app_count: 1,
             release_count: 1,
+            snapshot_version: 0,
             edge_pid: std::process::id(),
             metrics: state
                 .dashboard

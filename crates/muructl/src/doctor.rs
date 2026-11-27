@@ -43,6 +43,12 @@ pub struct DoctorArgs {
     #[arg(long)]
     json: bool,
 
+    /// Print what doctor found on the machine a bundle was made on, from
+    /// the archive muructl debug bundle wrote, in place of checking this
+    /// one.
+    #[arg(long, value_name = "FILE")]
+    bundle: Option<PathBuf>,
+
     #[command(flatten)]
     locations: LocationArgs,
 }
@@ -54,6 +60,22 @@ pub enum DoctorCommand {
     /// foreign key checks, the schema version, the rows in each table and
     /// Muru's own rules for what the store may hold.
     Store(StoreArgs),
+
+    /// What happened last, in order: the daemon's events, the last lines
+    /// of its own log and when each of its processes started.
+    Timeline(TimelineArgs),
+}
+
+/// What `muructl doctor timeline` takes.
+#[derive(Args)]
+pub struct TimelineArgs {
+    /// How many entries to print, the latest.
+    #[arg(long, value_name = "N", default_value_t = 50)]
+    limit: usize,
+
+    /// Print the entries as one JSON document.
+    #[arg(long)]
+    json: bool,
 }
 
 /// What `muructl doctor store` takes.
@@ -77,14 +99,14 @@ pub struct StoreArgs {
 const ASK: Duration = Duration::from_secs(3);
 
 /// A socket or a file of the installation.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 struct Item {
     /// Where it is.
     path: String,
     /// What it is for.
     what: String,
     /// Who owns it, when something does.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     owner: Option<String>,
     /// Its condition, as a few words.
     condition: String,
@@ -93,7 +115,7 @@ struct Item {
 }
 
 /// One check of a part of the installation against another.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 struct Check {
     /// The check's name.
     check: String,
@@ -102,13 +124,13 @@ struct Check {
     /// What was found.
     detail: String,
     /// The command that puts a failure right, when one does.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     fix: Option<String>,
 }
 
 /// Everything `muructl doctor` reports.
-#[derive(Debug, Default, Serialize)]
-struct Report {
+#[derive(Debug, Default, Serialize, serde::Deserialize)]
+pub(crate) struct Report {
     /// Whether every check passed and every listed thing is in order.
     ok: bool,
     sockets: Vec<Item>,
@@ -237,6 +259,10 @@ struct EdgeRecord {
 #[derive(serde::Deserialize)]
 struct HostRecord {
     pid: u32,
+    /// The runtime library directory the host runs with, which ends in
+    /// the library's version and the interpreter's tag.
+    #[serde(default)]
+    runtime: Option<PathBuf>,
     #[serde(default)]
     sockets: Vec<PathBuf>,
     #[serde(default)]
@@ -1670,6 +1696,343 @@ fn check_store(installation: &Installation, report: &mut Report) {
     }
 }
 
+/// Check the edge against the daemon: the edge the daemon names is the
+/// one its record names and the one that answers, and the routing it
+/// serves is the routing the daemon last gave it. Gives the edge's
+/// version, for the check of versions.
+async fn check_edge(installation: &Installation, report: &mut Report) -> Option<String> {
+    const CHECK: &str = "edge";
+    let locations = &installation.locations;
+    let status = installation.status.as_ref()?;
+    let recorded = record::<EdgeRecord>(&locations.edge_record());
+
+    let Some(recorded) = recorded else {
+        report.fail(
+            CHECK,
+            format!(
+                "the daemon runs and has no record of its edge at {}",
+                locations.edge_record().display()
+            ),
+            Some("muructl daemon restart"),
+        );
+        return None;
+    };
+
+    let edge = match muru_controller::edges::status_of(&recorded.control, ASK).await {
+        Ok(edge) => edge,
+        Err(error) => {
+            report.fail(
+                CHECK,
+                format!(
+                    "the edge (pid {}) gave no status on {}: {error:#}",
+                    recorded.pid,
+                    recorded.control.display()
+                ),
+                Some("muructl daemon restart"),
+            );
+            return None;
+        }
+    };
+
+    let version = Some(edge.version.clone()).filter(|version| !version.is_empty());
+
+    if edge.pid != recorded.pid || edge.pid != status.edge_pid {
+        report.fail(
+            CHECK,
+            format!(
+                "the edge that answers is pid {}, its record names pid {} and the daemon names \
+                 pid {}",
+                edge.pid, recorded.pid, status.edge_pid
+            ),
+            Some("muructl daemon restart"),
+        );
+        return version;
+    }
+
+    // A daemon of a version before this check says nothing of what it
+    // sent, which reads as version 0.
+
+    if status.snapshot_version == 0 && status.version != env!("CARGO_PKG_VERSION") {
+        report.pass(
+            CHECK,
+            format!(
+                "the edge (pid {}) answers; the daemon, version {}, does not say which routing \
+                 it last sent",
+                edge.pid, status.version
+            ),
+        );
+        return version;
+    }
+
+    // The daemon may send a snapshot between the two answers, so it is
+    // asked again after the edge, and either of its answers matches.
+
+    let after = crate::admin::status_within(&locations.admin_socket(), ASK)
+        .await
+        .map(|status| status.snapshot_version);
+    let sent = [Some(status.snapshot_version), after];
+
+    match sent.contains(&Some(edge.snapshot_version)) {
+        true => report.pass(
+            CHECK,
+            format!(
+                "the edge (pid {}) serves snapshot {}, the one the daemon last sent",
+                edge.pid, edge.snapshot_version
+            ),
+        ),
+        false => report.fail(
+            CHECK,
+            format!(
+                "the edge (pid {}) serves snapshot {}, and the daemon last sent {}",
+                edge.pid,
+                edge.snapshot_version,
+                after.unwrap_or(status.snapshot_version)
+            ),
+            Some("muructl daemon restart"),
+        ),
+    }
+
+    version
+}
+
+/// The version of the runtime library a host runs with, from the
+/// directory its record names: `runtime/VERSION/TAG`.
+fn runtime_version(runtime: &Path) -> Option<String> {
+    runtime
+        .parent()?
+        .file_name()
+        .map(|version| version.to_string_lossy().into_owned())
+}
+
+/// A version as two builds of Muru say it: the package's own form and
+/// the one in a directory's name (`0.1.0-alpha.37`, `0.1.0a37`) are the
+/// same version.
+fn same_version(one: &str, other: &str) -> bool {
+    let plain = |version: &str| {
+        version
+            .replace("-alpha.", "a")
+            .replace("-beta.", "b")
+            .replace("-rc.", "rc")
+    };
+    plain(one) == plain(other)
+}
+
+/// Check the versions: the daemon and its edge run the version of this
+/// muructl, which is the installed one. A half-finished upgrade leaves
+/// them apart. Each host keeps the runtime library it started with
+/// through an upgrade, so a host on another version is said and is no
+/// failure.
+fn check_versions(installation: &Installation, edge: Option<String>, report: &mut Report) {
+    const CHECK: &str = "versions";
+    let own = env!("CARGO_PKG_VERSION");
+
+    let Some(status) = &installation.status else {
+        report.pass(
+            CHECK,
+            format!("no daemon runs; this muructl is version {own}"),
+        );
+        return;
+    };
+
+    if !same_version(&status.version, own) {
+        report.fail(
+            CHECK,
+            format!(
+                "the daemon (pid {}) runs version {}, and this muructl is version {own}",
+                status.pid, status.version
+            ),
+            Some("muructl daemon upgrade"),
+        );
+        return;
+    }
+
+    match &edge {
+        Some(edge) if !same_version(edge, &status.version) => {
+            report.fail(
+                CHECK,
+                format!(
+                    "the edge runs version {edge}, and the daemon version {}: an upgrade \
+                     replaces the edge, and this one was not replaced",
+                    status.version
+                ),
+                Some("muructl daemon upgrade"),
+            );
+            return;
+        }
+        _ => {}
+    }
+
+    // The hosts, by the runtime library each was started with.
+
+    let mut others: Vec<String> = Vec::new();
+    let mut hosts = 0;
+
+    for release in &installation.releases {
+        let files = installation.locations.host_files(release.number);
+        let host = record::<HostRecord>(&files.join(muru_controller::daemon::HOST_RECORD));
+
+        let Some(version) = host
+            .filter(|host| muru_controller::host::alive(host.pid))
+            .and_then(|host| host.runtime)
+            .and_then(|runtime| runtime_version(&runtime))
+        else {
+            continue;
+        };
+
+        hosts += 1;
+
+        if !same_version(&version, own) {
+            others.push(format!("{}@{} on {version}", release.app, release.id));
+        }
+    }
+
+    let edge = match edge {
+        Some(_) => "the daemon and its edge run",
+        None => "the daemon runs",
+    };
+
+    match others.is_empty() {
+        true if hosts == 0 => {
+            report.pass(CHECK, format!("{edge} version {own}, as this muructl is"));
+        }
+        true => report.pass(
+            CHECK,
+            format!(
+                "{edge} version {own}, as this muructl is, and so does the runtime library of \
+                 {hosts} hosts"
+            ),
+        ),
+        false => report.pass(
+            CHECK,
+            format!(
+                "{edge} version {own}, as this muructl is; {} of {hosts} hosts keep the runtime \
+                 library they started with until a deploy ({})",
+                others.len(),
+                others.join(", ")
+            ),
+        ),
+    }
+}
+
+/// The least room a location may have before it is a failure.
+const LEAST_FREE: u64 = 64 * 1024 * 1024;
+
+/// Check the disk: each location is a directory its daemon's user owns
+/// and may write to, on a file system with room left.
+fn check_disk(installation: &Installation, report: &mut Report) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    const CHECK: &str = "disk";
+    let locations = &installation.locations;
+
+    // The daemon's user when one runs, else whoever asks.
+
+    // SAFETY: geteuid has no preconditions and cannot fail.
+
+    let caller = unsafe { libc::geteuid() };
+    let owner = installation
+        .daemon_process()
+        .and_then(|process| process.uid)
+        .unwrap_or(caller);
+    let mut failed = false;
+    let mut room = Vec::new();
+
+    for (what, path) in [
+        ("state", &locations.state.path),
+        ("run", &locations.run.path),
+        ("log", &locations.logs.path),
+        ("cache", &locations.cache.path),
+    ] {
+        let Ok(metadata) = path.metadata() else {
+            continue;
+        };
+
+        if !metadata.is_dir() {
+            report.fail(
+                CHECK,
+                format!("the {what} directory {} is not a directory", path.display()),
+                None,
+            );
+            failed = true;
+            continue;
+        }
+
+        if metadata.uid() != owner {
+            report.fail(
+                CHECK,
+                format!(
+                    "the {what} directory {} belongs to {}, and the daemon's user is {}",
+                    path.display(),
+                    muru_controller::processes::user_name(metadata.uid()),
+                    muru_controller::processes::user_name(owner)
+                ),
+                None,
+            );
+            failed = true;
+        }
+
+        if metadata.mode() & 0o300 != 0o300 {
+            report.fail(
+                CHECK,
+                format!(
+                    "the {what} directory {} has mode {:o}, which its owner cannot write to",
+                    path.display(),
+                    metadata.mode() & 0o7777
+                ),
+                None,
+            );
+            failed = true;
+        }
+
+        // The run directory admits its owner, and its group for the
+        // edge, and nobody else may make a socket in it.
+
+        if what == "run" && metadata.mode() & 0o002 != 0 {
+            report.fail(
+                CHECK,
+                format!(
+                    "the run directory {} has mode {:o}, which lets any user write to it",
+                    path.display(),
+                    metadata.mode() & 0o7777
+                ),
+                None,
+            );
+            failed = true;
+        }
+
+        match muru_controller::diagnostics::facts::free_bytes(path) {
+            Some(free) if free < LEAST_FREE => {
+                report.fail(
+                    CHECK,
+                    format!(
+                        "the {what} directory {} has {} free",
+                        path.display(),
+                        human_size(free)
+                    ),
+                    Some("muructl release prune"),
+                );
+                failed = true;
+            }
+            Some(free) => room.push(format!("{what} {}", human_size(free))),
+            None => {}
+        }
+    }
+
+    if !failed {
+        report.pass(
+            CHECK,
+            match room.is_empty() {
+                true => "no location exists yet".to_owned(),
+                false => format!(
+                    "each location belongs to {} and has room: {} free",
+                    muru_controller::processes::user_name(owner),
+                    room.join(", ")
+                ),
+            },
+        );
+    }
+}
+
 /// Print a table of items, the paths lined up.
 fn print_items(heading: &str, items: &[Item]) {
     println!("{heading}");
@@ -1706,14 +2069,9 @@ fn print_checks(checks: &[Check]) {
     }
 }
 
-/// Run `muructl doctor`: the exit code is 1 when anything failed.
-pub async fn doctor(args: DoctorArgs) -> anyhow::Result<i32> {
-    let locations = args.locations.resolve()?;
-
-    if let Some(DoctorCommand::Store(store)) = &args.command {
-        return doctor_store(&locations, store, args.json || store.json);
-    }
-
+/// Everything doctor finds of the installation at `locations`: its
+/// sockets and files, and each check.
+pub(crate) async fn examine(locations: Locations) -> Report {
     let installation = Installation::read(locations).await;
     let mut report = Report::default();
 
@@ -1724,6 +2082,9 @@ pub async fn doctor(args: DoctorArgs) -> anyhow::Result<i32> {
     check_paths(&installation, &mut report);
     check_store(&installation, &mut report);
     check_releases(&installation, &mut report);
+    let edge = check_edge(&installation, &mut report).await;
+    check_versions(&installation, edge, &mut report);
+    check_disk(&installation, &mut report);
 
     report.ok = report.checks.iter().all(|check| check.ok)
         && report
@@ -1731,29 +2092,102 @@ pub async fn doctor(args: DoctorArgs) -> anyhow::Result<i32> {
             .iter()
             .chain(&report.files)
             .all(|item| item.ok);
+    report
+}
+
+/// Print a report as text.
+fn print_report(report: &Report) {
+    print_items("SOCKETS", &report.sockets);
+    println!();
+    print_items("FILES", &report.files);
+    println!();
+    print_checks(&report.checks);
+}
+
+/// A daemon that runs says where its files are. Unless `--state-dir`
+/// names the state directory, when a daemon answers on the run
+/// directory's admin socket its state, log and cache directories and its
+/// configuration file are the ones checked, so that the run directory
+/// alone finds a daemon that was started with locations of its own. A
+/// state directory given by the flag is kept, and the check of the locks
+/// says when the daemon on the run directory is not that one's.
+async fn follow_daemon(mut locations: Locations) -> Locations {
+    if locations.state.rule == "option" {
+        return locations;
+    }
+
+    let socket = locations.admin_socket();
+
+    let Some(status) = (match exists(&socket) {
+        true => crate::admin::status_within(&socket, ASK).await,
+        false => None,
+    }) else {
+        return locations;
+    };
+
+    if status.kind != "daemon" {
+        return locations;
+    }
+
+    for (location, said) in [
+        (&mut locations.state, &status.state_dir),
+        (&mut locations.logs, &status.log_dir),
+        (&mut locations.cache, &status.cache_dir),
+        (&mut locations.config, &status.config),
+    ] {
+        if !said.is_empty() {
+            *location = locations::Location {
+                path: PathBuf::from(said),
+                rule: "daemon",
+            };
+        }
+    }
+
+    locations
+}
+
+/// Run `muructl doctor`: the exit code is 1 when anything failed.
+pub async fn doctor(args: DoctorArgs) -> anyhow::Result<i32> {
+    if let Some(bundle) = &args.bundle {
+        anyhow::ensure!(
+            args.command.is_none(),
+            "--bundle prints all that a bundle holds of doctor's, and takes no part to look into"
+        );
+        return from_bundle(bundle, args.json);
+    }
+
+    let locations = follow_daemon(args.locations.resolve()?).await;
+
+    match &args.command {
+        Some(DoctorCommand::Store(store)) => {
+            return doctor_store(&locations, store, args.json || store.json);
+        }
+        Some(DoctorCommand::Timeline(timeline)) => {
+            return doctor_timeline(locations, timeline, args.json || timeline.json).await;
+        }
+        None => {}
+    }
+
+    let report = examine(locations).await;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print_items("SOCKETS", &report.sockets);
-        println!();
-        print_items("FILES", &report.files);
-        println!();
-        print_checks(&report.checks);
+        print_report(&report);
     }
 
     Ok(i32::from(!report.ok))
 }
 
 /// What `muructl doctor store` reports.
-#[derive(Debug, Default, Serialize)]
-struct StoreReport {
+#[derive(Debug, Default, Serialize, serde::Deserialize)]
+pub(crate) struct StoreReport {
     ok: bool,
     path: String,
     /// The bytes of the database and of its write-ahead log.
     bytes: u64,
     wal_bytes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     schema_version: Option<i64>,
     expected_schema_version: i64,
     /// Each table with its rows.
@@ -1761,53 +2195,10 @@ struct StoreReport {
     checks: Vec<Check>,
 }
 
-/// Run `muructl doctor store` on the store of `locations`.
-fn doctor_store(locations: &Locations, args: &StoreArgs, json: bool) -> anyhow::Result<i32> {
-    let path = locations.state_store();
-
-    anyhow::ensure!(
-        path.is_file(),
-        "there is no state store at {}; --state-dir names another state directory",
-        path.display()
-    );
-
-    let store = Store::open_read_only(&path)
+/// Check the store at `path`, opened read-only.
+pub(crate) fn examine_store(path: &Path) -> anyhow::Result<StoreReport> {
+    let store = Store::open_read_only(path)
         .map_err(|error| anyhow::anyhow!("{} cannot be opened: {error}", path.display()))?;
-
-    if args.dump_schema {
-        print!("{}", store.schema_sql()?);
-        return Ok(0);
-    }
-
-    if let Some(copy) = &args.copy {
-        anyhow::ensure!(
-            !exists(copy),
-            "{} exists; a copy is never written over a file",
-            copy.display()
-        );
-        store.copy_to(copy)?;
-
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "copied": path.display().to_string(),
-                    "to": copy.display().to_string(),
-                    "bytes": measure(copy).0,
-                }))?
-            );
-        } else {
-            println!(
-                "muru: copied {} to {} ({})",
-                path.display(),
-                copy.display(),
-                human_size(measure(copy).0)
-            );
-        }
-
-        return Ok(0);
-    }
-
     let mut report = Report::default();
     let version = store.schema_version().ok().flatten();
 
@@ -1896,22 +2287,20 @@ fn doctor_store(locations: &Locations, args: &StoreArgs, json: bool) -> anyhow::
         .collect();
     let wal = PathBuf::from(format!("{}-wal", path.display()));
 
-    let report = StoreReport {
+    Ok(StoreReport {
         ok: report.checks.iter().all(|check| check.ok),
         path: path.display().to_string(),
-        bytes: measure(&path).0,
+        bytes: measure(path).0,
         wal_bytes: measure(&wal).0,
         schema_version: version,
         expected_schema_version: SCHEMA_VERSION,
         tables,
         checks: report.checks,
-    };
+    })
+}
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(i32::from(!report.ok));
-    }
-
+/// Print a store's report as text.
+fn print_store(report: &StoreReport) {
     println!(
         "store    {} ({}, write-ahead log {})",
         report.path,
@@ -1929,13 +2318,303 @@ fn doctor_store(locations: &Locations, args: &StoreArgs, json: bool) -> anyhow::
     crate::instances::print_table(&rows);
     println!();
     print_checks(&report.checks);
+}
+
+/// Run `muructl doctor store` on the store of `locations`.
+fn doctor_store(locations: &Locations, args: &StoreArgs, json: bool) -> anyhow::Result<i32> {
+    let path = locations.state_store();
+
+    anyhow::ensure!(
+        path.is_file(),
+        "there is no state store at {}; --state-dir names another state directory",
+        path.display()
+    );
+
+    if args.dump_schema || args.copy.is_some() {
+        let store = Store::open_read_only(&path)
+            .map_err(|error| anyhow::anyhow!("{} cannot be opened: {error}", path.display()))?;
+
+        let Some(copy) = &args.copy else {
+            print!("{}", store.schema_sql()?);
+            return Ok(0);
+        };
+
+        anyhow::ensure!(
+            !exists(copy),
+            "{} exists; a copy is never written over a file",
+            copy.display()
+        );
+        store.copy_to(copy)?;
+
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "copied": path.display().to_string(),
+                    "to": copy.display().to_string(),
+                    "bytes": measure(copy).0,
+                }))?
+            );
+        } else {
+            println!(
+                "muru: copied {} to {} ({})",
+                path.display(),
+                copy.display(),
+                human_size(measure(copy).0)
+            );
+        }
+
+        return Ok(0);
+    }
+
+    let report = examine_store(&path)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_store(&report);
+    }
 
     Ok(i32::from(!report.ok))
+}
+
+/// The part of a bundle that holds doctor's report, and the one that
+/// holds its checks of the store.
+pub(crate) const BUNDLE_REPORT: &str = "doctor/report.json";
+pub(crate) const BUNDLE_STORE: &str = "doctor/store.json";
+
+/// Run `muructl doctor --bundle`: print what doctor found where and when
+/// the bundle was made, which the bundle carries. A socket's condition
+/// can only be asked on the machine it is on, so nothing is checked
+/// again here, and the exit code is that of the checks as they were.
+fn from_bundle(path: &Path, json: bool) -> anyhow::Result<i32> {
+    use muru_controller::diagnostics::archive;
+
+    let wanted = [archive::layout::MANIFEST, BUNDLE_REPORT, BUNDLE_STORE];
+    let parts = archive::read_parts(path, &wanted)
+        .map_err(|error| anyhow::anyhow!("{} cannot be read: {error}", path.display()))?;
+
+    let Some(report) = parts.get(BUNDLE_REPORT) else {
+        anyhow::bail!(
+            "{} holds no {BUNDLE_REPORT}: it is no bundle of a daemon's, or one made by a \
+             version of Muru before doctor's report was part of a bundle",
+            path.display()
+        );
+    };
+
+    let report: Report = serde_json::from_slice(report)
+        .map_err(|error| anyhow::anyhow!("{BUNDLE_REPORT} cannot be read: {error}"))?;
+    let store: Option<StoreReport> = parts
+        .get(BUNDLE_STORE)
+        .and_then(|store| serde_json::from_slice(store).ok());
+    let manifest: serde_json::Value = parts
+        .get(archive::layout::MANIFEST)
+        .and_then(|manifest| serde_json::from_slice(manifest).ok())
+        .unwrap_or_default();
+    let ok = report.ok && store.as_ref().is_none_or(|store| store.ok);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": ok,
+                "bundle": path.display().to_string(),
+                "created": manifest["created"],
+                "node": manifest["node"],
+                "muru": manifest["muru"],
+                "report": report,
+                "store": store,
+            }))?
+        );
+        return Ok(i32::from(!ok));
+    }
+
+    let said = |key: &str| manifest[key].as_str().unwrap_or("unknown").to_owned();
+    println!(
+        "bundle   {}, made {} on {} by Muru {}",
+        path.display(),
+        said("created"),
+        said("node"),
+        said("muru")
+    );
+    println!();
+    print_report(&report);
+
+    if let Some(store) = &store {
+        println!();
+        print_store(store);
+    }
+
+    Ok(i32::from(!ok))
+}
+
+/// One entry of the timeline.
+#[derive(Debug, Clone, Serialize)]
+struct Moment {
+    /// When, Unix milliseconds.
+    time_unix_ms: u64,
+    /// The same as text, in UTC.
+    time: String,
+    /// Where it is from: `event`, `log` or `process`.
+    source: &'static str,
+    /// What happened.
+    text: String,
+}
+
+impl Moment {
+    fn new(time_unix_ms: u64, source: &'static str, text: String) -> Self {
+        let at = std::time::UNIX_EPOCH + Duration::from_millis(time_unix_ms);
+        let (date, hours, minutes, seconds, millis) = muru_edge::access::civil(at);
+
+        Self {
+            time_unix_ms,
+            time: format!("{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z"),
+            source,
+            text,
+        }
+    }
+}
+
+/// How much of the end of the daemon's log is read for its last lines.
+const LOG_TAIL: u64 = 256 * 1024;
+
+/// The last lines of the log at `path` that begin with a time, each
+/// with its time.
+fn log_moments(path: &Path) -> Vec<Moment> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+
+    let size = file.metadata().map_or(0, |metadata| metadata.len());
+    let from = size.saturating_sub(LOG_TAIL);
+    let mut tail = Vec::new();
+
+    if file.seek(SeekFrom::Start(from)).is_err() || file.read_to_end(&mut tail).is_err() {
+        return Vec::new();
+    }
+
+    // The first line of a tail that starts mid-file is a part of one.
+
+    String::from_utf8_lossy(&tail)
+        .lines()
+        .skip(usize::from(from > 0))
+        .filter_map(|line| {
+            let time = muru_controller::diagnostics::window::line_time(line.as_bytes())?;
+            let text = line.split_once(' ').map_or(line, |(_, rest)| rest);
+            Some(Moment::new(time, "log", text.to_owned()))
+        })
+        .collect()
+}
+
+/// Run `muructl doctor timeline`: the events the store keeps, the last
+/// lines of the daemon's own log and the start of each of the
+/// installation's processes, merged in order, the latest `limit`.
+async fn doctor_timeline(
+    locations: Locations,
+    args: &TimelineArgs,
+    json: bool,
+) -> anyhow::Result<i32> {
+    let log = locations.daemon_log();
+    let installation = Installation::read(locations).await;
+    let mut moments = log_moments(&log);
+
+    // The last events the store keeps.
+
+    if let Some(store) = &installation.store {
+        let last = store.last_event_sequence().unwrap_or(0);
+        let after = last.saturating_sub(args.limit as u64);
+
+        for event in store.events_after(after, args.limit).unwrap_or_default() {
+            moments.push(Moment::new(
+                event.time_unix_ms,
+                "event",
+                format!("{} {}: {}", event.kind, event.subject, event.message),
+            ));
+        }
+    }
+
+    // The processes of this installation: the daemon's own, and those
+    // that carry its instance ID.
+
+    let daemon = installation.daemon_process().map(|process| process.pid);
+
+    for process in &installation.processes {
+        let ours = Some(process.pid) == daemon
+            || (installation.id.is_some() && process.id == installation.id);
+
+        if let (true, Some(started)) = (ours, process.started_unix_ms) {
+            moments.push(Moment::new(
+                started,
+                "process",
+                format!("{} started (pid {})", process.title.trim(), process.pid),
+            ));
+        }
+    }
+
+    moments.sort_by_key(|moment| moment.time_unix_ms);
+    let skip = moments.len().saturating_sub(args.limit);
+    let moments = &moments[skip..];
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "timeline": moments }))?
+        );
+        return Ok(0);
+    }
+
+    if moments.is_empty() {
+        println!("muru: nothing to show: no events, no daemon log and no process");
+    }
+
+    for moment in moments {
+        println!("{}  {:<7}  {}", moment.time, moment.source, moment.text);
+    }
+
+    Ok(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versions_are_the_same_however_a_build_writes_them() {
+        assert!(same_version("0.1.0-alpha.37", "0.1.0a37"));
+        assert!(same_version("1.0.0", "1.0.0"));
+        assert!(!same_version("1.0.0", "1.1.0"));
+        assert!(!same_version("0.1.0-alpha.36", "0.1.0a37"));
+
+        assert_eq!(
+            runtime_version(Path::new("/var/lib/muru/runtime/1.0.0/cp313")).as_deref(),
+            Some("1.0.0")
+        );
+        assert_eq!(runtime_version(Path::new("cp313")), None);
+    }
+
+    #[test]
+    fn the_last_lines_of_a_log_that_begin_with_a_time_are_its_moments() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let log = directory.path().join("daemon.log");
+
+        std::fs::write(
+            &log,
+            "2026-11-02T05:40:11.204Z muru: state: /var/lib/muru (default)\n\
+             a line with no time\n\
+             2026-11-02T05:40:11.209Z muru: error: cannot listen on 0.0.0.0:80\n",
+        )
+        .expect("written");
+
+        let moments = log_moments(&log);
+        assert_eq!(moments.len(), 2);
+        assert_eq!(moments[1].time, "2026-11-02T05:40:11.209Z");
+        assert_eq!(moments[1].text, "muru: error: cannot listen on 0.0.0.0:80");
+        assert_eq!(moments[1].source, "log");
+        assert!(moments[0].time_unix_ms < moments[1].time_unix_ms);
+        assert!(log_moments(&directory.path().join("none")).is_empty());
+    }
 
     #[test]
     fn a_pid_is_read_from_a_lock_file_and_from_a_pid_file() {

@@ -148,6 +148,17 @@ directory and `deploy`'s settings, without the daemon.
   Check it before starting a run, and after stopping one, to see what
   was left running.
 
+- `doctor` checks Muru itself and changes nothing: every socket and
+  file of the daemon with its owner and condition, and checks of one
+  part against another, each failure naming the command that puts it
+  right. When something looks wrong with Muru and not with the
+  application (an instance that runs and is not listed, a release the
+  daemon says is ready that nothing answers for, a command that cannot
+  reach the daemon), run it first, with `store` for the state store and
+  `timeline` for what happened last, and include what it says when
+  reporting the problem. Do not run the command it names without being
+  asked when that command stops or removes something.
+
 - The daemon's own configuration file holds the node's settings, such
   as listeners, limits and `[daemon] detours`, and nothing of what it
   serves. `daemon_config` shows it (`full` for every setting with its

@@ -7,6 +7,7 @@ fails."""
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import socket
 import sqlite3
@@ -123,8 +124,33 @@ def test_doctor_lists_an_installation_and_fails_on_what_is_wrong(base: Path) -> 
         assert files["the host of shop@r1, for the next daemon"]["ok"]
 
         checks = {check["check"]: check for check in document["checks"]}
-        assert sorted(checks) == ["locks", "paths", "registry", "releases", "store"]
+        assert sorted(checks) == [
+            "disk",
+            "edge",
+            "locks",
+            "paths",
+            "registry",
+            "releases",
+            "store",
+            "versions",
+        ]
         assert f"the daemon (pid {pid}) holds its entry" in checks["registry"]["detail"]
+        assert "the one the daemon last sent" in checks["edge"]["detail"]
+        assert "the daemon and its edge run version " in checks["versions"]["detail"]
+        assert "has room: state " in checks["disk"]["detail"]
+
+        # A daemon that runs says where its files are, so its run
+        # directory alone finds it.
+
+        found = subprocess.run(
+            [str(support.muructl_path()), "doctor", "--json", "--run-dir", str(run_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        assert found.returncode == 0, found.stdout + found.stderr
+        assert by_path(json.loads(found.stdout)["sockets"]) == sockets
 
         # The text has one line for each, and the same exit code.
 
@@ -191,6 +217,103 @@ def test_doctor_lists_an_installation_and_fails_on_what_is_wrong(base: Path) -> 
     details = {check["check"]: check["detail"] for check in document["checks"]}
     assert details["locks"] == "no daemon runs, and nothing holds its locks"
     assert details["releases"].startswith("2 releases in the store, 0 with a host")
+
+
+def test_doctor_gives_a_timeline_and_reads_what_a_bundle_holds(base: Path) -> None:
+    daemon = start_daemon(base)
+    bundle = base / "bundle.tar.gz"
+    muructl = support.muructl_path()
+    assert muructl is not None
+
+    try:
+        daemon.deploy("shop", SHOP, "--processes", "1")
+        pid = daemon.process.pid
+
+        # The events, the daemon's processes and its log lines, in order.
+
+        shown = doctor(daemon, "timeline", "--json")
+        assert shown.returncode == 0, shown.stdout + shown.stderr
+        timeline = json.loads(shown.stdout)["timeline"]
+        assert [entry["time_unix_ms"] for entry in timeline] == sorted(
+            entry["time_unix_ms"] for entry in timeline
+        )
+        texts = {(entry["source"], entry["text"]) for entry in timeline}
+        assert ("event", "traffic.switched shop@r1: traffic moved to the release") in texts
+        assert any(
+            source == "process" and text.startswith("muru daemon ") and f"(pid {pid})" in text
+            for source, text in texts
+        ), texts
+        assert any(
+            source == "process" and text.startswith("muru host shop@r1") for source, text in texts
+        )
+
+        text = doctor(daemon, "timeline", "--limit", "3")
+        assert text.returncode == 0 and len(text.stdout.splitlines()) == 3, text.stdout
+        assert re.match(r"\d{4}-\d\d-\d\dT[\d:.]+Z  (event|log|process)  ", text.stdout), (
+            text.stdout
+        )
+
+        # A bundle carries what doctor finds as the bundle is made.
+
+        made = subprocess.run(
+            [
+                str(muructl),
+                "debug",
+                "bundle",
+                "--output",
+                str(bundle),
+                "--socket",
+                str(daemon.run_dir / "admin.sock"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+        assert made.returncode == 0, made.stdout + made.stderr
+    finally:
+        daemon.stop(shutdown=True)
+
+    # It is read with no daemon, as it would be on another machine: the
+    # sockets as they answered then, the checks as they passed then.
+
+    read = subprocess.run(
+        [str(muructl), "doctor", "--bundle", str(bundle), "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert read.returncode == 0, read.stdout + read.stderr
+    held = json.loads(read.stdout)
+    assert held["ok"] and held["bundle"] == str(bundle) and held["muru"]
+    sockets = by_path(held["report"]["sockets"])
+    assert sockets[str(daemon.run_dir / "admin.sock")]["condition"] == "answering"
+    assert sockets[str(daemon.run_dir / "h" / "1" / "worker-0.sock")]["condition"] == "answering"
+    assert {check["check"] for check in held["report"]["checks"]} >= {"registry", "edge", "disk"}
+    assert held["store"]["tables"]["releases"] == 1 and held["store"]["ok"]
+
+    text = subprocess.run(
+        [str(muructl), "doctor", "--bundle", str(bundle)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert text.returncode == 0, text.stdout + text.stderr
+    assert text.stdout.startswith(f"bundle   {bundle}, made ")
+    assert "\nSOCKETS\n" in text.stdout and "\nTABLES\n" in text.stdout
+
+    # An archive with nothing of doctor's in it says so.
+
+    refused = subprocess.run(
+        [str(muructl), "doctor", "--bundle", str(bundle), "store"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert refused.returncode != 0 and "takes no part to look into" in refused.stderr
 
 
 def the_daemon_still_serves(daemon: Daemon) -> bool:

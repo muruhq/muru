@@ -462,6 +462,16 @@ impl ServerHandler for Server {
                 Ok(command) => self.local_command(command).await,
                 Err(message) => failure(message),
             },
+            "doctor" => match (spec.command)(&arguments) {
+                // Doctor reads the daemon's files, which it finds from
+                // the daemon's locations and not from a socket, and a
+                // failed check is an answer with exit status 1.
+                Ok(mut command) => {
+                    command.extend(locations_of(&self.connect_for(&arguments)));
+                    self.local_command(command).await
+                }
+                Err(message) => failure(message),
+            },
             _ => match (spec.command)(&arguments) {
                 Ok(command) => {
                     let result = self.command(command, &self.connect_for(&arguments)).await;
@@ -472,6 +482,23 @@ impl ServerHandler for Server {
         };
 
         Ok(result.into())
+    }
+}
+
+/// The options that find a daemon's files, from those that reach its
+/// admin socket: a socket is in its daemon's run directory, which is
+/// what `--socket` becomes, and a daemon that runs says where the rest
+/// of its files are.
+fn locations_of(connect: &[String]) -> Vec<String> {
+    match connect {
+        [option, socket] if option == "--socket" => {
+            let run_dir = std::path::Path::new(socket)
+                .parent()
+                .map(|directory| directory.display().to_string())
+                .unwrap_or_default();
+            vec!["--run-dir".to_owned(), run_dir]
+        }
+        other => other.to_vec(),
     }
 }
 
@@ -840,6 +867,30 @@ fn specs() -> Vec<Spec> {
                 }
 
                 Ok(command)
+            },
+        },
+        Spec {
+            name: "doctor",
+            description: "Check Muru itself, not the application: every socket and file of the daemon's installation with what it is for, who owns it and its condition, and checks of one part against another (the registry, locks, paths, store, releases, edge, versions and disk), each failure with the command that puts it right. With part store, the state store's integrity, schema version, table counts and rules; with part timeline, the last events, daemon log lines and process starts in order. Changes nothing and works with no daemon running. Run it before reporting a problem with Muru.",
+            changes: false,
+            properties: json!({
+                "part": {"type": "string", "enum": ["installation", "store", "timeline"], "description": "What to check; the installation when left out"},
+                "limit": {"type": "integer", "description": "For timeline: how many entries, the latest (default 50)"},
+            }),
+            required: &[],
+            command: |arguments| match text(arguments, "part").as_deref() {
+                None | Some("installation") => Ok(words(&["doctor"])),
+                Some("store") => Ok(words(&["doctor", "store"])),
+                Some("timeline") => {
+                    let mut command = words(&["doctor", "timeline"]);
+
+                    if let Some(limit) = arguments.get("limit").and_then(Value::as_u64) {
+                        command.extend(["--limit".to_owned(), limit.to_string()]);
+                    }
+
+                    Ok(command)
+                }
+                Some(other) => Err(format!("no doctor part {other}")),
             },
         },
         Spec {

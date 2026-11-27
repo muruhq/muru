@@ -481,6 +481,9 @@ impl Admin for Service {
             app_count: apps.len() as u32,
             release_count: releases.len() as u32,
             edge_pid: info.edge_pid.load(std::sync::atomic::Ordering::Relaxed),
+            snapshot_version: info
+                .snapshot_version
+                .load(std::sync::atomic::Ordering::Relaxed),
             metrics: info
                 .metrics
                 .map(|address| address.to_string())

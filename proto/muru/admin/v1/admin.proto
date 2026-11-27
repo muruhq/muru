@@ -455,6 +455,7 @@ message Status {
   string hostname = 25;             // the machine's hostname
   string name = 26;                 // the instance's name: user, system or a named instance's; empty for a run, a serve or a daemon whose locations were given by flags
   repeated string start_flags = 27; // the flags the daemon was started with that stand over its configuration file: --listen, --metrics, --dashboard, --user (issue 894)
+  uint64 snapshot_version = 28;     // the version of the routing the daemon last gave its edge, which the edge's own status repeats once it has applied it (issue 950); 0 for a run
 }
 
 message ListWebSocketsRequest {

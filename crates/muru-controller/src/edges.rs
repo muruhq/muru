@@ -10,6 +10,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,9 @@ pub struct EdgeProcess {
     spec: EdgeSpec,
     process: Process,
     snapshot: pb::Snapshot,
+    /// The version of the snapshot last given to the edge, for the
+    /// daemon's status to report without asking its loop.
+    sent: Arc<AtomicU64>,
     /// The control socket as of the last snapshot, for the wake watcher,
     /// which follows the edge through respawns and upgrades.
     control_now: Arc<Mutex<PathBuf>>,
@@ -111,6 +115,7 @@ impl EdgeProcess {
             spec,
             process: Process::Child(child),
             snapshot: pb::Snapshot::default(),
+            sent: Arc::default(),
         })
     }
 
@@ -182,6 +187,7 @@ impl EdgeProcess {
                 version: status.snapshot_version,
                 ..Default::default()
             },
+            sent: Arc::new(AtomicU64::new(status.snapshot_version)),
         })
     }
 
@@ -298,6 +304,7 @@ impl EdgeProcess {
             version: self.snapshot.version + 1,
             ..snapshot
         };
+        self.sent.store(self.snapshot.version, Ordering::Relaxed);
         *self.control_now.lock().expect("control poisoned") = self.spec.control.clone();
         let mut client = connect(&self.spec.control).await?;
 
@@ -345,6 +352,11 @@ impl EdgeProcess {
     /// The version of the snapshot the edge was last given.
     pub fn snapshot_version(&self) -> u64 {
         self.snapshot.version
+    }
+
+    /// That version as it changes, shared with whoever reports it.
+    pub fn sent_version(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.sent)
     }
 
     /// Recent requests, the last minute's counters and the pools' state,
@@ -750,6 +762,24 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
     }
 
     command.spawn().context("starting the edge process")
+}
+
+/// Ask the edge on `control` for its status, within `bound`: its pid,
+/// its version and the version of the snapshot it serves. For a command
+/// that checks an edge against its daemon (issue 950).
+pub async fn status_of(control: &Path, bound: Duration) -> anyhow::Result<pb::EdgeStatus> {
+    let asked = async {
+        let mut client = connect(control).await?;
+        let status = client
+            .get_status(pb::EdgeStatusRequest {})
+            .await
+            .map_err(|status| anyhow::anyhow!("the edge did not answer: {}", status.message()))?;
+        Ok(status.into_inner())
+    };
+
+    tokio::time::timeout(bound, asked)
+        .await
+        .map_err(|_| anyhow::anyhow!("the edge did not answer in time"))?
 }
 
 /// Connect to an edge's control socket.

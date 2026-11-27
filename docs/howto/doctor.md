@@ -38,14 +38,23 @@ ok      locks         the daemon (pid 4120) holds the state and run directories
 ok      paths         the longest of 8 socket paths is 32 bytes of the 107 allowed, and the run directory holds sockets only
 ok      store         schema 22, as this muructl expects; muructl doctor store checks it in full
 ok      releases      3 releases in the store, 1 with a host or instances that run
+ok      edge          the edge (pid 4133) serves snapshot 12, the one the daemon last sent
+ok      versions      the daemon and its edge run version 1.0.0, as this muructl is, and so does the runtime library of 1 hosts
+ok      disk          each location belongs to root and has room: state 41.2GB, run 1.9GB, log 41.2GB, cache 41.2GB free
 ```
 
 It checks one installation: the daemon whose locations the command's
 flags and the environment give, as `muructl daemon start` takes them
 (`--system`, `--instance`, `--state-dir`, `--run-dir`, `--log-dir`,
 `--cache-dir` and `--config`), and the development runs under its run
-directory. `--json` prints one document with `ok`, `sockets`, `files`
-and `checks`.
+directory. A daemon that runs says where its files are, so for one
+started with locations of its own the run directory is enough:
+
+```
+muructl doctor --run-dir /srv/shop/run
+```
+
+`--json` prints one document with `ok`, `sockets`, `files` and `checks`.
 
 ## Sockets and files
 
@@ -84,6 +93,9 @@ development run's directory of files that no live run names.
 | `paths` | The run directory leaves room for the longest socket path, no socket's path is past the platform's limit, the run directory holds no regular file and nothing a daemon of an earlier version left, and neither the state directory nor the registry is under a temporary directory. |
 | `store` | The state store opens and its schema version is one this `muructl` reads. |
 | `releases` | No host's record names a process that is gone for a release the store says runs, no host runs for a release the store says is stopped, and every host's files belong to a release the store holds. |
+| `edge` | The edge that answers is the process the daemon and its record name, and the routing it serves is the routing the daemon last sent it. |
+| `versions` | The daemon and its edge run the version of this `muructl`. A release keeps the runtime library it started with through an [upgrade](upgrading.md#releases), so the releases on another version are named and are no failure. |
+| `disk` | Each of the state, run, log and cache directories belongs to the daemon's user, who may write to it, no other user may write to the run directory, and each has 64MB free or more. |
 
 A check that fails says what it found, and names the command that puts
 it right where one does:
@@ -97,6 +109,9 @@ ok      locks         the daemon (pid 4120) holds the state and run directories
 FAILED  paths         /run/muru/h/7/notes.txt is a regular file in the run directory, which holds sockets only
 ok      store         schema 22, as this muructl expects; muructl doctor store checks it in full
 ok      releases      3 releases in the store, 1 with a host or instances that run
+ok      edge          the edge (pid 4133) serves snapshot 12, the one the daemon last sent
+FAILED  versions      the daemon (pid 4120) runs version 1.0.0, and this muructl is version 1.1.0; see muructl daemon upgrade
+ok      disk          each location belongs to root and has room: state 41.2GB, run 1.9GB, log 41.2GB, cache 41.2GB free
 $ echo $?
 1
 ```
@@ -108,6 +123,8 @@ $ echo $?
 | `muructl instance prune` | Removes registry entries nothing runs behind, with a development run's directories. |
 | `muructl instance list --orphans` | Lists Muru's processes that no running instance accounts for, which `muructl instance prune` stops. |
 | `muructl daemon reset` | Removes what a daemon that no longer runs left in its directories. |
+| `muructl daemon upgrade` | Runs the daemon again from the installed `muructl` and replaces its edge, with nothing refused in between. |
+| `muructl release prune` | Removes releases that no longer serve, with their environments and logs, for the room. |
 
 Doctor repairs nothing itself.
 
@@ -174,3 +191,58 @@ blog|r1|ready
 The copy is one consistent database, taken while the daemon goes on
 using the store, with no write-ahead log beside it. It is never written
 over a file that exists.
+
+## What happened last
+
+`muructl doctor timeline` puts three records of the recent past in one
+order: the events the daemon keeps, the last lines of its own log, and
+when each of its processes started. It works with no daemon running.
+
+```console
+$ muructl doctor timeline --limit 8
+2026-11-02T05:40:11.204Z  process  muru daemon system started (pid 4120)
+2026-11-02T05:40:11.911Z  process  muru edge system started (pid 4133)
+2026-11-02T05:40:11.960Z  event    daemon.started daemon: serving on http://0.0.0.0:80, admin socket /run/muru/admin.sock
+2026-11-02T05:42:22.031Z  event    release.created shop@r4: from /srv/shop
+2026-11-02T05:42:22.840Z  process  muru host shop@r4 (system) started (pid 4190)
+2026-11-02T05:42:23.118Z  event    release.ready shop@r4: 2 workers ready in 0.3 s
+2026-11-02T05:42:23.120Z  event    traffic.switched shop@r4: traffic moved to the release
+2026-11-02T06:10:04.552Z  log      muru: warning: the edge did not apply the snapshot within 30 s
+```
+
+Each line has its time in UTC, where it is from (`event`, `log` or
+`process`) and what happened. `--limit N` prints the latest N, 50 when
+left out, and `--json` prints `{"timeline": [...]}`.
+
+## On a bundle from another machine
+
+[`muructl debug bundle`](debugging.md) puts what doctor finds, as the
+bundle is made, in `doctor/report.json`, and its checks of the state
+store in `doctor/store.json`. `--bundle` prints both wherever the
+archive is read:
+
+```console
+$ muructl doctor --bundle muru-bundle-20261102-061500.tar.gz
+bundle   muru-bundle-20261102-061500.tar.gz, made 2026-11-02T06:15:00Z on web1 by Muru 1.0.0
+
+SOCKETS
+/run/muru/admin.sock               admin API                                  daemon pid 4120   answering
+...
+```
+
+The sockets, files and checks are as they were on the machine the
+bundle was made on, when it was made, and the exit code is 1 if a check
+failed there. Nothing is checked again: whether a socket answers can
+only be asked where the socket is.
+
+A bundle does not hold the state store itself, since a release's record
+has its environment values, which a bundle never holds. To send the
+store to someone who may have it, take a copy with `muructl doctor store
+--copy FILE`.
+
+## From a coding agent
+
+The MCP server's `doctor` tool runs the same three commands on the
+daemon the server reaches, with `part` set to `installation`, `store`
+or `timeline`, and the [agent skill](coding-agents.md) tells an agent to
+run it before reporting a problem with Muru.

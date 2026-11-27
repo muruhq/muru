@@ -47,6 +47,41 @@ pub mod layout {
     /// The incidents of the window, each in a directory named by its id
     /// and laid out as an archive of its own is.
     pub const INCIDENTS: &str = "incidents";
+    /// What `muructl doctor` found when the archive was made (issue
+    /// 950): `report.json`, the sockets, files and checks, and
+    /// `store.json`, the checks of the state store.
+    pub const DOCTOR: &str = "doctor";
+}
+
+/// Read the parts named from the archive at `path`, each by its path
+/// below the archive's one directory: the content of each that is there.
+/// For a command that reads what an archive made elsewhere holds.
+pub fn read_parts(
+    path: &std::path::Path,
+    parts: &[&str],
+) -> io::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let mut found = std::collections::BTreeMap::new();
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let name = entry.path()?.to_string_lossy().into_owned();
+
+        // A member is ROOT/PART, whatever the archive's directory is.
+
+        let Some((_, part)) = name.split_once('/') else {
+            continue;
+        };
+
+        if parts.contains(&part) {
+            let mut content = Vec::new();
+            entry.read_to_end(&mut content)?;
+            found.insert(part.to_owned(), content);
+        }
+    }
+
+    Ok(found)
 }
 
 /// One part of an archive, as the manifest lists it.
@@ -350,6 +385,28 @@ mod tests {
         }
 
         members
+    }
+
+    #[test]
+    fn the_parts_asked_for_are_read_back_from_an_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bundle.tar.gz");
+        let mut archive = Archive::new(
+            std::fs::File::create(&path).unwrap(),
+            "muru-bundle-1",
+            1_793_598_142,
+        );
+        archive
+            .bytes("doctor/report.json", b"{\"ok\": true}\n", None)
+            .unwrap();
+        archive.bytes("installation.json", b"{}\n", None).unwrap();
+        archive.finish(manifest()).unwrap();
+
+        let parts = read_parts(&path, &["doctor/report.json", layout::MANIFEST, "none"]).unwrap();
+        assert_eq!(parts["doctor/report.json"], b"{\"ok\": true}\n");
+        assert!(parts.contains_key(layout::MANIFEST));
+        assert_eq!(parts.len(), 2);
+        assert!(read_parts(&directory.path().join("missing"), &[]).is_err());
     }
 
     #[test]

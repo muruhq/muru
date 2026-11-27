@@ -1122,6 +1122,8 @@ pub struct Info {
     pub started_unix_ms: u64,
     /// The edge process's pid, for status.
     pub edge_pid: std::sync::atomic::AtomicU32,
+    /// The version of the snapshot the edge was last given.
+    pub snapshot_version: Arc<std::sync::atomic::AtomicU64>,
     /// Where the Prometheus exposition is served, or nowhere.
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard is served, or nowhere.
@@ -2489,6 +2491,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         limits: std::sync::RwLock::new(settings.limits.clone()),
         started_unix_ms: crate::model::now_unix_ms(),
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
+        snapshot_version: edge.sent_version(),
         metrics,
         dashboard,
         dashboard_sessions: dashboard_sessions.clone(),
