@@ -155,6 +155,11 @@ MEMORY_CAUSES = ("memory", "container_memory")
 SURGE_FIRST = "surge_first"
 DRAIN_FIRST = "drain_first"
 
+# Section 7.9: the limits of the node's budget that can leave a group's
+# surge allowance short, as the daemon names them and as a message does.
+
+BUDGET_LIMITS = {"workers": "worker", "memory": "memory", "cpu": "CPU"}
+
 # Section 7.7 (issue 624): the score every worker raises its own
 # /proc/self/oom_score_adj to after the fork, so the kernel picks a worker,
 # which its host replaces, before a host, the edge or another service.
@@ -1549,6 +1554,14 @@ class Host:
         # turn, by the group's name, in the order they came.
 
         self.swaps: dict[str, deque[Swap]] = {}
+
+        # Section 7.9: the surge allowance the daemon last granted each
+        # group, by its name, with what left it short of the group's
+        # max_surge (traffic, workers, memory or cpu) or nothing. It is
+        # kept while the daemon is away; a group never granted one has
+        # its max_surge.
+
+        self.allowances: dict[str, tuple[int, str]] = {}
 
         # Section 7.4: indices forked by a scale-out and not yet ready, and
         # indices a scale-in emptied, to be used again by the next one.
@@ -2976,6 +2989,10 @@ class Host:
             self.recycle_worker(request_id, wanted, asked, args)
             return
 
+        if op == "surge":
+            self.take_surge(request_id, args)
+            return
+
         if op == "status":
             self.answer_status(request_id, wanted)
             return
@@ -3225,6 +3242,32 @@ class Host:
                 "workers": [{**self.worker_fields(state.index), "pid": state.pid, "ok": True}],
             }
         )
+
+    # Section 7.9: the daemon grants each group a surge allowance that
+    # fits the node's budget, and says again when it changes.
+
+    def take_surge(self, request_id: int, args: dict[str, Any]) -> None:
+        """Take the surge allowances the supervisor grants, by group.
+
+        A swap that waited for an allowance starts at once when one is
+        granted. A surge under way is left alone when its allowance is
+        withdrawn.
+        """
+
+        granted = args.get("groups")
+
+        if isinstance(granted, dict):
+            for group in self.groups:
+                given = granted.get(group.name)
+
+                if isinstance(given, dict):
+                    self.allowances[group.name] = (
+                        max(0, int(given.get("allowance", 0))),
+                        str(given.get("short", "")),
+                    )
+
+        self.send_to_supervisor({"type": "response", "id": request_id, "workers": []})
+        self.run_swaps()
 
     def active_indices(self, group: Group) -> list[int]:
         """Return the group's indices with a worker that serves or is starting, in order."""
@@ -4172,9 +4215,14 @@ class Host:
         # grace on that path; reap() forks its successor.
 
         if order == DRAIN_FIRST:
+            lacking = self.surge_short(group)
             why = (
                 f"max_surge of the group {group.name} is 0"
                 if not group.max_surge
+                else "its release takes no traffic, so it has no surge allowance"
+                if allowance < 1 and lacking == "traffic"
+                else f"the node's {BUDGET_LIMITS[lacking]} budget has no room for a surge"
+                if allowance < 1 and lacking in BUDGET_LIMITS
                 else f"the group {group.name} has no surge allowance"
                 if allowance < 1
                 else f"no surge slot of the group {group.name} is free"
@@ -4206,9 +4254,36 @@ class Host:
     # and max_unavailable.
 
     def surge_allowance(self, group: Group) -> int:
-        """Return how many workers the group may run over its count during a swap."""
+        """Return how many workers the group may run over its count during a swap.
 
-        return group.max_surge or 0
+        Section 7.9: what the daemon last granted, never more than the
+        group's max_surge, and its max_surge when nothing was granted.
+        """
+
+        granted = self.allowances.get(group.name)
+        most = group.max_surge or 0
+        return most if granted is None else min(most, granted[0])
+
+    def surge_short(self, group: Group) -> str:
+        """Return what left the group's allowance short of its max_surge, or nothing."""
+
+        granted = self.allowances.get(group.name)
+
+        if granted is None or granted[0] >= (group.max_surge or 0):
+            return ""
+
+        return granted[1]
+
+    def unavailable_allowance(self, group: Group) -> int:
+        """Return how many workers the group may run under its count during a swap.
+
+        Section 7.9: a release that takes no traffic swaps drain first
+        whatever its max_unavailable, since nobody is served by the
+        worker that stops.
+        """
+
+        allowed = group.max_unavailable or 0
+        return max(allowed, 1) if self.surge_short(group) == "traffic" else allowed
 
     def surge_in_use(self, group: Group) -> int:
         """Return how many of the group's workers have a replacement alive beside them."""
@@ -4249,7 +4324,7 @@ class Host:
         if self.surge_in_use(group) < self.surge_allowance(group):
             return SURGE_FIRST
 
-        if self.unavailable_in_use(group) < (group.max_unavailable or 0):
+        if self.unavailable_in_use(group) < self.unavailable_allowance(group):
             return DRAIN_FIRST
 
         return None
@@ -4328,6 +4403,26 @@ class Host:
                 "unavailable",
                 f"max_unavailable {group.max_unavailable} of the group {group.name} "
                 "allows no more of its workers out of routing",
+            )
+
+        # Section 7.9: the daemon granted less than max_surge.
+
+        short = self.surge_short(group)
+        allowance = self.surge_allowance(group)
+        allowed = self.unavailable_allowance(group)
+
+        if short and not allowance and allowed:
+            return (
+                "unavailable",
+                f"the group {group.name} has no surge allowance, and {allowed} of its workers "
+                "may be out of routing at once",
+            )
+
+        if short in BUDGET_LIMITS and self.surge_in_use(group) < (group.max_surge or 0):
+            return (
+                "budget",
+                f"the node's {BUDGET_LIMITS[short]} budget has no room for another worker of the "
+                f"group {group.name} over its count",
             )
 
         return (

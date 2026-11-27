@@ -1157,3 +1157,63 @@ def test_a_groups_swap_settings_are_its_own_or_the_releases(tmp_path: Path) -> N
     for refused in ("reports=0,0", "reports=1", "=1,0", "reports=-1,2", "reports=a,b"):
         with pytest.raises(argparse.ArgumentTypeError):
             host.parse_group_swap(refused)
+
+
+def test_swaps_are_surge_first_only_within_the_allowance_the_daemon_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section 7.9: the host keeps the allowance it was last granted."""
+
+    instance, states, sent, forks = swapping_host(tmp_path, monkeypatch)
+    default = instance.groups[0]
+    assert instance.surge_allowance(default) == 1
+
+    # No room in the budget and nothing allowed under the count: the swap
+    # waits, and says which limit it waits on.
+
+    instance.take_request(
+        {
+            "type": "request",
+            "id": 7,
+            "op": "surge",
+            "args": {"groups": {"default": {"allowance": 0, "short": "memory"}}},
+        }
+    )
+    assert sent[-1] == {"type": "response", "id": 7, "workers": []}
+    assert instance.surge_allowance(default) == 0
+    instance.swap(states[0], "served 10 requests", "worker.recycled", "max_requests")
+    assert forks == []
+    assert waiting(sent) == [("default", "budget")]
+    event = next(message for message in sent if message.get("kind") == "worker.swap_waiting")
+    assert event["message"].endswith(
+        "the node's memory budget has no room for another worker of the group default over "
+        "its count"
+    )
+
+    # An involuntary replacement is not held back, and keeps the order:
+    # its successor is forked once it has exited.
+
+    assert instance.replace(states[1], "ran too long", "worker.timeout_killed", "hard_timeout")
+    assert forks == []
+    assert instance.replacing[1].stop_first
+
+    # The swap that waited starts as soon as an allowance is granted, and
+    # never more is taken than the group's max_surge.
+
+    surge = {"groups": {"default": {"allowance": 3, "short": ""}}}
+    instance.take_request({"type": "request", "id": 8, "op": "surge", "args": surge})
+    assert instance.surge_allowance(default) == 1
+    assert forks == [(0, 5000)]
+
+
+def test_a_release_with_no_traffic_swaps_drain_first_whatever_its_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, sent, forks = swapping_host(tmp_path, monkeypatch, workers=1)
+    surge = {"groups": {"default": {"allowance": 0, "short": "traffic"}}}
+    instance.take_request({"type": "request", "id": 3, "op": "surge", "args": surge})
+    instance.swap(states[0], "lived 60 s", "worker.recycled", "max_lifetime")
+    assert forks == []
+    assert instance.routed[0] is None
+    assert instance.replacing[0].stop_first
+    assert waiting(sent) == []

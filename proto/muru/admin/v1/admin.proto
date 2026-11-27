@@ -1306,6 +1306,8 @@ message Release {
   uint64 number = 42;               // its number among every release the daemon has held, which names its host's directories (issue 948); 0 for a detour
   uint32 max_surge = 43;            // workers a group may run over its count while workers are swapped
   uint32 max_unavailable = 44;      // workers a group may run under its count while workers are swapped
+  optional uint32 surge_allowance = 45; // the default group's surge allowance as last granted: its max_surge, or fewer; absent when no host runs
+  string surge_short = 46;          // what left that allowance short of max_surge: traffic, workers, memory or cpu; empty when nothing did
 }
 
 // A gate a release passed: a run of a command at a point in its life.
@@ -1353,6 +1355,8 @@ message ReleaseGroup {
   repeated string mounts = 11;          // the named mounts its workers serve, every mount when empty
   uint32 max_surge = 12;                // workers the group may run over its count while workers are swapped, its own or the release's
   uint32 max_unavailable = 13;          // workers the group may run under its count while workers are swapped
+  optional uint32 surge_allowance = 14; // its surge allowance as last granted: its max_surge, or fewer; absent when no host runs
+  string surge_short = 15;              // what left that allowance short of max_surge: traffic, workers, memory or cpu
 }
 
 message Worker {

@@ -8845,6 +8845,31 @@ fn swap_settings(max_surge: u32, max_unavailable: u32) -> String {
     format!("max_surge {max_surge}, max_unavailable {max_unavailable} ({order})")
 }
 
+/// What a release's description says of a surge allowance the daemon
+/// granted short of `max_surge`, or nothing when it is whole or no host
+/// runs.
+fn surge_granted(max_surge: u32, allowance: Option<u32>, short: &str) -> String {
+    let Some(allowance) = allowance.filter(|allowance| *allowance < max_surge) else {
+        return String::new();
+    };
+
+    let why = match short {
+        "traffic" => "the release takes no traffic".to_owned(),
+        "workers" => "the node's worker budget has no room".to_owned(),
+        "memory" => "the node's memory budget has no room".to_owned(),
+        "cpu" => "the node's CPU budget has no room".to_owned(),
+        _ => "the node's budget has no room".to_owned(),
+    };
+
+    if allowance == 0 && short == "traffic" {
+        format!("; no surge allowance now, since {why}, so the old worker stops first")
+    } else if allowance == 0 {
+        format!("; no surge allowance now, since {why}")
+    } else {
+        format!("; a surge allowance of {allowance} now, since {why}")
+    }
+}
+
 pub async fn release_show(release: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
     let mut client = client::connect(&socket.endpoint()?).await?;
@@ -9067,7 +9092,7 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
                     ", {}",
                     swap_settings(group.max_surge, group.max_unavailable)
                 )
-            },
+            } + &surge_granted(group.max_surge, group.surge_allowance, &group.surge_short),
         ));
     }
 
@@ -9077,7 +9102,12 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
     if release.max_surge + release.max_unavailable > 0 {
         lines.push((
             "swaps".to_owned(),
-            swap_settings(release.max_surge, release.max_unavailable),
+            swap_settings(release.max_surge, release.max_unavailable)
+                + &surge_granted(
+                    release.max_surge,
+                    release.surge_allowance,
+                    &release.surge_short,
+                ),
         ));
     }
 

@@ -439,6 +439,60 @@ for another scale-out window. Each new shortfall is a
 to make room for another application, a pin is not limited by the budget,
 and an advisory policy reports without it.
 
+### Room for replacing workers
+
+A worker is [replaced](recycling.md#how-many-at-once-and-in-which-order)
+by starting its replacement beside it, so a group runs one worker over
+its count for the length of each replacement, or as many as its
+`max_surge`. The budget holds that room: each group of each release
+that takes traffic is granted a surge allowance of its `max_surge`
+workers, or as many of them as the budget has room for, and what is
+granted counts as held, as `muructl daemon status` shows:
+
+```
+budget   3 of 3 workers, 1 worker held for swaps
+```
+
+Allowances are granted before scale-outs, the applications with a
+higher `priority` first, and are worked out again every second, so a
+changed limit, a resized container, a scale-out or a move of traffic
+changes them for the next replacement. A node with many groups holds a
+worker's worth of its budget for each of them; `max_surge = 0` on a
+group gives its share back, and its workers then stop before their
+replacements start.
+
+A group granted less than its `max_surge` replaces fewer workers at
+once. Granted none, a recycle stops the old worker first when the
+group's `max_unavailable` allows it, and otherwise waits for room,
+with a `worker.swap_waiting` event that names the limit:
+
+```
+worker.swap_waiting  shop@r1  worker 1 (pid 13027) waits to be replaced (served 1027 requests (max_requests 1000)): the node's worker budget has no room for another worker of the group default over its count
+```
+
+A worker that has to be replaced, one past its hard timeout or over
+its hard memory limit, is not held back: with no allowance it stops
+first and its replacement starts once it has exited.
+
+A release that takes no traffic, one held for a preview or kept warm
+for a rollback, is granted no allowance whatever its `max_surge`, and
+its workers stop before their replacements start whatever its
+`max_unavailable`. A held release with one worker does not answer a
+preview for the moment its worker is replaced. `muructl release show`
+says when a release or a group has less than its `max_surge`:
+
+```
+swaps        max_surge 1, max_unavailable 0 (the new worker starts first); no surge allowance now, since the node's worker budget has no room
+```
+
+On a node with no budget every group that takes traffic has its
+`max_surge`. A release's host keeps the allowances it was last given
+while the daemon is stopped or being upgraded. Under `muructl run` and
+`muructl serve` there is no budget for this, and a group has its
+`max_surge`.
+
+### Releases and the budget
+
 Before a release starts for a deploy, a rollout or a traffic policy, its
 memory is estimated from the application's serving release, else from
 its `memory.soft_limit`. When it fits only with the retained releases

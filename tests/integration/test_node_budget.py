@@ -97,7 +97,7 @@ def budget_line(daemon: Daemon, expected: str | None = None, timeout: float = 20
 
 
 def test_scale_ups_are_admitted_within_the_worker_budget(tmp_path: Path) -> None:
-    daemon = start_daemon(tmp_path, config_extra="[daemon.budget]\nworkers = 2\n")
+    daemon = start_daemon(tmp_path, config_extra="[daemon.budget]\nworkers = 3\n")
     stopping = threading.Event()
 
     def load() -> None:
@@ -114,11 +114,15 @@ def test_scale_ups_are_admitted_within_the_worker_budget(tmp_path: Path) -> None
         applied = daemon.muructl("apply", "-f", str(config)).stdout
         assert "set-priority" in applied, applied
         assert "[priority 5]" in daemon.muructl("app", "list").stdout
-        assert budget_line(daemon, "1 of 2") == "budget   1 of 2 workers"
+
+        # Section 7.9: the one worker and the room held to replace it.
+
+        held = "budget   2 of 3 workers, 1 worker held for swaps"
+        assert budget_line(daemon, "2 of 3") == held
 
         # Four requests in flight against one single-threaded worker: the
-        # group asks for more than the node's two workers, and is given
-        # what fits.
+        # group asks for more than the node has room for beside what it
+        # holds for swaps, and is given what fits.
 
         for thread in threads:
             thread.start()
@@ -130,7 +134,7 @@ def test_scale_ups_are_admitted_within_the_worker_budget(tmp_path: Path) -> None
 
         time.sleep(4)
         assert ready_workers(daemon) == 2
-        assert budget_line(daemon, "2 of 2") == "budget   2 of 2 workers"
+        assert budget_line(daemon, "3 of 3") == "budget   3 of 3 workers, 1 worker held for swaps"
         assert "held at 2" in daemon.muructl("scale", "status", "shop").stdout
 
         # A floor beyond the budget is reported when applied, and once
@@ -158,6 +162,60 @@ min_workers = 4
             if thread.is_alive():
                 thread.join(timeout=10)
 
+        daemon.stop()
+
+
+def test_the_budget_holds_room_for_swaps_and_a_recycle_waits_without_it(tmp_path: Path) -> None:
+    """Section 7.9: a group's surge allowance counts as held, is withdrawn
+    when the budget has no room and for a release that takes no traffic,
+    and a recycle waits for it when nothing may stop first."""
+
+    daemon = start_daemon(tmp_path, config_extra="[daemon.budget]\nworkers = 3\n")
+
+    try:
+        config = tmp_path / "shop.toml"
+        config.write_text(
+            f"[app.shop.release.r1]\nsource = '{SHOP}'\npython = '{sys.executable}'\n"
+            "processes = 2\nthreads = 1\nmax_requests = 20\n"
+        )
+        assert daemon.muructl("apply", "-f", str(config)).returncode == 0
+        held = "budget   3 of 3 workers, 1 worker held for swaps"
+        assert budget_line(daemon, "held for swaps") == held
+        assert "surge allowance" not in daemon.muructl("release", "show", "shop@r1").stdout
+
+        # A third worker takes the room the allowance held. The workers
+        # come due for a recycle and wait, since max_unavailable is 0.
+
+        daemon.muructl("scale", "shop", "--processes", "3")
+        assert wait_until(lambda: budget_line(daemon) == "budget   3 of 3 workers")
+        shown = daemon.muructl("release", "show", "shop@r1").stdout
+        assert "no surge allowance now, since the node's worker budget has no room" in shown
+
+        for _ in range(90):
+            assert daemon.get("/").status == 200
+
+        waits = wait_for_event(daemon, "worker.swap_waiting")
+        assert waits, daemon.muructl("events").stdout
+        assert "the node's worker budget has no room for another worker" in waits[0]
+        assert not wait_for_event(daemon, "worker.recycled", timeout=3)
+
+        # Back at two workers the allowance is granted again, and the
+        # recycles that waited go ahead, one at a time.
+
+        daemon.muructl("scale", "shop", "--processes", "2")
+        assert wait_for_event(daemon, "worker.recycled")
+        assert budget_line(daemon, "held for swaps") == held
+
+        # A held release takes no traffic, so it is granted no allowance.
+
+        daemon.deploy("shop", SHOP, "--hold", "--processes", "1")
+        assert wait_until(
+            lambda: (
+                "no surge allowance now, since the release takes no traffic"
+                in daemon.muructl("release", "show", "shop@r2").stdout
+            )
+        ), daemon.muructl("release", "show", "shop@r2").stdout
+    finally:
         daemon.stop()
 
 

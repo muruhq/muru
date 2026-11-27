@@ -4797,6 +4797,15 @@ async fn await_host_report(handle: &Handle, release: &Release) {
     }
 }
 
+/// What left a group's surge allowance short of its `max_surge`, as the
+/// API names it, or empty (section 7.9).
+fn surge_short(surge: Option<&crate::budget::Surge>) -> String {
+    surge
+        .and_then(|surge| surge.short)
+        .map_or("", crate::budget::Short::as_str)
+        .to_owned()
+}
+
 fn release_message(release: Release, handle: &Handle) -> pb::Release {
     let serving = handle
         .store
@@ -4903,6 +4912,11 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
     pb::Release {
         max_surge,
         max_unavailable,
+        surge_allowance: live
+            .surge
+            .get(muru_edge::routing::DEFAULT_GROUP)
+            .map(|surge| surge.allowance),
+        surge_short: surge_short(live.surge.get(muru_edge::routing::DEFAULT_GROUP)),
         traffic: String::new(),
         detour: None,
         metadata: release.spec.metadata.clone(),
@@ -5026,6 +5040,8 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                 mounts: group.mounts.clone(),
                 max_surge: group.max_surge.unwrap_or(max_surge),
                 max_unavailable: group.max_unavailable.unwrap_or(max_unavailable),
+                surge_allowance: live.surge.get(&group.name).map(|surge| surge.allowance),
+                surge_short: surge_short(live.surge.get(&group.name)),
             })
             .collect(),
         detected_interface,

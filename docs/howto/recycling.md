@@ -95,6 +95,11 @@ keeps the order: its replacement is started at once when `max_surge`
 is 1 or more, and with `max_surge = 0` only after the old worker has
 exited.
 
+On a daemon with a [budget](scaling.md#room-for-replacing-workers) the
+room for a replacement started first is held in the budget, and a group
+is granted as much of its `max_surge` as fits. A release that takes no
+traffic is granted none.
+
 A worker group sets `max_surge` and `max_unavailable` of its own, and
 takes the release's where it sets neither. `muructl release show`
 prints them, and `muructl deploy --dry-run` lists them with where each

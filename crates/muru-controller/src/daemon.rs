@@ -465,6 +465,10 @@ struct RolloutRun {
 /// over.
 const SIGNAL_WINDOW: Duration = Duration::from_secs(4);
 
+/// Section 7.9: how often a host is told its surge allowances again when
+/// they have not changed, in case a message was lost with a connection.
+const SURGE_RETELL: Duration = Duration::from_secs(30);
+
 /// How long `muructl logs reopen` waits for the edge and the relays to say
 /// they have reopened their files before it answers anyway.
 const REOPEN_WAIT: Duration = Duration::from_secs(5);
@@ -1199,6 +1203,8 @@ pub struct LiveRelease {
     /// For a retained release, when it is stopped, in Unix milliseconds;
     /// otherwise 0.
     pub retained_until_unix_ms: u64,
+    /// Each group's surge allowance as last granted (section 7.9).
+    pub surge: BTreeMap<String, crate::budget::Surge>,
 }
 
 /// What each release's entrypoints run as (section 6.7): the interface
@@ -1447,6 +1453,11 @@ struct Running {
     /// The voluntary swaps waiting their turn in the host, by group
     /// (section 7.8).
     swaps_waiting: BTreeMap<String, u32>,
+    /// Section 7.9: each group's surge allowance as last granted, and
+    /// what the host was last told and when, so that it is told again
+    /// when they change and now and then besides.
+    surge: BTreeMap<String, crate::budget::Surge>,
+    surge_told: Option<(Instant, BTreeMap<String, crate::budget::Surge>)>,
     /// Section 11.1: workers the host replaced, by group and reason, and
     /// workers that exited, likewise, since the release started.
     recycles: BTreeMap<(String, String), u64>,
@@ -1539,7 +1550,14 @@ impl Running {
     /// each group at the larger of the workers it has and the count its
     /// autoscaler is bringing it to, at what a worker costs, and the
     /// host's own memory; a managed server's instances count as workers.
+    /// A group's surge allowance counts as workers held (section 7.9).
     fn usage(&self, fallback: Option<u64>) -> crate::budget::Usage {
+        self.usage_with(fallback, true)
+    }
+
+    /// What the release holds, with or without its surge allowances,
+    /// which are granted over what the node holds without any.
+    fn usage_with(&self, fallback: Option<u64>, surge: bool) -> crate::budget::Usage {
         let mut usage = crate::budget::Usage::default();
 
         if matches!(self.backend, Backend::Servers(_)) {
@@ -1554,7 +1572,18 @@ impl Running {
                 count = count.max(group.scaler.desired());
             }
 
-            usage.add(count, self.worker_cost(group, fallback));
+            let cost = self.worker_cost(group, fallback);
+            usage.add(count, cost);
+
+            // Section 7.9: the room held for the group's swaps.
+
+            if surge {
+                let allowance = self
+                    .surge
+                    .get(&group.name)
+                    .map_or(0, |surge| surge.allowance);
+                usage.add_surge(allowance, cost);
+            }
         }
 
         usage.memory += self.host_pss.unwrap_or(0);
@@ -3024,6 +3053,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 daemon.sample_history(samples.as_deref()).await;
                 daemon.evaluate_conditions(samples.as_deref());
                 daemon.advance_rollouts(samples.as_deref()).await;
+                daemon.grant_surges();
                 daemon.autoscale(samples.as_deref()).await;
                 daemon.guard_memory();
                 daemon.refresh_client_lists().await;
@@ -6518,6 +6548,8 @@ impl Daemon {
                         load_ms: None,
                         memory_replacements: Vec::new(),
                         swaps_waiting: BTreeMap::new(),
+                        surge: BTreeMap::new(),
+                        surge_told: None,
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
                         signals_from: None,
@@ -6627,6 +6659,8 @@ impl Daemon {
                         load_ms: None,
                         memory_replacements: Vec::new(),
                         swaps_waiting: BTreeMap::new(),
+                        surge: BTreeMap::new(),
+                        surge_told: None,
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
                         signals_from: None,
@@ -8294,6 +8328,8 @@ impl Daemon {
                 load_ms: None,
                 memory_replacements: Vec::new(),
                 swaps_waiting: BTreeMap::new(),
+                surge: BTreeMap::new(),
+                surge_told: None,
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
                 signals_from: None,
@@ -8588,6 +8624,8 @@ impl Daemon {
                 load_ms: None,
                 memory_replacements: Vec::new(),
                 swaps_waiting: BTreeMap::new(),
+                surge: BTreeMap::new(),
+                surge_told: None,
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
                 signals_from: None,
@@ -11508,6 +11546,113 @@ impl Daemon {
         used
     }
 
+    /// Section 7.9: grant each group of each release with a host its
+    /// surge allowance, from nothing, over what the node holds without
+    /// any, and tell each host its own when they change. A release with
+    /// no share of traffic has none.
+    fn grant_surges(&mut self) {
+        let budget = self.budget();
+        let fallback = self.node_mean_pss();
+        let routes = self.effective().0;
+        let rollouts = self.store.rollouts(None).unwrap_or_default();
+        let priorities: HashMap<String, i32> = self
+            .store
+            .apps()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|app| (app.name, app.priority))
+            .collect();
+        let mut used = crate::budget::Usage::default();
+        let mut asks = Vec::new();
+
+        for ((app, id), running) in &self.running {
+            used.add_usage(&running.usage_with(fallback, false));
+
+            if running.backend.host().is_none() {
+                continue;
+            }
+
+            let traffic = running.retained_until.is_none()
+                && !running.held
+                && self.traffic_share(app, id, &routes, &rollouts) > 0;
+
+            for group in &running.scalers {
+                asks.push(crate::budget::SurgeAsk {
+                    key: (app.clone(), id.clone(), group.name.clone()),
+                    priority: priorities.get(app).copied().unwrap_or(0),
+                    max_surge: group.max_surge,
+                    cost: running.worker_cost(group, fallback),
+                    traffic,
+                });
+            }
+        }
+
+        for starting in self.starting.values() {
+            used.memory += starting.reserved;
+        }
+
+        let mut granted: HashMap<(String, String), BTreeMap<String, crate::budget::Surge>> =
+            HashMap::new();
+
+        for ((app, id, group), surge) in crate::budget::grant_surges(&budget, used, asks) {
+            granted.entry((app, id)).or_default().insert(group, surge);
+        }
+
+        // The host keeps what it was last told while the daemon is away,
+        // so it is told at once of a change, and again now and then in
+        // case a message was lost with a connection.
+
+        let now = Instant::now();
+        let mut tell = Vec::new();
+
+        for (key, running) in &mut self.running {
+            running.surge = granted.remove(key).unwrap_or_default();
+
+            if running.control.is_none() || running.surge.is_empty() {
+                continue;
+            }
+
+            let stale = running.surge_told.as_ref().is_none_or(|(at, told)| {
+                *told != running.surge || now.saturating_duration_since(*at) >= SURGE_RETELL
+            });
+
+            if stale {
+                running.surge_told = Some((now, running.surge.clone()));
+                tell.push(key.clone());
+            }
+        }
+
+        for key in tell {
+            let Some(running) = self.running.get(&key) else {
+                continue;
+            };
+            let Some(control) = running.control.as_ref() else {
+                continue;
+            };
+            let groups: serde_json::Map<String, serde_json::Value> = running
+                .surge
+                .iter()
+                .map(|(group, surge)| {
+                    (
+                        group.clone(),
+                        serde_json::json!({
+                            "allowance": surge.allowance,
+                            "short": surge.short.map_or("", crate::budget::Short::as_str),
+                        }),
+                    )
+                })
+                .collect();
+
+            self.last_request += 1;
+            control.request(
+                self.last_request,
+                "surge",
+                None,
+                &serde_json::json!({ "groups": groups }),
+            );
+        }
+    }
+
     /// Section 7.4: the node's budget and what its releases hold, for the
     /// checks before a release starts and on schedules.
     fn budget_view(&self, used: crate::budget::Usage) -> crate::budget::View {
@@ -13010,6 +13155,7 @@ impl Daemon {
                         announced: running.announced,
                         workers: running.workers.clone(),
                         retained_until_unix_ms: running.retained_until_unix_ms,
+                        surge: running.surge.clone(),
                     },
                 )
             })
@@ -14407,6 +14553,7 @@ fn scalers_for(
     // Issue 384: a worker of a group with a hard limit counts at it.
 
     for scaling in &mut scalers {
+        scaling.max_surge = spec.group_swap(&scaling.name).0;
         scaling.hard_limit = spec
             .groups
             .iter()

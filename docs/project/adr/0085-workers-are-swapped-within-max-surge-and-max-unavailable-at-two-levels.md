@@ -206,6 +206,25 @@ decisions above.
   traffic, so that its `worker.swap_waiting` can say so with the daemon
   away.
 
+- **No traffic means no allowance, with or without a budget.** Issue
+  960 says both that a release with no share of traffic gets none
+  whatever its `max_surge`, and that with no budget the allowance is the
+  group's `max_surge`. The first is applied first: a held or retained
+  release swaps drain first on every node, so that one rule says how
+  such a release behaves. Its swaps go drain first whatever its
+  `max_unavailable`, since nobody is served by the worker that stops,
+  and a held release with the default `max_unavailable = 0` would
+  otherwise never recycle.
+
+- **`muructl run` and `muructl serve` grant nothing.** Their groups
+  have their `max_surge`. A serve's container limit is watched by the
+  memory guard, which stops a worker first when memory is short.
+
+- **A release start does not wait for the allowances.** It is checked
+  against what was held the second before, allowances included, and
+  the allowances are then granted again from nothing over what the new
+  release holds, so they give way to it within a second.
+
 - **A surge under way is not stopped** when its allowance is withdrawn.
   It ends on its own in the time a worker takes to start and another to
   drain.

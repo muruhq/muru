@@ -1383,6 +1383,9 @@ pub struct GroupScaling {
     /// The last scale-out the budget held back: the count asked for, the
     /// count given and the limit, so each is one event.
     pub denied: Option<(u32, u32, crate::budget::Limit)>,
+    /// The group's `max_surge` (section 7.8): the most its surge
+    /// allowance can be.
+    pub max_surge: u32,
 }
 
 /// What one second's observation of a group comes to.
@@ -1423,6 +1426,7 @@ impl GroupScaling {
             memory_limit,
             hard_limit: None,
             denied: None,
+            max_surge: muru_config::DEFAULT_MAX_SURGE,
         }
     }
 
