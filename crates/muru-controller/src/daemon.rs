@@ -14339,6 +14339,7 @@ impl Daemon {
                 group,
                 reason,
                 time_unix_ms,
+                number,
                 ..
             } => {
                 let level = match level.as_str() {
@@ -14347,6 +14348,52 @@ impl Daemon {
                     "notice" => "notice",
                     _ => "info",
                 };
+
+                // Section 11.5: the event is recorded, one the host held
+                // with the time it happened. A host that numbers its
+                // events (issue 982) is told once each is recorded, and
+                // sends again what it was not told of, to this daemon or
+                // the next, so one recorded already is acknowledged
+                // again and neither recorded nor counted twice.
+
+                let new = match number {
+                    Some(number) => {
+                        let recorded = self.events.emit_from_host(&crate::store::HostEvent {
+                            app,
+                            release: id,
+                            number,
+                            kind: &kind,
+                            level,
+                            message: &message,
+                            happened_unix_ms: time_unix_ms,
+                        });
+
+                        if recorded.is_some()
+                            && let Some(control) = self
+                                .running
+                                .get(&key)
+                                .and_then(|running| running.control.as_ref())
+                        {
+                            control.recorded(number.seq);
+                        }
+
+                        recorded.unwrap_or(false)
+                    }
+                    None => {
+                        self.events.emit_at(
+                            &kind,
+                            &format!("{app}@{id}"),
+                            level,
+                            &message,
+                            time_unix_ms,
+                        );
+                        true
+                    }
+                };
+
+                if !new {
+                    return;
+                }
 
                 // Section 11.1: a replaced worker and an exit are counted
                 // by group and reason.
@@ -14383,12 +14430,6 @@ impl Daemon {
                         .entry((app.to_owned(), id.to_owned()))
                         .or_default() += 1;
                 }
-
-                // Section 11.5: an event the host held while no daemon
-                // was connected is recorded with the time it happened.
-
-                self.events
-                    .emit_at(&kind, &format!("{app}@{id}"), level, &message, time_unix_ms);
             }
         }
     }

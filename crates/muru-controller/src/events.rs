@@ -47,17 +47,43 @@ impl Events {
             .store
             .append_event_at(kind, subject, level, message, time_unix_ms)
         {
-            Ok(event) => {
-                match level {
-                    "error" => tracing::error!(%subject, "{message}"),
-                    "warning" => tracing::warn!(%subject, "{message}"),
-                    _ => tracing::info!(%subject, "{message}"),
-                }
-
-                let _ = self.sender.send(event);
-            }
+            Ok(event) => self.tell(event),
             Err(error) => tracing::error!(%error, "recording an event failed"),
         }
+    }
+
+    /// Record an event a release's host raised and numbered, and tell
+    /// the watchers, unless it is recorded already (section 11.5, issue
+    /// 982). Returns whether it was new, or none when the store failed,
+    /// in which case the host is not told the event is recorded.
+    pub fn emit_from_host(&self, raised: &crate::store::HostEvent<'_>) -> Option<bool> {
+        let appended = self.store.append_host_event(raised);
+
+        match appended {
+            Ok(Some(event)) => {
+                self.tell(event);
+                Some(true)
+            }
+            Ok(None) => Some(false),
+            Err(error) => {
+                tracing::error!(%error, "recording an event failed");
+                None
+            }
+        }
+    }
+
+    /// Log an event that has been recorded and hand it to the watchers.
+    fn tell(&self, event: Event) {
+        let subject = &event.subject;
+        let message = &event.message;
+
+        match event.level {
+            "error" => tracing::error!(%subject, "{message}"),
+            "warning" => tracing::warn!(%subject, "{message}"),
+            _ => tracing::info!(%subject, "{message}"),
+        }
+
+        let _ = self.sender.send(event);
     }
 
     /// Watch for new events from now on.

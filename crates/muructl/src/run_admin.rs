@@ -79,6 +79,13 @@ impl HostLink {
         }
     }
 
+    /// Tell the host its events up to this number are recorded.
+    pub fn recorded(&self, seq: u64) {
+        if let Some(control) = &self.control {
+            control.recorded(seq);
+        }
+    }
+
     /// The host answered a request, or said why no worker was asked.
     pub fn answer(&mut self, id: u64, workers: Vec<WorkerReply>, error: String) {
         if let Some(done) = self.asked.remove(&id) {

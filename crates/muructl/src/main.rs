@@ -5521,6 +5521,10 @@ async fn run_with(
 
     let mut signalled = false;
 
+    // Issue 982: the last event recorded from the host, by its number.
+
+    let mut events_recorded = muru_controller::host::Recorded::default();
+
     let outcome = loop {
         tokio::select! {
             served = &mut serving => {
@@ -5617,7 +5621,22 @@ async fn run_with(
                             }
                         }
                     }
-                    muru_controller::host::HostMessage::Event { kind, level, message, group, reason, evidence, time_unix_ms } => {
+                    muru_controller::host::HostMessage::Event { kind, level, message, group, reason, evidence, time_unix_ms, number } => {
+                        // Issue 982: the host is told the event is
+                        // recorded, and one it sends again, to a
+                        // connection made again before it heard so, is
+                        // not recorded twice.
+
+                        if let Some(number) = number {
+                            let new = events_recorded.take(number);
+                            host_link.lock().expect("host link poisoned").recorded(number.seq);
+
+                            if !new {
+                                continue;
+                            }
+                        }
+
+
                         // The host has logged the event, and its line is
                         // the one the terminal shows; the run counts it
                         // and keeps it for muructl events, and its

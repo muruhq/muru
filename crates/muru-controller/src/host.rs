@@ -83,6 +83,11 @@ pub enum HostMessage {
         /// held while no supervisor was connected (section 11.5); none
         /// for one sent as it happened.
         time_unix_ms: Option<u64>,
+        /// Which of the host's events this is (issue 982), for the
+        /// supervisor to acknowledge once it is recorded and to tell one
+        /// sent again from one it has; none from a host that numbers
+        /// none.
+        number: Option<EventNumber>,
     },
     /// Evidence for request records that is no event of its own (issue
     /// 706): that a request past its deadline has since ended.
@@ -411,6 +416,10 @@ impl HostMessage {
                 reason: value["reason"].as_str().unwrap_or_default().to_owned(),
                 evidence: value.get("evidence").map(|_| evidence(&value)),
                 time_unix_ms: value["time_unix_ms"].as_u64(),
+                number: value["seq"].as_u64().map(|seq| EventNumber {
+                    stream: value["stream"].as_u64().unwrap_or(0),
+                    seq,
+                }),
             }),
             "capture" => Some(Self::Capture(evidence(&value))),
             "loaded" => Some(Self::Loaded {
@@ -568,6 +577,42 @@ pub fn loaded_message(outcome: &str, ms: u64, imports: Option<&serde_json::Value
     }
 
     message
+}
+
+/// Which of a host's events one is (section 11.5, issue 982): the host
+/// numbers the events it raises from 1 and names itself by a number
+/// made when it started, so the events of the host that replaces it are
+/// not taken for ones already recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventNumber {
+    /// The host that raised the event.
+    pub stream: u64,
+    /// The event's number among that host's, from 1.
+    pub seq: u64,
+}
+
+/// The last of a host's events a supervisor that keeps its events in
+/// memory has recorded, by which it tells an event sent again.
+#[derive(Debug, Default)]
+pub struct Recorded {
+    last: Option<EventNumber>,
+}
+
+impl Recorded {
+    /// Take an event's number, and say whether the event is new: not
+    /// when one of the same host with this number or a later one has
+    /// been taken.
+    pub fn take(&mut self, number: EventNumber) -> bool {
+        let seen = self
+            .last
+            .is_some_and(|last| last.stream == number.stream && last.seq >= number.seq);
+
+        if !seen {
+            self.last = Some(number);
+        }
+
+        !seen
+    }
 }
 
 /// The import report a host sends in parts (section 6.18), put back
@@ -738,6 +783,14 @@ impl HostControl {
         let _ = self
             .outgoing
             .send(format!("{{\"type\":\"applied\",\"version\":{version}}}\n"));
+    }
+
+    /// Tell the host that its events up to this number are recorded
+    /// (section 11.5, issue 982), so it holds them no longer.
+    pub fn recorded(&self, seq: u64) {
+        let _ = self
+            .outgoing
+            .send(format!("{{\"type\":\"recorded\",\"seq\":{seq}}}\n"));
     }
 
     /// Ask the host's workers something (section 11.7), one of them when

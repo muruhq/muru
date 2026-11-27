@@ -44,6 +44,10 @@ $ muructl events
     60 12:31:07 info     worker.ready         shop@r3                  worker 1 (pid 5120) is ready
 ```
 
+A host holds each event until the daemon has told it the event is
+recorded, so one raised in the moment a daemon stops is sent to the
+daemon that follows, and every event is recorded once.
+
 When a host raises more than 256 events with no daemon, the oldest are
 dropped: its log says when that begins, and a `host.events_dropped`
 warning, recorded ahead of the events it kept, says how many. The
