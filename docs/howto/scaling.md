@@ -481,8 +481,8 @@ reports      1            0/1        1.00    -             0/6        target 1-6
   diagnosis: idle
 ```
 
-`scale status` shows the application's serving release unless
-`--release` names another. When a route splits its traffic, by its own
+`scale status` shows the application's serving release, and another
+when it is named, as `muructl scale status shop@r43`. When a route splits its traffic, by its own
 policy or an [overlay](overlays.md)'s pin or split, a `traffic:` line
 below the release says its share of each such route, such as `traffic:
 none, shop-root sends 100% to r43 (overlay cutover-r43)` for a serving
