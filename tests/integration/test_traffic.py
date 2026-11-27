@@ -245,7 +245,15 @@ def test_a_preview_needs_the_releases_secret(daemon: Daemon, tmp_path: Path) -> 
     # release's secret, a release that does not exist with and without a
     # secret. Nothing says whether the release exists.
 
-    misses = ["r2", f"r2.{secret[:-1]}0", f"r2.{secret[:-1]}1", f"r2.{other}", "r9", f"r9.{secret}"]
+    # A wrong secret differs from the real one in its last digit, or its
+    # first, whatever those are (issue 966).
+
+    def other_digit(digit: str) -> str:
+        return "0" if digit != "0" else "1"
+
+    last = secret[:-1] + other_digit(secret[-1])
+    first = other_digit(secret[0]) + secret[1:]
+    misses = ["r2", f"r2.{last}", f"r2.{first}", f"r2.{other}", "r9", f"r9.{secret}"]
     by_header = {miss: answered(daemon, **{"Muru-Preview": miss}) for miss in misses}
     assert all(got == ("r1", ["ignored"], []) for got in by_header.values()), by_header
     by_cookie = {miss: answered(daemon, Cookie=f"muru_preview={miss}") for miss in misses}
