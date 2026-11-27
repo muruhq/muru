@@ -196,7 +196,7 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         assert re.search(
             r"^  installation\.json +asked for when the bundle is made$", planned, re.M
         )
-        assert re.search(r"^  events\.jsonl +\d+B$", planned, re.M)
+        assert re.search(r"^  events\.jsonl +[\d.]+K?B$", planned, re.M)
         assert re.search(r"^  config/releases/shop@r1\.json +[\d.]+KB$", planned, re.M)
         assert f"{out} has " in planned and " free." in planned
         assert list(out.iterdir()) == []
