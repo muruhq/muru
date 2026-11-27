@@ -1646,3 +1646,34 @@ def test_an_announcement_never_acknowledged_is_not_what_the_edge_has(tmp_path: P
     instance.drop_supervisor()
     assert instance.edge_routes == {0: "worker-0.sock"}
     assert not instance.announcements
+
+
+# Issue 987: a worker's socket file goes when the worker has.
+
+
+def test_a_replaced_workers_socket_file_is_removed_once_it_has_exited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, _sent, forks = swapping_host(tmp_path, monkeypatch)
+    monkeypatch.chdir(tmp_path)
+
+    for name in ("w0.sock", "w1.sock", "w0-g1.sock"):
+        Path(name).touch()
+
+    # The old worker's file stays while it finishes what it holds, and
+    # goes when it is reaped; the others are untouched.
+
+    instance.swap(states[0], "served 10 requests", "worker.recycled", "max_requests")
+    ready(instance, forks[0][1])
+    assert sorted(os.listdir()) == ["w0-g1.sock", "w0.sock", "w1.sock"]
+    exits(monkeypatch, (states[0].pid, 0))
+    instance.reap()
+    assert sorted(os.listdir()) == ["w0-g1.sock", "w1.sock"]
+
+    # A path that is the second name of another worker's socket, which
+    # the edge connects to with no supervisor, is left.
+
+    instance.aliases[1] = ("w1.sock", "w1-g1.sock")
+    exits(monkeypatch, (states[1].pid, 0))
+    instance.reap()
+    assert sorted(os.listdir()) == ["w0-g1.sock", "w1.sock"]

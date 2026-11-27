@@ -5437,7 +5437,11 @@ class Host:
                 continue
 
             spawned_at = self.spawned_at.pop(pid, 0.0)
-            self.states.pop(pid, None)
+            gone = self.states.pop(pid, None)
+
+            if gone is not None:
+                self.remove_socket(gone.path)
+
             self.worker_pipes_ended(pid)
             self.adopt_orphans(index, pid)
             if self.stopping:
@@ -5613,6 +5617,28 @@ class Host:
                 )
 
             self.restart_after[index] = time.monotonic() + RESTART_DELAY_SECONDS
+
+    def remove_socket(self, path: str) -> None:
+        """Remove the socket file of a worker that has exited (issue 987).
+
+        A worker never removes its own, and a replacement listens on a
+        path of the next generation, so the file of each worker replaced
+        would stay until the host stops. It is left when the path is in
+        use again: by a worker that listens on it, or as the second name
+        of another worker's socket, which the edge connects to.
+        """
+
+        if self.tcp_base_port is not None:
+            return
+
+        if any(state.path == path for state in self.states.values()):
+            return
+
+        if any(alias == path for alias, _path in self.aliases.values()):
+            return
+
+        with contextlib.suppress(OSError):
+            os.unlink(path)
 
     def took_oom_kill(self, status: int) -> bool:
         """Say whether a worker's exit is one of the kernel's kills for memory.

@@ -258,6 +258,13 @@ def test_recycling_under_the_daemon_moves_traffic_with_no_request_failed(
 
         load.check("recycling under the daemon")
         assert json.loads(first.get("/info").body)["pid"] != pid
+
+        # A replaced worker's socket file goes with it (issue 987): the
+        # directory holds the worker that serves and at most the one
+        # being replaced, not one for each of the workers there have been.
+
+        sockets = first.host_sockets("shop@r1")
+        wait_for(lambda: len(list(sockets.glob("worker-*.sock"))) <= 2)
         assert first.releases("shop") == [
             {"release": "shop@r1", "state": "ready", "serving": "yes"}
         ]
