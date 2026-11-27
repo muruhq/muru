@@ -149,6 +149,11 @@ With `--approve-each-step`, the rollout stops before each step after the
 first with the state `awaiting_approval` and the previous step's share
 still in force, until `rollout resume` approves it.
 
+A canary runs the candidate beside the baseline at whatever size each
+has. On a node whose budget cannot hold two full copies of the
+application, the releases are sized by hand at each approved step: see
+[upgrading in place on a host with limited memory](upgrading-in-place.md).
+
 A rollout is not part of the configuration `muructl deployment export`
 writes. `deployment export --resolve-rollouts` writes it as where it stands:
 the candidate declared beside the serving release, and the

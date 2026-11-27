@@ -453,6 +453,10 @@ first, until it is back under, and until then other releases' scale-out
 is refused. While the node is over its memory budget, retained releases
 are stopped, oldest first.
 
+When a new release at full size does not fit beside the one that
+serves, the application is upgraded a step at a time: see
+[upgrading in place on a host with limited memory](upgrading-in-place.md).
+
 A retained release counts against the budget with the workers it keeps.
 After a [rollout](rollouts.md) is rolled back or aborted, its candidate
 is kept for 10 minutes beside the release a rollback goes to, so the
