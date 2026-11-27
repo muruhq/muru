@@ -97,6 +97,18 @@ pub enum HostMessage {
         /// 7.8).
         swaps_waiting: std::collections::BTreeMap<String, u32>,
     },
+    /// How far a restart of every worker has got (section 10.14), sent
+    /// when it changes and to a supervisor that connects during one.
+    Restart {
+        /// The workers marked.
+        total: u32,
+        /// Those not yet replaced; 0 once it has finished.
+        left: u32,
+        /// When it began, in Unix milliseconds.
+        started_unix_ms: u64,
+        /// The one group it restarts; every group when empty.
+        group: String,
+    },
     /// The workers' answers to a request (section 11.7).
     Response {
         /// The request's id.
@@ -409,6 +421,12 @@ impl HostMessage {
                 part: value["part"].as_u64().unwrap_or(0) as usize,
                 parts: value["parts"].as_u64().unwrap_or(1) as usize,
                 data: value["data"].as_str().unwrap_or_default().to_owned(),
+            }),
+            "restart" => Some(Self::Restart {
+                total: value["total"].as_u64().unwrap_or(0) as u32,
+                left: value["left"].as_u64().unwrap_or(0) as u32,
+                started_unix_ms: value["started_unix_ms"].as_u64().unwrap_or(0),
+                group: value["group"].as_str().unwrap_or_default().to_owned(),
             }),
             "response" => Some(Self::Response {
                 id: value["id"].as_u64().unwrap_or(0),
@@ -3233,6 +3251,18 @@ mod tests {
 
         assert_eq!(start_time(first.id()), None);
         assert_eq!(start_time(0), None);
+    }
+
+    #[test]
+    fn a_restarts_progress_is_read() {
+        let parsed = HostMessage::parse(
+            r#"{"type":"restart","total":4,"left":3,"started_unix_ms":1700000000000,"group":"reports"}"#,
+        );
+        assert!(matches!(
+            parsed,
+            Some(HostMessage::Restart { total: 4, left: 3, started_unix_ms: 1_700_000_000_000, ref group })
+                if group == "reports"
+        ));
     }
 
     #[test]

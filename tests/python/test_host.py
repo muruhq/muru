@@ -1217,3 +1217,135 @@ def test_a_release_with_no_traffic_swaps_drain_first_whatever_its_settings(
     assert instance.routed[0] is None
     assert instance.replacing[0].stop_first
     assert waiting(sent) == []
+
+
+# Section 10.14: every worker restarted on request, through the queue.
+
+
+def ask(instance: host.Host, op: str, **args: object) -> None:
+    instance.take_request({"type": "request", "id": 9, "op": op, "args": args})
+
+
+def restart_progress(sent: list[dict[str, Any]]) -> list[tuple[object, object]]:
+    return [
+        (message["total"], message["left"]) for message in sent if message.get("type") == "restart"
+    ]
+
+
+def test_every_worker_is_restarted_in_turn_through_the_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, _states, sent, forks = swapping_host(tmp_path, monkeypatch)
+    ask(instance, "restart_all")
+
+    # Both workers are marked and the answer names them; the first is
+    # replaced at once and the second waits its turn.
+
+    response = next(message for message in sent if message.get("type") == "response")
+    assert [worker["pid"] for worker in response["workers"]] == [4000, 4001]
+    assert kinds(sent)[0] == "restart.started"
+    assert forks == [(0, 5000)]
+    assert len(instance.swaps["default"]) == 1
+    assert restart_progress(sent) == [(2, 2)]
+
+    # A second ask marks only what has started since: the replacement.
+
+    ask(instance, "restart_all")
+    assert instance.restart is not None and instance.restart.total == 3
+
+    ready(instance, 5000)
+    exits(monkeypatch, (4000, 0))
+    instance.reap()
+    instance.tick()
+    assert forks == [(0, 5000), (1, 5001)]
+    assert restart_progress(sent)[-1] == (3, 2)
+
+    ready(instance, 5001)
+    exits(monkeypatch, (4001, 0))
+    instance.reap()
+    instance.tick()
+    assert forks == [(0, 5000), (1, 5001), (0, 5002)]
+
+    ready(instance, 5002)
+    exits(monkeypatch, (5000, 0))
+    instance.reap()
+    instance.tick()
+    assert instance.restart is None
+    assert restart_progress(sent)[-1] == (3, 0)
+    finished = [message for message in sent if message.get("kind") == "restart.finished"]
+    assert finished[0]["message"] == "the 3 workers marked have each been replaced or have gone"
+    restarted = [message for message in sent if message.get("kind") == "worker.restarted"]
+    assert len(restarted) == 3 and restarted[0]["reason"] == "restart"
+    assert restarted[0]["message"] == (
+        "worker 0 (pid 4000) replaced by pid 5000: restarted on request"
+    )
+
+
+def test_a_cancelled_restart_leaves_the_workers_not_yet_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, sent, forks = swapping_host(tmp_path, monkeypatch, workers=3)
+    ask(instance, "restart_cancel")
+    assert sent[-1]["error"] == "no restart is under way"
+
+    ask(instance, "restart_all")
+    assert forks == [(0, 5000)]
+    ask(instance, "restart_cancel")
+
+    # The replacement under way is finished; the two that waited stay,
+    # and are no longer queued.
+
+    assert [worker["pid"] for worker in sent[-1]["workers"]] == [4001, 4002]
+    assert not instance.swaps["default"]
+    assert not states[1].queued and not states[2].queued
+    assert instance.restart is not None
+
+    ready(instance, 5000)
+    exits(monkeypatch, (4000, 0))
+    instance.reap()
+    instance.tick()
+    assert instance.restart is None
+    assert forks == [(0, 5000)]
+    finished = next(message for message in sent if message.get("kind") == "restart.finished")
+    assert finished["reason"] == "cancelled"
+    assert finished["message"] == (
+        "cancelled: 1 of the 3 marked workers were replaced or have gone, and 2 stay as they were"
+    )
+
+
+def test_a_restart_of_one_group_marks_only_its_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    reports = host.Group("reports", 1, 1, 1, 1)
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1, groups=[reports])
+    sent: list[dict[str, Any]] = []
+    instance.control_listener = object()  # type: ignore[assignment]
+    instance.send_to_supervisor = sent.append  # type: ignore[method-assign]
+    instance.spawn = lambda index, replacing=False: 5000 + index  # type: ignore[method-assign]
+
+    for index in range(2):
+        state = host.WorkerState(index, 4000 + index, 0, f"w{index}.sock", time.monotonic(), -1)
+        state.ready = True
+        instance.states[state.pid] = state
+        instance.workers[state.pid] = index
+        instance.routed[index] = state.path
+
+    ask(instance, "restart_all", group="nosuch")
+    assert sent[-1]["error"] == "no worker group nosuch"
+
+    ask(instance, "restart_all", group="reports")
+    assert sent[-1]["workers"] == [{"index": 0, "group": "reports", "pid": 4001, "ok": True}]
+    assert list(instance.replacing) == [1]
+    started = next(message for message in sent if message.get("kind") == "restart.started")
+    assert started["group"] == "reports"
+    assert started["message"] == (
+        "1 worker of the group reports started before now is to be replaced, each in its turn"
+    )
+
+    # A supervisor that connects meanwhile is told how far it has got.
+
+    assert instance.restart is not None
+    instance.restart.told = None
+    instance.tell_restart()
+    assert sent[-1]["type"] == "restart" and (sent[-1]["total"], sent[-1]["left"]) == (1, 1)

@@ -5824,8 +5824,8 @@ pub enum ScaleCommand {
     },
 }
 
-/// What `restart` takes: one worker of a release, by index or pid, or
-/// every worker in turn, gracefully or at once.
+/// What `restart` takes: one worker of a release, by index or pid,
+/// gracefully or at once, or every worker in turn.
 #[derive(Args)]
 pub struct RestartArgs {
     /// The release as app@release, or an application for its current
@@ -5844,18 +5844,26 @@ pub struct RestartArgs {
     #[arg(long, value_name = "PID", conflicts_with = "all")]
     pid: Option<u32>,
 
-    /// Every worker of the release, one at a time so capacity holds.
-    #[arg(long, required_unless_present_any = ["worker", "pid"])]
+    /// Every worker of the release, each in its turn: as many at once
+    /// as the max_surge and max_unavailable of its group allow, one at a
+    /// time by default, so capacity holds. The release's host takes the
+    /// turns, so the restart carries on if the daemon is stopped.
+    #[arg(long, required_unless_present_any = ["worker", "pid", "group", "cancel"])]
     all: bool,
 
-    /// With --all, the workers of one group only.
-    #[arg(long, value_name = "NAME", requires = "all")]
+    /// Every worker of one worker group, each in its turn.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["worker", "pid"])]
     group: Option<String>,
+
+    /// End a restart of every worker that is under way: the workers not
+    /// yet replaced stay as they are.
+    #[arg(long, conflicts_with_all = ["worker", "pid", "all", "group", "force", "no_wait"])]
+    cancel: bool,
 
     /// Take the worker out of routing and kill it at once, its stacks
     /// written to the log; the requests it is serving fail, and a
-    /// debugger session in it ends.
-    #[arg(long)]
+    /// debugger session in it ends. For one worker.
+    #[arg(long, conflicts_with_all = ["all", "group"])]
     force: bool,
 
     /// Return once the restart is under way, without waiting for the
@@ -5880,6 +5888,10 @@ const RESTART_POLL: Duration = Duration::from_millis(250);
 
 /// Replace one worker of a release, or each in turn, with a fresh one.
 pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
+    if args.cancel || args.all || args.group.is_some() {
+        return restart_release(args).await;
+    }
+
     let status = ask(
         &args.socket,
         args.target.as_deref().unwrap_or_default(),
@@ -5917,13 +5929,7 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
         None => status.release.clone(),
     };
 
-    let chosen: Vec<(WorkerName, u32)> = if args.all {
-        serving
-            .iter()
-            .filter(|(_, _, group)| args.group.as_ref().is_none_or(|wanted| wanted == group))
-            .map(|(name, pid, _)| (name.clone(), *pid))
-            .collect()
-    } else if let Some(pid) = args.pid {
+    let chosen: Vec<(WorkerName, u32)> = if let Some(pid) = args.pid {
         serving
             .iter()
             .find(|(_, candidate, _)| *candidate == pid)
@@ -5933,22 +5939,13 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
         let wanted = args
             .worker
             .as_ref()
-            .expect("clap requires --worker, --pid or --all");
+            .expect("clap requires --worker or --pid without --all");
         serving
             .iter()
             .find(|(name, _, _)| name == wanted)
             .map(|(name, pid, _)| vec![(name.clone(), *pid)])
             .ok_or_else(|| anyhow::anyhow!("{release} has no serving worker {wanted}"))?
     };
-
-    if chosen.is_empty() {
-        let group = args
-            .group
-            .as_ref()
-            .map(|group| format!(" in group {group}"))
-            .unwrap_or_default();
-        anyhow::bail!("{release} has no serving worker{group}");
-    }
 
     // With --json, one object for each worker replaced, printed together
     // at the end.
@@ -6011,6 +6008,108 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// `restart --all`, `--group` and `--cancel`: every worker of a release,
+/// or of one group, replaced in turn by one call of the admin API, which
+/// the release's host carries out, or such a restart cancelled.
+async fn restart_release(args: RestartArgs) -> anyhow::Result<()> {
+    let target = args.target.as_deref().unwrap_or_default();
+
+    let (app, release) = match target {
+        "" => ("", ""),
+        target => split_target(target)?,
+    };
+
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
+
+    if args.cancel {
+        let answer = client
+            .cancel_restart(pb::CancelRestartRequest {
+                app: app.to_owned(),
+                release: release.to_owned(),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner();
+
+        if args.output.json {
+            return print_answer(&answer);
+        }
+
+        println!(
+            "muru: the restart of {} is cancelled: {} left as {} {}",
+            release_name(&answer.app, &answer.release),
+            counted(answer.workers.len(), "worker", "workers"),
+            if answer.workers.len() == 1 {
+                "it"
+            } else {
+                "they"
+            },
+            if answer.workers.len() == 1 {
+                "was"
+            } else {
+                "were"
+            },
+        );
+        return Ok(());
+    }
+
+    let answer = client
+        .restart_release(pb::RestartReleaseRequest {
+            app: app.to_owned(),
+            release: release.to_owned(),
+            group: args.group.clone().unwrap_or_default(),
+            wait: !args.no_wait,
+            wait_timeout_ms: 0,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+    let name = release_name(&answer.app, &answer.release);
+    let scope = args
+        .group
+        .as_ref()
+        .map(|group| format!(" of the group {group}"))
+        .unwrap_or_default();
+
+    if answer.workers.is_empty() {
+        anyhow::bail!("{name} has no worker{scope} to restart");
+    }
+
+    if args.output.json {
+        print_answer(&answer)?;
+    } else {
+        println!(
+            "muru: {}{scope} of {name} marked to be replaced, each in its turn",
+            counted(answer.workers.len(), "worker", "workers"),
+        );
+    }
+
+    match (&answer.restart, args.no_wait) {
+        (Some(restart), false) => anyhow::bail!(
+            "the restart of {name} is still under way: {} of {} left; muructl release show \
+             says how far it has got, and muructl restart --cancel ends it",
+            counted(restart.left as usize, "worker", "workers"),
+            restart.total
+        ),
+        (None, false) if !args.output.json => {
+            println!("muru: the restart of {name} has finished");
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// A release as a line names it: app@release, or the release alone for
+/// the one application of a run that named none.
+fn release_name(app: &str, release: &str) -> String {
+    if app.is_empty() {
+        release.to_owned()
+    } else {
+        format!("{app}@{release}")
+    }
 }
 
 /// Wait until the worker at `index` is one other than `old_pid`, ready,
@@ -9108,6 +9207,25 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
                     release.surge_allowance,
                     &release.surge_short,
                 ),
+        ));
+    }
+
+    // Section 10.14: a restart of every worker under way.
+
+    if let Some(restart) = &release.restart {
+        lines.push((
+            "restart".to_owned(),
+            format!(
+                "{} of {}{} still to be replaced, each in its turn; muructl restart --cancel \
+                 leaves them",
+                restart.left,
+                counted(restart.total, "worker", "workers"),
+                if restart.group.is_empty() {
+                    String::new()
+                } else {
+                    format!(" of the group {}", restart.group)
+                }
+            ),
         ));
     }
 

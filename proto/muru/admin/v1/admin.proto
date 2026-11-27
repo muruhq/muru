@@ -73,6 +73,18 @@ service Admin {
   // edge, or serve it as usual again.
   rpc SetMaintenance(SetMaintenanceRequest) returns (MaintenanceStatus);
 
+  // Replace every worker of a release, or of one of its worker groups,
+  // that was started before the call, each in its turn under the
+  // group's max_surge and max_unavailable. The release's host takes the
+  // turns, so the restart carries on while the daemon is stopped or
+  // upgrading. The call returns once the workers are marked, or with
+  // `wait` once they have all been replaced. The events restart.started,
+  // worker.restarted and restart.finished follow it.
+  rpc RestartRelease(RestartReleaseRequest) returns (RestartReleaseResponse);
+  // Clear the marks of a restart under way: the workers not yet
+  // replaced stay, and a replacement already started is finished.
+  rpc CancelRestart(CancelRestartRequest) returns (RestartReleaseResponse);
+
   // Change which requests the access log writes for a
   // period, put the changes back, or list those in force.
   rpc OverrideAccessLog(OverrideAccessLogRequest) returns (AccessLogOverrides);
@@ -1308,6 +1320,7 @@ message Release {
   uint32 max_unavailable = 44;      // workers a group may run under its count while workers are swapped
   optional uint32 surge_allowance = 45; // the default group's surge allowance as last granted: its max_surge, or fewer; absent when no host runs
   string surge_short = 46;          // what left that allowance short of max_surge: traffic, workers, memory or cpu; empty when nothing did
+  RestartStatus restart = 47;       // a restart of every worker under way, and how far it has got; absent when none is
 }
 
 // A gate a release passed: a run of a command at a point in its life.
@@ -1395,6 +1408,36 @@ message ShutdownRequest {
 }
 
 message ShutdownResponse {}
+
+// A restart of every worker of a release (RestartRelease).
+message RestartReleaseRequest {
+  string app = 1;                   // the one application of a run or a serve when empty
+  string release = 2;               // the application's serving release when empty
+  string group = 3;                 // one worker group; every group when empty
+  bool wait = 4;                    // answer once every marked worker has been replaced, or the wait is over
+  uint64 wait_timeout_ms = 5;       // how long to wait; ten minutes when 0
+}
+
+message CancelRestartRequest {
+  string app = 1;
+  string release = 2;               // the application's serving release when empty
+}
+
+// The answer to RestartRelease and CancelRestart.
+message RestartReleaseResponse {
+  string app = 1;
+  string release = 2;
+  repeated Worker workers = 3;      // the workers this call marked; for a cancel, those left as they were
+  RestartStatus restart = 4;        // the restart under way as the answer is given; absent when none is
+}
+
+// A restart of every worker under way: how far it has got.
+message RestartStatus {
+  uint32 total = 1;                 // the workers marked
+  uint32 left = 2;                  // those not yet replaced
+  uint64 started_unix_ms = 3;
+  string group = 4;                 // the one group it restarts; every group when empty
+}
 
 message DebugRequest {
   string app = 1;

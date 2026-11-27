@@ -1205,6 +1205,22 @@ pub struct LiveRelease {
     pub retained_until_unix_ms: u64,
     /// Each group's surge allowance as last granted (section 7.9).
     pub surge: BTreeMap<String, crate::budget::Surge>,
+    /// The restart of every worker under way, if one is (section 10.14).
+    pub restart: Option<RestartProgress>,
+}
+
+/// How far a restart of every worker of a release has got (section
+/// 10.14), as its host last said.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestartProgress {
+    /// The workers marked.
+    pub total: u32,
+    /// Those not yet replaced.
+    pub left: u32,
+    /// When it began, in Unix milliseconds.
+    pub started_unix_ms: u64,
+    /// The one group it restarts; every group when empty.
+    pub group: String,
 }
 
 /// What each release's entrypoints run as (section 6.7): the interface
@@ -1458,6 +1474,9 @@ struct Running {
     /// when they change and now and then besides.
     surge: BTreeMap<String, crate::budget::Surge>,
     surge_told: Option<(Instant, BTreeMap<String, crate::budget::Surge>)>,
+    /// Section 10.14: the restart of every worker its host has under
+    /// way, as the host last said how far it had got.
+    restart: Option<RestartProgress>,
     /// Section 11.1: workers the host replaced, by group and reason, and
     /// workers that exited, likewise, since the release started.
     recycles: BTreeMap<(String, String), u64>,
@@ -6550,6 +6569,7 @@ impl Daemon {
                         swaps_waiting: BTreeMap::new(),
                         surge: BTreeMap::new(),
                         surge_told: None,
+                        restart: None,
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
                         signals_from: None,
@@ -6661,6 +6681,7 @@ impl Daemon {
                         swaps_waiting: BTreeMap::new(),
                         surge: BTreeMap::new(),
                         surge_told: None,
+                        restart: None,
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
                         signals_from: None,
@@ -8330,6 +8351,7 @@ impl Daemon {
                 swaps_waiting: BTreeMap::new(),
                 surge: BTreeMap::new(),
                 surge_told: None,
+                restart: None,
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
                 signals_from: None,
@@ -8626,6 +8648,7 @@ impl Daemon {
                 swaps_waiting: BTreeMap::new(),
                 surge: BTreeMap::new(),
                 surge_told: None,
+                restart: None,
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
                 signals_from: None,
@@ -13156,6 +13179,7 @@ impl Daemon {
                         workers: running.workers.clone(),
                         retained_until_unix_ms: running.retained_until_unix_ms,
                         surge: running.surge.clone(),
+                        restart: running.restart.clone(),
                     },
                 )
             })
@@ -13430,6 +13454,24 @@ impl Daemon {
                     running.status = workers;
                     running.memory_replacements = memory_replacements;
                     running.swaps_waiting = swaps_waiting;
+                }
+            }
+            HostMessage::Restart {
+                total,
+                left,
+                started_unix_ms,
+                group,
+            } => {
+                // Section 10.14: the host holds the restart, and says how
+                // far it has got; none is under way once nothing is left.
+
+                if let Some(running) = self.running.get_mut(&key) {
+                    running.restart = (left > 0).then_some(RestartProgress {
+                        total,
+                        left,
+                        started_unix_ms,
+                        group,
+                    });
                 }
             }
             HostMessage::Response { id, workers, error } => {

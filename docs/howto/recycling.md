@@ -77,7 +77,7 @@ replaces one worker each way at the same time.
 
 A replacement that nothing is forcing waits its turn: a recycle for
 `max_requests`, `max_lifetime` or the [soft memory limit](memory.md),
-and a [restart of every worker](#restarting-a-worker-by-hand). Each
+and a [restart of every worker](#restarting-every-worker). Each
 group has a queue, taken in the order the workers came due. The next
 one starts as soon as the group is within `max_surge`, with its
 replacement started first, or else within `max_unavailable`, with the
@@ -160,17 +160,15 @@ worker of a named group (`--worker reports/1`), or by its process id:
 ```
 muructl restart shop --worker 1
 muructl restart shop@r3 --pid 48213
-muructl restart shop --all
-muructl restart shop --all --group reports
 ```
 
 The replacement is forked on a new socket, the edge routes to it, and
 only then is the old worker told to stop, so no request is lost; the
 command waits until the new worker serves and the old one has gone, and
 prints both pids (`--no-wait` returns as soon as the restart is under
-way). `--all` restarts every worker in turn, one at a time, so capacity
-holds. A worker that is frozen is recovered the same way, since the host
-acts on its own records and signals and never needs the worker to
+way). With `max_surge = 0` the old worker stops first, as it does for a
+recycle. A worker that is frozen is recovered the same way, since the
+host acts on its own records and signals and never needs the worker to
 answer; it takes about ten seconds with the default timeouts.
 
 `--force` is for a worker that must go now: it leaves routing at once,
@@ -183,6 +181,57 @@ command says so.
 ```
 muructl restart shop --worker 1 --force
 ```
+
+## Restarting every worker
+
+```console
+$ muructl restart shop --all
+muru: 4 workers of shop@r3 marked to be replaced, each in its turn
+muru: the restart of shop@r3 has finished
+$ muructl restart shop --group reports
+muru: 2 workers of the group reports of shop@r3 marked to be replaced, each in its turn
+muru: the restart of shop@r3 has finished
+```
+
+`--all` replaces every worker of the release that was running when the
+command was given, and `--group NAME` every worker of one
+[worker group](worker-groups.md). Each takes its turn among its
+group's replacements: one at a time with the default `max_surge` and
+`max_unavailable`, its replacement started first, so capacity holds
+and no request is lost, or as those settings say
+([how many at once, and in which
+order](#how-many-at-once-and-in-which-order)). Recycles that come due
+meanwhile take their turns in the same queue.
+
+The release's host takes the turns, not the command. The command
+waits until every worker has been replaced, for up to ten minutes, and
+`--no-wait` returns once the workers are marked. Either way the restart
+carries on if the command is interrupted and while the daemon is
+stopped or being upgraded. `muructl release show` says how far it has
+got:
+
+```
+restart      3 of 4 workers still to be replaced, each in its turn; muructl restart --cancel leaves them
+```
+
+`muructl restart shop --cancel` ends a restart that is under way: the
+workers not yet replaced stay as they are, and a replacement that has
+started is finished.
+
+A worker that is replaced another way meanwhile, by a recycle or after
+a crash, or that a scale-in stops, has had its restart. A worker being
+debugged is left until its session ends. Giving the command again
+while a restart is under way adds the workers started since. `--force`
+is for one worker, and is not taken with `--all` or `--group`.
+
+The events are `restart.started`, a `worker.restarted` for each worker
+and `restart.finished`, which says how many were replaced and, after a
+cancel, how many were left. In the admin API the restart is the call
+`RestartRelease`, with `CancelRestart` to end it, apart from the debug
+operations, so a client allowed to restart workers needs no other
+access to them.
+
+## What a restart does and does not do
 
 A restart resets the worker's state but loads no new code: workers fork
 from the host's already loaded interpreter, so the application is as it

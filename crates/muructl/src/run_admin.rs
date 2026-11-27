@@ -754,6 +754,16 @@ pub fn debug_source(
     })
 }
 
+/// A worker a restart marked, or left, as the admin API names it.
+fn marked_worker(reply: WorkerReply) -> pb::Worker {
+    pb::Worker {
+        index: reply.index,
+        pid: reply.pid,
+        group: reply.group,
+        ..pb::Worker::default()
+    }
+}
+
 /// Workers replaced and workers gone, by metric, application, release,
 /// group and reason, counted from the host's events. A process runs one
 /// application, so one count serves it.
@@ -832,6 +842,20 @@ pub fn set_release_load(app: &str, release: &str, ms: u64) {
         .lock()
         .expect("loads poisoned")
         .insert((app.to_owned(), release.to_owned()), ms);
+}
+
+/// The restart of every worker the host has under way, as it last said
+/// how far it had got; none when none is.
+static RESTART: Mutex<Option<pb::RestartStatus>> = Mutex::new(None);
+
+/// Note how far the host's restart of every worker has got, or that
+/// none is under way.
+pub fn set_restart(restart: Option<pb::RestartStatus>) {
+    *RESTART.lock().expect("restart poisoned") = restart;
+}
+
+fn restart_under_way() -> Option<pb::RestartStatus> {
+    RESTART.lock().expect("restart poisoned").clone()
 }
 
 /// The voluntary swaps waiting their turn in each group of the release
@@ -1964,6 +1988,7 @@ impl Admin for Service {
         request: Request<pb::DebugRequest>,
     ) -> Result<Response<pb::DebugResponse>, Status> {
         let request = request.into_inner();
+        muru_controller::api::refuse_host_request(&request.op).map_err(Status::invalid_argument)?;
         let imports = request.op == "imports";
 
         // Section 6.18: an earlier load's import report is kept too, under
@@ -2218,6 +2243,67 @@ impl Admin for Service {
         });
         let stream: EventStream = Box::pin(tokio_stream::StreamExt::chain(first, rest));
         Ok(Response::new(stream))
+    }
+
+    /// Every worker of the run's release replaced in turn by its host,
+    /// as the daemon's call does.
+    async fn restart_release(
+        &self,
+        request: Request<pb::RestartReleaseRequest>,
+    ) -> Result<Response<pb::RestartReleaseResponse>, Status> {
+        let request = request.into_inner();
+        let release = self
+            .state
+            .target(&request.app, &request.release)
+            .map_err(Status::not_found)?;
+        let marked = self
+            .state
+            .ask(
+                "restart_all",
+                None,
+                serde_json::json!({ "group": request.group }),
+            )
+            .await
+            .map_err(Status::failed_precondition)?;
+
+        if request.wait && !marked.is_empty() {
+            let deadline = tokio::time::Instant::now()
+                + muru_controller::api::restart_wait(request.wait_timeout_ms);
+
+            while restart_under_way().is_some() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+
+        Ok(Response::new(pb::RestartReleaseResponse {
+            app: self.state.app.clone(),
+            release,
+            workers: marked.into_iter().map(marked_worker).collect(),
+            restart: restart_under_way(),
+        }))
+    }
+
+    async fn cancel_restart(
+        &self,
+        request: Request<pb::CancelRestartRequest>,
+    ) -> Result<Response<pb::RestartReleaseResponse>, Status> {
+        let request = request.into_inner();
+        let release = self
+            .state
+            .target(&request.app, &request.release)
+            .map_err(Status::not_found)?;
+        let left = self
+            .state
+            .ask("restart_cancel", None, serde_json::json!({}))
+            .await
+            .map_err(Status::failed_precondition)?;
+
+        Ok(Response::new(pb::RestartReleaseResponse {
+            app: self.state.app.clone(),
+            release,
+            workers: left.into_iter().map(marked_worker).collect(),
+            restart: restart_under_way(),
+        }))
     }
 
     needs_the_daemon! {

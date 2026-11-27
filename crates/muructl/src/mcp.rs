@@ -1626,12 +1626,15 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "restart",
-            description: "Replace a release's worker (by its index within its group, as GROUP/N outside the default group) with a fresh one, gracefully or at once with force; or every worker in turn with all.",
+            description: "Replace a release's worker (by its index within its group, as GROUP/N outside the default group) with a fresh one, gracefully or at once with force; or every worker in turn with all, or every worker of one worker group with group, which the release's host carries out under the group's max_surge and max_unavailable and which waits until it has finished unless no_wait is given; cancel ends such a restart, leaving the workers not yet replaced.",
             changes: true,
             properties: json!({
                 "target": {"type": "string", "description": "app, or app@release"},
                 "worker": {"type": "string", "description": "Its index within its group, as GROUP/N outside the default group"},
                 "all": {"type": "boolean"},
+                "group": {"type": "string", "description": "Every worker of this worker group"},
+                "cancel": {"type": "boolean", "description": "End a restart of every worker that is under way"},
+                "no_wait": {"type": "boolean"},
                 "force": {"type": "boolean"},
             }),
             required: &["target"],
@@ -1639,8 +1642,14 @@ fn specs() -> Vec<Spec> {
                 let mut command =
                     [words(&["restart"]), vec![needed(arguments, "target")?]].concat();
                 command.extend(option(arguments, "worker", "--worker"));
+                command.extend(option(arguments, "group", "--group"));
 
-                for (key, name) in [("all", "--all"), ("force", "--force")] {
+                for (key, name) in [
+                    ("all", "--all"),
+                    ("cancel", "--cancel"),
+                    ("no_wait", "--no-wait"),
+                    ("force", "--force"),
+                ] {
                     if flag(arguments, key) {
                         command.push(name.to_owned());
                     }

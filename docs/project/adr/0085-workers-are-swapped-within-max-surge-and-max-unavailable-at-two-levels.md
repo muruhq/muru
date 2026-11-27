@@ -243,6 +243,16 @@ decisions above.
 - **`muructl restart --all` waits by default,** as it did, and
   `--no-wait` returns once the workers are marked.
 
+- **A worker of a restart that waits its turn raises no
+  `worker.swap_waiting`.** Taking turns is what the restart is, and
+  `restart.started` has said so; an event for each worker but the first
+  would bury the ones that matter. A wait for the node's budget is
+  still raised, since that one may never end.
+
+- **`--force` is for one worker.** `muructl restart --all --force` is
+  refused: a forced restart kills a worker without asking it to stop,
+  which a queue that exists to keep capacity has no place for.
+
 - **Doctor's finding is a warning** and does not change its exit code:
   a node with no memory limit is a way to run, and a development
   machine has none.

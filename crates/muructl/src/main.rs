@@ -2970,6 +2970,12 @@ async fn host_control(
     Option<muru_controller::host::HostControl>,
     tokio::sync::mpsc::Receiver<muru_controller::host::HostMessage>,
 ) {
+    // Section 10.14: a new host has no restart of every worker under
+    // way, whatever the last one was doing; one that has says so once
+    // connected.
+
+    run_admin::set_restart(None);
+
     match muru_controller::host::HostControl::connect(&host.control_path()).await {
         Ok((control, messages)) => (Some(control), messages),
         Err(error) => {
@@ -5610,6 +5616,14 @@ async fn run_with(
                     }
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);
+                    }
+                    muru_controller::host::HostMessage::Restart { total, left, started_unix_ms, group } => {
+                        run_admin::set_restart((left > 0).then_some(muru_proto::admin::v1::RestartStatus {
+                            total,
+                            left,
+                            started_unix_ms,
+                            group,
+                        }));
                     }
                     muru_controller::host::HostMessage::Status { workers, host_rss, memory_replacements, swaps_waiting } => {
                         run_admin::set_worker_modules(&label, &format!("r{}", current.release), &workers);

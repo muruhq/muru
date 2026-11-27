@@ -160,6 +160,11 @@ DRAIN_FIRST = "drain_first"
 
 BUDGET_LIMITS = {"workers": "worker", "memory": "memory", "cpu": "CPU"}
 
+# Section 10.14: the cause, as one word, of a worker replaced by the
+# restart of every worker on request.
+
+RESTART_CAUSE = "restart"
+
 # Section 7.7 (issue 624): the score every worker raises its own
 # /proc/self/oom_score_adj to after the fork, so the kernel picks a worker,
 # which its host replaces, before a host, the edge or another service.
@@ -1359,6 +1364,24 @@ class Swap:
 
 
 @dataclass
+class RestartAll:
+    """A restart of every worker on request, as far as it has got (section 10.14).
+
+    `pending` holds the pids marked and not yet being replaced, and
+    `under_way` those whose replacement has started and that have not
+    exited yet.
+    """
+
+    pending: set[int]
+    under_way: set[int] = field(default_factory=set)
+    total: int = 0
+    started_at: float = 0.0
+    group: str = ""
+    cancelled: int | None = None
+    told: tuple[int, int] | None = None
+
+
+@dataclass
 class Orphan:
     """A process a dead worker left behind, a child of the host now (section 6.10)."""
 
@@ -1562,6 +1585,11 @@ class Host:
         # its max_surge.
 
         self.allowances: dict[str, tuple[int, str]] = {}
+
+        # Section 10.14: the restart of every worker under way, if one is.
+        # The host holds it, so it carries on while the daemon is away.
+
+        self.restart: RestartAll | None = None
 
         # Section 7.4: indices forked by a scale-out and not yet ready, and
         # indices a scale-in emptied, to be used again by the next one.
@@ -2560,6 +2588,13 @@ class Host:
         self.send_to_supervisor(self.workers_message())
         self.send_imports()
 
+        # Section 10.14: a supervisor that connects while every worker is
+        # being restarted is told how far that has got.
+
+        if self.restart is not None:
+            self.restart.told = None
+            self.tell_restart()
+
         if self.loaded is not None:
             self.send_to_supervisor(
                 {"type": "loaded", **self.loaded, "first": not self.loaded_sent}
@@ -2993,6 +3028,14 @@ class Host:
             self.take_surge(request_id, args)
             return
 
+        if op == "restart_all":
+            self.restart_all(request_id, args)
+            return
+
+        if op == "restart_cancel":
+            self.cancel_restart(request_id)
+            return
+
         if op == "status":
             self.answer_status(request_id, wanted)
             return
@@ -3240,6 +3283,209 @@ class Host:
                 "type": "response",
                 "id": request_id,
                 "workers": [{**self.worker_fields(state.index), "pid": state.pid, "ok": True}],
+            }
+        )
+
+    # Section 10.14: every worker of the release, or of one group, is
+    # replaced on request, each in its turn in its group's queue of swaps.
+
+    def restart_all(self, request_id: int, args: dict[str, Any]) -> None:
+        """Mark every worker started before now, of every group or of one, to be replaced.
+
+        The answer names the workers marked. A restart already under way
+        takes the workers started since it began as well.
+        """
+
+        name = str(args.get("group") or "")
+        error = ""
+
+        if name and all(group.name != name for group in self.groups):
+            error = f"no worker group {name}"
+        elif self.control_listener is None:
+            error = "workers cannot be replaced without a control socket"
+
+        if error:
+            self.send_to_supervisor(
+                {"type": "response", "id": request_id, "workers": [], "error": error}
+            )
+            return
+
+        known = set() if self.restart is None else self.restart.pending | self.restart.under_way
+        marked = [
+            state
+            for state in sorted(self.states.values(), key=lambda state: state.index)
+            if not state.replaced
+            and state.pid not in known
+            and (not name or self.group_of(state.index).name == name)
+        ]
+
+        if marked:
+            if self.restart is None:
+                self.restart = RestartAll(set(), started_at=time.time(), group=name)
+
+            restart = self.restart
+            restart.pending.update(state.pid for state in marked)
+            restart.total += len(marked)
+            restart.cancelled = None
+            workers = len(marked)
+            self.emit(
+                "restart.started",
+                "notice",
+                f"{workers} worker{'' if workers == 1 else 's'} "
+                + (f"of the group {name} " if name else "")
+                + "started before now "
+                + ("is" if workers == 1 else "are")
+                + " to be replaced, each in its turn",
+                group=name or None,
+            )
+            self.advance_restart()
+
+        self.send_to_supervisor(
+            {
+                "type": "response",
+                "id": request_id,
+                "workers": [
+                    {**self.worker_fields(state.index), "pid": state.pid, "ok": True}
+                    for state in marked
+                ],
+            }
+        )
+
+    def cancel_restart(self, request_id: int) -> None:
+        """Clear the marks of a restart of every worker: those not yet replaced stay.
+
+        A replacement that has started is finished. The answer names the
+        workers left as they were.
+        """
+
+        restart = self.restart
+        left: list[WorkerState] = []
+
+        if restart is not None:
+            left = [self.states[pid] for pid in sorted(restart.pending) if pid in self.states]
+
+            # Their swaps leave the queues too.
+
+            for queue in self.swaps.values():
+                for swap in [swap for swap in queue if swap.cause == RESTART_CAUSE]:
+                    queue.remove(swap)
+
+            for state in left:
+                state.queued = False
+
+            restart.cancelled = len(left)
+            restart.pending.clear()
+            self.advance_restart()
+
+        self.send_to_supervisor(
+            {
+                "type": "response",
+                "id": request_id,
+                "workers": [
+                    {**self.worker_fields(state.index), "pid": state.pid, "ok": True}
+                    for state in left
+                ],
+                **({} if restart is not None else {"error": "no restart is under way"}),
+            }
+        )
+
+    def advance_restart(self) -> None:
+        """Move a restart of every worker along, and say when it has finished.
+
+        Each marked worker joins its group's queue of swaps once it is
+        ready. One that goes another way (a crash, a recycle, a scale-in)
+        is no longer marked, and one being debugged waits for its last
+        session to end.
+        """
+
+        restart = self.restart
+
+        if restart is None:
+            return
+
+        # The marked workers take their turns in the order of their
+        # indices, whatever order their pids come in.
+
+        def place(pid: int) -> int:
+            state = self.states.get(pid)
+            return -1 if state is None else state.index
+
+        for pid in sorted(restart.pending, key=place):
+            state = self.states.get(pid)
+
+            if state is None:
+                restart.pending.discard(pid)
+                continue
+
+            # A worker whose replacement keeps failing to start is left.
+
+            if self.start_failures.get(state.index, 0) >= MAX_START_FAILURES:
+                restart.pending.discard(pid)
+                continue
+
+            if state.ready and not state.replaced:
+                self.swap(state, "restarted on request", "worker.restarted", RESTART_CAUSE)
+
+            # Its swap may have started at once, and it may have been
+            # replaced for another reason or scaled in.
+
+            if state.replaced:
+                restart.pending.discard(pid)
+                leaving = self.replacing.get(state.index)
+
+                if leaving is not None and leaving.old_pid == pid and not leaving.retire:
+                    restart.under_way.add(pid)
+
+        restart.under_way = {pid for pid in restart.under_way if pid in self.workers}
+        self.tell_restart()
+
+        if restart.pending or restart.under_way:
+            return
+
+        self.restart = None
+        replaced = restart.total - (restart.cancelled or 0)
+        scope = f" of the group {restart.group}" if restart.group else ""
+
+        if restart.cancelled is None:
+            message = (
+                f"the {restart.total} worker{'' if restart.total == 1 else 's'}{scope} marked "
+                "have each been replaced or have gone"
+            )
+        else:
+            message = (
+                f"cancelled: {replaced} of the {restart.total} marked workers{scope} were "
+                f"replaced or have gone, and {restart.cancelled} stay as they were"
+            )
+
+        self.emit(
+            "restart.finished",
+            "notice",
+            message,
+            group=restart.group or None,
+            reason="cancelled" if restart.cancelled is not None else None,
+        )
+
+    def tell_restart(self) -> None:
+        """Tell the supervisor how far a restart of every worker has got, when that is news."""
+
+        restart = self.restart
+
+        if restart is None:
+            return
+
+        left = len(restart.pending) + len(restart.under_way)
+
+        if restart.told == (restart.total, left):
+            return
+
+        restart.told = (restart.total, left)
+        self.send_to_supervisor(
+            {
+                "type": "restart",
+                "total": restart.total,
+                "left": left,
+                "started_unix_ms": int(restart.started_at * 1000),
+                "group": restart.group,
             }
         )
 
@@ -4037,6 +4283,7 @@ class Host:
         for replacement in list(self.replacing.values()):
             self.advance(replacement, now)
 
+        self.advance_restart()
         self.run_swaps()
 
         # A profile sampled from outside is answered by its thread, so it is
@@ -4440,6 +4687,14 @@ class Host:
             return
 
         swap.waiting_for = word
+
+        # Section 10.14: the workers of a restart of every worker wait
+        # their turn by design, which restart.started has said; only a
+        # wait for the node's budget is news.
+
+        if swap.cause == RESTART_CAUSE and word != "budget":
+            return
+
         self.emit(
             "worker.swap_waiting",
             "info",
