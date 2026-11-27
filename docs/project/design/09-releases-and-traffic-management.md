@@ -92,6 +92,7 @@ Gates compare the candidate with the baseline over the same window, with a minim
 - bucket = hash(salt, key) mod 10000. Release ranges are contiguous, and the newest release grows downward from the top, so a user in the canary at 10% stays in it at 25%.
 - Hash keys: an anonymous id cookie issued by the edge (default), a named header such as a user id set by a trusted upstream proxy, an application cookie, or the client address as a last resort.
 - Strict stickiness issues a cookie recording the release, honoured while that release serves and ignored once it stops. sticky_grace bounds how long sticky users keep a draining release alive.
+- **What a sticky cookie reaches (issue 955).** The cookie is honoured only for a target the route sends to: one its policy names in `split` or `classes` (a release, or `upstream:NAME`), the application's serving release, and a release in its sticky grace, which the snapshot marks `sticky`. A cookie naming anything else the edge has, a held release, a detour the policy gives nothing or an upstream of another route, is ignored and the request is routed as usual. A preview of `upstream:NAME` is honoured under the same rule: only through a route whose policy names the upstream.
 
 ## 9.5 Draining
 

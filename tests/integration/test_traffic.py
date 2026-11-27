@@ -152,6 +152,31 @@ sticky_grace = "2s"
     assert served_by(daemon, Cookie="muru_release=r1")[0] == "r2"
 
 
+def test_a_sticky_cookie_reaches_only_what_the_policy_names(daemon: Daemon, tmp_path: Path) -> None:
+    # Issue 955: a held release takes no traffic, and naming it in the
+    # sticky cookie does not reach it until the policy gives it a share.
+
+    daemon.deploy("shop", SHOP)
+    daemon.deploy("shop", SHOP, "--hold")
+    assert states(daemon) == {"shop@r1": "ready", "shop@r2": "ready"}
+
+    applied = daemon.muructl(
+        "apply", "-f", str(policy_file(tmp_path, "[route.traffic]\nsticky = true\n"))
+    )
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert served_by(daemon, Cookie="muru_release=r2")[0] == "r1"
+    assert served_by(daemon, Cookie="muru_release=r1")[0] == "r1"
+
+    applied = daemon.muructl(
+        "apply",
+        "-f",
+        str(policy_file(tmp_path, "[route.traffic]\nsplit = { r2 = 0 }\nsticky = true\n")),
+    )
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert served_by(daemon, Cookie="muru_release=r2")[0] == "r2"
+    assert served_by(daemon)[0] == "r1"
+
+
 def test_header_and_client_keys_and_invalid_policies(daemon: Daemon, tmp_path: Path) -> None:
     daemon.deploy("shop", SHOP)
     daemon.deploy("shop", SHOP)

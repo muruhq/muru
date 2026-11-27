@@ -630,6 +630,17 @@ def test_a_traffic_share_goes_to_an_upstream(site: Fixture) -> None:
     previewed = call(site.daemon.port, "/half/", {"Cookie": "muru_preview=upstream:legacy"})
     assert report(previewed)["upstream"] == "legacy"
 
+    # Issue 955: neither cookie reaches an upstream the route's policy
+    # does not name, whether the route has a policy or none.
+
+    seen = report(call(site.daemon.port, "/split/", {"Cookie": "muru_release=upstream:socket"}))
+    assert seen["upstream"] == "legacy"
+    seen = report(call(site.daemon.port, "/half/", {"Cookie": "muru_preview=upstream:socket"}))
+    assert seen.get("upstream") != "socket", seen
+    cookies = "muru_preview=upstream:legacy; muru_release=upstream:legacy"
+    seen = report(call(site.daemon.port, "/", {"Cookie": cookies}))
+    assert "upstream" not in seen, seen
+
     # Half the buckets go to the upstream, the rest to the release.
 
     targets = set()

@@ -9068,6 +9068,7 @@ impl Daemon {
                 apps.push(pb::AppWorkers {
                     preview_secret: String::new(),
                     detour_paths: Vec::new(),
+                    sticky: running.sticky_until.is_some(),
                     limits: spec.as_ref().and_then(|spec| spec.limits.message()),
                     app: name.clone(),
                     release: id.clone(),

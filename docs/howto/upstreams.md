@@ -163,7 +163,8 @@ fallback = { upstream = 'legacy' }
 A route to an application can give an upstream a share of its requests,
 named `upstream:NAME` in the policy's `split`, with the bucketing,
 stickiness and preview of the [traffic guide](traffic.md). The sticky
-and preview cookies name it the same way:
+and preview cookies name it the same way, and reach it only through a
+route whose policy names it:
 
 ```toml
 [[route]]

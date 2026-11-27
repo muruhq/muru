@@ -537,10 +537,16 @@ impl Policy {
         (hash % u64::from(BUCKETS)) as u32
     }
 
-    /// Whether the policy gives a release traffic, by a share or a client
-    /// class.
-    fn names(&self, release: &str) -> bool {
-        let named = |target: &Target| *target == Target::Release(release.to_owned());
+    /// Whether the policy gives a target traffic, by a share or a client
+    /// class. The target is named as a cookie names it: a release id, or
+    /// `upstream:NAME`.
+    fn names(&self, label: &str) -> bool {
+        let wanted = match label.strip_prefix(UPSTREAM_PREFIX) {
+            Some(upstream) => Target::Upstream(upstream.to_owned()),
+            None => Target::Release(label.to_owned()),
+        };
+
+        let named = |target: &Target| *target == wanted;
 
         self.shares.iter().any(|(target, _, _)| named(target)) || self.classes.values().any(named)
     }
@@ -608,6 +614,13 @@ impl Chosen<'_> {
     /// Whether what was chosen is a detour (section 4.21).
     fn is_detour(&self) -> bool {
         matches!(self, Self::Pools(pools) if pools.is_detour())
+    }
+
+    /// Whether a sticky cookie reaches what was chosen though the route's
+    /// policy does not name it: the application's serving release, or a
+    /// release kept for its sticky clients (section 9.4).
+    fn holds_sticky(&self, app: &AppReleases) -> bool {
+        matches!(self, Self::Pools(pools) if pools.sticky || Arc::ptr_eq(pools, &app.serving))
     }
 
     fn label(&self) -> String {
@@ -683,9 +696,12 @@ fn detour_form(value: &str) -> bool {
 
 /// The release a preview names, as section 4.21 has it: a detour only by
 /// its release and secret together, anything else by its name as before.
+/// An upstream is previewed only through a route whose policy names it
+/// (issue 955), so a preview reaches nothing the route does not send to.
 fn previewed<'a>(
     name: &str,
     app: &'a AppReleases,
+    policy: Option<&Policy>,
     upstreams: &HashMap<String, Arc<Upstream>>,
 ) -> Option<Chosen<'a>> {
     if detour_form(name) {
@@ -695,6 +711,10 @@ fn previewed<'a>(
             .get(release)
             .filter(|pools| pools.previewed_by(secret))
             .map(Chosen::Pools);
+    }
+
+    if name.starts_with(UPSTREAM_PREFIX) && !policy.is_some_and(|policy| policy.names(name)) {
+        return None;
     }
 
     Chosen::named(name, app, upstreams).filter(|chosen| !chosen.is_detour())
@@ -767,7 +787,7 @@ fn choose<'a>(
 
     if let Some(chosen) = preview
         .as_deref()
-        .and_then(|name| previewed(name, app, upstreams))
+        .and_then(|name| previewed(name, app, policy, upstreams))
     {
         return chosen;
     }
@@ -794,13 +814,16 @@ fn choose<'a>(
         return chosen;
     }
 
-    // A sticky cookie reaches a detour only while the policy gives it
-    // traffic, so one cannot be made to reach it without the secret.
+    // A sticky cookie holds only for what the route sends to (issue 955):
+    // a target its policy names, the serving release, and a release kept
+    // for its sticky clients. A held release, a detour the policy gives
+    // nothing and another route's upstream cannot be reached by naming
+    // them in it.
 
     if policy.sticky
         && let Some(chosen) = cookie(client.headers, STICKY_COOKIE).and_then(|name| {
             Chosen::named(&name, app, upstreams)
-                .filter(|chosen| !chosen.is_detour() || policy.names(&name))
+                .filter(|chosen| policy.names(&name) || chosen.holds_sticky(app))
         })
     {
         return chosen;
@@ -893,6 +916,9 @@ pub struct AppPools {
     /// Section 4.21 (issue 909): the client URL paths a detour takes
     /// requests under; every path when empty.
     detour_paths: Arc<[String]>,
+    /// Section 9.4: replaced, and kept for the clients whose sticky
+    /// cookie names it.
+    sticky: bool,
 }
 
 /// A path that selects a worker group (section 7.1).
@@ -1059,6 +1085,7 @@ impl AppPools {
             limits: crate::RequestLimits::default(),
             preview_secret: None,
             detour_paths: Arc::default(),
+            sticky: false,
         })
     }
 
@@ -1079,6 +1106,7 @@ impl AppPools {
             limits: crate::RequestLimits::default(),
             preview_secret: None,
             detour_paths: Arc::default(),
+            sticky: false,
         }
     }
 
@@ -1113,6 +1141,13 @@ impl AppPools {
     /// (section 4.21).
     pub fn with_preview_secret(mut self, secret: &str) -> Self {
         self.preview_secret = (!secret.is_empty()).then(|| Arc::from(secret));
+        self
+    }
+
+    /// The same release, replaced and kept for the clients whose sticky
+    /// cookie names it (section 9.4).
+    pub fn with_sticky(mut self, sticky: bool) -> Self {
+        self.sticky = sticky;
         self
     }
 
@@ -1698,6 +1733,7 @@ impl Routing {
             .with_limits(crate::RequestLimits::from_message(app.limits.as_ref()))
             .with_waking(&app.waking_groups)
             .with_grpc_web(&app.grpc_web_origins)
+            .with_sticky(app.sticky)
             .with_static_dirs(static_paths_of(app)?);
 
             // Section 9.9: a managed HTTP release's instances stand in
@@ -3759,6 +3795,94 @@ mod tests {
             None,
         ));
         assert_eq!(first, again);
+    }
+
+    #[test]
+    fn cookies_reach_only_what_the_routes_policy_names() {
+        // Issue 955: r3 is held, r4 was replaced and is kept for its
+        // sticky clients, and the node has an upstream the route's
+        // policy does not name beside one it does.
+
+        let mut snapshot = split_snapshot(true, "header:x-user");
+        let release = |release: &str, sticky: bool| pb::AppWorkers {
+            app: "shop".to_owned(),
+            release: release.to_owned(),
+            sticky,
+            ..Default::default()
+        };
+        snapshot.apps.push(release("r3", false));
+        snapshot.apps.push(release("r4", true));
+        let upstream = |name: &str| pb::Upstream {
+            name: name.to_owned(),
+            addresses: vec!["127.0.0.1:9".to_owned()],
+            ..Default::default()
+        };
+        snapshot.upstreams = vec![upstream("legacy"), upstream("internal")];
+        snapshot.routes[0]
+            .traffic
+            .as_mut()
+            .unwrap()
+            .shares
+            .push(pb::Share {
+                release: String::new(),
+                weight: 0,
+                upstream: "legacy".to_owned(),
+            });
+        let ids = crate::errors::RequestIds::new();
+        let served = |snapshot: &pb::Snapshot, name: &str, value: &str| {
+            let routing = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(Routing::from_snapshot(snapshot, None))
+                .unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("x-user", "alice".parse().unwrap());
+            headers.insert(
+                http::header::COOKIE,
+                format!("{name}={value}").parse().unwrap(),
+            );
+
+            match routing.select(
+                Some("shop.example.com"),
+                "/",
+                "127.0.0.1:8080",
+                true,
+                &client(&headers, &ids),
+                None,
+            ) {
+                Decision::Serve { selection, .. } => match &selection.upstream {
+                    Some(upstream) => format!("{UPSTREAM_PREFIX}{}", upstream.name()),
+                    None => selection.release,
+                },
+                _ => panic!("not served"),
+            }
+        };
+        let usual = served(&snapshot, "other", "x");
+
+        // The sticky cookie holds for what the policy shares to, the
+        // serving release and a release kept for its sticky clients.
+
+        for name in ["r1", "r2", "r4", "upstream:legacy"] {
+            assert_eq!(served(&snapshot, STICKY_COOKIE, name), name);
+        }
+
+        // It does not reach a held release, or an upstream of another
+        // route, and nor does a preview reach that upstream.
+
+        assert_eq!(served(&snapshot, STICKY_COOKIE, "r3"), usual);
+        assert_eq!(served(&snapshot, STICKY_COOKIE, "upstream:internal"), usual);
+        assert_eq!(
+            served(&snapshot, PREVIEW_COOKIE, "upstream:internal"),
+            usual
+        );
+        assert_eq!(
+            served(&snapshot, PREVIEW_COOKIE, "upstream:legacy"),
+            "upstream:legacy"
+        );
+
+        // A route with no policy previews no upstream at all.
+
+        snapshot.routes[0].traffic = None;
+        assert_eq!(served(&snapshot, PREVIEW_COOKIE, "upstream:legacy"), "r1");
     }
 
     #[test]

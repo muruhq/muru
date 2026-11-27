@@ -107,7 +107,8 @@ order, and the first that applies wins:
    class.
 
 3. **A sticky cookie.** With `sticky = true`, a `muru_release` cookie
-   naming a release the route still has sends the client back to it.
+   naming the serving release, a release the policy names or one in its
+   sticky grace sends the client back to it.
 
 4. **The split.** The client's key, the anonymous id cookie the edge
    issues unless the policy names a header, a cookie or the client's

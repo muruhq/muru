@@ -44,7 +44,8 @@ release (a route with a `name` goes by it), and `muructl scale status` the same 
 
 A share can go to an [HTTP upstream](upstreams.md) instead of a release,
 named `upstream:NAME` in `split`. Its buckets sit below the releases'
-ranges, and the sticky and preview cookies name it the same way.
+ranges, and the sticky and preview cookies name it the same way. Either
+cookie reaches an upstream only through a route whose policy names it.
 
 ## The key
 
@@ -76,9 +77,11 @@ sticky_grace = "10m"
 
 With `sticky = true` the edge sets a `muru_release` cookie naming the
 release a client was given, and honours it on later requests as long as
-that release serves the route. The cookie is ignored once the release
-stops, and a cookie naming a release the route does not know is ignored
-too.
+that release serves the route: it is the serving release, or one the
+policy names in `split` or `classes`. The cookie is ignored once the
+release stops, and a cookie naming anything else is ignored too, a
+release deployed with `--hold` and an upstream the policy does not name
+among them.
 
 When a sticky release leaves the route, because the policy no longer
 names it or a deploy supersedes it, it stays reachable through the cookie
