@@ -149,6 +149,10 @@ With `--approve-each-step`, the rollout stops before each step after the
 first with the state `awaiting_approval` and the previous step's share
 still in force, until `rollout resume` approves it.
 
+A rollout runs two releases at once. An application that can run only
+one copy is deployed by hand instead: see [a worker that needs a
+resource to itself](exclusive-workers.md).
+
 A canary runs the candidate beside the baseline at whatever size each
 has. On a node whose budget cannot hold two full copies of the
 application, the releases are sized by hand at each approved step: see

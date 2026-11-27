@@ -65,7 +65,7 @@ leaves routing, finishes its requests and exits, and only then is its
 replacement started. The group is one worker under its count
 meanwhile, and never over it. This is the setting for a host with no
 memory to spare for an extra worker, and for an application whose
-worker needs a resource to itself. A group of
+worker [needs a resource to itself](exclusive-workers.md). A group of
 one worker then has none for the moment of each replacement: its
 requests wait at the edge, and are answered once the new worker is
 ready, or with 503 at the [queue timeout](timeouts.md).
