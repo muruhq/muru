@@ -419,3 +419,14 @@ A canary on a host sized for one copy of an application shares one total of work
 - Every group of both releases is sized by the release's share of traffic, each side with a share keeping one ready worker in each group, and the candidate's first worker is one over the total until its share earns a whole worker.
 - A step is not finished until the baseline is down to its count, bounded by the drain grace; a rollback does not wait.
 - Managed HTTP server releases are refused until their instances scale (issue 175).
+
+How it is built is recorded in ADR 0087:
+
+- **`muructl rollout canary --capacity shared`** asks for it (`StartRolloutRequest.capacity`; `own`, the default, runs each release at its own size). The rollout's record carries the sharing (`SharedCapacity`): the totals by group, the counts each release is pinned to, and the phase of the step.
+- **The counts** are `shared::sizes`: the candidate has `floor(total * percent / 100)` workers, the baseline the rest, each at least 1 while it has a share.
+- **A step puts its workers in place before its traffic moves** (`Daemon::size_rollout`, each second). While it does, the step before's share is in force (`Rollout::percent` with `sizing`), and the gates judge nothing. For each group `shared::plan` says what to do: grow the candidate by what fits the budget, measured over what the releases hold without the room held for swaps (section 7.9); with no room, pin the baseline down by its `max_unavailable` workers, wait for them to exit and let the candidate take the room; with `max_unavailable = 0`, wait; and with the baseline at the step's count and still no room, go on short. When every group is ready the traffic moves, the step's hold starts, and the baseline is pinned to its counts.
+- **A step ends when its hold has passed, its gates are satisfied and the workers the baseline gave up have exited:** the host's `worker.exited` events with the reason `scaled_in` are counted, for no longer than the release's stop budget and five seconds.
+- **The last step passing** grows the candidate to the whole total with the last share in force (`finishing`), and promotes it once those workers are ready. `muructl rollout promote` grows it as far as the budget has room and promotes at once.
+- **A rollback** pins the baseline up toward the total as far as the budget has room, moves the traffic and drains the candidate, without waiting.
+- **The pins are the rollout's own,** kept as an operator's are so that a restarted daemon restores them; `muructl scale` is refused for the two releases meanwhile, and every pin is lifted when the rollout ends, so the release that serves is sized by its count or policy (section 7.10).
+- **Events:** `rollout.capacity` for each move of workers, a warning when the candidate goes on short of its share.

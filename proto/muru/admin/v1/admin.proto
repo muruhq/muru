@@ -1084,6 +1084,7 @@ message StartRolloutRequest {
   uint64 max_worker_faults = 10;    // a gate: the candidate's worker crashes and timeout kills over the step
   uint64 max_queue_wait_p95_ms = 11; // a gate: the candidate's p95 wait for a worker thread; none when 0
   repeated string probes = 12;      // a gate: http or https URLs requested through the edge from each release by preview
+  string capacity = 13;             // own (the default, when empty): each release runs at its own size; shared: the two share the baseline's worker count, each sized by its share of the traffic
 }
 
 message RolloutStep {
@@ -1111,6 +1112,11 @@ message Rollout {
   uint64 max_worker_faults = 17;
   uint64 max_queue_wait_p95_ms = 18;
   repeated string probes = 19;
+  string capacity = 20;             // own or shared
+  map<string, uint32> totals = 21;  // sharing capacity: the workers the two releases share, by worker group
+  map<string, uint32> baseline_workers = 22;  // the count the rollout has each group of the baseline at
+  map<string, uint32> candidate_workers = 23; // the count the rollout has each group of the candidate at
+  bool sizing = 24;                 // a step's workers are being put in place, its traffic not yet moved
 }
 
 message GetRolloutRequest {

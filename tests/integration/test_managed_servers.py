@@ -387,6 +387,18 @@ app = "legacy"
         "deploy", "legacy", str(SHOP), "--python", sys.executable, "--hold"
     ).stdout.strip()
     assert held == "muru: release legacy@r2 is ready and held: not serving"
+
+    # Section 9.16: a server's instances are not scaled, so the two
+    # cannot share capacity; an ordinary canary runs each at its own size.
+
+    refused = daemon.muructl(
+        "rollout", "canary", "legacy@r2", "--steps", "50", "--capacity", "shared", check=False
+    )
+    assert refused.returncode != 0
+    assert (
+        "legacy@r1 runs a managed HTTP server, whose instances are not scaled, "
+        "so it cannot share capacity"
+    ) in refused.stderr, refused.stderr
     daemon.muructl(
         "rollout", "canary", "legacy@r2", "--steps", "50", "--hold", "2s", "--min-requests", "20"
     )

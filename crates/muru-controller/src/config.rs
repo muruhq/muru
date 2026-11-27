@@ -8851,6 +8851,7 @@ mod tests {
             message: message.to_owned(),
             created_unix_ms: id.parse().unwrap_or(0),
             updated_unix_ms: 0,
+            shared: None,
         }
     }
 

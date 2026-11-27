@@ -1659,21 +1659,61 @@ pub struct Rollout {
     pub created_unix_ms: u64,
     /// When it last changed, Unix milliseconds.
     pub updated_unix_ms: u64,
+    /// Section 9.16: the total of workers the two releases share, and
+    /// where the sharing stands; none when each runs at its own size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<SharedCapacity>,
+}
+
+/// Section 9.16 (issue 321): a rollout whose baseline and candidate
+/// share one total of workers, each sized by its share of the traffic.
+/// It is kept with the rollout, so a daemon that restarts carries on
+/// from the counts it finds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedCapacity {
+    /// The total, by worker group: the baseline's worker count when the
+    /// rollout began.
+    #[serde(default)]
+    pub totals: BTreeMap<String, u32>,
+    /// The count the rollout has pinned each group of the baseline to.
+    #[serde(default)]
+    pub baseline: BTreeMap<String, u32>,
+    /// The count the rollout has pinned each group of the candidate to.
+    #[serde(default)]
+    pub candidate: BTreeMap<String, u32>,
+    /// Whether the current step's workers are still being put in place,
+    /// its traffic not yet moved: the step before's share is in force.
+    #[serde(default)]
+    pub sizing: bool,
+    /// Whether every step has passed and the candidate is being grown
+    /// to the total ahead of its promotion, the last step's share still
+    /// in force.
+    #[serde(default)]
+    pub finishing: bool,
 }
 
 impl Rollout {
     /// The candidate's share in force: the current step's while running
-    /// or paused, the step before while the next awaits approval, all of
-    /// it once promoted and none once rolled back.
+    /// or paused, the step before while the next awaits approval or its
+    /// workers are being put in place (section 9.16), all of it once
+    /// promoted and none once rolled back.
     pub fn percent(&self) -> u32 {
+        let before = || {
+            self.step
+                .checked_sub(1)
+                .and_then(|index| self.steps.get(index))
+                .map_or(0, |step| step.percent)
+        };
+
         match self.state {
             RolloutState::Promoted => 100,
             RolloutState::RolledBack => 0,
-            RolloutState::AwaitingApproval => self
-                .step
-                .checked_sub(1)
-                .and_then(|index| self.steps.get(index))
-                .map_or(0, |step| step.percent),
+            RolloutState::AwaitingApproval => before(),
+            RolloutState::Running | RolloutState::Paused
+                if self.shared.as_ref().is_some_and(|shared| shared.sizing) =>
+            {
+                before()
+            }
             RolloutState::Running | RolloutState::Paused => {
                 self.steps.get(self.step).map_or(0, |step| step.percent)
             }

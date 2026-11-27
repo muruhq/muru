@@ -56,6 +56,7 @@ pub mod secrets;
 pub mod selector;
 pub mod servers;
 pub mod settings;
+pub mod shared;
 pub mod shutdown;
 pub mod sinks;
 pub mod store;

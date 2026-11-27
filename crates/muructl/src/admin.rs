@@ -5664,6 +5664,14 @@ pub enum RolloutCommand {
         #[arg(long)]
         approve_each_step: bool,
 
+        /// How the two releases are sized: own, each at its own size
+        /// (the default), or shared, the two sharing the worker count
+        /// the baseline has when the rollout starts, each sized by its
+        /// share of the traffic, for a node with no room for two full
+        /// copies.
+        #[arg(long, value_name = "MODE", default_value = "own", value_parser = ["own", "shared"])]
+        capacity: String,
+
         /// Stay until the rollout is promoted or rolled back.
         #[arg(long)]
         wait: bool,
@@ -6536,6 +6544,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             probes,
             min_requests,
             approve_each_step,
+            capacity,
             wait,
             override_freeze,
             socket,
@@ -6563,6 +6572,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                     min_requests,
                     approve_each_step,
                     override_freeze,
+                    capacity,
                 })
                 .await
                 .map_err(explain)?
