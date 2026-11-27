@@ -542,7 +542,14 @@ def test_a_restarted_daemon_serves_on_the_listeners_its_file_names(tmp_path: Pat
         second = start_daemon(tmp_path, run_dir=first.run_dir, listeners=[(new, False)])
 
         try:
-            assert "re-adopted the edge" in second.log()
+            # Issue 952: the admin socket answers while the daemon restores
+            # what the first left, and until the edge is replaced status
+            # names the old edge and its listeners, which still serve. The
+            # daemon is not ready until then, so the test waits for it.
+
+            log = second.wait_for_log(" replaced by pid ")
+            assert "re-adopted the edge" in log
+            assert " replaced by pid " in log, log
             status = second.muructl("status").stdout
             assert f"http://127.0.0.1:{new}" in status, status
             assert f"http://127.0.0.1:{old}" not in status, status
