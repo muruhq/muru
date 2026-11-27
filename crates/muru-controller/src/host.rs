@@ -601,6 +601,22 @@ impl ImportsParts {
     }
 }
 
+/// How long a host that is taken over is given to say what its workers
+/// are, once its control socket has been connected to.
+const ANNOUNCE_WAIT: Duration = Duration::from_secs(5);
+
+/// What a running host said when a supervisor connected to it: the
+/// sockets the edge should route to, and every message up to and
+/// including the one that said so.
+pub struct Announced {
+    /// The default group's sockets.
+    pub sockets: Vec<PathBuf>,
+    /// Each named group's sockets.
+    pub groups: Vec<(String, Vec<PathBuf>)>,
+    /// The messages the host sent, in order, the announcement last.
+    pub sent: Vec<HostMessage>,
+}
+
 /// The supervisor's side of a host's control connection: what the host
 /// sends arrives on the receiver, and acknowledgements go back.
 pub struct HostControl {
@@ -656,6 +672,63 @@ impl HostControl {
                 outgoing: outgoing_tx,
             },
             incoming_rx,
+        ))
+    }
+
+    /// Connect to the control socket of a host that is already running
+    /// and wait for it to say which sockets its workers listen on, which
+    /// it tells every supervisor that connects first of all (issue 981).
+    /// Returns the connection, the default group's sockets, each named
+    /// group's, and what the host has sent so far, the announcement
+    /// included, for whoever acts on a host's messages.
+    pub async fn connect_announced(
+        path: &Path,
+    ) -> anyhow::Result<(Self, mpsc::Receiver<HostMessage>, Announced)> {
+        let (control, mut messages) = Self::connect(path).await?;
+        let mut sent = Vec::new();
+
+        let wait = async {
+            while let Some(message) = messages.recv().await {
+                let found = match &message {
+                    HostMessage::Workers {
+                        sockets, groups, ..
+                    } => Some((sockets.clone(), groups.clone())),
+                    _ => None,
+                };
+
+                sent.push(message);
+
+                if found.is_some() {
+                    return found;
+                }
+            }
+
+            None
+        };
+
+        let Some((sockets, groups)) = tokio::time::timeout(ANNOUNCE_WAIT, wait)
+            .await
+            .with_context(|| {
+                format!(
+                    "the host did not say what its workers are on {}",
+                    path.display()
+                )
+            })?
+        else {
+            anyhow::bail!(
+                "the host closed {} before it said what its workers are",
+                path.display()
+            );
+        };
+
+        Ok((
+            control,
+            messages,
+            Announced {
+                sockets,
+                groups,
+                sent,
+            },
         ))
     }
 
@@ -1731,8 +1804,10 @@ impl HostProcess {
     }
 
     /// Take over a host a previous daemon started: it is checked to be
-    /// alive and its workers to be listening, and is stopped with signals
-    /// rather than waited for, since it is not this process's child. Its
+    /// alive, and is stopped with signals rather than waited for, since
+    /// it is not this process's child. The sockets are those the host
+    /// itself announced on its control connection (issue 981), since it
+    /// replaces workers while no daemon is there to keep its record. Its
     /// relay is adopted with it when `relay_pid` names one still there;
     /// otherwise a new one is started and given the host's pipes.
     #[allow(clippy::too_many_arguments)]
@@ -1757,7 +1832,8 @@ impl HostProcess {
 
         let relay =
             RelaySupervisor::start(launch, running, None, &Logs::default(), &relays, watcher);
-        let host = Self {
+
+        Ok(Self {
             process: Process::Adopted(pid),
             stdin: None,
             sockets,
@@ -1767,15 +1843,7 @@ impl HostProcess {
             release,
             relays,
             relay,
-        };
-        anyhow::ensure!(
-            host.required_sockets()
-                .iter()
-                .all(|socket| listening(socket)),
-            "the workers of process {pid} are not listening"
-        );
-
-        Ok(host)
+        })
     }
 
     /// The sockets the release is not ready without: every group's but
@@ -3404,6 +3472,76 @@ mod tests {
         assert_eq!(
             (ended.kind.as_str(), ended.requests.len()),
             ("request.ended", 1)
+        );
+    }
+
+    // Issue 981: a host that is taken over says which sockets its
+    // workers listen on, and what it said is kept for the daemon's inbox.
+
+    #[tokio::test]
+    async fn a_host_taken_over_is_asked_for_its_sockets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        let host = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let lines = concat!(
+                r#"{"type":"loaded","outcome":"preloaded","ms":3}"#,
+                "\n",
+                r#"{"type":"workers","version":4,"sockets":["/r/worker-0-g2.sock"],"#,
+                r#""groups":[{"name":"jobs","sockets":["/r/worker-1-0.sock"]}]}"#,
+                "\n",
+                r#"{"type":"event","kind":"worker.recycled","message":"later"}"#,
+                "\n",
+            );
+            stream.write_all(lines.as_bytes()).await.unwrap();
+            stream
+        });
+
+        let (_control, mut messages, announced) =
+            HostControl::connect_announced(&path).await.unwrap();
+        assert_eq!(
+            announced.sockets,
+            vec![PathBuf::from("/r/worker-0-g2.sock")]
+        );
+        assert_eq!(
+            announced.groups,
+            vec![("jobs".to_owned(), vec![PathBuf::from("/r/worker-1-0.sock")])]
+        );
+
+        // Everything up to the announcement is handed over in order, and
+        // what follows is still on the connection.
+
+        assert!(matches!(
+            announced.sent.as_slice(),
+            [
+                HostMessage::Loaded { .. },
+                HostMessage::Workers { version: 4, .. }
+            ]
+        ));
+        assert!(matches!(
+            messages.recv().await,
+            Some(HostMessage::Event { .. })
+        ));
+        drop(host.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_host_that_closes_before_it_announces_is_not_taken_over() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let refused = HostControl::connect_announced(&path).await;
+        assert!(
+            refused
+                .err()
+                .is_some_and(|error| error.to_string().contains("before it said"))
         );
     }
 }

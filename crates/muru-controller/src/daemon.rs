@@ -6462,6 +6462,40 @@ impl Daemon {
             return false;
         }
 
+        // Issue 981: the host says which sockets its workers listen on.
+        // It replaces workers and starts them again while no daemon is
+        // there, so the record, which the last daemon wrote, may name
+        // sockets of workers long gone.
+
+        let (control, messages, announced) = match HostControl::connect_announced(
+            &dirs.sockets.join("control.sock"),
+        )
+        .await
+        {
+            Ok(connected) => connected,
+            Err(error) => {
+                tracing::info!(error = %format!("{error:#}"), "release {app}@{id} could not be re-adopted");
+                return false;
+            }
+        };
+        let mut record = record;
+
+        for group in &mut record.groups {
+            group.sockets = announced
+                .groups
+                .iter()
+                .find(|(name, _)| *name == group.name)
+                .map(|(_, sockets)| sockets.clone())
+                .unwrap_or_default();
+        }
+
+        record.sockets = announced
+            .sockets
+            .iter()
+            .chain(record.groups.iter().flat_map(|group| &group.sockets))
+            .cloned()
+            .collect();
+
         let group_sockets = record
             .groups
             .iter()
@@ -6562,7 +6596,7 @@ impl Daemon {
                         inspected: false,
                         sticky_until: None,
                         held: false,
-                        control: None,
+                        control: Some(control),
                         status: Vec::new(),
                         load_ms: None,
                         memory_replacements: Vec::new(),
@@ -6579,7 +6613,13 @@ impl Daemon {
                         ready_at,
                     },
                 );
-                self.attach_control(app, id);
+
+                // What the host has said goes through the inbox with the
+                // rest, so its announcement is acknowledged only after
+                // the snapshot of the restored routing has gone to the
+                // edge: the host keeps the paths the edge had until then.
+
+                self.forward_control(app, id, announced.sent, messages);
                 self.events.emit(
                     "release.adopted",
                     &format!("{app}@{id}"),
@@ -13256,7 +13296,7 @@ impl Daemon {
         let (app, id) = (app.to_owned(), id.to_owned());
 
         tokio::spawn(async move {
-            let (control, mut messages) = match HostControl::connect(&path).await {
+            let (control, messages) = match HostControl::connect(&path).await {
                 Ok(connected) => connected,
                 Err(error) => {
                     tracing::info!(%error, "release {app}@{id}: no host control connection");
@@ -13276,19 +13316,25 @@ impl Daemon {
                 return;
             }
 
-            while let Some(message) = messages.recv().await {
-                let sent = commands
-                    .send(Command::HostMessage {
-                        app: app.clone(),
-                        id: id.clone(),
-                        message,
-                    })
-                    .await;
+            forward_host_messages(&commands, &app, &id, Vec::new(), messages).await;
+        });
+    }
 
-                if sent.is_err() {
-                    break;
-                }
-            }
+    /// Feed what a host says on a control connection already made into
+    /// the daemon's inbox, `sent` first: what it said before the
+    /// connection was handed over.
+    fn forward_control(
+        &self,
+        app: &str,
+        id: &str,
+        sent: Vec<HostMessage>,
+        messages: mpsc::Receiver<HostMessage>,
+    ) {
+        let commands = self.commands.clone();
+        let (app, id) = (app.to_owned(), id.to_owned());
+
+        tokio::spawn(async move {
+            forward_host_messages(&commands, &app, &id, sent, messages).await;
         });
     }
 
@@ -14556,6 +14602,44 @@ fn size_scalers(
         if let Some((threads, sync_threads, concurrency)) = sizes {
             (scaling.slots_per_worker, scaling.threads) =
                 crate::scaling::worker_size(interface, threads, sync_threads, concurrency);
+        }
+    }
+}
+
+/// Pass a host's messages to the daemon's inbox, those already taken
+/// from the connection first, until the connection or the daemon ends.
+async fn forward_host_messages(
+    commands: &mpsc::Sender<Command>,
+    app: &str,
+    id: &str,
+    sent: Vec<HostMessage>,
+    mut messages: mpsc::Receiver<HostMessage>,
+) {
+    for message in sent {
+        let forwarded = commands
+            .send(Command::HostMessage {
+                app: app.to_owned(),
+                id: id.to_owned(),
+                message,
+            })
+            .await;
+
+        if forwarded.is_err() {
+            return;
+        }
+    }
+
+    while let Some(message) = messages.recv().await {
+        let forwarded = commands
+            .send(Command::HostMessage {
+                app: app.to_owned(),
+                id: id.to_owned(),
+                message,
+            })
+            .await;
+
+        if forwarded.is_err() {
+            break;
         }
     }
 }
