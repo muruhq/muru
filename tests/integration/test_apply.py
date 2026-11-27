@@ -428,7 +428,7 @@ def test_serving_stages_a_release_and_promotes_it(daemon: Daemon, tmp_path: Path
     assert "ready and held: not serving" in staged.stdout
     assert "deploy          shop@r3                  recorded and stopped" in staged.stdout
     assert answers and set(answers) == {"r1"}, answers
-    preview = daemon.request("/", host="shop.test", headers={"Muru-Preview": "r2"})
+    preview = daemon.request("/", host="shop.test", headers=daemon.preview_header("shop@r2"))
     assert json.loads(preview.body)["release"] == "r2"
     assert daemon.releases("shop") == [
         {"release": "shop@r3", "state": "stopped", "serving": ""},

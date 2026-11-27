@@ -36,6 +36,7 @@ use crate::servers::{Servers, ServersRecord};
 use crate::store::Store;
 
 mod detouring;
+mod previewing;
 
 /// How long a release may take from its host starting to every worker
 /// listening (section 9.1 startup timeout, provisional).
@@ -912,12 +913,12 @@ pub enum Command {
         /// Answered with the detour as it is now, or why not.
         done: oneshot::Sender<Result<muru_proto::admin::v1::Detour, String>>,
     },
-    /// Section 4.21: mint entry links to a detour's preview.
-    PreviewDetour {
-        /// Which detour, and which of its application's addresses.
-        request: muru_proto::admin::v1::PreviewDetourRequest,
+    /// Section 4.22: mint entry links to a release's preview.
+    PreviewRelease {
+        /// Which release, and which of its application's addresses.
+        request: muru_proto::admin::v1::PreviewReleaseRequest,
         /// Answered with the links, or why not.
-        done: oneshot::Sender<Result<muru_proto::admin::v1::DetourPreview, String>>,
+        done: oneshot::Sender<Result<muru_proto::admin::v1::ReleasePreview, String>>,
     },
     /// Section 9.13: a detour's stream ended, from its run's side or the
     /// daemon's.
@@ -2116,6 +2117,9 @@ struct Daemon {
     /// again has none.
     detours_enabled: bool,
     detours: BTreeMap<(String, String), crate::detours::Detour>,
+    /// Section 4.22: the releases the edge was last told to route to,
+    /// which are the ones that can be previewed.
+    routed: BTreeSet<(String, String)>,
     detour_serial: u64,
     /// When the detours' runs were last checked in the registry.
     detours_checked: Instant,
@@ -2703,6 +2707,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         debug_exec: settings.debug_exec,
         detours_enabled: settings.detours,
         detours: BTreeMap::new(),
+        routed: BTreeSet::new(),
         detour_serial: 0,
         detours_checked: Instant::now(),
         runs: runs.clone(),
@@ -5065,7 +5070,12 @@ impl Daemon {
             .filter(|host| !host.is_empty() && !host.contains('*'));
         let url = format!("http://127.0.0.1:{port}{path}");
 
-        crate::rollouts::probe_host(&self.probe_client, &url, host.as_deref(), &id)
+        // Section 4.22: the probe previews the release as anything else
+        // does, with its secret.
+
+        let preview = self.preview_value(&app, &id)?;
+
+        crate::rollouts::probe_host(&self.probe_client, &url, host.as_deref(), &preview)
             .await
             .map_err(|error| {
                 crate::overlays::describe_probe_failure(
@@ -7261,8 +7271,8 @@ impl Daemon {
                         .await,
                 );
             }
-            Command::PreviewDetour { request, done } => {
-                let _ = done.send(self.preview_detour(request).await);
+            Command::PreviewRelease { request, done } => {
+                let _ = done.send(self.preview_release(request).await);
             }
             Command::CloseDetour { serial, reason } => {
                 self.close_detour(serial, &reason).await;
@@ -7354,7 +7364,7 @@ impl Daemon {
                 tracing::error!(%error, "pushing the snapshot for a held release failed");
             }
 
-            self.mark_ready(app, &release.id, "held: not serving");
+            self.mark_ready(app, &release.id, &held_message(app, &release.id));
 
             return self
                 .store
@@ -9035,6 +9045,15 @@ impl Daemon {
             .map(|(app, id)| ((*app).clone(), (*id).clone()))
             .collect();
 
+        // Section 4.22: what the edge routes to is what can be previewed,
+        // each release by its own secret.
+
+        self.routed = included.clone();
+        let secrets = self.store.preview_secrets().unwrap_or_else(|error| {
+            tracing::warn!(%error, "reading the releases' preview secrets failed");
+            HashMap::new()
+        });
+
         // Section 9.13: a detour takes what its overlay gives it.
 
         included.extend(self.detours.keys().cloned());
@@ -9066,7 +9085,10 @@ impl Daemon {
                 };
 
                 apps.push(pb::AppWorkers {
-                    preview_secret: String::new(),
+                    preview_secret: secrets
+                        .get(&(name.clone(), id.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
                     detour_paths: Vec::new(),
                     sticky: running.sticky_until.is_some(),
                     limits: spec.as_ref().and_then(|spec| spec.limits.message()),
@@ -9414,7 +9436,7 @@ impl Daemon {
                 .iter()
                 .map(muru_edge::access::Override::to_message)
                 .collect(),
-            detours: self.detours_enabled && self.locations.mode != crate::locations::Mode::System,
+            previews: true,
         }
     }
 
@@ -9908,14 +9930,25 @@ impl Daemon {
         let failures = self.probe_failures.clone();
         let urls = rollout.gates.probes.clone();
         let app = rollout.app.clone();
-        let releases = [rollout.candidate.clone(), rollout.baseline.clone()];
+
+        // Section 4.22: each release is probed by its preview, its ID
+        // and its secret; one whose secret cannot be read fails its
+        // probes, which says why.
+
+        let releases = [rollout.candidate.clone(), rollout.baseline.clone()]
+            .map(|release| (self.preview_value(&rollout.app, &release), release));
 
         tokio::spawn(async move {
             let mut failed = Vec::new();
 
-            for release in releases {
+            for (preview, release) in releases {
                 for url in &urls {
-                    if let Err(error) = crate::rollouts::probe(&client, url, &release).await {
+                    let probed = match &preview {
+                        Ok(preview) => crate::rollouts::probe(&client, url, preview).await,
+                        Err(error) => Err(error.clone()),
+                    };
+
+                    if let Err(error) = probed {
                         tracing::debug!(%app, %release, %error, "a rollout probe failed");
                         failed.push((release.clone(), error));
                     }
@@ -10452,7 +10485,7 @@ impl Daemon {
             tracing::error!(%error, "pushing the snapshot for a held release failed");
         }
 
-        self.mark_ready(app, id, "held: not serving");
+        self.mark_ready(app, id, &held_message(app, id));
         Ok(true)
     }
 
@@ -14515,6 +14548,16 @@ fn upstream_message(name: &str, table: &muru_config::Upstream) -> anyhow::Result
 }
 
 /// A policy's sticky grace: what it says, or 10 minutes.
+/// What a held release's message starts with, by which listings know
+/// one.
+pub(crate) const HELD: &str = "held: not serving";
+
+/// A held release's message: that it serves nothing, and how to try it
+/// (section 4.22). Never its preview secret.
+fn held_message(app: &str, id: &str) -> String {
+    format!("{HELD}; muructl preview {app}@{id} previews it")
+}
+
 fn sticky_grace_of(traffic: &muru_config::Traffic) -> Duration {
     traffic
         .sticky_grace

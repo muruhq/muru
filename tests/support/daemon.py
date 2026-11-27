@@ -261,6 +261,20 @@ class Daemon:
 
         return next((port for port, tls in self.listeners if tls), None)
 
+    def preview(self, release: str) -> str:
+        """The value that previews a release, named as APP@RELEASE: its ID
+        and its preview secret, as `muructl preview --header` gives it."""
+
+        printed = self.muructl("preview", release, "--header").stdout.strip()
+        name, _, value = printed.partition(": ")
+        assert name == "Muru-Preview" and value, printed
+        return value
+
+    def preview_header(self, release: str) -> dict[str, str]:
+        """The request header that previews a release, named as APP@RELEASE."""
+
+        return {"Muru-Preview": self.preview(release)}
+
     def releases(self, app: str = "") -> list[dict[str, str]]:
         """The release table as muructl prints it, parsed by column."""
 

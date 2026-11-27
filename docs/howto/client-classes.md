@@ -127,7 +127,7 @@ these two routes and a third for `/api`, a crawler's request for
 `/api/items` takes the `/api` route.
 
 A traffic policy's `classes` gives a class a release of its own, such as
-an older, cheaper one kept running for it. A preview header or cookie
+an older, cheaper one kept running for it. A [preview](traffic.md#previews)
 still comes first, but the class's release comes before a sticky cookie
 and the split:
 

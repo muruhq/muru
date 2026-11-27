@@ -84,8 +84,10 @@ def test_the_gunicorn_tutorial(tmp_path: Path) -> None:
                 "--min-requests",
                 "20",
             )
-            assert answer(daemon, **{"Muru-Preview": "r2"}) == "Hello from Muru\n"
-            assert answer(daemon, **{"Muru-Preview": "r1"}).startswith("Hello from gunicorn/")
+            assert answer(daemon, **daemon.preview_header("legacy@r2")) == "Hello from Muru\n"
+            assert answer(daemon, **daemon.preview_header("legacy@r1")).startswith(
+                "Hello from gunicorn/"
+            )
             followed = daemon.muructl("rollout", "status", "legacy", "--wait").stdout
             assert "rollout 1 promoted: every step passed its gates" in followed
             assert answer(daemon) == "Hello from Muru\n"

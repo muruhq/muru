@@ -357,6 +357,9 @@ pub struct Selection {
     /// Issue 909: a request carrying a detour's preview that went to the
     /// serving release, this one, since its path is outside the detour's.
     pub scoped_out: bool,
+    /// Section 4.22: the request carries the preview of the release that
+    /// serves it, its release and secret.
+    pub previewed: bool,
 }
 
 /// Section 4.5: what is left of a path once a route's stripped part,
@@ -427,8 +430,9 @@ pub const ID_COOKIE: &str = "muru_id";
 /// The cookie that keeps a client on the release it first got.
 pub const STICKY_COOKIE: &str = "muru_release";
 
-/// The value of the preview header on a response when the request named
-/// a release the route does not have.
+/// The value of the preview header on a response when the request
+/// carried a preview that was not honoured: whatever was wrong with it,
+/// the answer is this one (section 4.22).
 pub const PREVIEW_IGNORED: &str = "ignored";
 
 /// The cookie that pins a release for previews.
@@ -611,11 +615,6 @@ impl Chosen<'_> {
         }
     }
 
-    /// Whether what was chosen is a detour (section 4.21).
-    fn is_detour(&self) -> bool {
-        matches!(self, Self::Pools(pools) if pools.is_detour())
-    }
-
     /// Whether a sticky cookie reaches what was chosen though the route's
     /// policy does not name it: the application's serving release, or a
     /// release kept for its sticky clients (section 9.4).
@@ -658,11 +657,12 @@ fn upstream_selection(upstream: &Arc<Upstream>) -> Selection {
         detour: None,
         stripped: String::new(),
         scoped_out: false,
+        previewed: false,
     }
 }
 
-/// The release or `upstream:NAME` a request's preview header or cookie
-/// names, the header first.
+/// The preview a request carries, in its preview header or else its
+/// preview cookie: `RELEASE.SECRET` when it is one the edge may honour.
 fn named_preview(headers: &HeaderMap) -> Option<String> {
     headers
         .get(PREVIEW_HEADER)
@@ -671,53 +671,49 @@ fn named_preview(headers: &HeaderMap) -> Option<String> {
         .or_else(|| cookie(headers, PREVIEW_COOKIE))
 }
 
-/// Whether a request named a preview that what serves it is not: the
-/// route has no such release, a retained one included, and the request
-/// was routed as usual (section 9.4). A detour's preview names its
-/// release before the secret (section 4.21).
+/// Whether a request carried a preview that did not choose what serves
+/// it (section 4.22): the release is unknown to the route, the secret is
+/// wrong or missing, or the value names something that is no release.
+/// The request was routed as usual, and the response says the same
+/// thing for each, so it tells nothing of which releases exist.
 pub fn preview_ignored(headers: &HeaderMap, selection: &Selection) -> bool {
-    named_preview(headers).is_some_and(|name| {
-        match (name.strip_prefix(UPSTREAM_PREFIX), &selection.upstream) {
-            (Some(upstream), Some(serving)) => upstream != serving.name(),
-            (Some(_), None) => true,
-            (None, _) => {
-                name.split_once('.')
-                    .map_or(name.as_str(), |(release, _)| release)
-                    != selection.release
-            }
+    !selection.previewed && named_preview(headers).is_some()
+}
+
+/// A preview value's release and secret, `RELEASE.SECRET`. The secret is
+/// hexadecimal and has no dot, so the split is at the last one.
+fn preview_parts(value: &str) -> Option<(&str, &str)> {
+    value.rsplit_once('.')
+}
+
+/// Whether two secrets are the same, compared in constant time for
+/// their length.
+fn same_secret(own: &str, given: &str) -> bool {
+    own.len() == given.len()
+        && own
+            .bytes()
+            .zip(given.bytes())
+            .fold(0u8, |differs, (left, right)| differs | (left ^ right))
+            == 0
+}
+
+/// What a release's secret is compared with when the route has no such
+/// release, so that a miss costs what a wrong secret does.
+const NO_SECRET: &str = "00000000000000000000000000000000";
+
+/// The release a preview names, as section 4.22 has it: only by its
+/// release and its secret together. A bare release, a wrong secret, a
+/// release the route does not have and `upstream:NAME` are all nothing.
+fn previewed<'a>(value: &str, app: &'a AppReleases) -> Option<Chosen<'a>> {
+    let (release, secret) = preview_parts(value)?;
+
+    match app.releases.get(release) {
+        Some(pools) => pools.previewed_by(secret).then_some(Chosen::Pools(pools)),
+        None => {
+            let _ = same_secret(NO_SECRET, secret);
+            None
         }
-    })
-}
-
-/// Whether a preview value is a detour's form, `RELEASE.SECRET`.
-fn detour_form(value: &str) -> bool {
-    !value.starts_with(UPSTREAM_PREFIX) && value.contains('.')
-}
-
-/// The release a preview names, as section 4.21 has it: a detour only by
-/// its release and secret together, anything else by its name as before.
-/// An upstream is previewed only through a route whose policy names it
-/// (issue 955), so a preview reaches nothing the route does not send to.
-fn previewed<'a>(
-    name: &str,
-    app: &'a AppReleases,
-    policy: Option<&Policy>,
-    upstreams: &HashMap<String, Arc<Upstream>>,
-) -> Option<Chosen<'a>> {
-    if detour_form(name) {
-        let (release, secret) = name.split_once('.')?;
-        return app
-            .releases
-            .get(release)
-            .filter(|pools| pools.previewed_by(secret))
-            .map(Chosen::Pools);
     }
-
-    if name.starts_with(UPSTREAM_PREFIX) && !policy.is_some_and(|policy| policy.names(name)) {
-        return None;
-    }
-
-    Chosen::named(name, app, upstreams).filter(|chosen| !chosen.is_detour())
 }
 
 /// What a detour's scope is judged against (issue 909): the client URL
@@ -770,7 +766,7 @@ fn within_scope<'a>(
 }
 
 /// Section 4.5: which of an application's releases takes a request. The
-/// release a preview header or cookie names comes first, then the one the
+/// release a preview header or cookie names with its secret comes first, then the one the
 /// policy gives the client's class (section 4.14), then the one a sticky
 /// cookie records, then the policy's bucket for the client's key, else
 /// the serving release. Cookies the edge issues on the way go into
@@ -785,18 +781,15 @@ fn choose<'a>(
 ) -> Chosen<'a> {
     let preview = named_preview(client.headers);
 
-    if let Some(chosen) = preview
-        .as_deref()
-        .and_then(|name| previewed(name, app, policy, upstreams))
-    {
+    if let Some(chosen) = preview.as_deref().and_then(|value| previewed(value, app)) {
         return chosen;
     }
 
-    // Section 4.21: a preview cookie of a detour no longer open, ended or
-    // from before a daemon restart, is let go.
+    // Section 4.22: a preview cookie that is no release's on this node,
+    // because the release was removed, its secret was changed, its
+    // detour ended or the value never was one, is let go.
 
     if let Some(value) = cookie(client.headers, PREVIEW_COOKIE)
-        && detour_form(&value)
         && !previews.contains(&value)
     {
         cookies.push(crate::preview::expire_cookie(client.secure));
@@ -911,7 +904,8 @@ pub struct AppPools {
     /// default group's requests have and a named group's or a mount's own
     /// are laid over.
     limits: crate::RequestLimits,
-    /// Section 4.21: a detour's secret, which a preview of it must carry.
+    /// Section 4.22: the release's secret, which a preview of it must
+    /// carry; none on an edge that takes no previews.
     preview_secret: Option<Arc<str>>,
     /// Section 4.21 (issue 909): the client URL paths a detour takes
     /// requests under; every path when empty.
@@ -1137,8 +1131,8 @@ impl AppPools {
         self.server.as_ref()
     }
 
-    /// The same release as a detour, previewed only with its secret
-    /// (section 4.21).
+    /// The same release, previewed with this secret (section 4.22); not
+    /// previewed at all when it is empty.
     pub fn with_preview_secret(mut self, secret: &str) -> Self {
         self.preview_secret = (!secret.is_empty()).then(|| Arc::from(secret));
         self
@@ -1151,9 +1145,11 @@ impl AppPools {
         self
     }
 
-    /// Whether the release is a detour, previewed only with its secret.
+    /// Whether the release is a detour (section 4.21).
     fn is_detour(&self) -> bool {
-        self.preview_secret.is_some()
+        self.server
+            .as_ref()
+            .is_some_and(|server| server.is_detour())
     }
 
     /// The same detour, taking requests under these client URL paths
@@ -1197,26 +1193,21 @@ impl AppPools {
         path.starts_with(&toolbar) && self.previewed_in(client.headers)
     }
 
-    /// Whether a request carries this detour's preview, its release and
-    /// secret, by header or cookie, whatever chose the detour for it.
+    /// Whether a request carries this release's preview, its release and
+    /// secret, by header or cookie, whatever chose the release for it.
     fn previewed_in(&self, headers: &HeaderMap) -> bool {
         named_preview(headers)
             .as_deref()
-            .and_then(|name| name.split_once('.'))
+            .and_then(preview_parts)
             .is_some_and(|(release, secret)| release == self.release && self.previewed_by(secret))
     }
 
-    /// Whether a preview's secret is the detour's, compared in constant
+    /// Whether a preview's secret is the release's, compared in constant
     /// time.
     fn previewed_by(&self, secret: &str) -> bool {
-        self.preview_secret.as_deref().is_some_and(|own| {
-            own.len() == secret.len()
-                && own
-                    .bytes()
-                    .zip(secret.bytes())
-                    .fold(0u8, |differs, (left, right)| differs | (left ^ right))
-                    == 0
-        })
+        self.preview_secret
+            .as_deref()
+            .is_some_and(|own| same_secret(own, secret))
     }
 
     /// The same pools with the release's error pages and override
@@ -1288,6 +1279,7 @@ impl AppPools {
                 }),
                 stripped: String::new(),
                 scoped_out: false,
+                previewed: self.previewed_in(client.headers),
             });
         }
 
@@ -1359,6 +1351,7 @@ impl AppPools {
             detour: None,
             stripped: String::new(),
             scoped_out: false,
+            previewed: self.previewed_in(client.headers),
         })
     }
 
@@ -1505,12 +1498,12 @@ pub struct Routing {
     /// Whether any host or route has compression settings or header
     /// rules of its own.
     sites_vary: bool,
-    /// Section 4.21: the daemon takes detours, so the preview paths are
-    /// the edge's.
-    detours: bool,
-    /// Every open detour's preview value, `RELEASE.SECRET`, so a cookie
-    /// that names none of them is known to be stale.
-    detour_previews: HashSet<String>,
+    /// Section 4.22: the edge is a daemon's, so the preview paths are
+    /// its own.
+    previews: bool,
+    /// Every release's preview value, `RELEASE.SECRET`, so a cookie that
+    /// is none of them is known to be stale.
+    preview_values: HashSet<String>,
 }
 
 /// What the virtual host and the route a client's request names set for
@@ -1659,8 +1652,8 @@ impl Routing {
             h2c: HashMap::new(),
             listener_trust: HashMap::new(),
             sites_vary: false,
-            detours: false,
-            detour_previews: HashSet::new(),
+            previews: false,
+            preview_values: HashSet::new(),
         }
     }
 
@@ -1759,9 +1752,13 @@ impl Routing {
 
                 pools = pools
                     .with_server(Arc::new(server))
-                    .with_preview_secret(&app.preview_secret)
                     .with_detour_paths(&app.detour_paths);
             }
+
+            // Section 4.22: every release of a daemon has a secret its
+            // previews carry.
+
+            pools = pools.with_preview_secret(&app.preview_secret);
 
             let pools = Arc::new(pools);
             let releases = apps.entry(app.app.clone()).or_insert_with(|| AppReleases {
@@ -1943,8 +1940,8 @@ impl Routing {
             h2c,
             listener_trust,
             sites_vary: false,
-            detours: snapshot.detours,
-            detour_previews: snapshot
+            previews: snapshot.previews,
+            preview_values: snapshot
                 .apps
                 .iter()
                 .filter(|app| !app.preview_secret.is_empty())
@@ -2195,14 +2192,15 @@ impl Routing {
         servers
     }
 
-    /// Whether the daemon takes detours, which makes the preview paths
-    /// the edge's (section 4.21).
-    pub fn takes_detours(&self) -> bool {
-        self.detours
+    /// Whether the edge is a daemon's, which makes the preview paths its
+    /// own (section 4.22).
+    pub fn takes_previews(&self) -> bool {
+        self.previews
     }
 
-    /// An open detour's secret, by its application and release.
-    pub fn detour_secret(&self, app: &str, release: &str) -> Option<String> {
+    /// A release's preview secret, by its application and release, while
+    /// the edge routes to it.
+    pub fn preview_secret(&self, app: &str, release: &str) -> Option<String> {
         self.apps
             .get(app)?
             .releases
@@ -2723,7 +2721,7 @@ impl Routing {
                             client,
                             cookies,
                             &self.upstreams,
-                            &self.detour_previews,
+                            &self.preview_values,
                         );
                         let (chosen, scoped_out) =
                             within_scope(chosen, releases, policy, scope, client);
@@ -2752,6 +2750,7 @@ impl Routing {
                 detour: None,
                 stripped: String::new(),
                 scoped_out: false,
+                previewed: false,
             }),
         }
     }
@@ -2922,7 +2921,7 @@ mod tests {
             listener_proxies: Vec::new(),
             worker_sockets: Vec::new(),
             no_host: false,
-            detours: false,
+            previews: false,
             default_app: String::new(),
             default_release: String::new(),
             hosts: vec![
@@ -3332,11 +3331,13 @@ mod tests {
                 app: "shop".to_owned(),
                 release: "r1".to_owned(),
                 serving: true,
+                preview_secret: "aa11".to_owned(),
                 ..Default::default()
             },
             pb::AppWorkers {
                 app: "shop".to_owned(),
                 release: "r2".to_owned(),
+                preview_secret: "bb22".to_owned(),
                 ..Default::default()
             },
         ];
@@ -3491,7 +3492,7 @@ mod tests {
     #[test]
     fn a_detour_is_previewed_only_with_its_secret_and_a_stale_cookie_is_let_go() {
         let mut snapshot = split_snapshot(true, "header:x-user");
-        snapshot.detours = true;
+        snapshot.previews = true;
         snapshot.apps.push(pb::AppWorkers {
             app: "shop".to_owned(),
             release: "dev-7f3a".to_owned(),
@@ -3530,9 +3531,9 @@ mod tests {
             headers
         };
 
-        assert!(routing.takes_detours());
+        assert!(routing.takes_previews());
         assert_eq!(
-            routing.detour_secret("shop", "dev-7f3a").as_deref(),
+            routing.preview_secret("shop", "dev-7f3a").as_deref(),
             Some("0f1e")
         );
         assert_eq!(chosen(&header("dev-7f3a.0f1e")).0, "dev-7f3a");
@@ -3542,7 +3543,7 @@ mod tests {
             "dev-7f3a",
             "a wrong secret"
         );
-        assert_eq!(chosen(&header("r2")).0, "r2", "other releases by name");
+        assert_eq!(chosen(&header("r2.bb22")).0, "r2", "any release so");
 
         let (release, cookies) = chosen(&cookie(format!("{PREVIEW_COOKIE}=dev-7f3a.0f1e")));
         assert_eq!(release, "dev-7f3a");
@@ -3601,7 +3602,7 @@ mod tests {
             "/",
             "127.0.0.1:8080",
             true,
-            &client(&header("r2"), &ids),
+            &client(&header("r2.bb22"), &ids),
             None,
         );
         let Decision::Serve { selection, .. } = decision else {
@@ -3613,7 +3614,7 @@ mod tests {
     #[test]
     fn a_detour_takes_its_paths_alone_and_its_toolbar_for_its_preview() {
         let mut snapshot = snapshot();
-        snapshot.detours = true;
+        snapshot.previews = true;
         let detour = |release: &str, secret: &str, path: &str| pb::AppWorkers {
             app: "shop".to_owned(),
             release: release.to_owned(),
@@ -3693,6 +3694,84 @@ mod tests {
     }
 
     #[test]
+    fn every_preview_that_misses_is_answered_alike() {
+        // Section 4.22: r2 is held, and the route has no policy, so r1
+        // serves whatever is not a preview of r2 with its secret.
+
+        let mut snapshot = split_snapshot(false, "");
+        snapshot.routes[0].traffic = None;
+        let routing = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(Routing::from_snapshot(&snapshot, None))
+            .unwrap();
+        let ids = crate::errors::RequestIds::new();
+        let answered = |headers: &HeaderMap| match routing.select(
+            Some("shop.example.com"),
+            "/",
+            "127.0.0.1:8080",
+            true,
+            &client(headers, &ids),
+            None,
+        ) {
+            Decision::Serve {
+                selection, cookies, ..
+            } => (
+                selection.release.clone(),
+                preview_ignored(headers, &selection),
+                cookies,
+            ),
+            _ => panic!("not served"),
+        };
+        let by_header = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(PREVIEW_HEADER, value.parse().unwrap());
+            answered(&headers)
+        };
+        let by_cookie = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::COOKIE,
+                format!("{PREVIEW_COOKIE}={value}").parse().unwrap(),
+            );
+            answered(&headers)
+        };
+
+        // The release and its secret together preview it, the serving
+        // release too, and nothing is said or set.
+
+        assert_eq!(by_header("r2.bb22"), ("r2".to_owned(), false, vec![]));
+        assert_eq!(by_cookie("r2.bb22"), ("r2".to_owned(), false, vec![]));
+        assert_eq!(by_header("r1.aa11"), ("r1".to_owned(), false, vec![]));
+
+        // A bare release, a wrong secret, another release's secret, a
+        // release that does not exist, an upstream and nonsense are one
+        // answer: routed as usual, marked ignored, and the cookie let go.
+
+        let expired = vec![crate::preview::expire_cookie(false)];
+        let misses = [
+            "r2",
+            "r1",
+            "r2.bb23",
+            "r2.aa11",
+            "r2.",
+            "r9",
+            "r9.bb22",
+            "upstream:legacy",
+            ".bb22",
+            "",
+        ];
+
+        for miss in misses {
+            assert_eq!(by_header(miss), ("r1".to_owned(), true, vec![]), "{miss:?}");
+            assert_eq!(
+                by_cookie(miss),
+                ("r1".to_owned(), true, expired.clone()),
+                "{miss:?}"
+            );
+        }
+    }
+
+    #[test]
     fn preview_and_sticky_cookies_pin_the_release() {
         let routing = tokio::runtime::Runtime::new()
             .unwrap()
@@ -3705,7 +3784,7 @@ mod tests {
         let plain = "127.0.0.1:8080";
 
         let mut headers = HeaderMap::new();
-        headers.insert(PREVIEW_HEADER, "r2".parse().unwrap());
+        headers.insert(PREVIEW_HEADER, "r2.bb22".parse().unwrap());
         let (release, cookies) = release_of(routing.select(
             Some("shop.example.com"),
             "/",
@@ -3866,20 +3945,14 @@ mod tests {
         }
 
         // It does not reach a held release, or an upstream of another
-        // route, and nor does a preview reach that upstream.
+        // route, and a preview reaches no upstream at all (section 4.22).
 
         assert_eq!(served(&snapshot, STICKY_COOKIE, "r3"), usual);
         assert_eq!(served(&snapshot, STICKY_COOKIE, "upstream:internal"), usual);
-        assert_eq!(
-            served(&snapshot, PREVIEW_COOKIE, "upstream:internal"),
-            usual
-        );
-        assert_eq!(
-            served(&snapshot, PREVIEW_COOKIE, "upstream:legacy"),
-            "upstream:legacy"
-        );
 
-        // A route with no policy previews no upstream at all.
+        for upstream in ["upstream:internal", "upstream:legacy"] {
+            assert_eq!(served(&snapshot, PREVIEW_COOKIE, upstream), usual);
+        }
 
         snapshot.routes[0].traffic = None;
         assert_eq!(served(&snapshot, PREVIEW_COOKIE, "upstream:legacy"), "r1");

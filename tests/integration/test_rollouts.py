@@ -90,7 +90,7 @@ def test_a_held_release_takes_no_traffic_but_previews(daemon: Daemon, tmp_path: 
     prepare(daemon, tmp_path)
     assert states(daemon) == {"shop@r1": ("ready", "yes"), "shop@r2": ("ready", "")}
     assert releases_seen(daemon, 20, "held") == {"r1"}
-    assert served_by(daemon, **{"Muru-Preview": "r2"}) == "r2"
+    assert served_by(daemon, **daemon.preview_header("shop@r2")) == "r2"
 
     # A held release is not drained by a configuration change.
 
@@ -154,10 +154,12 @@ def test_a_failing_gate_rolls_the_canary_back(daemon: Daemon, tmp_path: Path) ->
     # and rolls back once the candidate has its 20 requests, which can be
     # mid-loop on a slow machine, and after that a preview reaches r1.
 
+    preview = daemon.preview_header("shop@r2")
+
     for n in range(30):
-        failed = daemon.request("/error", host="shop.test", headers={"Muru-Preview": "r2"})
+        failed = daemon.request("/error", host="shop.test", headers=preview)
         assert failed.status == 500, failed.status
-        previewed = served_by(daemon, **{"Muru-Preview": "r2"})
+        previewed = served_by(daemon, **preview)
         split = served_by(daemon, Cookie=f"muru_id=base-{n}")
 
         if n == 0:
@@ -180,7 +182,7 @@ def test_a_worker_crash_rolls_the_canary_back_at_once(daemon: Daemon, tmp_path: 
     # One crash, long before the step has the requests the other gates
     # need, decides.
 
-    crashed = daemon.request("/crash", host="shop.test", headers={"Muru-Preview": "r2"})
+    crashed = daemon.request("/crash", host="shop.test", headers=daemon.preview_header("shop@r2"))
     assert crashed.status >= 500, crashed.status
     wait_for_rollout(daemon, "rolled_back")
     status = daemon.muructl("rollout", "status", "shop").stdout
@@ -224,7 +226,7 @@ def test_a_rollout_needs_no_route_for_the_default_application(daemon: Daemon) ->
 
     seen = {release(Cookie=f"muru_id=default-{n}") for n in range(40)}
     assert seen == {"r1", "r2"}, seen
-    assert release(**{"Muru-Preview": "r2", "Cookie": "muru_id=default-0"}) == "r2"
+    assert release(**daemon.preview_header("shop@r2"), Cookie="muru_id=default-0") == "r2"
 
     daemon.muructl("rollout", "abort", "shop")
     assert {release(Cookie=f"muru_id=default-{n}") for n in range(20)} == {"r1"}
@@ -349,6 +351,6 @@ def test_a_held_release_previews_without_a_route(daemon: Daemon) -> None:
         return served
 
     assert {release(Cookie=f"muru_id=default-{n}") for n in range(20)} == {"r1"}
-    assert release(**{"Muru-Preview": "r2"}) == "r2"
-    assert release(Cookie="muru_preview=r2") == "r2"
+    assert release(**daemon.preview_header("shop@r2")) == "r2"
+    assert release(Cookie=f"muru_preview={daemon.preview('shop@r2')}") == "r2"
     assert release() == "r1"

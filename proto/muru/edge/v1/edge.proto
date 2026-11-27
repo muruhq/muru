@@ -44,7 +44,7 @@ service EdgeControl {
   // they are open, so a rotation's postrotate knows the renamed files are
   // complete.
   rpc ReopenLogs(ReopenLogsRequest) returns (LogsReopened);
-  // Section 4.21: keep one-time entry tokens to detours' previews, by
+  // Section 4.22: keep one-time entry tokens to releases' previews, by
   // their hashes, until they expire.
   rpc AddPreviewTokens(PreviewTokens) returns (PreviewTokensAdded);
 }
@@ -57,7 +57,7 @@ message PreviewTokens {
 message PreviewToken {
   bytes sha256 = 1;                     // the token's SHA-256
   string app = 2;
-  string release = 3;                   // the detour's
+  string release = 3;                   // the release previewed, a detour's or any other
   string path = 4;                      // where it redirects, on the host it is used on
   uint64 ttl_ms = 5;                    // how long it lasts
 }
@@ -93,7 +93,7 @@ message Snapshot {
   repeated ListenerLimits listener_limits = 20; // section 4.18: listeners' own limits, over the snapshot's; read only with limits
   repeated ListenerProxy listener_proxies = 21; // section 4.7: listeners' own trusted proxies, in place of proxy for their connections
   bool no_host = 22;                    // sections 4.3 and 4.5: several applications serve and no host chooses; every request is 421
-  bool detours = 23;                    // section 4.21: the daemon takes detours, so /_muru/preview/ is the edge's
+  bool previews = 23;                   // section 4.22: the edge is a daemon's, so /_muru/preview/ is its own, whether or not the daemon takes detours
 }
 
 // Section 11.2: which access records are written, where the edge was
@@ -460,7 +460,7 @@ message AppWorkers {
   reserved 18;
   AccessLogChoice access_log = 19;      // section 11.2: the application's own access log choice; none when absent
   RequestLimits limits = 20;            // section 4.6: the release's own limits on a request, over its host's; none when absent
-  string preview_secret = 21;           // section 4.21: a detour's secret, which a preview must carry as RELEASE.SECRET; empty for any other release
+  string preview_secret = 21;           // section 4.22: the release's secret, which a preview must carry as RELEASE.SECRET; a detour's is its run's (section 4.21); empty where nothing is previewed
   repeated string detour_paths = 22;    // section 4.21: the client URL paths a detour takes requests under, without a trailing slash; every path when empty
   bool sticky = 23;                     // section 9.4: replaced, and kept for the clients whose sticky cookie names it, which reaches it though no policy shares to it (issue 955)
 }

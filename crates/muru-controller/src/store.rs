@@ -3,7 +3,7 @@
 //! 10.2). Every access goes through one connection behind a mutex; the
 //! store is small and the reconciler is the only writer.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -197,7 +197,7 @@ CREATE TABLE IF NOT EXISTS log_files_seen (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// The store.
 pub struct Store {
@@ -214,6 +214,7 @@ impl Store {
         connection.execute_batch(SCHEMA)?;
         add_identity_columns(&connection)?;
         number_releases(&connection)?;
+        give_preview_secrets(&connection)?;
 
         // Version 1 had applications, releases and events; version 2
         // added hosts and routes and version 3 the event sink cursors,
@@ -241,7 +242,8 @@ impl Store {
         // the application's data directory and its parts are (issue 849),
         // added to an older table here, and version 22 the number of each
         // release (issue 948), given here to the releases of an older
-        // store.
+        // store, and version 23 the preview secret of each release
+        // (issue 928), given here to the releases that have none.
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -390,7 +392,28 @@ impl Store {
         self.with(|connection| {
             connection.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
             Ok(())
-        })
+        })?;
+
+        // Section 4.22: a copy is made to be looked at elsewhere, so it
+        // leaves out the releases' preview secrets, and is rebuilt so that
+        // no page of the file still holds one. A daemon started on a copy
+        // gives its releases new ones.
+
+        let copy = Connection::open(path)?;
+        let has_secrets = copy
+            .prepare("PRAGMA table_info(releases)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|column| column == "preview_secret");
+
+        if has_secrets {
+            copy.pragma_update(None, "journal_mode", "DELETE")?;
+            copy.pragma_update(None, "secure_delete", "ON")?;
+            copy.execute("UPDATE releases SET preview_secret = NULL", [])?;
+            copy.execute("VACUUM", [])?;
+        }
+
+        Ok(())
     }
 
     /// What the store holds that breaks a rule of Muru's own, each rule
@@ -478,6 +501,7 @@ impl Store {
         connection.execute_batch(SCHEMA)?;
         add_identity_columns(&connection)?;
         number_releases(&connection)?;
+        give_preview_secrets(&connection)?;
         connection.execute("INSERT INTO schema (version) VALUES (?1)", [SCHEMA_VERSION])?;
 
         Ok(Self {
@@ -750,26 +774,81 @@ impl Store {
     ) -> Result<Release, StoreError> {
         let encoded =
             toml::to_string(spec).map_err(|error| StoreError::Decode(error.to_string()))?;
+        let secret = new_preview_secret()?;
         self.with(|connection| {
             // The release's number (section 13.8, issue 948): the next of
             // a count that only goes up, so a number never names two
-            // releases of a store, whatever was removed in between.
+            // releases of a store, whatever was removed in between. Its
+            // preview secret (section 4.22) is made with it and kept for
+            // as long as the record is.
 
             connection.execute("UPDATE release_numbers SET last = last + 1", [])?;
             connection.execute(
-                "INSERT INTO releases (app, id, spec, state, created_unix_ms, number) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, (SELECT last FROM release_numbers))",
+                "INSERT INTO releases \
+                 (app, id, spec, state, created_unix_ms, number, preview_secret) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, (SELECT last FROM release_numbers), ?6)",
                 params![
                     app,
                     id,
                     encoded,
                     ReleaseState::Pending.as_str(),
-                    now_unix_ms() as i64
+                    now_unix_ms() as i64,
+                    secret
                 ],
             )?;
             Ok(())
         })?;
         self.release(app, id)
+    }
+
+    /// A release's preview secret (section 4.22). It is kept apart from
+    /// the release's record, which commands print and bundles carry, so
+    /// that nothing shows it but a preview that was asked for.
+    pub fn preview_secret(&self, app: &str, id: &str) -> Result<String, StoreError> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT preview_secret FROM releases WHERE app = ?1 AND id = ?2",
+                    [app, id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+                .ok_or_else(|| StoreError::NotFound(format!("release {app}@{id}")))
+        })
+    }
+
+    /// Every release's preview secret, by application and release, for
+    /// the snapshot.
+    pub fn preview_secrets(&self) -> Result<HashMap<(String, String), String>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT app, id, preview_secret FROM releases WHERE preview_secret IS NOT NULL",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(((row.get(0)?, row.get(1)?), row.get::<_, String>(2)?))
+            })?;
+            rows.collect::<Result<_, _>>().map_err(StoreError::from)
+        })
+    }
+
+    /// Give a release a new preview secret, so that every link, cookie
+    /// and header made with the old one stops previewing it.
+    pub fn renew_preview_secret(&self, app: &str, id: &str) -> Result<String, StoreError> {
+        let secret = new_preview_secret()?;
+        self.with(|connection| {
+            let changed = connection.execute(
+                "UPDATE releases SET preview_secret = ?1 WHERE app = ?2 AND id = ?3",
+                params![secret, app, id],
+            )?;
+
+            if changed == 0 {
+                return Err(StoreError::NotFound(format!("release {app}@{id}")));
+            }
+
+            Ok(())
+        })?;
+        Ok(secret)
     }
 
     /// The next generated release id for an application: r1, r2, ...
@@ -1941,8 +2020,36 @@ fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
         &[
             ("declared", "INTEGER NOT NULL DEFAULT 0"),
             ("number", "INTEGER"),
+            ("preview_secret", "TEXT"),
         ],
     )
+}
+
+/// Give a preview secret to every release that has none (version 23,
+/// issue 928): the releases of an older store, and those of a copy made
+/// by `muructl doctor store --copy`, which leaves the secrets out.
+fn give_preview_secrets(connection: &Connection) -> Result<(), StoreError> {
+    let without: Vec<i64> = {
+        let mut statement =
+            connection.prepare("SELECT rowid FROM releases WHERE preview_secret IS NULL")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+
+    for row in without {
+        connection.execute(
+            "UPDATE releases SET preview_secret = ?1 WHERE rowid = ?2",
+            params![new_preview_secret()?, row],
+        )?;
+    }
+
+    Ok(())
+}
+
+/// A new preview secret, or why the store cannot record a release
+/// without one.
+fn new_preview_secret() -> Result<String, StoreError> {
+    crate::detours::secret().map_err(StoreError::Decode)
 }
 
 /// Give every release a number (version 22, issue 948): the count the
@@ -2526,6 +2633,25 @@ pub(crate) mod tests {
         assert_eq!(copied.release("shop", "r1").unwrap().number, 1);
         assert!(copied.integrity().unwrap().is_empty());
 
+        // The copy holds no release's preview secret, in its rows or in
+        // the bytes of its file, and a daemon that opens it gives each a
+        // new one.
+
+        let secret = Store::open_read_only(&path)
+            .unwrap()
+            .preview_secret("shop", "r1")
+            .unwrap();
+        assert!(copied.preview_secret("shop", "r1").is_err());
+        drop(copied);
+        let bytes = std::fs::read(&copy).unwrap();
+        assert!(
+            !bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes())
+        );
+        let opened = Store::open(&copy).unwrap();
+        assert_ne!(opened.preview_secret("shop", "r1").unwrap(), secret);
+
         // A copy never replaces a file that is there.
 
         assert!(
@@ -2552,6 +2678,62 @@ pub(crate) mod tests {
         let third = store.create_release("blog", "r2", &spec()).unwrap();
         assert_eq!(third.number, 3);
         assert_eq!(store.releases(None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_release_keeps_its_preview_secret_until_it_is_given_a_new_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("muru.sqlite");
+
+        let (first, second) = {
+            let store = Store::open(&path).unwrap();
+            store.ensure_app("shop").unwrap();
+            store.create_release("shop", "r1", &spec()).unwrap();
+            store.create_release("shop", "r2", &spec()).unwrap();
+            (
+                store.preview_secret("shop", "r1").unwrap(),
+                store.preview_secret("shop", "r2").unwrap(),
+            )
+        };
+
+        // 128 bits in hexadecimal, each release its own.
+
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+
+        // A store opened again holds the same secrets, and one from
+        // before releases had them gives a secret to each that has none.
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.preview_secret("shop", "r1").unwrap(), first);
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE releases SET preview_secret = NULL WHERE id = 'r2'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.preview_secret("shop", "r1").unwrap(), first);
+        let given = store.preview_secret("shop", "r2").unwrap();
+        assert!(given.len() == 32 && given != second);
+
+        // A new secret replaces the old, for that release alone, and the
+        // release's record carries no secret to print.
+
+        let renewed = store.renew_preview_secret("shop", "r1").unwrap();
+        assert_ne!(renewed, first);
+        assert_eq!(store.preview_secret("shop", "r1").unwrap(), renewed);
+        assert_eq!(store.preview_secret("shop", "r2").unwrap(), given);
+        assert_eq!(store.preview_secrets().unwrap().len(), 2);
+        assert!(store.renew_preview_secret("shop", "r9").is_err());
+        assert!(store.preview_secret("shop", "r9").is_err());
+        let record = format!("{:?}", store.release("shop", "r1").unwrap());
+        assert!(!record.contains(&renewed));
     }
 
     #[test]

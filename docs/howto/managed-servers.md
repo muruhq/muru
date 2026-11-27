@@ -269,6 +269,7 @@ $ muructl deploy legacy /srv/legacy --server gunicorn -- gunicorn legacy.wsgi:ap
 muru: release legacy@r1 is ready and serving
 $ muructl deploy legacy /srv/legacy --hold
 muru: release legacy@r2 is ready and held: not serving
+muru: muructl preview legacy@r2 opens a preview of it
 $ muructl rollout canary legacy@r2 --steps 5,25,50 --hold 10m --wait
 muru: rollout 1 promoted: every step passed its gates
 $ muructl drain legacy@r1
@@ -276,7 +277,7 @@ $ muructl drain legacy@r1
 
 The first release runs the deployment as it is. The second is the same
 application on Muru's workers, held without traffic and checked through a
-preview. The [canary](rollouts.md) moves clients to it step by step,
+[preview](traffic.md#previews). The [canary](rollouts.md) moves clients to it step by step,
 judged against the gunicorn release, and rolls back to it when a gate
 fails. Once promoted, the gunicorn release drains and is kept warm until
 it is drained for good, and nothing in the application's routes or hosts

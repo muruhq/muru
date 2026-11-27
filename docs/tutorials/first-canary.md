@@ -53,6 +53,7 @@ muructl deploy hello v4 --hold
 
 ```
 muru: release hello@r4 is ready and held: not serving
+muru: muructl preview hello@r4 opens a preview of it
 ```
 
 Every request still goes to `r1`.
@@ -155,19 +156,22 @@ muructl rollout canary hello@r5 --steps 10,50 --hold 30s --approve-each-step
 
 ## Check it yourself
 
-While the candidate has its 10%, you can reach it on purpose. The
-`Muru-Preview` header names a release, and a request that carries it
-goes to that release whatever share it has:
+While the candidate has its 10%, you can reach it on purpose. A request
+that carries the release's `Muru-Preview` header goes to that release
+whatever share it has, and `muructl preview --header` prints the header:
 
 ```
-curl -H 'Muru-Preview: r5' http://127.0.0.1:8080/
+curl -H "$(muructl preview hello@r5 --header)" http://127.0.0.1:8080/
 ```
 
 ```
 Howdy from hello@r5
 ```
 
-A `muru_preview=r5` cookie does the same in a browser.
+The header carries the release's ID and a secret the daemon keeps for
+it, so nobody reaches a release by guessing its ID. `muructl preview
+hello@r5` on its own opens the release in a browser, which gets a cookie
+that does the same.
 
 ## Approve the next step
 

@@ -201,28 +201,34 @@ service Admin {
   // Change what a detour takes: preview, all, share=N or class=NAME,
   // until changed or until a time, when it takes preview again.
   rpc SetDetourTraffic(SetDetourTrafficRequest) returns (Detour);
-  // One-time entry links to a detour's preview, valid for a minute, and
-  // the Muru-Preview header value.
-  rpc PreviewDetour(PreviewDetourRequest) returns (DetourPreview);
+  // One-time entry links to a release's preview, a detour's or any
+  // other release the edge routes to, and the Muru-Preview header value.
+  // Nothing else the API answers carries a release's preview secret.
+  rpc PreviewRelease(PreviewReleaseRequest) returns (ReleasePreview);
 }
 
-message PreviewDetourRequest {
+message PreviewReleaseRequest {
   string app = 1;
-  string release = 2;
+  string release = 2;               // the release, a detour's ID or `detour` for the application's one detour; when empty, the application's open detour, else its one held release
   string host = 3;                  // a link for this host alone; the best address when empty
   bool all = 4;                     // a link for each of the application's addresses
   string name = 5;                  // the name to build the links from, which a host routing the application must take; its own names when empty
+  uint64 valid_for_ms = 6;          // how long the links last, at most an hour; a minute when 0
+  bool new_secret = 7;              // give the release a new preview secret first, so every link, cookie and header made before stops previewing it
 }
 
-message DetourPreview {
-  repeated DetourLink links = 1;    // best first; none when the application has no address
+message ReleasePreview {
+  repeated PreviewLink links = 1;   // best first; none when the application has no address
   string header = 2;                // the Muru-Preview header's value, RELEASE.SECRET, always given
   uint32 others = 3;                // the application's addresses no link was made for
   string unreachable = 4;           // why there are no links, when there are none
+  string app = 5;                   // the application previewed
+  string release = 6;               // the release previewed, as chosen when the request named none
+  uint64 valid_for_ms = 7;          // how long the links last
 }
 
-message DetourLink {
-  string url = 1;                   // the entry link
+message PreviewLink {
+  string url = 1;                   // the entry link, which works once
   string address = 2;               // where it leads
   string name = 3;                  // the name in it
   string bound = 4;                 // the address the listener it reaches is bound on

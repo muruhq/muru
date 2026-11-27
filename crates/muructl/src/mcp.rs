@@ -1250,35 +1250,48 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "detours",
-            description: "The daemon's detours, development runs it routes to as releases of an application while they run: list them, or give a one-time entry link to one's preview (link), valid for a minute, which a browser follows to get the preview cookie, with the Muru-Preview header value (header) for a client that sends headers instead.",
+            description: "The daemon's detours, development runs it routes to as releases of an application while they run: list them. The preview tool gives a link to one's preview.",
             changes: false,
             properties: json!({
-                "action": {"type": "string", "enum": ["list", "link"]},
-                "detour": {"type": "string", "description": "For link: the detour, by its release, application, label, tag or the start of its ID; the project's application's, or the one open, when left out"},
-                "host": {"type": "string", "description": "For link: one of the application's hosts, in place of its best address"},
-                "name": {"type": "string", "description": "For link: the name to build the link from, one of the names or patterns of a host that routes the application, as for a host whose names are all wildcards"},
+                "action": {"type": "string", "enum": ["list"]},
             }),
             required: &["action"],
             command: |arguments| match needed(arguments, "action")?.as_str() {
                 "list" => Ok(words(&["detour", "list"])),
-                "link" => {
-                    let mut command = words(&["detour", "preview", "--print"]);
+                other => Err(format!("{other:?} is not list")),
+            },
+        },
+        Spec {
+            name: "preview",
+            description: "Preview a release before it takes traffic, a detour or any release the daemon routes to (the serving one, one a traffic policy names, one deployed with --hold): a one-time entry link, valid for a minute unless valid_for says longer, which a browser follows to get the preview cookie, with the Muru-Preview header value (header) for a client that sends headers instead. The header value holds the release's preview secret: give it only to what should see the release.",
+            changes: false,
+            properties: json!({
+                "target": {"type": "string", "description": "The release as APP@RELEASE, an application (its open detour, else its one held release), or a detour by its release, label, tag or the start of its ID; the project's application, or the one detour open, when left out"},
+                "host": {"type": "string", "description": "One of the application's hosts, in place of its best address"},
+                "name": {"type": "string", "description": "The name to build the link from, one of the names or patterns of a host that routes the application, as for a host whose names are all wildcards"},
+                "valid_for": {"type": "string", "description": "How long the link can be used for, once, such as 10m; at most 1h"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["preview", "--print"]);
 
-                    if let Some(detour) = text(arguments, "detour") {
-                        command.push(detour);
-                    }
-
-                    if let Some(host) = text(arguments, "host") {
-                        command.extend(["--host".to_owned(), host]);
-                    }
-
-                    if let Some(name) = text(arguments, "name") {
-                        command.extend(["--name".to_owned(), name]);
-                    }
-
-                    Ok(command)
+                if let Some(target) = text(arguments, "target") {
+                    command.push(target);
                 }
-                other => Err(format!("{other:?} is not list or link")),
+
+                if let Some(host) = text(arguments, "host") {
+                    command.extend(["--host".to_owned(), host]);
+                }
+
+                if let Some(name) = text(arguments, "name") {
+                    command.extend(["--name".to_owned(), name]);
+                }
+
+                if let Some(valid_for) = text(arguments, "valid_for") {
+                    command.extend(["--valid-for".to_owned(), valid_for]);
+                }
+
+                Ok(command)
             },
         },
         Spec {
@@ -2177,17 +2190,22 @@ mod tests {
         );
         assert_eq!(
             command(
-                "detours",
-                json!({"action": "link", "detour": "feature-x", "host": "shop.localhost"})
+                "preview",
+                json!({"target": "shop@r2", "host": "shop.localhost", "valid_for": "10m"})
             ),
             Ok(vec![
-                "detour".into(),
                 "preview".into(),
                 "--print".into(),
-                "feature-x".into(),
+                "shop@r2".into(),
                 "--host".into(),
-                "shop.localhost".into()
+                "shop.localhost".into(),
+                "--valid-for".into(),
+                "10m".into()
             ])
+        );
+        assert_eq!(
+            command("preview", json!({})),
+            Ok(vec!["preview".into(), "--print".into()])
         );
         assert_eq!(
             command("detour_traffic", json!({"traffic": "all"})),

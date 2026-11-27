@@ -44,8 +44,8 @@ release (a route with a `name` goes by it), and `muructl scale status` the same 
 
 A share can go to an [HTTP upstream](upstreams.md) instead of a release,
 named `upstream:NAME` in `split`. Its buckets sit below the releases'
-ranges, and the sticky and preview cookies name it the same way. Either
-cookie reaches an upstream only through a route whose policy names it.
+ranges, and the sticky cookie names it the same way, reaching it only
+through a route whose policy names it.
 
 ## The key
 
@@ -92,29 +92,105 @@ with a message saying so.
 ## Previews
 
 A release with a share of `0` takes no ordinary traffic but can still be
-reached by name, which is how a release is checked before it gets a
-share:
+previewed, which is how a release is checked before it gets a share:
 
 ```toml
 [route.traffic]
 split = { r2 = 0 }
 ```
 
-A request carrying the `Muru-Preview: r2` header or a `muru_preview=r2`
-cookie goes to `r2` whatever the policy says, as long as `r2` is one of
-the route's releases. The serving release can be previewed the same way,
-which is useful while a split sends most clients elsewhere.
+`muructl preview` opens a release in the browser:
+
+```console
+$ muructl preview shop@r2
+muru: opened https://shop.example.com/ in preview of shop@r2
+```
+
+It opens a one-time entry link. Following the link gives the browser
+the `muru_preview` cookie and sends it on to the application's address,
+and from then on that browser's requests go to `r2` whatever the policy
+says, while every other client is routed as before. The cookie lasts
+until the browser closes or you leave preview, at `/_muru/preview/leave`
+on any of the application's hosts.
+
+```console
+$ muructl preview shop@r2 --print             # print a link, open nothing
+$ muructl preview shop@r2 --host admin.example.com
+$ muructl preview shop@r2 --list              # a link for each of the application's addresses
+$ muructl preview shop@r2 --name alice.shop.example.com
+$ muructl preview shop@r2 --valid-for 30m --print
+$ muructl preview shop@r2 --header
+Muru-Preview: r2.3f9c0e7a51b2d4c68e1f0a9b7c5d3e21
+```
+
+A link works once, within a minute, or within the time `--valid-for`
+gives, up to an hour, which is for a link sent to somebody else. The
+links are for the addresses `muructl open` gives the application, and
+only for names that reach this machine unless `--any-name` keeps the
+others; `--name` builds the link from a name of your choosing, which
+must reach a host that routes the application.
+
+`--header` prints the `Muru-Preview` header, which previews the release
+without a cookie, for curl or a test client:
+
+```console
+$ curl -H "$(muructl preview shop@r2 --header)" https://shop.example.com/
+```
+
+The target is a release as `APP@RELEASE`. An application alone means its
+open [detour](detours.md), or else its one release deployed with
+`--hold`, and with no target the application is the project's, as its
+`pyproject.toml` or `muru.toml` names it. When that leaves more than one
+release, or none, the command lists the releases to choose from.
+
+### The preview secret
+
+A preview is the release's ID and its preview secret together, as
+`r2.3f9c0e7a51b2d4c68e1f0a9b7c5d3e21` above, in the header or the
+cookie. The daemon makes the secret, 128 random bits, when the release
+is first recorded, and keeps it for as long as the release exists,
+across restarts and applies. Knowing the release's ID is not enough to
+see it: `Muru-Preview: r2` previews nothing.
+
+A preview that is not honoured, because the secret is wrong or missing
+or the route has no such release, is answered in one way whatever was
+wrong with it: the request is routed as usual, the response carries the
+header `muru-preview: ignored`, and a `muru_preview` cookie that is no
+release's is removed by the response.
+
+The secret is shown only by `muructl preview`. It is not in `muructl
+release list` or `release show`, in events, logs or the access log, in a
+[debug bundle](debugging.md) or in a copy of the state store. The edge
+takes the `Muru-Preview` header and the `muru_preview` cookie off every
+request before it reaches the application or an upstream, so the
+application never sees them.
+
+Treat a `--header` value, and a link until it is used, as you would a
+password for the release. `--new-secret` gives the release a new secret,
+after which every link, cookie and header given out before previews
+nothing:
+
+```console
+$ muructl preview shop@r2 --new-secret --print
+muru: shop@r2 has a new preview secret: links, cookies and headers given out before no longer preview it
+https://shop.example.com/_muru/preview/8c1f5e0a9b7d4c63f2e1a0b9c8d7e6f5
+```
+
+### What can be previewed
 
 Only releases the edge routes can be previewed: the serving release, a
 release named in the route's policy and a release deployed with `--hold`,
-which is the way to try one before it takes traffic. A retained release
-keeps its workers for a rollback and takes no requests, so it cannot be
-previewed. A preview naming a release the route does not have is ignored,
-the request is routed as usual, and the response carries the header
-`muru-preview: ignored`.
+which is the way to try one before it takes traffic. The serving release
+can be previewed too, which is useful while a split sends most clients
+elsewhere. A retained release keeps its workers for a rollback and takes
+no requests, so it cannot be previewed, and `muructl preview` says so.
+An upstream cannot be previewed: give it a client class of your own in
+the policy's `classes` to try it before it has a share (see
+[Cohorts](#cohorts)).
 
-The preview header is not an `X-Muru-` header, so it is not among the
-headers the edge removes from requests.
+The daemon's edge answers paths under `/_muru/preview/` itself, on every
+host: an entry link, and `leave`. An application's own route under that
+path is not reached.
 
 ## Cohorts
 

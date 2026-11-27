@@ -1071,7 +1071,7 @@ impl Admin for Service {
                     .split(' ')
                     .any(|word| word.ends_with('%') && word != "0%");
 
-                if shared && message.message == "held: not serving" {
+                if shared && message.message.starts_with(crate::daemon::HELD) {
                     message.message.clear();
                 }
 
@@ -2465,15 +2465,15 @@ impl Admin for Service {
         Ok(Response::new(detour))
     }
 
-    async fn preview_detour(
+    async fn preview_release(
         &self,
-        request: Request<pb::PreviewDetourRequest>,
-    ) -> Result<Response<pb::DetourPreview>, Status> {
+        request: Request<pb::PreviewReleaseRequest>,
+    ) -> Result<Response<pb::ReleasePreview>, Status> {
         let request = request.into_inner();
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
             .commands
-            .send(Command::PreviewDetour {
+            .send(Command::PreviewRelease {
                 request,
                 done: done_tx,
             })

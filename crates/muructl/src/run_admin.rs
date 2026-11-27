@@ -2235,7 +2235,7 @@ impl Admin for Service {
         preview_overlay(pb::PreviewOverlayRequest) -> pb::PreviewOverlayResponse, "muructl overlay";
         list_detours(pb::ListDetoursRequest) -> pb::ListDetoursResponse, "muructl detour";
         set_detour_traffic(pb::SetDetourTrafficRequest) -> pb::Detour, "muructl detour traffic";
-        preview_detour(pb::PreviewDetourRequest) -> pb::DetourPreview, "muructl detour preview";
+        preview_release(pb::PreviewReleaseRequest) -> pb::ReleasePreview, "muructl preview";
     }
 }
 

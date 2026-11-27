@@ -34,9 +34,6 @@ pub enum DetourCommand {
     /// Change what a detour takes while it runs: preview, all, share=N or class=NAME.
     Traffic(TrafficArgs),
 
-    /// Open a one-time entry link to a detour's preview in the browser, or print it.
-    Preview(PreviewArgs),
-
     /// List the daemon's open detours.
     List(ListArgs),
 }
@@ -48,52 +45,6 @@ pub struct ListArgs {
     output: crate::admin::JsonArgs,
 
     /// Which daemon's detours.
-    #[command(flatten)]
-    socket: SocketArgs,
-}
-
-/// `muructl detour preview`.
-#[derive(Args)]
-pub struct PreviewArgs {
-    /// The detour: its release, its application, its label, the tag
-    /// muructl instance list shows or a prefix of its ID (default: the
-    /// project's application, else the one detour open).
-    #[arg(value_name = "DETOUR")]
-    detour: Option<String>,
-
-    /// A link for this host of the application's, in place of its best
-    /// address.
-    #[arg(long, value_name = "HOST", conflicts_with = "list")]
-    host: Option<String>,
-
-    /// Print a link for each of the application's addresses, and open
-    /// none.
-    #[arg(long)]
-    list: bool,
-
-    /// Print the link, and open nothing.
-    #[arg(long)]
-    print: bool,
-
-    /// Print the Muru-Preview header that previews the detour without a
-    /// cookie, for curl or a test client.
-    #[arg(long, conflicts_with_all = ["list", "print", "host", "name"])]
-    header: bool,
-
-    /// Build the link from this name, which must be one of the names or
-    /// patterns of a host that routes the application, such as one name
-    /// of a host whose names are all wildcards.
-    #[arg(long, value_name = "NAME")]
-    name: Option<String>,
-
-    /// Keep names that resolve to another machine.
-    #[arg(long)]
-    any_name: bool,
-
-    #[command(flatten)]
-    output: crate::admin::JsonArgs,
-
-    /// Which daemon the detour is open on.
     #[command(flatten)]
     socket: SocketArgs,
 }
@@ -509,7 +460,7 @@ pub async fn run(args: DetourRunArgs) -> anyhow::Result<()> {
 }
 
 /// The daemon's open detours.
-async fn listed(
+pub(crate) async fn listed(
     client: &mut muru_proto::admin::v1::admin_client::AdminClient<tonic::transport::Channel>,
 ) -> anyhow::Result<Vec<pb::Detour>> {
     Ok(client
@@ -694,186 +645,6 @@ pub fn ending(until_unix_ms: u64) -> String {
     }
 }
 
-/// Ask the daemon for entry links to a detour's preview.
-async fn mint(
-    client: &mut muru_proto::admin::v1::admin_client::AdminClient<tonic::transport::Channel>,
-    detour: &pb::Detour,
-    host: Option<&str>,
-    all: bool,
-    name: Option<&str>,
-) -> anyhow::Result<pb::DetourPreview> {
-    Ok(client
-        .preview_detour(pb::PreviewDetourRequest {
-            app: detour.app.clone(),
-            release: detour.release.clone(),
-            host: host.unwrap_or_default().to_owned(),
-            all,
-            name: name.unwrap_or_default().to_owned(),
-        })
-        .await
-        .map_err(crate::admin::explain)?
-        .into_inner())
-}
-
-/// The entry links whose names reach this machine, as `muructl open`
-/// checks its URLs, with why each name left out was (issue 908); every
-/// link with `any_name`.
-fn reachable_links(
-    preview: &pb::DetourPreview,
-    any_name: bool,
-) -> (Vec<pb::DetourLink>, Vec<String>) {
-    let choices = preview
-        .links
-        .iter()
-        .map(|link| crate::open::Choice {
-            url: link.url.clone(),
-            scheme: String::new(),
-            name: link.name.clone(),
-            bound: link.bound.clone(),
-            route: String::new(),
-            host: String::new(),
-            why: link.address.clone(),
-        })
-        .collect();
-    let (kept, left_out) = crate::open::reachable_here(choices, any_name);
-    let links = kept
-        .into_iter()
-        .filter_map(|choice| {
-            preview
-                .links
-                .iter()
-                .find(|link| link.url == choice.url)
-                .cloned()
-        })
-        .collect();
-
-    (links, left_out)
-}
-
-/// The link to open: the first whose name reaches this machine, or why
-/// there is none.
-fn chosen_link(
-    preview: &pb::DetourPreview,
-    any_name: bool,
-) -> anyhow::Result<(pb::DetourLink, usize)> {
-    if preview.links.is_empty() {
-        anyhow::bail!(
-            "{}; muructl detour preview --header gives the header that previews it",
-            preview.unreachable
-        );
-    }
-
-    let (links, left_out) = reachable_links(preview, any_name);
-
-    match links.first() {
-        Some(link) => Ok((link.clone(), links.len() - 1)),
-        None => anyhow::bail!(
-            "none of the application's names reaches this machine: {}; pass --name with one \
-             that does, or --any-name to keep them",
-            left_out.join("; ")
-        ),
-    }
-}
-
-/// Open an entry link in the browser, saying where it leads and how
-/// many other addresses there are.
-fn open_link(link: &pb::DetourLink, others: usize, detour: &str) {
-    let others = match others {
-        0 => String::new(),
-        1 => " (1 other address: muructl detour preview --list)".to_owned(),
-        count => format!(" ({count} other addresses: muructl detour preview --list)"),
-    };
-
-    muru_common::muru_println!("opened {} in preview of {detour}{others}", link.address);
-    let url = link.url.clone();
-    std::thread::spawn(move || crate::browser::open(&url));
-}
-
-/// Run `muructl detour preview`.
-pub async fn preview(args: PreviewArgs) -> anyhow::Result<()> {
-    let mut client = muru_controller::client::connect(&args.socket.endpoint()?).await?;
-    let detours = listed(&mut client).await?;
-    let detour = chosen(args.detour.as_deref(), &detours)?.clone();
-    let name = format!("{}@{}", detour.app, detour.release);
-
-    // Every address's link is asked for, so the first whose name reaches
-    // this machine can be chosen; a host asked for gives its one.
-
-    let preview = mint(
-        &mut client,
-        &detour,
-        args.host.as_deref(),
-        args.host.is_none(),
-        args.name.as_deref(),
-    )
-    .await?;
-
-    // An agent or a script is given the header and the link chosen, or
-    // every link that reaches this machine with --list, or why there is
-    // none, and opens nothing.
-
-    if args.output.json {
-        let mut answer = preview.clone();
-
-        if !answer.links.is_empty() {
-            let (links, left_out) = reachable_links(&preview, args.any_name);
-            answer.others = u32::try_from(links.len().saturating_sub(1)).unwrap_or(u32::MAX);
-            answer.links = if args.list {
-                links
-            } else {
-                links.into_iter().take(1).collect()
-            };
-
-            if answer.links.is_empty() {
-                answer.unreachable = format!(
-                    "none of the application's names reaches this machine: {}",
-                    left_out.join("; ")
-                );
-            }
-        }
-
-        return crate::admin::print_answer(&answer);
-    }
-
-    if args.header {
-        println!("Muru-Preview: {}", preview.header);
-        return Ok(());
-    }
-
-    if args.list {
-        anyhow::ensure!(
-            !preview.links.is_empty(),
-            "{}; muructl detour preview --header gives the header that previews it",
-            preview.unreachable
-        );
-        let (links, left_out) = reachable_links(&preview, args.any_name);
-
-        for link in &links {
-            println!("{}  {}", link.url, link.address);
-        }
-
-        for left in left_out {
-            println!("left out: {left}");
-        }
-
-        return Ok(());
-    }
-
-    let (link, others) = chosen_link(&preview, args.any_name)?;
-
-    if args.print {
-        println!("{}", link.url);
-        return Ok(());
-    }
-
-    open_link(&link, others, &name);
-
-    // The browser is given a moment to start before muructl exits.
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    Ok(())
-}
-
 /// `--open-preview`: an entry link for the detour just opened, in the
 /// browser.
 pub async fn open_preview(
@@ -886,12 +657,15 @@ pub async fn open_preview(
         return Ok(());
     };
 
-    let mut client =
-        muru_controller::client::connect(&muru_controller::client::Endpoint::unix(daemon)).await?;
-    let preview = mint(&mut client, detour, None, true, name_asked).await?;
-    let (link, others) = chosen_link(&preview, any_name)?;
-    open_link(&link, others, &name(opened));
-    Ok(())
+    let endpoint = muru_controller::client::Endpoint::unix(daemon);
+    crate::preview::open_for(
+        &endpoint,
+        &detour.app,
+        &detour.release,
+        name_asked,
+        any_name,
+    )
+    .await
 }
 
 /// Bind the detour's socket in the run's directory, before anything
