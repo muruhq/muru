@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::edges::{EdgeProcess, EdgeSpec};
 use crate::events::Events;
-use crate::host::{HostControl, HostMessage, WorkerReply};
+use crate::host::{ControlEvent, HostControl, HostMessage, WorkerReply};
 use crate::host::{HostProcess, HostSpec};
 use crate::locations::{HostDirs, Locations};
 use crate::logs::Logs;
@@ -15366,19 +15366,13 @@ fn size_scalers(
     }
 }
 
-/// How long the daemon waits before it tries a host's control socket
-/// again, when the host is still there and a connection could not be made.
-const CONTROL_RETRY: Duration = Duration::from_secs(1);
-
 /// Keep a control connection to a release's host for as long as the
-/// release runs under it (section 5.9, issue 983): connect, hand the
-/// connection to the daemon, feed what the host says into the daemon's
-/// inbox, and when the connection ends ask the daemon whether the host
-/// is still the release's, connecting again if so. A host closes the
-/// connection when a send to its supervisor fails or does not complete,
-/// which a daemon that was stalled causes; the host sends its state and
-/// the events it held to whoever connects next. `made` is a connection
-/// already up, with what the host has said on it so far.
+/// release runs under it (section 5.9, issue 983), with
+/// `host::keep_control`: what the host says goes into the daemon's
+/// inbox, and when the connection ends the daemon is asked whether the
+/// host, by its pid, is still the release's, and the connection is made
+/// again if so. `made` is a connection already up, with what the host
+/// has said on it so far.
 async fn keep_control(
     commands: mpsc::Sender<Command>,
     app: String,
@@ -15387,120 +15381,54 @@ async fn keep_control(
     path: PathBuf,
     made: Option<(Vec<HostMessage>, mpsc::Receiver<HostMessage>)>,
 ) {
-    let mut made = made;
-    let mut again = false;
+    let wrap = move |event| match event {
+        ControlEvent::Attached { control, again } => {
+            if again {
+                tracing::info!(
+                    "release {app}@{id}: the host control connection ended and was made again"
+                );
+            }
 
-    loop {
-        let connected = match made.take() {
-            Some(made) => Some(made),
-            None => match HostControl::connect(&path).await {
-                Ok((control, messages)) => {
-                    let attached = commands
-                        .send(Command::HostAttached {
-                            app: app.clone(),
-                            id: id.clone(),
-                            control,
-                        })
-                        .await;
-
-                    if attached.is_err() {
-                        return;
-                    }
-
-                    if again {
-                        tracing::info!(
-                            "release {app}@{id}: the host control connection ended and was made again"
-                        );
-                    }
-
-                    Some((Vec::new(), messages))
-                }
-                // A host that has just exited closes its connection a
-                // moment before the daemon knows it has gone, so only a
-                // first connection that fails is worth a line.
-                Err(error) if again => {
-                    tracing::debug!(%error, "release {app}@{id}: no host control connection");
-                    None
-                }
-                Err(error) => {
-                    tracing::info!(%error, "release {app}@{id}: no host control connection");
-                    None
-                }
-            },
-        };
-
-        let failed = connected.is_none();
-
-        if let Some((sent, messages)) = connected
-            && !forward_host_messages(&commands, &app, &id, sent, messages).await
-        {
-            return;
+            Command::HostAttached {
+                app: app.clone(),
+                id: id.clone(),
+                control,
+            }
         }
+        ControlEvent::Message(message) => Command::HostMessage {
+            app: app.clone(),
+            id: id.clone(),
+            message: *message,
+        },
+        ControlEvent::Ended {
+            failed,
+            again,
+            answer,
+        } => {
+            // A host that has just exited closes its connection a
+            // moment before the daemon knows it has gone, so only a
+            // first connection that fails is worth a line.
 
-        // The connection ended, or none could be made. The daemon says
-        // whether the release still runs under this host.
+            match failed {
+                Some(error) if again => {
+                    tracing::debug!(%error, "release {app}@{id}: no host control connection");
+                }
+                Some(error) => {
+                    tracing::info!(%error, "release {app}@{id}: no host control connection");
+                }
+                None => {}
+            }
 
-        let (answer, answered) = oneshot::channel();
-        let asked = commands
-            .send(Command::HostDetached {
+            Command::HostDetached {
                 app: app.clone(),
                 id: id.clone(),
                 pid,
                 again: answer,
-            })
-            .await;
-
-        if asked.is_err() || !answered.await.unwrap_or(false) {
-            return;
+            }
         }
+    };
 
-        again = true;
-
-        if failed {
-            tokio::time::sleep(CONTROL_RETRY).await;
-        }
-    }
-}
-
-/// Pass a host's messages to the daemon's inbox, those already taken
-/// from the connection first, until the connection ends. Returns whether
-/// the daemon is still there to take them.
-async fn forward_host_messages(
-    commands: &mpsc::Sender<Command>,
-    app: &str,
-    id: &str,
-    sent: Vec<HostMessage>,
-    mut messages: mpsc::Receiver<HostMessage>,
-) -> bool {
-    for message in sent {
-        let forwarded = commands
-            .send(Command::HostMessage {
-                app: app.to_owned(),
-                id: id.to_owned(),
-                message,
-            })
-            .await;
-
-        if forwarded.is_err() {
-            return false;
-        }
-    }
-
-    while let Some(message) = messages.recv().await {
-        let forwarded = commands
-            .send(Command::HostMessage {
-                app: app.to_owned(),
-                id: id.to_owned(),
-                message,
-            })
-            .await;
-
-        if forwarded.is_err() {
-            return false;
-        }
-    }
-
-    true
+    crate::host::keep_control(commands, path, made, wrap).await;
 }
 
 /// Section 7.4: the scaling state of each group of a release that is

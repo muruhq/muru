@@ -14,7 +14,7 @@ use anyhow::Context as _;
 use muru_common::log::{Gathered, Stream, Traceback};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::locations::HostDirs;
 use crate::logs::Logs;
@@ -759,6 +759,123 @@ impl HostControl {
             "args": args,
         });
         let _ = self.outgoing.send(format!("{message}\n"));
+    }
+}
+
+/// How long a supervisor waits before it tries a host's control socket
+/// again, when the host is still there and a connection could not be made.
+const CONTROL_RETRY: Duration = Duration::from_secs(1);
+
+/// What `keep_control` tells the supervisor that keeps a control
+/// connection to a host.
+pub enum ControlEvent {
+    /// A connection was made; `again` when it replaces one that ended.
+    Attached {
+        /// The connection, for acknowledgements and requests.
+        control: HostControl,
+        /// Whether an earlier connection to this host ended.
+        again: bool,
+    },
+    /// The host said something.
+    Message(Box<HostMessage>),
+    /// The connection ended, or none could be made. Answered with
+    /// whether the host is still the one to be connected to, in which
+    /// case the connection is made again.
+    Ended {
+        /// Why no connection could be made, when that is what happened.
+        failed: Option<anyhow::Error>,
+        /// Whether an earlier connection to this host had ended before.
+        again: bool,
+        /// Where to say whether to connect again.
+        answer: oneshot::Sender<bool>,
+    },
+}
+
+/// Keep a control connection to a host for as long as its supervisor
+/// wants one (section 5.9, issues 983 and 988): connect, hand the
+/// connection over, pass on what the host says, and when the connection
+/// ends ask whether the host is still the one to be connected to,
+/// connecting again if so. A host closes the connection when a send to
+/// its supervisor fails or does not complete, which a supervisor that
+/// was stalled causes; the host sends its state and the events it holds
+/// to whoever connects next. Everything goes to `inbox` as what `wrap`
+/// makes of it, so the daemon takes it as commands and a run as the
+/// events themselves, and the task ends when the inbox is closed or the
+/// answer is no. `made` is a connection already up, with what the host
+/// has said on it so far.
+pub async fn keep_control<T>(
+    inbox: mpsc::Sender<T>,
+    path: PathBuf,
+    made: Option<(Vec<HostMessage>, mpsc::Receiver<HostMessage>)>,
+    wrap: impl Fn(ControlEvent) -> T,
+) {
+    let mut made = made;
+    let mut again = false;
+
+    loop {
+        let (connected, failed) = match made.take() {
+            Some(made) => (Some(made), None),
+            None => match HostControl::connect(&path).await {
+                Ok((control, messages)) => {
+                    let attached = inbox
+                        .send(wrap(ControlEvent::Attached { control, again }))
+                        .await;
+
+                    if attached.is_err() {
+                        return;
+                    }
+
+                    (Some((Vec::new(), messages)), None)
+                }
+                Err(error) => (None, Some(error)),
+            },
+        };
+
+        let retry = failed.is_some();
+
+        if let Some((sent, mut messages)) = connected {
+            for message in sent {
+                if inbox
+                    .send(wrap(ControlEvent::Message(Box::new(message))))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            while let Some(message) = messages.recv().await {
+                if inbox
+                    .send(wrap(ControlEvent::Message(Box::new(message))))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        // The connection ended, or none could be made. The supervisor
+        // says whether the host is still the one it wants.
+
+        let (answer, answered) = oneshot::channel();
+        let asked = inbox
+            .send(wrap(ControlEvent::Ended {
+                failed,
+                again,
+                answer,
+            }))
+            .await;
+
+        if asked.is_err() || !answered.await.unwrap_or(false) {
+            return;
+        }
+
+        again = true;
+
+        if retry {
+            tokio::time::sleep(CONTROL_RETRY).await;
+        }
     }
 }
 

@@ -59,6 +59,19 @@ impl HostLink {
         }
     }
 
+    /// The connection to the host that serves ended, or was made again
+    /// (issue 988): the requests still waiting, which were asked on the
+    /// connection that ended, are answered with why they cannot be.
+    pub fn reattach(&mut self, control: Option<HostControl>) {
+        self.control = control;
+
+        for (_, done) in self.asked.drain() {
+            let _ = done.send(Err(
+                "the connection to the host ended before it answered".to_owned()
+            ));
+        }
+    }
+
     /// Tell the host the edge routes by the workers it announced.
     pub fn acknowledge(&self, version: u64) {
         if let Some(control) = &self.control {
