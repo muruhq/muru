@@ -37,7 +37,7 @@ erDiagram
 | Application | apps/shop | default interface and entrypoint, defaults for releases, reload policy, schedules, memory and timeout defaults | Yes |
 | Release | apps/shop/releases/r42 | source (directory, or image digest), interpreter request and resolved interpreter, environment, mounts, worker groups, source fingerprint, metadata (section 9.14) | No, except scale and limits applied live |
 | Mount | part of a release | path, interface (wsgi, asgi or grpc), entrypoint, internal flag, thread pool, concurrency and connection limits | Paths and limits live, entrypoints fixed |
-| Worker group | part of a release | paths or mounts, processes, threads, scaling, timeouts, memory policy | Sizes live, thread changes are rolling restarts |
+| Worker group | part of a release | paths or mounts, processes, threads, scaling, timeouts, memory policy | Sizes live, thread changes are a new release (section 10.5) |
 | Worker | .../groups/default/workers/w3 | pid, state, slots, metrics | Observed only |
 | Host (virtual) | hosts/shop | names and patterns, listeners, TLS, canonical name, host-level settings | Yes |
 | Route | routes/shop-root | host, path and predicates, target, limits, buffering, error pages, upload and redirect settings | Yes |

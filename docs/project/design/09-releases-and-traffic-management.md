@@ -402,3 +402,19 @@ shop@r6                  retained            1 (2x8)          9b01c33d7a2e+   21
 - **Releases a deploy does not make.** A rollback, a promotion and a rollout make no release and change no metadata. A detour's release and the releases of `muructl run` carry none.
 
 The source fingerprint of section 9.8 is the reload watcher's record of what it last saw, and is separate from this metadata.
+
+## 9.15 Stopping the old before starting the new
+
+Every strategy of section 9.2 starts the new release beside the old one, and every swap of a worker by default starts the new worker beside the old (section 7.8). An application whose one worker needs exclusive access to a resource, a lock, a device, a port or a single-writer store, cannot run two copies at once.
+
+- **No recreate strategy (ADR 0085).** There is no strategy that stops the old release before it starts the new, no `exclusive` declaration on a release, and the edge does not hold requests across the gap. Stopping the old first is a manual procedure, documented in a how-to of its own: maintenance on for the application, drain the serving release, deploy the new one, which starts it and gives it the traffic, maintenance off. A held release, a preview and a canary each run a second copy and are not part of it.
+- **The running release** is given `max_surge = 0` and `max_unavailable = 1` and a fixed count of one, under which every replacement of its worker, a hard timeout, a stall and the memory guard included, stops the old worker before the new one is forked (section 7.8).
+
+## 9.16 Rollouts whose capacity follows traffic
+
+A canary on a host sized for one copy of an application shares one total of workers between the baseline and the candidate (issue 321). The decisions taken for it with the rest of the design for swapping workers are recorded in ADR 0085:
+
+- The total is the baseline's worker count when the rollout starts, group by group, and the budget only lowers it.
+- Every group of both releases is sized by the release's share of traffic, each side with a share keeping one ready worker in each group, and the candidate's first worker is one over the total until its share earns a whole worker.
+- A step is not finished until the baseline is down to its count, bounded by the drain grace; a rollback does not wait.
+- Managed HTTP server releases are refused until their instances scale (issue 175).

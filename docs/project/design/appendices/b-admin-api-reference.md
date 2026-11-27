@@ -57,6 +57,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | SetScale | POST /v1/apps/{app}/releases/{release}:scale | sizes, bounds, temporary floors |
 | GetScaleStatus | GET /v1/apps/{app}/releases/{release}/scale | signals, decisions, churn |
 | SetMaintenance | POST /v1/apps/{app}:maintenance | maintenance mode |
+| RestartRelease, CancelRestart | POST /v1/apps/{app}/releases/{release}:restart, :cancelRestart | replace every worker of a release, or of one group, in turn under the group's `max_surge` and `max_unavailable`, returning at once or waiting; cancel leaves the workers not yet replaced (10.14) |
 | RunCommand | POST /v1/apps/{app}/releases/{release}:exec | a declared command by name with its inputs (secret ones optionally as STORE/KEY), or a one-off command, run with the release (9.12), output streamed and the exit status last; with `detach`, started under its own log relay and answered with its run's id at once |
 | ListCommands | GET /v1/apps/{app}/releases/{release}/commands | the release's declared commands, their inputs and each one's last run |
 | ListCommandRuns | GET /v1/apps/{app}/runs | the runs the daemon keeps of the application's commands, or of one by `name`, those under way first (9.12) |
